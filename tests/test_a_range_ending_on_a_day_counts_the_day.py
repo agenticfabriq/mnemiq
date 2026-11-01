@@ -169,6 +169,12 @@ def test_a_column_not_bound_directly_to_a_base_table_is_never_moved(asked):
     "SELECT id FROM claim WHERE ts <= '2024-03-09' AND epoch(ts) > 1709942400",
     # `IS` with a value, SQLite's NULL-safe equality, written for another engine.
     "SELECT id FROM claim WHERE ts = '2024-03-09' AND ts IS '2024-03-09'",
+    # The timestamp compared inside a function (Codex's tenth review), or carried into an expression.
+    "SELECT id FROM claim WHERE ts = '2024-03-09' AND NOT list_contains([ts], TIMESTAMP '2024-03-09')",
+    "SELECT id FROM claim WHERE ts <= '2024-03-09' AND NULLIF(ts, filed) IS NULL",
+    "SELECT id, ts + INTERVAL 1 DAY AS later FROM claim WHERE ts <= '2024-03-09'",
+    "SELECT id FROM claim WHERE ts = '2024-03-09' "
+    "AND NOT list_contains([CAST(ts AS TIMESTAMPTZ)], TIMESTAMPTZ '2024-03-09 00:00:00+00')",
     # A day as the subject of an IN listing the timestamp (Codex's sixth review).
     "SELECT id FROM claim WHERE ts = '2024-03-09' AND '2024-03-09' NOT IN (ts)",
     "SELECT id FROM claim WHERE ts = '2024-03-09' AND '2024-03-09' IN (ts, ts)",
@@ -198,6 +204,11 @@ def test_a_day_compared_with_whole_days_text_or_a_projection_does_not_stop_the_m
 
 
 @pytest.mark.parametrize("asked, closed", [
+    # The timestamp passing through: projected, grouped, ordered, counted, its MAX, its day.
+    ("SELECT ts, COUNT(DISTINCT ts) AS n, MAX(ts) AS last, CAST(ts AS DATE) AS d FROM claim "
+     "WHERE ts <= '2024-03-09' GROUP BY ts ORDER BY ts",
+     "SELECT ts, COUNT(DISTINCT ts) AS n, MAX(ts) AS last, CAST(ts AS DATE) AS d FROM claim "
+     "WHERE ts < '2024-03-10' GROUP BY ts ORDER BY ts"),
     # Columns and literals only: a moment with its time of day, a number, other columns, a timestamp
     # join condition.
     ("SELECT id FROM claim WHERE ts <= '2024-03-09' AND ts > '2024-03-01 12:00:00' AND id > -1",
@@ -354,6 +365,19 @@ def test_a_next_day_no_timestamp_can_hold_leaves_the_statement_as_written():
     # The day before the last still moves.
     assert decide("SELECT id FROM claim WHERE ts <= '2262-04-10'", VISIBLE, dialect="duckdb",
                   target="duckdb", types=types).day_bounds == 1
+
+
+def test_the_tenth_reviews_membership_function_leaves_the_statement_as_written_on_the_engine():
+    """Codex's tenth review: `NOT list_contains([ts], TIMESTAMP D)` kept its midnight while `ts = D`
+    moved, and the noon row satisfied both. A timestamp inside a function now leaves the statement
+    as written, and it returns nothing."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INTEGER, ts TIMESTAMP)")
+    con.execute("INSERT INTO claim VALUES (1, '2024-03-09 12:00')")
+    asked = "SELECT id FROM claim WHERE ts = '2024-03-09' AND NOT list_contains([ts], TIMESTAMP '2024-03-09')"
+    verdict = decide(asked, VISIBLE, dialect="duckdb", target="duckdb", types=TYPES)
+    assert isinstance(verdict, Approved) and verdict.day_bounds == 0, verdict
+    assert con.execute(verdict.target_sql).fetchall() == con.execute(asked).fetchall() == []
 
 
 def test_contradictions_stay_contradictions_and_nulls_stay_null_on_the_engine():

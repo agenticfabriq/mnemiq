@@ -64,7 +64,6 @@ from mnemiq.sql.values_check import _in_scope, _iso_date, _moment, _scopes, _tem
 _DAY_FORMATS = frozenset({"%Y-%m-%d"})  # a parse format naming the day alone (Oracle's TO_DATE 'YYYY-MM-DD')
 _WRAPPERS = (exp.Cast, exp.TryCast, exp.DateStrToDate, exp.StrToDate, exp.StrToTime)
 _BINARY = (exp.EQ, exp.NEQ, exp.LT, exp.LTE, exp.GT, exp.GTE, exp.NullSafeEQ, exp.NullSafeNEQ, exp.Is)
-_PATTERNS = (exp.Like, exp.ILike, exp.Glob, exp.SimilarTo, exp.RegexpLike, exp.RegexpILike)
 # The days every engine's timestamp holds whole: DuckDB's TIMESTAMP_NS runs from 1677-09-21 00:12:43
 # to 2262-04-11. A bound outside them is NULL under TRY_CAST and an error under CAST, as written
 # (rewritten into a NULL-safe range it turns true into unknown: Codex's ninth review) or once moved
@@ -198,26 +197,27 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
         return OPAQUE
 
     rewrites: list[tuple[exp.Expression, exp.Expression]] = []
+    direct: set[int] = set()  # the operands of the comparisons read below
 
     for join in ast.find_all(exp.Join):
         if join.args.get("using") or str(join.args.get("method") or "").upper() == "NATURAL":
-            return 0
-    for match in ast.find_all(*_PATTERNS):
-        if TIMES in (_classify(match.this), _classify(match.expression)):
             return 0
     for node in list(ast.find_all(*_BINARY, exp.In, exp.Between, exp.Case)):
         if isinstance(node, exp.Case):
             if node.this is None:
                 continue  # a searched CASE compares nothing itself; its WHENs are comparisons of their own
             subject = _classify(node.this)
+            direct.add(id(node.this))
             for branch in node.args.get("ifs") or []:
                 value = _classify(branch.this)
+                direct.add(id(branch.this))
                 if not _agree(subject, value) or {subject, value} == {TIMES, DAY}:
                     return 0  # `CASE col WHEN D`: an equality this does not rewrite
             continue
         if isinstance(node, exp.Between):
             subject, low, high = node.this, node.args["low"], node.args["high"]
             classes = [_classify(subject), _classify(low), _classify(high)]
+            direct.update((id(subject), id(low), id(high)))
             if DAY in (classes[0],) or not (_agree(classes[0], classes[1]) and _agree(classes[0], classes[2])):
                 return 0  # a day as BETWEEN's subject, or a pair that disagrees
             if classes[0] == TIMES and DAY in classes[1:]:
@@ -237,6 +237,7 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
             if node.args.get("query") is not None:
                 items = [node.args["query"]]
             classes = [_classify(i) for i in items]
+            direct.update((id(node.this), *(id(i) for i in items)))
             if not items or not all(_agree(subject, c) for c in classes):
                 return 0
             if subject == DAY and TIMES in classes:
@@ -254,6 +255,7 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
             continue
         left, right = node.this, node.expression
         a, b = _classify(left), _classify(right)
+        direct.update((id(left), id(right)))
         if not _agree(a, b):
             return 0
         if {a, b} != {TIMES, DAY}:
@@ -278,6 +280,37 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
             return 0  # `IS` with a value: SQLite's NULL-safe equality, which no other engine has
         # `<` and `>=` already mean the day's boundary
 
+    # A timestamp column, or one whose type is unknown, anywhere else -- inside a function or an
+    # expression -- may be compared there with a day unread (`list_contains([ts], TIMESTAMP D)`,
+    # NULLIF, GREATEST: Codex's tenth review), so it leaves the statement as written, unless it only
+    # passes through: projected bare, grouped, ordered, partitioned, counted, MIN or MAX, or cast to
+    # DATE, which is its day.
+    for column in ast.find_all(exp.Column):
+        if id(column) not in direct and not _passes_through(column, oracle) and _classify(column) in (TIMES, OPAQUE):
+            return 0
+
     for node, replacement in rewrites:
         node.replace(replacement)
     return len(rewrites)
+
+
+def _passes_through(column: exp.Column, oracle: bool) -> bool:
+    """Whether `column` sits where it is compared with nothing but its own column's values: a bare
+    projection (aliased or not), a GROUP BY or ORDER BY item, a window's PARTITION BY or ORDER BY,
+    the sole argument of COUNT (DISTINCT included), MIN or MAX; or where it becomes its own day, a
+    cast to DATE outside Oracle (whose DATE keeps the time of day)."""
+    parent = column.parent
+    if (isinstance(parent, (exp.Cast, exp.TryCast)) and not oracle
+            and _temporal_kind(parent.args.get("to"), None) == "date"):
+        return True
+    if isinstance(parent, exp.Alias) and isinstance(parent.parent, exp.Select):
+        column, parent = parent, parent.parent
+    if isinstance(parent, exp.Select):
+        return any(e is column for e in parent.expressions)
+    if isinstance(parent, (exp.Group, exp.Ordered)):
+        return True
+    if isinstance(parent, exp.Window):
+        return any(e is column for e in parent.args.get("partition_by") or [])
+    if isinstance(parent, exp.Distinct) and isinstance(parent.parent, exp.Count):
+        return True
+    return isinstance(parent, (exp.Count, exp.Min, exp.Max)) and parent.this is column
