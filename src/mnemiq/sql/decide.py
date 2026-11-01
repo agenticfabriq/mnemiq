@@ -31,7 +31,8 @@ from mnemiq.sql.lineage import lineage_for
 from mnemiq.sql.scope import (base_tables, check_policy_target, fields_as_members, known_columns,
                               scope_resolved)
 from mnemiq.sql.reading import UNSUPPORTED_RAISES, as_duckdb_reads, kept, rendered, unprintable
-from mnemiq.sql.rls import apply_row_and_mask, check_filter_targets, unplaceable_policy
+from mnemiq.sql.rls import (apply_row_and_mask, as_written, check_filter_targets, unplaceable_policy,
+                            with_filters_held)
 from mnemiq.sql.values_check import check_values, ground_values
 from mnemiq.sql.views import check_views
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode, Verdict
@@ -286,11 +287,21 @@ def decide(
     asked_sql = _render_target(asked, asked_plan, dialect, target)
     if isinstance(asked_sql, Refusal):
         return asked_sql
-    plan_sql = shaped.sql(dialect=dialect)
+    # Each row filter printed as its operator wrote it, never from its parse (M222): held out of the
+    # tree through the print and the re-read, and put back once the statement is text.
+    try:
+        held, written = with_filters_held(shaped, registry, dialect)
+    except ValueError as exc:
+        return unprintable(target, exc, policys=True, tree=shaped)
+    plan_sql = held.sql(dialect=dialect)
     target_sql = (asked_sql if asked_plan == plan_sql
-                  else _render_target(shaped, plan_sql, dialect, target, policys=True))
+                  else _render_target(held, plan_sql, dialect, target, policys=True))
     if isinstance(target_sql, Refusal):
         return target_sql
+    try:
+        plan_sql, target_sql = as_written(plan_sql, written, dialect), as_written(target_sql, written, target)
+    except ValueError as exc:
+        return unprintable(target, exc, policys=True, tree=shaped)
 
     if adapter is not None:
         # the snapshot can be stale, and only the source knows the truth. `prove` picks the proof

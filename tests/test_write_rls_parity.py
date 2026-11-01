@@ -17,7 +17,7 @@ import sqlglot
 from mnemiq.authz.grants import GrantSet
 from mnemiq.sql.decide_write import decide_write
 from mnemiq.sql.policy import AccessPolicy
-from mnemiq.sql.rls import apply_row_and_mask
+from mnemiq.sql.rls import apply_row_and_mask, as_written, with_filters_held
 from mnemiq.sql.verdict import ApprovedWrite, Refusal, RefusalCode
 
 _VISIBLE = {"claim": {"id", "amount", "region"}, "scratch": {"id", "amount"}}
@@ -202,8 +202,10 @@ def test_the_write_path_rewrites_a_read_exactly_as_the_read_path_does(label, sel
 
     verdict = _write(f"INSERT INTO scratch (id, amount) {select_sql}", policy)
     assert isinstance(verdict, ApprovedWrite)
+    # Printed as both deciders print a governed tree: each filter's text as written (M222).
+    held, written = with_filters_held(governed_read)
     assert verdict.plan_sql == (
-        "INSERT INTO scratch (id, amount) " + governed_read.sql(dialect="duckdb")
+        "INSERT INTO scratch (id, amount) " + as_written(held.sql(dialect="duckdb"), written, "duckdb")
     )
 
 
