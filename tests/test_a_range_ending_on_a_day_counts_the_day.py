@@ -144,6 +144,20 @@ def test_a_column_not_bound_directly_to_a_base_table_is_never_moved(asked):
     "WHERE c.ts <= '2024-03-09' AND r.ts BETWEEN '2024-03-01' AND '2024-03-09'",
     "WITH r AS (SELECT id, ts FROM claim) SELECT c.id FROM claim AS c JOIN r ON r.id = c.id "
     "WHERE c.ts <= '2024-03-09' AND r.ts IN ('2024-03-09')",
+    # The same timestamp met by a day this cannot move (Codex's third review, and its kin): inside a
+    # subquery, through a cast of the column, as a DATE column's value or today's date.
+    "SELECT id FROM claim WHERE ts = '2024-03-09' AND ts <> (SELECT CAST('2024-03-09' AS TIMESTAMP))",
+    "SELECT id FROM claim WHERE ts = '2024-03-09' AND ts NOT IN (SELECT CAST('2024-03-09' AS TIMESTAMP))",
+    "SELECT id FROM claim WHERE ts = '2024-03-09' AND CAST(ts AS TIMESTAMPTZ) <> '2024-03-09'",
+    "SELECT id FROM claim WHERE ts <= '2024-03-09' AND ts > filed",
+    "SELECT id FROM claim WHERE ts <= '2024-03-09' AND ts > CURRENT_DATE",
+    "WITH r AS (SELECT '2024-03-09' AS d) SELECT id FROM claim, r WHERE ts <= '2024-03-09' AND ts > r.d",
+    "SELECT id FROM claim WHERE ts <= '2024-03-09' AND CAST(ts AS VARCHAR) > '2024-03-09'",
+    "SELECT id FROM claim WHERE ts = '2024-03-09' AND ts > CAST('2024-03-09' AS VARCHAR)",
+    "SELECT id FROM claim WHERE ts = '2024-03-09' "
+    "AND CAST(ts AS TIMESTAMPTZ) <> (SELECT CAST('2024-03-09' AS TIMESTAMPTZ))",
+    # A comparison this does not read: a USING join's.
+    "SELECT a.id FROM claim AS a JOIN claim AS b USING (id) WHERE a.ts <= '2024-03-09'",
 ])
 def test_one_comparison_that_cannot_be_read_by_day_leaves_the_whole_statement_as_written(asked):
     """One statement, one reading: beside a day compared with something this cannot read by day (an
@@ -159,6 +173,41 @@ def test_a_day_compared_with_whole_days_text_or_a_projection_does_not_stop_the_m
                    "AND filed <= '2024-03-09' AND CAST(ts AS DATE) <= '2024-03-09' AND note <> '2024-03-09'") == (
         "SELECT id, '2024-03-09' AS asof FROM claim WHERE ts < '2024-03-10' AND filed <= '2024-03-09' "
         "AND CAST(ts AS DATE) <= '2024-03-09' AND note <> '2024-03-09'", 1)
+
+
+@pytest.mark.parametrize("asked, closed", [
+    # A semi-join, a count, a moment with its time of day: none of them reads a day.
+    ("SELECT id FROM claim WHERE ts <= '2024-03-09' AND id IN (SELECT id FROM claim WHERE region = 'west')",
+     "SELECT id FROM claim WHERE ts < '2024-03-10' AND id IN (SELECT id FROM claim WHERE region = 'west')"),
+    ("SELECT region, COUNT(*) AS n FROM claim WHERE ts <= '2024-03-09' GROUP BY region HAVING COUNT(*) > 5",
+     "SELECT region, COUNT(*) AS n FROM claim WHERE ts < '2024-03-10' GROUP BY region HAVING COUNT(*) > 5"),
+    ("SELECT id FROM claim WHERE ts <= '2024-03-09' AND ts > '2024-03-01 12:00:00' AND id > -1",
+     "SELECT id FROM claim WHERE ts < '2024-03-10' AND ts > '2024-03-01 12:00:00' AND id > -1"),
+    ("SELECT a.id FROM claim AS a JOIN claim AS b ON a.id = b.id AND a.ts >= b.ts WHERE a.ts <= '2024-03-09'",
+     "SELECT a.id FROM claim AS a JOIN claim AS b ON a.id = b.id AND a.ts >= b.ts WHERE a.ts < '2024-03-10'"),
+])
+def test_comparisons_that_read_no_day_do_not_stop_the_move(asked, closed):
+    assert _closed(asked) == (closed, 1)
+
+
+def test_the_third_reviews_contradictions_stay_contradictions_on_the_engine():
+    """Codex's third review: a day inside a subquery, and a cast of the same column to TIMESTAMPTZ,
+    each kept its midnight while `=` moved, and a noon row satisfied a contradiction. A DATE
+    column's value is the same class. Each statement is now left as written, and returns nothing."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INTEGER, ts TIMESTAMP, filed DATE, tz TIMESTAMPTZ, note VARCHAR, "
+                "region VARCHAR)")
+    con.execute("INSERT INTO claim VALUES (1, '2024-03-09 12:00', '2024-03-09', NULL, NULL, 'west')")
+    for asked in ("SELECT count(*) FROM claim WHERE ts = '2024-03-09' AND ts <> (SELECT CAST('2024-03-09' AS TIMESTAMP))",
+                  "SELECT count(*) FROM claim WHERE ts = '2024-03-09' AND ts NOT IN (SELECT CAST('2024-03-09' AS TIMESTAMP))",
+                  "SELECT count(*) FROM claim WHERE ts = '2024-03-09' AND CAST(ts AS TIMESTAMPTZ) <> '2024-03-09'",
+                  "SELECT count(*) FROM claim WHERE ts <= '2024-03-09' AND ts > filed",
+                  # A day cast to TIMESTAMPTZ inside a subquery, against the same column's cast.
+                  "SELECT count(*) FROM claim WHERE ts = '2024-03-09' "
+                  "AND CAST(ts AS TIMESTAMPTZ) <> (SELECT CAST('2024-03-09' AS TIMESTAMPTZ))"):
+        verdict = decide(asked, VISIBLE, dialect="duckdb", target="duckdb", types=TYPES)
+        assert isinstance(verdict, Approved) and verdict.day_bounds == 0, (asked, verdict)
+        assert con.execute(verdict.target_sql).fetchone() == con.execute(asked).fetchone() == (0,), asked
 
 
 def test_contradictions_stay_contradictions_and_nulls_stay_null_on_the_engine():
