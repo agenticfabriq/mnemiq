@@ -65,10 +65,12 @@ _DAY_FORMATS = frozenset({"%Y-%m-%d"})  # a parse format naming the day alone (O
 _WRAPPERS = (exp.Cast, exp.TryCast, exp.DateStrToDate, exp.StrToDate, exp.StrToTime)
 _BINARY = (exp.EQ, exp.NEQ, exp.LT, exp.LTE, exp.GT, exp.GTE, exp.NullSafeEQ, exp.NullSafeNEQ, exp.Is)
 _PATTERNS = (exp.Like, exp.ILike, exp.Glob, exp.SimilarTo, exp.RegexpLike, exp.RegexpILike)
-# The last day every engine's timestamp holds: DuckDB's TIMESTAMP_NS ends on 2262-04-11, and a bound
-# moved past it is NULL under TRY_CAST and an error under CAST (Codex's eighth review). A next day
-# beyond it, or beyond the calendar ('9999-12-31'), leaves the statement as written.
-_LAST_DAY = date(2262, 4, 11)
+# The days every engine's timestamp holds whole: DuckDB's TIMESTAMP_NS runs from 1677-09-21 00:12:43
+# to 2262-04-11. A bound outside them is NULL under TRY_CAST and an error under CAST, as written
+# (rewritten into a NULL-safe range it turns true into unknown: Codex's ninth review) or once moved
+# (Codex's eighth). A day before the first, a next day after the last, or past the calendar
+# ('9999-12-31') leaves the statement as written.
+_FIRST_DAY, _LAST_DAY = date(1677, 9, 22), date(2262, 4, 11)
 _MIRROR = {exp.LT: exp.GT, exp.GT: exp.LT, exp.LTE: exp.GTE, exp.GTE: exp.LTE}  # `bound op col` as `col op' bound`
 
 # Operand classes (`_classify`): a bare day; a moment (an ISO timestamp string with its time of day);
@@ -111,9 +113,10 @@ def _next_day(bound: exp.Expression) -> exp.Expression:
 
 
 def _movable(bound: exp.Expression) -> bool:
-    """Whether the day after `bound`'s day is one every engine's timestamp can hold."""
+    """Whether `bound`'s day and the day after it are days every engine's timestamp holds whole."""
+    day = date.fromisoformat(_day(bound).this)
     try:
-        return date.fromisoformat(_day(bound).this) + timedelta(days=1) <= _LAST_DAY
+        return _FIRST_DAY <= day and day + timedelta(days=1) <= _LAST_DAY
     except OverflowError:
         return False
 

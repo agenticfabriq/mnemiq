@@ -336,6 +336,21 @@ def test_a_next_day_no_timestamp_can_hold_leaves_the_statement_as_written():
     sentinel = decide("SELECT id FROM claim WHERE ts <= '9999-12-31'", VISIBLE, dialect="duckdb",
                       target="duckdb", types=TYPES)
     assert sentinel.day_bounds == 0 and "<= '9999-12-31'" in sentinel.target_sql
+    # Below the first day TIMESTAMP_NS holds, the bound is NULL as written: rewritten into a NULL-safe
+    # range it turned true into unknown and dropped the row (Codex's ninth review).
+    plain = duckdb.connect()
+    plain.execute("CREATE TABLE claim (id INTEGER, ts TIMESTAMP)")
+    plain.execute("INSERT INTO claim VALUES (1, '2024-03-09 12:00:00')")
+    for asked in ("SELECT id FROM claim WHERE ts IS DISTINCT FROM TRY_CAST('1600-01-01' AS TIMESTAMP_NS)",
+                  "SELECT id FROM claim WHERE ts <> TRY_CAST('1677-09-21' AS TIMESTAMP_NS)"):
+        verdict = decide(asked, VISIBLE, dialect="duckdb", target="duckdb", types=TYPES)
+        assert isinstance(verdict, Approved) and verdict.day_bounds == 0, (asked, verdict)
+        assert plain.execute(verdict.target_sql).fetchall() == plain.execute(asked).fetchall(), asked
+    # The NULL-safe form as written returns the row (NULL is distinct from the noon timestamp).
+    assert plain.execute("SELECT id FROM claim WHERE ts IS DISTINCT FROM TRY_CAST('1600-01-01' AS TIMESTAMP_NS)"
+                         ).fetchall() == [(1,)]
+    assert decide("SELECT id FROM claim WHERE ts <= '1677-09-22'", VISIBLE, dialect="duckdb",
+                  target="duckdb", types=TYPES).day_bounds == 1
     # The day before the last still moves.
     assert decide("SELECT id FROM claim WHERE ts <= '2262-04-10'", VISIBLE, dialect="duckdb",
                   target="duckdb", types=types).day_bounds == 1
