@@ -176,6 +176,10 @@ def test_a_column_not_bound_directly_to_a_base_table_is_never_moved(asked):
     # An aggregate carrying the timestamp into a function that compares it (Codex's eleventh review).
     "SELECT NULLIF(MIN(ts), TIMESTAMP '2024-03-09') AS m FROM claim WHERE ts <= '2024-03-09'",
     "SELECT GREATEST(MAX(ts), TIMESTAMP '2024-03-09') AS m FROM claim WHERE ts <= '2024-03-09'",
+    # Set operations that compare rows (Codex's thirteenth review).
+    "SELECT COUNT(*) FROM (SELECT ts FROM claim WHERE ts <= '2024-03-09' EXCEPT SELECT TIMESTAMP '2024-03-09') AS q",
+    "SELECT ts FROM claim WHERE ts <= '2024-03-09' INTERSECT SELECT TIMESTAMP '2024-03-09'",
+    "SELECT ts FROM claim WHERE ts <= '2024-03-09' UNION SELECT TIMESTAMP '2024-03-09'",
     # A CTE's output, whose type is unknown, carried into a function that compares it.
     "WITH r AS (SELECT ts AS t FROM claim) SELECT list_contains([r.t], TIMESTAMP '2024-03-09') AS f "
     "FROM r, claim WHERE claim.ts <= '2024-03-09'",
@@ -215,6 +219,9 @@ def test_a_day_compared_with_whole_days_text_or_a_projection_does_not_stop_the_m
      "WHERE ts <= '2024-03-09' GROUP BY ts ORDER BY ts",
      "SELECT ts, COUNT(DISTINCT ts) AS n, MAX(ts) AS last, CAST(ts AS DATE) AS d FROM claim "
      "WHERE ts < '2024-03-10' GROUP BY ts ORDER BY ts"),
+    # UNION ALL compares nothing.
+    ("SELECT ts FROM claim WHERE ts <= '2024-03-09' UNION ALL SELECT ts FROM claim WHERE ts >= '2024-03-20'",
+     "SELECT ts FROM claim WHERE ts < '2024-03-10' UNION ALL SELECT ts FROM claim WHERE ts >= '2024-03-20'"),
     # A count is never a time, wherever it goes.
     ("SELECT NULLIF(COUNT(ts), 0) AS n FROM claim WHERE ts <= '2024-03-09'",
      "SELECT NULLIF(COUNT(ts), 0) AS n FROM claim WHERE ts < '2024-03-10'"),
@@ -403,6 +410,20 @@ def test_the_eleventh_reviews_aggregate_leaves_the_statement_as_written_on_the_e
     # Projected bare, MIN still lets the bound move.
     assert decide("SELECT MIN(ts) AS m FROM claim WHERE ts <= '2024-03-09' ORDER BY MAX(ts)", VISIBLE,
                   dialect="duckdb", target="duckdb", types=TYPES).day_bounds == 1
+
+
+def test_the_thirteenth_reviews_except_leaves_the_statement_as_written_on_the_engine():
+    """Codex's thirteenth review: EXCEPT compared the noon row with the day's midnight while the WHERE
+    bound moved, and the count went from 0 to 1. A set operation that compares rows now leaves the
+    statement as written."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INTEGER, ts TIMESTAMP)")
+    con.execute("INSERT INTO claim VALUES (1, '2024-03-09 12:00:00')")
+    asked = ("SELECT COUNT(*) FROM (SELECT ts FROM claim WHERE ts <= '2024-03-09' "
+             "EXCEPT SELECT TIMESTAMP '2024-03-09') AS q")
+    verdict = decide(asked, VISIBLE, dialect="duckdb", target="duckdb", types=TYPES)
+    assert isinstance(verdict, Approved) and verdict.day_bounds == 0, verdict
+    assert con.execute(verdict.target_sql).fetchall() == con.execute(asked).fetchall() == [(0,)]
 
 
 def test_contradictions_stay_contradictions_and_nulls_stay_null_on_the_engine():

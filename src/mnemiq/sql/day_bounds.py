@@ -42,7 +42,8 @@ bare columns and literals, and
 
 Where a time goes (`_CONSUMES`, `_CARRIES_ON`). A value computed from a timestamp column or a column
 of unknown type ends only where the comparisons above read it, in what the statement shows or sorts,
-or in a container whose outputs are read again as columns, passing on through an alias, MIN, MAX, a
+or in a container whose outputs are read again as columns (a derived table, a CTE, UNION ALL -- not
+INTERSECT, EXCEPT or UNION's dedup, which compare rows), passing on through an alias, MIN, MAX, a
 cast to DATE or a subquery; COUNT, EXISTS and comparisons consume it. Anywhere else -- a function,
 arithmetic, a CASE, a pattern match -- it may be compared unread.
 
@@ -83,10 +84,11 @@ _FIRST_DAY, _LAST_DAY = date(1677, 9, 22), date(2262, 4, 11)
 _CONSUMES = (*_BINARY, exp.In, exp.Between, exp.Count, exp.Exists, exp.And, exp.Or, exp.Not)
 # Where a time may go, or pass on from (`close_day_bounds`): what a statement shows or sorts, what
 # carries it on to be checked again (an alias, MIN, MAX, a subquery), and the containers whose
-# outputs are read again as columns of unknown type.
+# outputs are read again as columns of unknown type. A set operation only as UNION ALL: UNION's
+# dedup, INTERSECT and EXCEPT compare rows, a day's midnight among them (Codex's thirteenth review).
 _CARRIES_ON = (exp.Select, exp.Alias, exp.Group, exp.Order, exp.Ordered, exp.Window, exp.Distinct,
-               exp.Count, exp.Min, exp.Max, exp.Subquery, exp.SetOperation, exp.CTE, exp.With,
-               exp.From, exp.Join, exp.Paren, exp.Exists)
+               exp.Count, exp.Min, exp.Max, exp.Subquery, exp.CTE, exp.With, exp.From, exp.Join,
+               exp.Paren, exp.Exists)
 _MIRROR = {exp.LT: exp.GT, exp.GT: exp.LT, exp.LTE: exp.GTE, exp.GTE: exp.LTE}  # `bound op col` as `col op' bound`
 
 # Operand classes (`_classify`): a bare day; a moment (an ISO timestamp string with its time of day);
@@ -317,7 +319,8 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
     for node in ast.walk():
         if id(node) in carries and node.parent is not None and id(node) not in direct:
             parent = node.parent
-            if not (isinstance(parent, _CARRIES_ON) or _day_cast(parent, oracle)):
+            if not (isinstance(parent, _CARRIES_ON) or _day_cast(parent, oracle)
+                    or (isinstance(parent, exp.Union) and parent.args.get("distinct") is False)):
                 return 0
 
     for node, replacement in rewrites:
