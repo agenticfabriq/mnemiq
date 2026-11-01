@@ -180,6 +180,18 @@ def test_a_column_not_bound_directly_to_a_base_table_is_never_moved(asked):
     "SELECT COUNT(*) FROM (SELECT ts FROM claim WHERE ts <= '2024-03-09' EXCEPT SELECT TIMESTAMP '2024-03-09') AS q",
     "SELECT ts FROM claim WHERE ts <= '2024-03-09' INTERSECT SELECT TIMESTAMP '2024-03-09'",
     "SELECT ts FROM claim WHERE ts <= '2024-03-09' UNION SELECT TIMESTAMP '2024-03-09'",
+    # A day no comparison reads keeps its midnight while the bounds read the whole day; anything that
+    # later compares rows sees one day two ways (Codex's fourteenth review): an outer COUNT(DISTINCT),
+    # DISTINCT or GROUP BY over UNION ALL, a day carried there through a CTE, a day as a CASE's value
+    # or as a label beside the bound.
+    "SELECT COUNT(DISTINCT ts) FROM (SELECT ts FROM claim WHERE ts <= '2024-03-09' "
+    "UNION ALL SELECT TIMESTAMP '2024-03-09' AS ts) AS x",
+    "SELECT DISTINCT ts FROM (SELECT ts FROM claim WHERE ts <= '2024-03-09' UNION ALL SELECT '2024-03-09') AS x",
+    "SELECT ts FROM (SELECT ts FROM claim WHERE ts <= '2024-03-09' UNION ALL SELECT DATE '2024-03-09') AS x "
+    "GROUP BY ts",
+    "WITH d AS (SELECT DATE '2024-03-09' AS t) SELECT ts FROM claim WHERE ts <= '2024-03-09' UNION ALL SELECT t FROM d",
+    "SELECT CASE WHEN ts <= '2024-03-09' THEN '2024-03-09' END AS d FROM claim",
+    "SELECT id, '2024-03-09' AS asof FROM claim WHERE ts <= '2024-03-09'",
     # A CTE's output, whose type is unknown, carried into a function that compares it.
     "WITH r AS (SELECT ts AS t FROM claim) SELECT list_contains([r.t], TIMESTAMP '2024-03-09') AS f "
     "FROM r, claim WHERE claim.ts <= '2024-03-09'",
@@ -206,11 +218,18 @@ def test_one_comparison_that_cannot_be_read_by_day_leaves_the_whole_statement_as
     assert sql == sqlglot.parse_one(asked, read="duckdb").sql(dialect="duckdb")
 
 
-def test_a_day_compared_with_whole_days_text_or_a_projection_does_not_stop_the_move():
-    assert _closed("SELECT id, '2024-03-09' AS asof FROM claim WHERE ts <= '2024-03-09' "
+def test_a_day_compared_with_whole_days_or_text_does_not_stop_the_move():
+    assert _closed("SELECT id FROM claim WHERE ts <= '2024-03-09' "
                    "AND filed <= '2024-03-09' AND CAST(ts AS DATE) <= '2024-03-09' AND note <> '2024-03-09'") == (
-        "SELECT id, '2024-03-09' AS asof FROM claim WHERE ts < '2024-03-10' AND filed <= '2024-03-09' "
+        "SELECT id FROM claim WHERE ts < '2024-03-10' AND filed <= '2024-03-09' "
         "AND CAST(ts AS DATE) <= '2024-03-09' AND note <> '2024-03-09'", 1)
+
+
+def test_a_moment_beside_the_moved_bound_means_that_moment():
+    """A moment written with its time of day is not a day: projected beside the bound, it keeps
+    meaning that moment, and the statement moves (the boundary of Codex's fourteenth review)."""
+    assert _closed("SELECT ts FROM claim WHERE ts <= '2024-03-09' UNION ALL SELECT TIMESTAMP '2024-03-09 00:00:00'") == (
+        "SELECT ts FROM claim WHERE ts < '2024-03-10' UNION ALL SELECT CAST('2024-03-09 00:00:00' AS TIMESTAMP)", 1)
 
 
 @pytest.mark.parametrize("asked, closed", [
@@ -424,6 +443,41 @@ def test_the_thirteenth_reviews_except_leaves_the_statement_as_written_on_the_en
     verdict = decide(asked, VISIBLE, dialect="duckdb", target="duckdb", types=TYPES)
     assert isinstance(verdict, Approved) and verdict.day_bounds == 0, verdict
     assert con.execute(verdict.target_sql).fetchall() == con.execute(asked).fetchall() == [(0,)]
+
+
+def test_the_fourteenth_reviews_outer_dedup_leaves_the_statement_as_written_on_the_engine():
+    """Codex's fourteenth review: a day projected in a UNION ALL branch kept its midnight while the
+    bound read the whole day, and an outer COUNT(DISTINCT), DISTINCT or GROUP BY counted the noon row
+    and the midnight as two, 2 where the statement counts 1. A day no comparison reads now leaves
+    the statement as written."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INTEGER, ts TIMESTAMP)")
+    con.execute("INSERT INTO claim VALUES (1, '2024-03-09 12:00:00')")
+    both = ("SELECT ts FROM claim WHERE ts <= '2024-03-09' UNION ALL SELECT TIMESTAMP '2024-03-09' AS ts")
+    for asked in (f"SELECT COUNT(DISTINCT ts) FROM ({both}) AS x",
+                  f"SELECT COUNT(*) FROM (SELECT DISTINCT ts FROM ({both}) AS x) AS y",
+                  f"SELECT COUNT(*) FROM (SELECT ts FROM ({both}) AS x GROUP BY ts) AS y"):
+        verdict = decide(asked, VISIBLE, dialect="duckdb", target="duckdb", types=TYPES)
+        assert isinstance(verdict, Approved) and verdict.day_bounds == 0, (asked, verdict)
+        assert con.execute(verdict.target_sql).fetchall() == con.execute(asked).fetchall() == [(1,)], asked
+
+
+def test_a_date_columns_midnight_met_unread_leaves_the_statement_as_written_on_the_engine():
+    """A DATE column holds a midnight as a bare day does, and no literal shows it: the time reaching it
+    through a function, a derived table's column or EXCEPT is stopped by where a time goes, not by the
+    days rule. Moved, each would read the noon row against the midnight: a projected False where the
+    statement shows no row and the whole day shows True; a count of 1 where it counts 0."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INTEGER, ts TIMESTAMP, filed DATE)")
+    con.execute("INSERT INTO claim VALUES (1, '2024-03-09 12:00:00', '2024-03-09')")
+    for asked, rows in (("SELECT list_contains([ts], filed) AS f FROM claim WHERE ts = '2024-03-09'", []),
+                        ("SELECT count(*) FROM (SELECT ts AS t, filed FROM claim WHERE ts = '2024-03-09') AS x "
+                         "WHERE NOT list_contains([t], filed)", [(0,)]),
+                        ("SELECT count(*) FROM (SELECT ts FROM claim WHERE ts <= '2024-03-09' "
+                         "EXCEPT SELECT filed FROM claim) AS q", [(0,)])):
+        verdict = decide(asked, VISIBLE, dialect="duckdb", target="duckdb", types=TYPES)
+        assert isinstance(verdict, Approved) and verdict.day_bounds == 0, (asked, verdict)
+        assert con.execute(verdict.target_sql).fetchall() == con.execute(asked).fetchall() == rows, asked
 
 
 def test_contradictions_stay_contradictions_and_nulls_stay_null_on_the_engine():

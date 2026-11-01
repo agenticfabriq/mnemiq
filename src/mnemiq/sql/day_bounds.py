@@ -20,11 +20,12 @@ D+1 written in the literal's own spelling so the statement stays valid in its di
 and `col >= D` already mean the day's boundary and stay as written.
 
 One statement, one reading. Moving some of a statement's comparisons and not others let a
-contradiction return rows and complementary buckets count a row twice; twelve reviews by Codex each
-found a path by which the same timestamp reached a midnight value unmoved -- `<=` beside `>`, `=`
-beside IS DISTINCT FROM, a day inside a subquery, a cast of the column, SQLite's IS, a text or BLOB
-column, a zone-aware copy, an epoch number, a function comparing internally, an aggregate's result,
-a cast to DATE turned back into a timestamp. So the rule is closed by construction, on two parts.
+contradiction return rows and complementary buckets count a row twice; fourteen reviews by Codex
+each found a path by which the same day was read two ways -- `<=` beside `>`, `=` beside IS
+DISTINCT FROM, a day inside a subquery, a cast of the column, SQLite's IS, a text or BLOB column, a
+zone-aware copy, an epoch number, a function comparing internally, an aggregate's result, a cast to
+DATE turned back into a timestamp, a set operation comparing rows, a day projected beside the bound
+and compared with it by an outer DISTINCT. So the rule is closed by construction, on three parts.
 
 Comparisons (`_classify`, `_agree`). Every comparison in the statement, at any depth, is between
 bare columns and literals, and
@@ -40,6 +41,10 @@ bare columns and literals, and
   subject of a BETWEEN or of an IN listing one, `IS` with a value, a bound whose day or next day no
   engine's timestamp holds, and a USING or NATURAL join (a comparison nothing here reads) are absent.
 
+Days. Every bare day in the statement is an operand of a comparison above. A day projected, a
+CASE's value or a set operation's branch keeps its midnight while the bounds read the whole day, and
+whatever later compares rows (DISTINCT, GROUP BY, MIN, a sort) sees one day two ways.
+
 Where a time goes (`_CONSUMES`, `_CARRIES_ON`). A value computed from a timestamp column or a column
 of unknown type ends only where the comparisons above read it, in what the statement shows or sorts,
 or in a container whose outputs are read again as columns (a derived table, a CTE, UNION ALL -- not
@@ -53,9 +58,10 @@ or anything, and a cast to TIMESTAMP is numeric affinity there.
 Otherwise the statement is left exactly as written. The cost, accepted, and none on the saved runs
 it was measured on: a statement with any expression in a comparison (`COUNT(*) > 5`, an IN over a
 subquery, `upper(region) = 'WEST'`) or a timestamp inside a function or arithmetic (`ts + INTERVAL
-1 DAY` projected) is not moved. A bare day compared with a column declared DATE (whole days, where
-both readings are the same rows), a zone-aware timestamp, text or a number, or with a cast to DATE,
-is not moved and stops nothing.
+1 DAY` projected), or a bare day anywhere but in a comparison (`'2024-03-09' AS as_of`), is not
+moved. A bare day compared with a column declared DATE (whole days, where both readings are the
+same rows), a zone-aware timestamp, text or a number, or with a cast to DATE, is not moved and
+stops nothing.
 
 D is a date-only ISO literal naming a real day, spelled plain, cast or typed (an allow-list:
 `_day`). A timestamp column is a bare column bound directly to a base table of its own scope,
@@ -298,6 +304,19 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
         elif op is exp.Is:
             return 0  # `IS` with a value: SQLite's NULL-safe equality, which no other engine has
         # `<` and `>=` already mean the day's boundary
+
+    # Every bare day is read. A day no comparison above read -- projected, a CASE's value, a set
+    # operation's branch -- keeps its midnight while the bounds read the whole day, and whatever later
+    # compares rows (DISTINCT, GROUP BY, COUNT(DISTINCT), MIN, a sort) sees one day two ways: Codex's
+    # fourteenth review counted a noon row and a projected day as two where the statement counts one.
+    for node in ast.walk():
+        if _day(node) is None:
+            continue
+        spelled = node  # a day's literal sits inside the wrapper the comparison holds
+        while id(spelled) not in direct and isinstance(spelled.parent, _WRAPPERS):
+            spelled = spelled.parent
+        if id(spelled) not in direct:
+            return 0
 
     # Where a time goes. A value computed from a timestamp column or a column of unknown type --
     # through anything but a comparison, COUNT or EXISTS, which consume it -- carries that time, and
