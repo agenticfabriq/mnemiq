@@ -173,6 +173,9 @@ def test_a_column_not_bound_directly_to_a_base_table_is_never_moved(asked):
     "SELECT id FROM claim WHERE ts = '2024-03-09' AND NOT list_contains([ts], TIMESTAMP '2024-03-09')",
     "SELECT id FROM claim WHERE ts <= '2024-03-09' AND NULLIF(ts, filed) IS NULL",
     "SELECT id, ts + INTERVAL 1 DAY AS later FROM claim WHERE ts <= '2024-03-09'",
+    # An aggregate carrying the timestamp into a function that compares it (Codex's eleventh review).
+    "SELECT NULLIF(MIN(ts), TIMESTAMP '2024-03-09') AS m FROM claim WHERE ts <= '2024-03-09'",
+    "SELECT GREATEST(MAX(ts), TIMESTAMP '2024-03-09') AS m FROM claim WHERE ts <= '2024-03-09'",
     "SELECT id FROM claim WHERE ts = '2024-03-09' "
     "AND NOT list_contains([CAST(ts AS TIMESTAMPTZ)], TIMESTAMPTZ '2024-03-09 00:00:00+00')",
     # A day as the subject of an IN listing the timestamp (Codex's sixth review).
@@ -378,6 +381,22 @@ def test_the_tenth_reviews_membership_function_leaves_the_statement_as_written_o
     verdict = decide(asked, VISIBLE, dialect="duckdb", target="duckdb", types=TYPES)
     assert isinstance(verdict, Approved) and verdict.day_bounds == 0, verdict
     assert con.execute(verdict.target_sql).fetchall() == con.execute(asked).fetchall() == []
+
+
+def test_the_eleventh_reviews_aggregate_leaves_the_statement_as_written_on_the_engine():
+    """Codex's eleventh review: MIN(ts) passed through, and NULLIF compared its result with the day's
+    midnight unread, so moving the WHERE bound changed NULL to noon. MIN and MAX now pass through only
+    projected bare or ordered; consumed by a function, the statement is left as written."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INTEGER, ts TIMESTAMP)")
+    con.execute("INSERT INTO claim VALUES (1, '2024-03-09 12:00:00')")
+    asked = "SELECT NULLIF(MIN(ts), TIMESTAMP '2024-03-09') FROM claim WHERE ts <= '2024-03-09'"
+    verdict = decide(asked, VISIBLE, dialect="duckdb", target="duckdb", types=TYPES)
+    assert isinstance(verdict, Approved) and verdict.day_bounds == 0, verdict
+    assert con.execute(verdict.target_sql).fetchall() == con.execute(asked).fetchall() == [(None,)]
+    # Projected bare, MIN still lets the bound move.
+    assert decide("SELECT MIN(ts) AS m FROM claim WHERE ts <= '2024-03-09' ORDER BY MAX(ts)", VISIBLE,
+                  dialect="duckdb", target="duckdb", types=TYPES).day_bounds == 1
 
 
 def test_contradictions_stay_contradictions_and_nulls_stay_null_on_the_engine():

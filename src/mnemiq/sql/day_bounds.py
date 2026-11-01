@@ -297,8 +297,10 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
 def _passes_through(column: exp.Column, oracle: bool) -> bool:
     """Whether `column` sits where it is compared with nothing but its own column's values: a bare
     projection (aliased or not), a GROUP BY or ORDER BY item, a window's PARTITION BY or ORDER BY,
-    the sole argument of COUNT (DISTINCT included), MIN or MAX; or where it becomes its own day, a
-    cast to DATE outside Oracle (whose DATE keeps the time of day)."""
+    the sole argument of COUNT (DISTINCT included), or of a MIN or MAX that is itself projected bare
+    or ordered (consumed by anything else, its timestamp is compared there unread: NULLIF(MIN(ts),
+    TIMESTAMP D), Codex's eleventh review); or where it becomes its own day, a cast to DATE outside
+    Oracle (whose DATE keeps the time of day), whose every use depends on the day alone."""
     parent = column.parent
     if (isinstance(parent, (exp.Cast, exp.TryCast)) and not oracle
             and _temporal_kind(parent.args.get("to"), None) == "date"):
@@ -313,4 +315,19 @@ def _passes_through(column: exp.Column, oracle: bool) -> bool:
         return any(e is column for e in parent.args.get("partition_by") or [])
     if isinstance(parent, exp.Distinct) and isinstance(parent.parent, exp.Count):
         return True
-    return isinstance(parent, (exp.Count, exp.Min, exp.Max)) and parent.this is column
+    if isinstance(parent, exp.Count):
+        return parent.this is column  # a count is never a time
+    if isinstance(parent, (exp.Min, exp.Max)) and parent.this is column:
+        return _projected(parent)
+    return False
+
+
+def _projected(node: exp.Expression) -> bool:
+    """Whether `node` is a bare projection (aliased or not) or an ORDER BY item: shown or sorted, and
+    compared with nothing."""
+    parent = node.parent
+    if isinstance(parent, exp.Alias) and isinstance(parent.parent, exp.Select):
+        node, parent = parent, parent.parent
+    if isinstance(parent, exp.Select):
+        return any(e is node for e in parent.expressions)
+    return isinstance(parent, exp.Ordered)
