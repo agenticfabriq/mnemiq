@@ -20,12 +20,13 @@ D+1 written in the literal's own spelling so the statement stays valid in its di
 and `col >= D` already mean the day's boundary and stay as written.
 
 One statement, one reading. Moving some of a statement's comparisons and not others let a
-contradiction return rows and complementary buckets count a row twice; fourteen reviews by Codex
+contradiction return rows and complementary buckets count a row twice; fifteen reviews by Codex
 each found a path by which the same day was read two ways -- `<=` beside `>`, `=` beside IS
 DISTINCT FROM, a day inside a subquery, a cast of the column, SQLite's IS, a text or BLOB column, a
 zone-aware copy, an epoch number, a function comparing internally, an aggregate's result, a cast to
-DATE turned back into a timestamp, a set operation comparing rows, a day projected beside the bound
-and compared with it by an outer DISTINCT. So the rule is closed by construction, on three parts.
+DATE turned back into a timestamp, a set operation comparing rows, a day or a DATE value in another
+branch of UNION ALL compared with the moved rows by an outer DISTINCT. So the rule is closed by
+construction, on three parts.
 
 Comparisons (`_classify`, `_agree`). Every comparison in the statement, at any depth, is between
 bare columns and literals, and
@@ -47,10 +48,12 @@ whatever later compares rows (DISTINCT, GROUP BY, MIN, a sort) sees one day two 
 
 Where a time goes (`_CONSUMES`, `_CARRIES_ON`). A value computed from a timestamp column or a column
 of unknown type ends only where the comparisons above read it, in what the statement shows or sorts,
-or in a container whose outputs are read again as columns (a derived table, a CTE, UNION ALL -- not
-INTERSECT, EXCEPT or UNION's dedup, which compare rows), passing on through an alias, MIN, MAX, a
-cast to DATE or a subquery; COUNT, EXISTS and comparisons consume it. Anywhere else -- a function,
-arithmetic, a CASE, a pattern match -- it may be compared unread.
+or in a container whose outputs are read again as columns (a derived table, a CTE), passing on
+through an alias, MIN, MAX, a cast to DATE or a subquery; COUNT, EXISTS and comparisons consume it.
+Anywhere else -- a function, arithmetic, a CASE, a pattern match -- it may be compared unread. Never
+through a set operation, UNION ALL included: a column it shares with another branch may hold a
+midnight no literal shows (a DATE column, a truncation, a date in any spelling), which INTERSECT,
+EXCEPT and UNION's dedup compare with it at once and an outer DISTINCT or GROUP BY later.
 
 Never on SQLite, which has no temporal type: a column declared TIMESTAMP may hold ISO text, a number
 or anything, and a cast to TIMESTAMP is numeric affinity there.
@@ -58,8 +61,8 @@ or anything, and a cast to TIMESTAMP is numeric affinity there.
 Otherwise the statement is left exactly as written. The cost, accepted, and none on the saved runs
 it was measured on: a statement with any expression in a comparison (`COUNT(*) > 5`, an IN over a
 subquery, `upper(region) = 'WEST'`) or a timestamp inside a function or arithmetic (`ts + INTERVAL
-1 DAY` projected), or a bare day anywhere but in a comparison (`'2024-03-09' AS as_of`), is not
-moved. A bare day compared with a column declared DATE (whole days, where both readings are the
+1 DAY` projected), a bare day anywhere but in a comparison (`'2024-03-09' AS as_of`), or a
+timestamp through a set operation (`SELECT ts ... UNION ALL SELECT ts ...`) is not moved. A bare day compared with a column declared DATE (whole days, where both readings are the
 same rows), a zone-aware timestamp, text or a number, or with a cast to DATE, is not moved and
 stops nothing.
 
@@ -90,8 +93,9 @@ _FIRST_DAY, _LAST_DAY = date(1677, 9, 22), date(2262, 4, 11)
 _CONSUMES = (*_BINARY, exp.In, exp.Between, exp.Count, exp.Exists, exp.And, exp.Or, exp.Not)
 # Where a time may go, or pass on from (`close_day_bounds`): what a statement shows or sorts, what
 # carries it on to be checked again (an alias, MIN, MAX, a subquery), and the containers whose
-# outputs are read again as columns of unknown type. A set operation only as UNION ALL: UNION's
-# dedup, INTERSECT and EXCEPT compare rows, a day's midnight among them (Codex's thirteenth review).
+# outputs are read again as columns of unknown type. Never a set operation: INTERSECT, EXCEPT and
+# UNION's dedup compare rows (Codex's thirteenth review), and UNION ALL puts a time in one column with
+# another branch's DATE or truncated midnight for an outer DISTINCT to compare (the fifteenth).
 _CARRIES_ON = (exp.Select, exp.Alias, exp.Group, exp.Order, exp.Ordered, exp.Window, exp.Distinct,
                exp.Count, exp.Min, exp.Max, exp.Subquery, exp.CTE, exp.With, exp.From, exp.Join,
                exp.Paren, exp.Exists)
@@ -322,7 +326,7 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
     # through anything but a comparison, COUNT or EXISTS, which consume it -- carries that time, and
     # may end only where the classifier read it (a comparison's direct operand), in what the
     # statement shows (a projection, GROUP BY, ORDER BY, a window's PARTITION BY or ORDER BY), or in
-    # a container whose outputs are read again as columns (a derived table, a CTE, a set operation),
+    # a container whose outputs are read again as columns (a derived table, a CTE; never a set operation),
     # passing on through an alias, MIN or MAX, a cast to DATE outside Oracle, or a subquery. Reaching
     # anything else -- a function, arithmetic, a CASE -- it may be compared there with a day unread
     # (`list_contains([ts], TIMESTAMP D)`, `NULLIF(MIN(ts), TIMESTAMP D)`, `NULLIF(CAST(ts AS DATE) +
@@ -338,8 +342,7 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
     for node in ast.walk():
         if id(node) in carries and node.parent is not None and id(node) not in direct:
             parent = node.parent
-            if not (isinstance(parent, _CARRIES_ON) or _day_cast(parent, oracle)
-                    or (isinstance(parent, exp.Union) and parent.args.get("distinct") is False)):
+            if not (isinstance(parent, _CARRIES_ON) or _day_cast(parent, oracle)):
                 return 0
 
     for node, replacement in rewrites:
