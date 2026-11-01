@@ -317,6 +317,30 @@ def test_on_sqlite_nothing_moves():
         assert lite.execute(verdict.target_sql).fetchall() == lite.execute(asked).fetchall(), asked
 
 
+def test_a_next_day_no_timestamp_can_hold_leaves_the_statement_as_written():
+    """Codex's eighth review: DuckDB's TIMESTAMP_NS ends on 2262-04-11, and moved to the 12th a cast
+    bound was NULL (TRY_CAST, no rows) or an error (CAST). A next day past that, or past the calendar
+    (the '9999-12-31' sentinel), leaves the statement as written, and it returns what it returned."""
+    types = {"claim": {**TYPES["claim"], "ts": "TIMESTAMP_NS"}}
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INTEGER, ts TIMESTAMP_NS)")
+    con.execute("INSERT INTO claim VALUES (1, '2262-04-11 00:00:00'), (2, '2262-04-11 12:00:00')")
+    for asked in ("SELECT id FROM claim WHERE ts <= TRY_CAST('2262-04-11' AS TIMESTAMP_NS) ORDER BY id",
+                  "SELECT id FROM claim WHERE ts <= CAST('2262-04-11' AS TIMESTAMP_NS) ORDER BY id",
+                  "SELECT id FROM claim WHERE ts IN ('2262-04-11') ORDER BY id",
+                  "SELECT id FROM claim WHERE ts BETWEEN '2262-04-01' AND '2262-04-11' ORDER BY id"):
+        verdict = decide(asked, VISIBLE, dialect="duckdb", target="duckdb", types=types)
+        assert isinstance(verdict, Approved) and verdict.day_bounds == 0, (asked, verdict)
+        assert con.execute(verdict.target_sql).fetchall() == con.execute(asked).fetchall(), asked
+    # The calendar's last day has no next one (on a TIMESTAMP column; TIMESTAMP_NS cannot hold it).
+    sentinel = decide("SELECT id FROM claim WHERE ts <= '9999-12-31'", VISIBLE, dialect="duckdb",
+                      target="duckdb", types=TYPES)
+    assert sentinel.day_bounds == 0 and "<= '9999-12-31'" in sentinel.target_sql
+    # The day before the last still moves.
+    assert decide("SELECT id FROM claim WHERE ts <= '2262-04-10'", VISIBLE, dialect="duckdb",
+                  target="duckdb", types=types).day_bounds == 1
+
+
 def test_contradictions_stay_contradictions_and_nulls_stay_null_on_the_engine():
     """Codex's counterexamples: `=` moved beside an unmoved IS DISTINCT FROM or NOT IN let a noon
     row satisfy `ts = D AND ts IS DISTINCT FROM D`. Read together by day, each still holds for no

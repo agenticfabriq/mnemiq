@@ -65,6 +65,10 @@ _DAY_FORMATS = frozenset({"%Y-%m-%d"})  # a parse format naming the day alone (O
 _WRAPPERS = (exp.Cast, exp.TryCast, exp.DateStrToDate, exp.StrToDate, exp.StrToTime)
 _BINARY = (exp.EQ, exp.NEQ, exp.LT, exp.LTE, exp.GT, exp.GTE, exp.NullSafeEQ, exp.NullSafeNEQ, exp.Is)
 _PATTERNS = (exp.Like, exp.ILike, exp.Glob, exp.SimilarTo, exp.RegexpLike, exp.RegexpILike)
+# The last day every engine's timestamp holds: DuckDB's TIMESTAMP_NS ends on 2262-04-11, and a bound
+# moved past it is NULL under TRY_CAST and an error under CAST (Codex's eighth review). A next day
+# beyond it, or beyond the calendar ('9999-12-31'), leaves the statement as written.
+_LAST_DAY = date(2262, 4, 11)
 _MIRROR = {exp.LT: exp.GT, exp.GT: exp.LT, exp.LTE: exp.GTE, exp.GTE: exp.LTE}  # `bound op col` as `col op' bound`
 
 # Operand classes (`_classify`): a bare day; a moment (an ISO timestamp string with its time of day);
@@ -104,6 +108,14 @@ def _next_day(bound: exp.Expression) -> exp.Expression:
         return day
     literal.replace(day)
     return moved
+
+
+def _movable(bound: exp.Expression) -> bool:
+    """Whether the day after `bound`'s day is one every engine's timestamp can hold."""
+    try:
+        return date.fromisoformat(_day(bound).this) + timedelta(days=1) <= _LAST_DAY
+    except OverflowError:
+        return False
 
 
 def _the_day(column: exp.Expression, bound: exp.Expression) -> exp.Paren:
@@ -209,6 +221,8 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
                 if node.args.get("symmetric"):
                     return 0
                 if classes[2] == DAY:
+                    if not _movable(high):
+                        return 0
                     rewrites.append((node, exp.Paren(this=exp.And(
                         this=exp.GTE(this=subject.copy(), expression=low.copy()),
                         expression=exp.LT(this=subject.copy(), expression=_next_day(high))))))
@@ -227,6 +241,8 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
             if subject == TIMES and DAY in classes:
                 if not all(c == DAY for c in classes):
                     return 0  # a list mixing days and moments
+                if not all(_movable(i) for i in items):
+                    return 0
                 days = [_the_day(node.this, i) for i in items]
                 either = days[0]
                 for d in days[1:]:
@@ -241,6 +257,8 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
             continue
         column, bound = (left, right) if a == TIMES else (right, left)
         op = type(node) if a == TIMES else _MIRROR.get(type(node), type(node))
+        if op not in (exp.LT, exp.GTE) and not _movable(bound):
+            return 0
         if op is exp.LTE:
             rewrites.append((node, exp.LT(this=column.copy(), expression=_next_day(bound))))
         elif op is exp.GT:
