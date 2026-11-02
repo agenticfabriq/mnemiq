@@ -255,6 +255,10 @@ class Approved:
     # then declines as the no-rows rule did: an `Approved` built outside a decider
     # (`eval/verify_replay.py`) keeps that rule rather than answering on facts nobody gathered.
     value_grounding: ValueGrounding | None = None
+    # How many ranges the decider moved from ending at a bare date's midnight to ending before the
+    # next day (`close_day_bounds`): in its bounds, the statement that runs and is shown is not the
+    # one the model wrote. None where no decider set it.
+    day_bounds: int | None = None
 
     def model_sql(self) -> str:
         """What a model call may be shown of this statement (M156): the statement as asked, or

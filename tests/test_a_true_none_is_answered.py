@@ -337,20 +337,30 @@ def test_a_misspelled_value_in_a_projection_the_where_clause_reads_is_declined(s
     assert ans.deferred is True and "'OPNE'" in ans.answer, ans.answer
 
 
-def test_a_date_only_string_against_a_timestamp_is_declined(source):
-    """Measured: `ts = '2024-03-03'` is midnight, so it returns no rows while claims fall on that
-    day. A date-only string is a bound against a DATE column alone."""
+def test_a_date_only_string_against_a_timestamp_is_read_as_its_day_or_declined(source):
+    """Measured: `ts = '2024-03-03'` is midnight, so as written it returns no rows while claims fall
+    on that day. The decider reads it as the day (`close_day_bounds`), so it returns that day's
+    claims. On a zone-aware timestamp, whose midnight is the session's zone's, it is not moved, and
+    its empty result is declined, naming it. A date-only string is a bound against a DATE column
+    alone."""
     adapter, snap, values = source
-    assert adapter.execute("SELECT count(*) FROM claim WHERE CAST(ts AS DATE) = DATE '2024-03-03'"
-                           )[0][0] > 0
+    on_the_day = adapter.execute("SELECT count(*) FROM claim WHERE CAST(ts AS DATE) = DATE '2024-03-03'")[0][0]
+    assert on_the_day > 0
+    assert adapter.execute("SELECT count(*) FROM claim WHERE ts = '2024-03-03'")[0][0] == 0
     ans = _ask_instant(adapter, snap, values, "SELECT id FROM claim WHERE ts = '2024-03-03'",
+                       "Which claims were stamped on 3 March 2024?")
+    assert ans.deferred is False and ans.preview.row_count == on_the_day, ans.answer
+    assert adapter.execute("SELECT count(*) FROM claim WHERE tz = '2024-03-03'")[0][0] == 0
+    ans = _ask_instant(adapter, snap, values, "SELECT id FROM claim WHERE tz = '2024-03-03'",
                        "Which claims were stamped on 3 March 2024?")
     assert ans.deferred is True and "'2024-03-03'" in ans.answer, ans.answer
 
 
 def test_a_half_open_day_on_a_timestamp_is_answered(source):
-    """`ts >= day AND ts < next day` counts the day whole, so its "none" is answered; the same day
-    ended with `<=` is declined."""
+    """`ts >= day AND ts < next day` counts the day whole, so its "none" is answered. The same day
+    ended with `<=` the bare day is moved by the decider to end before the next day
+    (`close_day_bounds`), so it is that range and answered the same way. On a zone-aware timestamp
+    a bare day is the session zone's midnight, not moved, and its "none" is declined, naming it."""
     adapter, snap, values = source
     half_open = "SELECT id FROM claim WHERE region = 'west' AND ts >= '2031-01-01' AND ts < '2031-01-02'"
     assert adapter.execute(half_open.replace("SELECT id", "SELECT count(*)"))[0][0] == 0
@@ -359,6 +369,10 @@ def test_a_half_open_day_on_a_timestamp_is_answered(source):
     assert "No rows matched: region = 'west' AND ts >= '2031-01-01' AND ts < '2031-01-02'." in ans.answer
     inclusive = half_open.replace("ts < '2031-01-02'", "ts <= '2031-01-01'")
     ans = _ask_instant(adapter, snap, values, inclusive, "Which west claims were stamped on 1 January 2031?")
+    assert ans.deferred is False, ans.answer
+    assert "No rows matched: region = 'west' AND ts >= '2031-01-01' AND ts < '2031-01-02'." in ans.answer
+    zoned = "SELECT id FROM claim WHERE region = 'west' AND tz = '2031-01-01'"
+    ans = _ask_instant(adapter, snap, values, zoned, "Which west claims were stamped on 1 January 2031?")
     assert ans.deferred is True and "'2031-01-01'" in ans.answer, ans.answer
 
 
