@@ -6,6 +6,7 @@ from dataclasses import replace
 import sqlglot
 from sqlglot import exp
 
+from mnemiq.sql.deadline import bounded
 from mnemiq.contract import ViewDefinition
 from mnemiq.redact import policy_safe_detail
 from mnemiq.sql.functions import (
@@ -77,6 +78,7 @@ def _transpile_under_the_cap(shaped: exp.Expression, dialect: str, target: str) 
     return reread.sql(dialect=target, **UNSUPPORTED_RAISES)
 
 
+@bounded
 def decide(
     sql: str,
     visible: dict[str, set[str]],
@@ -128,7 +130,8 @@ def decide(
         return unsupported
     row_cap = shaped.meta.get("row_cap")  # read now: the rewrites below build new trees
 
-    refusal = check_access(shaped, visible, target, columns=known_columns(visible, policy))
+    refusal = check_access(shaped, visible, target, columns=known_columns(visible, policy),
+                           registry=registry)
     if refusal is not None:
         return refusal
     # M65: what `check_access` reads -- `base_tables` -- is empty for a source it cannot model,

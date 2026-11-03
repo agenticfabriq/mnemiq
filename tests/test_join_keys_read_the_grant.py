@@ -48,8 +48,8 @@ def worlds():
     return made
 
 
-def _decide(sql, visible, policy=COMPLETE):
-    return decide(sql, visible, dialect="duckdb", target="duckdb", policy=policy)
+def _decide(sql, visible, policy=COMPLETE, registry=None):
+    return decide(sql, visible, dialect="duckdb", target="duckdb", policy=policy, registry=registry)
 
 
 class _OkAdapter:
@@ -158,9 +158,10 @@ def test_a_qualified_reference_is_the_base_table_whatever_a_cte_is_called():
     hidden = {"pg.claim": {"id"}}
     for sql in ("WITH claim AS (SELECT 1 AS secret) SELECT count(*) AS n FROM pg.claim JOIN (SELECT 'Z' AS secret) e USING (secret)",
                 "WITH claim AS (SELECT 1 AS id) SELECT count(*) AS n FROM pg.claim NATURAL JOIN (SELECT 1 AS id, 'Z' AS secret) e"):
-        verdict = _decide(sql, hidden, policy=AccessPolicy(policy_schema=schema))
+        verdict = _decide(sql, hidden, policy=AccessPolicy(policy_schema=schema), registry={"pg": "public"})
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (sql, verdict)
-    granted = _decide("SELECT count(*) AS n FROM pg.claim JOIN (SELECT 1 AS id) e USING (id)", schema, policy=AccessPolicy(policy_schema=schema))
+    granted = _decide("SELECT count(*) AS n FROM pg.claim JOIN (SELECT 1 AS id) e USING (id)", schema, policy=AccessPolicy(policy_schema=schema),
+                      registry={"pg": "public"})
     assert isinstance(granted, Approved), granted
 
 

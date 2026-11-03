@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlglot
 from sqlglot import exp
 
+from mnemiq.sql.deadline import bounded
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import ViewDefinition
 from mnemiq.sql.authz_guard import (
@@ -22,7 +23,7 @@ from mnemiq.sql.cls import check_cls
 from mnemiq.sql.guard import bound_by_position, misgrouped_set_chain, niladic_names, unnamed_read
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove_governed
-from mnemiq.sql.qualify import object_key
+from mnemiq.sql.qualify import expand_tables, object_key
 from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys, rendered, unprintable
 from mnemiq.sql.scope import base_tables, check_policy_target, fields_as_members, known_columns
 from mnemiq.sql.rls import (apply_row_filters_to_write, as_written, check_filter_targets,
@@ -311,6 +312,7 @@ def check_write_shape(sql: str, dialect: str = "duckdb", executes_as: str | None
     return ast
 
 
+@bounded
 def decide_write(
     sql: str,
     visible: dict[str, set[str]],
@@ -322,6 +324,7 @@ def decide_write(
     target: str | None = None,
     views: dict[str, ViewDefinition] | None = None,
     writes_enabled: bool = False,
+    registry: dict[str, str] | None = None,
 ) -> ApprovedWrite | Refusal:
     """The deterministic write decider: deployment switch -> shape -> table/column authz ->
     target-writable -> proof.
@@ -343,6 +346,11 @@ def decide_write(
     is no snapshot), which is precisely why it must be *stated*: "no policy supplied" and "a
     policy that restricts nothing" are the same denial and different facts, and collapsing them is
     M2's finding and the peer lane's M45.
+
+    `registry` is a federation's catalog-to-schema map, None for a single source, as `decide`
+    takes it. The grant check reads it to split a held key into its parts (M226): a federated
+    write decided as a single source refuses every catalog-qualified table. The approved write is
+    expanded with it, row filters' text included, so it runs in the registered schema (M229).
     """
     target = target or dialect
     if not writes_enabled:
@@ -374,7 +382,7 @@ def decide_write(
         return unsupported
 
     refusal = check_access(shaped, visible, target,  # every referenced table readable, cols exist
-                           columns=known_columns(visible, policy))
+                           columns=known_columns(visible, policy), registry=registry)
     if refusal is not None:
         return refusal
     # M65: what `check_access` reads -- `base_tables` -- is empty for a source it cannot model,
@@ -429,7 +437,7 @@ def decide_write(
     # An INSERT's target is not a base table, so the grant check's test that the engine reads
     # a name as written (M223) has not seen it: on Oracle a write grant on a quoted `sales`
     # approved `INSERT INTO sales`, which writes SALES.
-    misread = not_read_as_written(_target_node(shaped), grants.writable, target)
+    misread = not_read_as_written(_target_node(shaped), grants.writable, target, registry)
     if misread is not None:
         return misread
     if not grants.allows_write(tgt):
@@ -497,6 +505,11 @@ def decide_write(
     if isinstance(governed, Refusal):
         return governed
     shaped = governed
+    # Federation: 'catalog.table' -> 'catalog.schema.table', as `decide` does, so the write runs in
+    # the schema the registry names. Run as written, DuckDB read `pg.claim` in the catalog's default
+    # schema and changed a same-named table there (M229). No-op on a single source.
+    expand_tables(shaped, registry or {})
+    expand_tables(asked, registry or {})
 
     # The write as asked first, then the governed one: a rewrite the target cannot print where the
     # write prints is the policy's refusal, not the model's (Codex's forty-seventh review of #160).
@@ -509,7 +522,7 @@ def decide_write(
         # Each row filter printed as its operator wrote it, never from its parse (M222), as `decide`
         # does, and held in the dialect it is written in: held as DuckDB, Oracle's MINUS raised out
         # of the decider (Codex's ninth review of #193).
-        held, written = with_filters_held(shaped, dialect=dialect)
+        held, written = with_filters_held(shaped, registry, dialect=dialect)
         plan_sql = held.sql(dialect=dialect)
         target_sql = asked_sql if asked_plan == plan_sql else rendered(plan_sql, dialect, target)
         plan_sql, target_sql = as_written(plan_sql, written, dialect), as_written(target_sql, written, target)

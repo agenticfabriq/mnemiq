@@ -52,6 +52,7 @@ from sqlglot import exp
 from sqlglot.errors import ErrorLevel, UnsupportedError
 from sqlglot.tokens import TokenType
 
+from mnemiq.sql.deadline import paused
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 logger = logging.getLogger(__name__)
@@ -78,7 +79,7 @@ def lambda_takers() -> frozenset[str]:
     listed `list_sort`, `list_any_value` and `list_grade_up`, which take none (the review gate
     on the twentieth and twenty-first rounds of #160)."""
     global _TAKERS
-    with _TAKERS_LOCK:
+    with paused(), _TAKERS_LOCK:  # a shared reader's wait is not the decider's work (M227)
         if _TAKERS is None:
             try:
                 from mnemiq.duckdb_extensions import connect_duckdb

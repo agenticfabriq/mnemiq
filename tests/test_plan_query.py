@@ -513,6 +513,9 @@ _RETRIED = {
     RefusalCode.UNREADABLE_LIMIT: True,
     RefusalCode.AMBIGUOUS_NILADIC_NAME: True,  # M194: the column qualified, or a call the engine keeps
     RefusalCode.UNPRINTABLE_FOR_TARGET: True,  # another spelling of the question may print for the target
+    # M227: not retried, since a retry may run as long, each holding a thread to the deadline; deferred
+    # under the default, as the engine never finished establishing that the statement is governed.
+    RefusalCode.DECISION_TIMEOUT: DeferralReason.UNGOVERNABLE,
     # "may only be selected, not used in a filter" / "Query the table directly." Both name a
     # different query, which is the test for belonging here.
     RefusalCode.MASKED_COLUMN_IN_PREDICATE: True,

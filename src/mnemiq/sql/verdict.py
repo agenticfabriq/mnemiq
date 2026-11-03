@@ -91,6 +91,11 @@ class RefusalCode(StrEnum):
     # print. A policy's rewrite that does not print where the statement does is
     # POLICY_TARGET_UNSUPPORTED, the deployment's.
     UNPRINTABLE_FOR_TARGET = "unprintable_for_target"
+    # The decision ran past its deadline (`deadline.DECISION_DEADLINE_S`, the decider's own work,
+    # source time excluded): sqlglot 30.12's DuckDB parser never returns on a struct literal holding
+    # a bare NOT, which held the deciding thread for good (M227). Never repairable: a retry is the
+    # model's next statement, which may run as long, and each would hold a thread to the deadline.
+    DECISION_TIMEOUT = "decision_timeout"
 
 
 # A refusal the model can act on is a repair; a refusal it cannot act on is a dead end.

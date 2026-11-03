@@ -216,7 +216,8 @@ _Q_POLICY = AccessPolicy(policy_schema={k: set(v) for k, v in _Q_VISIBLE.items()
 def _q_write(sql: str, writable: set[str]):
     return decide_write(sql, _Q_VISIBLE, GrantSet(frozenset(_Q_VISIBLE),
                                                   writable=frozenset(writable)),
-                        adapter=_OkAdapter(), policy=_Q_POLICY, writes_enabled=True)
+                        adapter=_OkAdapter(), policy=_Q_POLICY, writes_enabled=True,
+                        registry={"pg": "public"})  # `pg.claim` is federated beside a bare `claim`
 
 
 def test_a_qualified_target_is_not_authorized_by_a_bare_grant():
@@ -279,7 +280,8 @@ def test_the_reported_tables_are_spelled_as_the_snapshot_spells_them():
     visible = {"pg.claim": {"id", "amount"}, "scratch": {"id", "amount"}}
     verdict = decide_write("INSERT INTO scratch (id, amount) SELECT id, amount FROM pg.claim",
                            visible, GrantSet(frozenset(visible), writable=frozenset({"scratch"})),
-                           adapter=_OkAdapter(), policy=AccessPolicy(), writes_enabled=True)
+                           adapter=_OkAdapter(), policy=AccessPolicy(), writes_enabled=True,
+                           registry={"pg": "public"})
     assert isinstance(verdict, ApprovedWrite)
     assert verdict.tables == ["pg.claim", "scratch"]
 

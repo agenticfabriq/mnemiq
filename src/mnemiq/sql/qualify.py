@@ -16,12 +16,13 @@ def object_key(table: exp.Table) -> str:
     read a different catalog's table; snapshot object-ids never carry three parts, so a
     three-part reference now matches nothing and is refused.
 
-A quoted identifier containing a literal dot is ambiguous against a dotted key --
-    `"pg.entitlement"` reads the same as `pg.entitlement`. It is left ambiguous here rather
-    than made unmatchable: a discovered table genuinely named `sales.2026` has that string as
-    its object-id, and refusing it would make a real table unqueryable to spare a hypothetical
-    one. Row-filter validation, where the collision was exploitable, refuses dotted
-    identifiers itself.
+    A quoted identifier containing a literal dot is ambiguous against a dotted key --
+    `"pg.entitlement"` joins to the same string as `pg.entitlement`. It is left ambiguous here
+    rather than made unmatchable: a discovered table genuinely named `sales.2026` has that
+    string as its object-id, and refusing it would make a real table unqueryable. The grant
+    check tells the two apart by their parts (`key_parts`, M226), deciding a reference against
+    a held key only where it is written in that key's parts, three-part references included;
+    row-filter validation refuses dotted identifiers itself.
 
     This was three functions (`object_key`, `_full_key`, and a bare `.name`) that disagreed,
     and every disagreement between them was a bypass.
@@ -41,6 +42,13 @@ def engine_key(table: exp.Table, dialect: str | None) -> str | None:
     `sales` matched the written name while Oracle read another table (M223). The grant check
     decides a reference only where they agree (`authz_guard.not_read_as_written`).
     """
+    parts = engine_parts(table, dialect)
+    return None if parts is None else ".".join(parts)
+
+
+def engine_parts(table: exp.Table, dialect: str | None) -> tuple[str, ...] | None:
+    """`engine_key`'s parts, before the join: catalog, schema and name as the engine reads each,
+    those present. None where any is not a plain identifier or not read exactly."""
     parts = []
     for arg in ("catalog", "db", "this"):
         part = table.args.get(arg)
@@ -50,8 +58,29 @@ def engine_key(table: exp.Table, dialect: str | None) -> str | None:
                 if isinstance(part, exp.Identifier) else None)
         if read is None:
             return None
-        parts.append(read)
-    return ".".join(p for p in parts if p)
+        if read:
+            parts.append(read)
+    return tuple(parts)
+
+
+def key_parts(key: str, registry: dict[str, str] | None) -> tuple[str, ...]:
+    """The parts a reference to the held `key` is written in, which the key's string cannot say
+    (M226): `object_key` joins with dots, so a table stored as `aux.secret` and the reference
+    `aux.secret`, table `secret` in schema `aux`, have one key. The deployment says it. A single
+    source keys a table by its name alone, whatever the name holds; a federated one keys it as
+    `catalog.table`, split after the catalog, which is one the registry names. No registry is a
+    single source, as `decide` reads it."""
+    if registry:
+        catalog, dot, name = key.partition(".")
+        if dot and name and catalog in registry:
+            return (catalog, name)
+    return (key,)
+
+
+def stored_parts(key: str, registry: dict[str, str] | None, dialect: str | None) -> tuple[str, ...]:
+    """`key_parts`, each read as `stored_key` reads a stored name: what `engine_parts` must equal
+    for a reference to be read as that key."""
+    return tuple(stored_key(part, dialect) for part in key_parts(key, registry))
 
 
 def stored_key(key: str, dialect: str | None) -> str:

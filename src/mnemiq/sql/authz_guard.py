@@ -8,7 +8,7 @@ from sqlglot.dialects.dialect import Dialect
 
 from mnemiq.sql.functions import FunctionInventory, Unanswered, UnreadableCalls, called_names
 from mnemiq.sql.identifiers import resolve, resolve_exactly, resolve_identifier, resolve_stored, rules_for
-from mnemiq.sql.qualify import engine_key, object_key, stored_key
+from mnemiq.sql.qualify import engine_key, engine_parts, object_key, stored_key, stored_parts
 from mnemiq.sql.scope import GENERATED_NAME, KnownColumns, base_tables, candidate_tables, column_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
@@ -295,7 +295,8 @@ def _clause_of(column: exp.Column, dialect: str | None) -> tuple[str, bool]:
     return clause or "select", bare
 
 
-def not_read_as_written(table: exp.Table, held, dialect: str | None) -> Refusal | None:
+def not_read_as_written(table: exp.Table, held, dialect: str | None,
+                        registry: dict[str, str] | None = None) -> Refusal | None:
     """The repair for a reference whose written name is not the held name the engine reads it as
     (M223), where `held`, the names the caller may use here, has either; None where it is read as
     written and held, or where neither is held, which the caller's own check refuses.
@@ -307,13 +308,18 @@ def not_read_as_written(table: exp.Table, held, dialect: str | None) -> Refusal 
     listed `claim`) is the same repair, not an unauthorized table. The words name only what was
     written and names the caller holds, so they say nothing about whether an ungranted table
     exists.
+
+    Matched part by part, never by the parts joined (M226): a held table stored as `aux.secret`
+    and the reference `aux.secret`, table `secret` in schema `aux`, join to one key, and the
+    engine reads them as two tables. `registry` says how a held key splits (`qualify.key_parts`);
+    None is a single source.
     """
-    name, read = object_key(table), engine_key(table, dialect)
-    if name in held and read == stored_key(name, dialect):
+    name, read = object_key(table), engine_parts(table, dialect)
+    if name in held and read == stored_parts(name, registry, dialect):
         return None
     written = ".".join(table.args[arg].sql(dialect=dialect)
                        for arg in ("catalog", "db", "this") if table.args.get(arg) is not None)
-    listed = [key for key in held if read is not None and stored_key(key, dialect) == read]
+    listed = [key for key in held if read is not None and stored_parts(key, registry, dialect) == read]
     if len(listed) == 1:
         return Refusal(
             code=RefusalCode.UNKNOWN_TABLE,
@@ -383,7 +389,8 @@ def _write_as_listed(key: str, dialect: str | None) -> str:
 
 def check_access(ast: exp.Expression, visible: dict[str, set[str]],
                  dialect: str | None = None,
-                 columns: dict[str, set[str]] | None = None) -> Refusal | None:
+                 columns: dict[str, set[str]] | None = None,
+                 registry: dict[str, str] | None = None) -> Refusal | None:
     """Re-check every table and column the query touches against what the identity may see.
 
     `columns` is the schema the resolver binds a derived table's star through (M181): the grant's
@@ -408,7 +415,7 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
     resolved = column_tables(ast, dialect, columns if columns is not None else visible, named=named)
     for table in base_tables(ast, dialect):
         name = object_key(table)
-        misread = not_read_as_written(table, visible, dialect)
+        misread = not_read_as_written(table, visible, dialect, registry)
         if misread is not None:
             return misread
         if name not in visible:
