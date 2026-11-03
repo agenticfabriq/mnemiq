@@ -15,13 +15,19 @@ dependencies = [
   "pydantic>=2",
   "pydantic-settings>=2",
   "pytz",  # DuckDB needs it to profile Postgres timestamptz columns (else profiling throws)
-  # Capped at the newest release the suite has passed on (M121): 30.17 broke the write path's table walk
-  # (a write whose scope misses a table now fails closed, #66), 30.19 the fan-out check's grouping
-  # reads (now by node type), and 30.22 removed `qualify_columns(infer_schema=)` (the eval criterion
-  # passes it only where accepted). Known from 30.13 on, failing closed: a VALUES branch of a set
-  # operation inside a CTE is refused as `unmodelled_source` where 30.12 approves it -- none of 9,687
-  # gold queries has the shape. Raise the cap when the deps-canary job passes past it.
-  "sqlglot>=25.34.1,<30.23",
+  # Capped at the newest release the suite passes on (M121), which is 30.12 again. The cap rose to
+  # 30.22 when the suite passed there (#113); code merged since was run on the locked 30.12 alone, and
+  # the deps canary's fresh install, which resolves the newest release within these bounds, has failed
+  # since 2026-10-19. Measured 2026-11-03: on 30.16, 11 tests refuse under another code than they
+  # expect (failing closed); on 30.22, 406 fail, most because the scopes code reads changed shape
+  # (a write's subquery has a parent scope from 30.17, `union_scopes` is `set_operation_scopes` from
+  # 30.19). Earlier breaks, since handled: 30.17 the write path's table walk (a write whose scope
+  # misses a table now fails closed, #66), 30.19 the fan-out check's grouping reads (now by node
+  # type), and 30.22 removed `qualify_columns(infer_schema=)` (the eval criterion passes it only where
+  # accepted). Known from 30.13 on, failing closed: a VALUES branch of a set operation inside a CTE is
+  # refused where 30.12 approves it -- none of 9,687 gold queries has the shape. Raise the cap when
+  # the deps-canary job passes past it.
+  "sqlglot>=25.34.1,<30.13",
   "pyarrow>=17",
   "cachetools>=5",
   # Capped at the newest release the suite has passed on (M121). 2.x renamed FastMCP to MCPServer and,
