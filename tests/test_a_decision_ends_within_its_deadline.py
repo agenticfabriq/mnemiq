@@ -215,3 +215,31 @@ def test_a_timeout_fired_as_the_decision_ends_is_cleared_before_it_lands():
     go.set()
     thread.join(5)
     assert out.get("landed") is False, out
+
+
+class _SlowIndex:
+    """A value index whose reads take longer than the deadline, as DuckDB's may on a busy store."""
+    def __init__(self, seconds):
+        self.seconds, self.asked = seconds, 0
+
+    def has(self, table, column):
+        time.sleep(self.seconds)
+        self.asked += 1
+        return True
+
+    def contains(self, table, column, literal):
+        time.sleep(self.seconds)
+        return True
+
+    def nearest(self, *args, **kwargs):
+        time.sleep(self.seconds)
+        return []
+
+
+def test_time_waiting_on_the_value_index_does_not_count():
+    index = _SlowIndex(1.2)
+    with _safety_net():
+        verdict = decide("SELECT id FROM claim WHERE region = 'west'", SCHEMA, values=index,
+                         dialect="duckdb", target="duckdb")
+    assert index.asked, "the value index was never asked, so the test shows nothing"
+    assert isinstance(verdict, Approved), verdict

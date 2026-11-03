@@ -8,9 +8,10 @@ thread, so the deadline is raised INTO it: a timer, past the deadline, asks the 
 and the decision unwinds out of the parser. sqlglot runs as pure Python here, which is what makes
 that possible; a loop inside native code would not see it.
 
-Time spent waiting on the source does not count: a source call has its own timeout, and a busy
-source would otherwise refuse statements the decider had no trouble with. The adapter a decision
-is given is wrapped so the clock stops while any of its methods runs (`paused_source`).
+Time spent waiting on the source or the value index does not count: a source call has its own
+timeout, and a busy one would otherwise refuse statements the decider had no trouble with. The
+adapter and the value index a decision is given are wrapped so the clock stops while any of their
+methods runs (`paused_source`).
 """
 
 from __future__ import annotations
@@ -150,6 +151,12 @@ def paused_source(adapter):
     return None if adapter is None else _PausedSource(adapter)
 
 
+# The arguments a decision waits on: the source, and the value index, whose `has`, `contains` and
+# `nearest` query DuckDB (Codex's first review of M227: timed, a slow index read refused an
+# otherwise approved statement past the deadline).
+_SOURCES = ("adapter", "values")
+
+
 def bounded(decider):
     """`decider` run under `DECISION_DEADLINE_S`, read at each call, with its adapter's calls paused;
     past the deadline, a refusal. Every door decides through `decide` or `decide_write`, so each is
@@ -159,8 +166,9 @@ def bounded(decider):
     @functools.wraps(decider)
     def run(*args, **kwargs):
         bound = signature.bind(*args, **kwargs)
-        if bound.arguments.get("adapter") is not None:
-            bound.arguments["adapter"] = paused_source(bound.arguments["adapter"])
+        for name in _SOURCES:
+            if bound.arguments.get(name) is not None:
+                bound.arguments[name] = paused_source(bound.arguments[name])
         seconds = DECISION_DEADLINE_S
         try:
             with within(seconds):
