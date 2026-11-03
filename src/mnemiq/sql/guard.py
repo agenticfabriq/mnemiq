@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import functools
 import logging
 import re
 
@@ -279,14 +280,43 @@ _INTERSECT_BINDS_TIGHTER = frozenset({"duckdb", "postgres", "postgresql", "mysql
 # and `"current_date"` are columns the grant check reads, and `current_date()` is the call.
 _NILADIC_WORDS = ("current_date", "current_timestamp", "current_time", "localtime",
                   "localtimestamp", "session_user", "current_catalog")
-_BARE_NILADIC = re.compile(r"(?<![\w$.])(" + "|".join(_NILADIC_WORDS) + r")(?![\w(])", re.I)
+# Words an engine reads as a same-named column of a table read, where the parse reads the boolean
+# literal, so no grant check saw the column (M230): measured on SQLite 3.50.4 and Oracle Free 23,
+# where `SELECT true FROM kw` returned kw's column `true`. DuckDB and Postgres read the literal
+# (measured), and are not held to them. The value's repair is a comparison, which has no column.
+_LITERAL_WORDS: dict[str, tuple[str, ...]] = {"sqlite": ("true", "false"), "oracle": ("true", "false")}
+_LITERAL_ADVICE = {"true": "(1 = 1)", "false": "(1 = 0)"}
 _QUOTED_OR_COMMENT = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|`(?:[^`]|``)*`|/\*.*?\*/|--[^\n]*", re.S)
 
 
-def _bare_niladic_words(sql: str) -> collections.Counter:
-    """How many times `sql` holds each niladic word bare, lowercased, quoted spans and
-    comments cut."""
-    return collections.Counter(match.group(1).lower() for match in _BARE_NILADIC.finditer(_QUOTED_OR_COMMENT.sub(" ", sql)))
+def _words_for(engine: str | None) -> tuple[str, ...]:
+    """The words `engine` reads as a same-named column where a table read has one."""
+    return _NILADIC_WORDS + _LITERAL_WORDS.get((engine or "").lower(), ())
+
+
+@functools.cache
+def _bare_pattern(words: tuple[str, ...]) -> re.Pattern:
+    return re.compile(r"(?<![\w$.])(" + "|".join(words) + r")(?![\w(])", re.I)
+
+
+def _bare_niladic_words(sql: str, engine: str | None = None) -> collections.Counter:
+    """How many times `sql` holds each of `engine`'s words bare (`_words_for`), lowercased, quoted
+    spans and comments cut. With no engine, the niladic words alone."""
+    pattern = _bare_pattern(_words_for(engine))
+    return collections.Counter(match.group(1).lower() for match in pattern.finditer(_QUOTED_OR_COMMENT.sub(" ", sql)))
+
+
+def words_read_as_columns(text: str, tree: exp.Expression, engine: str | None, taken) -> list[str]:
+    """The words of `engine` that `text` holds bare more often than `tree` reads them as unqualified
+    columns, among `taken`, the lowercased names of the columns the tables in scope have: each a
+    column the engine reads and no check saw. By occurrence, not by word: a column reference that
+    prints bare accounts for one bare occurrence, and the rest are the function's or the literal's
+    spelling (the gate's second round on #175). `text` is what the engine runs."""
+    bare = _bare_niladic_words(text, engine)
+    as_columns = collections.Counter(
+        column.name.lower() for column in tree.find_all(exp.Column)
+        if not column.table and _bare_niladic_words(column.sql(dialect=engine), engine))
+    return sorted(name for name, count in bare.items() if count > as_columns[name] and name in taken)
 
 
 # The call spellings the repair may name, per dialect the model writes in (the statement it
@@ -388,23 +418,31 @@ def niladic_names(ast: exp.Expression, columns, dialect: str | None = None,
     # the function's spelling. By occurrence, not by word: taken off for the whole statement,
     # a quoted `"current_timestamp"` read in a subquery switched the rule off for the bare
     # word beside it and the column leaked (the gate's second round on this commit).
-    bare = _bare_niladic_words(printed)
-    as_columns = collections.Counter(
-        column.name.lower() for column in ast.find_all(exp.Column)
-        if not column.table and _bare_niladic_words(column.sql(dialect=engine)))
-    for name in sorted(name for name, count in bare.items() if count > as_columns[name]):
+    for name in words_read_as_columns(printed, ast, engine, taken):
         owners = sorted(table for table in referenced if name in columns_of(table))
-        if owners:
-            call = _call_advice(dialect, engine, taken)
-            advice = f"such as {call}" if call else "with its own name and parentheses"
+        if name in _LITERAL_ADVICE:
+            # Quoted: sqlglot reads `kw.true` as no column at all, so the repair would be refused.
+            stored = next((n for key, names in (columns or {}).items() if key.lower() == owners[0].lower()
+                           for n in names if n.lower() == name), name)
+            column = exp.to_identifier(stored, quoted=True).sql(dialect=engine)
             return Refusal(
                 code=RefusalCode.AMBIGUOUS_NILADIC_NAME,
-                message=(f"{name!r} names a column of {owners[0]!r} and a SQL function, and the "
+                message=(f"{name!r} names a column of {owners[0]!r} and a SQL literal, and the "
                          f"engine reads the column where that table is in the FROM. Write "
-                         f"{owners[0]}.{name} for the column, or for the function a call written "
-                         f"as one in this query's dialect, {advice}."),
+                         f"{owners[0]}.{column} for the column, or for the value a comparison, "
+                         f"{_LITERAL_ADVICE[name]}."),
                 subject=name,
             )
+        call = _call_advice(dialect, engine, taken)
+        advice = f"such as {call}" if call else "with its own name and parentheses"
+        return Refusal(
+            code=RefusalCode.AMBIGUOUS_NILADIC_NAME,
+            message=(f"{name!r} names a column of {owners[0]!r} and a SQL function, and the "
+                     f"engine reads the column where that table is in the FROM. Write "
+                     f"{owners[0]}.{name} for the column, or for the function a call written "
+                     f"as one in this query's dialect, {advice}."),
+            subject=name,
+        )
     return None
 
 

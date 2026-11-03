@@ -318,6 +318,44 @@ def _lost_names(filt: str, table: str, dialect: str) -> Refusal | None:
     )
 
 
+def _a_word_read_as_a_column(filt: str, table: str, dialect: str, policy: AccessPolicy,
+                             columns, executes_as: str | None = None) -> Refusal | None:
+    """The refusal for a filter whose text holds bare a word its engine reads as a same-named
+    column of a table in the filter's scope, where the parse reads a function or a literal, so
+    the checks above never saw the column (M225). The filter runs as written (M222), so the
+    engine binds the column: on DuckDB `current_catalog = 'allow'` filtered by a column of that
+    name, and on SQLite and Oracle `true = 'x'` did (M230's words). M194's rule for a statement,
+    with the filtered table's columns and the policy's columns of every table its subqueries read.
+    The caller is told only that the policy is not valid; the words go to the operator's log."""
+    from mnemiq.sql.guard import words_read_as_columns  # guard imports scope, which imports this module's peers
+
+    engine = (executes_as or dialect).lower()
+    try:
+        tree, wrapped = _parsed(filt, dialect), _parsed(filt, dialect, wrapped=True)
+    except Exception:  # noqa: BLE001 -- unparseable is the validator's refusal, made before this runs
+        return None
+    schema = policy.policy_schema or {}
+
+    def columns_of(key: str) -> set[str]:
+        return {c.lower() for k, names in schema.items() if k.lower() == key.lower() for c in names}
+
+    taken = {c.lower() for c in columns} | columns_of(table)
+    for read in base_tables(wrapped, engine):
+        if object_key(read) != _SUBJECT:
+            taken |= columns_of(object_key(read))
+    words = words_read_as_columns(filt, tree, engine, taken)
+    if not words:
+        return None
+    logger.warning("the row filter for %r names %s bare, which %s reads as a column of a table in its "
+                   "scope where the parse reads a function or a literal; quote the column, or write "
+                   "the function as a call", table, words, engine)
+    return Refusal(
+        code=RefusalCode.INVALID_ROW_FILTER,
+        message=f"The row-access policy for {table!r} is not a valid predicate.",
+        subject=table,
+    )
+
+
 def _without_a_closing_semicolon(filt: str, dialect: str) -> str:
     """The filter's text less a closing `;`, which its parse ignores and a parenthesised
     predicate cannot hold. Any other `;` is a second statement, and the parse refused it."""
@@ -2834,6 +2872,10 @@ def apply_row_and_mask(
             lost = _lost_names(policy.row_filter_for(name), name, dialect)
             if lost is not None:
                 return lost, []
+            bound = _a_word_read_as_a_column(policy.row_filter_for(name), name, dialect, policy,
+                                             visible[name], executes_as)
+            if bound is not None:
+                return bound, []
         derived = _derived_table(
             name, table_node.alias_or_name, visible[name],
             # `.lower()`: this dict is keyed folded and `name` is the QUERY's spelling.
@@ -2911,6 +2953,9 @@ def apply_row_filters_to_write(
     lost = _lost_names(filt, name, dialect)
     if lost is not None:
         return lost, []
+    bound = _a_word_read_as_a_column(filt, name, dialect, policy, visible.get(name, set()), executes_as)
+    if bound is not None:
+        return bound, []
     if (executes_as or dialect).lower() in _FENCED:
         # The target is filtered by conjunction, and a conjunction is not a fence: the engine may
         # still evaluate the statement's own WHERE on rows the filter removes (M160, measured on
