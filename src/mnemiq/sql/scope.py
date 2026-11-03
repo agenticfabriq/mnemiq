@@ -7,6 +7,7 @@ from sqlglot import exp
 from sqlglot.errors import OptimizeError
 from sqlglot.optimizer.scope import build_scope
 
+from mnemiq.sql.deadline import paused
 from mnemiq.sql.identifiers import (resolve, resolve_identifier, resolve_name, resolve_stored,
                                     rules_for)
 from mnemiq.sql.qualify import object_key
@@ -923,7 +924,7 @@ def _pattern_picks(pattern: str, candidates) -> bool:
     try:
         from mnemiq.duckdb_extensions import connect_duckdb
 
-        with _REGEX_LOCK:
+        with paused(), _REGEX_LOCK:  # a shared reader's wait is not the decider's work (M227)
             if _REGEX_READER is None:
                 _REGEX_READER = connect_duckdb(local_only=True)
             for candidate in candidates:

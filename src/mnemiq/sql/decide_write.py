@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlglot
 from sqlglot import exp
 
+from mnemiq.sql.deadline import bounded
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import ViewDefinition
 from mnemiq.sql.authz_guard import (
@@ -311,6 +312,7 @@ def check_write_shape(sql: str, dialect: str = "duckdb", executes_as: str | None
     return ast
 
 
+@bounded
 def decide_write(
     sql: str,
     visible: dict[str, set[str]],

@@ -11,6 +11,7 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.tokens import TokenType
 
+from mnemiq.sql.deadline import paused
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import expand_tables, names_one_object, object_key
 from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys, is_lambda_parameter, map_struct
@@ -487,7 +488,7 @@ def _duckdb(sql: str, params=()):
     global _READER
     from mnemiq.duckdb_extensions import connect_duckdb
 
-    with _READER_LOCK:
+    with paused(), _READER_LOCK:  # a shared reader's wait is not the decider's work (M227)
         if _READER is None:
             _READER = connect_duckdb(local_only=True)
         return _READER.execute(sql, list(params)).fetchone()[0]
@@ -498,7 +499,7 @@ def _duckdb_rows(sql: str, params=()):
     global _READER
     from mnemiq.duckdb_extensions import connect_duckdb
 
-    with _READER_LOCK:
+    with paused(), _READER_LOCK:  # a shared reader's wait is not the decider's work (M227)
         if _READER is None:
             _READER = connect_duckdb(local_only=True)
         return _READER.execute(sql, list(params)).fetchall()
