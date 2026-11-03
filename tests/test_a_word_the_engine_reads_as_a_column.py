@@ -291,3 +291,48 @@ def test_a_text_that_does_not_parse_counts_every_bare_word():
     from mnemiq.sql.guard import words_read_as_columns
     assert words_read_as_columns("SELECT id AS true FROM", "sqlite", {"true"}) == ["true"]
     assert words_read_as_columns("SELECT id AS true FROM kw", "sqlite", {"true"}) == []  # the control
+
+
+# --- Written in one dialect, run in another -----------------------------------------------------
+
+CROSS = ("localtimestamp", "localtime", "session_user", "current_catalog")
+CROSS_SCHEMA = {"kw": {"id", *CROSS}, "plain": {"id"}}
+
+
+@pytest.mark.parametrize("word", CROSS)
+@pytest.mark.parametrize("shape", ["SELECT {w} FROM kw", "SELECT id FROM kw WHERE {w} = 'withheld'"])
+def test_written_as_duckdb_and_run_on_sqlite_a_word_sqlite_reads_as_a_column_is_refused(word, shape):
+    # The checks read the DuckDB parse, where the word is a function; SQLite reads the printed word
+    # as kw's column. The target's parse holds a column reference there, which the checks never read
+    # (Codex's third review of this change: excused by it, all four were approved and answered).
+    con = _sqlite(CROSS)
+    assert con.execute(f"SELECT {word} FROM kw").fetchall() == [("withheld",)]  # the premise
+    verdict = decide(shape.format(w=word), {"kw": {"id"}, "plain": {"id"}}, dialect="duckdb", target="sqlite",
+                     policy=AccessPolicy(policy_schema=CROSS_SCHEMA))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, (
+        verdict, con.execute(verdict.target_sql).fetchall() if isinstance(verdict, Approved) else None)
+
+
+def test_written_as_duckdb_the_write_path_refuses_the_same():
+    grants = GrantSet(frozenset(CROSS_SCHEMA), writable=frozenset({"plain"}))
+    verdict = decide_write("UPDATE plain SET id = 2 WHERE id IN (SELECT id FROM kw WHERE localtime = 'withheld')",
+                           {"kw": {"id"}, "plain": {"id"}}, grants, dialect="duckdb", target="sqlite",
+                           writes_enabled=True, policy=AccessPolicy(policy_schema=CROSS_SCHEMA))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
+
+
+def test_written_as_duckdb_an_alias_is_still_a_name_on_sqlite():
+    verdict = decide("SELECT id AS localtime FROM kw", {"kw": {"id"}, "plain": {"id"}}, dialect="duckdb",
+                     target="sqlite", policy=AccessPolicy(policy_schema=CROSS_SCHEMA))
+    assert isinstance(verdict, Approved), verdict
+    assert _sqlite(CROSS).execute(verdict.target_sql).fetchall() == [(1,)]
+
+
+def test_a_filter_word_the_parse_reads_as_a_column_is_checked_as_one_and_passes():
+    # On SQLite, which has no such keyword, sqlglot reads `localtimestamp` as a column, so the
+    # validators check it: a column the policy lists, which the filter may name.
+    schema = {"kw": {"id", "localtimestamp"}}
+    verdict = decide("SELECT id FROM kw", schema, dialect="sqlite", target="sqlite",
+                     policy=AccessPolicy(policy_schema=schema, row_filters={"kw": "localtimestamp = 'withheld'"}))
+    assert isinstance(verdict, Approved), verdict
+    assert _sqlite(("localtimestamp",)).execute(verdict.target_sql).fetchall() == [(1,)]
