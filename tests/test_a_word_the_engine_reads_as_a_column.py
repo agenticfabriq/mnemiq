@@ -202,6 +202,23 @@ def test_the_filtered_table_s_column_counts_whether_the_caller_holds_it_or_not()
     assert isinstance(unlisted, Refusal) and unlisted.code is RefusalCode.INVALID_ROW_FILTER, unlisted
 
 
+@pytest.mark.parametrize("filt", [
+    "$$'$$ != 'x' AND current_catalog = 'allow'",      # a quote inside a dollar-quoted string
+    "$t$'$t$ != 'x' AND localtime = 'allow'",
+    "/* ' */ current_date = 'allow'",                  # inside a comment
+    "-- '\ncurrent_time = 'allow'",
+    "E'\\'' <> 'x' AND session_user = 'allow'",       # an escaped quote
+    "'it''s' <> 'x' AND current_catalog = 'allow'",
+])
+def test_a_quote_inside_a_string_or_a_comment_does_not_hide_the_word(filt):
+    # Read by the tokenizer, as the parse is: a regex over the text took the quote inside `$$'$$`
+    # for a string's start and cut the bare word out (Codex's first review of this change).
+    assert _duck().execute(f"SELECT id FROM kw WHERE {filt}").fetchall() == [(1,)]  # the engine reads the column
+    verdict = decide("SELECT id FROM kw", DUCK_SCHEMA, dialect="duckdb", target="duckdb",
+                     policy=_filtered("kw", filt, DUCK_SCHEMA))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
 def test_a_row_filter_s_subquery_is_read_against_its_own_tables():
     filt = "id IN (SELECT id FROM ent WHERE current_date = 'allow')"
     verdict = decide("SELECT id FROM plain", DUCK_SCHEMA, dialect="duckdb", target="duckdb",

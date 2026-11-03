@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import collections
-import functools
 import logging
-import re
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.tokens import TokenType
 
 from mnemiq.sql.identifiers import resolve_name
 from mnemiq.sql.qualify import object_key
@@ -273,11 +272,11 @@ _INTERSECT_BINDS_TIGHTER = frozenset({"duckdb", "postgres", "postgresql", "mysql
 # commit); MySQL's `UTC_TIMESTAMP()` parses to a node of its own and prints the same bare
 # word (the gate on the eighth); and `now()` written as MySQL prints `NOW()` for Postgres,
 # a call there, which the Postgres parser reads back as the CURRENT_TIMESTAMP node and a
-# re-parse of the printing refused (the gate on the same round). A word is bare where no
-# word character, dollar or dot precedes it and no word character or `(` follows, outside
-# every quoted span and comment (`_QUOTED_OR_COMMENT`, cut before the scan: `'a
-# current_timestamp'` was refused with the scan over the whole text, the gate): `kw.current_date`
-# and `"current_date"` are columns the grant check reads, and `current_date()` is the call.
+# re-parse of the printing refused (the gate on the same round). A word is bare where it is a
+# token of its own, no literal or quoted name, not after a dot and not before `(`
+# (`_bare_niladic_words`): a word inside `'a current_timestamp'` is no word (the gate), and
+# `kw.current_date` and `"current_date"` are columns the grant check reads, and `current_date()`
+# is the call.
 _NILADIC_WORDS = ("current_date", "current_timestamp", "current_time", "localtime",
                   "localtimestamp", "session_user", "current_catalog")
 # Words an engine reads as a same-named column of a table read, where the parse reads the boolean
@@ -286,7 +285,6 @@ _NILADIC_WORDS = ("current_date", "current_timestamp", "current_time", "localtim
 # (measured), and are not held to them. The value's repair is a comparison, which has no column.
 _LITERAL_WORDS: dict[str, tuple[str, ...]] = {"sqlite": ("true", "false"), "oracle": ("true", "false")}
 _LITERAL_ADVICE = {"true": "(1 = 1)", "false": "(1 = 0)"}
-_QUOTED_OR_COMMENT = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|`(?:[^`]|``)*`|/\*.*?\*/|--[^\n]*", re.S)
 
 
 def _words_for(engine: str | None) -> tuple[str, ...]:
@@ -294,25 +292,44 @@ def _words_for(engine: str | None) -> tuple[str, ...]:
     return _NILADIC_WORDS + _LITERAL_WORDS.get((engine or "").lower(), ())
 
 
-@functools.cache
-def _bare_pattern(words: tuple[str, ...]) -> re.Pattern:
-    return re.compile(r"(?<![\w$.])(" + "|".join(words) + r")(?![\w(])", re.I)
+# A token of these types is a literal or a quoted name, never a bare word: what a regex over the
+# text took for a quote (`'` inside DuckDB's `$$'$$`) cut a bare `current_catalog` out of a row
+# filter, which then passed (Codex's first review of M225's branch).
+_QUOTED_TOKENS = frozenset({TokenType.STRING, TokenType.NATIONAL_STRING, TokenType.RAW_STRING,
+                            TokenType.HEREDOC_STRING, TokenType.BIT_STRING, TokenType.HEX_STRING,
+                            TokenType.BYTE_STRING, TokenType.UNICODE_STRING, TokenType.IDENTIFIER})
 
 
-def _bare_niladic_words(sql: str, engine: str | None = None) -> collections.Counter:
-    """How many times `sql` holds each of `engine`'s words bare (`_words_for`), lowercased, quoted
-    spans and comments cut. With no engine, the niladic words alone."""
-    pattern = _bare_pattern(_words_for(engine))
-    return collections.Counter(match.group(1).lower() for match in pattern.finditer(_QUOTED_OR_COMMENT.sub(" ", sql)))
+def _bare_niladic_words(sql: str, engine: str | None = None, dialect: str | None = None) -> collections.Counter:
+    """How many times `sql` holds each of `engine`'s words bare (`_words_for`), lowercased: a token
+    that is no literal or quoted name, not after a dot and not before `(`. Read by sqlglot's
+    tokenizer for `dialect` (the engine's where none is given), which reads strings, dollar quotes,
+    quoted names and comments as the parse compared with it does. With no engine, the niladic
+    words alone."""
+    words = set(_words_for(engine))
+    tokens = sqlglot.tokenize(sql, read=dialect or engine)
+    found: collections.Counter = collections.Counter()
+    for i, token in enumerate(tokens):
+        word = token.text.lower()
+        if word not in words or token.token_type in _QUOTED_TOKENS:
+            continue
+        if i and tokens[i - 1].token_type is TokenType.DOT:
+            continue
+        if i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.L_PAREN:
+            continue
+        found[word] += 1
+    return found
 
 
-def words_read_as_columns(text: str, tree: exp.Expression, engine: str | None, taken) -> list[str]:
+def words_read_as_columns(text: str, tree: exp.Expression, engine: str | None, taken,
+                          dialect: str | None = None) -> list[str]:
     """The words of `engine` that `text` holds bare more often than `tree` reads them as unqualified
     columns, among `taken`, the lowercased names of the columns the tables in scope have: each a
     column the engine reads and no check saw. By occurrence, not by word: a column reference that
     prints bare accounts for one bare occurrence, and the rest are the function's or the literal's
-    spelling (the gate's second round on #175). `text` is what the engine runs."""
-    bare = _bare_niladic_words(text, engine)
+    spelling (the gate's second round on #175). `text` is what the engine runs, tokenized as
+    `dialect` (the engine's where none is given)."""
+    bare = _bare_niladic_words(text, engine, dialect)
     as_columns = collections.Counter(
         column.name.lower() for column in tree.find_all(exp.Column)
         if not column.table and _bare_niladic_words(column.sql(dialect=engine), engine))

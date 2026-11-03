@@ -343,7 +343,10 @@ def _a_word_read_as_a_column(filt: str, table: str, dialect: str, policy: Access
     for read in base_tables(wrapped, engine):
         if object_key(read) != _SUBJECT:
             taken |= columns_of(object_key(read))
-    words = words_read_as_columns(filt, tree, engine, taken)
+    try:
+        words = words_read_as_columns(filt, tree, engine, taken, dialect)
+    except sqlglot.errors.SqlglotError:
+        words = ["(the text could not be tokenized)"]  # it parsed, so this is not expected: refused
     if not words:
         return None
     logger.warning("the row filter for %r names %s bare, which %s reads as a column of a table in its "
