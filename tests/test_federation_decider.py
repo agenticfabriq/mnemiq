@@ -12,17 +12,21 @@ def _ast(sql):
     return sqlglot.parse_one(sql, read="duckdb")
 
 
+# The grant check splits a federated key after its catalog, which only the registry names (M226).
+REGISTRY = {"pg": "public", "ops": "public"}
+
+
 def test_check_access_accepts_qualified_and_refuses_bare_in_federated():
     visible = {"pg.person": {"id", "last_name"}, "ops.orders": {"id", "pid"}}
-    assert check_access(_ast("SELECT id FROM pg.person"), visible) is None
-    r = check_access(_ast("SELECT id FROM person"), visible)  # bare -> unknown in federated
+    assert check_access(_ast("SELECT id FROM pg.person"), visible, registry=REGISTRY) is None
+    r = check_access(_ast("SELECT id FROM person"), visible, registry=REGISTRY)  # bare -> unknown in federated
     assert r is not None and r.code == RefusalCode.UNAUTHORIZED_TABLE
 
 
 def test_check_access_qualified_cross_source_join():
     visible = {"pg.person": {"id", "last_name"}, "ops.orders": {"pid", "amount"}}
     sql = "SELECT p.last_name, o.amount FROM pg.person p JOIN ops.orders o ON o.pid = p.id"
-    assert check_access(_ast(sql), visible) is None
+    assert check_access(_ast(sql), visible, registry=REGISTRY) is None
 
 
 def test_cls_denies_qualified_column():

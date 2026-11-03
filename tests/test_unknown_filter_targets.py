@@ -99,7 +99,8 @@ def test_on_a_federated_snapshot_the_catalog_is_part_of_the_name(key, refused):
     that names nothing."""
     grants = GrantSet(frozenset({"pg.claim"}), row_filters={key: _FILTER})
     verdict = decide("SELECT id FROM pg.claim", {"pg.claim": {"id", "region"}},
-                     policy=build_access_policy(_snapshot(prefix="pg."), grants), target="duckdb")
+                     policy=build_access_policy(_snapshot(prefix="pg."), grants), target="duckdb",
+                     registry={"pg": "public"})
     assert isinstance(verdict, Refusal) is refused, verdict
 
 
