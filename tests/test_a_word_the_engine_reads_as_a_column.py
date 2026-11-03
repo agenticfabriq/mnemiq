@@ -63,7 +63,6 @@ def test_on_sqlite_a_bare_true_or_false_is_refused_where_the_table_read_has_the_
 @pytest.mark.parametrize("sql, rows", [
     ("SELECT id AS true FROM kw", [(1,)]),                       # an output name, not a read
     ("SELECT t.id FROM kw AS t", [(1,)]),
-    ("WITH true AS (SELECT id FROM kw) SELECT id FROM true", [(1,)]),
 ])
 def test_a_word_declared_as_a_name_is_no_read_of_the_column(sql, rows):
     # Matched by offset: an alias or a CTE's name is an identifier where it stands (Codex's second
@@ -142,14 +141,14 @@ def test_on_oracle_live_true_reads_the_column_and_the_rule_refuses_it():
                            password=os.environ.get("MNEMIQ_ORACLE_TEST_PASSWORD", "apppw"), dsn=ORACLE_DSN)
     cur = con.cursor()
     table = "M230_KW"
-    schema = {table: {"ID", "TRUE", "FALSE"}}
+    schema = {table: {"ID", "TRUE", "FALSE", "SECRET"}}
     try:
         try:
             cur.execute(f"DROP TABLE {table} PURGE")
         except oracledb.DatabaseError:
             pass
-        cur.execute(f'CREATE TABLE {table} (ID NUMBER, "TRUE" VARCHAR2(20), "FALSE" VARCHAR2(20))')
-        cur.execute(f"INSERT INTO {table} VALUES (1, 'withheld', 'withheld')")
+        cur.execute(f'CREATE TABLE {table} (ID NUMBER, "TRUE" VARCHAR2(20), "FALSE" VARCHAR2(20), SECRET VARCHAR2(20))')
+        cur.execute(f"INSERT INTO {table} VALUES (1, 'withheld', 'withheld', 'withheld')")
         assert cur.execute(f"SELECT TRUE, FALSE FROM {table}").fetchall() == [("withheld", "withheld")]  # the premise
         for sql in (f"SELECT TRUE FROM {table}", f"SELECT ID FROM {table} WHERE FALSE = 'withheld'"):
             verdict = decide(sql, {table: {"ID"}}, dialect="oracle", target="oracle",
@@ -163,6 +162,12 @@ def test_on_oracle_live_true_reads_the_column_and_the_rule_refuses_it():
         filtered = decide(f"SELECT ID FROM {table}", schema, dialect="oracle", target="oracle",
                           policy=AccessPolicy(policy_schema=schema, row_filters={table: "TRUE = 'withheld'"}))
         assert isinstance(filtered, Refusal) and filtered.code is RefusalCode.INVALID_ROW_FILTER, filtered
+        # M232: the table aliased TRUE, and its withheld SECRET read through the alias.
+        aliased = f"SELECT true.SECRET FROM {table} true"
+        assert cur.execute(aliased).fetchall() == [("withheld",)]  # the premise
+        verdict = decide(aliased, {table: {"ID"}}, dialect="oracle", target="oracle",
+                         policy=AccessPolicy(policy_schema=schema))
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
     finally:
         try:
             cur.execute(f"DROP TABLE {table} PURGE")
@@ -336,3 +341,202 @@ def test_a_filter_word_the_parse_reads_as_a_column_is_checked_as_one_and_passes(
                      policy=AccessPolicy(policy_schema=schema, row_filters={"kw": "localtimestamp = 'withheld'"}))
     assert isinstance(verdict, Approved), verdict
     assert _sqlite(("localtimestamp",)).execute(verdict.target_sql).fetchall() == [(1,)]
+
+
+def _joined(key_in_plain):
+    con = sqlite3.connect(":memory:")
+    con.execute('CREATE TABLE kw (id INT, "localtimestamp" TEXT)')
+    con.execute("INSERT INTO kw VALUES (1, 'withheld')")
+    con.execute('CREATE TABLE plain (id INT, "localtimestamp" TEXT)')
+    con.execute(f"INSERT INTO plain VALUES (1, '{key_in_plain}')")
+    return con
+
+
+JOIN_SCHEMA = {"kw": {"id", "localtimestamp"}, "plain": {"id", "localtimestamp"}}
+
+
+def test_written_as_duckdb_a_using_key_sqlite_reads_as_a_column_is_refused():
+    # A USING key is a read of the column on both sides, not a declared name: written as DuckDB it was
+    # a function to the checks, and SQLite's join answered on the withheld key (Codex's fourth review).
+    sql = "SELECT kw.id FROM kw JOIN plain USING (localtimestamp)"
+    assert _joined("withheld").execute(sql).fetchall() == [(1,)]  # the premise: the join reads the key
+    assert _joined("other").execute(sql).fetchall() == []
+    verdict = decide(sql, {"kw": {"id"}, "plain": {"id"}}, dialect="duckdb", target="sqlite",
+                     policy=AccessPolicy(policy_schema=JOIN_SCHEMA))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
+
+
+def test_a_using_key_the_checks_read_as_a_column_passes():
+    # Written and run as SQLite, the key is a name to the checks too, and granted: the join stands.
+    verdict = decide("SELECT kw.id FROM kw JOIN plain USING (localtimestamp)", JOIN_SCHEMA, dialect="sqlite",
+                     target="sqlite", policy=AccessPolicy(policy_schema=JOIN_SCHEMA))
+    assert isinstance(verdict, Approved), verdict
+    assert _joined("withheld").execute(verdict.target_sql).fetchall() == [(1,)]
+
+
+# --- A word the parse reads as a literal or a function, standing as a table's alias (M232) -------
+
+ALIASED = {"kw": {"id", "secret"}, "plain": {"id"}, "ent": {"id", "secret"}}
+ALIASED_HIDDEN = {"kw": {"id"}, "plain": {"id"}, "ent": {"id"}}
+SHAPES = ["SELECT {w}.secret FROM kw AS {w}", "SELECT {w}.secret FROM kw {w}",
+          "SELECT id FROM kw {w} WHERE {w}.secret = 'withheld'"]
+
+
+def _with_secret(engine):
+    con = duckdb.connect() if engine == "duckdb" else sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE kw (id INT, secret VARCHAR(20))")
+    con.execute("INSERT INTO kw VALUES (1, 'withheld')")
+    return con
+
+
+@pytest.mark.parametrize("engine, word", [("duckdb", w) for w in NILADIC] + [("sqlite", w) for w in LITERAL])
+@pytest.mark.parametrize("shape", SHAPES)
+def test_a_table_aliased_by_a_word_the_parse_reads_otherwise_is_refused(engine, word, shape):
+    # The engine reads `w.secret` as kw's column; sqlglot reads a field of the literal or the
+    # function, so no check saw `secret`: approved, it returned the withheld value (M232).
+    sql = shape.format(w=word)
+    ran = _with_secret(engine).execute(sql).fetchall()
+    assert ran and ("withheld",) in ran or ran == [(1,)], ran  # the premise: the engine reads the column
+    verdict = decide(sql, ALIASED_HIDDEN, dialect=engine, target=engine, policy=AccessPolicy(policy_schema=ALIASED))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
+
+
+@pytest.mark.parametrize("sql", ["SELECT TRUE.SECRET FROM KW TRUE", "SELECT ID FROM KW FALSE WHERE FALSE.SECRET = 'withheld'"])
+def test_on_oracle_a_table_aliased_true_or_false_is_refused(sql):
+    verdict = decide(sql, {"KW": {"ID"}}, dialect="oracle", target="oracle",
+                     policy=AccessPolicy(policy_schema={"KW": {"ID", "SECRET"}}))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
+
+
+def test_an_ordinary_alias_and_a_field_of_a_column_are_unchanged():
+    granted = decide("SELECT c.secret FROM kw AS c", ALIASED, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(policy_schema=ALIASED))
+    assert isinstance(granted, Approved), granted
+    withheld = decide("SELECT c.secret FROM kw AS c", ALIASED_HIDDEN, dialect="duckdb", target="duckdb",
+                      policy=AccessPolicy(policy_schema=ALIASED))
+    assert isinstance(withheld, Refusal) and withheld.code is RefusalCode.UNKNOWN_COLUMN, withheld
+    con = duckdb.connect()
+    con.execute("CREATE TABLE st (id INT, s STRUCT(f VARCHAR))")
+    con.execute("INSERT INTO st VALUES (1, {'f': 'x'})")
+    field = decide("SELECT st.s.f FROM st", {"st": {"id", "s"}}, dialect="duckdb", target="duckdb")
+    assert isinstance(field, Approved), field
+    assert con.execute(field.target_sql).fetchall() == [("x",)]
+
+
+def test_the_write_path_refuses_an_aliased_read_too():
+    grants = GrantSet(frozenset(ALIASED), writable=frozenset({"plain"}))
+    verdict = decide_write("DELETE FROM plain WHERE id IN (SELECT current_date.id FROM kw AS current_date "
+                           "WHERE current_date.secret = 'withheld')", ALIASED_HIDDEN, grants, dialect="duckdb",
+                           target="duckdb", writes_enabled=True, policy=AccessPolicy(policy_schema=ALIASED))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
+
+
+def test_a_row_filter_with_such_an_alias_is_refused():
+    filt = "id IN (SELECT localtime.id FROM ent AS localtime WHERE localtime.secret = 'withheld')"
+    verdict = decide("SELECT id FROM plain", ALIASED, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(policy_schema=ALIASED, row_filters={"plain": filt}))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
+def test_a_qualifier_the_parse_reads_as_the_literal_is_refused_even_where_harmless():
+    # `true.id` is a field of the literal TRUE to the parser, whatever `true` names: nothing can tell
+    # which column it reads, so it is refused with a repair that costs one alias (M232).
+    verdict = decide("WITH true AS (SELECT id FROM kw) SELECT true.id FROM true", SQLITE_HIDDEN, dialect="sqlite",
+                     target="sqlite", policy=AccessPolicy(policy_schema=SQLITE_SCHEMA))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
+    assert "another alias" in verdict.message
+    repaired = decide("WITH t AS (SELECT id FROM kw) SELECT t.id FROM t", SQLITE_HIDDEN, dialect="sqlite",
+                      target="sqlite", policy=AccessPolicy(policy_schema=SQLITE_SCHEMA))
+    assert isinstance(repaired, Approved), repaired
+
+
+def test_a_qualifier_the_parse_reads_as_a_name_is_a_table_not_a_read():
+    # On SQLite `localtimestamp` is a name to the parser too, so `localtimestamp.id` is kw's id under
+    # that alias, which the grant check reads; the qualifier is no read of a column so named.
+    verdict = decide("SELECT localtimestamp.id FROM kw AS localtimestamp", {"kw": {"id"}, "plain": {"id"}},
+                     dialect="sqlite", target="sqlite", policy=AccessPolicy(policy_schema=CROSS_SCHEMA))
+    assert isinstance(verdict, Approved), verdict
+    assert _sqlite(CROSS).execute(verdict.target_sql).fetchall() == [(1,)]
+
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT (current_date).secret FROM kw AS current_date",      # a parenthesised base
+    "SELECT current_date['secret'] FROM kw AS current_date",     # a bracket
+    "SELECT current_date FROM kw AS current_date",               # the whole row, every column
+    "SELECT id FROM kw AS current_date ORDER BY current_date.secret",
+    "SELECT max(current_date.secret) FROM kw AS current_date",
+    "WITH current_date AS (SELECT * FROM kw) SELECT current_date.secret FROM current_date",
+])
+def test_every_form_of_reference_through_such_a_name_is_refused(sql):
+    # The name is the cause: refused for any reference through it (the review gate on M232's row
+    # found the parenthesised, bracketed and whole-row forms past a check of field access alone).
+    ran = _with_secret("duckdb").execute(sql).fetchall()  # the premise: DuckDB binds the name to kw
+    assert ran and ("ORDER BY" in sql or "withheld" in str(ran)), ran  # ORDER BY uses the value unseen
+    verdict = decide(sql, ALIASED_HIDDEN, dialect="duckdb", target="duckdb", policy=AccessPolicy(policy_schema=ALIASED))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
+
+
+@pytest.mark.parametrize("engine, sql", [
+    ("postgres", 'SELECT id FROM "user"'),                  # a common table name, a word Postgres binds no table by
+    ("sqlite", "SELECT localtimestamp.id FROM kw AS localtimestamp"),
+    ("duckdb", "SELECT t.id FROM kw AS true_t AS t"),
+])
+def test_names_the_engine_binds_no_table_by_are_not_refused(engine, sql):
+    verdict = decide(sql.replace("AS true_t AS t", "AS t"), {"kw": {"id"}, "user": {"id"}}, dialect=engine,
+                     target=engine, policy=AccessPolicy(policy_schema={"kw": {"id", "secret"}, "user": {"id"}}))
+    assert not (isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME), verdict
+
+
+@pytest.mark.parametrize("word", ["bigint", "int", "date", "json", "list", "struct", "text", "uuid", "variant"])
+def test_on_duckdb_a_table_aliased_by_a_type_name_and_read_by_bracket_is_refused(word):
+    # sqlglot reads `bigint['secret']` as an array of the BIGINT type; DuckDB reads the `secret` field
+    # of kw's row under that alias (M232, swept: 59 type names, this shape alone).
+    sql = f"SELECT {word}['secret'] FROM kw AS {word}"
+    assert _with_secret("duckdb").execute(sql).fetchall() == [("withheld",)]  # the premise
+    verdict = decide(sql, ALIASED_HIDDEN, dialect="duckdb", target="duckdb", policy=AccessPolicy(policy_schema=ALIASED))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT CAST(d.id AS DATE) AS x FROM kw AS date, kw AS d",   # a type in a cast's target names no table
+    "SELECT date.id FROM kw AS date WHERE date.id > 0",          # the alias read as a column's qualifier
+    "SELECT id FROM kw AS t WHERE CAST(t.id AS BIGINT) > 0",
+])
+def test_a_type_standing_as_a_type_or_a_qualifier_read_as_one_is_not_refused(sql):
+    verdict = decide(sql, ALIASED, dialect="duckdb", target="duckdb", policy=AccessPolicy(policy_schema=ALIASED))
+    assert not (isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME), verdict
+
+
+@pytest.mark.parametrize("sql", ['SELECT current_date.secret FROM "current_date"', 'SELECT current_date FROM "current_date"'])
+def test_a_table_itself_named_by_such_a_word_is_refused_too(sql):
+    # Not only an alias: a table stored as "current_date" is read through the bare word, its row whole.
+    con = duckdb.connect()
+    con.execute('CREATE TABLE "current_date" (id INT, secret VARCHAR)')
+    con.execute("INSERT INTO \"current_date\" VALUES (1, 'withheld')")
+    assert "withheld" in str(con.execute(sql).fetchall())  # the premise
+    verdict = decide(sql, {"current_date": {"id"}}, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(policy_schema={"current_date": {"id", "secret"}}))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
+
+
+def test_a_table_named_by_such_a_word_and_holding_such_a_column_is_read_by_its_name():
+    # The table's own name in FROM is a name, not a read of its column so named: approved, as DuckDB
+    # reads `FROM localtime` as the table.
+    con = duckdb.connect()
+    con.execute('CREATE TABLE "localtime" (id INT, "localtime" VARCHAR)')
+    con.execute("INSERT INTO \"localtime\" VALUES (1, 'x')")
+    schema = {"localtime": {"id", "localtime"}}
+    verdict = decide("SELECT id FROM localtime", schema, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(policy_schema=schema))
+    assert isinstance(verdict, Approved), verdict
+    assert con.execute(verdict.target_sql).fetchall() == [(1,)]
+
+
+def test_a_filter_s_subquery_reading_such_a_table_by_its_bare_name_passes():
+    # A filter runs as written, so the table's name stays bare there: still a name, not a read of
+    # the column so named that the table holds.
+    schema = {"plain": {"id"}, "localtime": {"id", "localtime"}}
+    verdict = decide("SELECT id FROM plain", schema, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(policy_schema=schema, row_filters={"plain": "id IN (SELECT id FROM localtime)"}))
+    assert isinstance(verdict, Approved), verdict

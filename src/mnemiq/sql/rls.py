@@ -334,6 +334,16 @@ def _a_word_read_as_a_column(filt: str, table: str, dialect: str, policy: Access
         wrapped = _parsed(filt, dialect, wrapped=True)
     except Exception:  # noqa: BLE001 -- unparseable is the validator's refusal, made before this runs
         return None
+    from mnemiq.sql.guard import a_table_named_by_a_word
+
+    aliased = a_table_named_by_a_word(wrapped, engine)  # M232: such a word naming a table
+    if aliased is not None:
+        logger.warning("the row filter for %r reads %s", table, aliased.message)
+        return Refusal(
+            code=RefusalCode.INVALID_ROW_FILTER,
+            message=f"The row-access policy for {table!r} is not a valid predicate.",
+            subject=table,
+        )
     schema = policy.policy_schema or {}
 
     def columns_of(key: str) -> set[str]:

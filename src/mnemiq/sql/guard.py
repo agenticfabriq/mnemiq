@@ -326,6 +326,22 @@ def _bare_niladic_words(sql: str, engine: str | None = None, dialect: str | None
     return collections.Counter(word for _, word in _bare_tokens(sql, engine, dialect))
 
 
+# The nodes whose Identifier declares a name rather than reading a column, by allow-list: everything
+# else is a read. A JOIN's USING key had been excused as "not a column reference" and is one: written
+# as DuckDB for SQLite, `USING (localtimestamp)` was a function to the checks, a column to SQLite,
+# and the join answered on the withheld key (Codex's fourth review of M230's branch).
+_DECLARING = (exp.Alias, exp.TableAlias, exp.Table)
+
+
+def _declares_a_name(node: exp.Identifier) -> bool:
+    """Whether `node` declares a name where it stands: an alias, a table's or a CTE's name, a
+    column alias list, a table's name, or a column's qualifier, never the column's own name."""
+    parent = node.parent
+    if isinstance(parent, _DECLARING):
+        return True
+    return isinstance(parent, exp.Column) and parent.this is not node
+
+
 def words_read_as_columns(text: str, engine: str | None, taken, dialect: str | None = None,
                           checked: collections.Counter | None = None) -> list[str]:
     """The words of `engine` that `text` holds bare as reads no check saw, among `taken`, the
@@ -334,9 +350,10 @@ def words_read_as_columns(text: str, engine: str | None, taken, dialect: str | N
 
     Decided where each word stands, by its offset in the parse of `text` as `dialect` (the engine's
     where none is given); sqlglot records one on every Identifier it builds from the text. A word
-    where that parse declares a name, an output alias, a table's alias or a CTE's name, is no read:
-    `SELECT id AS true` reads no column `true` (Codex's second review of this change). A word where
-    it holds a column reference, or nothing, is a read. Which reads the checks saw depends on whose
+    where that parse declares a name (`_declares_a_name`: an output alias, a table's alias, a CTE's
+    name, a column alias list, a table's name or a column's qualifier) is no read: `SELECT id AS
+    true` reads no column `true` (Codex's second review of this change). Any other word is a read,
+    a USING key among them (its fourth). Which reads the checks saw depends on whose
     tree they read:
     - `checked` None: the parse of `text` is the tree the checks read (a row filter, run as written
       in its engine's dialect), so a column reference at the word's offset was checked.
@@ -352,8 +369,12 @@ def words_read_as_columns(text: str, engine: str | None, taken, dialect: str | N
     columns: set[int] = set()
     try:
         for node in sqlglot.parse_one(text, read=read_as).find_all(exp.Identifier):
-            if "start" in node.meta:
-                (columns if isinstance(node.parent, exp.Column) else names).add(node.meta["start"])
+            if "start" not in node.meta:
+                continue
+            if _declares_a_name(node):
+                names.add(node.meta["start"])
+            elif isinstance(node.parent, exp.Column) and node.parent.this is node:
+                columns.add(node.meta["start"])
     except sqlglot.errors.SqlglotError:
         pass
     reads = collections.Counter(
@@ -409,6 +430,52 @@ def _call_advice(dialect: str | None, target: str | None, taken: frozenset[str])
     return None
 
 
+def _a_type(node: exp.DataType) -> bool:
+    """Whether a type node stands as a type (a cast's target, a column's type), not as a value."""
+    top = node
+    while isinstance(top.parent, exp.DataType):
+        top = top.parent
+    return top.arg_key in ("to", "kind") or isinstance(top.parent, (exp.Cast, exp.TryCast, exp.ColumnDef))
+
+
+def a_table_named_by_a_word(ast: exp.Expression, engine: str | None) -> Refusal | None:
+    """A reference to a table in scope that the parse reads as a function, a literal or a type
+    (M232). With `FROM kw AS current_date`, DuckDB reads `current_date.secret`, `(current_date).secret`,
+    `current_date['secret']` and a bare `current_date` (the whole row) through kw, where sqlglot reads
+    the CURRENT_DATE node; SQLite and Oracle read `true.secret` through a table aliased `true`, where
+    sqlglot reads the literal; and DuckDB reads `bigint['secret']` through a table aliased `bigint`,
+    where sqlglot reads an array of the BIGINT type (measured). No column is attributed, so no grant
+    check saw `secret`. Found where it stands, on any engine: a node of the checks' tree that is no
+    column or name, prints for the engine as one bare word, and spells a table or alias in scope; a
+    type standing as a cast's target or a column's type is a type, so a table named `date` keeps
+    `CAST(x AS DATE)`. The repair costs one alias."""
+    named = {table.name.lower() for table in ast.find_all(exp.Table) if table.name}
+    named |= {alias.this.name.lower() for alias in ast.find_all(exp.TableAlias) if isinstance(alias.this, exp.Identifier)}
+    if not named:
+        return None
+    for node in ast.walk():
+        if not isinstance(node, (exp.Func, exp.Boolean, exp.Null, exp.DataType)):
+            continue
+        if isinstance(node, exp.DataType) and _a_type(node):
+            continue
+        try:
+            tokens = sqlglot.tokenize(node.sql(dialect=engine), read=engine)
+        except Exception:  # noqa: BLE001 -- a node that does not print or tokenize spells no word
+            continue
+        if len(tokens) != 1 or tokens[0].token_type in _QUOTED_TOKENS:
+            continue
+        word = tokens[0].text.lower()
+        if word in named:
+            return Refusal(
+                code=RefusalCode.AMBIGUOUS_NILADIC_NAME,
+                message=(f"{word!r} names a table here, and the parser reads it as a SQL function, "
+                         f"literal or type where the engine reads the table, so no check can tell "
+                         f"which column it reads. Give the table another alias."),
+                subject=word,
+            )
+    return None
+
+
 def niladic_names(ast: exp.Expression, columns, dialect: str | None = None,
                   target: str | None = None) -> Refusal | None:
     """A column named like a niladic SQL function is read through the function's node, which
@@ -441,6 +508,9 @@ def niladic_names(ast: exp.Expression, columns, dialect: str | None = None,
     from mnemiq.sql.scope import base_tables  # scope imports this module's checks
 
     engine = target or dialect
+    aliased = a_table_named_by_a_word(ast, engine)  # M232: the same words naming a table
+    if aliased is not None:
+        return aliased
     referenced = {object_key(table) for table in base_tables(ast, engine)}
 
     def columns_of(table: str) -> set[str]:
@@ -468,6 +538,10 @@ def niladic_names(ast: exp.Expression, columns, dialect: str | None = None,
     checked = collections.Counter(
         column.name.lower() for column in ast.find_all(exp.Column)
         if not column.table and _bare_niladic_words(column.sql(dialect=engine), engine))
+    # A USING key the checks read as a name is a column they checked, as the join-key rule reads it.
+    checked += collections.Counter(
+        key.name.lower() for join in ast.find_all(exp.Join) for key in join.args.get("using") or ()
+        if isinstance(key, exp.Identifier) and _bare_niladic_words(key.sql(dialect=engine), engine))
     for name in words_read_as_columns(printed, engine, taken, checked=checked):
         owners = sorted(table for table in referenced if name in columns_of(table))
         if name in _LITERAL_ADVICE:
