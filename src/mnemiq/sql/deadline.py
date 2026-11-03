@@ -50,7 +50,8 @@ def _raise_in(thread_id: int, exc: type[BaseException] | None) -> None:
 
 
 class _Clock:
-    """One thread's deadline: armed, paused while the source runs, resumed, and disarmed."""
+    """One thread's deadline: armed, paused while the source runs, resumed, and disarmed. It fires
+    at most once: a second timeout could land in the cleanup that handles the first."""
 
     def __init__(self, seconds: float) -> None:
         self.thread_id = threading.get_ident()
@@ -58,73 +59,94 @@ class _Clock:
         self.lock = threading.Lock()
         self.live = True
         self.fired = False
+        self.pauses = 0
         self.timer: threading.Timer | None = None
         self.started = 0.0
 
     def _fire(self) -> None:
         with self.lock:
-            if self.live and self.timer is not None:
+            if self.live and self.timer is not None and not self.fired:
                 self.fired = True
                 _raise_in(self.thread_id, DecisionTimeout)
 
-    def start(self) -> None:
-        with self.lock:
+    def _arm(self) -> None:  # under the lock
+        if self.live and self.timer is None and self.pauses == 0:
             self.started = time.monotonic()
             self.timer = threading.Timer(max(self.remaining, 0.0), self._fire)
             self.timer.daemon = True
             self.timer.start()
 
-    def stop(self) -> None:
+    def _hold(self) -> None:  # under the lock
+        if self.timer is not None:
+            self.timer.cancel()
+            self.timer = None
+            self.remaining -= time.monotonic() - self.started
+
+    def start(self) -> None:
         with self.lock:
-            if self.timer is not None:
-                self.timer.cancel()
-                self.timer = None
-                self.remaining -= time.monotonic() - self.started
+            self._arm()
+
+    def pause(self) -> None:
+        """Stop the clock; nested pauses stop it once and resume it once, at the outermost."""
+        with self.lock:
+            self.pauses += 1
+            self._hold()
+
+    def resume(self) -> None:
+        with self.lock:
+            self.pauses = max(self.pauses - 1, 0)
+            self._arm()
 
     def disarm(self) -> None:
         with self.lock:
             self.live = False
-            if self.timer is not None:
-                self.timer.cancel()
-                self.timer = None
+            self._hold()
             if self.fired:
                 # Fired as the block ended: the timeout may be pending, not yet raised. Cleared here,
                 # so it never lands in whatever the thread does next.
                 _raise_in(self.thread_id, None)
 
 
+def _release(clock: _Clock) -> None:
+    """Disarm `clock` and leave the thread without it, whatever interrupts the first attempt."""
+    try:
+        clock.disarm()
+    finally:
+        if getattr(_active, "clock", None) is clock:
+            _active.clock = None
+
+
 @contextmanager
 def within(seconds: float):
     """Run the block under a deadline of `seconds` of this thread's own work; past it,
     `DecisionTimeout` is raised in this thread. Nested, the outer deadline holds and the inner one
-    is a no-op: an inner one disarming would clear the outer's pending timeout."""
+    is a no-op: an inner one disarming would clear the outer's pending timeout. The clock is armed
+    inside the guarded block, so a timeout cannot land between arming and the guard."""
     if getattr(_active, "clock", None) is not None:
         yield
         return
     clock = _Clock(seconds)
     _active.clock = clock
-    clock.start()
     try:
+        clock.start()
         yield
     finally:
-        try:
-            clock.disarm()
-        finally:
-            _active.clock = None
+        _release(clock)
 
 
 @contextmanager
 def paused():
-    """Stop this thread's deadline for the block, a call to the source; a no-op outside one."""
+    """Stop this thread's deadline for the block, a wait on the source or on a shared reader; a
+    no-op outside one."""
     clock = getattr(_active, "clock", None)
-    if clock is None or not clock.live:
+    if clock is None:
         yield
         return
-    clock.stop()
+    clock.pause()
     try:
         yield
     finally:
-        clock.start()
+        clock.resume()
 
 
 class _PausedSource:
@@ -169,6 +191,8 @@ def bounded(decider):
         for name in _SOURCES:
             if bound.arguments.get(name) is not None:
                 bound.arguments[name] = paused_source(bound.arguments[name])
+        if getattr(_active, "clock", None) is not None:
+            return decider(*bound.args, **bound.kwargs)  # nested: the outer deadline holds
         seconds = DECISION_DEADLINE_S
         try:
             with within(seconds):
@@ -180,5 +204,12 @@ def bounded(decider):
                 message=("This statement took longer to check than this engine allows, so it was "
                          "not run. Ask a simpler question."),
             )
+        finally:
+            # The owner's cleanup: a timeout landing in `within`'s own skips the rest of it, and the
+            # thread kept a clock every later decision read as an outer deadline, so ran with none
+            # (Codex's second review of M227). The timer fires at most once, so this pass completes.
+            leftover = getattr(_active, "clock", None)
+            if leftover is not None:
+                _release(leftover)
 
     return run

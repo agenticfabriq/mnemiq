@@ -243,3 +243,116 @@ def test_time_waiting_on_the_value_index_does_not_count():
                          dialect="duckdb", target="duckdb")
     assert index.asked, "the value index was never asked, so the test shows nothing"
     assert isinstance(verdict, Approved), verdict
+
+
+# --- Round two of the review: the cleanup, the shared readers, and pauses ----------------------
+
+def _hold(lock, seconds):
+    """Hold `lock` from another thread for `seconds`, as a concurrent decision would."""
+    taken = threading.Event()
+
+    def holder():
+        with lock:
+            taken.set()
+            time.sleep(seconds)
+    thread = threading.Thread(target=holder, daemon=True)
+    thread.start()
+    assert taken.wait(5)
+    return thread
+
+
+@pytest.mark.parametrize("module, lock, sql, policy, refused_as", [
+    ("mnemiq.sql.scope", "_REGEX_LOCK", "SELECT q.id FROM (SELECT COLUMNS('id') FROM claim) q", None, None),
+    # Every statement that asks the lambda reader is refused for its unmodelled call; that refusal,
+    # not a timeout, is what it must get.
+    ("mnemiq.sql.reading", "_TAKERS_LOCK", "SELECT array_apply([id], x -> x + 1) AS a FROM claim", None,
+     RefusalCode.UNMODELLED_CALL),
+    ("mnemiq.sql.rls", "_READER_LOCK", "SELECT id FROM claim",
+     AccessPolicy(policy_schema={"claim": {"id", "region", "attrs"}}, row_filters={"claim": "attrs = '{\"a\": 1}'"}),
+     None),
+])
+def test_waiting_on_a_shared_reader_does_not_count(module, lock, sql, policy, refused_as):
+    # A shared DuckDB reader's lock and query are not the decider's own work: held by another
+    # decision past the deadline, they refused a valid statement (Codex's second review of M227).
+    import importlib
+    held = _hold(getattr(importlib.import_module(module), lock), 1.5)
+    schema = {"claim": {"id", "region", "attrs"}}
+    started = time.monotonic()
+    with _safety_net():
+        verdict = decide(sql, schema, dialect="duckdb", target="duckdb", policy=policy)
+    waited = time.monotonic() - started
+    held.join(5)
+    assert waited >= 1.4, f"the decision waited {waited:.2f} s, not on the reader, so this shows nothing"
+    if refused_as is None:
+        assert isinstance(verdict, Approved), verdict
+    else:
+        assert isinstance(verdict, Refusal) and verdict.code is refused_as, verdict
+
+
+def test_a_timeout_landing_in_the_cleanup_leaves_the_thread_with_no_stale_deadline(monkeypatch):
+    # Landing at the start of `within`'s cleanup skipped the rest of it, and the thread kept a clock
+    # every later decision read as an outer deadline, so ran with none (Codex's second review). The
+    # landing is made deterministic with a trace hook that raises there once, as the timer would.
+    import inspect
+    import sys
+    source, first = inspect.getsourcelines(deadline.within.__wrapped__)
+    after = next(i for i, line in enumerate(source) if line.strip() == "finally:")
+    target = first + after + 1
+    raised = []
+
+    def tracer(frame, event, arg):
+        if frame.f_code is deadline.within.__wrapped__.__code__:
+            def local(frame, event, arg):
+                if event == "line" and frame.f_lineno == target and not raised:
+                    raised.append(True)
+                    raise deadline.DecisionTimeout
+                return local
+            return local
+        return None
+
+    with _safety_net():
+        sys.settrace(tracer)
+        try:
+            first_verdict = decide("SELECT id FROM claim", SCHEMA, dialect="duckdb", target="duckdb")
+        finally:
+            sys.settrace(None)
+        assert raised, "the cleanup line was never reached, so this shows nothing"
+        assert _timed_out(first_verdict), first_verdict
+        assert getattr(deadline._active, "clock", None) is None
+        assert _timed_out(decide("SELECT struct(id, not) FROM claim", SCHEMA, dialect="duckdb", target="duckdb"))
+
+
+def test_a_clock_fires_once_and_a_resume_after_it_arms_nothing():
+    # A second timer, armed by a resume after the first fired, could land in the cleanup of the first.
+    out = {"timeouts": 0}
+    fired = threading.Event()
+
+    def deciding():
+        clock = deadline._Clock(0.05)
+        clock.start()
+        try:
+            fired.wait(0.5)  # a C call: the timeout lands as it returns
+            _spin(0.1)
+        except deadline.DecisionTimeout:
+            out["timeouts"] += 1
+        try:
+            clock.pause()
+            clock.resume()
+            _spin(0.3)
+        except deadline.DecisionTimeout:
+            out["timeouts"] += 1
+        clock.disarm()
+
+    thread = threading.Thread(target=deciding, daemon=True)
+    thread.start()
+    thread.join(5)
+    assert out["timeouts"] == 1, out
+
+
+def test_a_nested_pause_does_not_restart_the_clock_inside_the_outer_one():
+    with _safety_net():
+        with deadline.within(0.5):
+            with deadline.paused():
+                with deadline.paused():
+                    pass
+                time.sleep(0.8)  # still inside the outer pause
