@@ -304,6 +304,9 @@ class Runtime:
         views = inventory_for(self.snapshot)
         verdict = decide_write(sql, visible, grants, adapter=self.adapter, dialect=dialect,
                                policy=policy, views=views,
+                               # M226: a federated grant is keyed `catalog.table`, a single
+                               # source's by the name alone, and only the registry says which.
+                               registry=getattr(self.adapter, "registry", None),
                                # M3: the deployment switch reaches the decider, so a disabled
                                # deployment refuses in our vocabulary instead of letting the
                                # read-only attachment raise and calling that a refusal.

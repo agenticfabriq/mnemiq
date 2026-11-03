@@ -246,6 +246,10 @@ def test_an_unreadable_inventory_defers_before_the_first_model_call():
 # Third time a narrowing in `_reachable` has silently disarmed the guard downstream of it, after
 # the unparseable-body case it already handles and the unavailable-inventory case above.
 
+# A federated snapshot's registry: the grant check splits `pg.claim_v` after the catalog (M226).
+FED_REGISTRY = {"pg": "public"}
+
+
 def _federated():
     from mnemiq.config import SourceSpec
     from mnemiq.semantic.federation import merge_snapshots
@@ -266,7 +270,7 @@ def test_a_federated_view_only_grant_does_not_bypass_the_row_filter():
     policy = build_access_policy(fed, grants)
     assert dict(policy.row_filters) == {"pg.claim": "region = 'west'"}
     v = decide("SELECT id FROM pg.claim_v", {"pg.claim_v": {"id"}},
-               policy=policy, views=inventory_for(fed))
+               policy=policy, views=inventory_for(fed), registry=FED_REGISTRY)
     assert getattr(v, "code", None) is RefusalCode.UNGOVERNED_VIEW, v
 
 
@@ -276,7 +280,7 @@ def test_a_federated_caller_with_no_row_filters_is_still_approved():
     fed = _federated()
     v = decide("SELECT id FROM pg.claim_v", {"pg.claim_v": {"id"}},
                policy=build_access_policy(fed, GrantSet(objects=frozenset({"pg.claim_v"}))),
-               views=inventory_for(fed))
+               views=inventory_for(fed), registry=FED_REGISTRY)
     assert not isinstance(v, type(None)) and getattr(v, "code", None) is None, v
 
 
@@ -309,7 +313,7 @@ def test_a_nested_federated_view_is_resolved_in_its_own_catalog():
     grants = GrantSet(objects=frozenset({"pg.claim_v2"}),
                       row_filters={"pg.claim": "region = 'west'"})
     v = decide("SELECT id FROM pg.claim_v2", {"pg.claim_v2": {"id"}},
-               policy=build_access_policy(fed, grants), views=inventory_for(fed))
+               policy=build_access_policy(fed, grants), views=inventory_for(fed), registry=FED_REGISTRY)
     assert getattr(v, "code", None) is RefusalCode.UNGOVERNED_VIEW, v
 
 
@@ -324,7 +328,7 @@ def test_the_write_door_refuses_the_federated_view_identically():
     v = decide_write("INSERT INTO pg.scratch SELECT id FROM pg.claim_v2",
                      {"pg.claim_v2": {"id"}, "pg.scratch": {"id"}}, grants, adapter=None,
                      dialect="duckdb", policy=build_access_policy(fed, grants),
-                     views=inventory_for(fed), writes_enabled=True)
+                     views=inventory_for(fed), writes_enabled=True, registry=FED_REGISTRY)
     assert getattr(v, "code", None) is RefusalCode.UNGOVERNED_VIEW, v
 
 
@@ -450,7 +454,8 @@ def test_the_federated_nested_view_folds_case_too(inner_ref, catalog):
     # Decided as DuckDB, which runs a federated statement and reads `PG` as `pg`; on Postgres the
     # unquoted `PG` is `pg`, and a grant keyed `PG.claim_v2` a quoted catalog (M223).
     v = decide(f"SELECT id FROM {catalog}.claim_v2", {f"{catalog}.claim_v2": {"id"}},
-               policy=build_access_policy(fed, grants), views=inventory_for(fed), target="duckdb")
+               policy=build_access_policy(fed, grants), views=inventory_for(fed), target="duckdb",
+               registry={catalog: "public"})
     assert getattr(v, "code", None) is RefusalCode.UNGOVERNED_VIEW, v
 
 

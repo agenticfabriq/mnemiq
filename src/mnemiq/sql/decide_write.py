@@ -322,6 +322,7 @@ def decide_write(
     target: str | None = None,
     views: dict[str, ViewDefinition] | None = None,
     writes_enabled: bool = False,
+    registry: dict[str, str] | None = None,
 ) -> ApprovedWrite | Refusal:
     """The deterministic write decider: deployment switch -> shape -> table/column authz ->
     target-writable -> proof.
@@ -343,6 +344,10 @@ def decide_write(
     is no snapshot), which is precisely why it must be *stated*: "no policy supplied" and "a
     policy that restricts nothing" are the same denial and different facts, and collapsing them is
     M2's finding and the peer lane's M45.
+
+    `registry` is a federation's catalog-to-schema map, None for a single source, as `decide`
+    takes it. The grant check reads it to split a held key into its parts (M226): a federated
+    write decided as a single source refuses every catalog-qualified table.
     """
     target = target or dialect
     if not writes_enabled:
@@ -374,7 +379,7 @@ def decide_write(
         return unsupported
 
     refusal = check_access(shaped, visible, target,  # every referenced table readable, cols exist
-                           columns=known_columns(visible, policy))
+                           columns=known_columns(visible, policy), registry=registry)
     if refusal is not None:
         return refusal
     # M65: what `check_access` reads -- `base_tables` -- is empty for a source it cannot model,
@@ -429,7 +434,7 @@ def decide_write(
     # An INSERT's target is not a base table, so the grant check's test that the engine reads
     # a name as written (M223) has not seen it: on Oracle a write grant on a quoted `sales`
     # approved `INSERT INTO sales`, which writes SALES.
-    misread = not_read_as_written(_target_node(shaped), grants.writable, target)
+    misread = not_read_as_written(_target_node(shaped), grants.writable, target, registry)
     if misread is not None:
         return misread
     if not grants.allows_write(tgt):

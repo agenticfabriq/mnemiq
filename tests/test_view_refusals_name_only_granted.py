@@ -121,7 +121,8 @@ def test_a_federated_body_spelling_gets_no_hint():
     schema = {"pg.customer": {"id", "store_id"}, "pg.v": {"id"}}
     policy = AccessPolicy(row_filters={"pg.customer": "store_id = 1"}, policy_schema=schema)
     views = {"pg.v": ViewDefinition(object_id="pg.v", dialect=D, definition="SELECT id FROM customer")}
-    verdict = decide("SELECT id FROM pg.v", schema, dialect=D, target=D, policy=policy, views=views)
+    verdict = decide("SELECT id FROM pg.v", schema, dialect=D, target=D, policy=policy, views=views,
+                     registry={"pg": "public"})
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW
     assert "directly" not in verdict.message
 
