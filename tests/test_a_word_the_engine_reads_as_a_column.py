@@ -60,6 +60,26 @@ def test_on_sqlite_a_bare_true_or_false_is_refused_where_the_table_read_has_the_
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
 
 
+@pytest.mark.parametrize("sql, rows", [
+    ("SELECT id AS true FROM kw", [(1,)]),                       # an output name, not a read
+    ("SELECT t.id FROM kw AS t", [(1,)]),
+    ("WITH true AS (SELECT id FROM kw) SELECT id FROM true", [(1,)]),
+])
+def test_a_word_declared_as_a_name_is_no_read_of_the_column(sql, rows):
+    # Matched by offset: an alias or a CTE's name is an identifier where it stands (Codex's second
+    # review of this change: counted against column references alone, `AS true` was refused).
+    verdict = decide(sql, SQLITE_HIDDEN, dialect="sqlite", target="sqlite",
+                     policy=AccessPolicy(policy_schema=SQLITE_SCHEMA))
+    assert isinstance(verdict, Approved), verdict
+    assert _sqlite().execute(verdict.target_sql).fetchall() == rows
+
+
+def test_an_alias_beside_a_bare_read_still_refuses_the_read():
+    verdict = decide("SELECT id AS true, true AS t FROM kw", SQLITE_HIDDEN, dialect="sqlite", target="sqlite",
+                     policy=AccessPolicy(policy_schema=SQLITE_SCHEMA))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
+
+
 def test_the_control_sqlite_reads_the_column_and_sqlglot_reads_the_literal():
     con = _sqlite()
     assert con.execute("SELECT true FROM kw").fetchall() == [("withheld",)]
@@ -264,3 +284,10 @@ def test_a_filter_on_a_table_without_such_columns_still_runs():
     verdict = decide_write("DELETE FROM plain WHERE id > 0", DUCK_SCHEMA, grants, dialect="duckdb", target="duckdb",
                            writes_enabled=True, policy=_filtered("plain", "id > 0", DUCK_SCHEMA))
     assert isinstance(verdict, ApprovedWrite), verdict
+
+
+def test_a_text_that_does_not_parse_counts_every_bare_word():
+    # Fail-closed: with no parse there is no name to account for a word, so each bare one is a read.
+    from mnemiq.sql.guard import words_read_as_columns
+    assert words_read_as_columns("SELECT id AS true FROM", "sqlite", {"true"}) == ["true"]
+    assert words_read_as_columns("SELECT id AS true FROM kw", "sqlite", {"true"}) == []  # the control

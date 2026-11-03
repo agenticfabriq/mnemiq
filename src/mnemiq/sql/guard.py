@@ -300,15 +300,14 @@ _QUOTED_TOKENS = frozenset({TokenType.STRING, TokenType.NATIONAL_STRING, TokenTy
                             TokenType.BYTE_STRING, TokenType.UNICODE_STRING, TokenType.IDENTIFIER})
 
 
-def _bare_niladic_words(sql: str, engine: str | None = None, dialect: str | None = None) -> collections.Counter:
-    """How many times `sql` holds each of `engine`'s words bare (`_words_for`), lowercased: a token
-    that is no literal or quoted name, not after a dot and not before `(`. Read by sqlglot's
+def _bare_tokens(sql: str, engine: str | None, dialect: str | None = None) -> list[tuple[int, str]]:
+    """Each of `engine`'s words (`_words_for`) that `sql` holds bare, as (offset, lowercased word): a
+    token that is no literal or quoted name, not after a dot and not before `(`. Read by sqlglot's
     tokenizer for `dialect` (the engine's where none is given), which reads strings, dollar quotes,
-    quoted names and comments as the parse compared with it does. With no engine, the niladic
-    words alone."""
+    quoted names and comments as the parse it is matched with does."""
     words = set(_words_for(engine))
     tokens = sqlglot.tokenize(sql, read=dialect or engine)
-    found: collections.Counter = collections.Counter()
+    found = []
     for i, token in enumerate(tokens):
         word = token.text.lower()
         if word not in words or token.token_type in _QUOTED_TOKENS:
@@ -317,23 +316,34 @@ def _bare_niladic_words(sql: str, engine: str | None = None, dialect: str | None
             continue
         if i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.L_PAREN:
             continue
-        found[word] += 1
+        found.append((token.start, word))
     return found
 
 
-def words_read_as_columns(text: str, tree: exp.Expression, engine: str | None, taken,
-                          dialect: str | None = None) -> list[str]:
-    """The words of `engine` that `text` holds bare more often than `tree` reads them as unqualified
-    columns, among `taken`, the lowercased names of the columns the tables in scope have: each a
-    column the engine reads and no check saw. By occurrence, not by word: a column reference that
-    prints bare accounts for one bare occurrence, and the rest are the function's or the literal's
-    spelling (the gate's second round on #175). `text` is what the engine runs, tokenized as
-    `dialect` (the engine's where none is given)."""
-    bare = _bare_niladic_words(text, engine, dialect)
-    as_columns = collections.Counter(
-        column.name.lower() for column in tree.find_all(exp.Column)
-        if not column.table and _bare_niladic_words(column.sql(dialect=engine), engine))
-    return sorted(name for name, count in bare.items() if count > as_columns[name] and name in taken)
+def _bare_niladic_words(sql: str, engine: str | None = None, dialect: str | None = None) -> collections.Counter:
+    """How many times `sql` holds each of `engine`'s words bare (`_bare_tokens`). With no engine,
+    the niladic words alone."""
+    return collections.Counter(word for _, word in _bare_tokens(sql, engine, dialect))
+
+
+def words_read_as_columns(text: str, engine: str | None, taken, dialect: str | None = None) -> list[str]:
+    """The words of `engine` that `text` holds bare where its parse holds no name, among `taken`, the
+    lowercased names of the columns the tables in scope have: each a column the engine reads that
+    no check saw, since the parse read a function's node or a literal there. Decided where each word
+    stands, by its offset: sqlglot records one on every Identifier it builds from the text, so a
+    column reference, an output alias, a table alias and a CTE's name are each a name at their own
+    offset, and `SELECT id AS true` is no read of a column `true` (Codex's second review of this
+    change; subtracting column references by count left the alias counted). `text` is what the
+    engine runs, parsed and tokenized as `dialect` (the engine's where none is given); a text that
+    does not parse holds no names, so each bare word in it counts."""
+    read_as = dialect or engine
+    try:
+        named = {node.meta["start"] for node in sqlglot.parse_one(text, read=read_as).find_all(exp.Identifier)
+                 if "start" in node.meta}
+    except sqlglot.errors.SqlglotError:
+        named = set()
+    return sorted({word for start, word in _bare_tokens(text, engine, dialect)
+                   if start not in named and word in taken})
 
 
 # The call spellings the repair may name, per dialect the model writes in (the statement it
@@ -435,7 +445,7 @@ def niladic_names(ast: exp.Expression, columns, dialect: str | None = None,
     # the function's spelling. By occurrence, not by word: taken off for the whole statement,
     # a quoted `"current_timestamp"` read in a subquery switched the rule off for the bare
     # word beside it and the column leaked (the gate's second round on this commit).
-    for name in words_read_as_columns(printed, ast, engine, taken):
+    for name in words_read_as_columns(printed, engine, taken):
         owners = sorted(table for table in referenced if name in columns_of(table))
         if name in _LITERAL_ADVICE:
             # Quoted: sqlglot reads `kw.true` as no column at all, so the repair would be refused.

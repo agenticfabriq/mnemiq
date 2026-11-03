@@ -331,7 +331,7 @@ def _a_word_read_as_a_column(filt: str, table: str, dialect: str, policy: Access
 
     engine = (executes_as or dialect).lower()
     try:
-        tree, wrapped = _parsed(filt, dialect), _parsed(filt, dialect, wrapped=True)
+        wrapped = _parsed(filt, dialect, wrapped=True)
     except Exception:  # noqa: BLE001 -- unparseable is the validator's refusal, made before this runs
         return None
     schema = policy.policy_schema or {}
@@ -344,7 +344,7 @@ def _a_word_read_as_a_column(filt: str, table: str, dialect: str, policy: Access
         if object_key(read) != _SUBJECT:
             taken |= columns_of(object_key(read))
     try:
-        words = words_read_as_columns(filt, tree, engine, taken, dialect)
+        words = words_read_as_columns(filt, engine, taken, dialect)
     except sqlglot.errors.SqlglotError:
         words = ["(the text could not be tokenized)"]  # it parsed, so this is not expected: refused
     if not words:
