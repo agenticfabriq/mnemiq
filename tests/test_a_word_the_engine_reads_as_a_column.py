@@ -540,3 +540,36 @@ def test_a_filter_s_subquery_reading_such_a_table_by_its_bare_name_passes():
     verdict = decide("SELECT id FROM plain", schema, dialect="duckdb", target="duckdb",
                      policy=AccessPolicy(policy_schema=schema, row_filters={"plain": "id IN (SELECT id FROM localtime)"}))
     assert isinstance(verdict, Approved), verdict
+
+
+@pytest.mark.parametrize("word", ["int8", "integer", "int4", "string", "bool", "numeric", "bigint", "current_date"])
+def test_a_row_filter_reading_a_table_through_a_word_is_refused_by_its_own_spelling(word):
+    # A filter runs as written, and sqlglot prints `int8` as BIGINT: checked on the reprint, the alias
+    # was missed and the filter answered on kw's withheld secret (Codex's fifth review of this change).
+    filt = f"id IN (SELECT id FROM kw AS {word} WHERE {word}['secret'] = 'withheld')"
+    con = duckdb.connect()
+    con.execute("CREATE TABLE kw (id INT, secret VARCHAR); INSERT INTO kw VALUES (1, 'withheld')")
+    con.execute("CREATE TABLE plain (id INT); INSERT INTO plain VALUES (1)")
+    assert con.execute(f"SELECT id FROM plain WHERE {filt}").fetchall() == [(1,)]  # the premise
+    schema = {"kw": {"id"}, "plain": {"id"}}  # secret is in no schema the checks know
+    verdict = decide("SELECT id FROM plain", schema, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(policy_schema=schema, row_filters={"plain": filt}))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
+def test_a_row_filter_with_an_ordinary_alias_or_a_type_in_a_cast_still_passes():
+    schema = {"kw": {"id", "secret"}, "plain": {"id"}}
+    for filt in ("id IN (SELECT t.id FROM kw AS t WHERE t.secret = 'x')",
+                 "id IN (SELECT id FROM kw WHERE TRY_CAST(id AS int8) > 0)"):
+        verdict = decide("SELECT id FROM plain", schema, dialect="duckdb", target="duckdb",
+                         policy=AccessPolicy(policy_schema=schema, row_filters={"plain": filt}))
+        assert isinstance(verdict, Approved), (filt, verdict)
+
+
+def test_a_row_filter_calling_a_function_named_like_its_alias_passes():
+    # A call names no table: `abs(abs.id)` under `FROM kw AS abs` reads the function and kw's id.
+    schema = {"kw": {"id", "secret"}, "plain": {"id"}}
+    filt = "id IN (SELECT abs.id FROM kw AS abs WHERE abs(abs.id) > 0)"
+    verdict = decide("SELECT id FROM plain", schema, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(policy_schema=schema, row_filters={"plain": filt}))
+    assert isinstance(verdict, Approved), verdict

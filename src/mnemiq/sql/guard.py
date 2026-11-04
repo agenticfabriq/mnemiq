@@ -476,6 +476,31 @@ def a_table_named_by_a_word(ast: exp.Expression, engine: str | None) -> Refusal 
     return None
 
 
+def a_table_named_in_text(text: str, dialect: str | None) -> str | None:
+    """M232 for a text the engine runs as written, a row filter: the first token that spells a table
+    or alias the text names in scope where the parse of the same text holds no name at that offset,
+    so the parse read it as a function, literal or type. Read off the text, never a reprint: sqlglot
+    prints `int8` as BIGINT, so a filter's `int8['secret']` under `FROM kw AS int8` passed a check of
+    the reprint while DuckDB read kw's column (Codex's fifth review of M230's branch). A call (the
+    word before `(`) is no reference to the table; a word after a dot with no name at its offset is
+    counted, which can only refuse more."""
+    tree = sqlglot.parse_one(text, read=dialect)
+    named = {table.name.lower() for table in tree.find_all(exp.Table) if table.name}
+    named |= {alias.this.name.lower() for alias in tree.find_all(exp.TableAlias) if isinstance(alias.this, exp.Identifier)}
+    if not named:
+        return None
+    held = {node.meta["start"] for node in tree.find_all(exp.Identifier) if "start" in node.meta}
+    tokens = sqlglot.tokenize(text, read=dialect)
+    for i, token in enumerate(tokens):
+        word = token.text.lower()
+        if word not in named or token.token_type in _QUOTED_TOKENS or token.start in held:
+            continue
+        if i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.L_PAREN:
+            continue  # a call, which names no table
+        return word
+    return None
+
+
 def niladic_names(ast: exp.Expression, columns, dialect: str | None = None,
                   target: str | None = None) -> Refusal | None:
     """A column named like a niladic SQL function is read through the function's node, which

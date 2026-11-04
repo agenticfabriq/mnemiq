@@ -335,11 +335,15 @@ def _a_word_read_as_a_column(filt: str, table: str, dialect: str, policy: Access
         wrapped = _parsed(filt, dialect, wrapped=True)
     except Exception:  # noqa: BLE001 -- unparseable is the validator's refusal, made before this runs
         return None
-    from mnemiq.sql.guard import a_table_named_by_a_word
+    from mnemiq.sql.guard import a_table_named_in_text
 
-    aliased = a_table_named_by_a_word(wrapped, engine)  # M232: such a word naming a table
+    try:  # M232, read off the text as written, which the engine runs
+        aliased = a_table_named_in_text(filt, dialect)
+    except sqlglot.errors.SqlglotError:
+        aliased = "(the text could not be read)"  # it parsed, so this is not expected: refused
     if aliased is not None:
-        logger.warning("the row filter for %r reads %s", table, aliased.message)
+        logger.warning("the row filter for %r reads the table named %r through a word the parse reads "
+                       "as a function, literal or type; give the table another alias", table, aliased)
         return Refusal(
             code=RefusalCode.INVALID_ROW_FILTER,
             message=f"The row-access policy for {table!r} is not a valid predicate.",
