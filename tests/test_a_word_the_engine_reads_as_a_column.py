@@ -750,7 +750,7 @@ def test_a_qualified_reference_after_non_ascii_text_passes():
 def test_a_reference_after_unicode_whitespace_is_matched_by_name_or_refused():
     # DuckDB normalises Unicode whitespace before it parses, so its places shift: a misread current_date
     # landed on id's place and was excused by any name there (Codex's twelfth review of this change).
-    filt = "  id IN (SELECT id FROM kw AS current_date WHERE id+current_date.secret > 0)"
+    filt = "\u2003\u00a0id IN (SELECT id FROM kw AS current_date WHERE id+current_date.secret > 0)"
     answers = []
     for secret in (42, -42):
         con = duckdb.connect()
@@ -767,12 +767,12 @@ def test_a_reference_after_unicode_whitespace_is_matched_by_name_or_refused():
 def test_a_filter_whose_places_cannot_be_matched_to_its_text_is_refused():
     # Fail-closed: where DuckDB's places are not where the text spells its references, none is trusted.
     from mnemiq.sql.guard import a_table_named_in_text
-    assert a_table_named_in_text("  id IN (SELECT t.id FROM kw AS t)", "duckdb", frozenset({"kw"})) \
+    assert a_table_named_in_text("\u2003\u00a0id IN (SELECT t.id FROM kw AS t)", "duckdb", frozenset({"kw"})) \
         == "(the filter's references could not be placed)"
     assert a_table_named_in_text("id IN (SELECT t.id FROM kw AS t)", "duckdb", frozenset({"kw"})) is None
 
 
-@pytest.mark.parametrize("space", [" ", " ", " " * 9 + " ", "　"])
+@pytest.mark.parametrize("space", ["\u2003", "\u00a0", "\u2003" * 9 + "\u00a0", "\u3000"])
 def test_a_duckdb_filter_holding_unicode_whitespace_is_refused(space):
     # DuckDB rewrites such whitespace before it parses, so its places cannot be checked against the text.
     from mnemiq.sql.guard import a_table_named_in_text
@@ -785,7 +785,7 @@ def test_unicode_whitespace_is_refused_even_where_duckdb_s_places_still_line_up(
     # After every reference the places agree, so only the whitespace rule refuses: it does not wait for
     # a shift to show.
     from mnemiq.sql.guard import a_table_named_in_text
-    assert a_table_named_in_text("t.id = 1 ", "duckdb", frozenset({"t"})) == "(the filter's references could not be placed)"
+    assert a_table_named_in_text("t.id = 1\u2003", "duckdb", frozenset({"t"})) == "(the filter's references could not be placed)"
 
 
 def test_a_place_that_does_not_spell_its_reference_is_refused(monkeypatch):
@@ -816,26 +816,23 @@ def test_a_filter_whose_string_value_is_non_ascii_still_passes():
 
 
 @pytest.mark.parametrize("filt", [
-    "region = 'a b'", "region = 'a‍b'", "region = ''",
-    "region = $$a b$$", "region = 'a b' AND id = 1",   # a reference after the literal still reads
+    "region = 'a\u00a0b'", "region = 'a\u200db'", "region = '\ue000'",
+    "region = $$a\u2003b$$", "region = 'a\u00a0b' AND id = 1",
 ])
-def test_a_folded_character_inside_a_comparison_value_passes(filt):
-    # DuckDB keeps a literal as written, so a value holding such a character is an ordinary filter (Codex's
-    # fifteenth review: these were refused by a rule that read the whole text).
-    con = duckdb.connect()
-    con.execute("CREATE TABLE t (id INT, region VARCHAR)")
-    value = filt.split("'")[1] if "'" in filt else filt.split("$$")[1]
-    con.execute("INSERT INTO t VALUES (1, ?)", [value])
+def test_a_folded_character_inside_a_comparison_value_is_refused_as_an_accepted_cost(filt):
+    # Refused though DuckDB keeps a literal as written: passing over a literal's contents would trust
+    # sqlglot and DuckDB to agree on its boundaries, which could not be reviewed. A filter comparing
+    # against such a value is therefore refused, fail-closed, the owner's choice on 2026-11-03 (Codex's
+    # fifteenth review found the refusal; it is recorded on M232, not fixed).
     schema = {"t": {"id", "region"}}
     verdict = decide("SELECT id FROM t", schema, dialect="duckdb", target="duckdb",
                      policy=AccessPolicy(policy_schema=schema, row_filters={"t": filt}))
-    assert isinstance(verdict, Approved), verdict
-    assert con.execute(verdict.target_sql).fetchall() == [(1,)]
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
 
 
 @pytest.mark.parametrize("text", [
-    "/* a b */ EXISTS (SELECT 1 FROM kw AS t WHERE t.id = 1)",   # in a comment: still checked
-    'EXISTS (SELECT 1 FROM kw AS t WHERE t."a b" = 1)',          # in a quoted name: still checked
+    "/* a\u00a0b */ EXISTS (SELECT 1 FROM kw AS t WHERE t.id = 1)",   # in a comment: still checked
+    'EXISTS (SELECT 1 FROM kw AS t WHERE t."a\u00a0b" = 1)',          # in a quoted name: still checked
 ])
 def test_a_folded_character_outside_a_literal_is_still_refused(text):
     from mnemiq.sql.guard import a_table_named_in_text

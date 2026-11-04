@@ -301,10 +301,6 @@ _QUOTED_TOKENS = frozenset({TokenType.STRING, TokenType.NATIONAL_STRING, TokenTy
                             TokenType.BYTE_STRING, TokenType.UNICODE_STRING, TokenType.IDENTIFIER})
 
 
-# The string literals among `_QUOTED_TOKENS`: a quoted name is not one.
-_LITERAL_TOKENS = _QUOTED_TOKENS - {TokenType.IDENTIFIER}
-
-
 def _bare_tokens(sql: str, engine: str | None, dialect: str | None = None) -> list[tuple[int, str]]:
     """Each of `engine`'s words (`_words_for`) that `sql` holds bare, as (offset, lowercased word): a
     token that is no literal or quoted name, not after a dot and not before `(`. Read by sqlglot's
@@ -545,15 +541,11 @@ def a_table_named_in_text(text: str, dialect: str | None, outer: frozenset[str] 
         return None
     held = {node.meta["start"] for node in tree.find_all(exp.Identifier) if "start" in node.meta}
     if (dialect or "").lower() == "duckdb":
-        # A string literal's contents are kept as written: no separator, format or control character
-        # inside one shifted a later reference's place, in quoted, E'', $$ or $tag$ literals (1,147
-        # characters each, measured), so those are passed over, and a filter may compare against them
-        # (Codex's fifteenth review found 'a b' with a no-break space refused). A quoted name and a
-        # comment are not literals, so a character there is still checked.
-        literal = {k for token in sqlglot.tokenize(text, read=dialect) if token.token_type in _LITERAL_TOKENS
-                   for k in range(token.start, token.end + 1)}
-        if any(ord(char) > 127 and unicodedata.category(char)[0] in ("Z", "C") and k not in literal
-               for k, char in enumerate(text)):
+        # Anywhere in the text, string literals included. Passing over a literal's contents would let
+        # through a filter wherever sqlglot and DuckDB disagree on a literal's boundaries, which could
+        # not be reviewed; so a filter whose comparison value holds such a character (a no-break space)
+        # is refused, an accepted fail-closed cost (Codex's fifteenth review, the owner on 2026-11-03).
+        if any(ord(char) > 127 and unicodedata.category(char)[0] in ("Z", "C") for char in text):
             # DuckDB folds Unicode spacing, format and control characters (an em space, a BOM, even
             # inside a comment) before it parses, which shifts every place it reports against this
             # text, so none can be trusted (Codex's twelfth to fourteenth reviews of M230's branch).
