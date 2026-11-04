@@ -758,17 +758,26 @@ def test_live_mysql_rejects_a_bare_introducer_and_straight_join(live_source):
     words = sorted(k for k in MySQL.Tokenizer.KEYWORDS if k.startswith("_")) + ["straight_join"]
     assert len(words) >= 40  # 42 introducers + straight_join on sqlglot 30.12; guards a shrunk list
     for word in words:
-        # A same-named column IS in scope (the derived table exposes it backticked), so if MySQL
-        # read the bare word as that column the query would return 1. It does not -- MySQL never
-        # reads a bare introducer or STRAIGHT_JOIN as a column (an introducer wants a string
-        # literal; STRAIGHT_JOIN is a select modifier / join operator, not a column reference),
-        # which is the precise interpretation M231 turns on.
-        with pytest.raises(MySQLRejected):
-            live_source.execute_arrow(f"SELECT {word} FROM (SELECT 1 AS `{word}`) t")
-        # Backticked, the same column is reachable and returns its value, so the rejection above is
+        # A same-named column IS in scope (the derived table exposes it backticked), so each bare
+        # position below would return a row if MySQL read the word as that column. None does --
+        # MySQL never reads a bare introducer or STRAIGHT_JOIN as a column (an introducer wants a
+        # string literal; STRAIGHT_JOIN is a select modifier / join operator, not a column
+        # reference), the precise interpretation M231 turns on. The select-list, WHERE, ORDER BY
+        # and GROUP BY positions are covered because `decide` as mysql approves the bare word in
+        # each, so the engine is the only barrier there.
+        scope = f"(SELECT 1 AS `{word}`) t"
+        for bare in (
+            f"SELECT {word} FROM {scope}",
+            f"SELECT 1 AS n FROM {scope} WHERE {word} = 1",
+            f"SELECT 1 AS n FROM {scope} ORDER BY {word}",
+            f"SELECT 1 AS n FROM {scope} GROUP BY {word}",
+        ):
+            with pytest.raises(MySQLRejected):
+                live_source.execute_arrow(bare)
+        # Backticked, the same column is reachable and returns its value, so the rejections are
         # about the bare spelling, not an absent column.
         assert live_source.execute_arrow(
-            f"SELECT `{word}` FROM (SELECT 1 AS `{word}`) t").to_pylist() == [{word: 1}]
+            f"SELECT `{word}` FROM {scope}").to_pylist() == [{word: 1}]
 
 
 @pytest.mark.integration
