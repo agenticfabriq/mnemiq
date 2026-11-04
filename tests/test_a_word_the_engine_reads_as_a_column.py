@@ -671,3 +671,23 @@ def test_a_nested_or_multiword_type_in_a_filter_is_a_type(table, filt):
 def test_a_type_span_ends_where_its_type_does(text, found):
     from mnemiq.sql.guard import a_table_named_in_text
     assert a_table_named_in_text(text, "duckdb", frozenset({"int8"})) == found
+
+
+@pytest.mark.parametrize("table, filt", [
+    ("day", "d > TIMESTAMP '2000-01-01' + INTERVAL '1' DAY"),
+    ("month", "d > TIMESTAMP '2000-01-01' + INTERVAL 1 MONTH"),
+    ("hour", "d > TIMESTAMP '2000-01-01' + INTERVAL '1' HOUR"),
+    ("year", "EXTRACT(year FROM d) > 2000"),
+])
+def test_a_unit_spelled_like_the_filtered_table_is_a_unit(table, filt):
+    # Only a keyword fits an interval's unit or EXTRACT's field, so the word names no table there
+    # (Codex's ninth review of this change: such filters made tables named day or year unreadable).
+    con = duckdb.connect()
+    con.execute(f'CREATE TABLE "{table}" (id INT, d TIMESTAMP)')
+    con.execute(f"INSERT INTO \"{table}\" VALUES (1, TIMESTAMP '2020-01-01')")
+    assert con.execute(f'SELECT id FROM "{table}" WHERE {filt}').fetchall() == [(1,)]  # runs on the engine
+    schema = {table: {"id", "d"}}
+    verdict = decide(f'SELECT id FROM "{table}"', schema, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(policy_schema=schema, row_filters={table: filt}))
+    assert isinstance(verdict, Approved), verdict
+    assert con.execute(verdict.target_sql).fetchall() == [(1,)]

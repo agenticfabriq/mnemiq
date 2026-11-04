@@ -476,60 +476,22 @@ def a_table_named_by_a_word(ast: exp.Expression, engine: str | None) -> Refusal 
     return None
 
 
-_CASTS = frozenset({"cast", "try_cast", "safe_cast"})
-# The words a type is spelled with beside its own keywords: `TIMESTAMP WITH TIME ZONE`,
-# `DOUBLE PRECISION`, `CHARACTER VARYING`.
-_TYPE_WORDS = frozenset({"with", "without", "time", "zone", "local", "precision", "varying"})
+_PROBE = "zz_mnemiq_name_probe"
 
 
-def _type_positions(tokens: list, dialect: str | None) -> set[int]:
-    """The indexes of the tokens that spell a type, where the engine reads a type and nothing else: a
-    cast's target, everything after its own `AS` up to its closing parenthesis (`STRUCT(a int8)`,
-    `TIMESTAMP WITH TIME ZONE`); a type after `::`, with its parentheses and words; and the run of
-    type words before a string, a typed literal (`DATE '2020-01-01'`). Codex's eighth review of
-    M230's branch found nested and multi-word types refused where only the next token was a type."""
-    kinds = sqlglot.Dialect.get_or_raise(dialect).parser_class.TYPE_TOKENS
-    closes: dict[int, int] = {}
-    stack: list[int] = []
-    for i, token in enumerate(tokens):
-        if token.token_type is TokenType.L_PAREN:
-            stack.append(i)
-        elif token.token_type is TokenType.R_PAREN and stack:
-            closes[stack.pop()] = i
-    typed: set[int] = set()
-    for opening, closing in closes.items():
-        if not (opening and tokens[opening - 1].text.lower() in _CASTS):
-            continue
-        depth = 0
-        for k in range(opening + 1, closing):
-            kind = tokens[k].token_type
-            if kind is TokenType.L_PAREN:
-                depth += 1
-            elif kind is TokenType.R_PAREN:
-                depth -= 1
-            elif kind is TokenType.ALIAS and depth == 0:
-                typed.update(range(k + 1, closing))
-                break
-    for i, token in enumerate(tokens):
-        if token.token_type is TokenType.DCOLON:
-            k = i + 1
-            while k < len(tokens):
-                kind, word = tokens[k].token_type, tokens[k].text.lower()
-                if kind is TokenType.L_PAREN and k in closes:
-                    typed.update(range(k, closes[k] + 1))
-                    k = closes[k] + 1
-                elif kind in kinds or word in _TYPE_WORDS or kind in (TokenType.L_BRACKET, TokenType.R_BRACKET) \
-                        or k == i + 1:
-                    typed.add(k)
-                    k += 1
-                else:
-                    break
-        elif token.token_type is TokenType.STRING:
-            k = i - 1
-            while k >= 0 and (tokens[k].token_type in kinds or tokens[k].text.lower() in _TYPE_WORDS):
-                typed.add(k)
-                k -= 1
-    return typed
+def _a_name_stands_there(text: str, token, dialect: str | None) -> bool:
+    """Whether the place `token` stands in is one where a name stands, so the engine reads the word
+    there as the table it spells: a fresh name in its stead parses as a column reference (bare, by a
+    dot, in brackets or parentheses). Where it parses as anything else, or not at all, only a keyword
+    fits: `INTERVAL '1' DAY` on a table named day is a unit (Codex's ninth review of M230's branch),
+    as M222's probes read a place."""
+    probe = text[:token.start] + _PROBE + text[token.end + 1:]
+    try:
+        tree = sqlglot.parse_one(probe, read=dialect)
+    except sqlglot.errors.SqlglotError:
+        return False
+    return any(isinstance(node.parent, exp.Column) for node in tree.find_all(exp.Identifier)
+               if node.name == _PROBE)
 
 
 def a_table_named_in_text(text: str, dialect: str | None, outer: frozenset[str] = frozenset()) -> str | None:
@@ -537,9 +499,11 @@ def a_table_named_in_text(text: str, dialect: str | None, outer: frozenset[str] 
     or alias the text names in scope where the parse of the same text holds no name at that offset,
     so the parse read it as a function, literal or type. Read off the text, never a reprint: sqlglot
     prints `int8` as BIGINT, so a filter's `int8['secret']` under `FROM kw AS int8` passed a check of
-    the reprint while DuckDB read kw's column (Codex's fifth review of M230's branch). A call (the
-    word before `(`) is no reference to the table; a word after a dot with no name at its offset is
-    counted, which can only refuse more. `outer` is every table and alias in scope from outside the
+    the reprint while DuckDB read kw's column (Codex's fifth review of M230's branch). Each such word
+    is then asked of its place (`_a_name_stands_there`): only where a name stands does the engine read
+    the word as the table, so a type, a call, an interval's unit or EXTRACT's field spelled like the
+    table is passed over (its seventh to ninth reviews found each refused by narrower rules, which
+    this one probe replaces). `outer` is every table and alias in scope from outside the
     text: the filtered table's own name, and a write's, whose filter is conjoined to its statement
     (Codex's sixth review: a filter `int8['secret'] = ...` on a table named int8 declared nothing)."""
     tree = sqlglot.parse_one(text, read=dialect)
@@ -548,17 +512,12 @@ def a_table_named_in_text(text: str, dialect: str | None, outer: frozenset[str] 
     if not named:
         return None
     held = {node.meta["start"] for node in tree.find_all(exp.Identifier) if "start" in node.meta}
-    tokens = sqlglot.tokenize(text, read=dialect)
-    typed = _type_positions(tokens, dialect)
-    for i, token in enumerate(tokens):
+    for token in sqlglot.tokenize(text, read=dialect):
         word = token.text.lower()
         if word not in named or token.token_type in _QUOTED_TOKENS or token.start in held:
             continue
-        if i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.L_PAREN:
-            continue  # a call, which names no table
-        if i in typed:
-            continue  # `TRY_CAST(x AS int8)` on a table named int8 names a type (Codex's seventh review)
-        return word
+        if _a_name_stands_there(text, token, dialect):
+            return word
     return None
 
 
