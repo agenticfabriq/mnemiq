@@ -90,10 +90,9 @@ def modes_for(settings: Settings) -> dict[str, Mode]:
     return modes
 
 
-def widest_card_style(settings: Settings) -> str:
-    """The largest schema form any mode sends, which is the one the window has to hold."""
-    styles = {mode.card_style or settings.card_style for mode in modes_for(settings).values()}
-    return next(style for style in ("cards", "ddl", "bare") if style in styles)
+def card_styles(settings: Settings) -> list[str]:
+    """Every schema form a mode sends. No form is always the largest, so the window is checked for each."""
+    return sorted({mode.card_style or settings.card_style for mode in modes_for(settings).values()})
 
 
 def build_agent(

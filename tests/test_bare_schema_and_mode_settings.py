@@ -14,7 +14,7 @@ import pytest
 import sqlglot
 from pydantic import ValidationError
 
-from mnemiq.agent.modes import MODES, PROFILES, modes_for, widest_card_style
+from mnemiq.agent.modes import MODES, PROFILES, card_styles, modes_for
 from mnemiq.agent.route import UnknownMode
 from mnemiq.authz.grants import GrantSet
 from mnemiq.config import Settings
@@ -112,6 +112,18 @@ def test_a_join_with_no_keys_is_still_named():
 def test_a_name_is_spelled_so_a_copy_of_it_runs_on_this_engine(name, dialect, spelled):
     snapshot = _snapshot(_column("t", name, "INTEGER"), _column("t", "other"))
     assert f"\n    {spelled} INTEGER," in _card(snapshot, "t", dialect=dialect)
+
+
+def test_a_dotted_column_is_one_name_and_a_dotted_table_may_be_a_path():
+    """A column name is never qualified, so its dot belongs to the name: unquoted, the statement would not parse and a
+    copy of it would read as table and column. An object id may be either, and the id alone cannot say which."""
+    snapshot = _snapshot(_column("main.orders", "a.b"), _column("account", "c.d"),
+                         relationships=[_fk("main.orders", "account", ("a.b", "c.d"))])
+    card = _card(snapshot, "main.orders")
+    assert card.startswith("CREATE TABLE main.orders (")
+    assert '\n    "a.b" INTEGER,' in card
+    assert 'FOREIGN KEY ("a.b") REFERENCES account ("c.d")' in card
+    sqlglot.parse_one(card, read="duckdb")
 
 
 def test_a_table_and_its_keys_are_spelled_the_same_way():
@@ -214,11 +226,11 @@ def test_a_knob_that_would_change_nothing_is_refused(knobs):
     assert modes_for(_settings(mode_settings={"instant": {**knobs, "candidates": 3}}))["instant"].candidates == 3
 
 
-def test_the_widest_form_any_mode_can_send_is_the_one_the_window_is_checked_for():
-    assert widest_card_style(_settings()) == "cards"
-    assert widest_card_style(_settings(card_style="bare")) == "bare"
-    assert widest_card_style(_settings(card_style="bare", mode_settings={"deep": {"card_style": "ddl"}})) == "ddl"
-    assert widest_card_style(_settings(mode_settings={"instant": {"card_style": "bare"}})) == "cards"
+def test_every_form_a_mode_sends_is_named_once():
+    assert card_styles(_settings()) == ["cards"]
+    assert card_styles(_settings(card_style="bare")) == ["bare"]
+    assert card_styles(_settings(card_style="bare", mode_settings={"deep": {"card_style": "ddl"}})) == ["bare", "ddl"]
+    assert card_styles(_settings(mode_settings={"instant": {"card_style": "bare"}})) == ["bare", "cards"]
 
 
 def test_a_copied_env_example_line_means_no_settings(monkeypatch):
@@ -268,8 +280,8 @@ def test_an_unknown_profile_is_refused_naming_the_real_ones():
 
 
 def test_a_profile_reaches_the_window_check():
-    assert widest_card_style(_settings(profile="qwen-32b")) == "cards"
-    assert widest_card_style(_settings(profile="qwen-32b", card_style="bare")) == "bare"
+    assert card_styles(_settings(profile="qwen-32b")) == ["bare", "cards"]
+    assert card_styles(_settings(profile="qwen-32b", card_style="bare")) == ["bare"]
 
 
 # --- the join: the mode's form reaches the prompt ---------------------------------------------------
@@ -384,8 +396,13 @@ def test_a_bare_prompt_over_the_window_has_nothing_to_withhold(caplog):
     assert any("no column descriptions to withhold" in r.getMessage() for r in caplog.records)
 
 
-def test_the_window_is_checked_for_the_widest_form_a_mode_sends(monkeypatch, tmp_path):
-    """A deployment on the bare form with one mode on cards can still overflow on that mode."""
+def _report(prompt_tokens: int):
+    from mnemiq.llm.window import WindowReport
+
+    return WindowReport(prompt_tokens=prompt_tokens, reply_tokens=10, window=100, counted_by_server=True, cards=1)
+
+
+def _window_warnings(monkeypatch, caplog, sizes: dict, **fields) -> tuple[list[str], str]:
     import mnemiq.llm.window as window_mod
     from mnemiq.runtime import _warn_prompt_window
 
@@ -393,10 +410,37 @@ def test_the_window_is_checked_for_the_widest_form_a_mode_sends(monkeypatch, tmp
 
     def fake_worst(con, snapshot, settings, dialect, authz):
         seen.append(settings.card_style)
-        raise RuntimeError("stop here: the form is what this test reads")
+        return _report(sizes[settings.card_style])
 
     monkeypatch.setattr(window_mod, "worst_window", fake_worst)
-    settings = _settings(card_style="bare", llm_window_check=True, mode_settings={"deep": {"card_style": "cards"}})
-    settings = settings.model_copy(update={"llm_base_url": "http://x/v1"})
-    _warn_prompt_window(settings, None, Snapshot(version="v", source_id="s", created_at="t"), None, None, frozenset())
+    settings = _settings(llm_window_check=True, **fields).model_copy(update={"llm_base_url": "http://x/v1"})
+    with caplog.at_level(logging.INFO, logger="mnemiq.runtime"):
+        _warn_prompt_window(settings, None, Snapshot(version="v", source_id="s", created_at="t"), None, None,
+                            frozenset())
+    return seen, caplog.text
+
+
+@pytest.mark.parametrize("sizes", [{"bare": 500, "cards": 50}, {"bare": 50, "cards": 500}])
+def test_the_window_is_checked_for_every_form_and_the_worst_is_reported(monkeypatch, caplog, sizes):
+    """No form is always the largest: on a schema with little to describe, the card can be the smaller. So each form
+    in use is measured, and a mode that cannot fit is reported whichever form it is on."""
+    seen, text = _window_warnings(monkeypatch, caplog, sizes, mode_settings={"instant": {"card_style": "bare"}})
+    assert seen == ["bare", "cards"]
+    assert "510" in text          # the larger one's tokens, prompt and reply
+    assert "prompt window fits" not in text
+
+
+def test_one_form_is_measured_once(monkeypatch, caplog):
+    seen, _ = _window_warnings(monkeypatch, caplog, {"cards": 50})
     assert seen == ["cards"]
+
+
+@pytest.mark.parametrize("fields", [{"profile": "qwen-32b"}, {"mode_settings": {"instant": {"card_style": "bare"}}},
+                                    {"profile": "nobody"}])
+def test_the_eval_door_refuses_settings_it_would_not_apply(fields):
+    """It builds its own agent and takes no mode, so these would never run, and a benchmark through it would report
+    settings that did not. `MNEMIQ_CARD_STYLE` and its own arguments are what it reads."""
+    from mnemiq.eval.engine import build_engine
+
+    with pytest.raises(ValueError, match="eval"):
+        build_engine(Snapshot(version="v", source_id="s", created_at="t"), None, _settings(**fields))

@@ -198,15 +198,16 @@ def _render_ddl(table: str, cols: list[tuple[str, str, str]], rels: list[str]) -
     return out
 
 
+def _bare_table(name: str, dialect: str | None) -> str:
+    """A table's object id as a model should copy it. A dotted one is left as written: it may be a qualified name or
+    one name holding a dot, and the id alone cannot say which."""
+    return name if "." in name else _bare_name(name, dialect)
+
+
 def _bare_name(name: str, dialect: str | None) -> str:
     """`name` as a model should copy it: quoted only where the plain spelling would not reach it on this engine,
-    because it is not a plain word, is a word the engine reserves, or folds to another name.
-
-    A dotted object id is left as written: it may be a qualified name or one name holding a dot, and the id alone
-    cannot say which. An engine with no list of its own takes every list, since a needless quote costs nothing and a
-    missing one makes the statement a syntax error."""
-    if "." in name:
-        return name
+    because it is not a plain word, is a word the engine reserves, or folds to another name. An engine with no list of
+    its own takes every list, since a needless quote costs nothing and a missing one makes the statement a syntax error."""
     lists = [frozenset(words) for words in (RESERVED.get((dialect or "").lower()),
                                             BARE_TABLE_UNSAFE.get((dialect or "").lower())) if words]
     if not lists:
@@ -225,9 +226,10 @@ def _render_bare(table: str, cols: list[tuple[str, str, str]], rels: list, diale
         if rel.join_keys:
             left = ", ".join(_bare_name(k.left, dialect) for k in rel.join_keys)
             right = ", ".join(_bare_name(k.right, dialect) for k in rel.join_keys)
-            items.append((f"    FOREIGN KEY ({left}) REFERENCES {_bare_name(rel.to, dialect)} ({right})", ""))
+            items.append((f"    FOREIGN KEY ({left}) REFERENCES {_bare_table(rel.to, dialect)} ({right})", ""))
     body = "\n".join(text + ("," if i < len(items) - 1 else "") + (f"  -- {note}" if note else "")
                      for i, (text, note) in enumerate(items))
-    out = f"CREATE TABLE {_bare_name(table, dialect)} (\n{body}\n);" if body else f"CREATE TABLE {_bare_name(table, dialect)} (\n);"
-    named = [f"-- joins {_bare_name(rel.to, dialect)}" for rel in rels if not rel.join_keys]
+    name = _bare_table(table, dialect)
+    out = f"CREATE TABLE {name} (\n{body}\n);" if body else f"CREATE TABLE {name} (\n);"
+    named = [f"-- joins {_bare_table(rel.to, dialect)}" for rel in rels if not rel.join_keys]
     return "\n".join([out, *named])

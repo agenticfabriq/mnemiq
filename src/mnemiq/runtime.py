@@ -8,7 +8,7 @@ from typing import Any
 
 from mnemiq.agent.history import scope_history
 from mnemiq.agent.loop import Agent, AgentAnswer
-from mnemiq.agent.modes import DEFAULT_MODE, MODES, Mode, build_agent, modes_for, widest_card_style
+from mnemiq.agent.modes import DEFAULT_MODE, MODES, Mode, build_agent, card_styles, modes_for
 from mnemiq.agent.route import Router, StaticRouter, UnknownMode
 from mnemiq.assembly import build_components
 from mnemiq.authz.grants import AuthzProvider, DenyAll, FileAuthzProvider
@@ -444,10 +444,12 @@ def _warn_prompt_window(settings: Settings, con, snapshot, adapter, authz,
 
         # Per identity: what is sent to be counted must be what that identity's own questions
         # could send (`mnemiq.llm.window`).
-        # For the largest form any mode sends: `Settings.card_style` alone would pass a deployment whose
-        # one mode on the fuller form cannot fit.
-        report = worst_window(con, snapshot, settings.model_copy(update={"card_style": widest_card_style(settings)}),
-                              getattr(adapter, "dialect", "duckdb"), authz)
+        # Each form a mode sends, and the worst of them reported: `Settings.card_style` alone would pass a
+        # deployment with one mode on a form that cannot fit, and no form is always the largest.
+        reports = [worst_window(con, snapshot, settings.model_copy(update={"card_style": style}),
+                                getattr(adapter, "dialect", "duckdb"), authz)
+                   for style in card_styles(settings)]
+        report = max((r for r in reports if r is not None), key=lambda r: r.needed, default=None)
     except Exception as exc:  # noqa: BLE001 -- an advisory check must never stop a boot
         # INFO, not DEBUG: a server that cannot be reached is already a count it did not give, so
         # what lands here is the measurement itself failing (or a base URL httpx cannot parse),
