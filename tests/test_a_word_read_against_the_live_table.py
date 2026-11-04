@@ -259,3 +259,24 @@ def test_a_federated_registry_schema_is_matched_without_regard_to_case(registere
                       registry={"pg": registered},
                       policy=AccessPolicy(policy_schema=snapshot, row_filters={"pg.kw": "current_catalog = 'x'"}))
     assert isinstance(filtered, Refusal) and filtered.code is RefusalCode.INVALID_ROW_FILTER, filtered
+
+
+def test_a_user_table_named_like_the_internal_prefix_is_inventoried():
+    # SQLite's internal-name exclusion escapes the LIKE underscore, so a user table `sqlitex` (not an
+    # internal `sqlite_` name) is discovered and inventoried; the plain LIKE dropped it, and a guarded
+    # word reading its live column was approved (Codex's sixth review of the live-column change).
+    import sqlite3
+    from mnemiq.adapters.sqlite import SQLiteAdapter
+    con = sqlite3.connect(":memory:")
+    con.execute('CREATE TABLE sqlitex (id INT, "true" INT)')
+    con.execute("INSERT INTO sqlitex (id, \"true\") VALUES (1, 123), (2, 456)")
+    adapter = SQLiteAdapter.__new__(SQLiteAdapter)
+    adapter._con = con
+    assert "sqlitex" in adapter.introspect()
+    snapshot = {"sqlitex": {"id"}}
+    read = decide("SELECT true FROM sqlitex", snapshot, adapter=adapter, dialect="sqlite", target="sqlite",
+                  policy=AccessPolicy(policy_schema=snapshot))
+    assert isinstance(read, Refusal) and read.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, read
+    filtered = decide("SELECT id FROM sqlitex", snapshot, adapter=adapter, dialect="sqlite", target="sqlite",
+                      policy=AccessPolicy(policy_schema=snapshot, row_filters={"sqlitex": "true = 123"}))
+    assert isinstance(filtered, Refusal) and filtered.code is RefusalCode.INVALID_ROW_FILTER, filtered

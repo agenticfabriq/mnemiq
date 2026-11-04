@@ -27,7 +27,7 @@ class SQLiteAdapter:
     def introspect(self) -> list[str]:
         rows = self._con.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' "
-            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            r"AND name NOT LIKE 'sqlite\_%' ESCAPE '\' ORDER BY name"  # `_` is a LIKE wildcard: escape it, or a user table like `sqlitex` is dropped (M225, Codex review)
         ).fetchall()
         return [r[0] for r in rows]
 
@@ -37,7 +37,7 @@ class SQLiteAdapter:
         implemented in `str.partition`."""
         rows = self._con.execute(
             "SELECT name, sql FROM sqlite_master WHERE type = 'view' "
-            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            r"AND name NOT LIKE 'sqlite\_%' ESCAPE '\' ORDER BY name"  # `_` is a LIKE wildcard: escape it, as introspect does
         ).fetchall()
         return [(r[0], r[1], "sqlite") for r in rows if r[1]]
 
