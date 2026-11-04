@@ -476,14 +476,60 @@ def a_table_named_by_a_word(ast: exp.Expression, engine: str | None) -> Refusal 
     return None
 
 
-def _a_type_position(tokens: list, i: int) -> bool:
-    """Whether token `i` stands where the text names a type: after `::`, before a string (a typed
-    literal, `DATE '2020-01-01'`), or after `AS` with no name of its own, which only a cast's type is
-    (an alias is a name at its offset, and the caller has passed those over)."""
-    previous = tokens[i - 1] if i else None
-    if previous is not None and previous.token_type in (TokenType.DCOLON, TokenType.ALIAS):
-        return True
-    return i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.STRING
+_CASTS = frozenset({"cast", "try_cast", "safe_cast"})
+# The words a type is spelled with beside its own keywords: `TIMESTAMP WITH TIME ZONE`,
+# `DOUBLE PRECISION`, `CHARACTER VARYING`.
+_TYPE_WORDS = frozenset({"with", "without", "time", "zone", "local", "precision", "varying"})
+
+
+def _type_positions(tokens: list, dialect: str | None) -> set[int]:
+    """The indexes of the tokens that spell a type, where the engine reads a type and nothing else: a
+    cast's target, everything after its own `AS` up to its closing parenthesis (`STRUCT(a int8)`,
+    `TIMESTAMP WITH TIME ZONE`); a type after `::`, with its parentheses and words; and the run of
+    type words before a string, a typed literal (`DATE '2020-01-01'`). Codex's eighth review of
+    M230's branch found nested and multi-word types refused where only the next token was a type."""
+    kinds = sqlglot.Dialect.get_or_raise(dialect).parser_class.TYPE_TOKENS
+    closes: dict[int, int] = {}
+    stack: list[int] = []
+    for i, token in enumerate(tokens):
+        if token.token_type is TokenType.L_PAREN:
+            stack.append(i)
+        elif token.token_type is TokenType.R_PAREN and stack:
+            closes[stack.pop()] = i
+    typed: set[int] = set()
+    for opening, closing in closes.items():
+        if not (opening and tokens[opening - 1].text.lower() in _CASTS):
+            continue
+        depth = 0
+        for k in range(opening + 1, closing):
+            kind = tokens[k].token_type
+            if kind is TokenType.L_PAREN:
+                depth += 1
+            elif kind is TokenType.R_PAREN:
+                depth -= 1
+            elif kind is TokenType.ALIAS and depth == 0:
+                typed.update(range(k + 1, closing))
+                break
+    for i, token in enumerate(tokens):
+        if token.token_type is TokenType.DCOLON:
+            k = i + 1
+            while k < len(tokens):
+                kind, word = tokens[k].token_type, tokens[k].text.lower()
+                if kind is TokenType.L_PAREN and k in closes:
+                    typed.update(range(k, closes[k] + 1))
+                    k = closes[k] + 1
+                elif kind in kinds or word in _TYPE_WORDS or kind in (TokenType.L_BRACKET, TokenType.R_BRACKET) \
+                        or k == i + 1:
+                    typed.add(k)
+                    k += 1
+                else:
+                    break
+        elif token.token_type is TokenType.STRING:
+            k = i - 1
+            while k >= 0 and (tokens[k].token_type in kinds or tokens[k].text.lower() in _TYPE_WORDS):
+                typed.add(k)
+                k -= 1
+    return typed
 
 
 def a_table_named_in_text(text: str, dialect: str | None, outer: frozenset[str] = frozenset()) -> str | None:
@@ -503,14 +549,15 @@ def a_table_named_in_text(text: str, dialect: str | None, outer: frozenset[str] 
         return None
     held = {node.meta["start"] for node in tree.find_all(exp.Identifier) if "start" in node.meta}
     tokens = sqlglot.tokenize(text, read=dialect)
+    typed = _type_positions(tokens, dialect)
     for i, token in enumerate(tokens):
         word = token.text.lower()
         if word not in named or token.token_type in _QUOTED_TOKENS or token.start in held:
             continue
         if i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.L_PAREN:
             continue  # a call, which names no table
-        if _a_type_position(tokens, i):
-            continue  # `CAST(x AS int8)` on a table named int8 names a type (Codex's seventh review)
+        if i in typed:
+            continue  # `TRY_CAST(x AS int8)` on a table named int8 names a type (Codex's seventh review)
         return word
     return None
 

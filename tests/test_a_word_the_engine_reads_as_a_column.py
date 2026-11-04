@@ -641,3 +641,33 @@ def test_a_filter_s_type_positions_are_read_off_its_own_text(text, found):
     # positions are asked of the check itself, with the filtered table named int8 in scope.
     from mnemiq.sql.guard import a_table_named_in_text
     assert a_table_named_in_text(text, "duckdb", frozenset({"int8"})) == found
+
+
+@pytest.mark.parametrize("table, filt", [
+    ("int8", "TRY_CAST(ROW(id) AS STRUCT(a int8)).a > 0"),                # a nested type
+    ("time", "TRY_CAST(d AS TIMESTAMP WITH TIME ZONE) IS NOT NULL"),     # a type of several words
+    ("time", "d > TIMESTAMP WITH TIME ZONE '2000-01-01 00:00:00+00'"),    # a typed literal of several words
+])
+def test_a_nested_or_multiword_type_in_a_filter_is_a_type(table, filt):
+    # The whole type is a type, not only its first word (Codex's eighth review of this change).
+    con = duckdb.connect()
+    con.execute(f'CREATE TABLE "{table}" (id INT, d TIMESTAMP)')
+    con.execute(f"INSERT INTO \"{table}\" VALUES (1, TIMESTAMP '2020-01-01')")
+    assert con.execute(f'SELECT id FROM "{table}" WHERE {filt}').fetchall() == [(1,)]  # runs on the engine
+    schema = {table: {"id", "d"}}
+    verdict = decide(f'SELECT id FROM "{table}"', schema, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(policy_schema=schema, row_filters={table: filt}))
+    assert isinstance(verdict, Approved), verdict
+    assert con.execute(verdict.target_sql).fetchall() == [(1,)]
+
+
+@pytest.mark.parametrize("text, found", [
+    ("x::STRUCT(a int8) IS NOT NULL", None),
+    ("x::int8[] IS NOT NULL", None),
+    ("TRY_CAST(x AS DECIMAL(10, 2)) > int8['secret']", "int8"),   # the type spans its cast alone
+    ("TRY_CAST(int8['secret'] AS VARCHAR) = 'x'", "int8"),        # before the AS is a value
+    ("TRY_CAST(f(1 AS a, int8['secret']) AS VARCHAR) = 'x'", "int8"),  # an AS nested in the value is not the cast's
+])
+def test_a_type_span_ends_where_its_type_does(text, found):
+    from mnemiq.sql.guard import a_table_named_in_text
+    assert a_table_named_in_text(text, "duckdb", frozenset({"int8"})) == found
