@@ -125,3 +125,23 @@ def test_a_write_against_a_source_that_cannot_list_its_columns_is_refused():
                            dialect="duckdb", target="duckdb", writes_enabled=True,
                            policy=AccessPolicy(policy_schema=SNAPSHOT, row_filters={"kw": "current_catalog = 'allow'"}))
     assert isinstance(verdict, Refusal), verdict
+
+
+def test_a_generated_column_the_live_table_holds_is_refused_on_sqlite():
+    # SQLite's list_columns reads PRAGMA table_xinfo, so a GENERATED column, which table_info omits but
+    # the engine reads by name, is in the live inventory (Codex's review of this change, M225).
+    import sqlite3
+    from mnemiq.adapters.sqlite import SQLiteAdapter
+    con = sqlite3.connect(":memory:")
+    con.execute('CREATE TABLE kw (id INT, secret INT, "true" INT GENERATED ALWAYS AS (secret) VIRTUAL)')
+    con.execute("INSERT INTO kw (id, secret) VALUES (1, 123), (2, 456)")
+    adapter = SQLiteAdapter.__new__(SQLiteAdapter)
+    adapter._con = con
+    assert "true" in {c for _t, c, _ in adapter.list_columns()}  # the premise: xinfo lists it
+    snapshot, schema = {"kw": {"id"}}, {"kw": {"id", "secret"}}
+    read = decide("SELECT true FROM kw", snapshot, adapter=adapter, dialect="sqlite", target="sqlite",
+                  policy=AccessPolicy(policy_schema=schema))
+    assert isinstance(read, Refusal) and read.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, read
+    filtered = decide("SELECT id FROM kw", snapshot, adapter=adapter, dialect="sqlite", target="sqlite",
+                      policy=AccessPolicy(policy_schema=schema, row_filters={"kw": "true = 123"}))
+    assert isinstance(filtered, Refusal) and filtered.code is RefusalCode.INVALID_ROW_FILTER, filtered
