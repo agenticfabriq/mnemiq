@@ -15,7 +15,7 @@ from mnemiq.sql.deadline import paused
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import expand_tables, names_one_object, object_key
 from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys, is_lambda_parameter, map_struct
-from mnemiq.sql.reserved_words import reserved
+from mnemiq.sql.reserved_words import bare_table_reserved, reserved
 from mnemiq.sql.scope import (KnownColumns, base_tables, column_tables, cte_references,
                               known_columns, scope_resolved)
 from mnemiq.sql.verdict import Refusal, RefusalCode
@@ -2646,9 +2646,33 @@ def _raising_refusal(node: exp.Expression, table: str, engine: str) -> Refusal:
     )
 
 
+def _spelled_name(name: str, engine: str | None) -> exp.Identifier:
+    """`name` as an identifier the engine reads back as that name: quoted where the engine
+    reserves the bare word (`null`, `true`, `false`, ...), else left as sqlglot spells it.
+
+    Forced quoting only where the word is reserved: a bare reserved word is no name to the
+    engine, so the governed query will not parse (M233); but quoting a NON-reserved bare
+    identifier folds differently on Oracle and Postgres, which would change the identity the
+    outer query's references resolve to, so those stay bare."""
+    ident = exp.to_identifier(name)
+    if bare_table_reserved(name, engine):
+        ident.set("quoted", True)
+    return ident
+
+
+def _spelled_table(table: str, engine: str | None) -> exp.Table:
+    """The table a filtered derived table reads from, each dotted part quoted where the engine
+    reserves it (M233). `exp.to_table` splits on dots, so a qualified key is spelled part by part."""
+    node = exp.to_table(table)
+    for part in (node.args.get("catalog"), node.args.get("db"), node.this):
+        if isinstance(part, exp.Identifier) and bare_table_reserved(part.name, engine):
+            part.set("quoted", True)
+    return node
+
+
 def _derived_table(
     table: str, alias: str, cols: set[str], masked_cols: set[str], filt: exp.Expression | None,
-    fence: bool = False,
+    fence: bool = False, engine: str | None = None,
 ) -> exp.Subquery:
     """(SELECT <cols, masked->NULL AS c> FROM table [WHERE filt [AND ROWNUM > 0]]) AS alias.
 
@@ -2663,12 +2687,12 @@ def _derived_table(
             projections.append(exp.alias_(exp.null(), c))
         else:
             projections.append(exp.column(c))
-    inner = exp.select(*projections).from_(exp.to_table(table))
+    inner = exp.select(*projections).from_(_spelled_table(table, engine))
     if filt is not None:
         inner = inner.where(filt)
         if fence:
             inner = inner.where(exp.GT(this=exp.column("ROWNUM"), expression=exp.Literal.number(0)))
-    return exp.Subquery(this=inner, alias=exp.TableAlias(this=exp.to_identifier(alias)))
+    return exp.Subquery(this=inner, alias=exp.TableAlias(this=_spelled_name(alias, engine)))
 
 
 @dataclass(frozen=True)
@@ -2916,8 +2940,10 @@ def apply_row_and_mask(
             # the projection was EMPTY, so the masked column was emitted as its real
             # value instead of NULL -- the mask silently doing nothing.
             masked_by_table.get(name.lower(), set()), filt,
-            # The engine that RUNS it, as everywhere else here: the fence is about its optimizer.
+            # The engine that RUNS it, as everywhere else here: the fence is about its optimizer,
+            # and the engine decides which reserved table/alias names must be quoted (M233).
             fence=(executes_as or dialect).lower() in _FENCED,
+            engine=(executes_as or dialect),
         )
         table_node.replace(derived)
         _record(narrowed, Narrowing(object=name, rows=needs_filter, columns=needs_mask))
