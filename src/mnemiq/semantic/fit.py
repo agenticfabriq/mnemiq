@@ -152,14 +152,15 @@ class PromptFitter:
                                   declare_assumed_terms=self.declare_assumed_terms)
                     for s in (None, *STRATEGIES)), key=len)
 
-    def fit(self, packet: ContextPacket, snapshot, grants) -> ContextPacket:
+    def fit(self, packet: ContextPacket, snapshot, grants, card_style: str | None = None) -> ContextPacket:
         """`packet` itself when it fits (or nothing says how big the window is); otherwise a copy
         whose cards carry as many descriptions as fit. Never raises: a question is not stopped by
-        the step that exists to let it through."""
+        the step that exists to let it through. `card_style` is the form `packet` was retrieved
+        in, where the mode's differs from the deployment's."""
         if len(packet.question) > self.max_question_chars:
             return packet  # declined, by the door or the agent (M147): nothing to fit, nothing to count
         try:
-            return self._fit(packet, snapshot, grants)
+            return self._fit(packet, snapshot, grants, card_style or self.card_style)
         except Exception:  # noqa: BLE001
             logger.warning("prompt window: fitting the cards failed; sending them as retrieved",
                            exc_info=True)
@@ -193,7 +194,7 @@ class PromptFitter:
         self._server_window, self._window_seen_at = reported, time.monotonic()
         return tokens
 
-    def _fit(self, packet: ContextPacket, snapshot, grants) -> ContextPacket:
+    def _fit(self, packet: ContextPacket, snapshot, grants, style: str) -> ContextPacket:
         from mnemiq.generate.prompts import user_prompt
 
         if snapshot is None or not packet.cards:
@@ -221,9 +222,14 @@ class PromptFitter:
             window = self._server_window or self.window  # that count may have moved it
         if (tokens if tokens is not None else ceiling) + reserve <= window:
             return packet
-        return self._trim(packet, snapshot, grants, system, reserve, tokens)
+        if style == "bare":
+            logger.warning("prompt window: the prompt needs about %d tokens against %d after the reply "
+                           "budget, with no column descriptions to withhold; the server may refuse it",
+                           tokens if tokens is not None else ceiling, window - reserve)
+            return packet
+        return self._trim(packet, snapshot, grants, system, reserve, tokens, style)
 
-    def _trim(self, packet, snapshot, grants, system, reserve, full_tokens) -> ContextPacket:
+    def _trim(self, packet, snapshot, grants, system, reserve, full_tokens, style) -> ContextPacket:
         """The most descriptions, in rank order, whose prompt fits the window less `reserve`.
 
         Estimated from the server's counts at both ends -- the full prompt and the one with no
@@ -245,11 +251,11 @@ class PromptFitter:
         def render(n: int) -> ContextPacket:
             keep = set(ranked[:n])
             texts = {c.object_id: c.text for c in build_cards(
-                snapshot, policy=policy, style=self.card_style,
+                snapshot, policy=policy, style=style, dialect=self.dialect,
                 describe=lambda table, column: (table, column) in keep)}
             fresh = [RetrievedCard(object_id=c.object_id, card=texts[c.object_id], score=c.score)
                      for c in packet.cards if c.object_id in texts]
-            _attach_facts(fresh, snapshot.table_facts, self.card_style, grants=grants,
+            _attach_facts(fresh, snapshot.table_facts, style, grants=grants,
                           columns=snapshot.columns,
                           relationships=known_relationships(snapshot))
             by_id = {c.object_id: c for c in fresh}

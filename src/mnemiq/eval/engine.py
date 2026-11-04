@@ -231,6 +231,7 @@ def build_engine(
                           # validates it, so `DDL` or a stray space cannot silently select
                           # the other form.
                           card_style=settings.card_style,
+                          dialect=getattr(adapter, "dialect", None),
                           definitions=definitions, table_facts=snapshot.table_facts,
                           metrics=snapshot.metrics, dimensions=snapshot.dimensions,
                           columns=snapshot.columns, ontology_index=ontology_index,

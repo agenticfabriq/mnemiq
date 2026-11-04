@@ -192,7 +192,8 @@ def largest_prompts(con, snapshot, settings, dialect: str,
     k = settings.retrieval_k
     # The cards retrieval renders for this identity: its tables only, under its column policy.
     rendered = [c for c in build_cards(snapshot, policy=build_access_policy(snapshot, grants),
-                                       style=settings.card_style, describe=describe)
+                                       style=settings.card_style, describe=describe,
+                                       dialect=dialect)
                 if c.object_id in grants.objects]
     # Every granted table visible, so a definition bound to one inside the k and one outside it
     # still rides in.

@@ -8,7 +8,7 @@ from typing import Any
 
 from mnemiq.agent.history import scope_history
 from mnemiq.agent.loop import Agent, AgentAnswer
-from mnemiq.agent.modes import DEFAULT_MODE, MODES, build_agent
+from mnemiq.agent.modes import DEFAULT_MODE, MODES, Mode, build_agent, modes_for, widest_card_style
 from mnemiq.agent.route import Router, StaticRouter, UnknownMode
 from mnemiq.assembly import build_components
 from mnemiq.authz.grants import AuthzProvider, DenyAll, FileAuthzProvider
@@ -75,6 +75,7 @@ class Runtime:
     authz: AuthzProvider
     settings: Settings | None
     agents: dict[str, Agent] | None = None  # one per mode; None = single-agent (tests)
+    modes: dict[str, Mode] | None = None  # what each agent was built from, `Settings.mode_settings` applied
     router: Router = field(default_factory=StaticRouter)
     loaded_versions: dict[str, str] = field(default_factory=dict)
     sink: Any = None  # observability sink; None = NullSink (no record written)
@@ -139,6 +140,13 @@ class Runtime:
                                 self.authz, _acknowledged(self.settings))
             _warn_policy_advisories(self.authz, snapshot)
 
+    def _card_style(self, mode: str) -> str:
+        """The schema form this mode's prompt carries."""
+        own = (self.modes or {}).get(mode)
+        if own is not None and own.card_style:
+            return own.card_style
+        return self.settings.card_style if self.settings else "cards"
+
     def _source_id(self) -> str:
         """The id this runtime is actually answering FOR.
 
@@ -188,7 +196,8 @@ class Runtime:
                 table_facts=self.snapshot.table_facts if self.snapshot else (),
                 # Both doors pass this or the eval measures a prompt form `ask` cannot emit
                 # -- the M81 shape the two-doors guard exists to catch, which it did.
-                card_style=self.settings.card_style if self.settings else "cards",
+                card_style=self._card_style(name),
+                dialect=getattr(self.adapter, "dialect", None),
                 # Definitions ride with the snapshot: the glossary channel had no runtime
                 # producer until the ontology digest, so this stayed unfed from Plan 08 until SP1.
                 definitions=self.snapshot.definitions if self.snapshot else (),
@@ -209,7 +218,7 @@ class Runtime:
         # After the history, which the prompt carries too; before the agent, so the generator, the
         # corrector and the judge all read the cards the window has room for (M127).
         if self.fitter is not None:
-            packet = self.fitter.fit(packet, self.snapshot, grants)
+            packet = self.fitter.fit(packet, self.snapshot, grants, card_style=self._card_style(name))
         answer = agent.answer(packet, self.snapshot, grants, identity, emit=emit)
         return self._record(answer, name, grants, identity, packet.question, packet, started)
 
@@ -435,8 +444,10 @@ def _warn_prompt_window(settings: Settings, con, snapshot, adapter, authz,
 
         # Per identity: what is sent to be counted must be what that identity's own questions
         # could send (`mnemiq.llm.window`).
-        report = worst_window(con, snapshot, settings, getattr(adapter, "dialect", "duckdb"),
-                              authz)
+        # For the largest form any mode sends: `Settings.card_style` alone would pass a deployment whose
+        # one mode on the fuller form cannot fit.
+        report = worst_window(con, snapshot, settings.model_copy(update={"card_style": widest_card_style(settings)}),
+                              getattr(adapter, "dialect", "duckdb"), authz)
     except Exception as exc:  # noqa: BLE001 -- an advisory check must never stop a boot
         # INFO, not DEBUG: a server that cannot be reached is already a count it did not give, so
         # what lands here is the measurement itself failing (or a base URL httpx cannot parse),
@@ -798,12 +809,13 @@ def _build_verifier(level: str, *, threshold: float, grounding: bool, judge, fai
                     fail_closed=fail_closed)
 
 
-def _build_mode_verifiers(settings: Settings, *, client):
+def _build_mode_verifiers(settings: Settings, *, client, modes: dict[str, Mode] | None = None):
     """Return ({mode_name: Verifier|None}, judge_build_count). The judge is built at most once
     (self-judge on the local model, unless MNEMIQ_VERIFY_* points elsewhere) and shared across
     every mode that needs it."""
     override = settings.verify_override
-    levels = {name: _resolve_verify_level(m.verify, override) for name, m in MODES.items()}
+    modes = modes if modes is not None else modes_for(settings)
+    levels = {name: _resolve_verify_level(m.verify, override) for name, m in modes.items()}
     judge = None
     judge_calls = 0
     if any(lvl == "full" for lvl in levels.values()):
@@ -821,7 +833,7 @@ def _build_mode_verifiers(settings: Settings, *, client):
                               grounding=settings.verify_grounding, judge=judge,
                               fail_closed=settings.verify_fail_closed,
                               sanity=settings.verify_sanity)
-        for name in MODES
+        for name in modes
     }
     return verifiers, judge_calls
 
@@ -936,7 +948,8 @@ def build_runtime(settings: Settings) -> Runtime:
     ontology = OntologyIndex(con)
     # Per-mode result verifier: sanity (free) in every mode, judge in `thinking` and `deep`; the
     # judge is built once and shared. MNEMIQ_VERIFY=0 forces off (byte-for-byte), =1 forces full.
-    verifiers, _ = _build_mode_verifiers(settings, client=kit.client)
+    modes = modes_for(settings)
+    verifiers, _ = _build_mode_verifiers(settings, client=kit.client, modes=modes)
     agents = {
         name: build_agent(
             mode,
@@ -952,7 +965,7 @@ def build_runtime(settings: Settings) -> Runtime:
             guard_fanout=settings.guard_fanout,
             max_question_chars=settings.max_question_chars,
         )
-        for name, mode in MODES.items()
+        for name, mode in modes.items()
     }
     _boot_authz = _authz(settings)
     _warn_policy_advisories(_boot_authz, snapshot)
@@ -973,6 +986,7 @@ def build_runtime(settings: Settings) -> Runtime:
         authz=_boot_authz,
         settings=settings,
         agents=agents,
+        modes=modes,
         router=StaticRouter(default=default_mode),
         loaded_versions=loaded_versions,
         sink=sink,

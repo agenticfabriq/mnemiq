@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import field_validator, Field, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator, Field, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # The Verity endpoint the certified pull needs, as a VALUE. It is the one that accepts `since`
 # and returns a `watermark`; its sibling `/api/semantic/records` does neither, so a deployment
@@ -74,6 +74,32 @@ def _manifest_tables(entry: dict) -> tuple[str, ...]:
     return tuple(t.strip() for t in tables)
 
 
+class ModeSettings(BaseModel):
+    """One mode's settings, as an operator sets them: `agent.modes.modes_for` applies what is set here over the
+    mode's own value. Refused rather than ignored, each of them: a benchmark arm whose setting never ran scores
+    cleanly and reads as "no effect", a finding about nothing."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    card_style: Literal["cards", "ddl", "bare"] | None = None
+    candidates: int | None = Field(default=None, ge=1)
+    corrector: bool | None = None
+    judge: bool | None = None
+    min_agreement: float | None = Field(default=None, ge=0, le=1)
+    budget_s: float | None = Field(default=None, gt=0)
+    max_attempts: int | None = Field(default=None, ge=1)
+    verify: Literal["off", "sanity", "full"] | None = None
+
+    @model_validator(mode="after")
+    def _null_only_where_it_means_something(self):
+        # `card_style` null is "this deployment's form", `min_agreement` null is "no agreement gate"; on any other
+        # setting a null names no value, so it could only be a mistake for leaving the setting out.
+        for name in self.model_fields_set - {"card_style", "min_agreement"}:
+            if getattr(self, name) is None:
+                raise ValueError(f"{name} cannot be null: leave it out to keep the mode's own value")
+        return self
+
+
 class Settings(BaseSettings):
     """All engine configuration, one source of truth. `env_prefix="MNEMIQ_"` maps each field to its
     env var (llm_base_url -> MNEMIQ_LLM_BASE_URL), so every historical name is preserved. No env_file:
@@ -126,10 +152,28 @@ class Settings(BaseSettings):
     # Validated, not free text: `style != "ddl"` in the renderer means `DDL` or `ddl ` would
     # silently select the OTHER form, and the run record would not say which one produced the
     # score -- a 35.7% form and a 50.5% form told apart only by shell history.
-    card_style: Literal["cards", "ddl"] = Field(default="cards",
-                            description="schema card form for the GENERATOR: cards|ddl. "
+    card_style: Literal["cards", "ddl", "bare"] = Field(default="cards",
+                            description="schema card form for the GENERATOR: cards|ddl|bare. "
                                         "`ddl` renders CREATE TABLE for a model fine-tuned "
-                                        "on DDL; the retrieval index always embeds `cards`.")
+                                        "on DDL; `bare` is CREATE TABLE with names, types and "
+                                        "keys alone; the retrieval index always embeds `cards`.")
+    profile: str = Field(default="frontier",
+                         description="the settings for a kind of model, per mode: frontier|qwen-32b. "
+                                     "`frontier` is the modes as built; see `agent.modes.PROFILES`.")
+    # NoDecode, read by `_read_mode_settings`: pydantic-settings would otherwise JSON-decode the raw variable and fail
+    # on the empty line a copied `.env.example` holds, before any validator could say what it means.
+    mode_settings: Annotated[dict[str, ModeSettings] | None, NoDecode] = Field(default=None,
+                            description="per-mode settings as JSON, e.g. {\"instant\": {\"card_style\": \"bare\"}}: "
+                                        "card_style, candidates, corrector, judge, min_agreement, budget_s, "
+                                        "max_attempts, verify. They win over the profile; unset keeps its value.")
+
+    @field_validator("mode_settings", mode="before")
+    @classmethod
+    def _read_mode_settings(cls, value):
+        if isinstance(value, str):
+            return json.loads(value) if value.strip() else None
+        return value
+
     guided_sql: bool = Field(default=False, description="constrained decoding: force non-empty sql (response_format json_schema; works on vLLM and OpenAI-compatible endpoints)")
     assertive_sql: bool = Field(default=False, description="assertive prompt: attempt an answer instead of deferring")
     # M35, off by default: withdrawn on its own pre-registered criterion. Beacon's answerable band
