@@ -604,7 +604,10 @@ def live_columns_for_bare_words(ast: exp.Expression, policy, adapter, engine: st
     if policy is not None:
         wanted |= {key.lower() for key in (policy.policy_schema or {})}
     live: dict[str, set[str]] = {}
-    for row in adapter.list_columns():  # raises on a source that cannot list its columns: fail closed
+    # The execution source's inventory where the adapter narrows discovery (a scoped wrapper), else its
+    # own: the statement runs on the source, so its columns are what the engine reads.
+    inventory = adapter.execution_columns if hasattr(adapter, "execution_columns") else adapter.list_columns
+    for row in inventory():  # raises on a source that cannot list its columns: fail closed
         table = str(row[0]).lower()
         if table in wanted:
             live.setdefault(table, set()).add(str(row[1]).lower())

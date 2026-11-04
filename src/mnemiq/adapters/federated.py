@@ -99,9 +99,12 @@ class FederatedAdapter:
         catalogs; DuckDB's information_schema lists generated columns. Restricted to the registry's
         catalogs, so DuckDB's own `system`/`temp` catalogs do not enter the set."""
         rows = self._con.execute(
-            "SELECT table_catalog, table_name, column_name, data_type FROM information_schema.columns"
+            "SELECT table_catalog, table_schema, table_name, column_name, data_type FROM information_schema.columns"
         ).fetchall()
-        return [(f"{cat}.{tbl}", col, (typ or "unknown")) for cat, tbl, col, typ in rows if cat in self.catalogs]
+        # Only each catalog's registered schema, the one expansion reads: a same-named table in another
+        # schema of the catalog lent its columns to catalog.table (Codex's third review).
+        return [(f"{cat}.{tbl}", col, (typ or "unknown")) for cat, sch, tbl, col, typ in rows
+                if cat in self.catalogs and sch == self.registry.get(cat)]
 
     def execute(self, sql: str) -> list[tuple]:
         return self._con.execute(sql).fetchall()

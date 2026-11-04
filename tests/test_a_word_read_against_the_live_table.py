@@ -181,3 +181,39 @@ def test_a_source_present_but_unable_to_list_columns_refuses():
     verdict = decide("SELECT current_catalog FROM kw", SNAPSHOT, adapter=_NoList(), dialect="duckdb",
                      target="duckdb", policy=AccessPolicy(policy_schema=SNAPSHOT))
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
+
+
+def test_a_scoped_source_is_inventoried_unscoped_so_a_dropped_table_is_still_checked():
+    # The manifest's scope narrows discovery, not execution: after the scope drops kw, a snapshot that
+    # still authorizes kw reads it, and the live check must see kw's columns (Codex's third review).
+    from mnemiq.adapters.scoped import TableScopedAdapter
+    inner = _Live({"kw": {"id", "current_catalog"}, "plain": {"id"}})
+    scoped = TableScopedAdapter(inner, ("plain",), "src")
+    assert "current_catalog" not in {c for t, c, _ in scoped.list_columns()}   # discovery hides it
+    assert "current_catalog" in {c for t, c, _ in scoped.execution_columns()}  # execution does not
+    read = decide("SELECT current_catalog FROM kw", SNAPSHOT, adapter=scoped, dialect="duckdb",
+                  target="duckdb", policy=AccessPolicy(policy_schema=SNAPSHOT))
+    assert isinstance(read, Refusal) and read.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, read
+    filtered = decide("SELECT id FROM kw", SNAPSHOT, adapter=scoped, dialect="duckdb", target="duckdb",
+                      policy=AccessPolicy(policy_schema=SNAPSHOT, row_filters={"kw": "current_catalog = 'allow'"}))
+    assert isinstance(filtered, Refusal) and filtered.code is RefusalCode.INVALID_ROW_FILTER, filtered
+
+
+def test_a_federated_inventory_reads_only_the_registered_schema():
+    # A same-named table in another schema of the catalog must not lend its columns to catalog.table:
+    # archive.kw's current_date made pg.kw's current_date (the function) a refusal (Codex's third review).
+    import duckdb
+    from mnemiq.adapters.federated import FederatedAdapter
+    con = duckdb.connect()
+    con.execute("ATTACH ':memory:' AS pg")
+    con.execute("CREATE SCHEMA pg.public")
+    con.execute("CREATE SCHEMA pg.archive")
+    con.execute("CREATE TABLE pg.public.kw (id INT)")
+    con.execute('CREATE TABLE pg.archive.kw (id INT, "current_date" VARCHAR)')
+    con.execute("INSERT INTO pg.public.kw VALUES (1)")
+    adapter = FederatedAdapter.__new__(FederatedAdapter)
+    adapter._con, adapter.registry, adapter.catalogs = con, {"pg": "public"}, frozenset({"pg"})
+    assert ("pg.kw", "current_date") not in {(t, c) for t, c, _ in adapter.list_columns()}
+    verdict = decide("SELECT current_date FROM pg.kw", {"pg.kw": {"id"}}, adapter=adapter, dialect="duckdb",
+                     target="duckdb", registry={"pg": "public"}, policy=AccessPolicy(policy_schema={"pg.kw": {"id"}}))
+    assert isinstance(verdict, Approved), verdict
