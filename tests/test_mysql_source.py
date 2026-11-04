@@ -15,10 +15,16 @@ import traceback
 
 import duckdb
 import pytest
+from sqlglot.dialects.mysql import MySQL
 
 from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
 from mnemiq.eval import mysql_source
-from mnemiq.eval.mysql_source import MySQLMisconfigured, MySQLSource, MySQLUnavailable
+from mnemiq.eval.mysql_source import (
+    MySQLMisconfigured,
+    MySQLRejected,
+    MySQLSource,
+    MySQLUnavailable,
+)
 from mnemiq.execute.runner import (
     ExecutionError,
     QueryCancelledError,
@@ -733,6 +739,45 @@ def test_live_the_catalogue_reads_as_text(live_source):
     assert tables and columns
     assert all(isinstance(c[2], str) for c in columns)  # column_type arrives as bytes, decoded
     assert live_source.user_functions() == []
+
+
+@pytest.mark.integration
+@needs_mysql
+def test_live_mysql_rejects_a_bare_introducer_and_straight_join(live_source):
+    # M231: with mysql as the model's dialect, sqlglot reads a charset introducer (_utf8, _binary,
+    # ...) or STRAIGHT_JOIN as no column, so another engine would read it as a same-named column
+    # unchecked. The only path that decides as mysql -- the BEAVER source -- also executes on
+    # MySQL, which rejects these bare: an introducer expects a string literal and STRAIGHT_JOIN is a
+    # reserved keyword, so the statement fails closed here rather than reading a column. Nothing
+    # routes a mysql-dialect decision to another engine, so the cross-engine reads from the M225
+    # sweep are unreachable. This locks the engine's reading: a MySQL that accepted one bare would
+    # fail here and reopen M231.
+    # The whole class sqlglot reads as no column: every `_`-prefixed charset introducer its MySQL
+    # tokenizer knows, plus STRAIGHT_JOIN. Derived from sqlglot so the lock tracks its introducer
+    # set rather than a hand-picked few (the register's review).
+    words = sorted(k for k in MySQL.Tokenizer.KEYWORDS if k.startswith("_")) + ["straight_join"]
+    assert len(words) >= 40  # 42 introducers + straight_join on sqlglot 30.12; guards a shrunk list
+    for word in words:
+        # A same-named column IS in scope (the derived table exposes it backticked), so each bare
+        # position below would return a row if MySQL read the word as that column. None does --
+        # MySQL never reads a bare introducer or STRAIGHT_JOIN as a column (an introducer wants a
+        # string literal; STRAIGHT_JOIN is a select modifier / join operator, not a column
+        # reference), the precise interpretation M231 turns on. The select-list, WHERE, ORDER BY
+        # and GROUP BY positions are covered because `decide` as mysql approves the bare word in
+        # each, so the engine is the only barrier there.
+        scope = f"(SELECT 1 AS `{word}`) t"
+        for bare in (
+            f"SELECT {word} FROM {scope}",
+            f"SELECT 1 AS n FROM {scope} WHERE {word} = 1",
+            f"SELECT 1 AS n FROM {scope} ORDER BY {word}",
+            f"SELECT 1 AS n FROM {scope} GROUP BY {word}",
+        ):
+            with pytest.raises(MySQLRejected):
+                live_source.execute_arrow(bare)
+        # Backticked, the same column is reachable and returns its value, so the rejections are
+        # about the bare spelling, not an absent column.
+        assert live_source.execute_arrow(
+            f"SELECT `{word}` FROM {scope}").to_pylist() == [{word: 1}]
 
 
 @pytest.mark.integration
