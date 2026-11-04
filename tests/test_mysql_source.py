@@ -18,7 +18,12 @@ import pytest
 
 from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
 from mnemiq.eval import mysql_source
-from mnemiq.eval.mysql_source import MySQLMisconfigured, MySQLSource, MySQLUnavailable
+from mnemiq.eval.mysql_source import (
+    MySQLMisconfigured,
+    MySQLRejected,
+    MySQLSource,
+    MySQLUnavailable,
+)
 from mnemiq.execute.runner import (
     ExecutionError,
     QueryCancelledError,
@@ -733,6 +738,24 @@ def test_live_the_catalogue_reads_as_text(live_source):
     assert tables and columns
     assert all(isinstance(c[2], str) for c in columns)  # column_type arrives as bytes, decoded
     assert live_source.user_functions() == []
+
+
+@pytest.mark.integration
+@needs_mysql
+def test_live_mysql_rejects_a_bare_introducer_and_straight_join(live_source):
+    # M231: with mysql as the model's dialect, sqlglot reads a charset introducer (_utf8, _binary,
+    # ...) or STRAIGHT_JOIN as no column, so another engine would read it as a same-named column
+    # unchecked. The only path that decides as mysql -- the BEAVER source -- also executes on
+    # MySQL, which rejects these bare: an introducer expects a string literal and STRAIGHT_JOIN is a
+    # reserved keyword, so the statement fails closed here rather than reading a column. Nothing
+    # routes a mysql-dialect decision to another engine, so the cross-engine reads from the M225
+    # sweep are unreachable. This locks the engine's reading: a MySQL that accepted one bare would
+    # fail here and reopen M231.
+    for word in ("_utf8", "_utf8mb4", "_binary", "straight_join"):
+        with pytest.raises(MySQLRejected):
+            live_source.execute_arrow(f"SELECT {word}")
+    # Backticked, each is a valid identifier -- it is only the bare form MySQL will not read.
+    assert live_source.execute_arrow("SELECT 1 AS `straight_join`").to_pylist() == [{"straight_join": 1}]
 
 
 @pytest.mark.integration
