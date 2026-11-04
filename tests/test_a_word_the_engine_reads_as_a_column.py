@@ -770,3 +770,29 @@ def test_a_filter_whose_places_cannot_be_matched_to_its_text_is_refused():
     assert a_table_named_in_text("  id IN (SELECT t.id FROM kw AS t)", "duckdb", frozenset({"kw"})) \
         == "(the filter's references could not be placed)"
     assert a_table_named_in_text("id IN (SELECT t.id FROM kw AS t)", "duckdb", frozenset({"kw"})) is None
+
+
+@pytest.mark.parametrize("space", [" ", " ", " " * 9 + " ", "　"])
+def test_a_duckdb_filter_holding_unicode_whitespace_is_refused(space):
+    # DuckDB rewrites such whitespace before it parses, so its places cannot be checked against the text.
+    from mnemiq.sql.guard import a_table_named_in_text
+    text = f"{space}EXISTS (SELECT 1 FROM kw AS t WHERE t.id = 1)"
+    assert a_table_named_in_text(text, "duckdb", frozenset({"kw"})) == "(the filter's references could not be placed)"
+    assert a_table_named_in_text(text.replace(space, " "), "duckdb", frozenset({"kw"})) is None
+
+
+def test_unicode_whitespace_is_refused_even_where_duckdb_s_places_still_line_up():
+    # After every reference the places agree, so only the whitespace rule refuses: it does not wait for
+    # a shift to show.
+    from mnemiq.sql.guard import a_table_named_in_text
+    assert a_table_named_in_text("t.id = 1 ", "duckdb", frozenset({"t"})) == "(the filter's references could not be placed)"
+
+
+def test_a_place_that_does_not_spell_its_reference_is_refused(monkeypatch):
+    # The backstop for any other rewrite DuckDB makes before it parses: a reported place that is not
+    # where the text spells the reference refuses the filter.
+    import mnemiq.sql.guard as guard
+    monkeypatch.setattr(guard, "_duckdb_column_reads", lambda text: [(0, "t"), (2, "t")])
+    assert guard.a_table_named_in_text("t.id = 1", "duckdb", frozenset({"t"})) == "(the filter's references could not be placed)"
+    monkeypatch.setattr(guard, "_duckdb_column_reads", lambda text: [(0, "t")])
+    assert guard.a_table_named_in_text("t.id = 1", "duckdb", frozenset({"t"})) is None
