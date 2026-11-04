@@ -42,6 +42,20 @@ def test_a_reserved_word_table_runs_on_duckdb_under_a_filter(table: str) -> None
     assert rows == [(1,)], governed
 
 
+@pytest.mark.parametrize("table", ["join", "inner", "like"])
+def test_a_duckdb_keyword_not_in_the_reserved_category_still_quotes(table: str) -> None:
+    # `join`/`inner`/`like` are keywords DuckDB rejects as a bare table name but are NOT in
+    # duckdb_keywords()'s 'reserved' category, so the narrow reserved() set missed them
+    # (Codex's review). The bare-table set is built from the engine's parser, so they quote.
+    visible = {table: {"id", "flag"}}
+    governed = _governed_sql(table, "flag", visible, "duckdb")
+    con = duckdb.connect(":memory:")
+    q = sqlglot.exp.to_identifier(table, quoted=True).sql(dialect="duckdb")
+    con.execute(f"CREATE TABLE {q}(id INTEGER, flag BOOLEAN)")
+    con.execute(f"INSERT INTO {q} VALUES (1, true), (2, false)")
+    assert con.execute(governed).fetchall() == [(1,)], governed
+
+
 def test_a_plain_table_name_is_left_bare() -> None:
     # Non-reserved names must NOT be quoted: a quoted bare alias folds differently on Oracle and
     # Postgres, so over-quoting would change identity. Here it must stay `claim`, not `"claim"`.
