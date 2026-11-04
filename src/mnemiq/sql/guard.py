@@ -487,15 +487,28 @@ def _duckdb_column_reads(text: str) -> list[tuple[int, str]] | None:
 
     from mnemiq.sql.rls import _duckdb  # rls imports this module's checks
 
-    tree = json.loads(_duckdb("SELECT json_serialize_sql($1)", [_WHERE + text]))
+    full = _WHERE + text
+    tree = json.loads(_duckdb("SELECT json_serialize_sql($1)", [full]))
     if tree.get("error"):
         return None
+    encoded = full.encode("utf-8")
     found: list[tuple[int, str]] = []
+
+    def place(location) -> int:
+        """DuckDB's place is in UTF-8 bytes, sqlglot's in characters: before any non-ASCII text the two
+        agree, after it they do not (Codex's eleventh review of M230's branch: a reference shifted onto
+        another's offset was excused). A place that is no character boundary matches nothing (-1)."""
+        if not isinstance(location, int) or not 0 <= location <= len(encoded):
+            return -1
+        try:
+            return len(encoded[:location].decode("utf-8")) - len(_WHERE)
+        except UnicodeDecodeError:
+            return -1
 
     def walk(node) -> None:
         if isinstance(node, dict):
             if node.get("class") == "COLUMN_REF" and node.get("column_names"):
-                found.append((node.get("query_location", -1) - len(_WHERE), str(node["column_names"][0]).lower()))
+                found.append((place(node.get("query_location")), str(node["column_names"][0]).lower()))
             for value in node.values():
                 walk(value)
         elif isinstance(node, list):

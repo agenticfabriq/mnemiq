@@ -722,3 +722,26 @@ def test_on_sqlite_a_word_before_a_dot_is_the_reference_and_a_keyword_elsewhere_
     passed = decide('SELECT id FROM "true"', {"true": {"id", "flag"}}, dialect="sqlite", target="sqlite",
                     policy=AccessPolicy(policy_schema={"true": {"id", "flag"}}, row_filters={"true": "flag IS TRUE"}))
     assert isinstance(passed, Approved), passed
+
+
+def test_a_reference_after_non_ascii_text_is_placed_in_characters():
+    # DuckDB places a reference in UTF-8 bytes, sqlglot in characters: after accented text a misread
+    # current_date landed on secret's offset and was excused (Codex's eleventh review of this change).
+    filt = ("/*ééééééééééééé*/ id IN (SELECT id FROM kw AS current_date "
+            "WHERE current_date.secret = $$withheld$$)")
+    con = duckdb.connect()
+    con.execute("CREATE TABLE kw (id INT, secret VARCHAR); INSERT INTO kw VALUES (1, 'withheld')")
+    con.execute("CREATE TABLE plain (id INT); INSERT INTO plain VALUES (1)")
+    assert con.execute(f"SELECT id FROM plain WHERE {filt}").fetchall() == [(1,)]  # the premise
+    schema = {"kw": {"id"}, "plain": {"id"}}
+    verdict = decide("SELECT id FROM plain", schema, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(policy_schema=schema, row_filters={"plain": filt}))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
+def test_a_qualified_reference_after_non_ascii_text_passes():
+    schema = {"kw": {"id"}, "plain": {"id"}}
+    filt = "/*ééééé*/ id IN (SELECT t.id FROM kw AS t WHERE t.id > 0)"
+    verdict = decide("SELECT id FROM plain", schema, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(policy_schema=schema, row_filters={"plain": filt}))
+    assert isinstance(verdict, Approved), verdict
