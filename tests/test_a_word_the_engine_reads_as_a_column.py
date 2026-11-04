@@ -745,3 +745,28 @@ def test_a_qualified_reference_after_non_ascii_text_passes():
     verdict = decide("SELECT id FROM plain", schema, dialect="duckdb", target="duckdb",
                      policy=AccessPolicy(policy_schema=schema, row_filters={"plain": filt}))
     assert isinstance(verdict, Approved), verdict
+
+
+def test_a_reference_after_unicode_whitespace_is_matched_by_name_or_refused():
+    # DuckDB normalises Unicode whitespace before it parses, so its places shift: a misread current_date
+    # landed on id's place and was excused by any name there (Codex's twelfth review of this change).
+    filt = "  id IN (SELECT id FROM kw AS current_date WHERE id+current_date.secret > 0)"
+    answers = []
+    for secret in (42, -42):
+        con = duckdb.connect()
+        con.execute(f"CREATE TABLE kw (id INT, secret INT); INSERT INTO kw VALUES (1, {secret})")
+        con.execute("CREATE TABLE plain (id INT); INSERT INTO plain VALUES (1)")
+        answers.append(con.execute(f"SELECT id FROM plain WHERE {filt}").fetchall())
+    assert answers == [[(1,)], []]  # the premise: the filter's answer turns on the withheld secret
+    schema = {"kw": {"id"}, "plain": {"id"}}
+    verdict = decide("SELECT id FROM plain", schema, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(policy_schema=schema, row_filters={"plain": filt}))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
+def test_a_filter_whose_places_cannot_be_matched_to_its_text_is_refused():
+    # Fail-closed: where DuckDB's places are not where the text spells its references, none is trusted.
+    from mnemiq.sql.guard import a_table_named_in_text
+    assert a_table_named_in_text("  id IN (SELECT t.id FROM kw AS t)", "duckdb", frozenset({"kw"})) \
+        == "(the filter's references could not be placed)"
+    assert a_table_named_in_text("id IN (SELECT t.id FROM kw AS t)", "duckdb", frozenset({"kw"})) is None

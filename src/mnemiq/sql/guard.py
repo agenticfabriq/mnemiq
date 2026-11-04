@@ -543,6 +543,15 @@ def a_table_named_in_text(text: str, dialect: str | None, outer: frozenset[str] 
         reads = _duckdb_column_reads(text)
         if reads is None:
             return "(the text DuckDB does not parse)"
+        # Each place DuckDB reports must be where the text spells that reference, or the places are not
+        # the text's, and the filter is refused. DuckDB normalises Unicode whitespace before it parses,
+        # so a reference after an em space was placed on another name's offset and excused by the name
+        # there (Codex's twelfth review of M230's branch). With every place spelling its own reference,
+        # a name the parse holds at one is that reference's.
+        spelled = {token.start: token.text.lower() for token in sqlglot.tokenize(text, read=dialect)
+                   if token.token_type not in _QUOTED_TOKENS or token.token_type is TokenType.IDENTIFIER}
+        if any(spelled.get(start) != first for start, first in reads):
+            return "(the filter's references could not be placed)"
         return next((first for start, first in reads if first in named and start not in held), None)
     tokens = sqlglot.tokenize(text, read=dialect)
     for i, token in enumerate(tokens):
