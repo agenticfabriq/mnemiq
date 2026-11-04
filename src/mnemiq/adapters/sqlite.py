@@ -27,7 +27,7 @@ class SQLiteAdapter:
     def introspect(self) -> list[str]:
         rows = self._con.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' "
-            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            r"AND name NOT LIKE 'sqlite\_%' ESCAPE '\' ORDER BY name"  # `_` is a LIKE wildcard: escape it, or a user table like `sqlitex` is dropped (M225, Codex review)
         ).fetchall()
         return [r[0] for r in rows]
 
@@ -37,15 +37,21 @@ class SQLiteAdapter:
         implemented in `str.partition`."""
         rows = self._con.execute(
             "SELECT name, sql FROM sqlite_master WHERE type = 'view' "
-            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            r"AND name NOT LIKE 'sqlite\_%' ESCAPE '\' ORDER BY name"  # `_` is a LIKE wildcard: escape it, as introspect does
         ).fetchall()
         return [(r[0], r[1], "sqlite") for r in rows if r[1]]
 
     def list_columns(self) -> list[tuple[str, str, str]]:
         out: list[tuple[str, str, str]] = []
         for table in self.introspect():
-            # PRAGMA table_info: (cid, name, type, notnull, dflt_value, pk)
-            for row in self._con.execute(f'PRAGMA table_info("{table}")').fetchall():
+            # PRAGMA table_xinfo, not table_info: xinfo lists GENERATED and hidden columns too, and the
+            # engine reads those by name, so a governance inventory must hold them (a generated column
+            # named like a SQL word was read while table_info omitted it, M225, Codex's review).
+            # (cid, name, type, notnull, dflt_value, pk, hidden). The table-valued form, with the name as a
+            # parameter: interpolated into PRAGMA table_xinfo("..."), a table named with a double quote
+            # broke the statement, and since the live check inventories every table, one such table
+            # refused every guarded-word query on the source (Codex's fourth review of that change).
+            for row in self._con.execute("SELECT * FROM pragma_table_xinfo(?)", [table]).fetchall():
                 out.append((table, row[1], (row[2] or "unknown")))
         return out
 

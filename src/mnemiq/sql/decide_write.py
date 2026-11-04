@@ -20,7 +20,8 @@ from mnemiq.sql.functions import (
     opaque_columns,
 )
 from mnemiq.sql.cls import check_cls
-from mnemiq.sql.guard import bound_by_position, misgrouped_set_chain, niladic_names, unnamed_read
+from mnemiq.sql.guard import (bound_by_position, live_columns_for_bare_words, misgrouped_set_chain,
+                               niladic_names, unnamed_read)
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove_governed
 from mnemiq.sql.qualify import expand_tables, object_key
@@ -371,7 +372,15 @@ def decide_write(
     ambiguous = fields_as_members(shaped, target, known_columns(visible, policy))  # M165, M167
     if ambiguous is not None:
         return ambiguous
-    named = niladic_names(shaped, known_columns(visible, policy), dialect, target)  # M194: the write path leaks the same names
+    # M194/M225: a word that reads as a column, checked against the live table too where present, as on
+    # the read path; a source that cannot say which columns it holds refuses.
+    try:
+        live = live_columns_for_bare_words(shaped, policy, adapter, target)
+    except Exception:  # noqa: BLE001 -- the source could not list its columns: fail closed
+        return Refusal(code=RefusalCode.AMBIGUOUS_NILADIC_NAME,
+                       message="This engine could not confirm which column a name in the statement reads. Try "
+                               "again, or name the column with its table.")
+    named = niladic_names(shaped, known_columns(visible, policy), dialect, target, live=live)  # M194
     if named is not None:
         return named
     if ambiguous is not None:
@@ -501,7 +510,7 @@ def decide_write(
         return unplaceable
     asked = shaped.copy()  # M51: the write as asked, before the row-filter rewrite
     governed, narrowed = apply_row_filters_to_write(
-        shaped, policy, visible, _target_node(shaped), dialect, executes_as=target)
+        shaped, policy, visible, _target_node(shaped), dialect, executes_as=target, live=live)
     if isinstance(governed, Refusal):
         return governed
     shaped = governed

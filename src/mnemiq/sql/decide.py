@@ -24,7 +24,7 @@ from mnemiq.sql.authz_guard import (
 from mnemiq.sql.cls import check_cls
 from mnemiq.sql.day_bounds import close_day_bounds
 from mnemiq.sql.fanout_check import KeyFacts, check_fanout
-from mnemiq.sql.guard import MAX_ROWS, check_shape, niladic_names
+from mnemiq.sql.guard import MAX_ROWS, check_shape, live_columns_for_bare_words, niladic_names
 from mnemiq.sql.lint import lint
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove_governed
@@ -119,9 +119,17 @@ def decide(
     ambiguous = fields_as_members(shaped, target, known_columns(visible, policy))
     if ambiguous is not None:
         return ambiguous
-    # M194: a bare `current_date` where a known table has a column so named reads the column
-    # through the function's node, which no check below sees.
-    named = niladic_names(shaped, known_columns(visible, policy), dialect, target)  # the advice in the dialect the model writes
+    # M194/M225: a bare `current_date` where a table the statement reads has a column so named reads
+    # the column through the function's node, which no check below sees. Asked of the live table too,
+    # not only the snapshot, where such a word is present (M225); a source that cannot say refuses.
+    try:
+        live = live_columns_for_bare_words(shaped, policy, adapter, target)
+    except Exception as exc:  # noqa: BLE001 -- the source could not list its columns: fail closed
+        logger.warning("could not read the live columns to decide a word that reads as one (%s); refused (M225)", exc)
+        return Refusal(code=RefusalCode.AMBIGUOUS_NILADIC_NAME,
+                       message="This engine could not confirm which column a name in the query reads. Try again, "
+                               "or name the column with its table.")
+    named = niladic_names(shaped, known_columns(visible, policy), dialect, target, live=live)  # advice in the model's dialect
     if named is not None:
         return named
     # M150: before any policy is applied, refuse an engine whose CTE binding the rewrite misreads.
@@ -293,7 +301,7 @@ def decide(
         return unplaceable
     if not policy.empty:
         shaped, narrowed = apply_row_and_mask(shaped, policy, visible, dialect=dialect,
-                                              executes_as=target)
+                                              executes_as=target, live=live)
         if isinstance(shaped, Refusal):
             return shaped
 

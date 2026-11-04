@@ -330,7 +330,8 @@ def _names_in(ast: exp.Expression) -> frozenset[str]:
 
 def _a_word_read_as_a_column(filt: str, table: str, dialect: str, policy: AccessPolicy,
                              columns, executes_as: str | None = None,
-                             outer: frozenset[str] = frozenset()) -> Refusal | None:
+                             outer: frozenset[str] = frozenset(),
+                             live: dict | None = None) -> Refusal | None:
     """The refusal for a filter whose text holds bare a word its engine reads as a same-named
     column of a table in the filter's scope, where the parse reads a function or a literal, so
     the checks above never saw the column (M225). The filter runs as written (M222), so the
@@ -362,7 +363,10 @@ def _a_word_read_as_a_column(filt: str, table: str, dialect: str, policy: Access
     schema = policy.policy_schema or {}
 
     def columns_of(key: str) -> set[str]:
-        return {c.lower() for k, names in schema.items() if k.lower() == key.lower() for c in names}
+        # The snapshot's columns of `key`, and the live table's (M225): the snapshot can lag the
+        # source, and a column it does not list the engine still reads. Only ever added, never granted.
+        return ({c.lower() for k, names in schema.items() if k.lower() == key.lower() for c in names}
+                | {c.lower() for k, names in (live or {}).items() if k.lower() == key.lower() for c in names})
 
     taken = {c.lower() for c in columns} | columns_of(table)
     for read in base_tables(wrapped, engine):
@@ -2812,6 +2816,7 @@ def apply_row_and_mask(
     dialect: str = "duckdb",
     exclude: exp.Expression | None = None,
     executes_as: str | None = None,
+    live: dict | None = None,
 ) -> tuple[exp.Expression | Refusal, list[Narrowing]]:
     """Wrap each base table that has a row filter or a referenced masked column in a derived
     table that applies the filter and NULLs masked columns AT THE SOURCE. Returns the rewritten
@@ -2901,7 +2906,7 @@ def apply_row_and_mask(
             if lost is not None:
                 return lost, []
             bound = _a_word_read_as_a_column(policy.row_filter_for(name), name, dialect, policy,
-                                             visible[name], executes_as, outer=_names_in(ast))
+                                             visible[name], executes_as, outer=_names_in(ast), live=live)
             if bound is not None:
                 return bound, []
         derived = _derived_table(
@@ -2926,6 +2931,7 @@ def apply_row_filters_to_write(
     target: exp.Expression | None,
     dialect: str = "duckdb",
     executes_as: str | None = None,
+    live: dict | None = None,
 ) -> tuple[exp.Expression | Refusal, list[Narrowing]]:
     """Govern a write with the read path's RLS. Returns the rewritten AST or a Refusal, and what
     the policy narrowed.
@@ -2982,7 +2988,7 @@ def apply_row_filters_to_write(
     if lost is not None:
         return lost, []
     bound = _a_word_read_as_a_column(filt, name, dialect, policy, visible.get(name, set()), executes_as,
-                                     outer=_names_in(ast))
+                                     outer=_names_in(ast), live=live)
     if bound is not None:
         return bound, []
     if (executes_as or dialect).lower() in _FENCED:

@@ -92,6 +92,24 @@ class FederatedAdapter:
     def reachable_user_functions(self) -> list[str]:
         return duckdb_reachable_user_functions(self._con)
 
+    def list_columns(self) -> list[tuple[str, str, str]]:
+        """Every column of every attached source, keyed `catalog.table` as `object_key` keys a
+        federated table (M225): the live-column check needs an inventory from the execution source,
+        and the federated adapter is that source. Over the one connection, across all attached
+        catalogs; DuckDB's information_schema lists generated columns. Restricted to the registry's
+        catalogs, so DuckDB's own `system`/`temp` catalogs do not enter the set."""
+        rows = self._con.execute(
+            "SELECT table_catalog, table_schema, table_name, column_name, data_type FROM information_schema.columns"
+        ).fetchall()
+        # Only each catalog's registered schema, the one expansion reads: a same-named table in another
+        # schema of the catalog lent its columns to catalog.table (Codex's third review). Matched as
+        # DuckDB matches identifiers, without regard to case: a registry naming `PUBLIC` dropped every
+        # row DuckDB reports under `public`, which it executes against, and the check failed open
+        # (Codex's fifth review).
+        registered = {catalog.casefold(): schema.casefold() for catalog, schema in self.registry.items()}
+        return [(f"{cat}.{tbl}", col, (typ or "unknown")) for cat, sch, tbl, col, typ in rows
+                if registered.get(cat.casefold()) == sch.casefold()]
+
     def execute(self, sql: str) -> list[tuple]:
         return self._con.execute(sql).fetchall()
 

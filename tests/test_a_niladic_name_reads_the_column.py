@@ -64,6 +64,11 @@ class _OkAdapter:
     def execute(self, sql):
         return []
 
+    def list_columns(self):
+        # A real source lists its columns (M225's live check asks, and refuses a source that cannot):
+        # this one's live tables hold nothing the snapshot does not, so the snapshot decides.
+        return []
+
 
 def _decide_write(sql, visible, policy=None):
     grants = GrantSet(frozenset(visible), writable=frozenset({"sink"}))

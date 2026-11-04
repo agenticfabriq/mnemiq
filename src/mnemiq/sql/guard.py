@@ -574,8 +574,48 @@ def a_table_named_in_text(text: str, dialect: str | None, outer: frozenset[str] 
     return None
 
 
+class LiveColumnsUnavailable(Exception):
+    """The source runs the statement but cannot list its columns, so a word that reads as a column
+    cannot be told from the function: the decider fails closed (M225)."""
+
+
+def live_columns_for_bare_words(ast: exp.Expression, policy, adapter, engine: str | None) -> dict:
+    """The columns the source says the statement's tables and the policy's hold now, lowercased by
+    table, when a word the engine reads as a column (`_words_for`) appears in the statement or a row
+    filter; else {}. The snapshot can lag the source, so a filter or a read of such a column the
+    snapshot does not list was approved (M225). Raises if the source must be asked and cannot answer,
+    and the caller fails closed; with no source, {} (the snapshot alone decides, as before)."""
+    from mnemiq.sql.scope import base_tables
+
+    texts = [f for f in (policy.row_filters or {}).values() if f] if policy is not None else []
+    try:
+        texts.append(ast.sql(dialect=engine))
+    except Exception:  # noqa: BLE001 -- a statement the engine cannot print is refused downstream (unprintable),
+        pass            # so there is no live word to check here; the row filters are still scanned
+    if not any(_bare_niladic_words(text, engine) for text in texts):
+        return {}
+    if adapter is None:
+        return {}  # no execution source (enrichment, tests): the snapshot alone decides, as before (c)
+    if not hasattr(adapter, "list_columns"):
+        # A source that runs the statement but cannot be inventoried: a federated adapter without the
+        # method read as "no source" and the check failed open (Codex's second review of (c)). Refuse.
+        raise LiveColumnsUnavailable("the source cannot list its columns")
+    wanted = {object_key(table).lower() for table in base_tables(ast, engine)}
+    if policy is not None:
+        wanted |= {key.lower() for key in (policy.policy_schema or {})}
+    live: dict[str, set[str]] = {}
+    # The execution source's inventory where the adapter narrows discovery (a scoped wrapper), else its
+    # own: the statement runs on the source, so its columns are what the engine reads.
+    inventory = adapter.execution_columns if hasattr(adapter, "execution_columns") else adapter.list_columns
+    for row in inventory():  # raises on a source that cannot list its columns: fail closed
+        table = str(row[0]).lower()
+        if table in wanted:
+            live.setdefault(table, set()).add(str(row[1]).lower())
+    return live
+
+
 def niladic_names(ast: exp.Expression, columns, dialect: str | None = None,
-                  target: str | None = None) -> Refusal | None:
+                  target: str | None = None, live: dict | None = None) -> Refusal | None:
     """A column named like a niladic SQL function is read through the function's node, which
     no grant, deny or mask check sees: DuckDB binds a bare `current_date` to a same-named
     column of the query's own FROM before the function, and sqlglot reads the name as
@@ -617,7 +657,10 @@ def niladic_names(ast: exp.Expression, columns, dialect: str | None = None,
         # alone the policy's `current_date` was unseen and the bare name approved (Codex's
         # first review of #175). Folded on every engine, which refuses more where quoting
         # keeps `"KW"` and `kw` apart, never less.
-        return {n.lower() for key, names in (columns or {}).items() if key.lower() == table.lower() for n in names}
+        snapshot = {n.lower() for key, names in (columns or {}).items() if key.lower() == table.lower() for n in names}
+        # The live table's columns too (M225): the snapshot can lag the source, and a column it does
+        # not list the engine still reads. Only ever added, so a live column refuses, never grants.
+        return snapshot | {n.lower() for key, names in (live or {}).items() if key.lower() == table.lower() for n in names}
 
     taken = frozenset(name for table in referenced for name in columns_of(table))
     try:

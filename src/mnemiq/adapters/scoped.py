@@ -52,6 +52,13 @@ class TableScopedAdapter:
                 f"{', '.join(missing)} -- check the names in the manifest's \"tables\" "
                 "(matched without regard to case; * and ? are patterns)")
 
+    def execution_columns(self) -> list[tuple[str, str, str]]:
+        """The execution source's full column inventory, NOT narrowed to the manifest's scope. The
+        scope narrows discovery; execution is untouched, so a table a loaded snapshot still authorizes
+        after the scope was narrowed is still read. The live-column check (M225) must see its columns,
+        and a scoped inventory hid them (Codex's third review of the live-column change)."""
+        return self._inner.list_columns()
+
     def list_columns(self) -> list[tuple[str, str, str]]:
         rows = self._inner.list_columns()
         self._check({table for table, _col, _type in rows})
