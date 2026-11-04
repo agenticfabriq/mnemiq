@@ -145,3 +145,39 @@ def test_a_generated_column_the_live_table_holds_is_refused_on_sqlite():
     filtered = decide("SELECT id FROM kw", snapshot, adapter=adapter, dialect="sqlite", target="sqlite",
                       policy=AccessPolicy(policy_schema=schema, row_filters={"kw": "true = 123"}))
     assert isinstance(filtered, Refusal) and filtered.code is RefusalCode.INVALID_ROW_FILTER, filtered
+
+
+def test_a_federated_source_lists_its_columns_and_a_withheld_live_word_is_refused():
+    # FederatedAdapter runs the statement but had no list_columns, so the check failed open on a
+    # federated snapshot missing a guarded name (Codex's second review of (c), M225). It lists
+    # columns now, keyed catalog.table, and the read and the filter are refused.
+    import duckdb
+    from mnemiq.adapters.federated import FederatedAdapter
+    con = duckdb.connect()
+    con.execute("ATTACH ':memory:' AS pg")
+    con.execute("CREATE SCHEMA pg.public")
+    con.execute('CREATE TABLE pg.public.kw (id INT, "current_catalog" VARCHAR)')
+    con.execute("INSERT INTO pg.public.kw VALUES (1, 'allow'), (2, 'deny')")
+    adapter = FederatedAdapter.__new__(FederatedAdapter)
+    adapter._con = con
+    adapter.registry = {"pg": "public"}
+    adapter.catalogs = frozenset({"pg"})
+    assert ("pg.kw", "current_catalog", "VARCHAR") in [(t, c, ty) for t, c, ty in adapter.list_columns()]
+    snapshot, schema = {"pg.kw": {"id"}}, {"pg.kw": {"id"}}
+    read = decide("SELECT current_catalog FROM pg.kw", snapshot, adapter=adapter, dialect="duckdb",
+                  target="duckdb", registry={"pg": "public"}, policy=AccessPolicy(policy_schema=schema))
+    assert isinstance(read, Refusal) and read.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, read
+    filtered = decide("SELECT id FROM pg.kw", snapshot, adapter=adapter, dialect="duckdb", target="duckdb",
+                      registry={"pg": "public"},
+                      policy=AccessPolicy(policy_schema=schema, row_filters={"pg.kw": "current_catalog = 'allow'"}))
+    assert isinstance(filtered, Refusal) and filtered.code is RefusalCode.INVALID_ROW_FILTER, filtered
+
+
+def test_a_source_present_but_unable_to_list_columns_refuses():
+    # adapter present without list_columns: refused, not treated as no source (fail closed).
+    class _NoList:
+        dialect = "duckdb"
+        def execute(self, sql): return []
+    verdict = decide("SELECT current_catalog FROM kw", SNAPSHOT, adapter=_NoList(), dialect="duckdb",
+                     target="duckdb", policy=AccessPolicy(policy_schema=SNAPSHOT))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict

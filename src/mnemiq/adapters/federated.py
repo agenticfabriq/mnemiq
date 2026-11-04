@@ -92,6 +92,17 @@ class FederatedAdapter:
     def reachable_user_functions(self) -> list[str]:
         return duckdb_reachable_user_functions(self._con)
 
+    def list_columns(self) -> list[tuple[str, str, str]]:
+        """Every column of every attached source, keyed `catalog.table` as `object_key` keys a
+        federated table (M225): the live-column check needs an inventory from the execution source,
+        and the federated adapter is that source. Over the one connection, across all attached
+        catalogs; DuckDB's information_schema lists generated columns. Restricted to the registry's
+        catalogs, so DuckDB's own `system`/`temp` catalogs do not enter the set."""
+        rows = self._con.execute(
+            "SELECT table_catalog, table_name, column_name, data_type FROM information_schema.columns"
+        ).fetchall()
+        return [(f"{cat}.{tbl}", col, (typ or "unknown")) for cat, tbl, col, typ in rows if cat in self.catalogs]
+
     def execute(self, sql: str) -> list[tuple]:
         return self._con.execute(sql).fetchall()
 

@@ -574,6 +574,11 @@ def a_table_named_in_text(text: str, dialect: str | None, outer: frozenset[str] 
     return None
 
 
+class LiveColumnsUnavailable(Exception):
+    """The source runs the statement but cannot list its columns, so a word that reads as a column
+    cannot be told from the function: the decider fails closed (M225)."""
+
+
 def live_columns_for_bare_words(ast: exp.Expression, policy, adapter, engine: str | None) -> dict:
     """The columns the source says the statement's tables and the policy's hold now, lowercased by
     table, when a word the engine reads as a column (`_words_for`) appears in the statement or a row
@@ -589,8 +594,12 @@ def live_columns_for_bare_words(ast: exp.Expression, policy, adapter, engine: st
         pass            # so there is no live word to check here; the row filters are still scanned
     if not any(_bare_niladic_words(text, engine) for text in texts):
         return {}
-    if adapter is None or not hasattr(adapter, "list_columns"):
-        return {}
+    if adapter is None:
+        return {}  # no execution source (enrichment, tests): the snapshot alone decides, as before (c)
+    if not hasattr(adapter, "list_columns"):
+        # A source that runs the statement but cannot be inventoried: a federated adapter without the
+        # method read as "no source" and the check failed open (Codex's second review of (c)). Refuse.
+        raise LiveColumnsUnavailable("the source cannot list its columns")
     wanted = {object_key(table).lower() for table in base_tables(ast, engine)}
     if policy is not None:
         wanted |= {key.lower() for key in (policy.policy_schema or {})}
