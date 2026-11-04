@@ -61,6 +61,23 @@ def test_a_dotted_reserved_name_quotes_only_the_reserved_part() -> None:
     assert '"cat"' not in out, out
 
 
+def test_a_reserved_word_table_runs_on_native_sqlite_under_a_filter() -> None:
+    import sqlite3
+    import tempfile
+
+    # SQLite's native adapter (eval runners) and a sqlite-decided path: `null` is reserved as a
+    # bare table on SQLite, so the governed query must render quoted there too.
+    governed = _governed_sql("null", "flag", {"null": {"id", "flag"}}, "sqlite")
+    path = f"{tempfile.mkdtemp()}/x.db"
+    w = sqlite3.connect(path)
+    w.execute('CREATE TABLE "null"(id INTEGER, flag INTEGER)')
+    w.execute('INSERT INTO "null" VALUES (1, 1), (2, 0)')
+    w.commit()
+    w.close()
+    ro = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    assert ro.execute(governed).fetchall() == [(1,)], governed
+
+
 def test_reserved_rendering_per_engine() -> None:
     from mnemiq.sql.rls import _derived_table
 
