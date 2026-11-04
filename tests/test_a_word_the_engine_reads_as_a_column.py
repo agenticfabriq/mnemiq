@@ -798,7 +798,7 @@ def test_a_place_that_does_not_spell_its_reference_is_refused(monkeypatch):
     assert guard.a_table_named_in_text("t.id = 1", "duckdb", frozenset({"t"})) is None
 
 
-@pytest.mark.parametrize("char", ["﻿", "​", " ", " ", "　", "\u0085", " "])
+@pytest.mark.parametrize("char", ["\ufeff", "\u200b", "\u2003", "\u00a0", "\u3000", "\u0085", "\u2028"])
 def test_a_duckdb_filter_holding_a_folded_character_is_refused(char):
     # DuckDB folds spacing, format and BOM characters before it parses, even inside a comment, which
     # shifts every place it reports (Codex's twelfth to fourteenth reviews). Refused by category, so
@@ -813,3 +813,40 @@ def test_a_filter_whose_string_value_is_non_ascii_still_passes():
     from mnemiq.sql.guard import a_table_named_in_text
     assert a_table_named_in_text("region = 'über'", "duckdb", frozenset({"kw"})) is None
     assert a_table_named_in_text("名前 = 'x'", "duckdb", frozenset({"kw"})) is None
+
+
+@pytest.mark.parametrize("filt", [
+    "region = 'a b'", "region = 'a‍b'", "region = ''",
+    "region = $$a b$$", "region = 'a b' AND id = 1",   # a reference after the literal still reads
+])
+def test_a_folded_character_inside_a_comparison_value_passes(filt):
+    # DuckDB keeps a literal as written, so a value holding such a character is an ordinary filter (Codex's
+    # fifteenth review: these were refused by a rule that read the whole text).
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (id INT, region VARCHAR)")
+    value = filt.split("'")[1] if "'" in filt else filt.split("$$")[1]
+    con.execute("INSERT INTO t VALUES (1, ?)", [value])
+    schema = {"t": {"id", "region"}}
+    verdict = decide("SELECT id FROM t", schema, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(policy_schema=schema, row_filters={"t": filt}))
+    assert isinstance(verdict, Approved), verdict
+    assert con.execute(verdict.target_sql).fetchall() == [(1,)]
+
+
+@pytest.mark.parametrize("text", [
+    "/* a b */ EXISTS (SELECT 1 FROM kw AS t WHERE t.id = 1)",   # in a comment: still checked
+    'EXISTS (SELECT 1 FROM kw AS t WHERE t."a b" = 1)',          # in a quoted name: still checked
+])
+def test_a_folded_character_outside_a_literal_is_still_refused(text):
+    from mnemiq.sql.guard import a_table_named_in_text
+    assert a_table_named_in_text(text, "duckdb", frozenset({"kw"})) == "(the filter's references could not be placed)"
+
+
+def test_a_bom_in_a_comment_beside_a_same_spelling_alias_is_refused_by_the_category_rule():
+    # Codex's fourteenth review: U+FEFF, which str.isspace misses, shifts DuckDB's place for the reference
+    # onto the alias of the same spelling, where the per-place backstop agrees. Only the category rule
+    # refuses it, so this is the case that rule exists for.
+    from mnemiq.sql.guard import a_table_named_in_text
+    # The double space puts DuckDB's place on the alias, where the backstop agrees: the category rule alone refuses.
+    text = "/*" + "\ufeff" * 10 + "*/ EXISTS (SELECT 1 FROM kw AS current_date  WHERE current_date.secret = 42)"
+    assert a_table_named_in_text(text, "duckdb", frozenset({"kw"})) == "(the filter's references could not be placed)"
