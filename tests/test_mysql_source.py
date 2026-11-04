@@ -752,10 +752,16 @@ def test_live_mysql_rejects_a_bare_introducer_and_straight_join(live_source):
     # sweep are unreachable. This locks the engine's reading: a MySQL that accepted one bare would
     # fail here and reopen M231.
     for word in ("_utf8", "_utf8mb4", "_binary", "straight_join"):
+        # A same-named column IS in scope (the derived table exposes it backticked), so if MySQL
+        # read the bare word as that column the query would return 1. It does not -- it is a syntax
+        # error (an introducer expects a string literal; STRAIGHT_JOIN is reserved) -- which is the
+        # precise interpretation M231 turns on: MySQL never reads the bare word as the column.
         with pytest.raises(MySQLRejected):
-            live_source.execute_arrow(f"SELECT {word}")
-    # Backticked, each is a valid identifier -- it is only the bare form MySQL will not read.
-    assert live_source.execute_arrow("SELECT 1 AS `straight_join`").to_pylist() == [{"straight_join": 1}]
+            live_source.execute_arrow(f"SELECT {word} FROM (SELECT 1 AS `{word}`) t")
+        # Backticked, the same column is reachable and returns its value, so the rejection above is
+        # about the bare spelling, not an absent column.
+        assert live_source.execute_arrow(
+            f"SELECT `{word}` FROM (SELECT 1 AS `{word}`) t").to_pylist() == [{word: 1}]
 
 
 @pytest.mark.integration
