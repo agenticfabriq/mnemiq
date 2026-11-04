@@ -319,8 +319,18 @@ def _lost_names(filt: str, table: str, dialect: str) -> Refusal | None:
     )
 
 
+def _names_in(ast: exp.Expression) -> frozenset[str]:
+    """Every table and alias a statement names, lowercased: in scope for a filter conjoined to it (a
+    write's target), and counted for one placed in its own derived table (a read) too, which only
+    refuses more."""
+    names = {table.name.lower() for table in ast.find_all(exp.Table) if table.name}
+    names |= {alias.this.name.lower() for alias in ast.find_all(exp.TableAlias) if isinstance(alias.this, exp.Identifier)}
+    return frozenset(names)
+
+
 def _a_word_read_as_a_column(filt: str, table: str, dialect: str, policy: AccessPolicy,
-                             columns, executes_as: str | None = None) -> Refusal | None:
+                             columns, executes_as: str | None = None,
+                             outer: frozenset[str] = frozenset()) -> Refusal | None:
     """The refusal for a filter whose text holds bare a word its engine reads as a same-named
     column of a table in the filter's scope, where the parse reads a function or a literal, so
     the checks above never saw the column (M225). The filter runs as written (M222), so the
@@ -338,7 +348,7 @@ def _a_word_read_as_a_column(filt: str, table: str, dialect: str, policy: Access
     from mnemiq.sql.guard import a_table_named_in_text
 
     try:  # M232, read off the text as written, which the engine runs
-        aliased = a_table_named_in_text(filt, dialect)
+        aliased = a_table_named_in_text(filt, dialect, outer)
     except sqlglot.errors.SqlglotError:
         aliased = "(the text could not be read)"  # it parsed, so this is not expected: refused
     if aliased is not None:
@@ -2891,7 +2901,7 @@ def apply_row_and_mask(
             if lost is not None:
                 return lost, []
             bound = _a_word_read_as_a_column(policy.row_filter_for(name), name, dialect, policy,
-                                             visible[name], executes_as)
+                                             visible[name], executes_as, outer=_names_in(ast))
             if bound is not None:
                 return bound, []
         derived = _derived_table(
@@ -2971,7 +2981,8 @@ def apply_row_filters_to_write(
     lost = _lost_names(filt, name, dialect)
     if lost is not None:
         return lost, []
-    bound = _a_word_read_as_a_column(filt, name, dialect, policy, visible.get(name, set()), executes_as)
+    bound = _a_word_read_as_a_column(filt, name, dialect, policy, visible.get(name, set()), executes_as,
+                                     outer=_names_in(ast))
     if bound is not None:
         return bound, []
     if (executes_as or dialect).lower() in _FENCED:

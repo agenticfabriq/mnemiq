@@ -573,3 +573,39 @@ def test_a_row_filter_calling_a_function_named_like_its_alias_passes():
     verdict = decide("SELECT id FROM plain", schema, dialect="duckdb", target="duckdb",
                      policy=AccessPolicy(policy_schema=schema, row_filters={"plain": filt}))
     assert isinstance(verdict, Approved), verdict
+
+
+@pytest.mark.parametrize("word, form", [("int8", "int8['secret'] = 'withheld'"), ("bigint", "bigint['secret'] = 'withheld'"),
+                                        ("current_date", "current_date.secret = 'withheld'")])
+def test_a_filter_reading_its_own_table_through_a_word_is_refused(word, form):
+    # The filtered table is in the filter's scope though the filter declares nothing: on a table named
+    # int8, `int8['secret']` read its withheld column (Codex's sixth review of this change).
+    con = duckdb.connect()
+    con.execute(f'CREATE TABLE "{word}" (id INT, secret VARCHAR)')
+    con.execute(f"INSERT INTO \"{word}\" VALUES (1, 'withheld'), (2, 'other')")
+    assert con.execute(f'SELECT id FROM "{word}" WHERE {form}').fetchall() == [(1,)]  # the premise
+    schema = {word: {"id"}}  # secret is in no schema the checks know
+    verdict = decide(f'SELECT id FROM "{word}"', schema, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(policy_schema=schema, row_filters={word: form}))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (
+        verdict, con.execute(verdict.target_sql).fetchall() if isinstance(verdict, Approved) else None)
+
+
+def test_a_write_s_alias_cannot_rebind_a_word_in_the_target_s_filter():
+    # A write's filter is conjoined to the statement, so the caller's aliases are in its scope: a target
+    # aliased current_date would rebind the operator's `current_date` to the target's row.
+    schema = {"kw": {"id", "d"}}
+    grants = GrantSet(frozenset(schema), writable=frozenset(schema), row_filters={"kw": "d > current_date - INTERVAL 30 DAY"})
+    verdict = decide_write("DELETE FROM kw AS current_date WHERE id > 0", schema, grants, dialect="duckdb",
+                           target="duckdb", writes_enabled=True,
+                           policy=AccessPolicy(policy_schema=schema, row_filters={"kw": "d > current_date - INTERVAL 30 DAY"}))
+    assert isinstance(verdict, Refusal), verdict
+
+
+def test_a_filter_s_correlated_reference_to_its_own_table_passes():
+    # Bare, as a filter names its own table's columns (one qualified by the table's name is refused
+    # before this change, and still is).
+    schema = {"kw": {"id", "secret"}, "ent": {"id"}}
+    verdict = decide("SELECT id FROM kw", schema, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(policy_schema=schema, row_filters={"kw": "EXISTS (SELECT 1 FROM ent WHERE ent.id = id)"}))
+    assert isinstance(verdict, Approved), verdict

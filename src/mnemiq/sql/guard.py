@@ -476,16 +476,18 @@ def a_table_named_by_a_word(ast: exp.Expression, engine: str | None) -> Refusal 
     return None
 
 
-def a_table_named_in_text(text: str, dialect: str | None) -> str | None:
+def a_table_named_in_text(text: str, dialect: str | None, outer: frozenset[str] = frozenset()) -> str | None:
     """M232 for a text the engine runs as written, a row filter: the first token that spells a table
     or alias the text names in scope where the parse of the same text holds no name at that offset,
     so the parse read it as a function, literal or type. Read off the text, never a reprint: sqlglot
     prints `int8` as BIGINT, so a filter's `int8['secret']` under `FROM kw AS int8` passed a check of
     the reprint while DuckDB read kw's column (Codex's fifth review of M230's branch). A call (the
     word before `(`) is no reference to the table; a word after a dot with no name at its offset is
-    counted, which can only refuse more."""
+    counted, which can only refuse more. `outer` is every table and alias in scope from outside the
+    text: the filtered table's own name, and a write's, whose filter is conjoined to its statement
+    (Codex's sixth review: a filter `int8['secret'] = ...` on a table named int8 declared nothing)."""
     tree = sqlglot.parse_one(text, read=dialect)
-    named = {table.name.lower() for table in tree.find_all(exp.Table) if table.name}
+    named = {table.name.lower() for table in tree.find_all(exp.Table) if table.name} | set(outer)
     named |= {alias.this.name.lower() for alias in tree.find_all(exp.TableAlias) if isinstance(alias.this, exp.Identifier)}
     if not named:
         return None
