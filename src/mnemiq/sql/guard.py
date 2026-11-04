@@ -80,6 +80,16 @@ def check_shape(
             message="Only SELECT queries are allowed. This engine never modifies data.",
             subject=type(ast).__name__.upper(),
         )
+    # A SELECT ... INTO has a Select root, so it clears the check above, but it is a write: DuckDB and
+    # SQLite render it as CREATE TABLE ... AS and Postgres as SELECT ... INTO, each creating the target,
+    # and INTO TEMP plants a connection-local table that can shadow a real one (M234). Refused anywhere
+    # it appears (a CTE-led or parenthesised SELECT carries the clause inside).
+    if ast.find(exp.Into) is not None:
+        return Refusal(
+            code=RefusalCode.NOT_SELECT_ONLY,
+            message="Only SELECT queries are allowed. A SELECT ... INTO writes a table; this engine never modifies data.",
+            subject="INTO",
+        )
 
     # `executes_as`, not `dialect`. One is what we PARSE as and the other is what will RUN the
     # statement, and identifier folding belongs to the second: `decide` defaults to parsing duckdb
