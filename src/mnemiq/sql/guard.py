@@ -476,47 +476,67 @@ def a_table_named_by_a_word(ast: exp.Expression, engine: str | None) -> Refusal 
     return None
 
 
-_PROBE = "zz_mnemiq_name_probe"
+_WHERE = "SELECT 1 WHERE "
 
 
-def _a_name_stands_there(text: str, token, dialect: str | None) -> bool:
-    """Whether the place `token` stands in is one where a name stands, so the engine reads the word
-    there as the table it spells: a fresh name in its stead parses as a column reference (bare, by a
-    dot, in brackets or parentheses). Where it parses as anything else, or not at all, only a keyword
-    fits: `INTERVAL '1' DAY` on a table named day is a unit (Codex's ninth review of M230's branch),
-    as M222's probes read a place."""
-    probe = text[:token.start] + _PROBE + text[token.end + 1:]
-    try:
-        tree = sqlglot.parse_one(probe, read=dialect)
-    except sqlglot.errors.SqlglotError:
-        return False
-    return any(isinstance(node.parent, exp.Column) for node in tree.find_all(exp.Identifier)
-               if node.name == _PROBE)
+def _duckdb_column_reads(text: str) -> list[tuple[int, str]] | None:
+    """Where DuckDB's own parser reads a column reference in a filter's text: (offset, the first part of
+    its name, lowercased), from `json_serialize_sql`, which records each node's place; None where
+    DuckDB does not parse the text."""
+    import json
+
+    from mnemiq.sql.rls import _duckdb  # rls imports this module's checks
+
+    tree = json.loads(_duckdb("SELECT json_serialize_sql($1)", [_WHERE + text]))
+    if tree.get("error"):
+        return None
+    found: list[tuple[int, str]] = []
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            if node.get("class") == "COLUMN_REF" and node.get("column_names"):
+                found.append((node.get("query_location", -1) - len(_WHERE), str(node["column_names"][0]).lower()))
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+    walk(tree.get("statements", []))
+    return found
 
 
 def a_table_named_in_text(text: str, dialect: str | None, outer: frozenset[str] = frozenset()) -> str | None:
-    """M232 for a text the engine runs as written, a row filter: the first token that spells a table
-    or alias the text names in scope where the parse of the same text holds no name at that offset,
-    so the parse read it as a function, literal or type. Read off the text, never a reprint: sqlglot
-    prints `int8` as BIGINT, so a filter's `int8['secret']` under `FROM kw AS int8` passed a check of
-    the reprint while DuckDB read kw's column (Codex's fifth review of M230's branch). Each such word
-    is then asked of its place (`_a_name_stands_there`): only where a name stands does the engine read
-    the word as the table, so a type, a call, an interval's unit or EXTRACT's field spelled like the
-    table is passed over (its seventh to ninth reviews found each refused by narrower rules, which
-    this one probe replaces). `outer` is every table and alias in scope from outside the
-    text: the filtered table's own name, and a write's, whose filter is conjoined to its statement
-    (Codex's sixth review: a filter `int8['secret'] = ...` on a table named int8 declared nothing)."""
+    """M232 for a text the engine runs as written, a row filter: a reference, through a table or alias
+    in scope, that the parse of the text reads as no name, so as a function, literal or type. Read off
+    the text, never a reprint: sqlglot prints `int8` as BIGINT, so a filter's `int8['secret']` under
+    `FROM kw AS int8` passed a check of the reprint while DuckDB read kw's column (Codex's fifth review
+    of M230's branch). `outer` is every table and alias in scope from outside the text: the filtered
+    table's own name, and a write's, whose filter is conjoined to its statement (its sixth).
+
+    Where the engine reads a reference is the engine's to say. On DuckDB, its own parser: a column
+    reference whose name starts with a table or alias in scope, at an offset where sqlglot's parse
+    holds no name. Narrower rules over sqlglot's tokens refused a type, an interval's unit and the
+    keyword after IS in turn (its seventh to tenth reviews), each a place DuckDB reads no reference.
+    Elsewhere, where only a word before a dot was measured to read the table (`true.secret` on SQLite
+    and Oracle; Postgres rejects such an alias), a word spelling a name in scope with no name at its
+    offset, before a dot. A text DuckDB does not parse is refused, as its engine would refuse it."""
     tree = sqlglot.parse_one(text, read=dialect)
     named = {table.name.lower() for table in tree.find_all(exp.Table) if table.name} | set(outer)
     named |= {alias.this.name.lower() for alias in tree.find_all(exp.TableAlias) if isinstance(alias.this, exp.Identifier)}
     if not named:
         return None
     held = {node.meta["start"] for node in tree.find_all(exp.Identifier) if "start" in node.meta}
-    for token in sqlglot.tokenize(text, read=dialect):
+    if (dialect or "").lower() == "duckdb":
+        reads = _duckdb_column_reads(text)
+        if reads is None:
+            return "(the text DuckDB does not parse)"
+        return next((first for start, first in reads if first in named and start not in held), None)
+    tokens = sqlglot.tokenize(text, read=dialect)
+    for i, token in enumerate(tokens):
         word = token.text.lower()
         if word not in named or token.token_type in _QUOTED_TOKENS or token.start in held:
             continue
-        if _a_name_stands_there(text, token, dialect):
+        if i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.DOT:
             return word
     return None
 

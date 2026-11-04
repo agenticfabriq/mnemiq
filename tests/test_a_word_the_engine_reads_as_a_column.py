@@ -634,7 +634,8 @@ def test_a_type_in_a_filter_spelled_like_a_table_in_scope_is_a_type(table, sql, 
     ("d > int8 '1'", None),                         # a typed literal
     ("int8['secret'] = 'x'", "int8"),             # the table, read by bracket
     ("(int8).secret = 'x'", None),                 # a column to the parse, which the filter's check reads
-    ("f(id AS int8) > 0", None),                   # an alias, a declared name
+    ("id IN (SELECT id AS int8 FROM kw)", None),   # an alias, a declared name
+    ("f(id AS int8) > 0", "(the text DuckDB does not parse)"),  # refused, as DuckDB would refuse it
 ])
 def test_a_filter_s_type_positions_are_read_off_its_own_text(text, found):
     # The conversion rule refuses every CAST and `::` in a filter before this check runs, so these
@@ -666,7 +667,7 @@ def test_a_nested_or_multiword_type_in_a_filter_is_a_type(table, filt):
     ("x::int8[] IS NOT NULL", None),
     ("TRY_CAST(x AS DECIMAL(10, 2)) > int8['secret']", "int8"),   # the type spans its cast alone
     ("TRY_CAST(int8['secret'] AS VARCHAR) = 'x'", "int8"),        # before the AS is a value
-    ("TRY_CAST(f(1 AS a, int8['secret']) AS VARCHAR) = 'x'", "int8"),  # an AS nested in the value is not the cast's
+    ("TRY_CAST(CAST(id AS VARCHAR) || int8['secret'] AS VARCHAR) = 'x'", "int8"),  # an AS nested in the value is not the cast's
 ])
 def test_a_type_span_ends_where_its_type_does(text, found):
     from mnemiq.sql.guard import a_table_named_in_text
@@ -691,3 +692,33 @@ def test_a_unit_spelled_like_the_filtered_table_is_a_unit(table, filt):
                      policy=AccessPolicy(policy_schema=schema, row_filters={table: filt}))
     assert isinstance(verdict, Approved), verdict
     assert con.execute(verdict.target_sql).fetchall() == [(1,)]
+
+
+@pytest.mark.parametrize("table, filt", [
+    ("unknown", "flag IS NOT UNKNOWN"), ("null", "flag IS NOT NULL"),
+    ("true", "flag IS TRUE"), ("false", "flag IS NOT FALSE"),
+])
+def test_on_duckdb_a_keyword_after_is_spelled_like_the_table_is_a_keyword(table, filt):
+    # DuckDB's own parse reads no reference after IS; sqlglot's took any expression there, and a probe
+    # by it refused these (Codex's tenth review of this change).
+    con = duckdb.connect()
+    con.execute(f'CREATE TABLE "{table}" (id INT, flag BOOLEAN)')
+    con.execute(f"INSERT INTO \"{table}\" VALUES (1, true)")
+    assert con.execute(f'SELECT id FROM "{table}" WHERE {filt}').fetchall() == [(1,)]  # runs on the engine
+    schema = {table: {"id", "flag"}}
+    verdict = decide(f'SELECT id FROM "{table}"', schema, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(policy_schema=schema, row_filters={table: filt}))
+    assert isinstance(verdict, Approved), verdict
+    if table == "unknown":  # the rewrite prints a reserved table name bare, which DuckDB cannot run
+        assert con.execute(verdict.target_sql).fetchall() == [(1,)]
+
+
+def test_on_sqlite_a_word_before_a_dot_is_the_reference_and_a_keyword_elsewhere_is_not():
+    schema = {"kw": {"id", "secret"}, "plain": {"id", "flag"}}
+    refused = decide("SELECT id FROM plain", schema, dialect="sqlite", target="sqlite", policy=AccessPolicy(
+        policy_schema={"kw": {"id"}, "plain": {"id", "flag"}},
+        row_filters={"plain": "id IN (SELECT id FROM kw AS true WHERE true.secret = 'x')"}))
+    assert isinstance(refused, Refusal) and refused.code is RefusalCode.INVALID_ROW_FILTER, refused
+    passed = decide('SELECT id FROM "true"', {"true": {"id", "flag"}}, dialect="sqlite", target="sqlite",
+                    policy=AccessPolicy(policy_schema={"true": {"id", "flag"}}, row_filters={"true": "flag IS TRUE"}))
+    assert isinstance(passed, Approved), passed
