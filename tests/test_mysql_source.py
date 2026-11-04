@@ -15,6 +15,7 @@ import traceback
 
 import duckdb
 import pytest
+from sqlglot.dialects.mysql import MySQL
 
 from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
 from mnemiq.eval import mysql_source
@@ -751,11 +752,17 @@ def test_live_mysql_rejects_a_bare_introducer_and_straight_join(live_source):
     # routes a mysql-dialect decision to another engine, so the cross-engine reads from the M225
     # sweep are unreachable. This locks the engine's reading: a MySQL that accepted one bare would
     # fail here and reopen M231.
-    for word in ("_utf8", "_utf8mb4", "_binary", "straight_join"):
+    # The whole class sqlglot reads as no column: every `_`-prefixed charset introducer its MySQL
+    # tokenizer knows, plus STRAIGHT_JOIN. Derived from sqlglot so the lock tracks its introducer
+    # set rather than a hand-picked few (the register's review).
+    words = sorted(k for k in MySQL.Tokenizer.KEYWORDS if k.startswith("_")) + ["straight_join"]
+    assert len(words) >= 40  # 42 introducers + straight_join on sqlglot 30.12; guards a shrunk list
+    for word in words:
         # A same-named column IS in scope (the derived table exposes it backticked), so if MySQL
-        # read the bare word as that column the query would return 1. It does not -- it is a syntax
-        # error (an introducer expects a string literal; STRAIGHT_JOIN is reserved) -- which is the
-        # precise interpretation M231 turns on: MySQL never reads the bare word as the column.
+        # read the bare word as that column the query would return 1. It does not -- MySQL never
+        # reads a bare introducer or STRAIGHT_JOIN as a column (an introducer wants a string
+        # literal; STRAIGHT_JOIN is a select modifier / join operator, not a column reference),
+        # which is the precise interpretation M231 turns on.
         with pytest.raises(MySQLRejected):
             live_source.execute_arrow(f"SELECT {word} FROM (SELECT 1 AS `{word}`) t")
         # Backticked, the same column is reachable and returns its value, so the rejection above is
