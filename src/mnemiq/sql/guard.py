@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import collections
+import unicodedata
 import logging
-import re
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.tokens import TokenType
 
 from mnemiq.sql.identifiers import resolve_name
 from mnemiq.sql.qualify import object_key
@@ -272,21 +273,117 @@ _INTERSECT_BINDS_TIGHTER = frozenset({"duckdb", "postgres", "postgresql", "mysql
 # commit); MySQL's `UTC_TIMESTAMP()` parses to a node of its own and prints the same bare
 # word (the gate on the eighth); and `now()` written as MySQL prints `NOW()` for Postgres,
 # a call there, which the Postgres parser reads back as the CURRENT_TIMESTAMP node and a
-# re-parse of the printing refused (the gate on the same round). A word is bare where no
-# word character, dollar or dot precedes it and no word character or `(` follows, outside
-# every quoted span and comment (`_QUOTED_OR_COMMENT`, cut before the scan: `'a
-# current_timestamp'` was refused with the scan over the whole text, the gate): `kw.current_date`
-# and `"current_date"` are columns the grant check reads, and `current_date()` is the call.
+# re-parse of the printing refused (the gate on the same round). A word is bare where it is a
+# token of its own, no literal or quoted name, not after a dot and not before `(`
+# (`_bare_niladic_words`): a word inside `'a current_timestamp'` is no word (the gate), and
+# `kw.current_date` and `"current_date"` are columns the grant check reads, and `current_date()`
+# is the call.
 _NILADIC_WORDS = ("current_date", "current_timestamp", "current_time", "localtime",
                   "localtimestamp", "session_user", "current_catalog")
-_BARE_NILADIC = re.compile(r"(?<![\w$.])(" + "|".join(_NILADIC_WORDS) + r")(?![\w(])", re.I)
-_QUOTED_OR_COMMENT = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|`(?:[^`]|``)*`|/\*.*?\*/|--[^\n]*", re.S)
+# Words an engine reads as a same-named column of a table read, where the parse reads the boolean
+# literal, so no grant check saw the column (M230): measured on SQLite 3.50.4 and Oracle Free 23,
+# where `SELECT true FROM kw` returned kw's column `true`. DuckDB and Postgres read the literal
+# (measured), and are not held to them. The value's repair is a comparison, which has no column.
+_LITERAL_WORDS: dict[str, tuple[str, ...]] = {"sqlite": ("true", "false"), "oracle": ("true", "false")}
+_LITERAL_ADVICE = {"true": "(1 = 1)", "false": "(1 = 0)"}
 
 
-def _bare_niladic_words(sql: str) -> collections.Counter:
-    """How many times `sql` holds each niladic word bare, lowercased, quoted spans and
-    comments cut."""
-    return collections.Counter(match.group(1).lower() for match in _BARE_NILADIC.finditer(_QUOTED_OR_COMMENT.sub(" ", sql)))
+def _words_for(engine: str | None) -> tuple[str, ...]:
+    """The words `engine` reads as a same-named column where a table read has one."""
+    return _NILADIC_WORDS + _LITERAL_WORDS.get((engine or "").lower(), ())
+
+
+# A token of these types is a literal or a quoted name, never a bare word: what a regex over the
+# text took for a quote (`'` inside DuckDB's `$$'$$`) cut a bare `current_catalog` out of a row
+# filter, which then passed (Codex's first review of M225's branch).
+_QUOTED_TOKENS = frozenset({TokenType.STRING, TokenType.NATIONAL_STRING, TokenType.RAW_STRING,
+                            TokenType.HEREDOC_STRING, TokenType.BIT_STRING, TokenType.HEX_STRING,
+                            TokenType.BYTE_STRING, TokenType.UNICODE_STRING, TokenType.IDENTIFIER})
+
+
+def _bare_tokens(sql: str, engine: str | None, dialect: str | None = None) -> list[tuple[int, str]]:
+    """Each of `engine`'s words (`_words_for`) that `sql` holds bare, as (offset, lowercased word): a
+    token that is no literal or quoted name, not after a dot and not before `(`. Read by sqlglot's
+    tokenizer for `dialect` (the engine's where none is given), which reads strings, dollar quotes,
+    quoted names and comments as the parse it is matched with does."""
+    words = set(_words_for(engine))
+    tokens = sqlglot.tokenize(sql, read=dialect or engine)
+    found = []
+    for i, token in enumerate(tokens):
+        word = token.text.lower()
+        if word not in words or token.token_type in _QUOTED_TOKENS:
+            continue
+        if i and tokens[i - 1].token_type is TokenType.DOT:
+            continue
+        if i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.L_PAREN:
+            continue
+        found.append((token.start, word))
+    return found
+
+
+def _bare_niladic_words(sql: str, engine: str | None = None, dialect: str | None = None) -> collections.Counter:
+    """How many times `sql` holds each of `engine`'s words bare (`_bare_tokens`). With no engine,
+    the niladic words alone."""
+    return collections.Counter(word for _, word in _bare_tokens(sql, engine, dialect))
+
+
+# The nodes whose Identifier declares a name rather than reading a column, by allow-list: everything
+# else is a read. A JOIN's USING key had been excused as "not a column reference" and is one: written
+# as DuckDB for SQLite, `USING (localtimestamp)` was a function to the checks, a column to SQLite,
+# and the join answered on the withheld key (Codex's fourth review of M230's branch).
+_DECLARING = (exp.Alias, exp.TableAlias, exp.Table)
+
+
+def _declares_a_name(node: exp.Identifier) -> bool:
+    """Whether `node` declares a name where it stands: an alias, a table's or a CTE's name, a
+    column alias list, a table's name, or a column's qualifier, never the column's own name."""
+    parent = node.parent
+    if isinstance(parent, _DECLARING):
+        return True
+    return isinstance(parent, exp.Column) and parent.this is not node
+
+
+def words_read_as_columns(text: str, engine: str | None, taken, dialect: str | None = None,
+                          checked: collections.Counter | None = None) -> list[str]:
+    """The words of `engine` that `text` holds bare as reads no check saw, among `taken`, the
+    lowercased names of the columns the tables in scope have: each a column the engine reads where
+    the checks read a function's node or a literal.
+
+    Decided where each word stands, by its offset in the parse of `text` as `dialect` (the engine's
+    where none is given); sqlglot records one on every Identifier it builds from the text. A word
+    where that parse declares a name (`_declares_a_name`: an output alias, a table's alias, a CTE's
+    name, a column alias list, a table's name or a column's qualifier) is no read: `SELECT id AS
+    true` reads no column `true` (Codex's second review of this change). Any other word is a read,
+    a USING key among them (its fourth). Which reads the checks saw depends on whose
+    tree they read:
+    - `checked` None: the parse of `text` is the tree the checks read (a row filter, run as written
+      in its engine's dialect), so a column reference at the word's offset was checked.
+    - `checked` given: the checks read another tree (a statement, parsed as the dialect the model
+      writes and run as printed for the target), and `checked` counts per word the unqualified
+      column references the checks read there. A column reference in the target's parse proves
+      nothing about them: written as DuckDB for SQLite, `localtimestamp` was a function to the
+      checks and a column to SQLite, and excused by the target's parse it was approved (Codex's
+      third review). So that many reads of each word are accounted for, and no more.
+    A text that does not parse holds no names, so each bare word in it is a read."""
+    read_as = dialect or engine
+    names: set[int] = set()
+    columns: set[int] = set()
+    try:
+        for node in sqlglot.parse_one(text, read=read_as).find_all(exp.Identifier):
+            if "start" not in node.meta:
+                continue
+            if _declares_a_name(node):
+                names.add(node.meta["start"])
+            elif isinstance(node.parent, exp.Column) and node.parent.this is node:
+                columns.add(node.meta["start"])
+    except sqlglot.errors.SqlglotError:
+        pass
+    reads = collections.Counter(
+        word for start, word in _bare_tokens(text, engine, dialect)
+        if start not in names and not (checked is None and start in columns))
+    if checked is not None:
+        reads -= checked
+    return sorted(word for word, count in reads.items() if count > 0 and word in taken)
 
 
 # The call spellings the repair may name, per dialect the model writes in (the statement it
@@ -334,6 +431,149 @@ def _call_advice(dialect: str | None, target: str | None, taken: frozenset[str])
     return None
 
 
+def _a_type(node: exp.DataType) -> bool:
+    """Whether a type node stands as a type (a cast's target, a column's type), not as a value."""
+    top = node
+    while isinstance(top.parent, exp.DataType):
+        top = top.parent
+    return top.arg_key in ("to", "kind") or isinstance(top.parent, (exp.Cast, exp.TryCast, exp.ColumnDef))
+
+
+def a_table_named_by_a_word(ast: exp.Expression, engine: str | None) -> Refusal | None:
+    """A reference to a table in scope that the parse reads as a function, a literal or a type
+    (M232). With `FROM kw AS current_date`, DuckDB reads `current_date.secret`, `(current_date).secret`,
+    `current_date['secret']` and a bare `current_date` (the whole row) through kw, where sqlglot reads
+    the CURRENT_DATE node; SQLite and Oracle read `true.secret` through a table aliased `true`, where
+    sqlglot reads the literal; and DuckDB reads `bigint['secret']` through a table aliased `bigint`,
+    where sqlglot reads an array of the BIGINT type (measured). No column is attributed, so no grant
+    check saw `secret`. Found where it stands, on any engine: a node of the checks' tree that is no
+    column or name, prints for the engine as one bare word, and spells a table or alias in scope; a
+    type standing as a cast's target or a column's type is a type, so a table named `date` keeps
+    `CAST(x AS DATE)`. The repair costs one alias."""
+    named = {table.name.lower() for table in ast.find_all(exp.Table) if table.name}
+    named |= {alias.this.name.lower() for alias in ast.find_all(exp.TableAlias) if isinstance(alias.this, exp.Identifier)}
+    if not named:
+        return None
+    for node in ast.walk():
+        if not isinstance(node, (exp.Func, exp.Boolean, exp.Null, exp.DataType)):
+            continue
+        if isinstance(node, exp.DataType) and _a_type(node):
+            continue
+        try:
+            tokens = sqlglot.tokenize(node.sql(dialect=engine), read=engine)
+        except Exception:  # noqa: BLE001 -- a node that does not print or tokenize spells no word
+            continue
+        if len(tokens) != 1 or tokens[0].token_type in _QUOTED_TOKENS:
+            continue
+        word = tokens[0].text.lower()
+        if word in named:
+            return Refusal(
+                code=RefusalCode.AMBIGUOUS_NILADIC_NAME,
+                message=(f"{word!r} names a table here, and the parser reads it as a SQL function, "
+                         f"literal or type where the engine reads the table, so no check can tell "
+                         f"which column it reads. Give the table another alias."),
+                subject=word,
+            )
+    return None
+
+
+_WHERE = "SELECT 1 WHERE "
+
+
+def _duckdb_column_reads(text: str) -> list[tuple[int, str]] | None:
+    """Where DuckDB's own parser reads a column reference in a filter's text: (offset, the first part of
+    its name, lowercased), from `json_serialize_sql`, which records each node's place; None where
+    DuckDB does not parse the text."""
+    import json
+
+    from mnemiq.sql.rls import _duckdb  # rls imports this module's checks
+
+    full = _WHERE + text
+    tree = json.loads(_duckdb("SELECT json_serialize_sql($1)", [full]))
+    if tree.get("error"):
+        return None
+    encoded = full.encode("utf-8")
+    found: list[tuple[int, str]] = []
+
+    def place(location) -> int:
+        """DuckDB's place is in UTF-8 bytes, sqlglot's in characters: before any non-ASCII text the two
+        agree, after it they do not (Codex's eleventh review of M230's branch: a reference shifted onto
+        another's offset was excused). A place that is no character boundary matches nothing (-1)."""
+        if not isinstance(location, int) or not 0 <= location <= len(encoded):
+            return -1
+        try:
+            return len(encoded[:location].decode("utf-8")) - len(_WHERE)
+        except UnicodeDecodeError:
+            return -1
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            if node.get("class") == "COLUMN_REF" and node.get("column_names"):
+                found.append((place(node.get("query_location")), str(node["column_names"][0]).lower()))
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+    walk(tree.get("statements", []))
+    return found
+
+
+def a_table_named_in_text(text: str, dialect: str | None, outer: frozenset[str] = frozenset()) -> str | None:
+    """M232 for a text the engine runs as written, a row filter: a reference, through a table or alias
+    in scope, that the parse of the text reads as no name, so as a function, literal or type. Read off
+    the text, never a reprint: sqlglot prints `int8` as BIGINT, so a filter's `int8['secret']` under
+    `FROM kw AS int8` passed a check of the reprint while DuckDB read kw's column (Codex's fifth review
+    of M230's branch). `outer` is every table and alias in scope from outside the text: the filtered
+    table's own name, and a write's, whose filter is conjoined to its statement (its sixth).
+
+    Where the engine reads a reference is the engine's to say. On DuckDB, its own parser: a column
+    reference whose name starts with a table or alias in scope, at an offset where sqlglot's parse
+    holds no name. Narrower rules over sqlglot's tokens refused a type, an interval's unit and the
+    keyword after IS in turn (its seventh to tenth reviews), each a place DuckDB reads no reference.
+    Elsewhere, where only a word before a dot was measured to read the table (`true.secret` on SQLite
+    and Oracle; Postgres rejects such an alias), a word spelling a name in scope with no name at its
+    offset, before a dot. A text DuckDB does not parse is refused, as its engine would refuse it."""
+    tree = sqlglot.parse_one(text, read=dialect)
+    named = {table.name.lower() for table in tree.find_all(exp.Table) if table.name} | set(outer)
+    named |= {alias.this.name.lower() for alias in tree.find_all(exp.TableAlias) if isinstance(alias.this, exp.Identifier)}
+    if not named:
+        return None
+    held = {node.meta["start"] for node in tree.find_all(exp.Identifier) if "start" in node.meta}
+    if (dialect or "").lower() == "duckdb":
+        # Anywhere in the text, string literals included. Passing over a literal's contents would let
+        # through a filter wherever sqlglot and DuckDB disagree on a literal's boundaries, which could
+        # not be reviewed; so a filter whose comparison value holds such a character (a no-break space)
+        # is refused, an accepted fail-closed cost (Codex's fifteenth review, the owner on 2026-11-03).
+        if any(ord(char) > 127 and unicodedata.category(char)[0] in ("Z", "C") for char in text):
+            # DuckDB folds Unicode spacing, format and control characters (an em space, a BOM, even
+            # inside a comment) before it parses, which shifts every place it reports against this
+            # text, so none can be trusted (Codex's twelfth to fourteenth reviews of M230's branch).
+            # A superset by category, not a list of characters: `str.isspace` misses U+FEFF.
+            return "(the filter's references could not be placed)"
+        reads = _duckdb_column_reads(text)
+        if reads is None:
+            return "(the text DuckDB does not parse)"
+        # Each place DuckDB reports must be where the text spells that reference, or the places are not
+        # the text's, and the filter is refused. DuckDB normalises Unicode whitespace before it parses,
+        # so a reference after an em space was placed on another name's offset and excused by the name
+        # there (Codex's twelfth review of M230's branch). With every place spelling its own reference,
+        # a name the parse holds at one is that reference's.
+        spelled = {token.start: token.text.lower() for token in sqlglot.tokenize(text, read=dialect)
+                   if token.token_type not in _QUOTED_TOKENS or token.token_type is TokenType.IDENTIFIER}
+        if any(spelled.get(start) != first for start, first in reads):
+            return "(the filter's references could not be placed)"
+        return next((first for start, first in reads if first in named and start not in held), None)
+    tokens = sqlglot.tokenize(text, read=dialect)
+    for i, token in enumerate(tokens):
+        word = token.text.lower()
+        if word not in named or token.token_type in _QUOTED_TOKENS or token.start in held:
+            continue
+        if i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.DOT:
+            return word
+    return None
+
+
 def niladic_names(ast: exp.Expression, columns, dialect: str | None = None,
                   target: str | None = None) -> Refusal | None:
     """A column named like a niladic SQL function is read through the function's node, which
@@ -366,6 +606,9 @@ def niladic_names(ast: exp.Expression, columns, dialect: str | None = None,
     from mnemiq.sql.scope import base_tables  # scope imports this module's checks
 
     engine = target or dialect
+    aliased = a_table_named_by_a_word(ast, engine)  # M232: the same words naming a table
+    if aliased is not None:
+        return aliased
     referenced = {object_key(table) for table in base_tables(ast, engine)}
 
     def columns_of(table: str) -> set[str]:
@@ -388,23 +631,40 @@ def niladic_names(ast: exp.Expression, columns, dialect: str | None = None,
     # the function's spelling. By occurrence, not by word: taken off for the whole statement,
     # a quoted `"current_timestamp"` read in a subquery switched the rule off for the bare
     # word beside it and the column leaked (the gate's second round on this commit).
-    bare = _bare_niladic_words(printed)
-    as_columns = collections.Counter(
+    # The checks read `ast`, parsed as `dialect`; the engine runs `printed`. A column reference the
+    # checks read accounts for one bare occurrence of its word, by count, never by the target's parse.
+    checked = collections.Counter(
         column.name.lower() for column in ast.find_all(exp.Column)
-        if not column.table and _bare_niladic_words(column.sql(dialect=engine)))
-    for name in sorted(name for name, count in bare.items() if count > as_columns[name]):
+        if not column.table and _bare_niladic_words(column.sql(dialect=engine), engine))
+    # A USING key the checks read as a name is a column they checked, as the join-key rule reads it.
+    checked += collections.Counter(
+        key.name.lower() for join in ast.find_all(exp.Join) for key in join.args.get("using") or ()
+        if isinstance(key, exp.Identifier) and _bare_niladic_words(key.sql(dialect=engine), engine))
+    for name in words_read_as_columns(printed, engine, taken, checked=checked):
         owners = sorted(table for table in referenced if name in columns_of(table))
-        if owners:
-            call = _call_advice(dialect, engine, taken)
-            advice = f"such as {call}" if call else "with its own name and parentheses"
+        if name in _LITERAL_ADVICE:
+            # Quoted: sqlglot reads `kw.true` as no column at all, so the repair would be refused.
+            stored = next((n for key, names in (columns or {}).items() if key.lower() == owners[0].lower()
+                           for n in names if n.lower() == name), name)
+            column = exp.to_identifier(stored, quoted=True).sql(dialect=engine)
             return Refusal(
                 code=RefusalCode.AMBIGUOUS_NILADIC_NAME,
-                message=(f"{name!r} names a column of {owners[0]!r} and a SQL function, and the "
+                message=(f"{name!r} names a column of {owners[0]!r} and a SQL literal, and the "
                          f"engine reads the column where that table is in the FROM. Write "
-                         f"{owners[0]}.{name} for the column, or for the function a call written "
-                         f"as one in this query's dialect, {advice}."),
+                         f"{owners[0]}.{column} for the column, or for the value a comparison, "
+                         f"{_LITERAL_ADVICE[name]}."),
                 subject=name,
             )
+        call = _call_advice(dialect, engine, taken)
+        advice = f"such as {call}" if call else "with its own name and parentheses"
+        return Refusal(
+            code=RefusalCode.AMBIGUOUS_NILADIC_NAME,
+            message=(f"{name!r} names a column of {owners[0]!r} and a SQL function, and the "
+                     f"engine reads the column where that table is in the FROM. Write "
+                     f"{owners[0]}.{name} for the column, or for the function a call written "
+                     f"as one in this query's dialect, {advice}."),
+            subject=name,
+        )
     return None
 
 
