@@ -15,7 +15,7 @@ from mnemiq.sql.deadline import paused
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import expand_tables, names_one_object, object_key
 from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys, is_lambda_parameter, map_struct
-from mnemiq.sql.reserved_words import reserved
+from mnemiq.sql.reserved_words import bare_table_reserved, reserved
 from mnemiq.sql.scope import (KnownColumns, base_tables, column_tables, cte_references,
                               known_columns, scope_resolved)
 from mnemiq.sql.verdict import Refusal, RefusalCode
@@ -2655,7 +2655,7 @@ def _spelled_name(name: str, engine: str | None) -> exp.Identifier:
     identifier folds differently on Oracle and Postgres, which would change the identity the
     outer query's references resolve to, so those stay bare."""
     ident = exp.to_identifier(name)
-    if reserved(name, engine):
+    if bare_table_reserved(name, engine):
         ident.set("quoted", True)
     return ident
 
@@ -2665,7 +2665,7 @@ def _spelled_table(table: str, engine: str | None) -> exp.Table:
     reserves it (M233). `exp.to_table` splits on dots, so a qualified key is spelled part by part."""
     node = exp.to_table(table)
     for part in (node.args.get("catalog"), node.args.get("db"), node.this):
-        if isinstance(part, exp.Identifier) and reserved(part.name, engine):
+        if isinstance(part, exp.Identifier) and bare_table_reserved(part.name, engine):
             part.set("quoted", True)
     return node
 

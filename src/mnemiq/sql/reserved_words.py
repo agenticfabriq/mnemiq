@@ -7,12 +7,10 @@ no name: `TRIM(BOTH FROM region)` and `SELECT ALL id` were refused for BOTH and 
 seventh review of #193). After a dot Postgres and DuckDB read a reserved word as a column label
 (`e.all`), so a word after a dot is not taken as reserved.
 
-Measured on each engine, the lists below are subsets of what it reports. A dialect with no list
-here excuses nothing. Each list is checked against the engine: DuckDB's against the installed
-library, Oracle's and Postgres's live where a test database is set, and SQLite's against the
-bundled library -- SQLite takes most of its 147 keywords as names where a name fits, so its list
-is only the 58 its parser rejects as a bare table name (`null` and `select` among them, `true`
-and `false` not), which otherwise break the governed derived table a row filter builds (M233).
+Measured on each engine, the lists below are subsets of what it reports. An engine with no list
+here (SQLite, which takes most of its keywords as names where a name fits) excuses nothing. Each
+list is checked against the engine: DuckDB's against the installed library, Oracle's and
+Postgres's live where a test database is set.
 """
 from __future__ import annotations
 
@@ -42,21 +40,57 @@ of on option or order pctfree prior public raw rename resource revoke select set
 start synonym table then to trigger union unique update values varchar varchar2 view where with
 """  # V$RESERVED_WORDS WHERE reserved = 'Y', its words, Oracle Free 23
 
-_SQLITE = """
-add all alter and as autoincrement between case check collate commit constraint create default
-deferrable delete distinct drop else escape except exists foreign from group having in index insert
-intersect into is isnull join limit not nothing notnull null on or order primary references
-returning select set table then to transaction union unique update using values when where
-"""  # sqlite3_keyword_name(), kept where `SELECT 1 FROM <kw>` is a syntax error (bare table), SQLite 3.50.4
-
 RESERVED: dict[str, frozenset[str]] = {
     "duckdb": frozenset(_DUCKDB.split()),
     "postgres": frozenset(_POSTGRES.split()),
     "oracle": frozenset(_ORACLE.split()),
-    "sqlite": frozenset(_SQLITE.split()),
 }
 
 
 def reserved(word: str, dialect: str | None) -> bool:
     """Whether `dialect`'s engine reserves `word`, compared casefolded."""
     return word.casefold() in RESERVED.get((dialect or "").lower(), frozenset())
+
+
+# Words each engine will not read as a bare TABLE or alias name, so the row-filter rewrite's
+# derived table must quote them there (M233). This is BROADER than `reserved` above and a
+# different question: `reserved` is "a keyword wherever it stands" for the filter name-count,
+# while a table position also rejects the join and operator keywords (`inner`, `join`, `like`,
+# `is`) that a filter reads as a column label. Built from the engine's own parser: a word is
+# listed where `SELECT 1 FROM <word>` is a syntax error (parseable -> "no such table" is not).
+#
+# DuckDB and SQLite are probed exhaustively and complete. Postgres and Oracle reuse their
+# `reserved` lists above as a sound subset, not proven complete: a served postgres or sqlite
+# source runs through DuckDB (ATTACH), so DuckDB's list governs it, and only a native Oracle
+# source runs as oracle. An engine keyword outside its list here renders bare and the engine
+# then refuses the governed query -- fail-closed availability, never a disclosure. (M233 residual.)
+_DUCKDB_TABLE = """
+all analyse analyze and anti any array as asc asof asymmetric at authorization binary both by case
+cast check collate collation column concurrently constraint create cross default deferrable desc
+describe distinct do else end except false fetch for foreign freeze from full glob group having
+ilike in initially inner intersect into is isnull join lambda lateral leading left like limit
+natural not notnull null offset on only or order outer overlaps pivot pivot_longer pivot_wider
+placing positional primary qualify references returning right select semi show similar some
+summarize symmetric table tablesample then to trailing true union unique unpack unpivot using
+variadic verbose when where window with
+"""  # every duckdb_keywords() word that `SELECT 1 FROM <word>` rejects, DuckDB 1.5.4
+
+_SQLITE_TABLE = """
+add all alter and as autoincrement between case check collate commit constraint create default
+deferrable delete distinct drop else escape except exists foreign from group having in index insert
+intersect into is isnull join limit not nothing notnull null on or order primary references
+returning select set table then to transaction union unique update using values when where
+"""  # every sqlite3_keyword_name() word that `SELECT 1 FROM <word>` rejects, SQLite 3.50.4
+
+BARE_TABLE_UNSAFE: dict[str, frozenset[str]] = {
+    "duckdb": frozenset(_DUCKDB_TABLE.split()),
+    "sqlite": frozenset(_SQLITE_TABLE.split()),
+    "postgres": frozenset(_POSTGRES.split()),
+    "oracle": frozenset(_ORACLE.split()),
+}
+
+
+def bare_table_reserved(word: str, dialect: str | None) -> bool:
+    """Whether `dialect` refuses `word` as a bare table or alias name, so the row-filter
+    rewrite's derived table must quote it there (M233). Casefolded. See BARE_TABLE_UNSAFE."""
+    return word.casefold() in BARE_TABLE_UNSAFE.get((dialect or "").lower(), frozenset())
