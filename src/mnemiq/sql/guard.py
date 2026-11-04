@@ -476,6 +476,16 @@ def a_table_named_by_a_word(ast: exp.Expression, engine: str | None) -> Refusal 
     return None
 
 
+def _a_type_position(tokens: list, i: int) -> bool:
+    """Whether token `i` stands where the text names a type: after `::`, before a string (a typed
+    literal, `DATE '2020-01-01'`), or after `AS` with no name of its own, which only a cast's type is
+    (an alias is a name at its offset, and the caller has passed those over)."""
+    previous = tokens[i - 1] if i else None
+    if previous is not None and previous.token_type in (TokenType.DCOLON, TokenType.ALIAS):
+        return True
+    return i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.STRING
+
+
 def a_table_named_in_text(text: str, dialect: str | None, outer: frozenset[str] = frozenset()) -> str | None:
     """M232 for a text the engine runs as written, a row filter: the first token that spells a table
     or alias the text names in scope where the parse of the same text holds no name at that offset,
@@ -499,6 +509,8 @@ def a_table_named_in_text(text: str, dialect: str | None, outer: frozenset[str] 
             continue
         if i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.L_PAREN:
             continue  # a call, which names no table
+        if _a_type_position(tokens, i):
+            continue  # `CAST(x AS int8)` on a table named int8 names a type (Codex's seventh review)
         return word
     return None
 

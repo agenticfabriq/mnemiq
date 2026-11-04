@@ -609,3 +609,35 @@ def test_a_filter_s_correlated_reference_to_its_own_table_passes():
     verdict = decide("SELECT id FROM kw", schema, dialect="duckdb", target="duckdb",
                      policy=AccessPolicy(policy_schema=schema, row_filters={"kw": "EXISTS (SELECT 1 FROM ent WHERE ent.id = id)"}))
     assert isinstance(verdict, Approved), verdict
+
+
+@pytest.mark.parametrize("table, sql, filt", [
+    ("int8", 'SELECT id FROM "int8"', "TRY_CAST(id AS int8) > 0"),
+    ("text", 'SELECT id FROM "text"', "TRY_CAST(id AS text) <> ''"),
+    ("date", 'SELECT id FROM "date"', "d > DATE '2020-01-01'"),
+    ("kw", "SELECT int8.id FROM kw AS int8", "TRY_CAST(id AS int8) > 0"),
+])
+def test_a_type_in_a_filter_spelled_like_a_table_in_scope_is_a_type(table, sql, filt):
+    # A type position names a type, not the table the word also names (Codex's seventh review: such a
+    # filter was refused, leaving a table named like the type it casts to unreadable).
+    schema = {table: {"id", "d"}}
+    verdict = decide(sql, schema, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(policy_schema=schema, row_filters={table: filt}))
+    assert isinstance(verdict, Approved), verdict
+
+
+
+@pytest.mark.parametrize("text, found", [
+    ("id::int8 > 0", None),                        # after `::`
+    ("CAST(id AS int8) > 0", None),                # after a cast's AS
+    ("TRY_CAST(id AS int8) > 0", None),
+    ("d > int8 '1'", None),                         # a typed literal
+    ("int8['secret'] = 'x'", "int8"),             # the table, read by bracket
+    ("(int8).secret = 'x'", None),                 # a column to the parse, which the filter's check reads
+    ("f(id AS int8) > 0", None),                   # an alias, a declared name
+])
+def test_a_filter_s_type_positions_are_read_off_its_own_text(text, found):
+    # The conversion rule refuses every CAST and `::` in a filter before this check runs, so these
+    # positions are asked of the check itself, with the filtered table named int8 in scope.
+    from mnemiq.sql.guard import a_table_named_in_text
+    assert a_table_named_in_text(text, "duckdb", frozenset({"int8"})) == found
