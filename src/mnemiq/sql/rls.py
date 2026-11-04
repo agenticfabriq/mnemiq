@@ -1120,8 +1120,9 @@ _LIST_CONSTRUCTORS = frozenset({"array_value", "list_pack"})  # `list_value` par
 # [attrs])) = map_values(MAP(['a'], [region]))`, `list_extract([attrs], 1) = region` and the
 # struct and key twins were of unknown type on both sides, and parsed region as JSON on the
 # hidden row); by sqlglot's node where it has one, by name where it does not.
+_ARRAY_SORT = getattr(exp, "ArraySort", None) or getattr(exp, "SortArray")  # renamed in sqlglot 30.29 (M228)
 _PURE_CALL_NODES = (exp.MapKeys, exp.StructExtract, exp.ArrayDistinct, exp.MapFromEntries,
-                    exp.ArraySlice, exp.SortArray, exp.Flatten, exp.ArrayReverse)
+                    exp.ArraySlice, _ARRAY_SORT, exp.Flatten, exp.ArrayReverse)
 _PURE_CALLS = frozenset({"map_values", "map_entries", "list_extract", "array_extract", "list_element",
                          "array_element", "list_slice", "list_reverse", "list_unique",
                          "list_distinct", "array_distinct", "map_keys", "struct_extract",
