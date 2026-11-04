@@ -796,3 +796,20 @@ def test_a_place_that_does_not_spell_its_reference_is_refused(monkeypatch):
     assert guard.a_table_named_in_text("t.id = 1", "duckdb", frozenset({"t"})) == "(the filter's references could not be placed)"
     monkeypatch.setattr(guard, "_duckdb_column_reads", lambda text: [(0, "t")])
     assert guard.a_table_named_in_text("t.id = 1", "duckdb", frozenset({"t"})) is None
+
+
+@pytest.mark.parametrize("char", ["﻿", "​", " ", " ", "　", "\u0085", " "])
+def test_a_duckdb_filter_holding_a_folded_character_is_refused(char):
+    # DuckDB folds spacing, format and BOM characters before it parses, even inside a comment, which
+    # shifts every place it reports (Codex's twelfth to fourteenth reviews). Refused by category, so
+    # U+FEFF, which str.isspace misses, is caught too.
+    from mnemiq.sql.guard import a_table_named_in_text
+    text = f"/*{char * 10}*/ EXISTS (SELECT 1 FROM kw AS current_date WHERE current_date.secret = 42)"
+    assert a_table_named_in_text(text, "duckdb", frozenset({"kw"})) == "(the filter's references could not be placed)"
+
+
+def test_a_filter_whose_string_value_is_non_ascii_still_passes():
+    # A non-ASCII comparison value is ordinary: only spacing, format and control characters are folded.
+    from mnemiq.sql.guard import a_table_named_in_text
+    assert a_table_named_in_text("region = 'über'", "duckdb", frozenset({"kw"})) is None
+    assert a_table_named_in_text("名前 = 'x'", "duckdb", frozenset({"kw"})) is None

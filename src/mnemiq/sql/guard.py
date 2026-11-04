@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import unicodedata
 import logging
 
 import sqlglot
@@ -540,9 +541,11 @@ def a_table_named_in_text(text: str, dialect: str | None, outer: frozenset[str] 
         return None
     held = {node.meta["start"] for node in tree.find_all(exp.Identifier) if "start" in node.meta}
     if (dialect or "").lower() == "duckdb":
-        if any(char.isspace() and ord(char) > 127 for char in text):
-            # DuckDB normalises Unicode whitespace before it parses, so no place it reports can be
-            # trusted against this text (Codex's twelfth and thirteenth reviews of M230's branch).
+        if any(ord(char) > 127 and unicodedata.category(char)[0] in ("Z", "C") for char in text):
+            # DuckDB folds Unicode spacing, format and control characters (an em space, a BOM, even
+            # inside a comment) before it parses, which shifts every place it reports against this
+            # text, so none can be trusted (Codex's twelfth to fourteenth reviews of M230's branch).
+            # A superset by category, not a list of characters: `str.isspace` misses U+FEFF.
             return "(the filter's references could not be placed)"
         reads = _duckdb_column_reads(text)
         if reads is None:
