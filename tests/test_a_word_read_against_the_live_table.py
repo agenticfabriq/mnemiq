@@ -11,6 +11,7 @@ ordinary statement asks nothing. The live columns only ever refuse; they never g
 from __future__ import annotations
 
 import duckdb
+import pytest
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.sql.decide import decide
@@ -234,3 +235,27 @@ def test_an_unrelated_table_named_with_a_quote_does_not_refuse_an_ordinary_query
     verdict = decide("SELECT id FROM kw WHERE true", {"kw": {"id"}}, adapter=adapter, dialect="sqlite",
                      target="sqlite", policy=AccessPolicy(policy_schema={"kw": {"id"}}))
     assert isinstance(verdict, Approved), verdict
+
+
+@pytest.mark.parametrize("registered", ["PUBLIC", "Public", "public"])
+def test_a_federated_registry_schema_is_matched_without_regard_to_case(registered):
+    # DuckDB matches identifiers without regard to case, so a registry naming the schema in another case
+    # still names the schema it executes against; matched case-sensitively, the inventory dropped every
+    # row and a withheld guarded-word read was approved (Codex's fifth review of the live-column change).
+    import duckdb
+    from mnemiq.adapters.federated import FederatedAdapter
+    con = duckdb.connect()
+    con.execute("ATTACH ':memory:' AS pg")
+    con.execute("CREATE SCHEMA pg.public")
+    con.execute('CREATE TABLE pg.public.kw (id INT, "current_catalog" VARCHAR)')
+    adapter = FederatedAdapter.__new__(FederatedAdapter)
+    adapter._con, adapter.registry, adapter.catalogs = con, {"pg": registered}, frozenset({"pg"})
+    assert ("pg.kw", "current_catalog") in {(t, c) for t, c, _ in adapter.list_columns()}
+    snapshot = {"pg.kw": {"id"}}
+    read = decide("SELECT current_catalog FROM pg.kw", snapshot, adapter=adapter, dialect="duckdb",
+                  target="duckdb", registry={"pg": registered}, policy=AccessPolicy(policy_schema=snapshot))
+    assert isinstance(read, Refusal) and read.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, read
+    filtered = decide("SELECT id FROM pg.kw", snapshot, adapter=adapter, dialect="duckdb", target="duckdb",
+                      registry={"pg": registered},
+                      policy=AccessPolicy(policy_schema=snapshot, row_filters={"pg.kw": "current_catalog = 'x'"}))
+    assert isinstance(filtered, Refusal) and filtered.code is RefusalCode.INVALID_ROW_FILTER, filtered

@@ -102,9 +102,13 @@ class FederatedAdapter:
             "SELECT table_catalog, table_schema, table_name, column_name, data_type FROM information_schema.columns"
         ).fetchall()
         # Only each catalog's registered schema, the one expansion reads: a same-named table in another
-        # schema of the catalog lent its columns to catalog.table (Codex's third review).
+        # schema of the catalog lent its columns to catalog.table (Codex's third review). Matched as
+        # DuckDB matches identifiers, without regard to case: a registry naming `PUBLIC` dropped every
+        # row DuckDB reports under `public`, which it executes against, and the check failed open
+        # (Codex's fifth review).
+        registered = {catalog.casefold(): schema.casefold() for catalog, schema in self.registry.items()}
         return [(f"{cat}.{tbl}", col, (typ or "unknown")) for cat, sch, tbl, col, typ in rows
-                if cat in self.catalogs and sch == self.registry.get(cat)]
+                if registered.get(cat.casefold()) == sch.casefold()]
 
     def execute(self, sql: str) -> list[tuple]:
         return self._con.execute(sql).fetchall()
