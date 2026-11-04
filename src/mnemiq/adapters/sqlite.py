@@ -47,8 +47,11 @@ class SQLiteAdapter:
             # PRAGMA table_xinfo, not table_info: xinfo lists GENERATED and hidden columns too, and the
             # engine reads those by name, so a governance inventory must hold them (a generated column
             # named like a SQL word was read while table_info omitted it, M225, Codex's review).
-            # (cid, name, type, notnull, dflt_value, pk, hidden)
-            for row in self._con.execute(f'PRAGMA table_xinfo("{table}")').fetchall():
+            # (cid, name, type, notnull, dflt_value, pk, hidden). The table-valued form, with the name as a
+            # parameter: interpolated into PRAGMA table_xinfo("..."), a table named with a double quote
+            # broke the statement, and since the live check inventories every table, one such table
+            # refused every guarded-word query on the source (Codex's fourth review of that change).
+            for row in self._con.execute("SELECT * FROM pragma_table_xinfo(?)", [table]).fetchall():
                 out.append((table, row[1], (row[2] or "unknown")))
         return out
 

@@ -217,3 +217,20 @@ def test_a_federated_inventory_reads_only_the_registered_schema():
     verdict = decide("SELECT current_date FROM pg.kw", {"pg.kw": {"id"}}, adapter=adapter, dialect="duckdb",
                      target="duckdb", registry={"pg": "public"}, policy=AccessPolicy(policy_schema={"pg.kw": {"id"}}))
     assert isinstance(verdict, Approved), verdict
+
+
+def test_an_unrelated_table_named_with_a_quote_does_not_refuse_an_ordinary_query():
+    # SQLite's inventory reads each table by parameter, so a table named odd"name no longer breaks it and
+    # a guarded-word query on another table is decided, not refused (Codex's fourth review).
+    import sqlite3
+    from mnemiq.adapters.sqlite import SQLiteAdapter
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE kw (id INT)")
+    con.execute('CREATE TABLE "odd""name" (x INT)')
+    con.execute("INSERT INTO kw VALUES (1)")
+    adapter = SQLiteAdapter.__new__(SQLiteAdapter)
+    adapter._con = con
+    assert ('odd"name', "x") in {(t, c) for t, c, _ in adapter.list_columns()}
+    verdict = decide("SELECT id FROM kw WHERE true", {"kw": {"id"}}, adapter=adapter, dialect="sqlite",
+                     target="sqlite", policy=AccessPolicy(policy_schema={"kw": {"id"}}))
+    assert isinstance(verdict, Approved), verdict
