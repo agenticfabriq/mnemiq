@@ -280,3 +280,25 @@ def test_a_user_table_named_like_the_internal_prefix_is_inventoried():
     filtered = decide("SELECT id FROM sqlitex", snapshot, adapter=adapter, dialect="sqlite", target="sqlite",
                       policy=AccessPolicy(policy_schema=snapshot, row_filters={"sqlitex": "true = 123"}))
     assert isinstance(filtered, Refusal) and filtered.code is RefusalCode.INVALID_ROW_FILTER, filtered
+
+
+@pytest.mark.parametrize("configured", ["MAIN", "Main", "main"])
+def test_a_duckdb_schema_spelling_is_matched_without_regard_to_case(configured):
+    # DuckDB resolves identifiers without regard to case, so a schema configured MAIN still names the
+    # one it reports as main; matched case-sensitively, list_columns was empty and a guarded word read
+    # a live column unchecked (Codex's seventh review of the live-column change).
+    import duckdb
+    from mnemiq.adapters.duckdb import DuckDBAdapter
+    con = duckdb.connect()
+    con.execute('CREATE TABLE kw (id INT, "current_catalog" VARCHAR)')
+    con.execute("INSERT INTO kw VALUES (1, 'secret')")
+    adapter = DuckDBAdapter.__new__(DuckDBAdapter)
+    adapter._con, adapter._catalog, adapter._table_schema = con, "memory", configured
+    assert ("kw", "current_catalog") in {(t, c) for t, c, _ in adapter.list_columns()}
+    snapshot = {"kw": {"id"}}
+    read = decide("SELECT current_catalog FROM kw", snapshot, adapter=adapter, dialect="duckdb", target="duckdb",
+                  policy=AccessPolicy(policy_schema=snapshot))
+    assert isinstance(read, Refusal) and read.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, read
+    filtered = decide("SELECT id FROM kw", snapshot, adapter=adapter, dialect="duckdb", target="duckdb",
+                      policy=AccessPolicy(policy_schema=snapshot, row_filters={"kw": "current_catalog = 'secret'"}))
+    assert isinstance(filtered, Refusal) and filtered.code is RefusalCode.INVALID_ROW_FILTER, filtered

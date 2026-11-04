@@ -296,17 +296,23 @@ class DuckDBAdapter:
                    local_only=local_only)
 
     def introspect(self) -> list[str]:
+        # Catalog and schema matched without regard to case, as DuckDB resolves identifiers, and by
+        # parameter: configured as `MAIN` while DuckDB reports `main`, a case-sensitive predicate
+        # returned nothing, so the live-column inventory was empty and a guarded word read a column
+        # unchecked (M225, Codex's seventh review).
         rows = self._con.execute(
             "SELECT table_name FROM information_schema.tables "
-            f"WHERE table_catalog = '{self._catalog}' AND table_schema = '{self._table_schema}'"
+            "WHERE lower(table_catalog) = lower(?) AND lower(table_schema) = lower(?)",
+            [self._catalog, self._table_schema],
         ).fetchall()
         return [r[0] for r in rows]
 
     def list_columns(self) -> list[tuple[str, str, str]]:
         rows = self._con.execute(
             "SELECT table_name, column_name, data_type FROM information_schema.columns "
-            f"WHERE table_catalog = '{self._catalog}' AND table_schema = '{self._table_schema}' "
-            "ORDER BY table_name, ordinal_position"
+            "WHERE lower(table_catalog) = lower(?) AND lower(table_schema) = lower(?) "
+            "ORDER BY table_name, ordinal_position",
+            [self._catalog, self._table_schema],
         ).fetchall()
         return [(r[0], r[1], r[2]) for r in rows]
 
