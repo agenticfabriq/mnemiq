@@ -56,13 +56,13 @@ def _logged(base, tmp_path, **fields):  # noqa: F811
 
 
 def test_a_declined_answer_is_stamped(base, calls, retrieved, tmp_path):  # noqa: F811
-    rt, _ = _logged(base, tmp_path)
+    rt, _ = _logged(base, tmp_path, engine_commit="declared-commit")
     ans = rt.ask("q", _who("analyst"), mode="instant", profile="gpt")
     assert ans.deferred is True
     assert ans.profile == "gpt"
     assert ans.profile_version == rt.profiles["gpt"].version
     assert ans.model == "gpt-model"
-    assert ans.engine_commit == rt.engine_commit
+    assert ans.engine_commit == "declared-commit"
 
 
 def test_an_answered_question_is_stamped(base, calls, retrieved, tmp_path):  # noqa: F811

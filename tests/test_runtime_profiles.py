@@ -141,8 +141,9 @@ def test_the_fit_comes_from_the_picked_profile(base, calls, retrieved, monkeypat
         original = loaded.fitter.fit
         loaded.fitter.fit = (lambda orig, label: lambda packet, snapshot, grants, card_style=None: (
             fitted.append((label, card_style)), orig(packet, snapshot, grants, card_style=card_style))[1])(original, name)
+    rt.ask("q", _who("analyst"), mode="instant", profile="gpt")
     rt.ask("q", _who("analyst"), mode="instant", profile="qwen")
-    assert fitted == [("qwen", "bare")]
+    assert fitted == [("gpt", "cards"), ("qwen", "bare")]
 
 
 def test_profiles_share_the_source_cache_store_and_grants(base, calls, retrieved):

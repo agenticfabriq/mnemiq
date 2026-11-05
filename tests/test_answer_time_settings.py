@@ -218,7 +218,8 @@ def test_plan_attempts_of_two():
 
 
 def test_deep_candidates_stay_at_one_call_each():
-    agent = Agent(generator=FakeGenerator([_GOOD] * 5), synthesizer=FakeSynthesizer("p"), adapter=_Adapter(),
+    """A refused candidate drops out of the vote, however many repairs a mode's single path may spend."""
+    agent = Agent(generator=FakeGenerator([_STAR] + [_GOOD] * 9), synthesizer=FakeSynthesizer("p"), adapter=_Adapter(),
                   cache=TwoTierCache(L1Cache()), budget=Budget(), candidates=5, plan_attempts=3)
     _ask(agent)
     assert len(agent.generator.calls) == 5
