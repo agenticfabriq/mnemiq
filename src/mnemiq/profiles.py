@@ -68,6 +68,26 @@ class Profile:
     settings: Settings
 
 
+class UnknownProfile(ValueError):
+    """A request named a profile it may not pick. Unknown and forbidden read alike, so a name cannot disclose that a
+    profile exists. `offered` is what this caller may pick, and is all a door may tell them."""
+
+    def __init__(self, offered: list[str]) -> None:
+        super().__init__("that profile is not one this deployment offers you")
+        self.offered = offered
+
+
+def may_pick(profile: Profile, identity) -> bool:
+    """Read as `FileAuthzProvider.grants_for` reads an identity: roles and groups alike."""
+    if profile.roles is None or "*" in profile.roles:
+        return True
+    return bool(profile.roles & {*identity.roles, *identity.groups})
+
+
+def offered_to(identity, profiles) -> list[str]:
+    return sorted(name for name, profile in profiles.items() if may_pick(profile, identity))
+
+
 class _Entry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

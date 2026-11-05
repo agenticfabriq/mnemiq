@@ -18,6 +18,7 @@ from mnemiq.contract import HistoryTurn, IdentityContext, Snapshot
 from mnemiq.execute.runner import DEFAULT_TIMEOUT_S
 from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import Embedder, LLMEmbedder
+from mnemiq.profiles import Profile, ProfileFileError, UnknownProfile, load_profiles, may_pick, offered_to, profile_version
 from mnemiq.progress import Emit, Stage, step
 from mnemiq.semantic.retrieval import retrieve
 from mnemiq.semantic.ontology_index import OntologyIndex
@@ -63,6 +64,18 @@ class WriteResult:
 
 
 @dataclass
+class LoadedProfile:
+    """One profile, built: its own model, settings and agents, over the runtime's shared source, store, cache and grants."""
+
+    profile: Profile
+    version: str
+    settings: Settings
+    modes: dict[str, Mode]
+    agents: dict[str, Agent]
+    fitter: Any
+
+
+@dataclass
 class Runtime:
     """The engine assembled once for product use (CLI, MCP). Distinct from eval's in-memory
     build_engine: this loads a *persisted* snapshot and connects a real source read-only."""
@@ -86,6 +99,22 @@ class Runtime:
     # Fits each packet to the model's window before the agent sees it (M127); None = as retrieved.
     fitter: Any = None
     ontology: Any = None  # OntologyIndex reader; None = no question-time code resolution
+    # The profiles this deployment loaded; `agents`, `modes` and `fitter` above are the default's. None: built by hand.
+    profiles: dict[str, LoadedProfile] | None = None
+    default_profile: str = "default"
+
+    def _picked(self, profile: str | None, identity: IdentityContext) -> LoadedProfile | None:
+        """The profile this request runs on. First, before any work: refused, it has cost nothing and shown nothing."""
+        if self.profiles is None:
+            if profile is None:
+                return None
+            raise UnknownProfile([])
+        if profile is None:
+            return self.profiles[self.default_profile]
+        loaded = self.profiles.get(profile)
+        if loaded is None or not may_pick(loaded.profile, identity):
+            raise UnknownProfile(offered_to(identity, {n: lp.profile for n, lp in self.profiles.items()}))
+        return loaded
 
     def reload_if_stale(self) -> None:
         """Hot-swap the in-memory snapshot when the shared version pointer has advanced to a
@@ -136,16 +165,18 @@ class Runtime:
             # that fronts the same tools in-process alongside the HTTP app would be, and that
             # is a deployment property this repo cannot see.
             _warn_view_inventory(snapshot, _acknowledged(self.settings))
-            _warn_prompt_window(self.settings, self.con, snapshot, getattr(self, "adapter", None),
-                                self.authz, _acknowledged(self.settings))
+            for settings in ([lp.settings for lp in self.profiles.values()] if self.profiles else [self.settings]):
+                _warn_prompt_window(settings, self.con, snapshot, getattr(self, "adapter", None),
+                                    self.authz, _acknowledged(self.settings))
             _warn_policy_advisories(self.authz, snapshot)
 
-    def _card_style(self, mode: str) -> str:
+    def _card_style(self, mode: str, picked: LoadedProfile | None = None) -> str:
         """The schema form this mode's prompt carries."""
-        own = (self.modes or {}).get(mode)
+        modes, settings = (picked.modes, picked.settings) if picked else (self.modes, self.settings)
+        own = (modes or {}).get(mode)
         if own is not None and own.card_style:
             return own.card_style
-        return self.settings.card_style if self.settings else "cards"
+        return settings.card_style if settings else "cards"
 
     def _source_id(self) -> str:
         """The id this runtime is actually answering FOR.
@@ -170,10 +201,14 @@ class Runtime:
         mode: str | None = None,
         emit: Emit | None = None,
         history: list[HistoryTurn] | None = None,
+        profile: str | None = None,
     ) -> AgentAnswer:
-        # Route first: an unknown mode fails before any work.
+        # Route first: an unknown profile or mode fails before any work.
+        picked = self._picked(profile, identity)
         name = self.router.route(question, mode)
-        agent = (self.agents or {}).get(name, self.agent)
+        agents, settings, fitter = ((picked.agents, picked.settings, picked.fitter) if picked
+                                    else (self.agents, self.settings, self.fitter))
+        agent = (agents or {}).get(name, self.agent)
         # A question too long to read whole is declined before any work that can fail or wait on a server: the
         # snapshot reload (the control database, and on a swap the window count), retrieval (which embeds it) and
         # the fit (which counts it). It is still recorded as an answer (M147).
@@ -192,11 +227,11 @@ class Runtime:
                 # The default lives on the Settings field, not here. It was written out as a
                 # literal 12 and silently kept the old value when the measured default moved
                 # to 24 -- a second copy of a number is a second thing to forget.
-                k=self.settings.retrieval_k if self.settings else DEFAULT_RETRIEVAL_K,
+                k=settings.retrieval_k if settings else DEFAULT_RETRIEVAL_K,
                 table_facts=self.snapshot.table_facts if self.snapshot else (),
                 # Both doors pass this or the eval measures a prompt form `ask` cannot emit
                 # -- the M81 shape the two-doors guard exists to catch, which it did.
-                card_style=self._card_style(name),
+                card_style=self._card_style(name, picked),
                 dialect=getattr(self.adapter, "dialect", None),
                 # Definitions ride with the snapshot: the glossary channel had no runtime
                 # producer until the ontology digest, so this stayed unfed from Plan 08 until SP1.
@@ -217,8 +252,8 @@ class Runtime:
         packet.history = scope_history(history, grants.fingerprint)
         # After the history, which the prompt carries too; before the agent, so the generator, the
         # corrector and the judge all read the cards the window has room for (M127).
-        if self.fitter is not None:
-            packet = self.fitter.fit(packet, self.snapshot, grants, card_style=self._card_style(name))
+        if fitter is not None:
+            packet = fitter.fit(packet, self.snapshot, grants, card_style=self._card_style(name, picked))
         answer = agent.answer(packet, self.snapshot, grants, identity, emit=emit)
         return self._record(answer, name, grants, identity, packet.question, packet, started)
 
@@ -882,6 +917,11 @@ def build_runtime(settings: Settings) -> Runtime:
         raise UnknownMode(
             f"MNEMIQ_MODE={default_mode!r} names no mode; valid modes: {sorted(MODES)}"
         )
+    try:
+        # Before anything opens. A sentence, as a mistyped source manifest is, on every door.
+        profiles, default_profile = load_profiles(settings)
+    except ProfileFileError as exc:
+        raise SnapshotMissing(str(exc)) from exc
     con = init_store(settings.store_path, local_only=settings.local_only)
     # Current version per source (shared pointer when a control DSN is set, else local) + snapshot.
     snapshot, loaded_versions = load_current_snapshot(settings, con)
@@ -920,8 +960,6 @@ def build_runtime(settings: Settings) -> Runtime:
             # traceback, on every door.
             raise SnapshotMissing(str(exc)) from exc
 
-    # Shared components, built once; each mode is a thin Agent over the same instances.
-    kit = build_components(settings, adapter, con)
     # Live L2 (cross-replica) + observability sink when a control Postgres is configured;
     # L1-only + no-op sink otherwise (today, byte-for-byte).
     if settings.control_dsn:
@@ -948,27 +986,36 @@ def build_runtime(settings: Settings) -> Runtime:
     # Built at enrich time and persisted, exactly like the value index -- so ask-time needs the
     # store, not the records file. An unindexed store simply resolves nothing.
     ontology = OntologyIndex(con)
-    # Per-mode result verifier: sanity (free) in every mode, judge in `thinking` and `deep`; the
-    # judge is built once and shared. MNEMIQ_VERIFY=0 forces off (byte-for-byte), =1 forces full.
-    modes = modes_for(settings)
-    verifiers, _ = _build_mode_verifiers(settings, client=kit.client, modes=modes)
-    agents = {
-        name: build_agent(
-            mode,
-            generator=kit.generator,
-            synthesizer=kit.synthesizer,
-            adapter=adapter,
-            cache=cache,
-            corrector=kit.corrector,
-            values=kit.values,
-            selector=kit.selector,
-            verifier=verifiers[name],
-            guard_undefined_terms=settings.guard_undefined_terms,
-            guard_fanout=settings.guard_fanout,
-            max_question_chars=settings.max_question_chars,
-        )
-        for name, mode in modes.items()
-    }
+    # One set of components per profile, built once; each mode is a thin Agent over the same instances, and every
+    # profile shares the source, the store, the cache and the grants.
+    dialect = getattr(adapter, "dialect", "duckdb")
+    loaded: dict[str, LoadedProfile] = {}
+    for profile_name, profile in profiles.items():
+        kit = build_components(profile.settings, adapter, con)
+        # Per-mode result verifier: sanity (free) in every mode, judge in `thinking` and `deep`; the
+        # judge is built once and shared. MNEMIQ_VERIFY=0 forces off (byte-for-byte), =1 forces full.
+        modes = modes_for(profile.settings)
+        verifiers, _ = _build_mode_verifiers(profile.settings, client=kit.client, modes=modes)
+        agents = {
+            name: build_agent(
+                mode,
+                generator=kit.generator,
+                synthesizer=kit.synthesizer,
+                adapter=adapter,
+                cache=cache,
+                corrector=kit.corrector,
+                values=kit.values,
+                selector=kit.selector,
+                verifier=verifiers[name],
+                guard_undefined_terms=profile.settings.guard_undefined_terms,
+                guard_fanout=profile.settings.guard_fanout,
+                max_question_chars=settings.max_question_chars,
+            )
+            for name, mode in modes.items()
+        }
+        loaded[profile_name] = LoadedProfile(profile, profile_version(profile.settings, dialect), profile.settings, modes,
+                                             agents, kit.fitter)
+    default = loaded[default_profile]
     _boot_authz = _authz(settings)
     _warn_policy_advisories(_boot_authz, snapshot)
     _warn_source_enforcement(adapter, _acknowledged(settings))
@@ -978,21 +1025,26 @@ def build_runtime(settings: Settings) -> Runtime:
     # calling this from inside the function advisory ran it only when that one found
     # nothing to report, which is every deployment except a schema with no helpers.
     _warn_view_inventory(snapshot, _acknowledged(settings))
-    _warn_prompt_window(settings, con, snapshot, adapter, _boot_authz, _acknowledged(settings))
+    for profile_name, profile in profiles.items():
+        if len(profiles) > 1:
+            logger.info("the prompt window of profile %s:", profile_name)
+        _warn_prompt_window(profile.settings, con, snapshot, adapter, _boot_authz, _acknowledged(settings))
     return Runtime(
         con=con,
         snapshot=snapshot,
         adapter=adapter,
-        agent=agents[default_mode],
+        agent=default.agents[default_mode],
         embedder=LLMEmbedder(settings),
         authz=_boot_authz,
         settings=settings,
-        agents=agents,
-        modes=modes,
+        agents=default.agents,
+        modes=default.modes,
         router=StaticRouter(default=default_mode),
         loaded_versions=loaded_versions,
         sink=sink,
         trace_sink=trace_sink,
         ontology=ontology,
-        fitter=kit.fitter,
+        fitter=default.fitter,
+        profiles=loaded,
+        default_profile=default_profile,
     )
