@@ -56,6 +56,22 @@ class Synthesizer(Protocol):
                row_count: int | None = None) -> str: ...
 
 
+def system_text(markdown: bool, row_count: int | None, forced: bool) -> str:
+    opener = _OPEN_MARKDOWN if markdown else _OPEN_PLAIN
+    system = f"{_PERSONA}\n\n{opener}\n{_RULES}"
+    if markdown:
+        system += _MARKDOWN
+    if row_count is not None and row_count > LIST_LIMIT:
+        system += _SUMMARISE
+    if forced:
+        system += _FORCED
+    return system
+
+
+def user_text(question: str, sql: str, rendered: str) -> str:
+    return f"QUESTION: {question}\n\nSQL:\n{sql}\n\nRESULT:\n{rendered}"
+
+
 class LLMSynthesizer:
     def __init__(self, client, max_tokens: int = 1000, markdown: bool = False) -> None:
         self._client = client
@@ -64,16 +80,8 @@ class LLMSynthesizer:
 
     def answer(self, question: str, sql: str, rendered: str, forced: bool = False,
                row_count: int | None = None) -> str:
-        opener = _OPEN_MARKDOWN if self._markdown else _OPEN_PLAIN
-        system = f"{_PERSONA}\n\n{opener}\n{_RULES}"
-        if self._markdown:
-            system += _MARKDOWN
-        if row_count is not None and row_count > LIST_LIMIT:
-            system += _SUMMARISE
-        if forced:
-            system += _FORCED
-        user = f"QUESTION: {question}\n\nSQL:\n{sql}\n\nRESULT:\n{rendered}"
-        return self._client.complete(system, user, max_tokens=self._max_tokens).strip()
+        system = system_text(self._markdown, row_count, forced)
+        return self._client.complete(system, user_text(question, sql, rendered), max_tokens=self._max_tokens).strip()
 
 
 class FakeSynthesizer:

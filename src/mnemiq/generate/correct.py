@@ -19,6 +19,10 @@ def _strip_sql(raw: str) -> str:
     return s
 
 
+def user_text(sql: str, problem: str) -> str:
+    return f"SQL:\n{sql}\n\nProblem to fix (change only what this requires):\n{problem}"
+
+
 class SqlCorrector(Protocol):
     def correct(self, sql: str, problem: str) -> str: ...
 
@@ -35,8 +39,7 @@ class LLMCorrector:
         self._max_tokens = max_tokens
 
     def correct(self, sql: str, problem: str) -> str:
-        user = f"SQL:\n{sql}\n\nProblem to fix (change only what this requires):\n{problem}"
-        return _strip_sql(self._client.complete(_SYSTEM, user, max_tokens=self._max_tokens))
+        return _strip_sql(self._client.complete(_SYSTEM, user_text(sql, problem), max_tokens=self._max_tokens))
 
 
 class FakeCorrector:

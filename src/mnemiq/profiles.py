@@ -9,15 +9,26 @@ must not become reachable by accident, and `test_every_settings_field_is_classif
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import tomllib
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from types import SimpleNamespace as _Sample
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 
+from mnemiq.agent import synthesize
+from mnemiq.agent.loop import STRATEGIES
 from mnemiq.agent.modes import MODES, modes_for
 from mnemiq.config import ModeSettings, Settings
+from mnemiq.execute import select
+from mnemiq.execute.select import ClusterView
+from mnemiq.generate import correct, prompts
+from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
+from mnemiq.verify import judge
 
 # What changes how a question is answered, and nothing that decides who may see what.
 PROFILE_SETTINGS = frozenset({
@@ -184,3 +195,68 @@ def load_profiles(settings: Settings) -> tuple[dict[str, Profile], str]:
     if read.default not in read.profiles:
         raise ProfileFileError(f"default = {read.default!r} names no profile; the file has {sorted(read.profiles)}")
     return {name: _checked(name, entry, read.default, settings) for name, entry in read.profiles.items()}, read.default
+
+
+def _sample_packet() -> ContextPacket:
+    """Every section the writer's user prompt can hold, so a change to any of them moves the version. Fixed text: only
+    the templates vary. Duck-typed, since `meaning_sections` reads attributes and a real record would add nothing."""
+    return ContextPacket(
+        question="Q", cards=[RetrievedCard(object_id="t", card="C", score=1.0)], grant_fingerprint="f",
+        enrichment_version=None,
+        definitions=[_Sample(term="T", definition="D")],
+        metrics=[_Sample(label="L", id="i", measure=_Sample(source="s", expr="e"))],
+        dimensions=[_Sample(label="L", source="s", expression=lambda: "e")],
+        concepts=[_Sample(column_id="c", scheme_label="s", notation="n", label="l")],
+        examples=[_Sample(question="q", sql="s")],
+        history=[_Sample(question="q", sql="s", columns=["c"], rows=[[1]])],
+    )
+
+
+def _prompt_texts(settings: Settings, dialect: str) -> dict[str, str]:
+    """Every prompt a model call uses, as these settings render it. Read through each module at call time."""
+    texts = {f"writer system {strategy}": prompts.system_prompt(
+        dialect=dialect, strategy=strategy, assertive=settings.assertive_sql,
+        declare_assumed_terms=settings.guard_undefined_terms) for strategy in STRATEGIES}
+    texts["writer user"] = prompts.user_prompt(_sample_packet(), "F")
+    texts["corrector system"] = correct._SYSTEM
+    texts["corrector user"] = correct.user_text("s", "p")
+    texts["judge system"] = judge._SYSTEM
+    texts["judge user"] = judge._prompt("q", "s", "x", "p")
+    texts["selector system"] = select._SYSTEM
+    texts["selector user"] = select._judge_prompt("q", [ClusterView(sql="s", preview="p", size=1)])
+    for rows in (1, synthesize.LIST_LIMIT + 1):
+        for forced in (False, True):
+            texts[f"prose system {rows} {forced}"] = synthesize.system_text(settings.answer_markdown, rows, forced)
+    texts["prose user"] = synthesize.user_text("q", "s", "r")
+    return texts
+
+
+def _no_credentials(value):
+    """A URL as it may be logged: `user:password@` is a secret however it got there."""
+    if not isinstance(value, str) or "@" not in value:
+        return value
+    try:
+        parts = urlsplit(value)
+        host = parts.hostname or ""
+        port = f":{parts.port}" if parts.port else ""
+    except ValueError:
+        return "(unreadable url)"
+    return urlunsplit((parts.scheme, host + port, parts.path, parts.query, parts.fragment))
+
+
+def resolved_view(settings: Settings, dialect: str) -> dict:
+    """What this profile runs, with no secret in it: its answer-time settings, its modes and a hash of each prompt."""
+    return {
+        "dialect": dialect,
+        "settings": {name: _no_credentials(getattr(settings, name)) for name in sorted(PROFILE_SETTINGS)},
+        "modes": {name: asdict(mode) for name, mode in modes_for(settings).items()},
+        "prompts": {name: hashlib.sha256(text.encode()).hexdigest() for name, text in _prompt_texts(settings, dialect).items()},
+    }
+
+
+def profile_version(settings: Settings, dialect: str) -> str:
+    """The hash of what this profile resolves to, not of the file: a profile lists only what differs, so an engine
+    upgrade could otherwise change what an unchanged file means. Card rendering and the decider are not hashed, so an
+    answer stamps the engine's commit beside this."""
+    canonical = json.dumps(resolved_view(settings, dialect), sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()[:12]
