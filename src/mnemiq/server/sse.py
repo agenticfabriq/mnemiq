@@ -19,6 +19,7 @@ import logging
 from uuid import uuid4
 
 from mnemiq.agent.route import UnknownMode
+from mnemiq.profiles import UnknownProfile
 from mnemiq.server.serialize import answer_payload
 
 _DONE = object()
@@ -68,12 +69,13 @@ logger = logging.getLogger(__name__)
 # trip; a leaked one cannot be taken back.
 _CALLER_FACING: dict[type[BaseException], str] = {
     UnknownMode: "That mode is not one this deployment offers.",
+    UnknownProfile: "That profile is not one this deployment offers you.",
 }
 _OPAQUE = "The engine could not complete this request."
 
 
 async def chat_stream(runtime, identity, question: str, mode: str | None,
-                      heartbeat_s: float = 15.0, history=None):
+                      heartbeat_s: float = 15.0, history=None, profile: str | None = None):
     run_id, msg_id = uuid4().hex, uuid4().hex
     yield frame({"type": "RUN_STARTED", "runId": run_id})
 
@@ -85,7 +87,7 @@ async def chat_stream(runtime, identity, question: str, mode: str | None,
         loop.call_soon_threadsafe(queue.put_nowait, event)
 
     fut = loop.run_in_executor(
-        None, lambda: runtime.ask(question, identity, mode=mode, emit=emit, history=history)
+        None, lambda: runtime.ask(question, identity, mode=mode, emit=emit, history=history, profile=profile)
     )
     fut.add_done_callback(lambda _: queue.put_nowait(_DONE))
 

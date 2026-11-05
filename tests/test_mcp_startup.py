@@ -87,7 +87,7 @@ def test_a_mistyped_mode_on_one_call_reaches_the_client_as_its_instruction():
     from mnemiq.mcp.server import _mcp_classes, build_mcp
 
     class _Runtime:
-        def ask(self, question, identity, mode=None):
+        def ask(self, question, identity, mode=None, profile=None):
             raise UnknownMode(f"mode {mode!r} names no mode; valid modes: instant, thinking, deep")
 
     server = build_mcp(_Runtime(), IdentityContext(principal_id="p", tenant_id="t"))

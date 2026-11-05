@@ -528,7 +528,7 @@ def test_the_public_serializers_never_ship_a_bare_table_list():
     from mnemiq.mcp.server import _db_read
 
     class _Runtime:
-        def ask(self, question, identity, mode=None):
+        def ask(self, question, identity, mode=None, profile=None):
             return AgentAnswer(answer="x", trace=trace)
 
     mcp = _db_read(_Runtime(), IdentityContext(tenant_id="t", principal_id="p", roles=[]), "q")
@@ -663,7 +663,7 @@ def test_the_cli_json_surface_carries_lineage_too(monkeypatch, capsys):
                   lineage_reasons=["function"])
 
     class _RT:
-        def ask(self, q, identity, mode=None):
+        def ask(self, q, identity, mode=None, profile=None):
             return AgentAnswer(answer="A", trace=trace)
 
     monkeypatch.setattr(cli, "build_runtime", lambda settings: _RT())

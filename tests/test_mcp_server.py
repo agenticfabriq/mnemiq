@@ -19,7 +19,7 @@ class _RT:
         self._answer, self._cards = answer, cards
         self.mode = "UNSET"
 
-    def ask(self, question, identity, mode=None):
+    def ask(self, question, identity, mode=None, profile=None):
         self.mode = mode
         return self._answer
 

@@ -10,6 +10,7 @@ from mnemiq.agent.modes import MODES
 from mnemiq.config import Settings
 from mnemiq.contract.seams import disclosure_sentence
 from mnemiq.contract import IdentityContext
+from mnemiq.profiles import UnknownProfile
 from mnemiq.runtime import SnapshotMissing, build_runtime
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--roles", default=None, help="comma-separated (defaults to MNEMIQ_ROLES)")
     a.add_argument("--mode", choices=sorted(MODES), default=None,
                    help="instant (cheapest) | thinking (default) | deep (highest precision)")
+    a.add_argument("--profile", default=None, help="a profile this deployment offers you (defaults to its default)")
 
     w = sub.add_parser("write", help="execute a single INSERT/UPDATE/DELETE (governed)")
     w.add_argument("sql")
@@ -429,7 +431,11 @@ def _cmd_ask(settings: Settings, args) -> int:
     except SnapshotMissing as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    ans = rt.ask(args.question, _identity(args, settings), mode=args.mode)
+    try:
+        ans = rt.ask(args.question, _identity(args, settings), mode=args.mode, profile=args.profile)
+    except UnknownProfile as exc:
+        print(f"unknown profile; you may pick: {exc.offered}", file=sys.stderr)
+        return 1
     if args.json:
         import json
 

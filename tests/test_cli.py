@@ -27,7 +27,7 @@ def test_ask_prints_answer_and_exits_zero(monkeypatch, capsys):
     from mnemiq.agent.loop import AgentAnswer
 
     class _RT:
-        def ask(self, q, identity, mode=None):
+        def ask(self, q, identity, mode=None, profile=None):
             return AgentAnswer(answer="There are 2 claims.", trace=None, deferred=False)
 
     monkeypatch.setattr(cli, "build_runtime", lambda settings: _RT())
@@ -42,7 +42,7 @@ def test_ask_on_a_deferral_still_exits_zero(monkeypatch, capsys):
     from mnemiq.agent.loop import AgentAnswer
 
     class _RT:
-        def ask(self, q, identity, mode=None):
+        def ask(self, q, identity, mode=None, profile=None):
             return AgentAnswer(answer="I cannot answer that.", deferred=True)
 
     monkeypatch.setattr(cli, "build_runtime", lambda settings: _RT())
@@ -75,7 +75,7 @@ def test_ask_passes_mode_to_the_runtime_and_reports_it(monkeypatch, capsys):
     from mnemiq.agent.loop import AgentAnswer
 
     class _RT:
-        def ask(self, q, identity, mode=None):
+        def ask(self, q, identity, mode=None, profile=None):
             self.mode = mode
             return AgentAnswer(answer="ok", mode=mode or "thinking")
 
@@ -147,7 +147,7 @@ def test_roles_default_from_env_when_flag_omitted(monkeypatch, capsys):
     captured = {}
 
     class _RT:
-        def ask(self, q, identity, mode=None):
+        def ask(self, q, identity, mode=None, profile=None):
             captured["identity"] = identity
             return AgentAnswer(answer="ok", trace=None, deferred=False)
 
@@ -169,7 +169,7 @@ def test_roles_flag_overrides_env_var(monkeypatch, capsys):
     captured = {}
 
     class _RT:
-        def ask(self, q, identity, mode=None):
+        def ask(self, q, identity, mode=None, profile=None):
             captured["identity"] = identity
             return AgentAnswer(answer="ok", trace=None, deferred=False)
 
@@ -191,7 +191,7 @@ def test_principal_defaults_from_env_when_flag_omitted(monkeypatch, capsys):
     captured = {}
 
     class _RT:
-        def ask(self, q, identity, mode=None):
+        def ask(self, q, identity, mode=None, profile=None):
             captured["identity"] = identity
             return AgentAnswer(answer="ok", trace=None, deferred=False)
 
@@ -236,7 +236,7 @@ def test_tenant_defaults_from_env(monkeypatch, capsys):
     captured = {}
 
     class _RT:
-        def ask(self, q, identity, mode=None):
+        def ask(self, q, identity, mode=None, profile=None):
             captured["identity"] = identity
             return AgentAnswer(answer="ok", trace=None, deferred=False)
 
@@ -305,7 +305,7 @@ def test_ask_json_is_the_http_payload_and_carries_a_failure(monkeypatch, capsys)
                          failed=True, reason_code=DeferralReason.MODEL_UNAVAILABLE)
 
     class _RT:
-        def ask(self, q, identity, mode=None):
+        def ask(self, q, identity, mode=None, profile=None):
             return failed
 
     monkeypatch.setattr(cli, "build_runtime", lambda settings: _RT())

@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from mnemiq.agent.modes import MODES
 from mnemiq.agent.route import UnknownMode
+from mnemiq.profiles import UnknownProfile
 from mnemiq.contract import HistoryTurn
 from mnemiq.server.serialize import answer_payload
 from mnemiq.server.sse import chat_stream
@@ -35,6 +36,7 @@ _UNBUILT = """<!doctype html><meta charset="utf-8"><title>mnemiq</title>
 class AskBody(BaseModel):
     question: str
     mode: str | None = None
+    profile: str | None = None  # None: the deployment's default
     # Prior turns the caller wants this question read against. Untrusted: the engine
     # replays only those whose grant_fingerprint matches the CURRENT identity's
     # boundary, so echoing another identity's turn buys nothing (agent/history.py).
@@ -74,8 +76,11 @@ def build_app(
     def ask(body: AskBody) -> dict:
         try:
             return answer_payload(
-                runtime.ask(body.question, identity, mode=body.mode, history=body.history)
+                runtime.ask(body.question, identity, mode=body.mode, history=body.history, profile=body.profile)
             )
+        except UnknownProfile as exc:
+            # Composed from what this caller may pick. Unknown and forbidden read alike, and neither repeats the name.
+            raise HTTPException(status_code=422, detail=f"unknown profile; you may pick: {exc.offered}") from exc
         except UnknownMode as exc:
             # Built from the mode registry, not from `str(exc)`. The text this particular
             # exception carries happens to be safe -- the caller's own override and a fixed list
@@ -92,7 +97,7 @@ def build_app(
     def chat(body: AskBody) -> StreamingResponse:
         return StreamingResponse(
             chat_stream(runtime, identity, body.question, body.mode,
-                        heartbeat_s=heartbeat_s, history=body.history),
+                        heartbeat_s=heartbeat_s, history=body.history, profile=body.profile),
             media_type="text/event-stream",
             headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
         )
