@@ -170,9 +170,10 @@ class Runtime:
             # that fronts the same tools in-process alongside the HTTP app would be, and that
             # is a deployment property this repo cannot see.
             _warn_view_inventory(snapshot, _acknowledged(self.settings))
-            for settings in ([lp.settings for lp in self.profiles.values()] if self.profiles else [self.settings]):
+            for settings, profile in ([(lp.settings, lp.profile) for lp in self.profiles.values()] if self.profiles
+                                      else [(self.settings, None)]):
                 _warn_prompt_window(settings, self.con, snapshot, getattr(self, "adapter", None),
-                                    self.authz, _acknowledged(self.settings))
+                                    self.authz, _acknowledged(self.settings), profile)
             _warn_policy_advisories(self.authz, snapshot)
 
     def _card_style(self, mode: str, picked: LoadedProfile | None = None) -> str:
@@ -471,7 +472,7 @@ def _ack_did_not_apply(acknowledged: frozenset[str], matched: str | None,
 
 
 def _warn_prompt_window(settings: Settings, con, snapshot, adapter, authz,
-                        acknowledged: frozenset[str]) -> None:
+                        acknowledged: frozenset[str], profile: Profile | None = None) -> None:
     """Say at boot when the largest generation prompt cannot fit the server's window (M119).
 
     Without it the first sign is a question that retrieves the heaviest tables: vLLM refuses prompt
@@ -493,8 +494,11 @@ def _warn_prompt_window(settings: Settings, con, snapshot, adapter, authz,
         # could send (`mnemiq.llm.window`).
         # Each form a mode sends, and the worst of them reported: `Settings.card_style` alone would pass a
         # deployment with one mode on a form that cannot fit, and no form is always the largest.
+        # Only what this profile's own callers could send: the count sends the prompt to its endpoint, which may be hosted.
+        restricted = ({"allowed": lambda identity: may_pick(profile, identity)}
+                      if profile is not None and profile.roles is not None else {})
         reports = [worst_window(con, snapshot, settings.model_copy(update={"card_style": style}),
-                                getattr(adapter, "dialect", "duckdb"), authz)
+                                getattr(adapter, "dialect", "duckdb"), authz, **restricted)
                    for style in card_styles(settings)]
         report = max((r for r in reports if r is not None), key=lambda r: r.needed, default=None)
     except Exception as exc:  # noqa: BLE001 -- an advisory check must never stop a boot
@@ -1045,7 +1049,7 @@ def build_runtime(settings: Settings) -> Runtime:
     for profile_name, profile in profiles.items():
         if len(profiles) > 1:
             logger.info("the prompt window of profile %s:", profile_name)
-        _warn_prompt_window(profile.settings, con, snapshot, adapter, _boot_authz, _acknowledged(settings))
+        _warn_prompt_window(profile.settings, con, snapshot, adapter, _boot_authz, _acknowledged(settings), profile)
     return Runtime(
         con=con,
         snapshot=snapshot,

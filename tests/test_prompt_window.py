@@ -731,7 +731,7 @@ def test_a_hot_swapped_snapshot_re_measures(monkeypatch):
     monkeypatch.setattr("mnemiq.runtime.load_current_snapshot",
                         lambda _s, _c: (new_snapshot, {"src": "v2"}))
     monkeypatch.setattr("mnemiq.runtime._warn_prompt_window",
-                        lambda settings, con, snapshot, adapter, authz, ack: seen.append(snapshot))
+                        lambda settings, con, snapshot, adapter, authz, ack, profile=None: seen.append(snapshot))
 
     rt.reload_if_stale()
 

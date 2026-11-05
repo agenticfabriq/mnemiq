@@ -274,3 +274,69 @@ def test_the_window_measures_each_profiles_own_server(base, monkeypatch, caplog)
     with caplog.at_level(logging.INFO):
         build_runtime(base.model_copy(update={"llm_window_check": True}))
     assert {m for m in measured} >= {(HOSTED, "gpt-model"), (LOCAL, "qwen-model")}
+
+
+# --- a restricted profile's endpoint sees only what its own roles could send it -------------------------------------
+
+
+@pytest.fixture
+def two_views(base, tmp_path, monkeypatch) -> Settings:
+    """Two roles over two tables, one holding text the other role may not see, and a count that records what it was sent."""
+    store = tmp_path / "views.duckdb"
+    con = init_store(str(store))
+    save_snapshot(con, Snapshot(version="v1", source_id="only", created_at="t", columns=[
+        Column(id="wide.col_0", object_id="wide", name="col_0", data_type="VARCHAR"),
+        Column(id="private_table.planted_private_column", object_id="private_table", name="planted_private_column",
+               data_type="VARCHAR", description="planted private description")]))
+    con.close()
+    authz = tmp_path / "views.json"
+    authz.write_text(json.dumps({"roles": {"analyst": ["wide"], "viewer": ["private_table"]}}))
+    return base.model_copy(update={"store_path": str(store), "authz_path": str(authz), "llm_window_check": True})
+
+
+def _counted(monkeypatch) -> list[tuple[str, str]]:
+    sent: list[tuple[str, str]] = []
+
+    def server(base_url, model, system, user, http=None, api_key=None):
+        sent.append((base_url, user))
+        return (10, 28_672)
+
+    monkeypatch.setattr(window, "count_on_server", server)
+    return sent
+
+
+def test_a_restricted_profiles_endpoint_never_counts_another_roles_view(two_views, monkeypatch):
+    """Sending it is the disclosure, whatever the endpoint answers."""
+    sent = _counted(monkeypatch)
+    build_runtime(two_views)
+    hosted = [user for url, user in sent if url == HOSTED]
+    assert hosted, "the positive control: the hosted profile is counted, on its own role's view"
+    assert not any("planted_private" in user for user in hosted)
+    assert any("col_0" in user for user in hosted)
+
+
+def test_the_default_profile_still_counts_every_role(two_views, monkeypatch):
+    sent = _counted(monkeypatch)
+    build_runtime(two_views)
+    assert any("planted_private" in user for url, user in sent if url == LOCAL)
+
+
+def test_the_configured_identity_is_held_to_the_same_rule(two_views, monkeypatch):
+    """Its roles merge into one view, which is measured beside the policy's."""
+    sent = _counted(monkeypatch)
+    build_runtime(two_views.model_copy(update={"roles": "viewer", "principal": "operator"}))
+    assert not any("planted_private" in user for url, user in sent if url == HOSTED)
+
+
+def test_a_snapshot_swap_holds_a_restricted_profile_to_the_same_rule(two_views, monkeypatch):
+    rt = build_runtime(two_views.model_copy(update={"llm_window_check": True}))
+    sent = _counted(monkeypatch)
+    rt.settings = rt.settings.model_copy(update={"control_dsn": "x"})
+    snapshot = rt.snapshot
+    monkeypatch.setattr(rt_mod, "load_current_snapshot", lambda settings, con: (snapshot, {"only": "v2"}))
+    monkeypatch.setattr(rt_mod, "_warn_view_inventory", lambda *a, **k: None)
+    monkeypatch.setattr(rt_mod, "_warn_policy_advisories", lambda *a, **k: None)
+    rt.reload_if_stale()
+    hosted = [user for url, user in sent if url == HOSTED]
+    assert hosted
+    assert not any("planted_private" in user for user in hosted)
