@@ -219,6 +219,9 @@ class Settings(BaseSettings):
     roles: str | None = Field(default=None, description="MCP standalone identity: comma-separated roles")
     tenant: str | None = Field(default=None, description="MCP standalone identity: tenant id")
     # --- verifier ---
+    answer_log_path: str | None = Field(default=None, description="where each answer's record goes: which profile, version, model and engine commit produced it, as one JSON line each, with no question text, SQL or rows; unset keeps it beside the store as <store_path>.answers.jsonl, `off` writes none. Not rotated")
+    answer_log_text: bool = Field(default=False, description="opt-in: the answer log also holds the question and the SQL as asked, which carry literals from the question and values from the database; rows are never logged")
+    engine_commit: str | None = Field(default=None, description="the commit this engine runs, for a build with no git checkout to read it from; stamped on every answer beside the profile's version")
     verify_override: str | None = Field(default=None, validation_alias="MNEMIQ_VERIFY",
                                         description="verify override: unset=mode defaults, 0=force off, 1=force full")
     verify_threshold: float = Field(default=0.5, ge=0.0, le=1.0, description="judge-confidence defer cutoff")

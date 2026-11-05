@@ -40,6 +40,10 @@ def _db_read(
         "failed": ans.failed,
         "reason_code": str(ans.reason_code) if ans.reason_code else None,
         "mode": ans.mode,
+        "profile": ans.profile,
+        "profile_version": ans.profile_version,
+        "model": ans.model,
+        "engine_commit": ans.engine_commit,
         # M89: the same derivation as the HTTP payload, imported rather than restated. A governing
         # agent deciding whether to act on an answer needs to know the verifier could not be
         # reached; hand-building a second dict here is how this surface would silently diverge,

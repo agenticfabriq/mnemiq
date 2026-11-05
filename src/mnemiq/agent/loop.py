@@ -160,6 +160,12 @@ class AgentAnswer:
     # How many ranges the decider moved to end before the day after a bare date (`Approved.day_bounds`).
     day_bounds_closed: int | None = None
     mode: str | None = None  # resolved mode name, stamped by the Runtime (the Agent IS a mode)
+    # What produced this answer, stamped by the Runtime. The version pins the settings and the prompts, and the commit the
+    # rest of the engine: card rendering and the decider are in neither alone.
+    profile: str | None = None
+    profile_version: str | None = None
+    model: str | None = None
+    engine_commit: str | None = None
     preview: ResultPreview | None = None  # None on every deferral path -- never fabricated
     # The authorization boundary this answer was computed under. A client echoes it back
     # with the turn; the engine replays a turn only to the same boundary (history.py).

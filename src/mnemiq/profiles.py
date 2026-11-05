@@ -52,6 +52,7 @@ DEPLOYMENT_SETTINGS = frozenset({
     "llm_api_key", "verify_api_key",
     # The deployment's own running.
     "profiles_path", "mode_settings", "default_mode", "max_question_chars", "ack_advisories", "verify_judge", "acme_data_dir",
+    "answer_log_path", "answer_log_text", "engine_commit",
 })
 
 _NAME = re.compile(r"[a-z0-9][a-z0-9._-]*")

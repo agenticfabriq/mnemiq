@@ -18,7 +18,10 @@ from mnemiq.contract import HistoryTurn, IdentityContext, Snapshot
 from mnemiq.execute.runner import DEFAULT_TIMEOUT_S
 from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import Embedder, LLMEmbedder
-from mnemiq.profiles import Profile, ProfileFileError, UnknownProfile, load_profiles, may_pick, offered_to, profile_version
+from mnemiq.observability.answer_log import AnswerLog, build_answer_log
+from mnemiq.observability.answer_log import engine_commit as read_engine_commit
+from mnemiq.profiles import (Profile, ProfileFileError, UnknownProfile, load_profiles, may_pick, offered_to, profile_version,
+                             resolved_view)
 from mnemiq.progress import Emit, Stage, step
 from mnemiq.semantic.retrieval import retrieve
 from mnemiq.semantic.ontology_index import OntologyIndex
@@ -102,6 +105,8 @@ class Runtime:
     # The profiles this deployment loaded; `agents`, `modes` and `fitter` above are the default's. None: built by hand.
     profiles: dict[str, LoadedProfile] | None = None
     default_profile: str = "default"
+    answer_log: AnswerLog | None = None  # one line per answer, for a deployment with no sink
+    engine_commit: str | None = None
 
     def _picked(self, profile: str | None, identity: IdentityContext) -> LoadedProfile | None:
         """The profile this request runs on. First, before any work: refused, it has cost nothing and shown nothing."""
@@ -218,7 +223,7 @@ class Runtime:
         grants = self.authz.grants_for(identity)
         if (declined := agent.decline_if_too_long(question)) is not None:
             return self._record(declined, name, grants, identity, question, None,
-                                time.perf_counter())
+                                time.perf_counter(), picked)
         self.reload_if_stale()
         started = time.perf_counter()
         with step(emit, Stage.RETRIEVE, mode=name):
@@ -255,13 +260,20 @@ class Runtime:
         if fitter is not None:
             packet = fitter.fit(packet, self.snapshot, grants, card_style=self._card_style(name, picked))
         answer = agent.answer(packet, self.snapshot, grants, identity, emit=emit)
-        return self._record(answer, name, grants, identity, packet.question, packet, started)
+        return self._record(answer, name, grants, identity, packet.question, packet, started, picked)
 
     def _record(self, answer: AgentAnswer, name: str, grants, identity: IdentityContext, question: str,
-                packet, started: float) -> AgentAnswer:
-        """Stamps the answer with its mode and grants, and records it once in each sink."""
+                packet, started: float, picked: LoadedProfile | None = None) -> AgentAnswer:
+        """Stamps the answer with its mode, grants and profile, and records it once in each sink."""
         answer.mode = name
         answer.grant_fingerprint = grants.fingerprint
+        answer.engine_commit = self.engine_commit
+        if picked is not None:
+            answer.profile = picked.profile.name
+            answer.profile_version = picked.version
+            answer.model = picked.settings.llm_model
+        if self.answer_log is not None:
+            self.answer_log.record_answer(answer, question, (time.perf_counter() - started) * 1000)
         if self.trace_sink is not None:
             # One governed trace per answer. Fail-soft by the same contract as the metrics sink --
             # a Verity outage cannot stop mnemiq answering -- and the payload is built from the
@@ -1016,6 +1028,11 @@ def build_runtime(settings: Settings) -> Runtime:
         loaded[profile_name] = LoadedProfile(profile, profile_version(profile.settings, dialect), profile.settings, modes,
                                              agents, kit.fitter)
     default = loaded[default_profile]
+    commit = read_engine_commit(settings.engine_commit)
+    answer_log = build_answer_log(settings)
+    if answer_log is not None:
+        for profile_name, entry in loaded.items():
+            answer_log.record_profile(profile_name, entry.version, resolved_view(entry.settings, dialect), commit)
     _boot_authz = _authz(settings)
     _warn_policy_advisories(_boot_authz, snapshot)
     _warn_source_enforcement(adapter, _acknowledged(settings))
@@ -1047,4 +1064,6 @@ def build_runtime(settings: Settings) -> Runtime:
         fitter=default.fitter,
         profiles=loaded,
         default_profile=default_profile,
+        answer_log=answer_log,
+        engine_commit=commit,
     )
