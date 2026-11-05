@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from mnemiq.generate.prompts import system_prompt, user_prompt
+from mnemiq.generate.prompts import question_last_prompt, system_prompt, user_prompt
 from mnemiq.semantic.retrieval import ContextPacket
 
 _JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
@@ -119,24 +119,33 @@ GENERATOR_MAX_TOKENS = 4000
 class LLMGenerator:
     def __init__(self, client, max_tokens: int = GENERATOR_MAX_TOKENS, dialect: str = "duckdb",
                  guided_sql: bool = False, assertive: bool = False,
-                 declare_assumed_terms: bool = False) -> None:
+                 declare_assumed_terms: bool = False, temperature: float | None = None,
+                 layout: str = "question_first") -> None:
         self._client = client
         self._max_tokens = max_tokens
         self._dialect = dialect
         self._guided_sql = guided_sql
         self._assertive = assertive
         self._declare_assumed_terms = declare_assumed_terms
+        self._temperature = temperature
+        self._layout = layout
 
     def propose(
         self, packet: ContextPacket, feedback: str | None = None, strategy: str | None = None
     ) -> SqlProposal:
         extra = _guided_extra_body(self._guided_sql, self._declare_assumed_terms)
+        system = system_prompt(dialect=self._dialect, strategy=strategy, assertive=self._assertive,
+                               declare_assumed_terms=self._declare_assumed_terms)
+        if self._layout == "question_last":
+            system, user = question_last_prompt(system, packet, feedback)
+        else:
+            user = user_prompt(packet, feedback)
         raw = self._client.complete(
-            system_prompt(dialect=self._dialect, strategy=strategy, assertive=self._assertive,
-                          declare_assumed_terms=self._declare_assumed_terms),
-            user_prompt(packet, feedback),
+            system,
+            user,
             max_tokens=self._max_tokens,
             **({"extra_body": extra} if extra else {}),
+            **({"temperature": self._temperature} if self._temperature is not None else {}),
         )
         return _parse(raw)
 

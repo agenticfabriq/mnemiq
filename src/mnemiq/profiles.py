@@ -27,6 +27,7 @@ from mnemiq.config import ModeSettings, Settings
 from mnemiq.execute import select
 from mnemiq.execute.select import ClusterView
 from mnemiq.generate import correct, prompts
+from mnemiq.llm.client import accepts_temperature
 from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
 from mnemiq.verify import judge
 
@@ -35,6 +36,7 @@ PROFILE_SETTINGS = frozenset({
     "llm_base_url", "llm_model", "llm_seed", "llm_context_window", "llm_prompt_cut_check", "llm_window_check",
     "card_style", "guided_sql", "assertive_sql", "retrieval_k", "guard_undefined_terms", "guard_fanout",
     "answer_markdown", "verify_threshold", "verify_sanity", "verify_grounding", "verify_base_url", "verify_model",
+    "writer_temperature", "prompt_layout",
 })
 
 DEPLOYMENT_SETTINGS = frozenset({
@@ -178,6 +180,13 @@ def _resolved(name: str, entry: _Entry, base: Settings) -> Settings:
     return resolved
 
 
+def _refuse_an_unapplied_temperature(name: str, settings: Settings) -> None:
+    """`LLMClient` drops a temperature for a model that takes none. It would otherwise boot, get a version and log a value
+    the model never sampled at, which is the one thing a version exists to prevent."""
+    if settings.writer_temperature is not None and not accepts_temperature(settings.llm_model or ""):
+        raise ProfileFileError(f"profile {name!r} sets writer_temperature on {settings.llm_model!r}, which takes none")
+
+
 def _checked(name: str, entry: _Entry, default: str, base: Settings) -> Profile:
     if not _NAME.fullmatch(name):
         raise ProfileFileError(f"profile name {name!r} must match {_NAME.pattern}")
@@ -187,6 +196,7 @@ def _checked(name: str, entry: _Entry, default: str, base: Settings) -> Profile:
     if name != default and (not entry.roles or not all(role.strip() for role in entry.roles)):
         raise ProfileFileError(f"profile {name!r} must list the roles that may pick it, [\"*\"] meaning anyone")
     settings = _resolved(name, entry, base)
+    _refuse_an_unapplied_temperature(name, settings)
     try:
         modes_for(settings)
     except ValueError as exc:
@@ -203,6 +213,7 @@ def load_profiles(settings: Settings) -> tuple[dict[str, Profile], str]:
         # `Settings` ignores what it does not know, so this would silently stop meaning what it says.
         raise ProfileFileError("MNEMIQ_PROFILE is gone: name a file of profiles in MNEMIQ_PROFILES_PATH, or unset it")
     if not settings.profiles_path:
+        _refuse_an_unapplied_temperature("default", settings)
         return {"default": Profile("default", None, settings)}, "default"
     if settings.mode_settings:
         raise ProfileFileError("MNEMIQ_PROFILES_PATH and MNEMIQ_MODE_SETTINGS are both set: "
@@ -239,6 +250,10 @@ def _prompt_texts(settings: Settings, dialect: str) -> dict[str, str]:
         dialect=dialect, strategy=strategy, assertive=settings.assertive_sql,
         declare_assumed_terms=settings.guard_undefined_terms) for strategy in STRATEGIES}
     texts["writer user"] = prompts.user_prompt(_sample_packet(), "F")
+    if settings.prompt_layout == "question_last":
+        for strategy in STRATEGIES:
+            texts[f"writer system {strategy}"], texts["writer user"] = prompts.question_last_prompt(
+                texts[f"writer system {strategy}"], _sample_packet(), "F")
     texts["corrector system"] = correct._SYSTEM
     texts["corrector user"] = correct.user_text("s", "p")
     texts["judge system"] = judge._SYSTEM

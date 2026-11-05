@@ -226,8 +226,12 @@ class Agent:
         guard_undefined_terms: bool = False,
         guard_fanout: bool | None = False,
         max_question_chars: int = DEFAULT_MAX_QUESTION_CHARS,
+        plan_attempts: int = 3,
+        prose: bool = True,
     ) -> None:
         self.generator = generator
+        self.plan_attempts = plan_attempts
+        self.prose = prose
         # Defaults to the shipped limit, not to none: a construction site that forgets it still declines what no
         # stage would read alike (M147).
         self.max_question_chars = max_question_chars
@@ -355,6 +359,7 @@ class Agent:
                     adapter=self.adapter,
                     dialect=self.dialect,
                     target=self.dialect,
+                    max_attempts=self.plan_attempts,
                     feedback=feedback,
                     corrector=self.corrector,
                     values=self.values,
@@ -762,13 +767,17 @@ class Agent:
         attempts: int | None = None,
     ) -> AgentAnswer:
         cut = _cut(approved, table)
-        with step(emit, Stage.SYNTHESIZE, forced=forced):
-            # As asked, not the policy's rewrite (M156): the synthesizer is a model call, and the
-            # policy's predicate is not the caller's to read in the prose either.
-            answer = self.synthesizer.answer(
-                packet.question, approved.model_sql(), render_result(table, cut_at=cut), forced=forced,
-                row_count=table.num_rows,
-            )
+        if self.prose:
+            with step(emit, Stage.SYNTHESIZE, forced=forced):
+                # As asked, not the policy's rewrite (M156): the synthesizer is a model call, and the
+                # policy's predicate is not the caller's to read in the prose either.
+                answer = self.synthesizer.answer(
+                    packet.question, approved.model_sql(), render_result(table, cut_at=cut), forced=forced,
+                    row_count=table.num_rows,
+                )
+        else:
+            # The rows are the answer, in the preview. A fact the engine can state itself, not a model's reading of them.
+            answer = f"Returned {table.num_rows} row{'' if table.num_rows == 1 else 's'}."
         trace = build_trace(
             question=packet.question,
             approved=approved,

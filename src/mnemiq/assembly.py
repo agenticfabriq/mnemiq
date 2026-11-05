@@ -37,7 +37,8 @@ def build_components(settings: Settings, adapter, con) -> Components:
     # on one dialect and no cross-dialect transpile gap can bite.
     generator = LLMGenerator(client, dialect=getattr(adapter, "dialect", "duckdb"),
                              guided_sql=settings.guided_sql, assertive=settings.assertive_sql,
-                             declare_assumed_terms=settings.guard_undefined_terms)
+                             declare_assumed_terms=settings.guard_undefined_terms,
+                             temperature=settings.writer_temperature, layout=settings.prompt_layout)
     return Components(client=client, generator=generator, synthesizer=LLMSynthesizer(client, markdown=settings.answer_markdown),
                       corrector=LLMCorrector(client), values=ValueIndex(con),
                       selector=LLMSelector(client),

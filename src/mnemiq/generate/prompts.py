@@ -173,25 +173,35 @@ def history_section(packet: ContextPacket) -> list[str]:
     return parts
 
 
-def user_prompt(packet: ContextPacket, feedback: str | None = None) -> str:
+def _context_parts(packet: ContextPacket) -> list[str]:
+    """What the question is read against: the sections and the tables, each section led by a blank line."""
     cards = "\n\n".join(c.card for c in packet.cards) or "(no tables are available to you)"
-    # As asked, the way the judge, the selector and the synthesizer read it. A 500-character cut here answered long
-    # questions as cut ones (M147), and `sanitize` turned backticks into quotes and folded line breaks for the
-    # generator alone (M148). `sanitize` guards catalog text, which anyone who can name a column writes; the question is
-    # the asker's own. Its length is bounded before this runs: both doors decline a question over
-    # MNEMIQ_MAX_QUESTION_CHARS before retrieval, and `Agent.answer` declines it again.
-    parts = [f"QUESTION: {packet.question}"]
-    parts += meaning_sections(packet)
+    parts = meaning_sections(packet)
     if packet.examples:
         parts += ["", "WORKED EXAMPLES (verified queries over these tables -- adapt, don't copy blindly):"]
         for ex in packet.examples:
             parts += [f"Q: {sanitize(ex.question, limit=300)}", f"SQL: {ex.sql}"]
     parts += history_section(packet)
     parts += ["", "TABLES:", cards]
-    if feedback:
-        parts += [
-            "",
-            "Your previous query was rejected. Fix exactly this and try again:",
-            feedback,
-        ]
-    return "\n".join(parts)
+    return parts
+
+
+def _feedback_parts(feedback: str | None) -> list[str]:
+    if not feedback:
+        return []
+    return ["", "Your previous query was rejected. Fix exactly this and try again:", feedback]
+
+
+def question_last_prompt(system: str, packet: ContextPacket, feedback: str | None = None) -> tuple[str, str]:
+    """(system, user) with the context in the system message and the question alone in the user message."""
+    context = "\n".join(_context_parts(packet)).strip("\n")
+    return f"{system}\n\n{context}", "\n".join([f"QUESTION: {packet.question}", *_feedback_parts(feedback)])
+
+
+def user_prompt(packet: ContextPacket, feedback: str | None = None) -> str:
+    # As asked, the way the judge, the selector and the synthesizer read it. A 500-character cut here answered long
+    # questions as cut ones (M147), and `sanitize` turned backticks into quotes and folded line breaks for the
+    # generator alone (M148). `sanitize` guards catalog text, which anyone who can name a column writes; the question is
+    # the asker's own. Its length is bounded before this runs: both doors decline a question over
+    # MNEMIQ_MAX_QUESTION_CHARS before retrieval, and `Agent.answer` declines it again.
+    return "\n".join([f"QUESTION: {packet.question}", *_context_parts(packet), *_feedback_parts(feedback)])

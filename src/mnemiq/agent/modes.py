@@ -24,6 +24,8 @@ class Mode:
     max_attempts: int
     verify: str = "sanity"  # result-verifier level: "off" | "sanity" | "full" (sanity+judge)
     card_style: str | None = None  # the schema form its prompt carries; None: `Settings.card_style`
+    plan_attempts: int = 3  # writer calls spent on what the decider refuses, on the single path; deep's candidates get 1
+    prose: bool = True  # a model call turns the rows into sentences; off, the rows are the answer
 
 
 # Verify levels: sanity (deterministic empty/null net) in every mode; the LLM judge in
@@ -112,6 +114,8 @@ def build_agent(
         selector=selector if mode.judge else None,
         min_agreement=mode.min_agreement,
         verifier=verifier,
+        plan_attempts=mode.plan_attempts,
+        prose=mode.prose,
         guard_undefined_terms=guard_undefined_terms,
         guard_fanout=guard_fanout,
         max_question_chars=max_question_chars,

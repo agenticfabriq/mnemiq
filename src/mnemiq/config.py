@@ -89,6 +89,8 @@ class ModeSettings(BaseModel):
     budget_s: float | None = Field(default=None, gt=0)
     max_attempts: int | None = Field(default=None, ge=1)
     verify: Literal["off", "sanity", "full"] | None = None
+    plan_attempts: int | None = Field(default=None, ge=1)
+    prose: bool | None = None
 
     @model_validator(mode="after")
     def _null_only_where_it_means_something(self):
@@ -165,7 +167,7 @@ class Settings(BaseSettings):
     mode_settings: Annotated[dict[str, ModeSettings] | None, NoDecode] = Field(default=None,
                             description="per-mode settings as JSON, e.g. {\"instant\": {\"card_style\": \"bare\"}}: "
                                         "card_style, candidates, corrector, judge, min_agreement, budget_s, "
-                                        "max_attempts, verify; unset keeps the mode's own. With MNEMIQ_PROFILES_PATH, state them in the file.")
+                                        "max_attempts, verify, plan_attempts, prose; unset keeps the mode's own. With MNEMIQ_PROFILES_PATH, state them in the file.")
 
     @field_validator("mode_settings", mode="before")
     @classmethod
@@ -174,6 +176,8 @@ class Settings(BaseSettings):
             return json.loads(value) if value.strip() else None
         return value
 
+    writer_temperature: float | None = Field(default=None, ge=0, description="the SQL writer's sampling temperature; unset sends none, so the server's default applies (Qwen2.5: 0.7). Refused for a model that takes none, such as GPT-5, which would ignore it")
+    prompt_layout: Literal["question_first", "question_last"] = Field(default="question_first", description="how the writer's prompt is arranged: question_first sends the question and its context as the user message; question_last puts the context in the system message and the question alone in the user message")
     guided_sql: bool = Field(default=False, description="constrained decoding: force non-empty sql (response_format json_schema; works on vLLM and OpenAI-compatible endpoints)")
     assertive_sql: bool = Field(default=False, description="assertive prompt: attempt an answer instead of deferring")
     # M35, off by default: withdrawn on its own pre-registered criterion. Beacon's answerable band
