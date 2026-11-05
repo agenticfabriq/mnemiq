@@ -97,7 +97,7 @@ def build_engine(
 ) -> tuple[Engine, LLMClient]:
     """Retrieval + agent over one snapshot, assembled exactly once.
 
-    Refuses `profile` and `mode_settings`: this door builds its own agent from its own arguments and takes no mode,
+    Refuses `profiles_path` and `mode_settings`: this door builds its own agent from its own arguments and takes no mode,
     so they would not run, and a benchmark through it would report settings that did not.
 
     `index_adapter` builds the value index, and defaults to `adapter`. A caller whose `adapter`
@@ -110,8 +110,8 @@ def build_engine(
     Returns the ask function and the client whose token counter it shares, so the caller
     can report what the run cost.
     """
-    if settings.profile != "frontier" or settings.mode_settings:
-        raise ValueError("the eval door takes no MNEMIQ_PROFILE or MNEMIQ_MODE_SETTINGS: it builds its own agent "
+    if settings.profiles_path or settings.mode_settings:
+        raise ValueError("the eval door takes no MNEMIQ_PROFILES_PATH or MNEMIQ_MODE_SETTINGS: it builds its own agent "
                          "from its arguments, so they would not run. Measure them through /v1/ask.")
     embedder = LLMEmbedder(settings)
     con = init_store(store_path, local_only=settings.local_only)

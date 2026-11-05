@@ -8,13 +8,12 @@ declared keys, spelled so that what the model copies runs on this engine.
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
 
 import pytest
 import sqlglot
 from pydantic import ValidationError
 
-from mnemiq.agent.modes import MODES, PROFILES, card_styles, modes_for
+from mnemiq.agent.modes import MODES, card_styles, modes_for
 from mnemiq.agent.route import UnknownMode
 from mnemiq.authz.grants import GrantSet
 from mnemiq.config import Settings
@@ -248,40 +247,13 @@ def test_malformed_json_is_refused(monkeypatch):
         _settings()
 
 
-# --- profiles: one column of the table per kind of model ----------------------------------------
+# --- the window check reads each mode's form ------------------------------------------------------
 
 
-def test_the_frontier_profile_is_todays_table_and_the_default():
-    assert _settings().profile == "frontier"
-    assert PROFILES["frontier"] == {}
-    assert modes_for(_settings(profile="frontier")) == MODES
-
-
-def test_the_qwen_profile_changes_what_was_measured_and_nothing_else():
-    modes = modes_for(_settings(profile="qwen-32b"))
-    assert modes["instant"].card_style == "bare"
-    assert replace(modes["instant"], card_style=None) == MODES["instant"]
-    assert modes["thinking"] == MODES["thinking"]
-    assert modes["deep"] == MODES["deep"]
-
-
-def test_a_deployments_settings_win_over_its_profile():
-    modes = modes_for(_settings(profile="qwen-32b",
-                                mode_settings={"instant": {"card_style": "cards", "max_attempts": 2}}))
-    assert modes["instant"].card_style == "cards"
-    assert modes["instant"].max_attempts == 2
-    assert modes_for(_settings(profile="qwen-32b", mode_settings={"instant": {"max_attempts": 2}}))[
-        "instant"].card_style == "bare"
-
-
-def test_an_unknown_profile_is_refused_naming_the_real_ones():
-    with pytest.raises(ValueError, match="frontier"):
-        modes_for(_settings(profile="fast"))
-
-
-def test_a_profile_reaches_the_window_check():
-    assert card_styles(_settings(profile="qwen-32b")) == ["bare", "cards"]
-    assert card_styles(_settings(profile="qwen-32b", card_style="bare")) == ["bare"]
+def test_a_modes_form_reaches_the_window_check():
+    bare_instant = {"instant": {"card_style": "bare"}}
+    assert card_styles(_settings(mode_settings=bare_instant)) == ["bare", "cards"]
+    assert card_styles(_settings(mode_settings=bare_instant, card_style="bare")) == ["bare"]
 
 
 # --- the join: the mode's form reaches the prompt ---------------------------------------------------
@@ -435,8 +407,8 @@ def test_one_form_is_measured_once(monkeypatch, caplog):
     assert seen == ["cards"]
 
 
-@pytest.mark.parametrize("fields", [{"profile": "qwen-32b"}, {"mode_settings": {"instant": {"card_style": "bare"}}},
-                                    {"profile": "nobody"}])
+@pytest.mark.parametrize("fields", [{"profiles_path": "profiles.toml"},
+                                    {"mode_settings": {"instant": {"card_style": "bare"}}}])
 def test_the_eval_door_refuses_settings_it_would_not_apply(fields):
     """It builds its own agent and takes no mode, so these would never run, and a benchmark through it would report
     settings that did not. `MNEMIQ_CARD_STYLE` and its own arguments are what it reads."""

@@ -157,15 +157,15 @@ class Settings(BaseSettings):
                                         "`ddl` renders CREATE TABLE for a model fine-tuned "
                                         "on DDL; `bare` is CREATE TABLE with names, types and "
                                         "keys alone; the retrieval index always embeds `cards`.")
-    profile: str = Field(default="frontier",
-                         description="the settings for a kind of model, per mode: frontier|qwen-32b. "
-                                     "`frontier` is the modes as built; see `agent.modes.PROFILES`.")
+    profiles_path: str | None = Field(default=None,
+                            description="TOML file of named profiles, each a model and its settings per mode, and the "
+                                        "roles that may pick it; unset runs these settings as one default profile")
     # NoDecode, read by `_read_mode_settings`: pydantic-settings would otherwise JSON-decode the raw variable and fail
     # on the empty line a copied `.env.example` holds, before any validator could say what it means.
     mode_settings: Annotated[dict[str, ModeSettings] | None, NoDecode] = Field(default=None,
                             description="per-mode settings as JSON, e.g. {\"instant\": {\"card_style\": \"bare\"}}: "
                                         "card_style, candidates, corrector, judge, min_agreement, budget_s, "
-                                        "max_attempts, verify. They win over the profile; unset keeps its value.")
+                                        "max_attempts, verify; unset keeps the mode's own. With MNEMIQ_PROFILES_PATH, state them in the file.")
 
     @field_validator("mode_settings", mode="before")
     @classmethod
@@ -253,56 +253,14 @@ class Settings(BaseSettings):
     def from_env(cls) -> "Settings":
         return cls()
 
-    def assert_local_only(self, *, also: tuple[str, ...] = ()) -> None:
-        """Refuse to run when a chat, embedding, judge or Verity endpoint would carry data off
-        the network.
+    def local_only_offenders(self) -> list[str]:
+        """The endpoints that would leave this network under MNEMIQ_LOCAL_ONLY; empty when it is off. For a profile's
+        resolved copy, whose endpoints `assert_local_only` on the deployment's settings never sees."""
+        return self._local_only_walk()[0] if self.local_only else []
 
-        For a deployment whose whole premise is that nothing leaves, a mistyped base URL is not
-        a misconfiguration that fails -- it is one that SUCCEEDS, quietly, having sent every
-        schema card to a third party. This turns that into a startup error.
-
-        Checked: llm_base_url, embed_base_url, verify_base_url, and the three verity_* endpoints
-        (verity_records_url, verity_token_url, verity_traces_url) -- trace_sink POSTs to
-        verity_traces_url on every ask/serve, and even with the text/rows disclosure opt-ins off
-        that body still carries question hashes, timings, policy hashes and identity, so leaving
-        it unchecked would be telemetry escaping under a flag named LOCAL_ONLY. NOT checked:
-        pg_dsn and control_dsn -- see the trailing line of the raised message for why, which is
-        the answer an operator actually needs, not a comment only a reader of this source sees.
-
-        Loopback, the RFC1918 private ranges, and their IPv6 counterparts pass, because a data
-        centre runs the model on another host on its own network -- fc00::/7 (RFC 4193's
-        "unique local address" range, which `fd00::/8` in practice always comes from) is
-        RFC1918's own IPv6 analog, not a narrower or looser thing, so an IPv6-only deployment
-        gets the same allowance an IPv4 one does. An IPv4-mapped IPv6 literal (`::ffff:10.0.0.1`)
-        is judged on the IPv4 address it maps to, for the same reason: it is that address, just
-        spelled by a resolver or proxy that prefers IPv6 syntax. This is deliberately narrower
-        than `ipaddress`'s own `is_private`, which also accepts several IANA special-purpose
-        ranges we do NOT want to wave through silently -- 169.254.169.254 above all, the
-        link-local address several cloud providers use to serve their metadata API, which is
-        exactly the kind of off-box hop this check exists to catch. Anything we cannot place
-        inside loopback, RFC1918 or its IPv6 analog is refused:
-        a URL `urlparse` itself cannot parse (a malformed IPv6 host literal raises INSIDE
-        `urlparse`, before `.hostname` is ever read -- not the same failure as `.hostname`
-        returning None, and both have to be caught, not just the second one), an unresolved DNS
-        name (public or internal -- this performs no lookup, so an internal name is refused for
-        the same reason a public one is, not because it looks suspicious), and every other IANA
-        special range are all refused the same way, because none of them is evidence of being on
-        this network. Every offender is collected and named together, and each is evaluated
-        independently of the others -- one endpoint's `urlparse` failure must not discard an
-        offender already found for an earlier one, which is exactly the bug an unguarded
-        `urlparse(url).hostname` produced. An operator who fixes one and reruns only to be told
-        about the next will conclude the check itself is flaky and disable it.
-
-        A passing, enforced check still writes one line to stderr naming what it verified.
-        Silence otherwise means two things that must not look alike: "enforced, verified clean"
-        and "MNEMIQ_LOCALONLY (no underscore) was typo'd, so `local_only` is False and this
-        method returned on its first line." A typo is inert in exactly the same way a correct,
-        clean run is, and only one of them is safe.
-        """
-        if not self.local_only:
-            return
+    def _local_only_walk(self) -> tuple[list[str], list[str]]:
+        """(offenders, cleared), each endpoint judged independently of the others."""
         import ipaddress
-        import sys
         from urllib.parse import urlparse
 
         rfc1918 = (
@@ -358,6 +316,59 @@ class Settings(BaseSettings):
                 offenders.append(f"{name}={url!r} (host {host} is publicly routable)")
                 continue
             checked.append(name)
+        return offenders, checked
+
+    def assert_local_only(self, *, also: tuple[str, ...] = ()) -> None:
+        """Refuse to run when a chat, embedding, judge or Verity endpoint would carry data off
+        the network.
+
+        For a deployment whose whole premise is that nothing leaves, a mistyped base URL is not
+        a misconfiguration that fails -- it is one that SUCCEEDS, quietly, having sent every
+        schema card to a third party. This turns that into a startup error.
+
+        Checked: llm_base_url, embed_base_url, verify_base_url, and the three verity_* endpoints
+        (verity_records_url, verity_token_url, verity_traces_url) -- trace_sink POSTs to
+        verity_traces_url on every ask/serve, and even with the text/rows disclosure opt-ins off
+        that body still carries question hashes, timings, policy hashes and identity, so leaving
+        it unchecked would be telemetry escaping under a flag named LOCAL_ONLY. NOT checked:
+        pg_dsn and control_dsn -- see the trailing line of the raised message for why, which is
+        the answer an operator actually needs, not a comment only a reader of this source sees.
+
+        Loopback, the RFC1918 private ranges, and their IPv6 counterparts pass, because a data
+        centre runs the model on another host on its own network -- fc00::/7 (RFC 4193's
+        "unique local address" range, which `fd00::/8` in practice always comes from) is
+        RFC1918's own IPv6 analog, not a narrower or looser thing, so an IPv6-only deployment
+        gets the same allowance an IPv4 one does. An IPv4-mapped IPv6 literal (`::ffff:10.0.0.1`)
+        is judged on the IPv4 address it maps to, for the same reason: it is that address, just
+        spelled by a resolver or proxy that prefers IPv6 syntax. This is deliberately narrower
+        than `ipaddress`'s own `is_private`, which also accepts several IANA special-purpose
+        ranges we do NOT want to wave through silently -- 169.254.169.254 above all, the
+        link-local address several cloud providers use to serve their metadata API, which is
+        exactly the kind of off-box hop this check exists to catch. Anything we cannot place
+        inside loopback, RFC1918 or its IPv6 analog is refused:
+        a URL `urlparse` itself cannot parse (a malformed IPv6 host literal raises INSIDE
+        `urlparse`, before `.hostname` is ever read -- not the same failure as `.hostname`
+        returning None, and both have to be caught, not just the second one), an unresolved DNS
+        name (public or internal -- this performs no lookup, so an internal name is refused for
+        the same reason a public one is, not because it looks suspicious), and every other IANA
+        special range are all refused the same way, because none of them is evidence of being on
+        this network. Every offender is collected and named together, and each is evaluated
+        independently of the others -- one endpoint's `urlparse` failure must not discard an
+        offender already found for an earlier one, which is exactly the bug an unguarded
+        `urlparse(url).hostname` produced. An operator who fixes one and reruns only to be told
+        about the next will conclude the check itself is flaky and disable it.
+
+        A passing, enforced check still writes one line to stderr naming what it verified.
+        Silence otherwise means two things that must not look alike: "enforced, verified clean"
+        and "MNEMIQ_LOCALONLY (no underscore) was typo'd, so `local_only` is False and this
+        method returned on its first line." A typo is inert in exactly the same way a correct,
+        clean run is, and only one of them is safe.
+        """
+        if not self.local_only:
+            return
+        import sys
+
+        offenders, checked = self._local_only_walk()
         if offenders:
             raise RuntimeError(
                 "MNEMIQ_LOCAL_ONLY is set and these endpoints would leave this network:\n  "

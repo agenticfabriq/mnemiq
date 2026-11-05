@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 
 from mnemiq.agent.budget import Budget
 from mnemiq.agent.loop import Agent
-from mnemiq.config import DEFAULT_MAX_QUESTION_CHARS, ModeSettings, Settings
+from mnemiq.config import DEFAULT_MAX_QUESTION_CHARS, Settings
 
 # Modes are USER-INTENT bundles (pay ~6x when the answer matters), not an accuracy
 # router: routing by difficulty measured no signal (plan 18 calibration -- deep's gain
@@ -57,31 +57,20 @@ MODES: dict[str, Mode] = {
 DEFAULT_MODE = "thinking"
 
 
-# One entry per kind of model, per mode: what differs from the table above, and only what a measurement backs. The
-# best prompt depends on the model, so tuning a small model here cannot move a frontier model's results.
-PROFILES: dict[str, dict[str, ModeSettings]] = {
-    "frontier": {},
-    "qwen-32b": {"instant": ModeSettings(card_style="bare")},
-}
-
-
 def modes_for(settings: Settings) -> dict[str, Mode]:
-    """The modes this deployment runs: the table above, then its profile, then `Settings.mode_settings`, the later
-    winning knob by knob. The best prompt and the checks worth paying for depend on the model and the dataset, so
-    these are an operator's to benchmark.
+    """The modes these settings run: the table above, then `Settings.mode_settings`, setting by setting. The best prompt
+    and the checks worth paying for depend on the model and the dataset, so these are an operator's to benchmark, and a
+    profile's sections arrive here as its `mode_settings` (`mnemiq.profiles`).
 
     Only what was set is applied, so a null reaches the knob that takes one. Refuses a profile or mode that does not
     exist, and a knob only several candidates read on a mode with one: each would otherwise score as "no effect"."""
     from mnemiq.agent.route import UnknownMode  # route imports this module
 
-    if settings.profile not in PROFILES:
-        raise ValueError(f"MNEMIQ_PROFILE={settings.profile!r} names no profile; valid profiles: {sorted(PROFILES)}")
     modes = dict(MODES)
-    for layer in (PROFILES[settings.profile], settings.mode_settings or {}):
-        for name, override in layer.items():
-            if name not in MODES:
-                raise UnknownMode(f"MNEMIQ_MODE_SETTINGS names no mode {name!r}; valid modes: {sorted(MODES)}")
-            modes[name] = replace(modes[name], **{knob: getattr(override, knob) for knob in override.model_fields_set})
+    for name, override in (settings.mode_settings or {}).items():
+        if name not in MODES:
+            raise UnknownMode(f"MNEMIQ_MODE_SETTINGS names no mode {name!r}; valid modes: {sorted(MODES)}")
+        modes[name] = replace(modes[name], **{field: getattr(override, field) for field in override.model_fields_set})
     for name, mode in modes.items():
         unread = [knob for knob, value in (("judge", mode.judge), ("min_agreement", mode.min_agreement)) if value]
         if mode.candidates <= 1 and unread:

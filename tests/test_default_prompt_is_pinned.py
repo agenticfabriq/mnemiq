@@ -1,9 +1,9 @@
-"""The frontier profile is today's prompt, byte for byte.
+"""The engine's default prompt, byte for byte.
 
-Work on a smaller model's profile must not move a frontier model's results, and nothing else in the suite
-would notice if it did: a changed rule or card line reads as an improvement until a benchmark says otherwise.
-A hash fails on any change at all, so changing this prompt is a decision. If it is meant, re-measure the
-frontier baseline first, then update the hash here.
+A profile changes settings, so tuning for one model must not move what another model is sent, and nothing else in the
+suite would notice if it did: a changed rule or card line reads as an improvement until a benchmark says otherwise. A
+hash fails on any change at all, so changing this prompt is a decision. If it is meant, re-measure on a frontier model
+first, then update the hash here.
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ def rendered() -> tuple[str, str]:
     return system_prompt(dialect="duckdb"), user_prompt(packet)
 
 
-def test_the_frontier_prompt_has_not_moved():
+def test_the_default_prompt_has_not_moved():
     system, user = rendered()
     assert _sha(system) == SYSTEM_SHA
     assert _sha(user) == USER_SHA
