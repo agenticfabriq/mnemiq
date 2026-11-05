@@ -215,6 +215,26 @@ def test_the_base_judge_key_does_not_follow_the_chat_to_a_new_host(tmp_path, mon
     assert got.verify_endpoint() == (HOSTED, "chat-env-key")
 
 
+def test_the_base_judge_model_does_not_follow_the_chat_to_a_new_host(tmp_path, monkeypatch):
+    """The new server does not serve it, and under fail-closed every judged answer on this profile would fail."""
+    got = _moved(tmp_path, monkeypatch, _HOSTED_CHAT, verify_model="old-servers-judge")
+    assert got.verify_model is None
+
+
+def test_a_judge_model_the_profile_states_is_kept(tmp_path, monkeypatch):
+    got = _moved(tmp_path, monkeypatch, _HOSTED_CHAT + '\nverify_model = "new-judge"', verify_model="old-servers-judge")
+    assert got.verify_model == "new-judge"
+
+
+def test_a_judge_that_stays_put_keeps_its_model(tmp_path, monkeypatch):
+    got = _moved(tmp_path, monkeypatch, _HOSTED_CHAT, verify_base_url=OTHER, verify_api_key="k", verify_model="its-judge")
+    assert got.verify_model == "its-judge"
+
+
+def test_a_kept_chat_keeps_the_judge_model(tmp_path, monkeypatch):
+    assert _moved(tmp_path, monkeypatch, 'llm_model = "n"', verify_model="its-judge").verify_model == "its-judge"
+
+
 @pytest.mark.parametrize("judge", [OTHER, "http://localhost:8001/v1"])
 def test_a_judge_on_another_endpoint_with_no_key_of_its_own_is_refused(tmp_path, monkeypatch, judge):
     """`verify_endpoint` would hand it the chat key. Another port is another server."""

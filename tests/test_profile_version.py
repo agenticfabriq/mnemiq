@@ -57,6 +57,20 @@ def test_the_dialect_changes_it():
     assert profile_version(_settings(), "duckdb") != profile_version(_settings(), "oracle")
 
 
+@pytest.mark.parametrize("field, value", [("verify_override", "0"), ("verify_override", "1"), ("verify_fail_closed", False),
+                                          ("max_question_chars", 5)])
+def test_what_a_deployment_sets_that_changes_answers_changes_it(field, value):
+    """Per deployment, so out of a profile's reach, and it still decides what an answer is. One version on two boots that
+    answer differently would say nothing."""
+    assert profile_version(_settings(**{field: value}), "duckdb") != profile_version(_settings(), "duckdb")
+
+
+def test_the_view_says_what_the_verifier_will_do():
+    view = resolved_view(_settings(verify_override="0"), "duckdb")
+    assert {name: mode["verify"] for name, mode in view["modes"].items()} == {"instant": "off", "thinking": "off", "deep": "off"}
+    assert resolved_view(_settings(verify_fail_closed=False), "duckdb")["deployment"]["verify_fail_closed"] is False
+
+
 def test_who_may_pick_it_does_not_change_it(tmp_path):
     text = 'default = "d"\n[profiles.d]\nllm_model = "n"\n[profiles.only]\nllm_model = "n"\nroles = ["{}"]\n'
     assert (profile_version(_from_file(tmp_path, text.format("a")), "duckdb")

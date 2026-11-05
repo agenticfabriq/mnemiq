@@ -174,6 +174,9 @@ def _resolved(name: str, entry: _Entry, base: Settings) -> Settings:
         resolved = resolved.model_copy(update={"verify_api_key": _key_from(entry.verify_api_key_env, name)})
     elif judge != base.verify_endpoint()[0]:
         resolved = resolved.model_copy(update={"verify_api_key": None})
+    if judge != base.verify_endpoint()[0] and "verify_model" not in entry.model_fields_set:
+        # The old server's. The new one does not serve it, and under fail-closed every judged answer would fail.
+        resolved = resolved.model_copy(update={"verify_model": None})
     if judge != resolved.llm_base_url and not resolved.verify_api_key:
         raise ProfileFileError(f"profile {name!r} runs its judge on another endpoint with no key of its own, so it "
                                "would send the chat key there: set verify_api_key_env")
@@ -281,11 +284,18 @@ def _no_credentials(value):
 
 
 def resolved_view(settings: Settings, dialect: str) -> dict:
-    """What this profile runs, with no secret in it: its answer-time settings, its modes and a hash of each prompt."""
+    """What this profile runs, with no secret in it: its answer-time settings, its modes, what the deployment sets that
+    changes an answer, and a hash of each prompt."""
+    modes = {name: asdict(mode) for name, mode in modes_for(settings).items()}
+    if settings.verify_override in {"0", "1"}:  # as `_resolve_verify_level` reads it: what each mode's verifier will do
+        for mode in modes.values():
+            mode["verify"] = "off" if settings.verify_override == "0" else "full"
     return {
         "dialect": dialect,
         "settings": {name: _no_credentials(getattr(settings, name)) for name in sorted(PROFILE_SETTINGS)},
-        "modes": {name: asdict(mode) for name, mode in modes_for(settings).items()},
+        "modes": modes,
+        # Out of a profile's reach, and they still decide what an answer is.
+        "deployment": {"verify_fail_closed": settings.verify_fail_closed, "max_question_chars": settings.max_question_chars},
         "prompts": {name: hashlib.sha256(text.encode()).hexdigest() for name, text in _prompt_texts(settings, dialect).items()},
     }
 
