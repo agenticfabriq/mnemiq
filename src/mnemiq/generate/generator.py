@@ -102,23 +102,32 @@ _CLOSING_FENCE = re.compile(r"\n?```\s*$")
 def _parse_after_reasoning(raw: str) -> SqlProposal:
     """Read the JSON object that ends a reply which reasons first.
 
-    The answer is the one complete object the reply ends on, not any object in it. A reply the token limit cut short
-    ends mid-answer, and a draft before it was abandoned rather than answered; an object nested in the answer is part
-    of it, and its own `sql` must not stand for the answer's (a decline would become a query). So the first brace from
-    the start whose object decodes to the reply's very end is the answer, and anything else is a deferral, never an
-    exception. `_parse` spans the first brace to the last, which a brace in the reasoning would break."""
+    The answer is the one complete, outermost object the reply ends on, not any object in it. A reply the token limit
+    cut short ends mid-answer: a draft before it was abandoned rather than answered, and an object nested in the cut-off
+    answer can end where the reply does, so its own `sql` would stand for the answer's (a decline would become a query).
+
+    So braces are read from the start. A complete object that ends before the reply is a draft, and is passed over
+    whole, never searched inside. An object that fails to decode is a brace in the reasoning, a broken object or the
+    cut-off answer, and the search goes on from the next line: a brace before the break, or after it on that line, may
+    sit inside it, and the prompt asks for the answer on a line of its own. A cut-off answer fails at the end of the
+    text, or on a string strict decoding leaves open only to the end of its line, so no line follows and the reply is
+    a deferral. Left open: a broken answer spread over lines, with an `sql` object on a later line ending the reply.
+    Never an exception. `_parse` spans the first brace to the last, which a brace in the reasoning would break."""
     text = _CLOSING_FENCE.sub("", (raw or "").rstrip()).rstrip()
-    if text.endswith("}"):
-        decoder = json.JSONDecoder()
-        for match in re.finditer(r"\{", text):
-            try:
-                payload, end = decoder.raw_decode(text, match.start())
-            except json.JSONDecodeError:
-                continue
-            if end == len(text):
-                if isinstance(payload, dict) and "sql" in payload:
-                    return _proposal(payload)
-                break
+    decoder = json.JSONDecoder()
+    at = text.find("{")
+    while at >= 0:
+        try:
+            payload, stop = decoder.raw_decode(text, at)
+        except json.JSONDecodeError as exc:
+            line_end = text.find("\n", max(at + 1, exc.pos))
+            at = -1 if line_end < 0 else text.find("{", line_end)
+            continue
+        if stop == len(text):
+            if isinstance(payload, dict) and "sql" in payload:
+                return _proposal(payload)
+            break
+        at = text.find("{", stop)  # a complete draft: past it whole
     return SqlProposal(sql=None, reason="the model did not end its reasoning on the JSON answer")
 
 

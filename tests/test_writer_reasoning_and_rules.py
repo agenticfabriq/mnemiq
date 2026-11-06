@@ -121,6 +121,28 @@ def test_a_cut_off_answer_that_ends_on_a_brace_does_not_bring_back_the_draft():
     assert proposal.sql is None
 
 
+@pytest.mark.parametrize("reply", [
+    '{"sql": null, "reason": "no table", "assumed_terms": ["profit"], "notes": {"sql": "SELECT 1"}',
+    'Thinking.\n{\n  "sql": null,\n  "reason": "no table",\n  "notes": {\n    "sql": "SELECT 1"\n  }',
+])
+def test_a_cut_off_decline_does_not_become_the_query_nested_in_it(reply):
+    """The outer object lost its closing brace to the token limit, so the reply ends on the nested one's."""
+    proposal, _ = _propose(reply, reasoning="before_sql", declare_assumed_terms=True)
+    assert proposal.sql is None
+
+
+def test_a_broken_answer_does_not_become_the_object_inside_it():
+    """An unquoted quote breaks the outer object partway; the object after the break is inside it, not an answer."""
+    proposal, _ = _propose('Thinking.\n{"sql": null, "reason": "the "x" {"sql": "SELECT 1"}', reasoning="before_sql")
+    assert proposal.sql is None
+
+
+def test_a_brace_in_the_reasoning_does_not_hide_the_answer_after_it():
+    reply = 'The grouping is like {"k": [1, 2\nso one table.\n' + _ANSWER
+    proposal, _ = _propose(reply, reasoning="before_sql")
+    assert proposal.sql == "SELECT n FROM claim"
+
+
 def test_a_decline_with_sql_nested_inside_stays_a_decline():
     reply = 'Thinking.\n{"sql": null, "reason": "no table", "assumed_terms": ["profit"], "notes": {"sql": "SELECT 1"}}'
     proposal, _ = _propose(reply, reasoning="before_sql", declare_assumed_terms=True)
