@@ -190,6 +190,7 @@ def run_case_csv(
     result.verify_layer = answer.verify_layer
     result.judge_override = answer.judge_override
     result.candidates_executed = answer.candidates_executed
+    result.prose_failed = answer.prose_failed
 
     if answer.failed:
         result.outcome = Outcome.ERROR

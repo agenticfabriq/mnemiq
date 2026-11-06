@@ -547,7 +547,7 @@ def _cmd_metrics(settings: Settings) -> int:
               f"metrics for {source_id!r}, which may not be the id answers were recorded under. "
               "An empty result below may be that, not an absence of answers", file=sys.stderr)
     m = aggregate(sink.recent(source_id, 1000))
-    print(f"answers={m.answers} deferral_rate={m.deferral_rate:.1%} "
+    print(f"answers={m.answers} errors={m.errors} prose_failures={m.prose_failures} deferral_rate={m.deferral_rate:.1%} "
           f"cache_hit_rate={m.cache_hit_rate:.1%} p50={m.p50_ms:.0f}ms p95={m.p95_ms:.0f}ms")
     return 0
 

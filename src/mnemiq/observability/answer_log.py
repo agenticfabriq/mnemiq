@@ -92,6 +92,8 @@ class AnswerLog:
             "grant_fingerprint": answer.grant_fingerprint,
             "deferred": answer.deferred,
             "failed": answer.failed,
+            # The rows stand and their sentence failed: findable here, since the answer itself reads as a success.
+            "prose_failed": getattr(answer, "prose_failed", False),
             "reason_code": str(answer.reason_code) if answer.reason_code else None,
             "cached": answer.cached,
             "total_ms": round(total_ms, 1),

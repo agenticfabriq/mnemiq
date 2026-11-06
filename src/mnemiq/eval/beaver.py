@@ -386,6 +386,8 @@ def _ask_one(q: Question, cfg: RunConfig, header: dict, adapter, ask: Ask,
     row.update(
         sql=answer.trace.target_sql if answered and answer.trace else None,
         reason_code=_code(answer.reason_code) if answer is not None else None,
+        # The rows stand and their sentence failed; graded on the rows like any answer.
+        prose_failed=answer.prose_failed if answer is not None else False,
         answer=answer.answer if answer is not None else None,
         error=error,
         s=round(time.perf_counter() - started, 1),

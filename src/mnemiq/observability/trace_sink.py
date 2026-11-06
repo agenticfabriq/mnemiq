@@ -241,6 +241,8 @@ class VerityTraceSink(TraceSink):
                 "engine_commit": getattr(answer, "engine_commit", None),
                 "deferred": bool(getattr(answer, "deferred", False)),
                 "failed": bool(getattr(answer, "failed", False)),
+                # The rows stood and their sentence failed: an answer, not a failure, and the audit store can tell.
+                "prose_failed": bool(getattr(answer, "prose_failed", False)),
                 # The ENUM, never the message: the message is free text carrying schema and values,
                 # and now the provider's own error string too.
                 "reason_code": _reason_code(answer),

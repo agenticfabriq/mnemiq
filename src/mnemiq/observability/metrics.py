@@ -16,6 +16,9 @@ class AnswerRecord:
     # product claim rests on -- went UP when the database went down (register M6).
     failed: bool = False
     reason_code: DeferralReason | str | None = None
+    # The rows stood and their sentence failed. Not an error (the answer is the rows), and counted apart, so a prose
+    # model that is down still shows here rather than reading as a clean run.
+    prose_failed: bool = False
 
 
 @dataclass
@@ -23,6 +26,7 @@ class Metrics:
     answers: int = 0
     deferrals: int = 0
     errors: int = 0  # was hardcoded 0, so a total outage reported as flawless abstention (M2)
+    prose_failures: int = 0
     deferral_rate: float = 0.0
     cache_hit_rate: float = 0.0
     p50_ms: float = 0.0
@@ -43,13 +47,14 @@ def aggregate(records: list[AnswerRecord]) -> Metrics:
     n = len(records)
     deferrals = sum(1 for r in records if r.deferred and not r.failed)
     errors = sum(1 for r in records if r.failed)
+    prose_failures = sum(1 for r in records if r.prose_failed)
     cached = sum(1 for r in records if r.cached)
     latencies = [r.total_ms for r in records]
     # Deferring is a decision; failing is not. The rate is over the requests we actually decided,
     # so an outage can no longer raise it (M6).
     decided = n - errors
     return Metrics(
-        answers=n, deferrals=deferrals, errors=errors,
+        answers=n, deferrals=deferrals, errors=errors, prose_failures=prose_failures,
         deferral_rate=(deferrals / decided if decided else 0.0), cache_hit_rate=cached / n,
         p50_ms=_pct(latencies, 0.50), p95_ms=_pct(latencies, 0.95),
     )
@@ -86,7 +91,7 @@ class PostgresSink:
     _CREATE = (
         "CREATE TABLE IF NOT EXISTS mnemiq_answer_log ("
         "source_id TEXT, deferred BOOLEAN, cached BOOLEAN, total_ms DOUBLE PRECISION, mode TEXT, "
-        "failed BOOLEAN DEFAULT FALSE, reason_code TEXT, "
+        "failed BOOLEAN DEFAULT FALSE, reason_code TEXT, prose_failed BOOLEAN DEFAULT FALSE, "
         "created_at TIMESTAMPTZ DEFAULT now())"
     )
     # Existing deployments predate the two columns; without this their INSERT would fail and be
@@ -95,6 +100,7 @@ class PostgresSink:
         "ALTER TABLE mnemiq_answer_log "
         "ADD COLUMN IF NOT EXISTS failed BOOLEAN DEFAULT FALSE, "
         "ADD COLUMN IF NOT EXISTS reason_code TEXT, "
+        "ADD COLUMN IF NOT EXISTS prose_failed BOOLEAN DEFAULT FALSE, "
         "ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now()"
     )
 
@@ -138,10 +144,10 @@ class PostgresSink:
             try:
                 self._con.execute(
                     "INSERT INTO mnemiq_answer_log "
-                    "(source_id, deferred, cached, total_ms, mode, failed, reason_code) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    "(source_id, deferred, cached, total_ms, mode, failed, reason_code, prose_failed) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                     (source_id, rec.deferred, rec.cached, rec.total_ms, rec.mode, rec.failed,
-                     str(rec.reason_code) if rec.reason_code else None),
+                     str(rec.reason_code) if rec.reason_code else None, rec.prose_failed),
                 )
             except Exception:
                 self._con = None  # drop; next call reconnects
@@ -153,13 +159,13 @@ class PostgresSink:
                 return []
             try:
                 rows = self._con.execute(
-                    "SELECT deferred, cached, total_ms, mode, failed, reason_code "
+                    "SELECT deferred, cached, total_ms, mode, failed, reason_code, prose_failed "
                     "FROM mnemiq_answer_log WHERE source_id = %s "
                     "ORDER BY created_at DESC LIMIT %s",
                     (source_id, limit),
                 ).fetchall()
                 return [AnswerRecord(deferred=r[0], cached=r[1], total_ms=r[2], mode=r[3],
-                                     failed=bool(r[4]), reason_code=r[5])
+                                     failed=bool(r[4]), reason_code=r[5], prose_failed=bool(r[6]))
                         for r in rows]
             except Exception:
                 self._con = None
