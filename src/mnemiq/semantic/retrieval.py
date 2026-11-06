@@ -85,7 +85,11 @@ def _attach_facts(cards: list[RetrievedCard], table_facts: Sequence[TableFacts],
     `relationships` is required, and None means unknown: a fact with no dependencies recorded
     is shown only to an identity holding every related table, which cannot be established
     without them (M143). A default of none would show such facts wherever a caller forgot.
+
+    The bare form takes no block: it holds names, types and keys alone.
     """
+    if card_style == "bare":
+        return
     by_id = {tf.object_id: tf for tf in table_facts}
     for c in cards:
         tf = by_id.get(c.object_id)
@@ -359,6 +363,7 @@ def retrieve(
     snapshot=None,
     card_style: str = "cards",
     grants: GrantSet | None = None,
+    dialect: str | None = None,
 ) -> ContextPacket:
     """Hybrid retrieval, scoped to the identity's grants *before* anything is ranked.
 
@@ -460,7 +465,8 @@ def retrieve(
         scoped = {
             card.object_id: card.text
             for card in build_cards(
-                snapshot, policy=build_access_policy(snapshot, grants), style=card_style)
+                snapshot, policy=build_access_policy(snapshot, grants), style=card_style,
+                dialect=dialect)
         }
     packet.cards = [
         RetrievedCard(

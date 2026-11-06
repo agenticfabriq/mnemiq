@@ -19,6 +19,7 @@ from mnemiq.agent.route import UnknownMode
 from mnemiq.config import Settings
 from mnemiq.contract import IdentityContext
 from mnemiq.duckdb_extensions import ExtensionNotInstalled, ExtensionsNotReady
+from mnemiq.profiles import ProfileFileError, UnknownProfile
 from mnemiq.runtime import Runtime, SnapshotMissing, build_runtime
 from mnemiq.server.serialize import verified_state, write_payload
 
@@ -26,9 +27,10 @@ logger = logging.getLogger(__name__)
 
 
 def _db_read(
-    runtime: Runtime, identity: IdentityContext, question: str, mode: str | None = None
+    runtime: Runtime, identity: IdentityContext, question: str, mode: str | None = None,
+    profile: str | None = None,
 ) -> dict:
-    ans = runtime.ask(question, identity, mode=mode)
+    ans = runtime.ask(question, identity, mode=mode, profile=profile)
     trace = ans.trace
     return {
         "answer": ans.answer,
@@ -38,6 +40,10 @@ def _db_read(
         "failed": ans.failed,
         "reason_code": str(ans.reason_code) if ans.reason_code else None,
         "mode": ans.mode,
+        "profile": ans.profile,
+        "profile_version": ans.profile_version,
+        "model": ans.model,
+        "engine_commit": ans.engine_commit,
         # M89: the same derivation as the HTTP payload, imported rather than restated. A governing
         # agent deciding whether to act on an answer needs to know the verifier could not be
         # reached; hand-building a second dict here is how this surface would silently diverge,
@@ -119,6 +125,8 @@ def _client_message(exc: Exception) -> str:
     if isinstance(exc, SnapshotMissing) and isinstance(exc.__cause__, (SourceUnconfigured, UnknownSourceKind)):
         return ("This deployment's source is not configured: the operator's server log names what "
                 "is missing.")
+    if isinstance(exc, SnapshotMissing) and isinstance(exc.__cause__, ProfileFileError):
+        return "This deployment's profile file cannot be run: the operator's server log says why."
     if isinstance(exc, SnapshotMissing):
         return ("This deployment has no snapshot of its source yet: the operator runs "
                 "`mnemiq enrich` then `mnemiq build`.")
@@ -137,6 +145,8 @@ def _client_message(exc: Exception) -> str:
                 f"{sorted(MODES)}.")
     if isinstance(exc, UnknownMode):
         return f"Unknown mode; this deployment offers: {sorted(MODES)}."
+    if isinstance(exc, UnknownProfile):  # unknown and forbidden read alike, and neither repeats the name
+        return f"Unknown profile; you may pick: {exc.offered}."
     if isinstance(exc, TablesNotFound):
         return ("A table this deployment's source manifest lists does not exist in its source: the "
                 "operator's server log names it.")
@@ -149,7 +159,7 @@ def _client_message(exc: Exception) -> str:
 
 
 _SETUP = (SnapshotMissing, SourceUnconfigured, ExtensionNotInstalled, ExtensionsNotReady,
-          UnknownMode, UnfederatableSource, DriverMissing, TablesNotFound)
+          UnknownMode, UnknownProfile, UnfederatableSource, DriverMissing, TablesNotFound)
 
 
 def build_mcp(runtime: Runtime | Callable[[], Runtime], identity: IdentityContext):
@@ -189,12 +199,13 @@ def build_mcp(runtime: Runtime | Callable[[], Runtime], identity: IdentityContex
             raise tool_error(_INTERNAL) from exc
 
     @mcp.tool()
-    def db_read(question: str, mode: str | None = None) -> dict:
+    def db_read(question: str, mode: str | None = None, profile: str | None = None) -> dict:
         """Answer a natural-language question over the database (read-only). Returns the
         answer, the SQL run, and an auditable trace; defers honestly when it cannot answer.
         mode: 'instant' (cheapest, no retries), 'thinking' (default, self-repairing), or
-        'deep' (5 candidates + judge + agreement gate -- highest precision, ~6x cost)."""
-        return guarded(lambda: _db_read(get_runtime(), identity, question, mode=mode))
+        'deep' (5 candidates + judge + agreement gate -- highest precision, ~6x cost).
+        profile: a model and its settings this deployment offers you; unset uses its default."""
+        return guarded(lambda: _db_read(get_runtime(), identity, question, mode=mode, profile=profile))
 
     @mcp.tool()
     def db_write(sql: str) -> dict:

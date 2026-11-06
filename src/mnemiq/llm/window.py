@@ -192,7 +192,8 @@ def largest_prompts(con, snapshot, settings, dialect: str,
     k = settings.retrieval_k
     # The cards retrieval renders for this identity: its tables only, under its column policy.
     rendered = [c for c in build_cards(snapshot, policy=build_access_policy(snapshot, grants),
-                                       style=settings.card_style, describe=describe)
+                                       style=settings.card_style, describe=describe,
+                                       dialect=dialect)
                 if c.object_id in grants.objects]
     # Every granted table visible, so a definition bound to one inside the k and one outside it
     # still rides in.
@@ -372,20 +373,23 @@ def check_window(con, snapshot, settings, dialect: str, grants: GrantSet | None 
     return _count(prompts, settings, http, who)
 
 
-def grant_sets(authz, settings) -> list[tuple[str, GrantSet]]:
+def grant_sets(authz, settings, allowed=None) -> list[tuple[str, GrantSet]]:
     """(label, grants) for each distinct view to measure: every role the policy declares, and the
     configured identity, whose roles merge into one grant that may be wider than any of them. Views that see no
     table are dropped, and identical grants are measured once. Other principals holding several
-    roles are not: their combinations are not listed anywhere to measure."""
+    roles are not: their combinations are not listed anywhere to measure.
+
+    `allowed` says who may use the endpoint being measured. Counting a prompt sends it there, so a view no caller of this
+    endpoint could send is left out: the sending is the disclosure, whatever the server answers."""
     from mnemiq.config import identity_from_settings
     from mnemiq.contract import IdentityContext
 
     roles = getattr(authz, "policy_roles", None)
-    views = [(f"role {role}", authz.grants_for(
-        IdentityContext(tenant_id="boot", principal_id="boot", roles=[role])))
-        for role in (roles() if roles is not None else [])]
+    identities = [(f"role {role}", IdentityContext(tenant_id="boot", principal_id="boot", roles=[role]))
+                  for role in (roles() if roles is not None else [])]
     identity = identity_from_settings(settings)
-    views.append((f"identity {identity.principal_id}", authz.grants_for(identity)))
+    identities.append((f"identity {identity.principal_id}", identity))
+    views = [(label, authz.grants_for(who)) for label, who in identities if allowed is None or allowed(who)]
     measured: list[tuple[str, GrantSet]] = []
     seen: set[str] = set()
     for label, grants in views:
@@ -396,10 +400,10 @@ def grant_sets(authz, settings) -> list[tuple[str, GrantSet]]:
 
 
 def worst_window(con, snapshot, settings, dialect: str, authz,
-                 http: httpx.Client | None = None) -> WindowReport | None:
+                 http: httpx.Client | None = None, allowed=None) -> WindowReport | None:
     """The report for the view whose largest prompt is longest, measured locally and then counted
     on the server; None when no view sees a table."""
-    views = dict(grant_sets(authz, settings))
+    views = dict(grant_sets(authz, settings, allowed))
     candidates = [(label, largest_prompts(con, snapshot, settings, dialect, grants))
                   for label, grants in views.items()]
     if not candidates:

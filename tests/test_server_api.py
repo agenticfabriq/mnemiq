@@ -17,7 +17,7 @@ class _RT:
         self._starters = list(starters)
         self.asked = None
 
-    def ask(self, question, identity, mode=None, emit=None, history=None):
+    def ask(self, question, identity, mode=None, emit=None, history=None, profile=None):
         if self._raises:
             raise self._raises
         self.asked = (question, identity.principal_id, mode)

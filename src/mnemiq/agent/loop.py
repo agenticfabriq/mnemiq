@@ -160,6 +160,12 @@ class AgentAnswer:
     # How many ranges the decider moved to end before the day after a bare date (`Approved.day_bounds`).
     day_bounds_closed: int | None = None
     mode: str | None = None  # resolved mode name, stamped by the Runtime (the Agent IS a mode)
+    # What produced this answer, stamped by the Runtime. The version pins the settings and the prompts, and the commit the
+    # rest of the engine: card rendering and the decider are in neither alone.
+    profile: str | None = None
+    profile_version: str | None = None
+    model: str | None = None
+    engine_commit: str | None = None
     preview: ResultPreview | None = None  # None on every deferral path -- never fabricated
     # The authorization boundary this answer was computed under. A client echoes it back
     # with the turn; the engine replays a turn only to the same boundary (history.py).
@@ -220,8 +226,12 @@ class Agent:
         guard_undefined_terms: bool = False,
         guard_fanout: bool | None = False,
         max_question_chars: int = DEFAULT_MAX_QUESTION_CHARS,
+        plan_attempts: int = 3,
+        prose: bool = True,
     ) -> None:
         self.generator = generator
+        self.plan_attempts = plan_attempts
+        self.prose = prose
         # Defaults to the shipped limit, not to none: a construction site that forgets it still declines what no
         # stage would read alike (M147).
         self.max_question_chars = max_question_chars
@@ -349,6 +359,7 @@ class Agent:
                     adapter=self.adapter,
                     dialect=self.dialect,
                     target=self.dialect,
+                    max_attempts=self.plan_attempts,
                     feedback=feedback,
                     corrector=self.corrector,
                     values=self.values,
@@ -756,13 +767,17 @@ class Agent:
         attempts: int | None = None,
     ) -> AgentAnswer:
         cut = _cut(approved, table)
-        with step(emit, Stage.SYNTHESIZE, forced=forced):
-            # As asked, not the policy's rewrite (M156): the synthesizer is a model call, and the
-            # policy's predicate is not the caller's to read in the prose either.
-            answer = self.synthesizer.answer(
-                packet.question, approved.model_sql(), render_result(table, cut_at=cut), forced=forced,
-                row_count=table.num_rows,
-            )
+        if self.prose:
+            with step(emit, Stage.SYNTHESIZE, forced=forced):
+                # As asked, not the policy's rewrite (M156): the synthesizer is a model call, and the
+                # policy's predicate is not the caller's to read in the prose either.
+                answer = self.synthesizer.answer(
+                    packet.question, approved.model_sql(), render_result(table, cut_at=cut), forced=forced,
+                    row_count=table.num_rows,
+                )
+        else:
+            # The rows are the answer, in the preview. A fact the engine can state itself, not a model's reading of them.
+            answer = f"Returned {table.num_rows} row{'' if table.num_rows == 1 else 's'}."
         trace = build_trace(
             question=packet.question,
             approved=approved,

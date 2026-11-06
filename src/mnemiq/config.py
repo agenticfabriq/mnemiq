@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import field_validator, Field, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator, Field, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # The Verity endpoint the certified pull needs, as a VALUE. It is the one that accepts `since`
 # and returns a `watermark`; its sibling `/api/semantic/records` does neither, so a deployment
@@ -74,6 +74,34 @@ def _manifest_tables(entry: dict) -> tuple[str, ...]:
     return tuple(t.strip() for t in tables)
 
 
+class ModeSettings(BaseModel):
+    """One mode's settings, as an operator sets them: `agent.modes.modes_for` applies what is set here over the
+    mode's own value. Refused rather than ignored, each of them: a benchmark arm whose setting never ran scores
+    cleanly and reads as "no effect", a finding about nothing."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    card_style: Literal["cards", "ddl", "bare"] | None = None
+    candidates: int | None = Field(default=None, ge=1)
+    corrector: bool | None = None
+    judge: bool | None = None
+    min_agreement: float | None = Field(default=None, ge=0, le=1)
+    budget_s: float | None = Field(default=None, gt=0)
+    max_attempts: int | None = Field(default=None, ge=1)
+    verify: Literal["off", "sanity", "full"] | None = None
+    plan_attempts: int | None = Field(default=None, ge=1)
+    prose: bool | None = None
+
+    @model_validator(mode="after")
+    def _null_only_where_it_means_something(self):
+        # `card_style` null is "this deployment's form", `min_agreement` null is "no agreement gate"; on any other
+        # setting a null names no value, so it could only be a mistake for leaving the setting out.
+        for name in self.model_fields_set - {"card_style", "min_agreement"}:
+            if getattr(self, name) is None:
+                raise ValueError(f"{name} cannot be null: leave it out to keep the mode's own value")
+        return self
+
+
 class Settings(BaseSettings):
     """All engine configuration, one source of truth. `env_prefix="MNEMIQ_"` maps each field to its
     env var (llm_base_url -> MNEMIQ_LLM_BASE_URL), so every historical name is preserved. No env_file:
@@ -126,10 +154,30 @@ class Settings(BaseSettings):
     # Validated, not free text: `style != "ddl"` in the renderer means `DDL` or `ddl ` would
     # silently select the OTHER form, and the run record would not say which one produced the
     # score -- a 35.7% form and a 50.5% form told apart only by shell history.
-    card_style: Literal["cards", "ddl"] = Field(default="cards",
-                            description="schema card form for the GENERATOR: cards|ddl. "
+    card_style: Literal["cards", "ddl", "bare"] = Field(default="cards",
+                            description="schema card form for the GENERATOR: cards|ddl|bare. "
                                         "`ddl` renders CREATE TABLE for a model fine-tuned "
-                                        "on DDL; the retrieval index always embeds `cards`.")
+                                        "on DDL; `bare` is CREATE TABLE with names, types and "
+                                        "keys alone; the retrieval index always embeds `cards`.")
+    profiles_path: str | None = Field(default=None,
+                            description="TOML file of named profiles, each a model and its settings per mode, and the "
+                                        "roles that may pick it; unset runs these settings as one default profile")
+    # NoDecode, read by `_read_mode_settings`: pydantic-settings would otherwise JSON-decode the raw variable and fail
+    # on the empty line a copied `.env.example` holds, before any validator could say what it means.
+    mode_settings: Annotated[dict[str, ModeSettings] | None, NoDecode] = Field(default=None,
+                            description="per-mode settings as JSON, e.g. {\"instant\": {\"card_style\": \"bare\"}}: "
+                                        "card_style, candidates, corrector, judge, min_agreement, budget_s, "
+                                        "max_attempts, verify, plan_attempts, prose; unset keeps the mode's own. With MNEMIQ_PROFILES_PATH, state them in the file.")
+
+    @field_validator("mode_settings", mode="before")
+    @classmethod
+    def _read_mode_settings(cls, value):
+        if isinstance(value, str):
+            return json.loads(value) if value.strip() else None
+        return value
+
+    writer_temperature: float | None = Field(default=None, ge=0, description="the SQL writer's sampling temperature; unset sends none, so the server's default applies (Qwen2.5: 0.7). Refused for a model that takes none, such as GPT-5, which would ignore it")
+    prompt_layout: Literal["question_first", "question_last"] = Field(default="question_first", description="how the writer's prompt is arranged: question_first sends the question and its context as the user message; question_last puts the context in the system message and the question alone in the user message")
     guided_sql: bool = Field(default=False, description="constrained decoding: force non-empty sql (response_format json_schema; works on vLLM and OpenAI-compatible endpoints)")
     assertive_sql: bool = Field(default=False, description="assertive prompt: attempt an answer instead of deferring")
     # M35, off by default: withdrawn on its own pre-registered criterion. Beacon's answerable band
@@ -175,6 +223,9 @@ class Settings(BaseSettings):
     roles: str | None = Field(default=None, description="MCP standalone identity: comma-separated roles")
     tenant: str | None = Field(default=None, description="MCP standalone identity: tenant id")
     # --- verifier ---
+    answer_log_path: str | None = Field(default=None, description="where each answer's record goes: which profile, version, model and engine commit produced it, as one JSON line each, with no question text, SQL or rows; unset keeps it beside the store as <store_path>.answers.jsonl, `off` writes none. Not rotated")
+    answer_log_text: bool = Field(default=False, description="opt-in: the answer log also holds the question and the SQL as asked, which carry literals from the question and values from the database; rows are never logged")
+    engine_commit: str | None = Field(default=None, description="the commit this engine runs, for a build with no git checkout to read it from; stamped on every answer beside the profile's version")
     verify_override: str | None = Field(default=None, validation_alias="MNEMIQ_VERIFY",
                                         description="verify override: unset=mode defaults, 0=force off, 1=force full")
     verify_threshold: float = Field(default=0.5, ge=0.0, le=1.0, description="judge-confidence defer cutoff")
@@ -209,56 +260,14 @@ class Settings(BaseSettings):
     def from_env(cls) -> "Settings":
         return cls()
 
-    def assert_local_only(self, *, also: tuple[str, ...] = ()) -> None:
-        """Refuse to run when a chat, embedding, judge or Verity endpoint would carry data off
-        the network.
+    def local_only_offenders(self) -> list[str]:
+        """The endpoints that would leave this network under MNEMIQ_LOCAL_ONLY; empty when it is off. For a profile's
+        resolved copy, whose endpoints `assert_local_only` on the deployment's settings never sees."""
+        return self._local_only_walk()[0] if self.local_only else []
 
-        For a deployment whose whole premise is that nothing leaves, a mistyped base URL is not
-        a misconfiguration that fails -- it is one that SUCCEEDS, quietly, having sent every
-        schema card to a third party. This turns that into a startup error.
-
-        Checked: llm_base_url, embed_base_url, verify_base_url, and the three verity_* endpoints
-        (verity_records_url, verity_token_url, verity_traces_url) -- trace_sink POSTs to
-        verity_traces_url on every ask/serve, and even with the text/rows disclosure opt-ins off
-        that body still carries question hashes, timings, policy hashes and identity, so leaving
-        it unchecked would be telemetry escaping under a flag named LOCAL_ONLY. NOT checked:
-        pg_dsn and control_dsn -- see the trailing line of the raised message for why, which is
-        the answer an operator actually needs, not a comment only a reader of this source sees.
-
-        Loopback, the RFC1918 private ranges, and their IPv6 counterparts pass, because a data
-        centre runs the model on another host on its own network -- fc00::/7 (RFC 4193's
-        "unique local address" range, which `fd00::/8` in practice always comes from) is
-        RFC1918's own IPv6 analog, not a narrower or looser thing, so an IPv6-only deployment
-        gets the same allowance an IPv4 one does. An IPv4-mapped IPv6 literal (`::ffff:10.0.0.1`)
-        is judged on the IPv4 address it maps to, for the same reason: it is that address, just
-        spelled by a resolver or proxy that prefers IPv6 syntax. This is deliberately narrower
-        than `ipaddress`'s own `is_private`, which also accepts several IANA special-purpose
-        ranges we do NOT want to wave through silently -- 169.254.169.254 above all, the
-        link-local address several cloud providers use to serve their metadata API, which is
-        exactly the kind of off-box hop this check exists to catch. Anything we cannot place
-        inside loopback, RFC1918 or its IPv6 analog is refused:
-        a URL `urlparse` itself cannot parse (a malformed IPv6 host literal raises INSIDE
-        `urlparse`, before `.hostname` is ever read -- not the same failure as `.hostname`
-        returning None, and both have to be caught, not just the second one), an unresolved DNS
-        name (public or internal -- this performs no lookup, so an internal name is refused for
-        the same reason a public one is, not because it looks suspicious), and every other IANA
-        special range are all refused the same way, because none of them is evidence of being on
-        this network. Every offender is collected and named together, and each is evaluated
-        independently of the others -- one endpoint's `urlparse` failure must not discard an
-        offender already found for an earlier one, which is exactly the bug an unguarded
-        `urlparse(url).hostname` produced. An operator who fixes one and reruns only to be told
-        about the next will conclude the check itself is flaky and disable it.
-
-        A passing, enforced check still writes one line to stderr naming what it verified.
-        Silence otherwise means two things that must not look alike: "enforced, verified clean"
-        and "MNEMIQ_LOCALONLY (no underscore) was typo'd, so `local_only` is False and this
-        method returned on its first line." A typo is inert in exactly the same way a correct,
-        clean run is, and only one of them is safe.
-        """
-        if not self.local_only:
-            return
+    def _local_only_walk(self) -> tuple[list[str], list[str]]:
+        """(offenders, cleared), each endpoint judged independently of the others."""
         import ipaddress
-        import sys
         from urllib.parse import urlparse
 
         rfc1918 = (
@@ -314,6 +323,59 @@ class Settings(BaseSettings):
                 offenders.append(f"{name}={url!r} (host {host} is publicly routable)")
                 continue
             checked.append(name)
+        return offenders, checked
+
+    def assert_local_only(self, *, also: tuple[str, ...] = ()) -> None:
+        """Refuse to run when a chat, embedding, judge or Verity endpoint would carry data off
+        the network.
+
+        For a deployment whose whole premise is that nothing leaves, a mistyped base URL is not
+        a misconfiguration that fails -- it is one that SUCCEEDS, quietly, having sent every
+        schema card to a third party. This turns that into a startup error.
+
+        Checked: llm_base_url, embed_base_url, verify_base_url, and the three verity_* endpoints
+        (verity_records_url, verity_token_url, verity_traces_url) -- trace_sink POSTs to
+        verity_traces_url on every ask/serve, and even with the text/rows disclosure opt-ins off
+        that body still carries question hashes, timings, policy hashes and identity, so leaving
+        it unchecked would be telemetry escaping under a flag named LOCAL_ONLY. NOT checked:
+        pg_dsn and control_dsn -- see the trailing line of the raised message for why, which is
+        the answer an operator actually needs, not a comment only a reader of this source sees.
+
+        Loopback, the RFC1918 private ranges, and their IPv6 counterparts pass, because a data
+        centre runs the model on another host on its own network -- fc00::/7 (RFC 4193's
+        "unique local address" range, which `fd00::/8` in practice always comes from) is
+        RFC1918's own IPv6 analog, not a narrower or looser thing, so an IPv6-only deployment
+        gets the same allowance an IPv4 one does. An IPv4-mapped IPv6 literal (`::ffff:10.0.0.1`)
+        is judged on the IPv4 address it maps to, for the same reason: it is that address, just
+        spelled by a resolver or proxy that prefers IPv6 syntax. This is deliberately narrower
+        than `ipaddress`'s own `is_private`, which also accepts several IANA special-purpose
+        ranges we do NOT want to wave through silently -- 169.254.169.254 above all, the
+        link-local address several cloud providers use to serve their metadata API, which is
+        exactly the kind of off-box hop this check exists to catch. Anything we cannot place
+        inside loopback, RFC1918 or its IPv6 analog is refused:
+        a URL `urlparse` itself cannot parse (a malformed IPv6 host literal raises INSIDE
+        `urlparse`, before `.hostname` is ever read -- not the same failure as `.hostname`
+        returning None, and both have to be caught, not just the second one), an unresolved DNS
+        name (public or internal -- this performs no lookup, so an internal name is refused for
+        the same reason a public one is, not because it looks suspicious), and every other IANA
+        special range are all refused the same way, because none of them is evidence of being on
+        this network. Every offender is collected and named together, and each is evaluated
+        independently of the others -- one endpoint's `urlparse` failure must not discard an
+        offender already found for an earlier one, which is exactly the bug an unguarded
+        `urlparse(url).hostname` produced. An operator who fixes one and reruns only to be told
+        about the next will conclude the check itself is flaky and disable it.
+
+        A passing, enforced check still writes one line to stderr naming what it verified.
+        Silence otherwise means two things that must not look alike: "enforced, verified clean"
+        and "MNEMIQ_LOCALONLY (no underscore) was typo'd, so `local_only` is False and this
+        method returned on its first line." A typo is inert in exactly the same way a correct,
+        clean run is, and only one of them is safe.
+        """
+        if not self.local_only:
+            return
+        import sys
+
+        offenders, checked = self._local_only_walk()
         if offenders:
             raise RuntimeError(
                 "MNEMIQ_LOCAL_ONLY is set and these endpoints would leave this network:\n  "

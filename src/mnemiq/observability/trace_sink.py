@@ -234,6 +234,11 @@ class VerityTraceSink(TraceSink):
             },
             "resolved_intent": {
                 "mode": getattr(answer, "mode", None),
+                # What produced it. A model's name and a hash, never its endpoint or its key.
+                "profile": getattr(answer, "profile", None),
+                "profile_version": getattr(answer, "profile_version", None),
+                "model": getattr(answer, "model", None),
+                "engine_commit": getattr(answer, "engine_commit", None),
                 "deferred": bool(getattr(answer, "deferred", False)),
                 "failed": bool(getattr(answer, "failed", False)),
                 # The ENUM, never the message: the message is free text carrying schema and values,

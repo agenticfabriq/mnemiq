@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from mnemiq.agent.budget import Budget
 from mnemiq.agent.loop import Agent
-from mnemiq.config import DEFAULT_MAX_QUESTION_CHARS
+from mnemiq.config import DEFAULT_MAX_QUESTION_CHARS, Settings
 
 # Modes are USER-INTENT bundles (pay ~6x when the answer matters), not an accuracy
 # router: routing by difficulty measured no signal (plan 18 calibration -- deep's gain
@@ -23,6 +23,9 @@ class Mode:
     budget_s: float
     max_attempts: int
     verify: str = "sanity"  # result-verifier level: "off" | "sanity" | "full" (sanity+judge)
+    card_style: str | None = None  # the schema form its prompt carries; None: `Settings.card_style`
+    plan_attempts: int = 3  # writer calls spent on what the decider refuses, on the single path; deep's candidates get 1
+    prose: bool = True  # a model call turns the rows into sentences; off, the rows are the answer
 
 
 # Verify levels: sanity (deterministic empty/null net) in every mode; the LLM judge in
@@ -56,6 +59,33 @@ MODES: dict[str, Mode] = {
 DEFAULT_MODE = "thinking"
 
 
+def modes_for(settings: Settings) -> dict[str, Mode]:
+    """The modes these settings run: the table above, then `Settings.mode_settings`, setting by setting. The best prompt
+    and the checks worth paying for depend on the model and the dataset, so these are an operator's to benchmark, and a
+    profile's sections arrive here as its `mode_settings` (`mnemiq.profiles`).
+
+    Only what was set is applied, so a null reaches the knob that takes one. Refuses a profile or mode that does not
+    exist, and a knob only several candidates read on a mode with one: each would otherwise score as "no effect"."""
+    from mnemiq.agent.route import UnknownMode  # route imports this module
+
+    modes = dict(MODES)
+    for name, override in (settings.mode_settings or {}).items():
+        if name not in MODES:
+            raise UnknownMode(f"MNEMIQ_MODE_SETTINGS names no mode {name!r}; valid modes: {sorted(MODES)}")
+        modes[name] = replace(modes[name], **{field: getattr(override, field) for field in override.model_fields_set})
+    for name, mode in modes.items():
+        unread = [knob for knob, value in (("judge", mode.judge), ("min_agreement", mode.min_agreement)) if value]
+        if mode.candidates <= 1 and unread:
+            raise ValueError(f"{name} has one candidate, which {' and '.join(unread)} never read; "
+                             "set candidates above 1 or leave them out")
+    return modes
+
+
+def card_styles(settings: Settings) -> list[str]:
+    """Every schema form a mode sends. No form is always the largest, so the window is checked for each."""
+    return sorted({mode.card_style or settings.card_style for mode in modes_for(settings).values()})
+
+
 def build_agent(
     mode: Mode,
     *,
@@ -84,6 +114,8 @@ def build_agent(
         selector=selector if mode.judge else None,
         min_agreement=mode.min_agreement,
         verifier=verifier,
+        plan_attempts=mode.plan_attempts,
+        prose=mode.prose,
         guard_undefined_terms=guard_undefined_terms,
         guard_fanout=guard_fanout,
         max_question_chars=max_question_chars,

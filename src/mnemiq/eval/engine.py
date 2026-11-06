@@ -97,6 +97,9 @@ def build_engine(
 ) -> tuple[Engine, LLMClient]:
     """Retrieval + agent over one snapshot, assembled exactly once.
 
+    Refuses `profiles_path` and `mode_settings`: this door builds its own agent from its own arguments and takes no mode,
+    so they would not run, and a benchmark through it would report settings that did not.
+
     `index_adapter` builds the value index, and defaults to `adapter`. A caller whose `adapter`
     is bounded on the server (M152) passes an unbounded one here: each column's `SELECT DISTINCT`
     has no limit of its own, and one the bound cancels is skipped silently, losing that column's
@@ -107,6 +110,9 @@ def build_engine(
     Returns the ask function and the client whose token counter it shares, so the caller
     can report what the run cost.
     """
+    if settings.profiles_path or settings.mode_settings:
+        raise ValueError("the eval door takes no MNEMIQ_PROFILES_PATH or MNEMIQ_MODE_SETTINGS: it builds its own agent "
+                         "from its arguments, so they would not run. Measure them through /v1/ask.")
     embedder = LLMEmbedder(settings)
     con = init_store(store_path, local_only=settings.local_only)
     build_index(con, snapshot, embedder)
@@ -231,6 +237,7 @@ def build_engine(
                           # validates it, so `DDL` or a stray space cannot silently select
                           # the other form.
                           card_style=settings.card_style,
+                          dialect=getattr(adapter, "dialect", None),
                           definitions=definitions, table_facts=snapshot.table_facts,
                           metrics=snapshot.metrics, dimensions=snapshot.dimensions,
                           columns=snapshot.columns, ontology_index=ontology_index,

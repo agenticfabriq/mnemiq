@@ -76,7 +76,7 @@ def test_build_engine_builds_the_value_index_on_the_index_adapter_and_on_its_own
         built.append(adapter)
         raise Built
     monkeypatch.setattr(engine, "build_value_index", build_value_index)
-    settings = SimpleNamespace(local_only=False)
+    settings = SimpleNamespace(local_only=False, profiles_path=None, mode_settings=None)
     bounded, unbounded = Adapter("pg", statement_timeout_s=30.0), Adapter("pg")
 
     with pytest.raises(Built):

@@ -20,7 +20,7 @@ class _RT:
     def __init__(self):
         self.history = "unset"
 
-    def ask(self, question, identity, mode=None, emit=None, history=None):
+    def ask(self, question, identity, mode=None, emit=None, history=None, profile=None):
         self.history = history
         return AgentAnswer(answer="ok", grant_fingerprint="fp-analyst")
 

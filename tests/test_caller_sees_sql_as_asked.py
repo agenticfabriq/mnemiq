@@ -81,7 +81,7 @@ def test_the_http_payload_shows_the_statement_as_asked():
 
 def test_the_mcp_read_shows_the_statement_as_asked():
     class _Runtime:
-        def ask(self, question, identity, mode=None):
+        def ask(self, question, identity, mode=None, profile=None):
             return _answer()
 
     assert "entitlement" not in _db_read(_Runtime(), _IDENTITY, "how many claims")["sql"]

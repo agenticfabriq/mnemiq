@@ -4,12 +4,17 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from sqlglot import exp
+
 from mnemiq.contract import Column, Snapshot
 from mnemiq.semantic.values import shown
+from mnemiq.sql.identifiers import resolve
 from mnemiq.sql.policy import AccessPolicy
+from mnemiq.sql.reserved_words import BARE_TABLE_UNSAFE, RESERVED
 
 
 _BARE_IDENT = re.compile(r"[a-z_][a-z0-9_]*")
+_PLAIN_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 @dataclass
@@ -37,7 +42,8 @@ def render_facts_block(tf) -> str:
 
 def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
                 style: str = "cards",
-                describe: Callable[[str, str], bool] | None = None) -> list[SchemaCard]:
+                describe: Callable[[str, str], bool] | None = None,
+                dialect: str | None = None) -> list[SchemaCard]:
     """One self-sufficient card per table: what it is, what it holds, how it joins.
 
     This is the retrieval unit -- indexed, matched, and later read by the agent to write
@@ -62,6 +68,9 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
     every column does. Only the description is withheld: the name, type, coded values and the
     entirely-null note stay, so a column the window had no room to explain can still be found
     and used. `mnemiq.semantic.fit` is its caller.
+
+    `style="bare"` is the smallest form a writer can use: `CREATE TABLE` with names, types and keys. It leaves out
+    everything enrichment wrote and keeps what governs, the mask note. `dialect` spells its names; see `_bare_name`.
     """
     columns: dict[str, list[Column]] = {}
     for column in snapshot.columns:
@@ -79,9 +88,11 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
                        for k in rel.join_keys)
 
     joins: dict[str, list[str]] = {}
+    keyed: dict[str, list] = {}
     for rel in snapshot.relationships:
         if not join_visible(rel):
             continue
+        keyed.setdefault(rel.from_, []).append(rel)
         keys = ", ".join(f"{k.left} = {k.right}" for k in rel.join_keys)
         line = f"- joins {rel.to} ({rel.cardinality}{': ' + keys if keys else ''})"
         joins.setdefault(rel.from_, []).append(line)
@@ -92,6 +103,7 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
     for table in tables:
         lines = [f"TABLE {table}", "COLUMNS:"]
         ddl: list[tuple[str, str, str]] = []   # (name, data_type, trailing note)
+        bare: list[tuple[str, str, str]] = []  # the same, whose only note is the mask
         for column in columns.get(table, []):
             if policy is not None and (table, column.name) in policy.denied:
                 continue  # not merely unreadable: the identity is not told it exists
@@ -109,6 +121,7 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
                 lines.append(line + " MASKED for this identity: do not select or filter on it.")
                 ddl.append((column.name, column.data_type or "text",
                             "MASKED for this identity: do not select or filter on it."))
+                bare.append(ddl[-1])
                 continue
             if column.description and (describe is None or describe(table, column.name)):
                 line += f" {column.description}"
@@ -145,13 +158,18 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
             prose = line[len("".join(parts)):].strip()
             ddl.append((column.name, column.data_type or "text",
                         "; ".join(x for x in (annotations, prose) if x)))
+            bare.append((column.name, column.data_type or "text", ""))
 
         if table in joins:
             lines.append("RELATIONSHIPS:")
             lines.extend(joins[table])
 
-        text = ("\n".join(lines) if style != "ddl"
-                else _render_ddl(table, ddl, joins.get(table, [])))
+        if style == "bare":
+            text = _render_bare(table, bare, keyed.get(table, []), dialect)
+        elif style == "ddl":
+            text = _render_ddl(table, ddl, joins.get(table, []))
+        else:
+            text = "\n".join(lines)
         cards.append(SchemaCard(object_id=table, text=text))
     return cards
 
@@ -178,3 +196,40 @@ def _render_ddl(table: str, cols: list[tuple[str, str, str]], rels: list[str]) -
     if rels:
         out += "\n-- " + "\n-- ".join(r.lstrip("- ") for r in rels)
     return out
+
+
+def _bare_table(name: str, dialect: str | None) -> str:
+    """A table's object id as a model should copy it. A dotted one is left as written: it may be a qualified name or
+    one name holding a dot, and the id alone cannot say which."""
+    return name if "." in name else _bare_name(name, dialect)
+
+
+def _bare_name(name: str, dialect: str | None) -> str:
+    """`name` as a model should copy it: quoted only where the plain spelling would not reach it on this engine,
+    because it is not a plain word, is a word the engine reserves, or folds to another name. An engine with no list of
+    its own takes every list, since a needless quote costs nothing and a missing one makes the statement a syntax error."""
+    lists = [frozenset(words) for words in (RESERVED.get((dialect or "").lower()),
+                                            BARE_TABLE_UNSAFE.get((dialect or "").lower())) if words]
+    if not lists:
+        lists = [*RESERVED.values(), *BARE_TABLE_UNSAFE.values()]
+    if (_PLAIN_IDENT.fullmatch(name) and not any(name.casefold() in words for words in lists)
+            and resolve(name, quoted=False, dialect=dialect) == resolve(name, quoted=True, dialect=dialect)):
+        return name
+    return exp.to_identifier(name, quoted=True).sql(dialect=dialect)
+
+
+def _render_bare(table: str, cols: list[tuple[str, str, str]], rels: list, dialect: str | None) -> str:
+    """The card as a plain `CREATE TABLE`. A relationship inferred from names is spelled as a key too: to the writer
+    both say how the tables join, and the prompt is not a claim about the source's constraints."""
+    items = [(f"    {_bare_name(name, dialect)} {dtype}", note) for name, dtype, note in cols]
+    for rel in rels:
+        if rel.join_keys:
+            left = ", ".join(_bare_name(k.left, dialect) for k in rel.join_keys)
+            right = ", ".join(_bare_name(k.right, dialect) for k in rel.join_keys)
+            items.append((f"    FOREIGN KEY ({left}) REFERENCES {_bare_table(rel.to, dialect)} ({right})", ""))
+    body = "\n".join(text + ("," if i < len(items) - 1 else "") + (f"  -- {note}" if note else "")
+                     for i, (text, note) in enumerate(items))
+    name = _bare_table(table, dialect)
+    out = f"CREATE TABLE {name} (\n{body}\n);" if body else f"CREATE TABLE {name} (\n);"
+    named = [f"-- joins {_bare_table(rel.to, dialect)}" for rel in rels if not rel.join_keys]
+    return "\n".join([out, *named])
