@@ -50,9 +50,9 @@ card_style = "bare"
 ## What a profile may change
 
 Only how a question is answered: the model and its endpoint, the writer's prompt and temperature, the schema form,
-retrieval, the verifier and the per-mode settings. The full list is `PROFILE_SETTINGS` in
-[`src/mnemiq/profiles.py`](../src/mnemiq/profiles.py), and each setting's meaning is in
-[`.env.example`](../.env.example).
+retrieval, the verifier and the per-mode settings. [settings.md](settings.md) explains each one, with its default
+and the technique it belongs to; the code's list is `PROFILE_SETTINGS` in
+[`src/mnemiq/profiles.py`](../src/mnemiq/profiles.py).
 
 Nothing that decides who may see what is a profile's to change: the access policy, row and column rules, local-only
 mode, the data source and the store stay with the deployment. A setting no one has classified cannot be set from a

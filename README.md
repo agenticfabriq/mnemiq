@@ -79,7 +79,8 @@ defaults. More context is not free. More compute is not automatically better. Th
 depends on your data, and the point of the harness is that you can find out rather than guess.
 
 A deployment keeps the settings that suit its model and its data as named profiles in a file, and a request can
-pick one with no restart. See [docs/profiles.md](docs/profiles.md).
+pick one with no restart. See [docs/profiles.md](docs/profiles.md), and [docs/settings.md](docs/settings.md)
+for every setting, its default and the technique it belongs to.
 
 ### The semantic layer has tiers
 
