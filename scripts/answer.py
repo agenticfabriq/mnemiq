@@ -99,7 +99,8 @@ def main() -> int:
         # silent the model declares nothing, `ungrounded_terms([])` is `[]`, and the flag
         # reads as on while guarding nothing.
         generator=LLMGenerator(LLMClient(settings),
-                               declare_assumed_terms=settings.guard_undefined_terms),
+                               declare_assumed_terms=settings.guard_undefined_terms,
+                               reasoning=settings.writer_reasoning, rules=settings.writer_rules),
         synthesizer=LLMSynthesizer(LLMClient(settings)),
         adapter=DuckDBPostgresAdapter(settings.pg_dsn, local_only=settings.local_only,
                                   statement_timeout_s=DEFAULT_TIMEOUT_S),

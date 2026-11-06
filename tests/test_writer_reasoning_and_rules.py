@@ -88,7 +88,7 @@ def test_the_json_after_the_reasoning_is_read():
     assert proposal.sql == "SELECT n FROM claim"
 
 
-def test_the_last_json_object_is_the_answer():
+def test_the_object_that_ends_the_reply_is_the_answer():
     reply = ('A reply looks like {"sql": "SELECT 1", "reason": "draft"}, but the table is claim.\n'
              '```json\n' + _ANSWER + '\n```')
     proposal, _ = _propose(reply, reasoning="before_sql")
@@ -105,6 +105,44 @@ def test_an_object_nested_in_the_answer_is_not_the_answer():
     reply = 'Thinking.\n{"sql": "SELECT n FROM claim", "reason": "r", "notes": {"grain": "one row"}}'
     proposal, _ = _propose(reply, reasoning="before_sql")
     assert proposal.sql == "SELECT n FROM claim"
+
+
+def test_a_draft_before_a_cut_off_answer_is_never_run():
+    """A reply cut short by the token limit ends mid-answer. The draft before it was abandoned, not answered."""
+    reply = 'Draft: {"sql": "SELECT 1", "reason": "draft"}. Better:\n{"sql": "SELECT n FROM cl'
+    proposal, _ = _propose(reply, reasoning="before_sql")
+    assert proposal.sql is None
+
+
+def test_a_cut_off_answer_that_ends_on_a_brace_does_not_bring_back_the_draft():
+    reply = ('Draft: {"sql": "SELECT 1", "reason": "draft"}. Better:\n'
+             '{"sql": "SELECT n FROM claim WHERE note = \'}')
+    proposal, _ = _propose(reply, reasoning="before_sql")
+    assert proposal.sql is None
+
+
+def test_a_decline_with_sql_nested_inside_stays_a_decline():
+    reply = 'Thinking.\n{"sql": null, "reason": "no table", "assumed_terms": ["profit"], "notes": {"sql": "SELECT 1"}}'
+    proposal, _ = _propose(reply, reasoning="before_sql", declare_assumed_terms=True)
+    assert proposal.sql is None
+    assert proposal.reason == "no table" and proposal.assumed_terms == ["profit"]
+
+
+def test_a_decline_after_reasoning_keeps_its_reason():
+    proposal, _ = _propose('No table holds prices.\n{"sql": null, "reason": "no price table"}', reasoning="before_sql")
+    assert proposal.sql is None and proposal.reason == "no price table"
+
+
+def test_assumed_terms_survive_the_reasoning():
+    reply = 'Profit is not defined.\n{"sql": "SELECT n FROM claim", "reason": "r", "assumed_terms": ["profit"]}'
+    proposal, _ = _propose(reply, reasoning="before_sql", declare_assumed_terms=True)
+    assert proposal.sql == "SELECT n FROM claim" and proposal.assumed_terms == ["profit"]
+
+
+def test_words_after_the_answer_make_it_unread():
+    """The prompt asks for nothing after the JSON. Text after it could be a second thought, so it is not guessed at."""
+    proposal, _ = _propose(_ANSWER + "\nThis counts every claim.", reasoning="before_sql")
+    assert proposal.sql is None and proposal.reason
 
 
 def test_reasoning_with_no_json_is_a_deferral_not_an_error():
@@ -211,6 +249,22 @@ def test_the_window_check_renders_it():
                                                    binding_type="table")])
     system, *_ = window.largest_prompts(duckdb.connect(), snap, _settings(**_CHANGED), "duckdb", window.everything(snap))
     assert system == max((_expected(s) for s in (None, *STRATEGIES)), key=len)
+
+
+def test_every_writer_construction_site_passes_both_settings():
+    """A site that left them out would run the default prompt and reader under a profile that set them."""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    sites = []
+    for path in [*root.joinpath("src").rglob("*.py"), *root.joinpath("scripts").rglob("*.py")]:
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", getattr(node.func, "attr", None)) == "LLMGenerator":
+                named = {k.arg for k in node.keywords}
+                sites.append((str(path.relative_to(root)), {"reasoning", "rules"} - named))
+    assert sites, "the scan found no site, so it checks nothing"
+    assert [site for site in sites if site[1]] == []
 
 
 def test_the_version_hashes_it():
