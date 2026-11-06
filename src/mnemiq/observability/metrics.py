@@ -91,7 +91,7 @@ class PostgresSink:
     _CREATE = (
         "CREATE TABLE IF NOT EXISTS mnemiq_answer_log ("
         "source_id TEXT, deferred BOOLEAN, cached BOOLEAN, total_ms DOUBLE PRECISION, mode TEXT, "
-        "failed BOOLEAN DEFAULT FALSE, reason_code TEXT, "
+        "failed BOOLEAN DEFAULT FALSE, reason_code TEXT, prose_failed BOOLEAN DEFAULT FALSE, "
         "created_at TIMESTAMPTZ DEFAULT now())"
     )
     # Existing deployments predate the two columns; without this their INSERT would fail and be
@@ -100,6 +100,7 @@ class PostgresSink:
         "ALTER TABLE mnemiq_answer_log "
         "ADD COLUMN IF NOT EXISTS failed BOOLEAN DEFAULT FALSE, "
         "ADD COLUMN IF NOT EXISTS reason_code TEXT, "
+        "ADD COLUMN IF NOT EXISTS prose_failed BOOLEAN DEFAULT FALSE, "
         "ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now()"
     )
 
@@ -143,10 +144,10 @@ class PostgresSink:
             try:
                 self._con.execute(
                     "INSERT INTO mnemiq_answer_log "
-                    "(source_id, deferred, cached, total_ms, mode, failed, reason_code) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    "(source_id, deferred, cached, total_ms, mode, failed, reason_code, prose_failed) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                     (source_id, rec.deferred, rec.cached, rec.total_ms, rec.mode, rec.failed,
-                     str(rec.reason_code) if rec.reason_code else None),
+                     str(rec.reason_code) if rec.reason_code else None, rec.prose_failed),
                 )
             except Exception:
                 self._con = None  # drop; next call reconnects
@@ -158,13 +159,13 @@ class PostgresSink:
                 return []
             try:
                 rows = self._con.execute(
-                    "SELECT deferred, cached, total_ms, mode, failed, reason_code "
+                    "SELECT deferred, cached, total_ms, mode, failed, reason_code, prose_failed "
                     "FROM mnemiq_answer_log WHERE source_id = %s "
                     "ORDER BY created_at DESC LIMIT %s",
                     (source_id, limit),
                 ).fetchall()
                 return [AnswerRecord(deferred=r[0], cached=r[1], total_ms=r[2], mode=r[3],
-                                     failed=bool(r[4]), reason_code=r[5])
+                                     failed=bool(r[4]), reason_code=r[5], prose_failed=bool(r[6]))
                         for r in rows]
             except Exception:
                 self._con = None

@@ -367,3 +367,16 @@ def test_the_control_answers_with_the_gold_it_was_given():
     control.gold = "SELECT 7"
     answer = control("q?")
     assert answer.trace.target_sql == "SELECT 7" and not answer.deferred and not answer.failed
+
+
+def test_a_row_records_a_failed_sentence(tmp_path):
+    """The answer is the rows; the row says their sentence failed, so it is not read as prose switched off."""
+    _write_set(tmp_path, "dw", [{"id": "x_0", "question": "answer me"}])
+
+    def ask(question, grants=None):
+        return AgentAnswer(answer="Returned 1 row. The sentence could not be written: down", trace=_trace("SELECT 42"),
+                           prose_failed=True)
+
+    (row,) = run(RunConfig(beaver_dir=tmp_path, sets=["dw"], out=tmp_path / "r.jsonl", grade=False),
+                 source_for=lambda db: object(), engine_for=lambda adapter, db: (ask, None))
+    assert row["prose_failed"] is True and row["sql"] == "SELECT 42"

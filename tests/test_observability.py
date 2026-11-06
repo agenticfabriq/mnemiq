@@ -145,3 +145,36 @@ def test_aggregate_errors_excluded_from_deferral_rate():
     # deferral_rate is 1/2 (one deferral of two decided), not 1/3
     assert abs(m.deferral_rate - 0.5) < 1e-9
 
+
+
+class _RoundTripCon:
+    """Keeps what the sink inserts and hands it back to its select, column for column as each statement names them."""
+
+    def __init__(self):
+        self.queries: list[str] = []
+        self.rows: list[dict] = []
+
+    def execute(self, sql, params=None):
+        import re
+
+        self.queries.append(sql)
+        if sql.startswith("INSERT"):
+            columns = [c.strip() for c in re.search(r"\(([^)]*)\)\s*VALUES", sql).group(1).split(",")]
+            self.rows.append(dict(zip(columns, params)))
+        if sql.startswith("SELECT"):
+            columns = [c.strip() for c in re.search(r"SELECT (.*?) FROM", sql).group(1).split(",")]
+            return _FakeCursor([tuple(row.get(c) for c in columns) for row in self.rows])
+        return _FakeCursor()
+
+
+def test_a_failed_sentence_survives_the_postgres_round_trip():
+    from mnemiq.observability.metrics import PostgresSink
+
+    con = _RoundTripCon()
+    sink = PostgresSink("unused", connect=lambda: con)
+    sink.record("s", AnswerRecord(deferred=False, cached=False, total_ms=1.0, mode="instant", prose_failed=True))
+    sink.record("s", AnswerRecord(deferred=False, cached=False, total_ms=1.0, mode="instant"))
+    back = sink.recent("s", 10)
+    assert [r.prose_failed for r in back] == [True, False]
+    assert aggregate(back).prose_failures == 1
+    assert any("ADD COLUMN IF NOT EXISTS prose_failed" in q for q in con.queries), "a deployment's old table gains it"
