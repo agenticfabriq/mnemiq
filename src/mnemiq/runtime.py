@@ -305,7 +305,8 @@ class Runtime:
                 self._source_id(),
                 AnswerRecord(deferred=answer.deferred, cached=answer.cached,
                              total_ms=(time.perf_counter() - started) * 1000, mode=name,
-                             failed=answer.failed, reason_code=answer.reason_code),
+                             failed=answer.failed, reason_code=answer.reason_code,
+                             prose_failed=answer.prose_failed),
             )
         return answer
 

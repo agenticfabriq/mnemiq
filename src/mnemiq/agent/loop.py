@@ -683,6 +683,7 @@ class Agent:
             verify_confidence=base.verify_confidence,
             verify_layer=base.verify_layer,
             day_bounds_closed=base.day_bounds_closed,
+            prose_failed=base.prose_failed,
         )
 
     def _representative(self, packet: ContextPacket, members: list):

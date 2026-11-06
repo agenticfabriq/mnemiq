@@ -237,3 +237,69 @@ def test_under_a_row_filter_the_early_rows_show_the_sql_as_asked():
     trace = build_trace("q", approved, _IDENTITY, "v1", {"rows_ms": 1.0}, "1x1", [])
     early = result_payload({"trace": trace, "preview": None, "notes": []})
     assert early["sql"] == "SELECT id FROM claim LIMIT 1000" and early["narrowed"]
+
+
+# --- the flag reaches every consumer -----------------------------------------------------------------------------------
+
+
+def test_deep_mode_keeps_the_flag_when_it_rebuilds_the_answer():
+    candidates = MODES["deep"].candidates
+    answer, _ = _ask(replies=[_GOOD] * (candidates * 3), synth=_FailingSynthesizer(ModelUnavailable("down")),
+                     mode="deep")
+    assert answer.candidates_executed, "the case: deep mode's own path ran"
+    assert answer.prose_failed and not answer.failed
+
+
+def test_metrics_count_a_failed_sentence_apart_from_errors():
+    from mnemiq.observability.metrics import AnswerRecord, aggregate
+
+    records = [AnswerRecord(deferred=False, cached=False, total_ms=1.0, mode="instant", prose_failed=True),
+               AnswerRecord(deferred=False, cached=False, total_ms=1.0, mode="instant")]
+    metrics = aggregate(records)
+    assert metrics.prose_failures == 1 and metrics.errors == 0
+
+
+def test_the_runtime_records_a_failed_sentence_in_the_metrics_sink():
+    import time
+    from types import SimpleNamespace
+
+    from mnemiq.runtime import Runtime
+
+    answer, _ = _ask(synth=_FailingSynthesizer(ModelUnavailable("down")))
+    recorded = []
+    fake = SimpleNamespace(engine_commit="c", answer_log=None, trace_sink=None, snapshot=None,
+                           sink=SimpleNamespace(record=lambda source, rec: recorded.append(rec)),
+                           _source_id=lambda: "s")
+    Runtime._record(fake, answer, "instant", _GRANTS, _IDENTITY, "q", None, time.perf_counter())
+    assert recorded and recorded[0].prose_failed is True
+
+
+def test_mcp_carries_the_flag():
+    from mnemiq.mcp.server import _db_read
+
+    answer, _ = _ask(synth=_FailingSynthesizer(ModelUnavailable("down")))
+    runtime = type("RT", (), {"ask": lambda self, *a, **k: answer})()
+    assert _db_read(runtime, _IDENTITY, "q")["prose_failed"] is True
+
+
+def test_the_eval_grades_the_rows_and_records_the_flag():
+    """Graded on the result set, as every answer is; the record says the sentence failed."""
+    from mnemiq.contract import EvaluationCase
+    from mnemiq.eval.harness import Outcome, run_case
+
+    answer, _ = _ask(synth=_FailingSynthesizer(ModelUnavailable("down")))
+    case = EvaluationCase(id="c1", question="how many claims?", answerable=True, gold_sql="SELECT n FROM claim")
+    result = run_case(case, lambda q: answer, _Adapter())
+    assert result.prose_failed is True
+    assert result.outcome is not Outcome.ERROR
+
+
+def test_every_eval_runner_that_copies_an_answer_copies_the_flag():
+    """Spider 2 has a runner of its own beside the harness; a runner that copied the rest and not this would grade a
+    failed sentence as a clean answer with no trace of it."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "mnemiq" / "eval"
+    runners = [p for p in root.glob("*.py") if "result.candidates_executed = answer.candidates_executed" in p.read_text()]
+    assert len(runners) >= 2, "the scan found the runners, so it checks something"
+    assert [p.name for p in runners if "result.prose_failed = answer.prose_failed" not in p.read_text()] == []

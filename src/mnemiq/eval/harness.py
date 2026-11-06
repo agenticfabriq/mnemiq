@@ -55,6 +55,7 @@ class CaseResult:
     verify_layer: str | None = None
     judge_override: bool | None = None  # ...and picked against the majority?
     candidates_executed: int | None = None  # multi-candidate: how many of N ran
+    prose_failed: bool = False  # graded on its rows like any answer; the sentence for them failed
     proposed: bool = False
     approved: bool = False
     executed: bool = False
@@ -121,6 +122,7 @@ def run_case(case: EvaluationCase, engine: Engine, adapter, gold_adapter=None, *
     result.verify_layer = answer.verify_layer
     result.judge_override = answer.judge_override
     result.candidates_executed = answer.candidates_executed
+    result.prose_failed = answer.prose_failed
 
     gold: pa.Table | None = None
     if case.answerable:

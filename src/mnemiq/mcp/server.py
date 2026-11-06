@@ -38,6 +38,8 @@ def _db_read(
         # A governing agent has to choose between requesting a grant, rephrasing, and paging an
         # operator. Before this it got one boolean and a sentence for all three (register M6).
         "failed": ans.failed,
+        # The rows stand and their sentence failed: the answer is the rows, and an agent can tell it from prose off.
+        "prose_failed": ans.prose_failed,
         "reason_code": str(ans.reason_code) if ans.reason_code else None,
         "mode": ans.mode,
         "profile": ans.profile,

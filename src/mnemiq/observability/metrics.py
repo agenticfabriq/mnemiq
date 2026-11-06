@@ -16,6 +16,9 @@ class AnswerRecord:
     # product claim rests on -- went UP when the database went down (register M6).
     failed: bool = False
     reason_code: DeferralReason | str | None = None
+    # The rows stood and their sentence failed. Not an error (the answer is the rows), and counted apart, so a prose
+    # model that is down still shows here rather than reading as a clean run.
+    prose_failed: bool = False
 
 
 @dataclass
@@ -23,6 +26,7 @@ class Metrics:
     answers: int = 0
     deferrals: int = 0
     errors: int = 0  # was hardcoded 0, so a total outage reported as flawless abstention (M2)
+    prose_failures: int = 0
     deferral_rate: float = 0.0
     cache_hit_rate: float = 0.0
     p50_ms: float = 0.0
@@ -43,13 +47,14 @@ def aggregate(records: list[AnswerRecord]) -> Metrics:
     n = len(records)
     deferrals = sum(1 for r in records if r.deferred and not r.failed)
     errors = sum(1 for r in records if r.failed)
+    prose_failures = sum(1 for r in records if r.prose_failed)
     cached = sum(1 for r in records if r.cached)
     latencies = [r.total_ms for r in records]
     # Deferring is a decision; failing is not. The rate is over the requests we actually decided,
     # so an outage can no longer raise it (M6).
     decided = n - errors
     return Metrics(
-        answers=n, deferrals=deferrals, errors=errors,
+        answers=n, deferrals=deferrals, errors=errors, prose_failures=prose_failures,
         deferral_rate=(deferrals / decided if decided else 0.0), cache_hit_rate=cached / n,
         p50_ms=_pct(latencies, 0.50), p95_ms=_pct(latencies, 0.95),
     )
