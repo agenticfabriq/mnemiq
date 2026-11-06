@@ -34,7 +34,11 @@ card_style = "bare"
 - **`default`** names the profile that serves whoever names none. It takes no `roles`.
 - **Every other profile lists `roles`**, the roles or groups that may pick it, read as the access policy reads an
   identity. `["*"]` means anyone.
-- **A profile lists only what differs** from the deployment's settings. Anything it leaves out is inherited.
+- **A profile lists only what differs** from the deployment's settings. Anything it leaves out is inherited, with
+  three exceptions when a profile moves an endpoint, since the old value belongs to the old server: moving the chat
+  endpoint drops the deployment's `llm_context_window` unless the profile sets one, and moving the judge's endpoint
+  (which follows the chat endpoint unless `verify_base_url` is set) drops the deployment's `verify_model` and judge
+  key unless the profile sets them.
 - **Keys are never written in the file.** `api_key_env` and `verify_api_key_env` name the environment variables that
   hold them. A profile that moves the chat endpoint must name its own key variable, or it is refused: the deployment's
   key is never carried to another host. A server that takes no key still needs the variable to hold some value.
@@ -57,8 +61,9 @@ profile, since the list is an allow-list.
 ## Picking one
 
 `POST /v1/ask` and `POST /v1/chat` take an optional `profile` field. A name the caller may not pick is refused the
-same way as a name that does not exist, so a name cannot reveal that a profile exists. The refusal lists the
-profiles the caller may pick.
+same way as a name that does not exist, so a name cannot reveal that a profile exists. `/v1/ask` answers 422 and
+lists the profiles the caller may pick; `/v1/chat` ends its stream with a `RUN_ERROR` that says the profile is not
+offered, without the list.
 
 ## Versions
 
@@ -75,6 +80,11 @@ version.
 
 ## Refused at boot
 
+- A profiles file without an embedder in the deployment's own settings (`MNEMIQ_EMBED_BASE_URL` and
+  `MNEMIQ_EMBED_API_KEY`, or the chat endpoint and key they fall back to). The embedder stays with the deployment,
+  since the store's index was built with it, so a profile cannot supply it.
+- `MNEMIQ_PROFILE`, a setting from before profile files: name the file in `MNEMIQ_PROFILES_PATH` instead.
+- Per-mode settings that do not fit together, such as a judge or a minimum agreement on a mode with one candidate.
 - `writer_temperature` on a model that takes no temperature, such as GPT-5, which would ignore it.
 - A profile whose chat endpoint has no key, or whose judge runs on another endpoint with no key of its own.
 - A profile that would leave the network under `MNEMIQ_LOCAL_ONLY`.
