@@ -50,7 +50,7 @@ import httpx
 
 from mnemiq.authz.grants import GrantSet, classified_levels
 from mnemiq.generate.generator import GENERATOR_MAX_TOKENS
-from mnemiq.generate.prompts import system_prompt, user_prompt
+from mnemiq.generate.prompts import system_prompt, user_prompt, writer_style
 from mnemiq.llm.client import reasoning_budget
 
 # Without a server count, a prompt is held to its UTF-8 bytes: a byte-level tokenizer spends at most
@@ -253,8 +253,7 @@ def largest_prompts(con, snapshot, settings, dialect: str,
     # strategy and a long question. Past the window, a question can fail.
     real = packet_for([card(c) for c in largest])
     real.examples = examples
-    system = max((system_prompt(dialect=dialect, strategy=s, assertive=settings.assertive_sql,
-                                declare_assumed_terms=settings.guard_undefined_terms)
+    system = max((system_prompt(dialect=dialect, strategy=s, **writer_style(settings))
                   for s in (None, *STRATEGIES)), key=len)
     return system, user_prompt(packet), user_prompt(real), len(packet.cards)
 

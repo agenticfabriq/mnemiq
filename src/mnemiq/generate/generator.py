@@ -92,7 +92,46 @@ def _parse(raw: str) -> SqlProposal:
         return SqlProposal(sql=None, reason="the model's JSON was malformed")
     if not isinstance(payload, dict):
         return SqlProposal(sql=None, reason="the model's JSON was not an object")
+    return _proposal(payload)
 
+
+# A reply may close the JSON's code fence after it; nothing else may follow the answer.
+_CLOSING_FENCE = re.compile(r"\n?```\s*$")
+
+
+def _parse_after_reasoning(raw: str) -> SqlProposal:
+    """Read the JSON object that ends a reply which reasons first.
+
+    The answer is the one complete, outermost object the reply ends on, not any object in it. A reply the token limit
+    cut short ends mid-answer: a draft before it was abandoned rather than answered, and an object nested in the cut-off
+    answer can end where the reply does, so its own `sql` would stand for the answer's (a decline would become a query).
+
+    So braces are read from the start. A complete object that ends before the reply is a draft, and is passed over
+    whole, never searched inside. An object that fails to decode is a brace in the reasoning, a broken object or the
+    cut-off answer, and the search goes on from the next line: a brace before the break, or after it on that line, may
+    sit inside it, and the prompt asks for the answer on a line of its own. A cut-off answer fails at the end of the
+    text, or on a string strict decoding leaves open only to the end of its line, so no line follows and the reply is
+    a deferral. Left open: a broken answer spread over lines, with an `sql` object on a later line ending the reply.
+    Never an exception. `_parse` spans the first brace to the last, which a brace in the reasoning would break."""
+    text = _CLOSING_FENCE.sub("", (raw or "").rstrip()).rstrip()
+    decoder = json.JSONDecoder()
+    at = text.find("{")
+    while at >= 0:
+        try:
+            payload, stop = decoder.raw_decode(text, at)
+        except json.JSONDecodeError as exc:
+            line_end = text.find("\n", max(at + 1, exc.pos))
+            at = -1 if line_end < 0 else text.find("{", line_end)
+            continue
+        if stop == len(text):
+            if isinstance(payload, dict) and "sql" in payload:
+                return _proposal(payload)
+            break
+        at = text.find("{", stop)  # a complete draft: past it whole
+    return SqlProposal(sql=None, reason="the model did not end its reasoning on the JSON answer")
+
+
+def _proposal(payload: dict) -> SqlProposal:
     sql = payload.get("sql")
     reason = payload.get("reason")
     # Absent means "declared nothing", never "unknown": every existing prompt and every test double
@@ -120,7 +159,7 @@ class LLMGenerator:
     def __init__(self, client, max_tokens: int = GENERATOR_MAX_TOKENS, dialect: str = "duckdb",
                  guided_sql: bool = False, assertive: bool = False,
                  declare_assumed_terms: bool = False, temperature: float | None = None,
-                 layout: str = "question_first") -> None:
+                 layout: str = "question_first", reasoning: str = "none", rules: str = "full") -> None:
         self._client = client
         self._max_tokens = max_tokens
         self._dialect = dialect
@@ -129,13 +168,16 @@ class LLMGenerator:
         self._declare_assumed_terms = declare_assumed_terms
         self._temperature = temperature
         self._layout = layout
+        self._reasoning = reasoning
+        self._rules = rules
 
     def propose(
         self, packet: ContextPacket, feedback: str | None = None, strategy: str | None = None
     ) -> SqlProposal:
         extra = _guided_extra_body(self._guided_sql, self._declare_assumed_terms)
         system = system_prompt(dialect=self._dialect, strategy=strategy, assertive=self._assertive,
-                               declare_assumed_terms=self._declare_assumed_terms)
+                               declare_assumed_terms=self._declare_assumed_terms, reasoning=self._reasoning,
+                               rules=self._rules)
         if self._layout == "question_last":
             system, user = question_last_prompt(system, packet, feedback)
         else:
@@ -147,7 +189,7 @@ class LLMGenerator:
             **({"extra_body": extra} if extra else {}),
             **({"temperature": self._temperature} if self._temperature is not None else {}),
         )
-        return _parse(raw)
+        return _parse_after_reasoning(raw) if self._reasoning == "before_sql" else _parse(raw)
 
 
 class StrategyGenerator:

@@ -36,7 +36,7 @@ PROFILE_SETTINGS = frozenset({
     "llm_base_url", "llm_model", "llm_seed", "llm_context_window", "llm_prompt_cut_check", "llm_window_check",
     "card_style", "guided_sql", "assertive_sql", "retrieval_k", "guard_undefined_terms", "guard_fanout",
     "answer_markdown", "verify_threshold", "verify_sanity", "verify_grounding", "verify_base_url", "verify_model",
-    "writer_temperature", "prompt_layout",
+    "writer_temperature", "prompt_layout", "writer_reasoning", "writer_rules",
 })
 
 DEPLOYMENT_SETTINGS = frozenset({
@@ -190,6 +190,14 @@ def _refuse_an_unapplied_temperature(name: str, settings: Settings) -> None:
         raise ProfileFileError(f"profile {name!r} sets writer_temperature on {settings.llm_model!r}, which takes none")
 
 
+def _refuse_reasoning_under_guided_decoding(name: str, settings: Settings) -> None:
+    """Guided decoding holds the writer's reply to the JSON from its first token, so the reasoning it asks for could
+    never be written: the profile would log a setting that changed nothing but the prompt."""
+    if settings.guided_sql and settings.writer_reasoning != "none":
+        raise ProfileFileError(f"profile {name!r} sets writer_reasoning with guided_sql, which allows no text before the "
+                               "JSON: turn one of them off")
+
+
 def _checked(name: str, entry: _Entry, default: str, base: Settings) -> Profile:
     if not _NAME.fullmatch(name):
         raise ProfileFileError(f"profile name {name!r} must match {_NAME.pattern}")
@@ -200,6 +208,7 @@ def _checked(name: str, entry: _Entry, default: str, base: Settings) -> Profile:
         raise ProfileFileError(f"profile {name!r} must list the roles that may pick it, [\"*\"] meaning anyone")
     settings = _resolved(name, entry, base)
     _refuse_an_unapplied_temperature(name, settings)
+    _refuse_reasoning_under_guided_decoding(name, settings)
     try:
         modes_for(settings)
     except ValueError as exc:
@@ -217,6 +226,7 @@ def load_profiles(settings: Settings) -> tuple[dict[str, Profile], str]:
         raise ProfileFileError("MNEMIQ_PROFILE is gone: name a file of profiles in MNEMIQ_PROFILES_PATH, or unset it")
     if not settings.profiles_path:
         _refuse_an_unapplied_temperature("default", settings)
+        _refuse_reasoning_under_guided_decoding("default", settings)
         return {"default": Profile("default", None, settings)}, "default"
     if settings.mode_settings:
         raise ProfileFileError("MNEMIQ_PROFILES_PATH and MNEMIQ_MODE_SETTINGS are both set: "
@@ -250,8 +260,7 @@ def _sample_packet() -> ContextPacket:
 def _prompt_texts(settings: Settings, dialect: str) -> dict[str, str]:
     """Every prompt a model call uses, as these settings render it. Read through each module at call time."""
     texts = {f"writer system {strategy}": prompts.system_prompt(
-        dialect=dialect, strategy=strategy, assertive=settings.assertive_sql,
-        declare_assumed_terms=settings.guard_undefined_terms) for strategy in STRATEGIES}
+        dialect=dialect, strategy=strategy, **prompts.writer_style(settings)) for strategy in STRATEGIES}
     texts["writer user"] = prompts.user_prompt(_sample_packet(), "F")
     if settings.prompt_layout == "question_last":
         for strategy in STRATEGIES:

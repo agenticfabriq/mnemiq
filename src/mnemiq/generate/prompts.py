@@ -59,9 +59,30 @@ that is merely misspelled.
 """
 
 
+# `writer_reasoning = "before_sql"`: room to reason before answering, which a JSON-only reply leaves none of. The reply
+# still ends on the JSON channel, read as its last object, so declining and the M35 declaration work as before.
+_REPLY_AFTER_REASONING = (
+    "First think the question through in plain text, step by step: which tables and columns it needs, how they\n"
+    "join, which rows it keeps, and what one row of the result stands for. Then end your reply with this JSON\n"
+    "object on a line of its own, with nothing after it:"
+)
+_REPLY_ONLY = "Return ONLY a JSON object, no prose and no code fences:"
+
+
+def writer_style(settings) -> dict:
+    """What in the settings changes the writer's system prompt, as `system_prompt`'s keywords.
+
+    One reading for every place that renders it: the writer, the prompt fitter, the window check and the profile's
+    version. A setting read in one place and not another would size, warn about or hash a prompt the writer never sends.
+    """
+    return {"assertive": settings.assertive_sql, "declare_assumed_terms": settings.guard_undefined_terms,
+            "reasoning": settings.writer_reasoning, "rules": settings.writer_rules}
+
+
 def system_prompt(
     dialect: str = "duckdb", max_rows: int = MAX_ROWS, strategy: str | None = None,
     assertive: bool = False, declare_assumed_terms: bool = False,
+    reasoning: str = "none", rules: str = "full",
 ) -> str:
     defer = (
         _DEFER_ASSERTIVE.format(dialect=dialect)
@@ -71,12 +92,9 @@ def system_prompt(
     # M35's declaration ships only when the guard that reads it is on -- see `_DECLARE_KEY`.
     declare_key = _DECLARE_KEY if declare_assumed_terms else ""
     declare = _DECLARE if declare_assumed_terms else ""
-    base = f"""{PERSONA}
-
-You will be given a question and the schema cards for the ONLY tables you may use.
-Write one {dialect} SELECT query that answers the question.
-
-HARD RULES -- a query that breaks one of these is rejected before it runs:
+    task = f"""You will be given a question and the schema cards for the ONLY tables you may use.
+Write one {dialect} SELECT query that answers the question."""
+    rule_text = f"""HARD RULES -- a query that breaks one of these is rejected before it runs:
 - Exactly one statement, and it must be a SELECT. Never modify data.
 - Use ONLY the tables and columns on the cards. If a table is not on a card, it does not
   exist for you -- naming it anyway does not make it queryable, it just fails.
@@ -88,14 +106,19 @@ CODED VALUES: columns often store short codes. A card shows each coded column's 
 filter, group, and select on the stored code. When only a bare code is given, RETURN THE RAW CODE;
 never invent a human-readable label for it (e.g. do NOT write `CASE WHEN commod='ST' THEN
 'Strawberries' ...`). You do not know an ungrounded code's meaning, and guessing it returns wrong
-data -- the raw code is the correct answer.
+data -- the raw code is the correct answer."""
+    reply = _REPLY_AFTER_REASONING if reasoning == "before_sql" else _REPLY_ONLY
+    tail = f"""{defer}
 
-{defer}
-
-Return ONLY a JSON object, no prose and no code fences:
+{reply}
 {{"sql": "<the SELECT, or null>", "reason": "<one sentence>"{declare_key}}}
 {declare}"""
+    # `writer_rules = "none"`: the task, the decline and the reply, without the persona or the rule sections. The decider
+    # enforces the hard rules on what comes back either way; this only stops telling the model them.
+    base = f"{task}\n\n{tail}" if rules == "none" else f"{PERSONA}\n\n{task}\n\n{rule_text}\n\n{tail}"
     preamble = STRATEGY_PREAMBLES.get(strategy or "direct", "")
+    if preamble and reasoning == "before_sql":
+        preamble = preamble.replace("silently ", "")  # the reasoning is written now, so "silently" would contradict it
     return f"{base}\n{preamble}\n" if preamble else base
 
 
