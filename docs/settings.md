@@ -86,9 +86,10 @@ attempts, and some of those attempts are wrong; the decider and the verifier sti
 
 ### Guided decoding
 
-`guided_sql` constrains the model's reply to the answer's JSON schema with a non-empty `sql`, through the server's
-`response_format` (vLLM and other OpenAI-compatible servers). The reply can no longer be prose or malformed JSON. It
-leaves no room for reasoning before the answer.
+`guided_sql` asks the server to hold the writer's reply to the answer's JSON schema with a non-empty `sql`, through
+`response_format`. vLLM's structured output enforces the schema, so there the reply cannot be prose or malformed JSON.
+Other OpenAI-compatible providers treat it as best effort, so a malformed reply is still possible there, and it is
+declined. It leaves no room for reasoning before the answer.
 
 ### Repeatable sampling
 
@@ -111,9 +112,10 @@ corrector.
 
 Deep mode writes several candidate statements with different strategies (`candidates`), runs them all and groups
 them by their result. `min_agreement` is the share of candidates that must return the same result: below it, or when
-any candidate fails to run, the question is declined as disagreement rather than answered with a pick. When the
-candidates do not already agree, the `judge`, a model call, picks among their distinct results; without it, the most
-common result is taken. Both need more than one candidate.
+some candidates fail to run, the question is declined as disagreement rather than answered with a pick. When no
+candidate runs at all, deep mode falls back to the single path with its repairs, and that answer has no agreement
+behind it. When the candidates do not already agree, the `judge`, a model call, picks among their distinct results;
+without it, the most common result is taken. Both need more than one candidate.
 
 ### Checking the result
 
@@ -157,7 +159,7 @@ The settings a profile may change: how a question is answered, never who may see
 | `writer_rules` | `"full"` | A plain prompt | `full` carries the engine's rule text in the writer's prompt; `none` leaves it out. |
 | `prompt_layout` | `"question_first"` | Prompt layout | `question_first` or `question_last`: where the question sits in the writer's prompt. |
 | `assertive_sql` | `false` | Attempting rather than declining | Tells the writer to attempt an answer instead of declining. |
-| `guided_sql` | `false` | Guided decoding | Constrains the reply to the JSON schema with a non-empty `sql`. |
+| `guided_sql` | `false` | Guided decoding | Asks for the reply in the JSON schema with a non-empty `sql`: enforced by vLLM, best effort elsewhere. |
 | `writer_temperature` | unset | Repeatable sampling | The writer's sampling temperature; unset sends none. |
 | `guard_fanout` | unset | Refusing risky SQL shapes | Refuses an aggregate over rows a join multiplied. Unset: on when partitions were profiled. |
 | `guard_undefined_terms` | `false` | Refusing risky SQL shapes | Refuses a business term with no certified definition. Not recommended. |
@@ -179,8 +181,8 @@ Each mode's own values. A profile changes them in its mode section; without a pr
 | `candidates` | `1` | `1` | `5` | Several candidates | How many candidate statements to write and run. |
 | `corrector` | `false` | `true` | `true` | Repair from feedback | One targeted edit for a statement the decider refuses as wrong but runnable. |
 | `judge` | `false` | `false` | `true` | Several candidates | A model call picks among the candidates' results when they do not agree. |
-| `min_agreement` | unset | unset | `0.6` | Several candidates | The share of candidates that must agree, or the question is declined; unset: no gate. |
-| `budget_s` | `30.0` | `120.0` | `300.0` | plain parameter | Seconds an answer may take. |
+| `min_agreement` | unset | unset | `0.6` | Several candidates | The share of candidates that must agree, or the question is declined; unset: no gate. When no candidate runs, the single path answers instead. |
+| `budget_s` | `30.0` | `120.0` | `300.0` | plain parameter | A soft time budget in seconds. Nothing is cut off when it passes; the sentence is then written as an out-of-budget answer from the rows in hand. |
 | `max_attempts` | `1` | `3` | `3` | Repair from feedback | Tries after the database rejects a statement. |
 | `verify` | `"sanity"` | `"full"` | `"full"` | Checking the result | The verifier's level: `off`, `sanity` or `full`. |
 | `plan_attempts` | `3` | `3` | `3` | Repair from feedback | Writer calls spent on statements the decider refuses (each deep candidate gets one). |
