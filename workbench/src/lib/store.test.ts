@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { DEFERRAL, SCALAR_ANSWER } from "../test/fixtures";
-import { ANSWER_EVENT, isRunning, reduce, userTurn, type Turn } from "./store";
+import { ANSWER_EVENT, RESULT_EVENT, isRunning, reduce, userTurn, type Turn } from "./store";
 import type { AguiEvent } from "./types";
 
 const run = (events: AguiEvent[], from: Turn[] = []) => events.reduce(reduce, from);
@@ -64,6 +64,25 @@ describe("reduce", () => {
     const before = run(answered());
     const after = reduce(before, { type: "STEP_STARTED" } as AguiEvent);
     expect(after).toBe(before);
+  });
+
+  it("keeps the verified rows that arrive before the answer", () => {
+    const rows = { sql: "SELECT n FROM claim", tables_used: ["claim"], narrowed: [], preview: null,
+      notes: ["a note"], rows_ms: 10 };
+    const turns = [{ type: "RUN_STARTED", runId: "r1" }, { type: "CUSTOM", name: RESULT_EVENT, value: rows }]
+      .reduce(reduce, [] as Turn[]);
+    expect(turns[0]!.result).toEqual(rows);
+    expect(turns[0]!.answer).toBeUndefined();
+    expect(turns[0]!.status).toBe("running");
+  });
+
+  it("lands the answer after the rows and keeps both", () => {
+    const rows = { sql: "SELECT n FROM claim", tables_used: ["claim"], narrowed: [], preview: null,
+      notes: [], rows_ms: 10 };
+    const turns = [{ type: "RUN_STARTED", runId: "r1" }, { type: "CUSTOM", name: RESULT_EVENT, value: rows },
+      { type: "CUSTOM", name: ANSWER_EVENT, value: SCALAR_ANSWER }].reduce(reduce, [] as Turn[]);
+    expect(turns[0]!.result).toEqual(rows);
+    expect(turns[0]!.answer).toEqual(SCALAR_ANSWER);
   });
 
   it("ignores a CUSTOM event that is not the answer payload", () => {

@@ -9,7 +9,7 @@
  * so identity here is a correctness-adjacent performance contract, not a nicety.
  */
 
-import type { AguiEvent, AnswerPayload, Step } from "./types";
+import type { AguiEvent, AnswerPayload, ResultPayload, Step } from "./types";
 
 export type TurnStatus = "running" | "complete" | "error";
 
@@ -19,6 +19,8 @@ export type Turn = {
   text: string;
   /** Present once the CUSTOM frame lands; absent on a stream that errored early. */
   answer?: AnswerPayload;
+  /** The verified rows, ahead of the answer, so the table shows while the sentence is written. */
+  result?: ResultPayload;
   /** The phases this answer passed through, in the order the engine reported them. */
   steps?: Step[];
   error?: string;
@@ -26,6 +28,7 @@ export type Turn = {
 };
 
 export const ANSWER_EVENT = "mnemiq.answer";
+export const RESULT_EVENT = "mnemiq.result";
 
 // Ids must not collide with ids restored from a previous session, so they cannot be
 // a counter that restarts at zero on reload.
@@ -106,7 +109,12 @@ export function reduce(turns: Turn[], event: AguiEvent): Turn[] {
     }
 
     case "CUSTOM": {
-      if (!("name" in event) || event.name !== ANSWER_EVENT) return turns;
+      if (!("name" in event)) return turns;
+      if (event.name === RESULT_EVENT) {
+        const result = event.value as ResultPayload;
+        return patchLast(turns, (t) => ({ ...t, result }));
+      }
+      if (event.name !== ANSWER_EVENT) return turns;
       const answer = event.value as AnswerPayload;
       return patchLast(turns, (t) => ({ ...t, answer }));
     }

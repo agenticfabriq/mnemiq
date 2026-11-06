@@ -60,6 +60,20 @@ export type HistoryTurn = {
  *  field comments are the contract; `columns` in particular is not "your answer lost a column". */
 export type Narrowed = { object: string; rows: boolean; columns: boolean };
 
+/**
+ * The verified rows, sent before the prose (`mnemiq.result`): what the answer will say about them, from the same
+ * trace and preview, so the two cannot differ. `notes` are the governed sentences the answer appends after its prose
+ * (an empty result, a row filter, unresolved lineage, the row limit), shown with the table until the answer lands.
+ */
+export type ResultPayload = {
+  sql: string | null;
+  tables_used: string[] | null;
+  narrowed?: Narrowed[] | null;
+  preview: ResultPreview | null;
+  notes: string[];
+  rows_ms: number | null;
+};
+
 export type AnswerPayload = {
   answer: string;
   deferred: boolean;
@@ -92,6 +106,8 @@ export type AnswerPayload = {
   timing: Record<string, number> | null;
   preview: ResultPreview | null;
   grant_fingerprint?: string;
+  /** The rows stand and the sentence for them failed; optional, so an older engine reads as not reported. */
+  prose_failed?: boolean;
 };
 
 /**

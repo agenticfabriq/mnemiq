@@ -47,6 +47,41 @@ def verified_state(layer: str | None) -> str | None:
     return _VERIFIED_STATE.get(layer, "unknown")
 
 
+def _preview(p) -> dict | None:
+    return ({"columns": p.columns, "rows": p.rows, "row_count": p.row_count,
+             "truncated": p.truncated, "capped": p.capped} if p else None)
+
+
+def _narrowed(t) -> list | None:
+    # `null` distinguishes "not evaluated" from the `[]` that claims nothing was narrowed.
+    return [n.model_dump() for n in t.narrowed] if t and t.narrowed is not None else None
+
+
+def _lineage(t) -> dict | None:
+    return ({"tables": list(t.tables_used),
+             "completeness": t.lineage_completeness,
+             "unresolved": list(t.lineage_unresolved),
+             "reasons": list(t.lineage_reasons)} if t else None)
+
+
+def result_payload(event: dict) -> dict:
+    """The verified rows, sent before the prose (`progress.result_ready`).
+
+    What the final answer will say about those rows, from the same trace and preview and through the same helpers, so
+    the early rows and the answer cannot differ: the SQL as asked (M51), the tables and their lineage (M56), what a
+    policy narrowed, the preview, and the governed notes the answer appends after its sentence, as a list."""
+    t, p = event["trace"], event["preview"]
+    return {
+        "sql": t.asked_sql,
+        "tables_used": list(t.tables_used),
+        "lineage": _lineage(t),
+        "narrowed": _narrowed(t),
+        "preview": _preview(p),
+        "notes": list(event["notes"]),
+        "rows_ms": t.timing.get("rows_ms"),
+    }
+
+
 def answer_payload(ans: AgentAnswer) -> dict:
     t = ans.trace
     p = ans.preview
@@ -94,18 +129,13 @@ def answer_payload(ans: AgentAnswer) -> dict:
         # the truth may be "read through a function we could not classify". Emitting the list
         # here and the marker only in the Verity trace would have recreated it on the two
         # surfaces a customer actually reads.
-        "lineage": ({"tables": list(t.tables_used),
-                     "completeness": t.lineage_completeness,
-                     "unresolved": list(t.lineage_unresolved),
-                     "reasons": list(t.lineage_reasons)} if t else None),
-        # Structured beside the sentence that is already in `answer`. `null` distinguishes "not
-        # evaluated" from the `[]` that claims nothing was narrowed.
-        "narrowed": ([n.model_dump() for n in t.narrowed]
-                     if t and t.narrowed is not None else None),
+        "lineage": _lineage(t),
+        # Structured beside the sentence that is already in `answer`.
+        "narrowed": _narrowed(t),
         "enrichment_version": t.enrichment_version if t else None,
         "timing": t.timing if t else None,
-        "preview": ({"columns": p.columns, "rows": p.rows, "row_count": p.row_count,
-                     "truncated": p.truncated, "capped": p.capped} if p else None),
+        "preview": _preview(p),
+        "prose_failed": ans.prose_failed,
     }
 
 

@@ -18,7 +18,7 @@ from mnemiq.contract.seams import (
 )
 from mnemiq.contract import DeferralReason, IdentityContext, Snapshot, Trace
 from mnemiq.llm.client import ContextTooLong, ModelUnavailable, PromptCut, seed_offset
-from mnemiq.progress import Emit, Stage, step
+from mnemiq.progress import Emit, Stage, result_ready, step
 from mnemiq.redact import policy_safe_detail
 from mnemiq.execute.render import render_result
 from mnemiq.execute.resultset import cluster
@@ -142,6 +142,9 @@ class AgentAnswer:
     # a candidate that deferred, or that ran and hit an ExecutionError, is dropped by _execute and
     # never counted. The looser "how many of N ran" left that ambiguous at the definition site.
     candidates_executed: int | None = None
+    # The rows were verified and stand, and the prose call that should have put them into a sentence failed. Not
+    # `failed`: the answer is the rows. Flagged so a prose model that is down never reads as prose switched off.
+    prose_failed: bool = False
     # What the mode actually spent. `instant` and `thinking` differ only in the corrector and
     # the retry ceiling, and both are invisible on a question that succeeds first time -- so the
     # control read as inert when it was working exactly as designed (M33). `attempts` counts the
@@ -767,23 +770,13 @@ class Agent:
         attempts: int | None = None,
     ) -> AgentAnswer:
         cut = _cut(approved, table)
-        if self.prose:
-            with step(emit, Stage.SYNTHESIZE, forced=forced):
-                # As asked, not the policy's rewrite (M156): the synthesizer is a model call, and the
-                # policy's predicate is not the caller's to read in the prose either.
-                answer = self.synthesizer.answer(
-                    packet.question, approved.model_sql(), render_result(table, cut_at=cut), forced=forced,
-                    row_count=table.num_rows,
-                )
-        else:
-            # The rows are the answer, in the preview. A fact the engine can state itself, not a model's reading of them.
-            answer = f"Returned {table.num_rows} row{'' if table.num_rows == 1 else 's'}."
         trace = build_trace(
             question=packet.question,
             approved=approved,
             identity=identity,
             enrichment_version=packet.enrichment_version,
-            timing={"execute_ms": execute_ms, "total_ms": deadline.elapsed_ms},
+            # `total_ms` is set after the prose; `rows_ms` is when the verified rows were ready to show.
+            timing={"execute_ms": execute_ms, "rows_ms": deadline.elapsed_ms},
             result_shape=_shape(table.num_rows, table.num_columns),
             definitions=packet.definitions,
         )
@@ -797,8 +790,7 @@ class Agent:
         # Both disclosures appended in one place, so a third cannot be added and forgotten.
         # The lineage one is silent on a source-level `unknown`: that is a standing property of
         # the database, said once at boot, not on every answer it will ever give.
-        answer = append_notes(
-            answer,
+        notes = [note for note in (
             # First: what the answer is a "none" of (M146). Whatever the verifier did with it, an
             # empty result that is answered says so in the engine's words, not only the model's.
             answered_note(table, getattr(approved, "value_grounding", None)),
@@ -807,9 +799,35 @@ class Agent:
                                         list(trace.lineage_unresolved),
                                         list(trace.lineage_reasons)),
             cap_sentence(cut) if cut is not None else "",
-        )
+        ) if note]
+        preview = result_preview(table, self.preview_rows, capped=cut is not None)
+        # Verified, so nothing after this point withdraws the rows: the prose, the trace's total and the notes follow,
+        # and none of them declines. Sent with the notes, so a reader of the table alone still reads what was withheld
+        # or cut, and with the preview and trace the final answer is built from, so the two cannot differ.
+        result_ready(emit, trace=trace, preview=preview, notes=notes)
+        rows_line = f"Returned {table.num_rows} row{'' if table.num_rows == 1 else 's'}."
+        prose_failed = False
+        if self.prose:
+            try:
+                with step(emit, Stage.SYNTHESIZE, forced=forced):
+                    # As asked, not the policy's rewrite (M156): the synthesizer is a model call, and the
+                    # policy's predicate is not the caller's to read in the prose either.
+                    answer = self.synthesizer.answer(
+                        packet.question, approved.model_sql(), render_result(table, cut_at=cut), forced=forced,
+                        row_count=table.num_rows,
+                    )
+            except ModelUnavailable as exc:
+                # The rows stand: they were verified, and a listener may already be showing them. The failure is stated
+                # with the provider's own words, as `answer` states one before the rows, and flagged, so a prose model
+                # that is down never reads as prose switched off.
+                prose_failed = True
+                answer = f"{rows_line} The sentence for these rows could not be written: {str(exc).strip()}"
+        else:
+            # The rows are the answer, in the preview. A fact the engine can state itself, not a model's reading of them.
+            answer = rows_line
+        trace.timing["total_ms"] = deadline.elapsed_ms
+        answer = append_notes(answer, *notes)
         return AgentAnswer(answer=answer, trace=trace, deferred=False, cached=cached,
-                           narrowed=getattr(approved, "narrowed", None),
-                           preview=result_preview(table, self.preview_rows, capped=cut is not None),
+                           narrowed=getattr(approved, "narrowed", None), preview=preview,
                            attempts=attempts, corrected=approved.corrected,
-                           day_bounds_closed=getattr(approved, "day_bounds", None))
+                           day_bounds_closed=getattr(approved, "day_bounds", None), prose_failed=prose_failed)

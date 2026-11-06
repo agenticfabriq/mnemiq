@@ -11,7 +11,7 @@ import { useEffect, useState } from "react";
 import type { DataMessagePartProps } from "@assistant-ui/react";
 
 import type { Turn } from "../lib/store";
-import type { Step } from "../lib/types";
+import type { ResultPayload, Step } from "../lib/types";
 import { duration } from "../lib/verdict";
 import { Steps } from "./Steps";
 import { Badges } from "./Badges";
@@ -25,7 +25,7 @@ import { SqlBlock } from "./SqlBlock";
  * the phases it reports plus how long it has been going. Deep mode runs for minutes;
  * a bare spinner would say nothing about that.
  */
-function Working({ steps }: { steps: Step[] }) {
+function Working({ steps, label = "Working…" }: { steps: Step[]; label?: string }) {
   const [elapsed, setElapsed] = useState(0);
   useEffect(() => {
     const started = Date.now();
@@ -36,7 +36,27 @@ function Working({ steps }: { steps: Step[] }) {
   return (
     <div className="flex flex-col gap-1.5">
       <Steps steps={steps} live />
-      <p className="meta tabular">Working… {duration(elapsed)}</p>
+      <p className="meta tabular">{label} {duration(elapsed)}</p>
+    </div>
+  );
+}
+
+/**
+ * The verified rows, ahead of the sentence. The notes are the governed ones the answer will append after its prose,
+ * shown here so a reader of the table alone still reads what was withheld or cut. Once the answer lands it carries
+ * them in its text, and this view gives way to the answer's.
+ */
+function EarlyRows({ result, steps }: { result: ResultPayload; steps: Step[] }) {
+  return (
+    <div className="flex flex-col gap-2.5">
+      {result.sql && <SqlBlock sql={result.sql} narrowed={result.narrowed} />}
+      {result.preview && <ResultView preview={result.preview} />}
+      {result.notes.length > 0 && (
+        <div className="flex flex-col gap-1 text-[12px]">
+          {result.notes.map((note) => <p key={note}>{note}</p>)}
+        </div>
+      )}
+      <Working steps={steps} label="Writing the answer…" />
     </div>
   );
 }
@@ -59,7 +79,8 @@ export function TurnArtifacts({ data }: DataMessagePartProps<Turn>) {
   const answer = turn.answer;
   const steps = turn.steps ?? [];
   if (!answer) {
-    return turn.status === "running" ? <Working steps={steps} /> : null;
+    if (turn.status !== "running") return null;
+    return turn.result ? <EarlyRows result={turn.result} steps={steps} /> : <Working steps={steps} />;
   }
 
   const refused = answer.deferred || answer.failed;

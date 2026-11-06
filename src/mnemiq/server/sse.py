@@ -20,7 +20,7 @@ from uuid import uuid4
 
 from mnemiq.agent.route import UnknownMode
 from mnemiq.profiles import UnknownProfile
-from mnemiq.server.serialize import answer_payload
+from mnemiq.server.serialize import answer_payload, result_payload
 
 _DONE = object()
 
@@ -99,7 +99,10 @@ async def chat_stream(runtime, identity, question: str, mode: str | None,
             continue
         if item is _DONE:
             break
-        yield frame(step_frame(item))
+        if item.get("kind") == "result":  # the verified rows, ahead of the prose
+            yield frame({"type": "CUSTOM", "name": "mnemiq.result", "value": result_payload(item)})
+        else:
+            yield frame(step_frame(item))
 
     try:
         ans = fut.result()

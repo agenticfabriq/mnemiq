@@ -43,6 +43,16 @@ def _guarded(emit: Emit, event: dict) -> None:
         pass
 
 
+def result_ready(emit: Emit | None, **fields: object) -> None:
+    """The verified result, sent before the prose: a listener can show the rows while the sentence is written.
+
+    Not a stage, so it has no start and finish; `kind` tells it apart from the stage events. It carries the engine's own
+    objects, and the door that sends it shapes them (`serialize.result_payload`) from the helpers the final answer uses.
+    """
+    if emit is not None:
+        _guarded(emit, {"kind": "result", **fields})
+
+
 @contextmanager
 def step(emit: Emit | None, stage: Stage, **fields: object) -> Iterator[str | None]:
     """Bracket one stage: a started event, then a finished event with its duration.
