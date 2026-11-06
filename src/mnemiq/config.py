@@ -178,6 +178,8 @@ class Settings(BaseSettings):
 
     writer_temperature: float | None = Field(default=None, ge=0, description="the SQL writer's sampling temperature; unset sends none, so the server's default applies (Qwen2.5: 0.7). Refused for a model that takes none, such as GPT-5, which would ignore it")
     prompt_layout: Literal["question_first", "question_last"] = Field(default="question_first", description="how the writer's prompt is arranged: question_first sends the question and its context as the user message; question_last puts the context in the system message and the question alone in the user message")
+    writer_reasoning: Literal["none", "before_sql"] = Field(default="none", description="room for the SQL writer to reason: none asks for the JSON reply alone; before_sql asks it to think the question through step by step first, and reads the last JSON object of its reply. Refused with guided_sql, which allows no text before the JSON")
+    writer_rules: Literal["full", "none"] = Field(default="full", description="the rule text in the SQL writer's system prompt: full carries the persona, the hard rules and the coded-values guidance; none keeps only the task, the decline instruction and the reply format. The decider enforces the hard rules either way")
     guided_sql: bool = Field(default=False, description="constrained decoding: force non-empty sql (response_format json_schema; works on vLLM and OpenAI-compatible endpoints)")
     assertive_sql: bool = Field(default=False, description="assertive prompt: attempt an answer instead of deferring")
     # M35, off by default: withdrawn on its own pre-registered criterion. Beacon's answerable band

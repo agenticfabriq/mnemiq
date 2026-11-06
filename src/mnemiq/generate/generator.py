@@ -92,7 +92,28 @@ def _parse(raw: str) -> SqlProposal:
         return SqlProposal(sql=None, reason="the model's JSON was malformed")
     if not isinstance(payload, dict):
         return SqlProposal(sql=None, reason="the model's JSON was not an object")
+    return _proposal(payload)
 
+
+def _parse_after_reasoning(raw: str) -> SqlProposal:
+    """Read the last JSON object carrying `sql` in a reply that reasons first.
+
+    `_parse` spans the first brace to the last, so a brace in the reasoning would make the reply unreadable. Each brace is
+    tried from the end as the start of an object; one inside a string fails to decode and is passed over, and requiring
+    `sql` passes over an object nested in the answer. A reply we cannot read is a deferral, never an exception."""
+    decoder = json.JSONDecoder()
+    text = raw or ""
+    for start in reversed([m.start() for m in re.finditer(r"\{", text)]):
+        try:
+            payload, _ = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and "sql" in payload:
+            return _proposal(payload)
+    return SqlProposal(sql=None, reason="the model did not answer on the JSON channel after its reasoning")
+
+
+def _proposal(payload: dict) -> SqlProposal:
     sql = payload.get("sql")
     reason = payload.get("reason")
     # Absent means "declared nothing", never "unknown": every existing prompt and every test double
@@ -120,7 +141,7 @@ class LLMGenerator:
     def __init__(self, client, max_tokens: int = GENERATOR_MAX_TOKENS, dialect: str = "duckdb",
                  guided_sql: bool = False, assertive: bool = False,
                  declare_assumed_terms: bool = False, temperature: float | None = None,
-                 layout: str = "question_first") -> None:
+                 layout: str = "question_first", reasoning: str = "none", rules: str = "full") -> None:
         self._client = client
         self._max_tokens = max_tokens
         self._dialect = dialect
@@ -129,13 +150,16 @@ class LLMGenerator:
         self._declare_assumed_terms = declare_assumed_terms
         self._temperature = temperature
         self._layout = layout
+        self._reasoning = reasoning
+        self._rules = rules
 
     def propose(
         self, packet: ContextPacket, feedback: str | None = None, strategy: str | None = None
     ) -> SqlProposal:
         extra = _guided_extra_body(self._guided_sql, self._declare_assumed_terms)
         system = system_prompt(dialect=self._dialect, strategy=strategy, assertive=self._assertive,
-                               declare_assumed_terms=self._declare_assumed_terms)
+                               declare_assumed_terms=self._declare_assumed_terms, reasoning=self._reasoning,
+                               rules=self._rules)
         if self._layout == "question_last":
             system, user = question_last_prompt(system, packet, feedback)
         else:
@@ -147,7 +171,7 @@ class LLMGenerator:
             **({"extra_body": extra} if extra else {}),
             **({"temperature": self._temperature} if self._temperature is not None else {}),
         )
-        return _parse(raw)
+        return _parse_after_reasoning(raw) if self._reasoning == "before_sql" else _parse(raw)
 
 
 class StrategyGenerator:

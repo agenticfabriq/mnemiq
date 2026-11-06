@@ -35,10 +35,13 @@ def build_components(settings: Settings, adapter, con) -> Components:
     client = LLMClient(settings)
     # Generate in the dialect the source executes, so generation, parsing, and execution stay
     # on one dialect and no cross-dialect transpile gap can bite.
+    # Each keyword named, not spread from `writer_style`: the M35 scan holds every construction site to naming
+    # `declare_assumed_terms` itself, and `test_writer_reasoning_and_rules` holds these to `writer_style`'s reading.
     generator = LLMGenerator(client, dialect=getattr(adapter, "dialect", "duckdb"),
                              guided_sql=settings.guided_sql, assertive=settings.assertive_sql,
                              declare_assumed_terms=settings.guard_undefined_terms,
-                             temperature=settings.writer_temperature, layout=settings.prompt_layout)
+                             temperature=settings.writer_temperature, layout=settings.prompt_layout,
+                             reasoning=settings.writer_reasoning, rules=settings.writer_rules)
     return Components(client=client, generator=generator, synthesizer=LLMSynthesizer(client, markdown=settings.answer_markdown),
                       corrector=LLMCorrector(client), values=ValueIndex(con),
                       selector=LLMSelector(client),

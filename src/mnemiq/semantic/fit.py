@@ -133,6 +133,8 @@ class PromptFitter:
     reply_tokens: int
     assertive: bool = False
     declare_assumed_terms: bool = False
+    reasoning: str = "none"
+    rules: str = "full"
     window: int | None = None
     count: object = None
     # Both doors decline a longer question before retrieval (M147). The fitter skips one too, for a caller that fits
@@ -149,7 +151,8 @@ class PromptFitter:
         from mnemiq.generate.prompts import system_prompt
 
         return max((system_prompt(dialect=self.dialect, strategy=s, assertive=self.assertive,
-                                  declare_assumed_terms=self.declare_assumed_terms)
+                                  declare_assumed_terms=self.declare_assumed_terms, reasoning=self.reasoning,
+                                  rules=self.rules)
                     for s in (None, *STRATEGIES)), key=len)
 
     def fit(self, packet: ContextPacket, snapshot, grants, card_style: str | None = None) -> ContextPacket:
@@ -327,6 +330,7 @@ class PromptFitter:
 def fitter_for(settings, dialect: str) -> PromptFitter:
     """The fitter both doors use, from the same settings the generator is built from."""
     from mnemiq.generate.generator import GENERATOR_MAX_TOKENS
+    from mnemiq.generate.prompts import writer_style
     from mnemiq.llm.client import reasoning_budget
     from mnemiq.llm.window import _within_deadline, count_on_server
 
@@ -343,6 +347,5 @@ def fitter_for(settings, dialect: str) -> PromptFitter:
     return PromptFitter(
         dialect=dialect, card_style=settings.card_style,
         reply_tokens=reasoning_budget(settings.llm_model, GENERATOR_MAX_TOKENS),
-        assertive=settings.assertive_sql, declare_assumed_terms=settings.guard_undefined_terms,
-        window=settings.llm_context_window, count=count,
+        **writer_style(settings), window=settings.llm_context_window, count=count,
         max_question_chars=settings.max_question_chars)
