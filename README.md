@@ -78,6 +78,9 @@ Each of those is a dial with a cost on the other side, which is why they are dia
 defaults. More context is not free. More compute is not automatically better. The right setting
 depends on your data, and the point of the harness is that you can find out rather than guess.
 
+A deployment keeps the settings that suit its model and its data as named profiles in a file, and a request can
+pick one with no restart. See [docs/profiles.md](docs/profiles.md).
+
 ### The semantic layer has tiers
 
 Before any question is asked, mnemiq can inspect the database and build context around the schema:
