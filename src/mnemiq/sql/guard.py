@@ -10,7 +10,7 @@ from sqlglot.tokens import TokenType
 
 from mnemiq.sql.identifiers import resolve_name
 from mnemiq.sql.qualify import object_key
-from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys
+from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys, unprintable
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 logger = logging.getLogger(__name__)
@@ -676,8 +676,14 @@ def niladic_names(ast: exp.Expression, columns, dialect: str | None = None,
     try:
         printed = ast.sql(dialect=engine)
     except Exception as exc:  # noqa: BLE001 -- the decider's own printing fails the statement after this
+        try:
+            printed = ast.sql(dialect=dialect)
+        except Exception:  # noqa: BLE001
+            # Printed for neither. Where the statement's dialect is the target's, as on DuckDB, this is the same
+            # print again, and it raised out of `decide`, so the server answered 500 (`DATE()` with no argument,
+            # which sqlglot's DuckDB printer cannot print). Refused as the decider's own printing would refuse it.
+            return unprintable(engine, exc, policys=False, tree=ast)
         logger.warning("niladic rule: the statement could not be printed for %s (%s); read as printed for %s", engine, exc, dialect)
-        printed = ast.sql(dialect=dialect)
     # A word the dialect's parser reads as a column (`localtimestamp` on SQLite, which has no
     # such keyword) is the column, and the grant check reads it: each such column reference
     # that prints bare accounts for one bare occurrence, and the occurrences beyond them are
