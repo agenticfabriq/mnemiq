@@ -783,3 +783,12 @@ def test_each_answer_gets_its_own_trace_id(monkeypatch):
     )
     # Width is part of the contract with the store, which the old sha256 slice also satisfied.
     assert all(len(trace_id) == 32 for trace_id in trace_ids)
+
+
+def test_a_failed_sentence_reaches_the_audit_trace_without_the_providers_words(monkeypatch):
+    """The rows stood and their sentence failed: the audit store records that, never the provider's error text."""
+    answer = _Answer(answer="Returned 1 row. The sentence for these rows could not be written: upstream 503 at host-x")
+    answer.prose_failed = True
+    body = _sent(monkeypatch, _Settings(), _event(answer=answer))
+    assert body["resolved_intent"]["prose_failed"] is True and body["resolved_intent"]["failed"] is False
+    assert "host-x" not in json.dumps(body)
