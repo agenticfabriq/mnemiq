@@ -42,6 +42,9 @@ _START_KEYS = ("profile_file", "profile")
 _KEY_HINTS = tuple(hint for hint in _SECRET_HINTS if hint != "dsn")
 # Sources the engine reads from a local file, which can be hashed. A live database cannot be.
 _FILE_SOURCES = ("sqlite", "duckdb")
+# How much time and money a sweep may spend, and how long a question is expected to take: none changes an answer,
+# so a sweep may be resumed under new ones.
+_PLANNING = ("budget_hours", "budget_dollars", "seconds_per_question")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _KEYWORD_PASSWORD = re.compile(r"""(?i)(?:^|\s)password\s*=\s*(?:'(?:[^'\\]|\\.)*'|\S*)""")
 
@@ -544,12 +547,12 @@ def _answering_settings(settings: Settings) -> dict:
 def fingerprint(cfg: SweepConfig) -> str:
     """What a sweep's answers depend on, as one sha256, so that a sweep resumed under anything else is refused.
 
-    It covers the config, less `[search] budget_*` and `[[control]]` (a sweep may be resumed with a larger budget, or
-    given a control afterwards), each deployment's settings without its keys or passwords, the pinned files, and the
-    split seed.
+    It covers the config, less `[search]`'s budgets and `seconds_per_question` and less `[[control]]` (a sweep may be
+    resumed with a larger budget or a new estimate, or given a control afterwards), each deployment's settings without
+    its keys or passwords, the pinned files, and the split seed.
     """
     config = cfg.model_dump(mode="json")
-    config["search"] = {key: value for key, value in config["search"].items() if not key.startswith("budget_")}
+    config["search"] = {key: value for key, value in config["search"].items() if key not in _PLANNING}
     del config["control"]
     body = {
         "config": config,

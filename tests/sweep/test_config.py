@@ -63,7 +63,7 @@ def test_what_changes_an_answer_changes_the_fingerprint(tmp_path, stub_model, ch
     assert fingerprint(load_config(cfg.path)) != before
 
 
-@pytest.mark.parametrize("change", ["budget", "control"])
+@pytest.mark.parametrize("change", ["budget", "seconds_per_question", "control"])
 def test_what_does_not_change_an_answer_leaves_it(tmp_path, stub_model, change):
     cfg = load_config(write_config(tmp_path, deployment=tiny_deployment(tmp_path, stub_model)))
     before = fingerprint(cfg)

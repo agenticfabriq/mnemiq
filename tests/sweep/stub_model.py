@@ -7,8 +7,12 @@ judge, deep mode's selector, the corrector, the sentence that follows the rows, 
 
 The writer is answered from the cases the stub has learned (`learn`): the case whose question the request carries.
 Answering right means that case's gold SQL, or a decline when the case has no answer. Answering wrong means the case's
-wrong SQL, which returns other rows, or rows for a question that has none. A test can also pass a `rule`, which sees
-every chat request and returns the reply text, an HTTP status, or None for the scripted reply (`answer`).
+wrong SQL, which returns other rows, or rows for a question that has none. A plain stub answers wrong; `gold`, or
+`varies` or `start_misses` passed without `gold_when`, answers right. A test can also pass a `rule`, which sees every
+chat request and returns the reply text, an HTTP status, or None for the scripted reply (`answer`).
+
+A rule, predicate or callback that raises is answered with a 500 and kept in `errors`; the `stub_model` fixture fails
+the test at teardown when any stub it started kept one, so a broken rule never passes for a scripted failure.
 
 Counts are of HTTP requests. A failure status goes out with `x-should-retry: false`, which the client obeys, so one failed
 call is one request. A closed connection carries no header and the client retries it twice, so one failed call is three.
@@ -49,7 +53,8 @@ Rule = Callable[[dict], "str | int | None"]
 
 @dataclass(frozen=True)
 class ScriptedCase:
-    """One question the stub can answer. `variants` spell the gold SQL differently and return the same rows."""
+    """One question the stub can answer. `variants` spell the gold SQL differently and return its rows;
+    `wrong_variants` do the same for `wrong_sql`."""
 
     id: str
     question: str
@@ -57,6 +62,7 @@ class ScriptedCase:
     answerable: bool = True
     wrong_sql: str | None = None
     variants: tuple[str, ...] = ()
+    wrong_variants: tuple[str, ...] = ()
 
 
 def _scripted(case: Any) -> ScriptedCase:
@@ -70,7 +76,8 @@ def _scripted(case: Any) -> ScriptedCase:
             return getattr(case, key, default)
     return ScriptedCase(id=str(get("id")), question=get("question"), gold_sql=get("gold_sql"),
                         answerable=bool(get("answerable", True)), wrong_sql=get("wrong_sql"),
-                        variants=tuple(get("variants", ()) or ()))
+                        variants=tuple(get("variants", ()) or ()),
+                        wrong_variants=tuple(get("wrong_variants", ()) or ()))
 
 
 def _carries(text: str, question: str) -> bool:
@@ -170,10 +177,13 @@ class StubModel:
     Options:
       rule          called with every chat request: reply text, an HTTP status to return, or None for `answer`.
       gold          answer every question right. `gold_when(request)` answers right only where it returns true.
+                    With neither, a stub answers wrong, unless `varies` or `start_misses` is passed.
       sql           answer every writer call with this SQL, whatever the question.
-      varies        repeated asks of one question get the gold SQL's other spellings in turn.
+      varies        repeated asks of one question get the answer's other spellings in turn, right or wrong, with the
+                    same rows (a case's `variants` or `wrong_variants`). Passed without `gold_when`, right elsewhere.
       seconds       delay before each chat reply.
-      start_misses  answer the first N answerable cases wrong on every request, however `gold` reads.
+      start_misses  answer the first N answerable cases wrong on every request, however `gold` reads. Passed
+                    without `gold_when`, right everywhere else.
       on_call       called with the running chat request count, as each request arrives.
       fail_first    the first N chat requests fail with `status`.
       fail_after    every chat request after the first N fails with `status`, until `recover()`.
@@ -196,7 +206,9 @@ class StubModel:
         if isinstance(status, bool) or not (isinstance(status, int) or status in ("connect", "context_too_long")):
             raise ValueError(f"status must be an HTTP code, 'connect' or 'context_too_long', not {status!r}")
         self.rule = rule
-        self.gold_when = (lambda request: True) if gold else gold_when
+        # `varies` and `start_misses` describe how a right model departs from right, so either alone means one.
+        right = gold or (gold_when is None and (varies or start_misses > 0))
+        self.gold_when = (lambda request: True) if right else gold_when
         self.sql = sql
         self.varies = varies
         self.seconds = seconds
@@ -214,7 +226,8 @@ class StubModel:
         self.embedding_calls = 0
         self.tokenize_calls = 0
         self.running: int | None = None  # `/metrics` reports this when set, else the chat requests in flight
-        self.errors: list[BaseException] = []  # raised by a rule or a predicate; each answered as a 500
+        # Raised by a rule, a predicate or `on_call`. Each is answered as a 500, so `stub_model` fails the test for it.
+        self.errors: list[BaseException] = []
         self._lock = threading.Lock()
         self._in_flight = 0
         self._recovered = False
@@ -247,6 +260,10 @@ class StubModel:
         """Know these questions: `EvaluationCase`s, mappings or `ScriptedCase`s, with optional `wrong_sql` and
         `variants`. A question learned again replaces what was known for it."""
         self._script.learn(cases)
+
+    def all_errors(self) -> list[BaseException]:
+        """`errors` from this stub and every stub it started, in that order."""
+        return [*self.errors, *(error for other in self._started for error in other.all_errors())]
 
     def recover(self) -> None:
         """End a scripted failure: every later request is answered."""
@@ -295,9 +312,15 @@ class StubModel:
         if not missed and self.gold_when is not None and self.gold_when(request):
             if not case.answerable:
                 return _proposal(None)
-            spellings = (case.gold_sql, *case.variants) if self.varies else (case.gold_sql,)
-            return _proposal(spellings[asked % len(spellings)])
-        return _proposal(case.wrong_sql, "" if case.wrong_sql else "no wrong answer is scripted for that question")
+            return _proposal(self._spelled(case.gold_sql, case.variants, asked))
+        if case.wrong_sql is None:
+            return _proposal(None, "no wrong answer is scripted for that question")
+        return _proposal(self._spelled(case.wrong_sql, case.wrong_variants, asked))
+
+    def _spelled(self, sql: str, variants: tuple[str, ...], asked: int) -> str:
+        """The `asked`-th spelling of an answer under `varies`, else the answer as scripted."""
+        spellings = (sql, *variants) if self.varies else (sql,)
+        return spellings[asked % len(spellings)]
 
     # --- the doors --------------------------------------------------------------------------------------------------
 
@@ -311,7 +334,7 @@ class StubModel:
             try:
                 if self.on_call is not None:
                     self.on_call(n)
-            except Exception as exc:  # noqa: BLE001 -- a test's callback failing is shown to the test, not lost
+            except Exception as exc:  # noqa: BLE001 -- kept for `stub_model` to fail the test
                 self.errors.append(exc)
             if self.seconds:
                 time.sleep(self.seconds)
@@ -325,7 +348,7 @@ class StubModel:
                 reply = self.rule(body) if self.rule is not None else None
                 if reply is None:
                     reply = self.answer(body)
-            except Exception as exc:  # noqa: BLE001 -- a test's rule failing is shown to the test, not the server log
+            except Exception as exc:  # noqa: BLE001 -- kept for `stub_model` to fail the test
                 self.errors.append(exc)
                 handler.fail(500)
                 return

@@ -36,38 +36,47 @@ _LOANS = [(1, 1, "2026-01-04", 1), (2, 1, "2026-02-11", 1), (3, 2, "2026-01-19",
           (9, 6, "2026-06-12", 0), (10, 7, "2026-06-30", 1), (11, 8, "2026-07-08", 1), (12, 8, "2026-08-21", 0),
           (13, 2, "2026-09-03", 1), (14, 5, "2026-09-27", 1), (15, 1, "2026-10-14", 0)]
 
-# Synthetic questions over the tables above. `wrong_sql` runs and returns other rows; `variants` return the gold rows.
+# Synthetic questions over the tables above. `wrong_sql` runs and returns other rows; `variants` return the gold
+# rows, and `wrong_variants` the wrong rows, under another spelling.
 CASES: tuple[dict, ...] = (
     {"id": "book-count", "question": "How many books does the library hold?",
      "gold_sql": "SELECT COUNT(*) AS books FROM books",
      "variants": ["SELECT COUNT(book_id) AS books FROM books"],
-     "wrong_sql": "SELECT COUNT(*) AS books FROM authors"},
+     "wrong_sql": "SELECT COUNT(*) AS books FROM authors",
+     "wrong_variants": ["SELECT COUNT(author_id) AS books FROM authors"]},
     {"id": "canadian-authors", "question": "How many authors come from Canada?",
      "gold_sql": "SELECT COUNT(*) AS authors FROM authors WHERE country = 'Canada'",
      "variants": ["SELECT COUNT(author_id) AS authors FROM authors WHERE country = 'Canada'"],
-     "wrong_sql": "SELECT COUNT(*) AS authors FROM authors"},
+     "wrong_sql": "SELECT COUNT(*) AS authors FROM authors",
+     "wrong_variants": ["SELECT COUNT(author_id) AS authors FROM authors"]},
     {"id": "before-1950", "question": "Which books were published before 1950?",
      "gold_sql": "SELECT title FROM books WHERE published_year < 1950",
      "variants": ["SELECT title FROM books WHERE published_year <= 1949"],
-     "wrong_sql": "SELECT title FROM books WHERE published_year > 1950"},
+     "wrong_sql": "SELECT title FROM books WHERE published_year > 1950",
+     "wrong_variants": ["SELECT title FROM books WHERE published_year >= 1951"]},
     {"id": "loans-by-genre", "question": "How many loans has each genre had?",
      "gold_sql": "SELECT b.genre, COUNT(l.loan_id) AS loans FROM loans l JOIN books b ON b.book_id = l.book_id "
                  "GROUP BY b.genre",
      "variants": ["SELECT books.genre, COUNT(*) AS loans FROM loans JOIN books ON books.book_id = loans.book_id "
                   "GROUP BY books.genre"],
-     "wrong_sql": "SELECT genre, COUNT(*) AS loans FROM books GROUP BY genre"},
+     "wrong_sql": "SELECT genre, COUNT(*) AS loans FROM books GROUP BY genre",
+     "wrong_variants": ["SELECT genre, COUNT(book_id) AS loans FROM books GROUP BY genre"]},
     {"id": "open-loans", "question": "How many loans have not been returned?",
      "gold_sql": "SELECT COUNT(*) AS open_loans FROM loans WHERE returned = 0",
      "variants": ["SELECT COUNT(loan_id) AS open_loans FROM loans WHERE returned = 0"],
-     "wrong_sql": "SELECT COUNT(*) AS open_loans FROM loans"},
+     "wrong_sql": "SELECT COUNT(*) AS open_loans FROM loans",
+     "wrong_variants": ["SELECT COUNT(loan_id) AS open_loans FROM loans"]},
     {"id": "newest-book", "question": "What is the title of the most recently published book?",
      "gold_sql": "SELECT title FROM books ORDER BY published_year DESC LIMIT 1",
      "variants": ["SELECT title FROM books WHERE published_year = (SELECT MAX(published_year) FROM books)"],
-     "wrong_sql": "SELECT title FROM books ORDER BY published_year ASC LIMIT 1"},
+     "wrong_sql": "SELECT title FROM books ORDER BY published_year ASC LIMIT 1",
+     "wrong_variants": ["SELECT title FROM books WHERE published_year = (SELECT MIN(published_year) FROM books)"]},
     {"id": "book-prices", "question": "What does each book cost?", "gold_sql": None, "answerable": False,
-     "wrong_sql": "SELECT title, published_year AS cost FROM books"},
+     "wrong_sql": "SELECT title, published_year AS cost FROM books",
+     "wrong_variants": ["SELECT books.title, books.published_year AS cost FROM books"]},
     {"id": "top-members", "question": "Which members borrowed the most books?", "gold_sql": None, "answerable": False,
-     "wrong_sql": "SELECT book_id, COUNT(*) AS loans FROM loans GROUP BY book_id"},
+     "wrong_sql": "SELECT book_id, COUNT(*) AS loans FROM loans GROUP BY book_id",
+     "wrong_variants": ["SELECT book_id, COUNT(loan_id) AS loans FROM loans GROUP BY book_id"]},
 )
 _CASE_FIELDS = ("id", "question", "gold_sql", "answerable", "db_id")
 
@@ -157,8 +166,9 @@ def tiny_deployment(tmp_path: Path, stub: StubModel) -> TinyDeployment:
         # vectors are a function of the text alone, so a question embedded by the given stub matches this index.
         with StubModel() as builder:
             settings = _GivenOnly(**_env_values(d, builder.url), llm_window_check=False)
-            if _cmd_enrich(settings) != 0 or _cmd_build(settings) != 0:
-                raise RuntimeError("the tiny deployment's store did not build; see the captured output")
+            if _cmd_enrich(settings) != 0 or _cmd_build(settings) != 0 or builder.errors:
+                raise RuntimeError(f"the tiny deployment's store did not build ({builder.errors!r}); see the "
+                                   "captured output")
         _write_env(d, stub.url)
     stub.learn(CASES)
     return d
@@ -277,6 +287,8 @@ def alter(cfg, change: str) -> None:
     elif change == "budget":
         _rewrite_config(cfg.path, lambda doc: doc.setdefault("search", {}).update(budget_hours=12.5,
                                                                                     budget_dollars=40.0))
+    elif change == "seconds_per_question":
+        _rewrite_config(cfg.path, lambda doc: doc.setdefault("search", {}).update(seconds_per_question=45.0))
     elif change == "control":
         answers = cfg.path.parent / "other-answers.json"
         answers.write_text(json.dumps([{"id": CASES[0]["id"], "sql": CASES[0]["gold_sql"]}]))
@@ -286,11 +298,21 @@ def alter(cfg, change: str) -> None:
         raise ValueError(f"no such change: {change}")
 
 
+def fail_on_stub_errors(stub: StubModel) -> None:
+    """Fail the test when a rule, predicate or callback raised inside `stub` or a stub it started. The stub answered
+    each with a 500, which a test asserting on scripted failures would otherwise read as one of them."""
+    if errors := stub.all_errors():
+        pytest.fail(f"a stub's rule, predicate or callback raised {len(errors)} time(s); the first: {errors[0]!r}",
+                    pytrace=False)
+
+
 @pytest.fixture
 def stub_model():
-    """A running scripted model. Call it, `stub_model(**options)`, to start another; all stop at teardown."""
+    """A running scripted model. Call it, `stub_model(**options)`, to start another; all stop at teardown, and the test
+    fails there if any of them kept an error."""
     stub = StubModel()
     try:
         yield stub
     finally:
         stub.stop()
+    fail_on_stub_errors(stub)
