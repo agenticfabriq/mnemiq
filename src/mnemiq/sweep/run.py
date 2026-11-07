@@ -61,7 +61,8 @@ _ENDPOINT_STATUSES = frozenset({401, 403, 404, 429})
 _STATUS = re.compile(r"status_(\d{3})")
 # The one reason a failed answer gives when the source failed it: the source did not answer. Every other failed answer
 # is the arm's own, `EXECUTION_FAILED` among them: the source rejected or timed out on every repair of the arm's SQL. A
-# statement someone else cancelled reads the same way, which a store copy never sees.
+# statement someone else cancelled reads the same way: a file source never cancels one, a live database can, and that
+# case is accepted as the arm's.
 _SOURCE_REASONS = frozenset({DeferralReason.SOURCE_UNAVAILABLE})
 
 
