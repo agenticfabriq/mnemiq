@@ -159,7 +159,7 @@ def test_the_view_drops_a_password_whatever_it_holds(url):
 
 
 @pytest.mark.parametrize("url", ["http://localhost:8000/v1?version=2", "http://host/models@v2",
-                                 "https://api.example.com/models/claude@2024/v1", "https://host/v1?user=a@b",
+                                 "https://api.example.com/models/vendor-model@2024/v1", "https://host/v1?user=a@b",
                                  "https://host/v1#frag@x"])
 def test_a_setting_with_no_credential_is_logged_as_it_is(monkeypatch, url):
     settings = _settings(llm_base_url=url, llm_model="vendor-model@2024-06-20",

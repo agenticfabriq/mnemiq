@@ -133,6 +133,9 @@ def test_the_start_profile_files_content_is_pinned(tmp_path, stub_model):
     ("chat", "https://user:abc#SECRET@localhost/v1", "api_key_env"),
     ("chat", "https://user:abc?SECRET@localhost/v1", "api_key_env"),
     ("chat", "user:SECRET@localhost/v1", "api_key_env"),  # no scheme: a parser reads the password as a path
+    # A token holding a raw `#` or `?` reads as a host with a fragment or query that holds an `@`
+    ("chat", "https://SECRET#x@host/v1", "api_key_env"),
+    ("judge table", "https://SECRET?x@host/v1", "verify_api_key_env"),
 ])
 def test_an_endpoint_url_that_carries_a_credential_is_refused(tmp_path, where, url, key_env):
     model = {"llm_model": "stub-model", "llm_base_url": UNREACHABLE, "api_key_env": KEY_ENV}
@@ -190,7 +193,7 @@ def test_a_message_naming_a_deployment_url_shows_it_without_its_credentials():
 
 
 def test_an_endpoint_with_an_at_in_its_path_loads(tmp_path):
-    url = "https://api.example.com/models/claude@2024/v1"
+    url = "https://api.example.com/models/vendor-model@2024/v1"
     cfg = load_config(write_config(tmp_path, models={"m": {"llm_model": "stub-model", "llm_base_url": url,
                                                             "api_key_env": KEY_ENV}}))
     assert cfg.models["m"].llm_base_url == url

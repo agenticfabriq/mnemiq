@@ -48,25 +48,41 @@ def names_a_credential(name: str) -> bool:
     return any(hint in name.lower() for hint in _CREDENTIAL_HINTS)
 
 
+_HOST_CHARACTERS = re.compile(r"[\w.-]+")  # letters, digits, `_`, `.` and `-`: a name or an IPv4 address
+
+
 def _reads_as_host(value: str) -> bool:
-    """Whether `value`, read the standard way (`urlsplit`), has a netloc that is a host with an optional port that
-    parses."""
+    """Whether `value`, read the standard way (`urlsplit`), has a netloc that is a host, with a port that parses if it
+    has one. A host is letters, digits, `-`, `.` and `_` (a name or an IPv4 address), or a bracketed IPv6 address, its
+    zone included."""
+    import ipaddress
+
     try:
         parts = urlsplit(value)
         _ = parts.port  # raises for a port that is not a number
     except ValueError:
         return False
-    return parts.hostname is not None
+    host = parts.hostname
+    if not host:
+        return False
+    if not parts.netloc.rpartition("@")[2].startswith("["):
+        return _HOST_CHARACTERS.fullmatch(host) is not None
+    try:
+        ipaddress.IPv6Address(host)  # `hostname` drops the brackets and keeps the zone
+    except ValueError:
+        return False
+    return True
 
 
 def _split_userinfo(value: str) -> tuple[str, str | None, str]:
     """`value` cut as (its `scheme://` or nothing, its user and password or None, what follows their `@`).
 
-    A URL is read the standard way first. When its netloc is a host with a port that parses, that reading stands: the
-    user and password are whatever precedes the netloc's `@`, and an `@` in the path, query or fragment is theirs.
-    Otherwise (a password holding a raw `/` leaves a netloc such as `user:abc`, whose port does not parse) they run to
-    the last `@` before whitespace, `?` or `#`, the rule `mnemiq.redact` documents for a source's words, so the
-    password is taken whole. With no scheme, an Easy Connect string's `user/password@host` is read by that rule too.
+    A URL is read the standard way first. When its netloc reads as a host (`_reads_as_host`: host characters or an IP
+    literal, and a port that parses if there is one), that reading stands: the user and password are whatever precedes
+    the netloc's `@`, and an `@` in the path, query or fragment is theirs. Otherwise (a password holding a raw `/`
+    leaves a netloc such as `user:abc`, whose port does not parse, or `AbC+dE`, which is no host) they run to the last
+    `@` before whitespace, `?` or `#`, the rule `mnemiq.redact` documents for a source's words, so the password is
+    taken whole. With no scheme, an Easy Connect string's `user/password@host` is read by that rule too.
     """
     scheme, sep, rest = value.partition("://")
     if sep and _reads_as_host(value):
@@ -80,8 +96,9 @@ def _split_userinfo(value: str) -> tuple[str, str | None, str]:
 
 
 def userinfo_unplaced(value: str) -> bool:
-    """Whether `value` is a URL holding an `@` that neither reading places: its netloc is no host with a port, and
-    every `@` comes after a `?` or `#` (a password holding a raw `?` or `#`, or a broken URL)."""
+    """Whether `value` is a URL holding an `@` that neither reading places: its netloc does not read as a host
+    (`_reads_as_host`), and every `@` comes after whitespace, a `?` or a `#` (a password holding a raw `?` or `#`, or a
+    broken URL)."""
     return "://" in value and "@" in value and not _reads_as_host(value) and _split_userinfo(value)[1] is None
 
 
@@ -399,8 +416,10 @@ class Settings(BaseSettings):
             if host in ("localhost", "localhost.localdomain"):
                 checked.append(name)
                 continue
-            # A parser reads a password holding a raw `/` as the host and a path, so the host it gives can be part of
-            # the credential. Such a host is not named; the decision is the same either way.
+            # Where the netloc does not read as a host and port (`_reads_as_host`), a parser can read a password holding
+            # a raw `/` as the host and a path, so the host it gives can be part of the credential; a host found inside
+            # the user and password is then not named. Where the netloc reads, its host is named. The decision is the
+            # same either way.
             userinfo = None if _reads_as_host(url) else _split_userinfo(url)[1]
             if userinfo is not None and host in userinfo.lower():
                 host_named = None

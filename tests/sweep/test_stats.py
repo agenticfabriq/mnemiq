@@ -16,6 +16,16 @@ def test_holm_raises_the_bar_with_the_number_of_arms():
     assert holm({"a": 0.03, **{f"x{i}": 0.9 for i in range(9)}}, 0.05) == set()
 
 
+def test_holm_lowers_the_bar_after_each_pass():
+    # The first p is held to alpha / 2 and the second to alpha / 1; holding both to alpha / 2 would drop b.
+    assert holm({"a": 0.01, "b": 0.04}, 0.05) == {"a", "b"}
+
+
+def test_holm_needs_each_p_strictly_below_its_bar():
+    assert holm({"a": 0.05}, 0.05) == set()
+    assert holm({"a": 0.01, "b": 0.05}, 0.05) == {"a"}
+
+
 def test_detectable_gain_grows_with_the_arms_compared():
     assert [detectable_gain(500, m, 0.05) for m in (1, 5, 10, 20)] == [6, 8, 9, 10]
     assert detectable_gain(8, 10, 0.05) is None

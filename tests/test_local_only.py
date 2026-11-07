@@ -405,7 +405,7 @@ def test_where_a_url_reads_as_no_host_its_password_ends_where_redact_says(url):
     assert scrub_credentials(url) == f"{prefix}***@{rest}"
 
 
-_AT_OUTSIDE_THE_NETLOC = ["http://host/models@v2", "https://api.example.com/models/claude@2024/v1",
+_AT_OUTSIDE_THE_NETLOC = ["http://host/models@v2", "https://api.example.com/models/vendor-model@2024/v1",
                           "https://host/v1?user=a@b", "https://host/v1#frag@x"]
 
 
@@ -419,3 +419,32 @@ def test_an_at_outside_the_netloc_leaves_the_url_as_it_is(url):
     assert _s(llm_base_url=url, llm_api_key="k").local_only_offenders() == [
         f"llm_base_url={url!r} (host {host!r} is a DNS name; this check does not resolve names, so it cannot confirm "
         "one stays on this network)"]
+
+
+@pytest.mark.parametrize("url", ["http://[::1]:8000/v1", "http://[::1]:8000/models@v2",
+                                 "http://[fe80::1%25eth0]:8000/models@v2", "http://10.0.0.7:8000/models@v2",
+                                 "http://model_server:8000/models@v2", "https://Api.Example.com/models@v2"])
+def test_a_host_of_host_characters_or_an_ip_literal_reads_as_a_host(url):
+    # Letters, digits, `-`, `.` and `_`, or a bracketed IPv6 address with its zone: the standard reading stands.
+    from mnemiq.config import _reads_as_host, without_credentials
+
+    assert _reads_as_host(url) and without_credentials(url) == url
+
+
+def test_a_netloc_of_no_host_characters_loses_its_credentials():
+    # A base64 token holding a `+` before a raw `/` leaves a netloc no host could be, so the token is taken whole and
+    # the host a parser reads from inside it is not named.
+    from mnemiq.config import _HOST_IN_USERINFO, userinfo_unplaced, without_credentials
+
+    url = "https://AbC+dE/f=@host/v1"
+    assert without_credentials(url) == "https://host/v1"
+    assert _s(llm_base_url=url, llm_api_key="k").local_only_offenders() == [
+        f"llm_base_url='https://host/v1' ({_HOST_IN_USERINFO})"]
+    # A netloc holding whitespace is no host either, and an `@` after that whitespace is placed by neither reading.
+    assert userinfo_unplaced("https://a b/c@host/v1")
+
+
+def test_only_an_ipv6_address_reads_as_a_host_in_brackets():
+    from mnemiq.config import _reads_as_host
+
+    assert not _reads_as_host("http://[v1.fe]/models@v2")  # a parser accepts this future literal; it is no host

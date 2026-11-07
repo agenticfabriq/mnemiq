@@ -70,6 +70,24 @@ def test_when_the_engine_refuses_the_start_nothing_runs(tmp_path, monkeypatch):
     assert "nothing runs" in render(cfg) and KEY_ENV in render(cfg)
 
 
+def test_the_plan_says_why_nothing_is_compared_with_the_start(tmp_path, monkeypatch):
+    def why(cfg) -> str:
+        (line,) = [line for line in render(cfg).splitlines() if "nothing is compared" in line]
+        return line
+
+    assert why(load_config(write_config(tmp_path))).endswith("the space has no value to try")
+    one_refused = load_config(write_config(tmp_path, space={"instant": {"min_agreement": [0.6]}}))
+    assert "the engine refuses every arm" in why(one_refused)
+    two_modes = load_config(write_config(tmp_path, modes=["instant", "thinking"],
+                                         space={"instant": {"min_agreement": [0.6]}}))
+    assert [line.strip() for line in render(two_modes).splitlines() if "nothing is compared" in line] == [
+        "m, instant: nothing is compared with the start: the engine refuses every arm (see skipped)",
+        "m, thinking: nothing is compared with the start: the space has no value to try"]
+    cfg = load_config(write_config(tmp_path, arms_in_screen=2))
+    monkeypatch.delenv(KEY_ENV)
+    assert "the engine refuses the start" in why(cfg) and "no value to try" not in render(cfg)
+
+
 def test_check_mode_has_no_timing_and_no_confirm_round(tmp_path):
     # A start profile that changes a setting gives the defaults arm changes, which a search would time and confirm.
     start = tmp_path / "start.toml"
@@ -80,7 +98,6 @@ def test_check_mode_has_no_timing_and_no_confirm_round(tmp_path):
     assert est.case_runs == {1: (2 + 1) * 8, 2: 2 * 2 * 8}  # every question; the start twice in the first round
     rounds = [line.strip() for line in render(cfg).splitlines()]  # the store's path holds this test's name
     assert not [line for line in rounds if line.startswith(("timing:", "confirm,"))]
-
 
 
 def _priced_model(**judge) -> dict:

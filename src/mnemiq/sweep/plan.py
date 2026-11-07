@@ -270,6 +270,15 @@ def _refusals(refused: list[tuple[Arm, str]]) -> list[str]:
     return lines
 
 
+def _nothing_compared(est: Estimate, key: tuple[str, str]) -> str:
+    """Why no arm of one model and mode is compared with the start, for a sweep that searches."""
+    if not any(est.rounds[key].values()):
+        return "the engine refuses the start (see skipped)"
+    if any((arm.model, arm.mode) == key for arm, _ in est.refused):
+        return "the engine refuses every arm (see skipped)"
+    return "the space has no value to try"
+
+
 def render(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None = None) -> str:
     """What `plan` prints, for a person deciding whether to run the sweep."""
     est = estimate(cfg, tokens=tokens)
@@ -339,7 +348,12 @@ def render(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None = 
     if check:
         lines.append("  check mode: the start against the engine's defaults, for harm; no search, so no gain to detect")
     elif not est.detectable:
-        lines.append("  nothing is compared with the start: the space has no value to try")
+        reasons = {key: _nothing_compared(est, key) for key in est.rounds}
+        if len(set(reasons.values())) == 1:
+            lines.append(f"  nothing is compared with the start: {next(iter(reasons.values()))}")
+        else:
+            lines += [f"  {model}, {mode}: nothing is compared with the start: {why}"
+                      for (model, mode), why in reasons.items()]
     for (model, mode), gain in est.detectable.items():
         compared = est.compared[(model, mode)]
         if gain is None:

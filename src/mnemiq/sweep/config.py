@@ -50,6 +50,7 @@ _PLANNING = ("budget_hours", "budget_dollars", "seconds_per_question")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # The schemes an endpoint in `[models]` or `[judge]` may use: each is an OpenAI-compatible server.
 _WEB_SCHEMES = ("http", "https")
+_AT_AFTER_QUERY_OR_FRAGMENT = re.compile(r"[?#][^@]*@")
 
 
 class SweepConfigError(ValueError):
@@ -83,10 +84,12 @@ def _endpoint_url(value: str | None, info: ValidationInfo) -> str | None:
         return None
     key_env = "verify_api_key_env" if info.field_name.startswith("verify_") else "api_key_env"
     # Checked before any parse, which can stop at a password first: a user or password wherever the engine places one,
-    # a credential in the query, or an `@` no reading places (a password holding a raw `?` or `#`).
-    if without_credentials(value) != value or userinfo_unplaced(value):
-        raise ValueError("carries a credential (a user or password before an '@', or a key in its query). A key never "
-                         f"goes in this file: name the environment variable that holds it in {key_env}")
+    # a credential in the query, an `@` no reading places, or any `@` after a `?` or `#`. A token holding a raw `?` or
+    # `#` reads as a host followed by a query or fragment holding the `@`, and a base URL needs no `@` in either.
+    if without_credentials(value) != value or userinfo_unplaced(value) or _AT_AFTER_QUERY_OR_FRAGMENT.search(value):
+        raise ValueError("carries a credential (a user or password before an '@', or a key in its query), or an '@' "
+                         "after a '?' or '#', which a password holding either leaves. A key never goes in this file: "
+                         f"name the environment variable that holds it in {key_env}")
     try:
         parts = urlsplit(value)
         host, _ = parts.hostname, parts.port  # `port` raises for one that is not a number
