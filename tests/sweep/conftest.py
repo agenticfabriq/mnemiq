@@ -10,12 +10,14 @@ import json
 import re
 import sqlite3
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
 
-from mnemiq.config import Settings
+from mnemiq.config import DEFAULT_RETRIEVAL_K, Settings
+from mnemiq.contract import EvaluationCase
+from mnemiq.profiles import PROFILE_SETTINGS
 
 from .stub_model import StubModel
 
@@ -126,11 +128,16 @@ def _env_values(d: TinyDeployment, url: str | None) -> dict[str, str]:
     if url:
         values |= {"llm_base_url": url, "llm_api_key": STUB_KEY, "llm_model": "stub-model",
                    "embed_base_url": url, "embed_api_key": STUB_KEY, "embed_model": "stub-embed"}
+    else:
+        # An embedder that nothing answers: the engine's profile loader requires one, and nothing here calls it.
+        values |= {"embed_base_url": UNREACHABLE, "embed_api_key": STUB_KEY}
     return values
 
 
-def _write_env(d: TinyDeployment, url: str | None) -> None:
-    d.env.write_text("".join(f"MNEMIQ_{name.upper()}='{value}'\n" for name, value in _env_values(d, url).items()))
+def _write_env(d: TinyDeployment, url: str | None, extra: dict[str, str] | None = None) -> None:
+    lines = [f"MNEMIQ_{name.upper()}='{value}'\n" for name, value in _env_values(d, url).items()]
+    lines += [f"{name}='{value}'\n" for name, value in (extra or {}).items()]
+    d.env.write_text("".join(lines))
 
 
 def tiny_files(tmp_path: Path) -> TinyDeployment:
@@ -154,13 +161,17 @@ def tiny_files(tmp_path: Path) -> TinyDeployment:
     return d
 
 
-def tiny_deployment(tmp_path: Path, stub: StubModel) -> TinyDeployment:
+def tiny_deployment(tmp_path: Path, stub: StubModel, *, env_extra: dict[str, str] | None = None) -> TinyDeployment:
     """The tiny deployment, its store built once per `tmp_path`: a second call returns what the first built, so a
     rebuilt store never moves a fingerprint. Its env file points at the first stub given, for chat and embeddings, and
-    every stub given learns its cases."""
+    every stub given learns its cases. `env_extra` adds lines to the env file, as `{"MNEMIQ_NAME": "value"}`, and is
+    taken only by the call that builds the deployment."""
     from mnemiq.cli import _cmd_build, _cmd_enrich
 
     d = tiny_files(tmp_path)
+    if env_extra and d.store.exists():
+        raise ValueError("env_extra is written when the deployment is built: pass it to the first call for this "
+                         "tmp_path")
     if not d.store.exists():
         # A stub of its own builds the store, so the one given counts and fails only for what the test asks. The
         # vectors are a function of the text alone, so a question embedded by the given stub matches this index.
@@ -169,7 +180,7 @@ def tiny_deployment(tmp_path: Path, stub: StubModel) -> TinyDeployment:
             if _cmd_enrich(settings) != 0 or _cmd_build(settings) != 0 or builder.errors:
                 raise RuntimeError(f"the tiny deployment's store did not build ({builder.errors!r}); see the "
                                    "captured output")
-        _write_env(d, stub.url)
+        _write_env(d, stub.url, env_extra)
     stub.learn(CASES)
     return d
 
@@ -198,14 +209,20 @@ def dump_toml(doc: dict) -> str:
 
 
 def write_config(tmp_path: Path, *, deployment: TinyDeployment | None = None, model: StubModel | None = None,
-                 questions: Path | None = None, **sections) -> Path:
+                 questions: Path | None = None, arms_in_screen: int | None = None, **sections) -> Path:
     """A sweep config over the tiny deployment, written to `tmp_path / "sweep.toml"`.
 
     One model, `m`, keyed by `SWEEP_TEST_KEY`, at `model`'s URL (or one nothing answers), in instant mode, starting
     from the engine's defaults. With `model` and no `deployment` it builds the tiny deployment on that stub; with
     neither, it writes the deployment's files without a store, which loads without any server. Each other keyword
-    is a config section: `sweep` and `dataset` merge into the defaults, any other replaces its section.
+    is a config section: `sweep` and `dataset` merge into the defaults (`dataset=tiny_dataset(...)` swaps the
+    questions), any other replaces its section. `arms_in_screen=N` writes a space whose screen holds N arms beside
+    the start.
     """
+    if arms_in_screen is not None:
+        if "space" in sections:
+            raise ValueError("arms_in_screen writes the space: pass one or the other")
+        sections["space"] = {"retrieval_k": [DEFAULT_RETRIEVAL_K + 4 * i for i in range(1, arms_in_screen + 1)]}
     if deployment is None:
         deployment = tiny_deployment(tmp_path, model) if model is not None else tiny_files(tmp_path)
     if model is not None:
@@ -296,6 +313,81 @@ def alter(cfg, change: str) -> None:
             {"name": "another-system", "answers": str(answers)}))
     else:
         raise ValueError(f"no such change: {change}")
+
+
+def config_with(*, held_out: float = 0.3, split_seed: int = 7, strategy: str = "screen-then-grid"):
+    """A config for the parts that read no file: validated as `load_config` validates it, without opening any file it
+    names."""
+    from mnemiq.sweep.config import SweepConfig
+
+    return SweepConfig.model_validate({
+        "sweep": {"name": "pure", "out": "sweep-out"},
+        "dataset": {"questions": "questions.json", "env": "deployment.env", "held_out": held_out,
+                    "split_seed": split_seed, "identity": {"roles": [ROLE]}},
+        "models": {"m": {"llm_model": "stub-model", "llm_base_url": UNREACHABLE, "api_key_env": KEY_ENV}},
+        "modes": ["instant"],
+        "search": {"strategy": strategy},
+    })
+
+
+def cases(*, answerable: int, unanswerable: int) -> list[EvaluationCase]:
+    """Cases with nothing behind them but their ids and whether each has an answer."""
+    return ([EvaluationCase(id=f"a{i:03d}", question=f"answerable {i}", gold_sql="SELECT 1") for i in range(answerable)]
+            + [EvaluationCase(id=f"u{i:03d}", question=f"unanswerable {i}", answerable=False)
+               for i in range(unanswerable)])
+
+
+def answerable(some: list[EvaluationCase]) -> int:
+    return sum(case.answerable for case in some)
+
+
+def tiny_dataset(tmp_path: Path, *, cases: int, answerable: int) -> dict[str, str]:
+    """A question file of `cases` synthetic questions over the tiny tables, `answerable` of them with gold SQL and the
+    rest to decline. Returned as the `[dataset]` keys that name it, for `write_config(dataset=...)`."""
+    written = [{"id": f"after-{1900 + i}", "question": f"How many books were published after {1900 + i}?",
+                "gold_sql": f"SELECT COUNT(*) AS books FROM books WHERE published_year > {1900 + i}"}
+               for i in range(answerable)]
+    written += [{"id": f"price-{i}", "question": f"What did the library pay for book {i}?", "gold_sql": None,
+                 "answerable": False} for i in range(cases - answerable)]
+    path = tmp_path / f"questions-{cases}-{answerable}.json"
+    path.write_text(json.dumps(written, indent=2))
+    return {"questions": str(path)}
+
+
+def live_postgres_env(tmp_path: Path) -> TinyDeployment:
+    """The tiny deployment's files with its env file naming a Postgres source instead of the SQLite one. Nothing listens
+    at the address, so anything that connects fails at once."""
+    d = tiny_files(tmp_path)
+    env = d.root / "live.env"
+    values = {"source_id": "library", "pg_dsn": "postgresql://sweep@127.0.0.1:9/library", "store_path": str(d.store),
+              "authz_path": str(d.authz), "embed_base_url": UNREACHABLE, "embed_api_key": STUB_KEY}
+    env.write_text("".join(f"MNEMIQ_{name.upper()}='{value}'\n" for name, value in values.items()))
+    return replace(d, env=env)
+
+
+def arm_with(cfg, *, model: str = "m", mode: str = "instant", **changes):
+    """The arm that changes `changes` from the start of `model` in `mode`; a mode setting is named bare, as
+    `candidates=3`."""
+    from mnemiq.sweep.arms import arm_of
+
+    named = {name if name in PROFILE_SETTINGS else f"{mode}.{name}": value for name, value in changes.items()}
+    assert model in cfg.models and mode in cfg.modes
+    return arm_of(model, mode, named)
+
+
+def start_of(cfg, mode: str, *, model: str = "m"):
+    """The screen's start arm for `model` in `mode`."""
+    from mnemiq.sweep.arms import screen_arms
+
+    return next(a for a in screen_arms(cfg) if a.model == model and a.mode == mode and not a.changes)
+
+
+@pytest.fixture(autouse=True)
+def _model_key(monkeypatch):
+    """The key variable the default config names holds a key, as a user's shell would; a test that needs it unset
+    removes it. A stray `MNEMIQ_PROFILE` in the shell running the tests would make the engine refuse every profile."""
+    monkeypatch.setenv(KEY_ENV, STUB_KEY)
+    monkeypatch.delenv("MNEMIQ_PROFILE", raising=False)
 
 
 def fail_on_stub_errors(stub: StubModel) -> None:
