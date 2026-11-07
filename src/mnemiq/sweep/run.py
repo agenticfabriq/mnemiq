@@ -11,7 +11,8 @@ rows, and lists them in the sweep's `retries.json`, so the next run asks them ag
 again keeps its error. Only a model endpoint's failure counts toward the stop: the writer's or the judge's, read from
 the engine's `AgentAnswer.model_error`, or a provider error raised out of `Runtime.ask` (the embedder's), read by the
 client's own mapping. Never from an answer's words: one question's error (a prompt too long, SQL the source rejects, a
-statement the source cancelled) is a counted error of the arm and never stops it.
+statement the source cancelled) is a counted error of the arm and never stops it. Each error row says who failed it, in
+`error_kind`: the endpoint, the source, or the arm's own answer.
 
 An arm's first run records the pinned files in `pins.json`, and every run of it, a resume included, checks its store
 copies and the files it ends with against that record. A change makes the arm invalid for good: `invalid.json` is
@@ -58,8 +59,10 @@ _STREAK = 3
 # limit. Every 5xx joins them. Any other status is the one question's.
 _ENDPOINT_STATUSES = frozenset({401, 403, 404, 429})
 _STATUS = re.compile(r"status_(\d{3})")
-# A failed answer's reasons that are about the source, not the model or the question.
-_SOURCE_REASONS = frozenset({DeferralReason.SOURCE_UNAVAILABLE, DeferralReason.EXECUTION_FAILED})
+# The one reason a failed answer gives when the source failed it: the source did not answer. Every other failed answer
+# is the arm's own, `EXECUTION_FAILED` among them: the source rejected or timed out on every repair of the arm's SQL. A
+# statement someone else cancelled reads the same way, which a store copy never sees.
+_SOURCE_REASONS = frozenset({DeferralReason.SOURCE_UNAVAILABLE})
 
 
 def engine_build(package: Path | None = None) -> dict:
@@ -264,9 +267,13 @@ def _endpoint(model_error: str) -> bool:
 
 
 def _error_kind(result: CaseResult, answer: AgentAnswer | None, model_error: str | None) -> str | None:
-    """Why a row is an error: `endpoint` (a model's server failed in a way that fails every question), `answer` (this
-    question's own: another model error, or the engine raising), or `source` (the failed answer's reason is the
-    source's, or the answer or the gold could not be graded on it). None for a row that is not an error."""
+    """Who failed a row that is an error; None for a row that is not.
+
+    `endpoint`: a model's server stopped answering, in a way that fails every question. `source`: the source failed us,
+    not answering the arm's statement, or failing the gold query or the answer's re-run while it was graded.
+    `answer`: the arm's own failure, as one question's model error, the engine raising, or SQL the source rejected or
+    timed out on at every repair.
+    """
     if result.outcome != Outcome.ERROR:
         return None
     if model_error is not None:

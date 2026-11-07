@@ -478,6 +478,17 @@ def cancel_gold_once(monkeypatch, case_id: str = CASES[0]["id"]) -> None:
     monkeypatch.setattr(DuckDBAdapter, "execute_arrow", execute_arrow)
 
 
+def source_down(monkeypatch) -> None:
+    """Every statement run on the source fails as an attached source that cannot be read does: DuckDB's own word for a
+    source that could not be asked, which the engine reads as the source not answering."""
+    from mnemiq.adapters.duckdb import DuckDBAdapter
+
+    def execute_arrow(self, sql, timeout_s=None):
+        raise duckdb.OperationalError("IO Error: the attached database cannot be read")
+
+    monkeypatch.setattr(DuckDBAdapter, "execute_arrow", execute_arrow)
+
+
 def copy_package(tmp_path: Path) -> Path:
     """A copy of the installed `mnemiq` package's Python source."""
     import mnemiq

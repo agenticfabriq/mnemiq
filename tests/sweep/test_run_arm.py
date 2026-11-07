@@ -13,8 +13,8 @@ from mnemiq.sweep.config import deployment_settings, load_config
 from mnemiq.sweep.run import arm_folder, arm_settings, engine_build, identity_refusal, run_arm
 
 from .conftest import (
-    cancel_gold_once, copy_package, judged_by, one_arm, out_files, read_rows, start_of, tiny_deployment, touch_store,
-    tuning, two_deployments, write_config,
+    cancel_gold_once, copy_package, judged_by, one_arm, out_files, read_rows, source_down, start_of, tiny_deployment,
+    touch_store, tuning, two_deployments, write_config,
 )
 
 
@@ -47,11 +47,20 @@ def test_a_profile_setting_the_env_sets_is_reset_even_when_its_default_is_unset(
 
 
 def test_sql_the_source_rejects_never_stops_the_arm(tmp_path, stub_model):
-    # The decider passes it, and the source refuses it as it runs: every question an error, and none an outage.
+    # The decider passes it, and the source refuses it on every repair: each question the arm's own error, none an
+    # outage.
     cfg, arm = one_arm(tmp_path, stub_model(sql="SELECT CAST(title AS INTEGER) AS n FROM books"))
     assert run_arm(cfg, arm, tuning(cfg), arm_folder(cfg, arm, 1)) == "complete"
     kinds = [r["error_kind"] for r in read_rows(cfg, arm) if r["outcome"] == "error"]
-    assert len(kinds) >= 3 and set(kinds) <= {"source", "answer"}
+    assert len(kinds) >= 3 and set(kinds) == {"answer"}
+
+
+def test_a_source_that_stops_answering_is_the_sources_error_and_never_stops_the_arm(tmp_path, stub_model, monkeypatch):
+    cfg, arm = one_arm(tmp_path, stub_model(gold=True))
+    source_down(monkeypatch)
+    assert run_arm(cfg, arm, tuning(cfg), arm_folder(cfg, arm, 1)) == "complete"
+    kinds = [r["error_kind"] for r in read_rows(cfg, arm) if r["outcome"] == "error"]
+    assert len(kinds) >= 3 and set(kinds) == {"source"}
 
 
 @pytest.mark.parametrize("status", [400, "context_too_long"])   # one per question, so 3 in a row is no outage
@@ -142,7 +151,9 @@ def test_a_statement_cancelled_under_load_is_an_error_not_wrong(tmp_path, stub_m
     cancel_gold_once(monkeypatch)                    # the source raises its timeout on one gold query
     run_arm(cfg, arm, tuning(cfg), arm_folder(cfg, arm, 1))
     assert [r["outcome"] for r in read_rows(cfg, arm)].count("error") == 1
-    assert [r["error_kind"] for r in read_rows(cfg, arm) if r["outcome"] == "error"] == ["source"]
+    # The answer's own statement ran and showed rows; grading it could not, so the source failed, not the arm.
+    errors = [r for r in read_rows(cfg, arm) if r["outcome"] == "error"]
+    assert [(r["error_kind"], r["rows_ms"] is not None) for r in errors] == [("source", True)]
 
 
 def test_a_store_changed_during_an_arm_makes_it_invalid(tmp_path, stub_model):
