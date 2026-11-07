@@ -142,3 +142,28 @@ def test_the_view_says_what_ran():
     assert view["settings"]["retrieval_k"] == 9
     assert view["modes"]["instant"]["candidates"] == 1
     assert view["dialect"] == "duckdb"
+
+
+@pytest.mark.parametrize("field, url", [("llm_base_url", "http://h:8000/v1?api_key=planted-query-secret"),
+                                        ("verify_base_url", "http://judge:8001/v1?access_token=planted-query-secret")])
+def test_the_view_drops_a_credential_in_a_urls_query(field, url):
+    view = resolved_view(_settings(**{field: url}), "duckdb")
+    assert "planted-query-secret" not in json.dumps(view)
+    assert view["settings"][field] == url.split("?")[0]
+
+
+@pytest.mark.parametrize("url", ["https://user:planted/secret@host.example/v1",    # a raw `/` in the password
+                                 "https://user:planted#secret@host.example/v1"])   # a raw `#`, which moves the host
+def test_the_view_drops_a_password_whatever_it_holds(url):
+    assert "planted" not in json.dumps(resolved_view(_settings(llm_base_url=url), "duckdb"))
+
+
+@pytest.mark.parametrize("url", ["http://localhost:8000/v1?version=2", "http://host/models@v2",
+                                 "https://api.example.com/models/vendor-model@2024/v1", "https://host/v1?user=a@b",
+                                 "https://host/v1#frag@x"])
+def test_a_setting_with_no_credential_is_logged_as_it_is(monkeypatch, url):
+    settings = _settings(llm_base_url=url, llm_model="vendor-model@2024-06-20",
+                         verify_base_url="https://Judge.Example.net:8443/v1")
+    view, version = resolved_view(settings, "duckdb"), profile_version(settings, "duckdb")
+    monkeypatch.setattr("mnemiq.profiles._no_credentials", lambda value: value)
+    assert view == resolved_view(settings, "duckdb") and version == profile_version(settings, "duckdb")

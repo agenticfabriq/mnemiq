@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
+from urllib.parse import unquote_plus, urlsplit
 
 from typing import Annotated, Literal
 
@@ -34,6 +36,114 @@ DEFAULT_RETRIEVAL_K = 24
 DEFAULT_MAX_QUESTION_CHARS = 4_000
 
 _SECRET_HINTS = ("api_key", "dsn", "password", "secret")  # fields whose value is never printed in .env.example
+# A URL query parameter named like one of these carries a credential: the secret fields' hints, and the words a query
+# uses besides (`token`, `auth`, and `sig` for a signed URL's signature).
+_CREDENTIAL_HINTS = (*_SECRET_HINTS, "key", "token", "auth", "sig")
+_WEB_SCHEMES = ("http", "https")
+_KEYWORD_PASSWORD = re.compile(r"""(?i)(?:^|\s)password\s*=\s*(?:'(?:[^'\\]|\\.)*'|\S*)""")
+
+
+def names_a_credential(name: str) -> bool:
+    """Whether a URL query parameter called `name` carries a credential."""
+    return any(hint in name.lower() for hint in _CREDENTIAL_HINTS)
+
+
+_HOST_CHARACTERS = re.compile(r"[\w.-]+")  # letters, digits, `_`, `.` and `-`: a name or an IPv4 address
+
+
+def _reads_as_host(value: str) -> bool:
+    """Whether `value`, read the standard way (`urlsplit`), has a netloc that is a host, with a port that parses if it
+    has one. A host is letters, digits, `-`, `.` and `_` (a name or an IPv4 address), or a bracketed IPv6 address, its
+    zone included."""
+    import ipaddress
+
+    try:
+        parts = urlsplit(value)
+        _ = parts.port  # raises for a port that is not a number
+    except ValueError:
+        return False
+    host = parts.hostname
+    if not host:
+        return False
+    if not parts.netloc.rpartition("@")[2].startswith("["):
+        return _HOST_CHARACTERS.fullmatch(host) is not None
+    try:
+        ipaddress.IPv6Address(host)  # `hostname` drops the brackets and keeps the zone
+    except ValueError:
+        return False
+    return True
+
+
+def _split_userinfo(value: str) -> tuple[str, str | None, str]:
+    """`value` cut as (its `scheme://` or nothing, its user and password or None, what follows their `@`).
+
+    A URL is read the standard way first. When its netloc reads as a host (`_reads_as_host`: host characters or an IP
+    literal, and a port that parses if there is one), that reading stands: the user and password are whatever precedes
+    the netloc's `@`, and an `@` in the path, query or fragment is theirs. Otherwise (a password holding a raw `/`
+    leaves a netloc such as `user:abc`, whose port does not parse, or `AbC+dE`, which is no host) they run to the last
+    `@` before whitespace, `?` or `#`, the rule `mnemiq.redact` documents for a source's words, so the password is
+    taken whole. With no scheme, an Easy Connect string's `user/password@host` is read by that rule too.
+    """
+    scheme, sep, rest = value.partition("://")
+    if sep and _reads_as_host(value):
+        end = re.search(r"[/?#]", rest)
+        userinfo, at, _ = (rest[:end.start()] if end else rest).rpartition("@")
+        return (scheme + sep, userinfo, rest[len(userinfo) + 1:]) if at else (scheme + sep, None, rest)
+    prefix, rest = (scheme + sep, rest) if sep else ("", value)
+    end = re.search(r"[\s?#]", rest)
+    at = rest.rfind("@", 0, end.start() if end else len(rest))
+    return (prefix, rest[:at], rest[at + 1:]) if at != -1 else (prefix, None, rest)
+
+
+def userinfo_unplaced(value: str) -> bool:
+    """Whether `value` is a URL holding an `@` that neither reading places: its netloc does not read as a host
+    (`_reads_as_host`), and every `@` comes after whitespace, a `?` or a `#` (a password holding a raw `?` or `#`, or a
+    broken URL)."""
+    return "://" in value and "@" in value and not _reads_as_host(value) and _split_userinfo(value)[1] is None
+
+
+def without_credentials(value: str) -> str:
+    """A URL or DSN as a message, a log or a fingerprint may show it.
+
+    No user or password before the host's `@` (a database URL keeps its user, which names who reads and is no secret),
+    as `_split_userinfo` places them; no query parameter named like a credential; and no `password=` in a keyword DSN.
+    Everything else stays as written. So a URL whose netloc reads as a host and port comes back unchanged unless it
+    holds a credential, an `@` in its path, query or fragment included. A URL whose netloc does not read loses
+    everything up to the last `@` before whitespace, `?` or `#`, its credentials with it, even when no parser accepts
+    it.
+    """
+    if "://" not in value and _KEYWORD_PASSWORD.search(value):
+        return " ".join(_KEYWORD_PASSWORD.sub(" ", value).split())
+    if "://" not in value and any(c.isspace() for c in value):
+        return value  # a keyword DSN with no password in it
+    prefix, userinfo, rest = _split_userinfo(value)
+    kept_user = ""
+    if userinfo is not None:
+        # A database URL keeps its user, which names who reads; a web URL's user is part of its credential. A "user"
+        # holding a `/` is no user: the read ran across a path.
+        user = userinfo.split(":", 1)[0]
+        if prefix and prefix[:-3].lower() not in _WEB_SCHEMES and user and "/" not in user:
+            kept_user = f"{user}@"
+    before_fragment, hash_, fragment = rest.partition("#")
+    path, question, query = before_fragment.partition("?")
+    if question:
+        pairs = query.split("&")
+        kept = [pair for pair in pairs if not names_a_credential(unquote_plus(pair.split("=", 1)[0]))]
+        if len(kept) < len(pairs):
+            before_fragment = path + ("?" + "&".join(kept) if kept else "")
+    return f"{prefix}{kept_user}{before_fragment}{hash_}{fragment}"
+
+
+_HOST_IN_USERINFO = ("the only host it gives is read from inside its user and password, which are not percent-encoded, "
+                     "so it is not named")
+
+
+def _without_userinfo(text: str, url: str) -> str:
+    """`text`, a parser's message about `url`, with whatever `url` holds before its host's `@` taken out: a parse error
+    can quote the URL's netloc."""
+    userinfo = _split_userinfo(url)[1]
+    return text if userinfo is None else text.replace(f"{userinfo}@", "")
+
 
 # Every `Settings` field `assert_local_only` checks, by name. Nothing enforces that a NEW field
 # whose name ends in `_url` gets added here -- a future verity_*_url (or any other) setting would
@@ -288,6 +398,8 @@ class Settings(BaseSettings):
             url = getattr(self, name, None)
             if not url:
                 continue
+            # Named without its credentials: this message reaches stderr and any log the operator keeps.
+            shown = without_credentials(url)
             try:
                 host = urlparse(url).hostname
             except ValueError as exc:
@@ -296,20 +408,30 @@ class Settings(BaseSettings):
                 # `host is None` case below, and one an earlier version of this method let
                 # propagate uncaught, discarding every offender already collected for a field
                 # visited before this one in loop order.
-                offenders.append(f"{name}={url!r} (not a parseable URL: {exc})")
+                offenders.append(f"{name}={shown!r} (not a parseable URL: {_without_userinfo(str(exc), url)})")
                 continue
             if host is None:
-                offenders.append(f"{name}={url!r} (no host could be parsed)")
+                offenders.append(f"{name}={shown!r} (no host could be parsed)")
                 continue
             if host in ("localhost", "localhost.localdomain"):
                 checked.append(name)
                 continue
+            # Where the netloc does not read as a host and port (`_reads_as_host`), a parser can read a password holding
+            # a raw `/` as the host and a path, so the host it gives can be part of the credential; a host found inside
+            # the user and password is then not named. Where the netloc reads, its host is named. The decision is the
+            # same either way.
+            userinfo = None if _reads_as_host(url) else _split_userinfo(url)[1]
+            if userinfo is not None and host in userinfo.lower():
+                host_named = None
+            else:
+                host_named = host
             try:
                 addr = ipaddress.ip_address(host)
             except ValueError:
                 offenders.append(
-                    f"{name}={url!r} (host {host!r} is a DNS name; this check does not "
+                    f"{name}={shown!r} (host {host_named!r} is a DNS name; this check does not "
                     "resolve names, so it cannot confirm one stays on this network)"
+                    if host_named is not None else f"{name}={shown!r} ({_HOST_IN_USERINFO})"
                 )
                 continue
             # An IPv4-mapped IPv6 literal (`::ffff:10.0.0.1`) is IPv4's 10.0.0.1 by another
@@ -322,7 +444,8 @@ class Settings(BaseSettings):
             in_rfc1918 = v4_equivalent.version == 4 and any(v4_equivalent in net for net in rfc1918)
             in_ula = addr.version == 6 and addr in ula
             if not (v4_equivalent.is_loopback or in_rfc1918 or in_ula):
-                offenders.append(f"{name}={url!r} (host {host} is publicly routable)")
+                offenders.append(f"{name}={shown!r} (host {host_named} is publicly routable)"
+                                 if host_named is not None else f"{name}={shown!r} ({_HOST_IN_USERINFO})")
                 continue
             checked.append(name)
         return offenders, checked
