@@ -22,6 +22,7 @@ unjudged are all not right.
 
 from __future__ import annotations
 
+import json
 import statistics
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
@@ -34,7 +35,8 @@ from mnemiq.contract import IdentityContext, Trace
 from mnemiq.eval.harness import CaseResult, Outcome, run_case
 from mnemiq.runtime import source_adapter
 from mnemiq.sweep.arms import ROUNDS, arm_from_profile
-from mnemiq.sweep.config import Control, SweepConfig, control_answers, deployment_settings, load_questions
+from mnemiq.sweep.config import SWEEP, Control, SweepConfig, control_answers, deployment_settings, load_questions
+from mnemiq.sweep.plan import TIMING_CASES
 from mnemiq.sweep.run import INVALID, PROFILE, ROWS, _identity, _rows_so_far
 from mnemiq.sweep.split import saved_split, split
 from mnemiq.sweep.stats import mcnemar_p, mcnemar_p_one_sided
@@ -264,12 +266,35 @@ def _start_round(cfg: SweepConfig, round: str) -> str:
 
 def _owed(cfg: SweepConfig, round: str) -> dict[str, str | None]:
     """The cases each arm of `round` owes a row for, each to the deployment it reads: from the split the sweep saved,
-    read back and verified (`saved_split`), once a run has started it, else as `split` draws it."""
+    read back and verified (`saved_split`), once a run has started it, else as `split` draws it. The timing round owes
+    the first `TIMING_CASES` cases to tune on."""
     parts = saved_split(cfg)
     if parts is None:
         parts = split(cfg, load_questions(cfg))
     part = parts[_ROUND_PART.get(round, "tuning")]
+    if round == "timing":
+        part = part[:TIMING_CASES]
     return {case.id: case.db_id if cfg.dataset.deployments is not None else None for case in part}
+
+
+def decided_repeats(cfg: SweepConfig, state: dict | None = None) -> int:
+    """How many runs each arm owes: the config's count, or under `auto` the count the first round decided, as the
+    sweep's record (`state`, by default its `sweep.json`) holds it.
+
+    A search that stopped for want of room everywhere ran each start once and never decided, and is read at one run.
+    Raises when nothing has decided yet.
+    """
+    if isinstance(cfg.sweep.repeats, int):
+        return cfg.sweep.repeats
+    if state is None:
+        record = Path(cfg.sweep.out) / SWEEP
+        state = json.loads(record.read_text(encoding="utf-8")) if record.exists() else {}
+    if "repeats" in state:
+        return state["repeats"]
+    if state.get("stopped") == "no room":
+        return 1
+    raise ValueError('[sweep] repeats is "auto", and the first round has not decided yet how many runs each arm owes: '
+                     "pass repeats=, or run the first round to its end")
 
 
 def _against(pairs: dict[int, Pair], tallies: Mapping[int, Tally], start: Mapping[int, Tally]) -> list[dict]:
@@ -385,7 +410,7 @@ def report(cfg: SweepConfig, round: str, *, repeats: int | None = None,
     each cell giving every run's value in turn, and, against the start, only/other and p for each run. The screen's
     table also marks the arms whose value it keeps (Kept), and its p is the one-sided p it decides by; every other
     round's is the two-sided p. A grid that follows a screen is compared with the screen's start. The timing round is
-    refused: its arms answer only the cases timed.
+    read against the first `TIMING_CASES` cases to tune on, which is all it times, and at one run, which is all it runs.
 
     Each arm's label and changes are read back from the profile file its run wrote (`arm_from_profile`), and an arm
     folder this config would not have written is refused.
@@ -394,8 +419,9 @@ def report(cfg: SweepConfig, round: str, *, repeats: int | None = None,
     kept values that way, without running a control's SQL.
 
     `repeats` is how many runs each arm owes, and an arm short of one is not valid. By default it is the config's
-    `repeats` when that is a number. Under `auto` it must be passed, as the first round decided it: the folders alone
-    cannot tell an arm's missing run from a second run no arm has had yet.
+    `repeats` when that is a number, else the count the first round decided, from the sweep's record
+    (`decided_repeats`); one run when the search stopped for want of room before it decided. Before then it must be
+    passed: the folders alone cannot tell an arm's missing run from a second run no arm has had yet.
 
     A record holds the model, mode, round, `arm` (its profile id; None for a control), `label`, `control` (its name, or
     None), `changes` (each setting the arm changes from the start, to its value), `valid` (in every run), `runs` (each
@@ -405,13 +431,9 @@ def report(cfg: SweepConfig, round: str, *, repeats: int | None = None,
     if round not in ROUNDS:
         raise ValueError(f"{round!r} is not a round; the rounds are {', '.join(ROUNDS)}")
     if round == "timing":
-        raise ValueError("the timing round is not reported: its arms answer only the cases timed, and this report does "
-                         "not know which those are")
-    if repeats is None:
-        if not isinstance(cfg.sweep.repeats, int):
-            raise ValueError('[sweep] repeats is "auto": pass repeats=, the number of runs the first round decided '
-                             "each arm owes")
-        repeats = cfg.sweep.repeats
+        repeats = 1
+    elif repeats is None:
+        repeats = decided_repeats(cfg)
     if repeats < 1:
         raise ValueError("an arm owes at least one run")
     owed = _owed(cfg, round)

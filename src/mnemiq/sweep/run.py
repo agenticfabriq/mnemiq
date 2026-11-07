@@ -392,8 +392,9 @@ def _ask(runtime: Runtime, case: EvaluationCase, mode: str, arm: Arm, identity: 
 
 
 def _answer_all(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder: Path,
-                runtimes: dict[str | None, Runtime], build: dict) -> bool:
-    """Ask every case and mode not yet in `rows.jsonl`; True when the endpoint stopped answering."""
+                runtimes: dict[str | None, Runtime], build: dict, before: Callable[[str, str], None] | None) -> bool:
+    """Ask every case and mode not yet in `rows.jsonl`, calling `before` with the case's id and the mode just before
+    each is asked; True when the endpoint stopped answering."""
     identity = _identity(cfg)
     rows = folder / ROWS
     done = {(row.get("id"), row.get("mode")) for row in _read_rows(rows)}
@@ -410,6 +411,8 @@ def _answer_all(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], fol
             for mode in arm.modes:
                 if (case.id, mode) in done:
                     continue
+                if before is not None:
+                    before(case.id, mode)
                 row = _ask(runtime, case, mode, arm, identity, build)
                 if row["error_kind"] == "endpoint" and (case.id, mode) in retried:
                     write(row)  # failed again after a stop: kept as an error, and no part of a new streak
@@ -432,15 +435,16 @@ def _answer_all(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], fol
     return False
 
 
-def run_arm(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder: Path) -> str:
+def run_arm(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder: Path,
+            before: Callable[[str, str], None] | None = None) -> str:
     """Run `arm` on `cases` into `folder`, resuming from the rows already there.
 
     An arm with an `invalid.json` is not run again. Its first run records the pinned files in `pins.json`; every run
     checks the files against that record, copies each store the cases read and checks each copy against it, writes the
     arm's `profile.toml`, and builds one runtime per deployment. Each case not yet answered is asked as the config's
     identity in each of the arm's modes, graded by `run_case`, and appended to `rows.jsonl` as one flushed row per case
-    and mode. When the run ends, the pinned files are read again, and `invalid.json` records any that moved from the
-    record.
+    and mode, `before` (when given) called with the case's id and the mode just before it is asked. When the run ends,
+    the pinned files are read again, and `invalid.json` records any that moved from the record.
 
     Returns `"invalid"` (a pinned file moved, in this run or before it), else `"endpoint"` (the endpoint stopped
     answering; the rows stand, and the next run resumes), else `"complete"`. It holds the folder's lock while it runs,
@@ -451,10 +455,11 @@ def run_arm(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder:
     busy = ArmInUse(f"another process is running the arm in {folder}, as a worker a stopped sweep left running would; "
                     "run again once it has ended")
     with _sole(folder / LOCK, busy):
-        return _run_arm(cfg, arm, cases, folder)
+        return _run_arm(cfg, arm, cases, folder, before)
 
 
-def _run_arm(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder: Path) -> str:
+def _run_arm(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder: Path,
+             before: Callable[[str, str], None] | None) -> str:
     """`run_arm` itself, with the folder made and its lock held."""
     if (folder / INVALID).exists():
         return "invalid"
@@ -476,7 +481,7 @@ def _run_arm(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder
     try:
         for db_id in db_ids:
             runtimes[db_id] = build_runtime(arm_settings(cfg, arm, folder, db_id))
-        stopped = _answer_all(cfg, arm, cases, folder, runtimes, build)
+        stopped = _answer_all(cfg, arm, cases, folder, runtimes, build, before)
     finally:
         for runtime in runtimes.values():
             runtime.con.close()
@@ -726,8 +731,9 @@ def _exception_line(exc: BaseException) -> str:
 
 
 def _work(cfg: SweepConfig, arm: Arm, cases: list[EvaluationCase], folder: Path, conn,
-          secrets: Sequence[tuple[str, str]]) -> None:
-    """What a worker process runs: one arm, then how it ended, sent back on `conn`.
+          secrets: Sequence[tuple[str, str]], before: Callable[[str, str], None] | None = None) -> None:
+    """What a worker process runs: one arm, with `before` called ahead of each case, then how it ended, sent back on
+    `conn`.
 
     No exception leaves it: the process would print the traceback, chained causes and all, and building a runtime
     attaches each source with its DSN, which an error may quote. The exception's one line goes back instead, as
@@ -736,7 +742,7 @@ def _work(cfg: SweepConfig, arm: Arm, cases: list[EvaluationCase], folder: Path,
     """
     try:
         try:
-            outcome = run_arm(cfg, arm, cases, folder)
+            outcome = run_arm(cfg, arm, cases, folder, before)
         except BaseException as exc:
             with suppress(BaseException):  # the parent may be gone, or a second interrupt may land mid-send
                 conn.send(("raised", _hidden(_exception_line(exc), secrets)))
@@ -748,12 +754,14 @@ def _work(cfg: SweepConfig, arm: Arm, cases: list[EvaluationCase], folder: Path,
 
 @dataclass(frozen=True)
 class _Job:
-    """One run of one arm: run `repeat` of `arm`, on `cases`, in `folder`."""
+    """One run of one arm: run `repeat` of `arm`, on `cases`, in `folder`, calling `before` ahead of each case (it is
+    sent to the worker, so it must pickle)."""
 
     arm: Arm
     repeat: int
     cases: tuple[EvaluationCase, ...]
     folder: Path
+    before: Callable[[str, str], None] | None = None
 
     def left(self) -> int:
         return _left(self.folder, _owed(self.arm, self.cases))
@@ -926,25 +934,33 @@ class _Rounds:
 
     # --- the workers --------------------------------------------------------------------------------------------
 
-    def job(self, arm: Arm, repeat: int) -> _Job:
-        return _Job(arm, repeat, tuple(self.parts["tuning"]), arm_folder(self.cfg, arm, repeat))
+    def job(self, arm: Arm, repeat: int, cases: Sequence[EvaluationCase] | None = None,
+            before: Callable[[str, str], None] | None = None) -> _Job:
+        """Run `repeat` of `arm`, on `cases` (by default the cases to tune on)."""
+        cases = self.parts["tuning"] if cases is None else cases
+        return _Job(arm, repeat, tuple(cases), arm_folder(self.cfg, arm, repeat), before)
 
-    def drain(self, pending: deque[_Job], advance: Callable[[deque[_Job]], None] | None = None) -> None:
-        """Run the jobs in `pending` in turn, `[machine] parallel` at a time, each in a spawned worker of its own, until
-        every one has run or the sweep stops. A run already done is skipped. `advance` is called at the start and after
-        each run ends, and may queue more. When the sweep stops, the runs going on finish and none starts."""
+    def drain(self, pending: deque[_Job], advance: Callable[[deque[_Job]], None] | None = None, *,
+              parallel: int | None = None) -> None:
+        """Run the jobs in `pending` in turn, `parallel` at a time (by default `[machine] parallel`), each in a spawned
+        worker of its own, until every one has run or the sweep stops. A run already done is skipped, and so is a run of
+        the search for a model and mode that has run out of room. `advance` is called at the start and after each run
+        ends, and may queue more. When the sweep stops, the runs going on finish and none starts."""
+        limit = parallel or self.cfg.machine.parallel
         context = multiprocessing.get_context("spawn")
         running: dict[int, tuple[_Job, multiprocessing.process.BaseProcess, object, int]] = {}
         try:
             if advance is not None:
                 advance(pending)
             while True:
-                while pending and len(running) < self.cfg.machine.parallel and not self.halted:
+                while pending and len(running) < limit and not self.halted:
                     job = pending.popleft()
                     left = job.left()
                     if not left and (job.folder / INVALID).exists():
                         _say(_not_valid(job))
-                    if not left or (self.state is not None and not self._active((job.arm.model, job.arm.mode))):
+                    searching = job.arm.round not in _AFTER_SEARCH
+                    if not left or (self.state is not None and searching
+                                    and not self._active((job.arm.model, job.arm.mode))):
                         continue
                     beside = [(other, asked) for other, _, _, asked in running.values()]
                     if self.state is not None and (why := self._over_budget(job, left, beside)):
@@ -955,7 +971,7 @@ class _Rounds:
                     receiver, sender = context.Pipe(duplex=False)
                     process = context.Process(target=_work, name=f"mnemiq-sweep-{job.arm.profile_id}",
                                               args=(self.cfg, job.arm, list(job.cases), job.folder, sender,
-                                                    self.secrets))
+                                                    self.secrets, job.before))
                     process.start()
                     sender.close()
                     running[process.sentinel] = (job, process, receiver, left)
@@ -1135,7 +1151,8 @@ def run(cfg: SweepConfig, until: str | None = None, smoke: int | None = None) ->
 
     A run holds the out folder's lock throughout, so a second run on the same folder is refused at once. Before anything
     runs, an identity the sweep cannot grade is refused (`identity_refusal`). Then the first round runs, and, after a
-    screen, the grid of the values it kept.
+    screen, the grid of the values it kept. A search ends with the timing round and the confirm round
+    (`mnemiq.sweep.propose.after_search`).
 
     A sweep resumes where it stopped, run after run:
     - `sweep.json` holds the fingerprint and the engine build the sweep started under. A run under another config (the
@@ -1152,9 +1169,10 @@ def run(cfg: SweepConfig, until: str | None = None, smoke: int | None = None) ->
     `sweep.json` holds `fingerprint`, `engine_build` and `split_seed`; `repeats`, the runs each arm owes, once the first
     round has decided it or from the start when the config fixes it; `room`, by model and mode, the start's `misses`,
     the gain an arm `needed` (None when none can win), the arms `compared`, and `stopped: "no room"` when the search
-    stopped there; `seconds`, the time the sweep's runs have taken; and `stopped`, the sweep's own stop: `"budget"`,
+    stopped there; `seconds`, the time the sweep's runs have taken; `stopped`, the sweep's own stop: `"budget"`,
     `"endpoint"` or `"worker"` (a worker that died), each cleared by the next run, or `"no room"` once every model and
-    mode that searches has stopped for it.
+    mode that searches has stopped for it; and `finished`, true once the strategy's last round has run, which a
+    proposal waits for.
 
     A stop for the budget comes before an arm, never during one. When an endpoint stops answering, or a worker dies,
     the runs going on finish, none starts, and `run` exits non-zero naming the endpoint, or the run and what its worker
@@ -1181,5 +1199,8 @@ def run(cfg: SweepConfig, until: str | None = None, smoke: int | None = None) ->
         sweep.first_round()
         if not sweep.halted and until != sweep.first and strategy == "screen-then-grid":
             sweep.grid()
-        # The rounds that follow a search, timing and then confirm, are called here, after the grid.
+        if not sweep.halted and until in (None, "check", *_AFTER_SEARCH):
+            from mnemiq.sweep.propose import after_search  # the proposal reads this module's files
+
+            after_search(sweep, until)
         sweep.finish()

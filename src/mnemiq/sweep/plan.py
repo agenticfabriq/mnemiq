@@ -23,9 +23,10 @@ from mnemiq.sweep.config import _FILE_SOURCES, SweepConfig, _source_specs, load_
 from mnemiq.sweep.split import split
 from mnemiq.sweep.stats import detectable_gain
 
-# The timing round runs each finalist once, alone. How many finalists there are is known only after the grid; `plan`
-# counts the start and one finalist for each model and mode, and says so.
+# The timing round runs each finalist once, alone, on the first `TIMING_CASES` cases to tune on. How many finalists
+# there are is known only after the grid; `plan` counts the start and one finalist for each model and mode, and says so.
 TIMING_ARMS_PER_MODE = 2
+TIMING_CASES = 20
 _UNKNOWN = "unknown until the first questions run"
 _JUDGE_UNPRICED = "the judge's price is not known"
 # The rounds that compare arms on the tuning part, by strategy; timing and confirm follow a search.
@@ -113,7 +114,7 @@ def _questions_asked(cfg: SweepConfig, rounds: dict[str, list[Arm]], tuning: int
         count = 2 + (len(arms) - 1) * runs if first and decided else len(arms) * runs
         parallel += count * tuning
     if _searches(cfg, rounds):
-        alone += TIMING_ARMS_PER_MODE * tuning
+        alone += TIMING_ARMS_PER_MODE * min(TIMING_CASES, tuning)
     return parallel, alone
 
 
@@ -208,19 +209,27 @@ def estimate(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None 
                 detectable[key] = detectable_gain(room_bound, count, cfg.propose.alpha)
 
     store_bytes: dict[str, int | None] = {}
-    unpinned: list[str] = []
-    for db_id, settings in deployments:
+    for _, settings in deployments:
         store = os.path.abspath(settings.store_path)
         store_bytes[store] = os.path.getsize(store) if os.path.isfile(store) else None
-        for spec in _source_specs(settings):
-            if spec.kind not in _FILE_SOURCES:
-                unpinned.append(f"{spec.id} ({spec.kind})" if db_id is None else f"{db_id}: {spec.id} ({spec.kind})")
+    unpinned = unpinned_sources(deployments)
 
     return Estimate(
         arms=dict(arms), case_runs=case_runs, hours=hours, dollars=dollars, detectable=detectable, compared=compared,
         room_bound=room_bound, store_bytes=store_bytes, unpinned_sources=unpinned, refused=refused, rounds=rounds,
         parts={name: (len(part), sum(case.answerable for case in part)) for name, part in parts.items()},
         judged_elsewhere=judged_elsewhere)
+
+
+def unpinned_sources(deployments: list[tuple[str | None, Settings]]) -> list[str]:
+    """Each source of `deployments` (from `baselines`) that is not a file, and so cannot be pinned: by its id and kind,
+    after its deployment's db_id when there are several. Never by its target, which can hold a credential."""
+    unpinned = []
+    for db_id, settings in deployments:
+        for spec in _source_specs(settings):
+            if spec.kind not in _FILE_SOURCES:
+                unpinned.append(f"{spec.id} ({spec.kind})" if db_id is None else f"{db_id}: {spec.id} ({spec.kind})")
+    return unpinned
 
 
 def _priced(cfg: SweepConfig, model: str, tokens: dict[str, tuple[float, float]]) -> bool:
@@ -308,8 +317,8 @@ def render(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None = 
             else:
                 lines.append(f"    {name}: {len(arms)} arms: {labels}")
         if _searches(cfg, rounds):
-            lines.append(f"    timing: the start and each finalist, once each and alone (the cost counts "
-                         f"{TIMING_ARMS_PER_MODE}: the start and one finalist)")
+            lines.append(f"    timing: the start and each finalist, once each and alone, on the first {TIMING_CASES} "
+                         f"cases to tune on (the cost counts {TIMING_ARMS_PER_MODE}: the start and one finalist)")
     for model in cfg.models:
         if any(_searches(cfg, est.rounds[(model, mode)]) for mode in cfg.modes):
             lines.append(f"  confirm, {model}: the assembled profile against the start on the held-out part, in each "

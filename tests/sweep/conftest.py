@@ -10,6 +10,7 @@ import json
 import re
 import shutil
 import sqlite3
+import tempfile
 import tomllib
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -622,3 +623,268 @@ def stub_model():
     finally:
         stub.stop()
     fail_on_stub_errors(stub)
+
+
+# --- a sweep's rows written as `run_arm` writes them, so the proposal's rule is tested without a model ---------------
+
+
+def label_changes(label: str) -> dict:
+    """An arm's label, each `setting=value` joined by ` + `, as its changes: a value read as the config types it."""
+    changes = {}
+    for part in label.split(" + "):
+        name, _, value = part.partition("=")
+        try:
+            changes[name] = json.loads(value)
+        except ValueError:
+            changes[name] = value
+    return changes
+
+
+_STAMPED: dict[tuple[str, str], str] = {}
+
+
+def stamped_version(cfg, arm) -> str:
+    """The version a run of `arm` stamps on its rows: the engine's own profile loader and version function over the file
+    the run writes, on the deployment's baseline, with the dialect of the tiny deployment's DuckDB adapter."""
+    from mnemiq.profiles import load_profiles, profile_version
+    from mnemiq.sweep.arms import baseline, profile_text
+    from mnemiq.sweep.config import deployment_settings
+
+    text = profile_text(cfg, arm)
+    key = (str(cfg.dataset.env), text)
+    if key not in _STAMPED:
+        with tempfile.TemporaryDirectory(prefix="sweep-test-version-") as folder:
+            path = Path(folder) / "profiles.toml"
+            path.write_text(text)
+            settings = baseline(deployment_settings(cfg, None)).model_copy(update={"profiles_path": str(path)})
+            profiles, default = load_profiles(settings)
+            _STAMPED[key] = profile_version(profiles[default].settings, "duckdb")
+    return _STAMPED[key]
+
+
+def graded_rows(arm, cases: list[EvaluationCase], *, right: int, version: str, spec: dict | None = None) -> list[dict]:
+    """One run of `arm` on `cases`, in each of its modes. Without `spec` it is a start that gets the first `right`
+    answerable cases right and declines the rest. A `spec` departs from that start by `only` (right where the start is
+    not), `other` (not right where the start is), `more_wrong` and `more_made_up` (answers beyond the start's), every
+    row taking `ms` and `prompt` (its prompt tokens). Every other answer is a decline."""
+    spec = spec or {}
+    only, other = spec.get("only", 0), spec.get("other", 0)
+    wrong, made_up = spec.get("more_wrong", 0), spec.get("more_made_up", 0)
+    answerable = [case.id for case in cases if case.answerable]
+    unanswerable = [case.id for case in cases if not case.answerable]
+    assert other <= right and right + only + wrong <= len(answerable) and made_up <= len(unanswerable)
+    timed = {"ms": spec.get("ms", 1000.0), "prompt_tokens": spec.get("prompt", 900)}
+
+    def outcome(i: int) -> str:
+        if i < other or i >= right + only + wrong:
+            return "deferred_wrongly"
+        return "correct" if i < right + only else "wrong"
+
+    rows = []
+    for mode in arm.modes:
+        rows += [row(case, outcome(i), mode=mode, version=version, **timed) for i, case in enumerate(answerable)]
+        rows += [row(case, "wrong", mode=mode, made_up=True, version=version, **timed) if i < made_up
+                 else row(case, "deferred_correctly", mode=mode, version=version, **timed)
+                 for i, case in enumerate(unanswerable)]
+    return rows
+
+
+class ScriptedRounds:
+    """The rounds a sweep runs after its search, as `after_search` drives them, with no worker and no model: each run it
+    is asked for is written as `run_arm` writes it. A timed run copies the arm's own rows from the round that tuned it,
+    and calls its check before each case, as the worker running it would. A confirm run answers the held-out cases: the
+    start gets none right, and the assembled arm all of them, less what `held_out["assembled"]` asks of it."""
+
+    def __init__(self, cfg, state: dict, held_out: dict) -> None:
+        from mnemiq.sweep.run import _parts
+
+        self.cfg, self.state, self.held_out = cfg, state, held_out
+        self.parts = _parts(cfg)
+        self.halted = False
+        self.drained: list[tuple[int | None, list]] = []  # each drain's parallel override and its jobs
+
+    def job(self, arm, repeat: int, cases=None, before=None):
+        from mnemiq.sweep.run import _Job, arm_folder
+
+        return _Job(arm, repeat, tuple(self.parts["tuning"] if cases is None else cases),
+                    arm_folder(self.cfg, arm, repeat), before)
+
+    def drain(self, pending, advance=None, *, parallel=None) -> None:
+        jobs = list(pending)
+        self.drained.append((parallel, jobs))
+        for job in jobs:
+            if not job.left():
+                continue
+            rows = self._answers(job)
+            if job.before is not None:
+                for answer in rows:
+                    job.before(answer["id"], answer["mode"])
+            write_run(self.cfg, job.arm, rows, job.repeat)
+
+    def _answers(self, job) -> list[dict]:
+        if job.arm.round == "timing":
+            ids = {case.id for case in job.cases}
+            for tuned in ("screen", "grid"):
+                if found := read_rows(self.cfg, replace(job.arm, round=tuned)):
+                    return [answer for answer in found if answer["id"] in ids]
+            raise AssertionError(f"{job.arm.label} was timed but never tuned")
+        version = stamped_version(self.cfg, job.arm)
+        cases = list(job.cases)
+        if job.arm.profile_id == "start":
+            return graded_rows(job.arm, cases, right=0, version=version)
+        given = self.held_out.get("assembled", {})
+        spec = {"only": answerable(cases) - given.get("more_wrong", 0), **given}
+        return graded_rows(job.arm, cases, right=0, version=version, spec=spec)
+
+    def save(self) -> None:
+        (out(self.cfg) / "sweep.json").write_text(json.dumps(self.state))
+
+
+def play_after_search(cfg, *, held_out: dict | None = None, hosted: bool = False, server_running: int = 0,
+                      load: float = 0.5) -> ScriptedRounds:
+    """The timing and confirm rounds of a sweep whose search is written, played by `ScriptedRounds` through the code
+    `run` calls. The server reads `server_running` requests running before each timed case, or publishes no count when
+    `hosted`, and the sweep machine's 1-minute load reads `load` on its 8 cores."""
+    from mnemiq.sweep import propose
+
+    rounds = ScriptedRounds(cfg, sweep_json(cfg), held_out or {})
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(propose, "server_running", lambda base_url: None if hosted else server_running)
+        patch.setattr(propose, "machine_load", lambda: (load, 8))
+        propose.after_search(rounds, None)
+    return rounds
+
+
+def _idle_deployment(tmp_path: Path) -> TinyDeployment:
+    """The tiny deployment, its store built, on a stub that is stopped once it is: a sweep whose rows are written calls
+    no model."""
+    with StubModel() as idle:
+        return tiny_deployment(tmp_path, idle)
+
+
+def graded_sweep(tmp_path: Path, *, arms: dict | None = None, grid: dict | None = None, picks: dict | None = None,
+                 modes=("instant",), held_out: dict | None = None, hosted: bool = False, server_running: int = 0,
+                 load: float = 0.5, real_profiles: StubModel | None = None, cases: tuple[int, int] = (14, 12),
+                 play: bool = True, no_room: tuple[str, ...] = (), **sections):
+    """A screen-then-grid sweep of model `m` over `cases` (questions, answerable) synthetic questions, its search written
+    as rows, one run per arm, loaded. By default 9 answerable questions and 2 to decline are tuned on, and 3 answerable
+    held out.
+
+    `arms` (screen) and `grid` map a label to a dict for `graded_rows`, in every mode. The start gets right as many
+    answerable cases as the largest `other` asked for. `picks` maps each mode to the label that wins there (9 more right
+    and none lost) or to "start", where that label wins nothing.
+
+    `no_room` names the modes whose search the record says stopped for want of room after the start's first run.
+
+    The timing and confirm rounds follow (`play_after_search`, with `hosted`, `server_running` and `load`), unless
+    `play` is false. With `real_profiles`, a stub, they run for real instead, `run` driving them in workers on the
+    product path, on that stub."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    modes = list(modes)
+    per_mode = {mode: dict(arms or {}) for mode in modes}
+    if picks:
+        won = sorted({label for label in picks.values() if label != "start"})
+        per_mode = {mode: {label: dict(only=9, other=0) if picks[mode] == label else dict(only=0, other=0)
+                           for label in won} for mode in modes}
+    space: dict[str, list] = {}
+    for label in sorted({label for mine in per_mode.values() for label in mine} | set(grid or {})):
+        for name, value in label_changes(label).items():
+            if value not in space.setdefault(name, []):
+                space[name].append(value)
+    dataset = tiny_dataset(tmp_path, cases=cases[0], answerable=cases[1], stub=real_profiles)
+    deployment = tiny_deployment(tmp_path, real_profiles) if real_profiles is not None else _idle_deployment(tmp_path)
+    from mnemiq.sweep.arms import arm_of
+    from mnemiq.sweep.config import load_config
+    from mnemiq.sweep.run import _begin, _parts, run
+
+    cfg = load_config(write_config(tmp_path, deployment=deployment, model=real_profiles, dataset=dataset, space=space,
+                                   modes=modes, sweep={"repeats": 1}, **sections))
+    state = _begin(cfg)
+    if no_room:
+        stopped = {"misses": 0, "needed": None, "compared": 1, "stopped": "no room"}
+        state["room"] = {"m": {mode: stopped for mode in no_room}}
+        (out(cfg) / "sweep.json").write_text(json.dumps(state))
+    tuned = _parts(cfg)["tuning"]
+    for mode in modes:
+        specs = [*per_mode[mode].values(), *(grid or {}).values()]
+        right = max((spec.get("other", 0) for spec in specs), default=0)
+        start = arm_of("m", mode, {}, round="screen")
+        write_run(cfg, start, graded_rows(start, tuned, right=right, version=stamped_version(cfg, start)))
+        for round, labelled in (("screen", per_mode[mode]), ("grid", grid or {})):
+            for label, spec in labelled.items():
+                arm = arm_of("m", mode, label_changes(label), round=round)
+                write_run(cfg, arm, graded_rows(arm, tuned, right=right, version=stamped_version(cfg, arm), spec=spec))
+    if real_profiles is not None:
+        run(cfg)
+    elif play:
+        play_after_search(cfg, held_out=held_out, hosted=hosted, server_running=server_running, load=load)
+    return cfg
+
+
+def checked_rows(arm, cases: list[EvaluationCase], spec: dict, version: str) -> list[dict]:
+    """One run of a check-mode arm: its first `errors` cases failed by the model's endpoint, so not measured; then
+    `right` and `wrong` answerable cases, and `made_up` answers to cases that have none; every other case declined."""
+    errors, right, wrong, made_up = (spec.get(name, 0) for name in ("errors", "right", "wrong", "made_up"))
+    rows = []
+    for mode in arm.modes:
+        answered = invented = 0
+        for number, case in enumerate(cases):
+            if number < errors:
+                rows.append(row(case.id, "error", mode=mode, error_kind="endpoint", version=version))
+            elif case.answerable:
+                outcome = "correct" if answered < right else "wrong" if answered < right + wrong else "deferred_wrongly"
+                answered += 1
+                rows.append(row(case.id, outcome, mode=mode, version=version))
+            else:
+                rows.append(row(case.id, "wrong", mode=mode, made_up=True, version=version) if invented < made_up
+                            else row(case.id, "deferred_correctly", mode=mode, version=version))
+                invented += 1
+        assert errors >= len(cases) or (answered >= right + wrong and invented >= made_up)
+    return rows
+
+
+def checked_sweep(tmp_path: Path, *, start: dict, defaults: dict, modes=("instant",)):
+    """A check-mode sweep of model `m` already run, one run per arm, written as rows, over 26 synthetic questions, 17 of
+    them with an answer and 9 to decline, loaded. `start` and `defaults` are dicts for `checked_rows`."""
+    from mnemiq.sweep.arms import check_arms
+    from mnemiq.sweep.config import load_config
+    from mnemiq.sweep.run import _begin, _parts
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    cfg = load_config(write_config(tmp_path, deployment=_idle_deployment(tmp_path), modes=list(modes),
+                                   dataset=tiny_dataset(tmp_path, cases=26, answerable=17),
+                                   search={"strategy": "check"}, sweep={"repeats": 1}))
+    _begin(cfg)
+    for arm in check_arms(cfg):
+        spec = start if arm.profile_id == "start" else defaults
+        write_run(cfg, arm, checked_rows(arm, _parts(cfg)["tuning"], spec, stamped_version(cfg, arm)))
+    play_after_search(cfg)
+    return cfg
+
+
+def evidence(cfg, model: str = "m") -> dict:
+    """The evidence `propose` wrote for `model`."""
+    return json.loads((out(cfg) / "proposal" / model / "evidence.json").read_text())
+
+
+def proposal_file(cfg, model: str = "m") -> Path:
+    return out(cfg) / "proposal" / model / "profiles.toml"
+
+
+def _assembled_folders(cfg, model: str) -> list[Path]:
+    return sorted(folder for folder in (out(cfg) / model / "confirm").glob("*/assembled-*") if folder.is_dir())
+
+
+def confirm_arms_run(cfg, model: str = "m") -> int:
+    """How many assembled arms the confirm round ran for `model`."""
+    return len(_assembled_folders(cfg, model))
+
+
+def confirm_modes(cfg, model: str = "m") -> list[str]:
+    """The modes the confirm round's assembled arm answered in, from its rows."""
+    (folder,) = _assembled_folders(cfg, model)
+    return sorted({answer["mode"] for answer in json_lines(folder / "run-1" / "rows.jsonl")})
+
+
+def json_lines(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []

@@ -399,10 +399,14 @@ def test_a_report_under_auto_repeats_needs_the_count_the_first_round_decided(tmp
     assert report(cfg, "screen", repeats=1) == ("", [])
 
 
-def test_a_report_of_the_timing_round_is_refused(tmp_path):
-    cfg = load_config(write_config(tmp_path, sweep={"repeats": 1}))
-    with pytest.raises(ValueError, match="timing"):
-        report(cfg, "timing")
+def test_a_timing_round_is_read_against_its_first_20_cases_once(tmp_path):
+    dataset = tiny_dataset(tmp_path, cases=30, answerable=30) | {"held_out": 0.0}
+    cfg = load_config(write_config(tmp_path, dataset=dataset, sweep={"repeats": 2}))
+    start = replace(start_of(cfg, "instant"), round="timing")
+    write_run(cfg, start, [row(case.id, "correct") for case in tuning(cfg)[:20]])
+    (record,) = report(cfg, "timing")[1]
+    # One run, of 20 cases, though every arm of this sweep runs twice on its 30 cases to tune on.
+    assert record["valid"] is True and [(run["run"], run["cases"]) for run in record["runs"]] == [(1, 20)]
 
 
 def test_the_table_has_time_to_rows(tmp_path):
