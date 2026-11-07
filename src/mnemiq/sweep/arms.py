@@ -22,7 +22,7 @@ import json
 import os
 import tempfile
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from mnemiq.agent.modes import MODES, modes_for
 from mnemiq.config import ModeSettings, Settings
@@ -273,6 +273,35 @@ def profile_text(cfg: SweepConfig, arm: Arm) -> str:
         lines += [f"{field} = {_toml(values[f'{mode}.{field}'])}" for field in _MODE_FIELDS
                   if values[f"{mode}.{field}"] is not None]
     return "\n".join(lines) + "\n"
+
+
+def arm_from_profile(cfg: SweepConfig, model: str, round: str, modes: tuple[str, ...], profile_id: str,
+                     path: str | os.PathLike) -> Arm:
+    """The arm whose profiles file `profile_text` wrote at `path`, read back by the engine's own reader.
+
+    A change is each setting the file holds at a value other than the start's, where a setting the file leaves out is
+    unset, and only the sections of `modes` are read. The arm is rebuilt from those changes as its round built it, and
+    refused when it is not `profile_id`: the file was written under another config or another start.
+    """
+    read = _read_profile_file(os.fspath(path))
+    entry = read.profiles[read.default]
+    held = {name: getattr(entry, name) if name in entry.model_fields_set else None for name in PROFILE_SETTINGS}
+    for mode in modes:
+        section = getattr(entry, mode) or ModeSettings()
+        held.update({f"{mode}.{field}": getattr(section, field) if field in section.model_fields_set else None
+                     for field in _MODE_FIELDS})
+    start = start_settings(cfg, model)
+    changes = {name: value for name, value in held.items() if value != start[name]}
+    if profile_id == "defaults":
+        arm = next((replace(arm, round=round) for arm in check_arms(cfg)
+                    if arm.model == model and arm.modes == modes and arm.profile_id == "defaults"), None)
+    else:
+        arm = _arm(model, modes[0], round, changes, modes=modes, assembled=profile_id.startswith("assembled-"))
+    if arm is None or arm.profile_id != profile_id or dict(arm.changes) != changes:
+        found = arm.profile_id if arm is not None and dict(arm.changes) == changes else "other changes"
+        raise ValueError(f"the profile file {path} holds {found!r}, not {profile_id!r}: it was written under another "
+                         "config or another start")
+    return arm
 
 
 def baseline(settings: Settings) -> Settings:

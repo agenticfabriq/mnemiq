@@ -6,7 +6,9 @@ import re
 
 import pytest
 
-from mnemiq.sweep.arms import assembled_arm, check_arms, engine_refusal, grid_arms, profile_text, screen_arms
+from mnemiq.sweep.arms import (
+    arm_from_profile, assembled_arm, check_arms, engine_refusal, grid_arms, profile_text, screen_arms,
+)
 from mnemiq.sweep.config import load_config
 
 from .conftest import KEY_ENV, STUB_KEY, UNREACHABLE, arm_with, start_of, tiny_deployment, tiny_files, write_config
@@ -123,3 +125,30 @@ def test_no_profile_text_carries_a_credential_from_a_deployment_url(tmp_path):
     arms.append(assembled_arm(cfg, "m", {"instant": arm_with(cfg, writer_rules="none"),
                                          "thinking": start_of(cfg, "thinking")})[0])
     assert not [arm.label for arm in arms if "SECRET" in profile_text(cfg, arm)]
+
+
+def test_each_arms_profile_file_reads_back_as_that_arm(tmp_path):
+    start = tmp_path / "start.toml"
+    start.write_text('default = "tuned"\n[profiles.tuned]\nretrieval_k = 12\nllm_seed = 7\n'
+                     '[profiles.tuned.instant]\nplan_attempts = 2\n')
+    cfg = load_config(write_config(tmp_path, modes=["instant", "thinking"], start={"profile_file": str(start)},
+                                   space={"writer_rules": ["none"], "guided_sql": [True], "retrieval_k": [36],
+                                          "instant": {"candidates": [3]}}))
+    picks = {"instant": arm_with(cfg, writer_rules="none"),
+             "thinking": arm_with(cfg, mode="thinking", writer_rules="none", candidates=2)}
+    arms = (screen_arms(cfg) + check_arms(cfg) + [assembled_arm(cfg, "m", picks)[0]]
+            + grid_arms(cfg, {("m", "instant"): {"writer_rules": ["none"], "retrieval_k": [36]}}))
+    # the defaults arm unsets the start's seed, and the assembled arm changes a setting of each mode
+    assert {("llm_seed", None), ("thinking.candidates", 2)} <= {change for arm in arms for change in arm.changes}
+    for number, arm in enumerate(arms):
+        path = tmp_path / f"profile-{number}.toml"
+        path.write_text(profile_text(cfg, arm))
+        assert arm_from_profile(cfg, arm.model, arm.round, arm.modes, arm.profile_id, path) == arm
+
+
+def test_a_profile_file_written_for_another_arm_is_refused(tmp_path):
+    cfg = load_config(write_config(tmp_path, space={"writer_rules": ["none"]}))
+    path = tmp_path / "profile.toml"
+    path.write_text(profile_text(cfg, arm_with(cfg, writer_rules="none")))
+    with pytest.raises(ValueError, match="not 'start'"):
+        arm_from_profile(cfg, "m", "screen", ("instant",), "start", path)

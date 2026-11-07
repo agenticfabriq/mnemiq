@@ -446,6 +446,45 @@ def read_rows(cfg, arm, repeat: int = 1) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
 
 
+def row(case_id: str, outcome: str | None, *, mode: str = "instant", made_up: bool = False,
+        error_kind: str | None = None, verify_layer: str | None = None, version: str = "v1", ms: float = 1000.0,
+        rows_ms: float | None = 800.0, prompt_tokens: int = 900) -> dict:
+    """One row as `run_arm` writes it, for a test that reads rows without running an arm. An error row's model error
+    is a server that stopped answering when its kind is the endpoint's."""
+    answered = outcome in ("correct", "correct_facts", "wrong")
+    return {"id": case_id, "mode": mode, "outcome": outcome, "made_up": made_up,
+            "sql": "SELECT COUNT(*) AS books FROM books" if answered else "", "ms": ms,
+            "rows_ms": rows_ms if answered else None, "calls": 2, "prompt_tokens": prompt_tokens,
+            "completion_tokens": 40, "profile_version": version,
+            "engine_build": {"commit": None, "source_sha": "0" * 64}, "error_kind": error_kind,
+            "model_error": "status_503" if error_kind == "endpoint" else None, "verify_layer": verify_layer}
+
+
+def write_run(cfg, arm, rows: list[dict], repeat: int = 1) -> Path:
+    """One run of `arm` as `run_arm` leaves it: its profile file and its rows, in its folder, which is returned."""
+    from mnemiq.sweep.arms import profile_text
+    from mnemiq.sweep.run import arm_folder
+
+    folder = arm_folder(cfg, arm, repeat)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "profile.toml").write_text(profile_text(cfg, arm))
+    (folder / "rows.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return folder
+
+
+def answers_file(tmp_path: Path, *, gold_for: int = 0, wrong_for: int = 0, declined: int = 0) -> Path:
+    """Another system's answers to the tiny cases: its gold SQL for the first `gold_for` answerable cases, SQL that
+    returns other rows for the next `wrong_for`, and a decline for the first `declined` cases with no answer."""
+    answerable = [case for case in CASES if case.get("answerable", True)]
+    unanswerable = [case for case in CASES if not case.get("answerable", True)]
+    answers = [{"id": case["id"], "sql": case["gold_sql"]} for case in answerable[:gold_for]]
+    answers += [{"id": case["id"], "sql": case["wrong_sql"]} for case in answerable[gold_for:gold_for + wrong_for]]
+    answers += [{"id": case["id"], "declined": True} for case in unanswerable[:declined]]
+    path = tmp_path / "other-system-answers.json"
+    path.write_text(json.dumps(answers, indent=2))
+    return path
+
+
 def out_files(cfg) -> list[Path]:
     """Every file under the sweep's out folder."""
     return [path for path in Path(cfg.sweep.out).rglob("*") if path.is_file()]
