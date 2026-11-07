@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from mnemiq.llm.client import ModelUnavailable
+
 _SYSTEM = """You are a strict SQL reviewer. Given a question, the available schema, a SQL query
 that already ran, and a preview of its result, judge the PROBABILITY (0.0-1.0) that the result
 correctly and completely answers the question. Check: right tables/joins, every filter the
@@ -27,6 +29,8 @@ class JudgeRead:
     # consult counters to learn it. `unparsed` is deterministic for a model that cannot emit the
     # JSON, so retrying buys nothing; `error` is worth another attempt.
     reason: str = "ok"          # "ok" | "error" | "unparsed"
+    # On "error", the kind of the model's failure when the client raised one (`ModelUnavailable.kind`).
+    model_error: str | None = None
 
 
 def _prompt(question: str, schema: str, sql: str, preview: str) -> str:
@@ -68,6 +72,11 @@ class SemanticJudge:
         self.unparsed = 0      # it answered, but no confidence could be read out of the reply
 
     @property
+    def client(self):
+        """The model client this judge calls, for a caller counting what a profile spent."""
+        return self._client
+
+    @property
     def fallbacks(self) -> int:
         """Scores that are the constant rather than a judgement -- errors plus unreadable replies."""
         return self.errors + self.unparsed
@@ -98,9 +107,10 @@ class SemanticJudge:
                 self.unparsed += 1
                 return JudgeRead(1.0, fell_open=True, reason="unparsed")
             return JudgeRead(max(0.0, min(1.0, float(m.group(1)))), fell_open=False)
-        except Exception:
+        except Exception as exc:
             self.errors += 1
-            return JudgeRead(1.0, fell_open=True, reason="error")
+            return JudgeRead(1.0, fell_open=True, reason="error",
+                             model_error=exc.kind if isinstance(exc, ModelUnavailable) else None)
 
     def score(self, question: str, schema: str, sql: str, preview: str) -> float:
         """The float protocol the eval wrappers speak. Behaviour is unchanged, including fail-open."""

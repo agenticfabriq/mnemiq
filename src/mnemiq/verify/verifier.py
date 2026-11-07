@@ -133,11 +133,13 @@ class Verifier:
                 got = reader(packet.question, _judge_schema(packet), sql,
                              render_result(table, max_rows=5))
                 c, fell_open, why = got.score, got.fell_open, got.reason
+                model_error = getattr(got, "model_error", None)
             else:
                 c, fell_open, why = self.judge.score(
                     packet.question, _judge_schema(packet), sql,
                     render_result(table, max_rows=5)
                 ), False, "ok"
+                model_error = None
             if fell_open:
                 # No score, because there was no judgement. The fail-open constant used to travel
                 # in this field and it reads as a confident pass -- M89's shape one field over,
@@ -145,6 +147,6 @@ class Verifier:
                 return VerifyVerdict(None, self.fail_closed, _unavailable_reason(why,
                                      self.fail_closed), "judge_unavailable",
                                      failed=self.fail_closed,
-                                     code=DeferralReason.VERIFIER_UNAVAILABLE)
+                                     code=DeferralReason.VERIFIER_UNAVAILABLE, model_error=model_error)
             return VerifyVerdict(c, c < self.threshold, "The result may not correctly answer the question.", "judge")
         return VerifyVerdict.passed()

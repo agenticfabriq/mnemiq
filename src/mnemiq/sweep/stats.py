@@ -4,6 +4,9 @@ An arm is compared with the start question by question. Only the discordant ques
 right and the other did not. The exact two-sided McNemar test asks how likely a split at least that uneven would be if
 either side were equally likely to win each of them. Every arm compared with the start is one more chance of a lucky
 win, so Holm's step-down correction raises the bar with the number of arms.
+
+The screen asks a narrower question of each value it tries, whether it helped, so it reads one tail only: how likely the
+arm would win at least that many of the discordant questions by chance.
 """
 
 from __future__ import annotations
@@ -21,6 +24,17 @@ def mcnemar_p(only: int, other: int) -> float:
         return 1.0
     tail = sum(math.comb(n, i) for i in range(min(only, other) + 1))
     return float(min(Fraction(2 * tail, 2 ** n), Fraction(1)))
+
+
+def mcnemar_p_one_sided(only: int, other: int) -> float:
+    """The exact one-sided p that the side right alone on `only` questions, against `other` for the other side, wins at
+    least that many of them by chance."""
+    if only < 0 or other < 0:
+        raise ValueError("a count of questions cannot be negative")
+    n = only + other
+    if n == 0:
+        return 1.0
+    return float(Fraction(sum(math.comb(n, i) for i in range(only, n + 1)), 2 ** n))
 
 
 def holm(pvalues: dict[str, float], alpha: float) -> set[str]:

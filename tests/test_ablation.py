@@ -252,3 +252,11 @@ def test_a_snapshot_from_the_wrong_database_is_refused():
     assert complaint and "different database" in complaint
     # Nothing profiled is `enrich`'s complaint to make, not this one's.
     assert source_mismatch(_snapshot(), cases) is None
+
+
+def test_a_gold_query_names_a_table_only_as_a_whole_word():
+    from mnemiq.eval.ablation import names_table
+
+    assert names_table("SELECT title FROM src.main.Books b", "library.books")   # its last part, in any case
+    assert not names_table("SELECT COUNT(*) FROM books", "c")                     # not inside count(*)
+    assert not names_table("SELECT book_id FROM loans", "book")                   # not inside book_id

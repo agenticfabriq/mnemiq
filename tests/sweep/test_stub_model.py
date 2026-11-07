@@ -81,6 +81,15 @@ def test_repeated_asks_vary_the_sql_and_keep_the_rows(tmp_path, stub_model, opti
             assert _rows(first[case].engine_rows) == _rows(second[case].engine_rows), case
 
 
+def test_no_two_asks_of_one_question_are_spelled_alike(tmp_path, stub_model):
+    # Two runs any number of asks apart must differ, or a sweep would read a model that does not repeat as one that does.
+    stub = stub_model(varies=True)
+    runs = [_graded(tmp_path, stub) for _ in range(3)]
+    for case in ANSWERABLE:
+        assert len({run[case].sql for run in runs}) == 3, case
+        assert {run[case].outcome for run in runs} == {Outcome.CORRECT}, case
+
+
 def test_every_spelling_returns_its_answers_rows(tmp_path):
     """The tiny cases themselves: each variant returns its answer's rows, and each wrong answer other rows than gold."""
     from mnemiq.adapters.resolve import adapter_for

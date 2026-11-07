@@ -113,6 +113,11 @@ class AgentAnswer:
     # on -- and the eval harness graded it "safe: gave up on an answerable question" (M6).
     failed: bool = False
     reason_code: DeferralReason | None = None
+    # On an answer the model provider failed, the writer's model or the judge's, which way it failed
+    # (`ModelUnavailable.kind`): a server that stopped answering (`connect`, `status_503`) reads apart from one
+    # question's refusal (`status_400`, `context_too_long`) without parsing the provider's words. None on every other
+    # answer, a judge reply that could not be read included.
+    model_error: str | None = None
     cached: bool = False
     agreement: float | None = None
     judge_engaged: bool | None = None  # multi-candidate only: did the judge get consulted?
@@ -307,6 +312,7 @@ class Agent:
                             f"configuration problem, not a judgement about your data. {detail}"),
                     failed=True,
                     reason_code=DeferralReason.MODEL_UNAVAILABLE,
+                    model_error=exc.kind,
                 )
             if isinstance(exc, ContextTooLong):
                 # Refused rather than cut: the same configuration problem, told the same way.
@@ -321,6 +327,7 @@ class Agent:
                             f"trim column descriptions to fit. {detail[:300]}"),
                     failed=True,
                     reason_code=DeferralReason.MODEL_UNAVAILABLE,
+                    model_error=exc.kind,
                 )
             return AgentAnswer(
                 answer=(
@@ -330,6 +337,7 @@ class Agent:
                 ),
                 failed=True,
                 reason_code=DeferralReason.MODEL_UNAVAILABLE,
+                model_error=exc.kind,
             )
 
     def _answer_single(
@@ -750,6 +758,8 @@ class Agent:
             return AgentAnswer(answer=verdict.reason,
                                deferred=not verdict.failed, failed=verdict.failed,
                                reason_code=verdict.code,
+                               # The judge's model failing, as the writer's does in `answer`.
+                               model_error=verdict.model_error if verdict.failed else None,
                                verify_confidence=verdict.confidence,
                                verify_layer=verdict.layer,
                                # The query RAN before the verifier saw it, so the decision is a

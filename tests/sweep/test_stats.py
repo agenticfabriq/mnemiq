@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import pytest
 
-from mnemiq.sweep.stats import detectable_gain, holm, mcnemar_p
+from mnemiq.sweep.stats import detectable_gain, holm, mcnemar_p, mcnemar_p_one_sided
 
 
 def test_mcnemar_matches_the_exact_binomial():
     assert mcnemar_p(6, 0) == pytest.approx(0.03125) and mcnemar_p(3, 1) == pytest.approx(0.625)
+
+
+def test_the_one_sided_p_counts_the_tail_on_one_side_only():
+    # 5 of 7 discordant questions to one side: at least that many by chance is 29 in 128, and half the two-sided p.
+    assert mcnemar_p_one_sided(4, 0) == pytest.approx(1 / 16) and mcnemar_p_one_sided(5, 2) == pytest.approx(29 / 128)
+    assert mcnemar_p_one_sided(5, 2) == pytest.approx(mcnemar_p(5, 2) / 2)
+    assert mcnemar_p_one_sided(1, 3) == pytest.approx(15 / 16) and mcnemar_p_one_sided(0, 0) == 1.0
 
 
 def test_holm_raises_the_bar_with_the_number_of_arms():

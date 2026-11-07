@@ -126,6 +126,13 @@ _WITHHELD: dict[str, str] = {
     # the fact by someone who cannot re-run the request, so it goes to the audit record instead.
     "judge_fallback_reason": "operator diagnostics; the client-facing half is `judge_fell_back`, "
                              "which does ship -- see the Verity trace for the cause",
+    # Which way the model provider failed, for a caller in the engine's own process that must tell a
+    # server that stopped answering from one question's refusal: a sweep stops an arm on the first
+    # and never on the second. A client is told that the provider failed by `failed` and
+    # `reason_code`, and what it said by `answer`; shipping the kind as well is a wire decision of
+    # its own, not a side effect of measuring.
+    "model_error": "engine diagnostics; the client-facing half is `failed` with `reason_code` "
+                   "model_unavailable, and the provider's own words are in `answer`",
 }
 
 

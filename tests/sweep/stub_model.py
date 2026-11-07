@@ -179,8 +179,9 @@ class StubModel:
       gold          answer every question right. `gold_when(request)` answers right only where it returns true.
                     With neither, a stub answers wrong, unless `varies` or `start_misses` is passed.
       sql           answer every writer call with this SQL, whatever the question.
-      varies        repeated asks of one question get the answer's other spellings in turn, right or wrong, with the
-                    same rows (a case's `variants` or `wrong_variants`). Passed without `gold_when`, right elsewhere.
+      varies        every ask of one question gets a spelling of its own, right or wrong, with the same rows: the
+                    case's spellings in turn (`variants` or `wrong_variants`), each read from a derived table named
+                    for the ask, so no two asks are spelled alike. Passed without `gold_when`, right elsewhere.
       seconds       delay before each chat reply.
       start_misses  answer the first N answerable cases wrong on every request, however `gold` reads. Passed
                     without `gold_when`, right everywhere else.
@@ -191,6 +192,9 @@ class StubModel:
                     window error the client maps to `ContextTooLong`).
       confidence    what the result judge answers.
       window        the context window `/tokenize` and `/v1/models` report.
+      prompt_tokens the prompt tokens every chat reply reports, whatever was sent: a server that read only part of
+                    the prompt reports what it read.
+      embed_status  every embeddings request fails with this: an HTTP code or "connect".
 
     Calling a stub, `stub(**options)`, starts another that shares its cases and stops when it stops.
     """
@@ -199,12 +203,16 @@ class StubModel:
                  gold_when: Callable[[dict], bool] | None = None, sql: str | None = None, varies: bool = False,
                  seconds: float = 0.0, start_misses: int = 0, on_call: Callable[[int], None] | None = None,
                  fail_first: int = 0, fail_after: int | None = None, status: int | str = 500,
-                 confidence: float = 0.9, window: int = 32768, model: str = "stub-model",
+                 confidence: float = 0.9, window: int = 32768, prompt_tokens: int | None = None,
+                 embed_status: int | str | None = None, model: str = "stub-model",
                  script: _Script | None = None) -> None:
         if gold and gold_when is not None:
             raise ValueError("gold and gold_when say the same thing: pass one")
         if isinstance(status, bool) or not (isinstance(status, int) or status in ("connect", "context_too_long")):
             raise ValueError(f"status must be an HTTP code, 'connect' or 'context_too_long', not {status!r}")
+        if embed_status is not None and (isinstance(embed_status, bool)
+                                         or not (isinstance(embed_status, int) or embed_status == "connect")):
+            raise ValueError(f"embed_status must be an HTTP code or 'connect', not {embed_status!r}")
         self.rule = rule
         # `varies` and `start_misses` describe how a right model departs from right, so either alone means one.
         right = gold or (gold_when is None and (varies or start_misses > 0))
@@ -219,6 +227,8 @@ class StubModel:
         self.status = status
         self.confidence = confidence
         self.window = window
+        self.prompt_tokens = prompt_tokens
+        self.embed_status = embed_status
         self.model = model
         # What a test reads.
         self.calls = 0  # chat requests, failed ones included
@@ -318,9 +328,11 @@ class StubModel:
         return _proposal(self._spelled(case.wrong_sql, case.wrong_variants, asked))
 
     def _spelled(self, sql: str, variants: tuple[str, ...], asked: int) -> str:
-        """The `asked`-th spelling of an answer under `varies`, else the answer as scripted."""
-        spellings = (sql, *variants) if self.varies else (sql,)
-        return spellings[asked % len(spellings)]
+        """The answer as scripted, or under `varies` the `asked`-th ask's own spelling of it."""
+        if not self.varies:
+            return sql
+        spellings = (sql, *variants)
+        return f"SELECT * FROM ({spellings[asked % len(spellings)]}) AS ask_{asked}"
 
     # --- the doors --------------------------------------------------------------------------------------------------
 
@@ -365,7 +377,8 @@ class StubModel:
 
     def _completion(self, body: dict, reply: str, n: int) -> dict:
         system, user = _messages(body)
-        prompt, completion = _tokens(len(system) + len(user)), max(1, len(reply) // 4)
+        prompt = self.prompt_tokens if self.prompt_tokens is not None else _tokens(len(system) + len(user))
+        completion = max(1, len(reply) // 4)
         return {
             "id": f"chatcmpl-stub-{n}", "object": "chat.completion", "created": 0,
             "model": body.get("model") or self.model,
@@ -428,6 +441,8 @@ class _Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/v1/chat/completions":
             stub._chat(self, body)
+        elif path == "/v1/embeddings" and stub.embed_status is not None:
+            self.fail(stub.embed_status)
         elif path == "/v1/embeddings":
             self.send_json(200, stub._embeddings(body))
         elif path == "/tokenize":
