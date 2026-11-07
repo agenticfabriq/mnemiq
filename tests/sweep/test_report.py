@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -286,6 +287,18 @@ def test_the_grids_arms_are_compared_with_the_screens_start(tmp_path):
     assert [r["label"] for r in records] == ["start", "retrieval_k=36 + writer_rules=none"]
     assert _record(records, "start")["round"] == "screen"
     assert _record(records, "retrieval_k=36 + writer_rules=none")["pairs"][0]["only"] == 4
+
+
+def test_a_grid_with_no_screen_before_it_is_compared_with_its_own_start(tmp_path):
+    cfg = load_config(write_config(tmp_path, dataset=tiny_dataset(tmp_path, cases=14, answerable=12),
+                                   space={"writer_rules": ["none"]}, search={"strategy": "grid"}, sweep={"repeats": 1}))
+    start, arm = (replace(each, round="grid") for each in (start_of(cfg, "instant"), arm_with(cfg, writer_rules="none")))
+    cases = tuning(cfg)
+    write_run(cfg, start, [row(c.id, "deferred_wrongly" if c.answerable else "deferred_correctly") for c in cases])
+    write_run(cfg, arm, [row(c.id, "correct" if c.answerable else "deferred_correctly") for c in cases])
+    records = report(cfg, "grid")[1]
+    assert _record(records, "start")["round"] == "grid" and _record(records, "start")["valid"] is True
+    assert _record(records, "writer_rules=none")["pairs"][0]["only"] == sum(c.answerable for c in cases)
 
 
 def test_the_screen_keeps_a_value_that_helps_and_drops_one_that_harms(tmp_path):

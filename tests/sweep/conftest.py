@@ -330,6 +330,55 @@ def alter(cfg, change: str) -> None:
         raise ValueError(f"no such change: {change}")
 
 
+def rewrite(cfg, **sections) -> Path:
+    """The config's file with each section's keys changed to those given, as a person edits it before resuming; its
+    path."""
+    def change(doc: dict) -> None:
+        for name, value in sections.items():
+            if isinstance(value, dict):
+                doc.setdefault(name, {}).update(value)
+            else:
+                doc[name] = value
+
+    _rewrite_config(cfg.path, change)
+    return cfg.path
+
+
+def out(cfg) -> Path:
+    """The sweep's out folder."""
+    return Path(cfg.sweep.out)
+
+
+def sweep_json(cfg) -> dict:
+    """The sweep's own record, `sweep.json`."""
+    return json.loads((out(cfg) / "sweep.json").read_text())
+
+
+def started_sweep(tmp_path: Path, stub: StubModel, **sections):
+    """A sweep over the tiny deployment on `stub` whose first round has run, loaded. Each keyword is a section."""
+    from mnemiq.sweep.config import load_config
+    from mnemiq.sweep.run import run
+
+    cfg = load_config(write_config(tmp_path, model=stub, **sections))
+    run(cfg, until="screen")
+    return cfg
+
+
+def write_rows(cfg, arm, *, first: int, torn_last: bool = False) -> None:
+    """What a sweep stopped part way through `arm`'s first run leaves: the sweep's own files, and the arm's rows for the
+    first `first` cases to tune on, the last of them cut short when `torn_last`, as by a process stopped mid-line."""
+    from mnemiq.sweep.run import _begin, arm_folder, run_arm
+
+    _begin(cfg)
+    folder = arm_folder(cfg, arm, 1)
+    run_arm(cfg, arm, tuning(cfg)[:first], folder)
+    if torn_last:
+        rows = folder / "rows.jsonl"
+        text = rows.read_text().rstrip("\n")
+        last = text.rsplit("\n", 1)[-1]
+        rows.write_text(text[:len(text) - len(last) // 2])
+
+
 def config_with(*, held_out: float = 0.3, split_seed: int = 7, strategy: str = "screen-then-grid"):
     """A config for the parts that read no file: validated as `load_config` validates it, without opening any file it
     names."""
@@ -356,9 +405,12 @@ def answerable(some: list[EvaluationCase]) -> int:
     return sum(case.answerable for case in some)
 
 
-def tiny_dataset(tmp_path: Path, *, cases: int, answerable: int) -> dict[str, str]:
+def tiny_dataset(tmp_path: Path, *, cases: int, answerable: int, stub: StubModel | None = None) -> dict[str, str]:
     """A question file of `cases` synthetic questions over the tiny tables, `answerable` of them with gold SQL and the
-    rest to decline. Returned as the `[dataset]` keys that name it, for `write_config(dataset=...)`."""
+    rest to decline. Returned as the `[dataset]` keys that name it, for `write_config(dataset=...)`.
+
+    A stub declines a question it does not know. Given `stub`, it learns these, each answerable one with a wrong
+    answer that returns another count."""
     written = [{"id": f"after-{1900 + i}", "question": f"How many books were published after {1900 + i}?",
                 "gold_sql": f"SELECT COUNT(*) AS books FROM books WHERE published_year > {1900 + i}"}
                for i in range(answerable)]
@@ -366,6 +418,9 @@ def tiny_dataset(tmp_path: Path, *, cases: int, answerable: int) -> dict[str, st
                  "answerable": False} for i in range(cases - answerable)]
     path = tmp_path / f"questions-{cases}-{answerable}.json"
     path.write_text(json.dumps(written, indent=2))
+    if stub is not None:
+        stub.learn(case | ({"wrong_sql": case["gold_sql"].replace(">", "<")} if case["gold_sql"] else {})
+                   for case in written)
     return {"questions": str(path)}
 
 

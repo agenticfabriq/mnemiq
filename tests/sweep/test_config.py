@@ -53,6 +53,13 @@ def test_a_question_file_that_cannot_be_graded_is_refused(tmp_path, bad):
         load_config(write_config(tmp_path, questions=broken_questions(tmp_path, bad)))
 
 
+def test_no_model_can_take_the_name_of_the_smoke_folder(tmp_path):
+    # A smoke replaces <out>/smoke whole, and a model's arms live in <out>/<model>.
+    models = {"smoke": {"llm_model": "stub-model", "llm_base_url": UNREACHABLE, "api_key_env": KEY_ENV}}
+    with pytest.raises(SweepConfigError, match="models.smoke"):
+        load_config(write_config(tmp_path, models=models))
+
+
 def test_max_errors_must_be_a_count(tmp_path):
     for bad in (-1, 1.5, True, "2"):
         with pytest.raises(SweepConfigError, match="max_errors"):

@@ -22,7 +22,6 @@ unjudged are all not right.
 
 from __future__ import annotations
 
-import json
 import statistics
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
@@ -36,7 +35,7 @@ from mnemiq.eval.harness import CaseResult, Outcome, run_case
 from mnemiq.runtime import source_adapter
 from mnemiq.sweep.arms import ROUNDS, arm_from_profile
 from mnemiq.sweep.config import Control, SweepConfig, control_answers, deployment_settings, load_questions
-from mnemiq.sweep.run import INVALID, PROFILE, ROWS, _identity
+from mnemiq.sweep.run import INVALID, PROFILE, ROWS, _identity, _rows_so_far
 from mnemiq.sweep.split import split
 from mnemiq.sweep.stats import mcnemar_p, mcnemar_p_one_sided
 
@@ -44,8 +43,6 @@ _RIGHT = frozenset({Outcome.CORRECT, Outcome.CORRECT_FACTS})
 _DECLINED = frozenset({Outcome.DEFERRED_CORRECTLY, Outcome.DEFERRED_WRONGLY})
 _READ = _RIGHT | _DECLINED | {Outcome.WRONG, Outcome.ERROR}
 _UNMEASURED = ("errors", "unjudged", "ungraded")
-# The grid has no start of its own: its arms are compared with the screen's.
-_START_ROUND = {"grid": "screen"}
 # The part of the questions each round runs on, when it is not the tuning part.
 _ROUND_PART = {"confirm": "held_out"}
 _COLUMNS = ("Right", "Strict", "Wrong", "Made up", "Declined", "Failed", "Errors", "Ungraded", "Unjudged", "Median s",
@@ -233,20 +230,6 @@ class _Run:
     invalid: bool
 
 
-def _rows(path: Path) -> list[dict]:
-    """The rows written so far, read without changing the file: an arm may still be writing it, and a line it has not
-    finished is left out."""
-    if not path.exists():
-        return []
-    rows = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            rows.append(json.loads(line))
-        except ValueError:
-            continue
-    return rows
-
-
 def _run_numbers(folder: Path) -> list[int]:
     found = (path.name.removeprefix("run-") for path in folder.glob("run-*") if path.is_dir())
     return sorted(int(number) for number in found if number.isdigit())
@@ -268,9 +251,15 @@ def _arm_folders(cfg: SweepConfig, model: str, round: str, mode: str) -> list[tu
 
 def _runs(folder: Path, mode: str, count: int) -> dict[int, _Run]:
     """Runs 1 to `count` of the arm in `folder`, those that have a folder, with their rows in `mode`."""
-    return {number: _Run([row for row in _rows(folder / f"run-{number}" / ROWS) if row.get("mode") == mode],
+    return {number: _Run([row for row in _rows_so_far(folder / f"run-{number}" / ROWS) if row.get("mode") == mode],
                          (folder / f"run-{number}" / INVALID).exists())
             for number in range(1, count + 1) if (folder / f"run-{number}").is_dir()}
+
+
+def _start_round(cfg: SweepConfig, round: str) -> str:
+    """The round whose start the arms of `round` are compared with. A grid that follows a screen has no start of its
+    own, and is compared with the screen's; a grid run with no screen before it runs its own start."""
+    return "screen" if round == "grid" and cfg.search.strategy == "screen-then-grid" else round
 
 
 def _owed(cfg: SweepConfig, round: str) -> dict[str, str | None]:
@@ -290,7 +279,7 @@ def _against(pairs: dict[int, Pair], tallies: Mapping[int, Tally], start: Mappin
 
 def _table_records(cfg: SweepConfig, model: str, mode: str, round: str, owed: Mapping[str, str | None],
                    controls: list[tuple[str, list[dict]]], repeats: int) -> list[dict]:
-    start_round = _START_ROUND.get(round, round)
+    start_round = _start_round(cfg, round)
     start = next((folder for profile_id, _, folder in _arm_folders(cfg, model, start_round, mode)
                   if profile_id == "start"), None)
     arms = [found for found in _arm_folders(cfg, model, round, mode) if found[0] != "start"]
@@ -390,8 +379,8 @@ def report(cfg: SweepConfig, round: str, *, repeats: int | None = None) -> tuple
     Made up, Declined, Failed, Errors, Ungraded, Unjudged, Median s, Median s to rows and Prompt tokens (per question),
     each cell giving every run's value in turn, and, against the start, only/other and p for each run. The screen's
     table also marks the arms whose value it keeps (Kept), and its p is the one-sided p it decides by; every other
-    round's is the two-sided p. The grid's arms are compared with the screen's start. The timing round is refused: its
-    arms answer only the cases timed.
+    round's is the two-sided p. A grid that follows a screen is compared with the screen's start. The timing round is
+    refused: its arms answer only the cases timed.
 
     Each arm's label and changes are read back from the profile file its run wrote (`arm_from_profile`), and an arm
     folder this config would not have written is refused.
