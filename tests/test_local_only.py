@@ -405,17 +405,17 @@ def test_where_a_url_reads_as_no_host_its_password_ends_where_redact_says(url):
     assert scrub_credentials(url) == f"{prefix}***@{rest}"
 
 
-_AT_OUTSIDE_THE_NETLOC = ["http://host/models@v2", "https://api.example.com/models/vendor-model@2024/v1",
-                          "https://host/v1?user=a@b", "https://host/v1#frag@x"]
+_AT_OUTSIDE_THE_NETLOC = [("http://host/models@v2", "host"),
+                          ("https://api.example.com/models/vendor-model@2024/v1", "api.example.com"),
+                          ("https://host/v1?user=a@b", "host"), ("https://host/v1#frag@x", "host")]
 
 
-@pytest.mark.parametrize("url", _AT_OUTSIDE_THE_NETLOC)
-def test_an_at_outside_the_netloc_leaves_the_url_as_it_is(url):
+@pytest.mark.parametrize("url, host", _AT_OUTSIDE_THE_NETLOC)
+def test_an_at_outside_the_netloc_leaves_the_url_as_it_is(url, host):
     # The URL reads the standard way as a host, so that reading stands and its path, query and fragment are its own.
     from mnemiq.config import without_credentials
 
     assert without_credentials(url) == url
-    host = "api.example.com" if "api.example.com" in url else "host"
     assert _s(llm_base_url=url, llm_api_key="k").local_only_offenders() == [
         f"llm_base_url={url!r} (host {host!r} is a DNS name; this check does not resolve names, so it cannot confirm "
         "one stays on this network)"]
