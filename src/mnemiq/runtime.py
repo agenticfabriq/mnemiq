@@ -950,6 +950,43 @@ def load_current_snapshot(settings: Settings, con) -> tuple[Snapshot, dict[str, 
     return load_snapshot(con, v), versions
 
 
+def source_adapter(settings: Settings, *, read_only: bool):
+    """The adapter a runtime runs its statements through, for the sources `settings` names, and
+    the one anything grading against those sources runs on, so the two cannot differ.
+    `read_only` attaches every source read-only."""
+    specs = settings.source_specs()
+    if len(specs) > 1:
+        # Federated: ATTACH all sources into one DuckDB; the snapshot is the qualified union,
+        # carrying the catalog->schema registry the decider expands with.
+        from mnemiq.adapters.federated import FederatedAdapter
+
+        from mnemiq.adapters.duckdb import UnparseableDSN
+
+        try:
+            return FederatedAdapter(specs, read_only=read_only, local_only=settings.local_only,
+                                    statement_timeout_s=DEFAULT_TIMEOUT_S)
+        except UnparseableDSN as exc:  # a sentence, as the single-source door gives
+            raise SnapshotMissing(str(exc)) from exc
+    # Single source: dispatch on the SPEC, not on pg_dsn. This branch used to read
+    # `settings.pg_dsn` directly, which meant a one-entry manifest was resolved into a spec
+    # and then thrown away -- two sources were honoured and one was not. `adapter_for` is
+    # shared with the enrich and refresh commands so the three doors cannot drift apart.
+    from mnemiq.adapters.resolve import SourceUnconfigured, UnknownSourceKind, adapter_for
+
+    try:
+        # Bounded server-side at the execution timeout (M152): DuckDB's interrupt alone left
+        # the request waiting on, and the database running, every query it gave up on.
+        return adapter_for(specs[0], settings, read_only=read_only,
+                           statement_timeout_s=DEFAULT_TIMEOUT_S)
+    except (SourceUnconfigured, UnknownSourceKind) as exc:
+        # Preserves the established contract: a source the engine cannot connect to raises
+        # SnapshotMissing, now with a message that names what is actually missing. The
+        # unknown-kind case is translated too because `mnemiq ask` and `mnemiq write` catch
+        # SnapshotMissing and print it -- a typo in a manifest should be a sentence, not a
+        # traceback, on every door.
+        raise SnapshotMissing(str(exc)) from exc
+
+
 def build_runtime(settings: Settings) -> Runtime:
     default_mode = settings.default_mode or DEFAULT_MODE
     if default_mode not in MODES:
@@ -964,40 +1001,8 @@ def build_runtime(settings: Settings) -> Runtime:
     con = init_store(settings.store_path, local_only=settings.local_only)
     # Current version per source (shared pointer when a control DSN is set, else local) + snapshot.
     snapshot, loaded_versions = load_current_snapshot(settings, con)
-    specs = settings.source_specs()
-    if len(specs) > 1:
-        # Federated: ATTACH all sources into one DuckDB; the snapshot is the qualified union,
-        # carrying the catalog->schema registry the decider expands with.
-        from mnemiq.adapters.federated import FederatedAdapter
-
-        from mnemiq.adapters.duckdb import UnparseableDSN
-
-        try:
-            adapter = FederatedAdapter(specs, read_only=not settings.write_enabled,
-                                       local_only=settings.local_only,
-                                       statement_timeout_s=DEFAULT_TIMEOUT_S)
-        except UnparseableDSN as exc:  # a sentence, as the single-source door gives
-            raise SnapshotMissing(str(exc)) from exc
-    else:
-        # Single source: dispatch on the SPEC, not on pg_dsn. This branch used to read
-        # `settings.pg_dsn` directly, which meant a one-entry manifest was resolved into a spec
-        # and then thrown away -- two sources were honoured and one was not. `adapter_for` is
-        # shared with the enrich and refresh commands so the three doors cannot drift apart.
-        # Read-only attach unless writes are explicitly enabled -- the backstop under db_write.
-        from mnemiq.adapters.resolve import SourceUnconfigured, UnknownSourceKind, adapter_for
-
-        try:
-            # Bounded server-side at the execution timeout (M152): DuckDB's interrupt alone left
-            # the request waiting on, and the database running, every query it gave up on.
-            adapter = adapter_for(specs[0], settings, read_only=not settings.write_enabled,
-                                  statement_timeout_s=DEFAULT_TIMEOUT_S)
-        except (SourceUnconfigured, UnknownSourceKind) as exc:
-            # Preserves the established contract: a source the engine cannot connect to raises
-            # SnapshotMissing, now with a message that names what is actually missing. The
-            # unknown-kind case is translated too because `mnemiq ask` and `mnemiq write` catch
-            # SnapshotMissing and print it -- a typo in a manifest should be a sentence, not a
-            # traceback, on every door.
-            raise SnapshotMissing(str(exc)) from exc
+    # Read-only attach unless writes are explicitly enabled -- the backstop under db_write.
+    adapter = source_adapter(settings, read_only=not settings.write_enabled)
 
     # Live L2 (cross-replica) + observability sink when a control Postgres is configured;
     # L1-only + no-op sink otherwise (today, byte-for-byte).
