@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sqlite3
 import tomllib
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+import duckdb
 import pytest
 
 from mnemiq.config import DEFAULT_RETRIEVAL_K, Settings
@@ -161,14 +163,24 @@ def tiny_files(tmp_path: Path) -> TinyDeployment:
     return d
 
 
-def tiny_deployment(tmp_path: Path, stub: StubModel, *, env_extra: dict[str, str] | None = None) -> TinyDeployment:
+def _write_authz(d: TinyDeployment, *, withhold: str | None, row_filter: bool) -> None:
+    tables = [table for table in ("authors", "books", "loans") if table != withhold]
+    role = {"read": tables, "row_filters": {"loans": "returned = 1"}} if row_filter else tables
+    d.authz.write_text(json.dumps({"roles": {ROLE: role}}))
+
+
+def tiny_deployment(tmp_path: Path, stub: StubModel, *, env_extra: dict[str, str] | None = None,
+                    withhold: str | None = None, row_filter: bool = False) -> TinyDeployment:
     """The tiny deployment, its store built once per `tmp_path`: a second call returns what the first built, so a
     rebuilt store never moves a fingerprint. Its env file points at the first stub given, for chat and embeddings, and
     every stub given learns its cases. `env_extra` adds lines to the env file, as `{"MNEMIQ_NAME": "value"}`, and is
-    taken only by the call that builds the deployment."""
+    taken only by the call that builds the deployment. `withhold` takes one table out of the sweep's role, and
+    `row_filter` gives the role a row filter; the store does not depend on either."""
     from mnemiq.cli import _cmd_build, _cmd_enrich
 
     d = tiny_files(tmp_path)
+    if withhold is not None or row_filter:
+        _write_authz(d, withhold=withhold, row_filter=row_filter)
     if env_extra and d.store.exists():
         raise ValueError("env_extra is written when the deployment is built: pass it to the first call for this "
                          "tmp_path")
@@ -380,6 +392,94 @@ def start_of(cfg, mode: str, *, model: str = "m"):
     from mnemiq.sweep.arms import screen_arms
 
     return next(a for a in screen_arms(cfg) if a.model == model and a.mode == mode and not a.changes)
+
+
+def two_deployments(tmp_path: Path, stub: StubModel) -> dict:
+    """The tiny deployment read as two, `lib-a` and `lib-b`, with the tiny cases split between them by db_id: two env
+    files naming the same store and source, `lib-b`'s with a longer question limit, which its profile's version holds.
+    Returned as the `[dataset]` keys that name them, for `write_config(dataset=...)`."""
+    d = tiny_deployment(tmp_path, stub)
+    envs = {name: d.root / f"{name}.env" for name in ("lib-a", "lib-b")}
+    envs["lib-a"].write_text(d.env.read_text())
+    envs["lib-b"].write_text(d.env.read_text() + "MNEMIQ_MAX_QUESTION_CHARS='2000'\n")
+    questions = d.root / "questions-two-deployments.json"
+    questions.write_text(json.dumps([_graded(case) | {"db_id": ("lib-a", "lib-b")[number % 2]}
+                                     for number, case in enumerate(CASES)]))
+    return {"questions": str(questions), "deployments": {name: str(env) for name, env in envs.items()}}
+
+
+def one_arm(tmp_path: Path, stub: StubModel, *, env_extra: dict[str, str] | None = None,
+            api_key_env: str | None = None, **sections):
+    """A loaded config over the tiny deployment on `stub`, and the screen's start arm in instant mode. `env_extra` goes
+    to `tiny_deployment`, `api_key_env` names model `m`'s key variable, and each other keyword is a config section."""
+    from mnemiq.sweep.config import load_config
+
+    d = tiny_deployment(tmp_path, stub, env_extra=env_extra)
+    if api_key_env is not None:
+        sections["models"] = {"m": {"llm_model": "stub-model", "llm_base_url": stub.url, "api_key_env": api_key_env}}
+    cfg = load_config(write_config(tmp_path, deployment=d, model=stub, **sections))
+    return cfg, start_of(cfg, "instant")
+
+
+def tuning(cfg) -> list[EvaluationCase]:
+    """The cases the search runs on."""
+    from mnemiq.sweep.config import load_questions
+    from mnemiq.sweep.split import split
+
+    return split(cfg, load_questions(cfg))["tuning"]
+
+
+def read_rows(cfg, arm, repeat: int = 1) -> list[dict]:
+    """The rows of one run of `arm`, as written."""
+    from mnemiq.sweep.run import arm_folder
+
+    path = arm_folder(cfg, arm, repeat) / "rows.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
+
+
+def out_files(cfg) -> list[Path]:
+    """Every file under the sweep's out folder."""
+    return [path for path in Path(cfg.sweep.out).rglob("*") if path.is_file()]
+
+
+def touch_store(cfg, data: bytes) -> None:
+    """Append `data` to the deployment's own store, as anything else writing to it would change it."""
+    from mnemiq.sweep.config import deployment_settings
+
+    with open(deployment_settings(cfg, None).store_path, "ab") as fh:
+        fh.write(data)
+
+
+def cancel_gold_once(monkeypatch, case_id: str = CASES[0]["id"]) -> None:
+    """The source interrupts one case's gold query the first time it runs, as a statement bound does under load. The
+    answer's own SQL reaches the source with the guard's row limit added, so only the grader's run of the gold matches;
+    were the answer's run cancelled instead, it would be repaired, and the case would end with no error."""
+    from mnemiq.adapters.duckdb import DuckDBAdapter
+
+    gold = next(case["gold_sql"] for case in CASES if case["id"] == case_id)
+    run = DuckDBAdapter.execute_arrow
+    cancelled: list[str] = []
+
+    def execute_arrow(self, sql, timeout_s=None):
+        if sql == gold and not cancelled:
+            cancelled.append(sql)
+            raise duckdb.InterruptException("INTERRUPT Error: Interrupted!")
+        return run(self, sql, timeout_s)
+
+    monkeypatch.setattr(DuckDBAdapter, "execute_arrow", execute_arrow)
+
+
+def copy_package(tmp_path: Path) -> Path:
+    """A copy of the installed `mnemiq` package's Python source."""
+    import mnemiq
+
+    source = Path(mnemiq.__file__).resolve().parent
+    target = tmp_path / "mnemiq"
+    for path in source.rglob("*.py"):
+        copied = target / path.relative_to(source)
+        copied.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, copied)
+    return target
 
 
 @pytest.fixture(autouse=True)
