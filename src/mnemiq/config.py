@@ -48,15 +48,19 @@ def names_a_credential(name: str) -> bool:
     return any(hint in name.lower() for hint in _CREDENTIAL_HINTS)
 
 
-def _authority(value: str) -> tuple[str, str, str, str]:
-    """`value` cut as (scheme, `://`, authority, the rest), as a string and never parsed. With no scheme, an Easy
-    Connect string's `user/password@host` puts a `/` before the `@`, so only `?` and `#` end the authority."""
+def _split_userinfo(value: str) -> tuple[str, str | None, str]:
+    """`value` cut as (its `scheme://` or nothing, its user and password or None, what follows their `@`), read as a
+    string and never parsed.
+
+    They run to the last `@` before whitespace, `?` or `#`, the rule `mnemiq.redact` documents for a source's words, so
+    a raw `/` or `@` in a password is taken whole. An `@` in a path is read as theirs too, which shows less, never
+    more. With no scheme, an Easy Connect string's `user/password@host` is read by the same rule.
+    """
     scheme, sep, rest = value.partition("://")
-    if not sep:
-        scheme, rest = "", value
-    end = re.search(r"[/?#]" if sep else r"[?#]", rest)
-    cut = end.start() if end else len(rest)
-    return scheme, sep, rest[:cut], rest[cut:]
+    prefix, rest = (scheme + sep, rest) if sep else ("", value)
+    end = re.search(r"[\s?#]", rest)
+    at = rest.rfind("@", 0, end.start() if end else len(rest))
+    return (prefix, rest[:at], rest[at + 1:]) if at != -1 else (prefix, None, rest)
 
 
 def without_credentials(value: str) -> str:
@@ -71,11 +75,14 @@ def without_credentials(value: str) -> str:
         return " ".join(_KEYWORD_PASSWORD.sub(" ", value).split())
     if "://" not in value and any(c.isspace() for c in value):
         return value  # a keyword DSN with no password in it
-    scheme, sep, authority, rest = _authority(value)
-    userinfo, at, host = authority.rpartition("@")
-    if at:
+    prefix, userinfo, rest = _split_userinfo(value)
+    kept_user = ""
+    if userinfo is not None:
+        # A database URL keeps its user, which names who reads; a web URL's user is part of its credential. A "user"
+        # holding a `/` is no user: the read ran across a path.
         user = userinfo.split(":", 1)[0]
-        authority = f"{user}@{host}" if sep and user and scheme.lower() not in _WEB_SCHEMES else host
+        if prefix and prefix[:-3].lower() not in _WEB_SCHEMES and user and "/" not in user:
+            kept_user = f"{user}@"
     before_fragment, hash_, fragment = rest.partition("#")
     path, question, query = before_fragment.partition("?")
     if question:
@@ -83,14 +90,19 @@ def without_credentials(value: str) -> str:
         kept = [pair for pair in pairs if not names_a_credential(unquote_plus(pair.split("=", 1)[0]))]
         if len(kept) < len(pairs):
             before_fragment = path + ("?" + "&".join(kept) if kept else "")
-    return f"{scheme}{sep}{authority}{before_fragment}{hash_}{fragment}"
+    return f"{prefix}{kept_user}{before_fragment}{hash_}{fragment}"
+
+
+_HOST_IN_USERINFO = ("the only host it gives is read from inside its user and password, which are not percent-encoded, "
+                     "so it is not named")
 
 
 def _without_userinfo(text: str, url: str) -> str:
     """`text`, a parser's message about `url`, with whatever `url` holds before its host's `@` taken out: a parse error
     can quote the URL's netloc."""
-    userinfo, at, _ = _authority(url)[2].rpartition("@")
-    return text.replace(f"{userinfo}@", "") if at else text
+    userinfo = _split_userinfo(url)[1]
+    return text if userinfo is None else text.replace(f"{userinfo}@", "")
+
 
 # Every `Settings` field `assert_local_only` checks, by name. Nothing enforces that a NEW field
 # whose name ends in `_url` gets added here -- a future verity_*_url (or any other) setting would
@@ -363,12 +375,20 @@ class Settings(BaseSettings):
             if host in ("localhost", "localhost.localdomain"):
                 checked.append(name)
                 continue
+            # A parser reads a password holding a raw `/` as the host and a path, so the host it gives can be part of
+            # the credential. Such a host is not named; the decision is the same either way.
+            userinfo = _split_userinfo(url)[1]
+            if userinfo is not None and host in userinfo.lower():
+                host_named = None
+            else:
+                host_named = host
             try:
                 addr = ipaddress.ip_address(host)
             except ValueError:
                 offenders.append(
-                    f"{name}={shown!r} (host {host!r} is a DNS name; this check does not "
+                    f"{name}={shown!r} (host {host_named!r} is a DNS name; this check does not "
                     "resolve names, so it cannot confirm one stays on this network)"
+                    if host_named is not None else f"{name}={shown!r} ({_HOST_IN_USERINFO})"
                 )
                 continue
             # An IPv4-mapped IPv6 literal (`::ffff:10.0.0.1`) is IPv4's 10.0.0.1 by another
@@ -381,7 +401,8 @@ class Settings(BaseSettings):
             in_rfc1918 = v4_equivalent.version == 4 and any(v4_equivalent in net for net in rfc1918)
             in_ula = addr.version == 6 and addr in ula
             if not (v4_equivalent.is_loopback or in_rfc1918 or in_ula):
-                offenders.append(f"{name}={shown!r} (host {host} is publicly routable)")
+                offenders.append(f"{name}={shown!r} (host {host_named} is publicly routable)"
+                                 if host_named is not None else f"{name}={shown!r} ({_HOST_IN_USERINFO})")
                 continue
             checked.append(name)
         return offenders, checked

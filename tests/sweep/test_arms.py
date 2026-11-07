@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 from mnemiq.sweep.arms import assembled_arm, check_arms, engine_refusal, grid_arms, profile_text, screen_arms
 from mnemiq.sweep.config import load_config
 
@@ -94,16 +96,18 @@ def test_an_env_files_setting_never_reaches_the_engines_check(tmp_path):
     assert engine_refusal(cfg, start_of(cfg, "instant")) is None
 
 
-def test_a_refusal_never_quotes_a_credential_from_a_deployment_url(tmp_path):
+@pytest.mark.parametrize("url", ["http://embed:SECRET@embedder.example/v1?api_key=SECRET",
+                                 "http://embed:abc/SECRET@embedder.example/v1"])
+def test_a_refusal_never_quotes_a_credential_from_a_deployment_url(tmp_path, url):
     # Whatever an arm's refusal names, the sweep shows a deployment's URLs without their credentials. Here the refusal
     # is the local-only check's, for an embedder on a DNS name.
     d = tiny_files(tmp_path)
-    embedder = "MNEMIQ_EMBED_BASE_URL='http://embed:SECRET@embedder.example/v1?api_key=SECRET'"
+    embedder = f"MNEMIQ_EMBED_BASE_URL='{url}'"
     env = d.env.read_text().replace(f"MNEMIQ_EMBED_BASE_URL='{UNREACHABLE}'", embedder)
     d.env.write_text(env + "MNEMIQ_LOCAL_ONLY='true'\n")
     cfg = load_config(write_config(tmp_path, deployment=d))
     refusal = engine_refusal(cfg, start_of(cfg, "instant"))
-    assert "embed_base_url" in refusal and "embedder.example" in refusal and "SECRET" not in refusal
+    assert "embed_base_url='http://embedder.example/v1'" in refusal and "SECRET" not in refusal
 
 
 def test_no_profile_text_carries_a_credential_from_a_deployment_url(tmp_path):

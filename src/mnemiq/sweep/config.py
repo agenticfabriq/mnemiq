@@ -19,7 +19,7 @@ import tomllib
 from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated, Any, Literal
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import urlsplit
 
 from pydantic import (
     AfterValidator, BaseModel, ConfigDict, Field, PrivateAttr, TypeAdapter, ValidationError, ValidationInfo,
@@ -27,7 +27,7 @@ from pydantic import (
 )
 
 from mnemiq.agent.modes import MODES
-from mnemiq.config import _SECRET_HINTS, ModeSettings, Settings, SourceSpec, names_a_credential, without_credentials
+from mnemiq.config import _SECRET_HINTS, ModeSettings, Settings, SourceSpec, without_credentials
 from mnemiq.contract import EvaluationCase
 from mnemiq.profiles import _NAME, DEPLOYMENT_SETTINGS, PROFILE_SETTINGS, ProfileFileError
 from mnemiq.profiles import _read as _read_profile_file
@@ -80,18 +80,18 @@ def _endpoint_url(value: str | None, info: ValidationInfo) -> str | None:
     if value is None:
         return None
     key_env = "verify_api_key_env" if info.field_name.startswith("verify_") else "api_key_env"
+    # Checked before any parse, which can stop at a password first. Any `@` is refused, not only one a parser would
+    # read as a user's: a raw `?`, `#` or `/` in a password moves where a parser looks, and a base URL needs no `@`.
+    if "@" in value or without_credentials(value) != value:
+        raise ValueError("carries a credential (a user or password before an '@', or a key in its query). A key never "
+                         f"goes in this file: name the environment variable that holds it in {key_env}")
     try:
         parts = urlsplit(value)
         host, _ = parts.hostname, parts.port  # `port` raises for one that is not a number
-        query = parse_qsl(parts.query, keep_blank_values=True)
     except ValueError:
         raise ValueError("is not a URL that can be read") from None
-    # Without a scheme, a user and password read as the URL's path, where the check below would not look.
     if parts.scheme not in _WEB_SCHEMES or not host:
         raise ValueError("must be an http or https URL with a host, such as http://192.0.2.10:8000/v1")
-    if "@" in parts.netloc or any(names_a_credential(name) for name, _ in query):
-        raise ValueError("carries a credential (a user or password before '@', or a key in its query). A key never "
-                         f"goes in this file: name the environment variable that holds it in {key_env}")
     return value
 
 

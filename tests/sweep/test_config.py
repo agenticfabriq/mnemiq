@@ -129,6 +129,10 @@ def test_the_start_profile_files_content_is_pinned(tmp_path, stub_model):
     ("chat", "http://localhost/v1?api_key=SECRET", "api_key_env"),
     ("model judge", "https://judge:SECRET@localhost/v1", "verify_api_key_env"),
     ("judge table", "http://localhost/v1?access_token=SECRET", "verify_api_key_env"),
+    ("chat", "https://user:abc/SECRET@localhost/v1", "api_key_env"),
+    ("chat", "https://user:abc#SECRET@localhost/v1", "api_key_env"),
+    ("chat", "https://user:abc?SECRET@localhost/v1", "api_key_env"),
+    ("chat", "user:SECRET@localhost/v1", "api_key_env"),  # no scheme: a parser reads the password as a path
 ])
 def test_an_endpoint_url_that_carries_a_credential_is_refused(tmp_path, where, url, key_env):
     model = {"llm_model": "stub-model", "llm_base_url": UNREACHABLE, "api_key_env": KEY_ENV}
@@ -144,13 +148,12 @@ def test_an_endpoint_url_that_carries_a_credential_is_refused(tmp_path, where, u
     assert "SECRET" not in str(refused.value) and url not in str(refused.value)
 
 
-@pytest.mark.parametrize("url", ["user:SECRET@localhost/v1", "localhost:8000/v1", "ftp://localhost/v1"])
+@pytest.mark.parametrize("url", ["localhost:8000/v1", "ftp://localhost/v1", "http:///v1"])
 def test_an_endpoint_url_must_be_http_with_a_host(tmp_path, url):
-    # Without a scheme, a URL's user and password read as its path, where no check for them would look.
     model = {"llm_model": "stub-model", "llm_base_url": url, "api_key_env": KEY_ENV}
-    with pytest.raises(SweepConfigError, match="http") as refused:
+    with pytest.raises(SweepConfigError, match="http or https URL with a host") as refused:
         load_config(write_config(tmp_path, models={"m": model}))
-    assert "SECRET" not in str(refused.value) and url not in str(refused.value)
+    assert url not in str(refused.value)
 
 
 def test_a_deployment_urls_credentials_stay_out_of_the_fingerprint_and_its_host_does_not(tmp_path, stub_model):
@@ -168,6 +171,8 @@ def test_a_deployment_urls_credentials_stay_out_of_the_fingerprint_and_its_host_
     assert fingerprint_with("http://other:SECRET1@127.0.0.1:9/v1") == base  # on a web endpoint the user is a credential
     assert (fingerprint_with("http://127.0.0.1:9/v1?api_key=SECRET1")
             == fingerprint_with("http://127.0.0.1:9/v1?api_key=SECRET2"))
+    assert (fingerprint_with("http://embed:abc/SECRET1@127.0.0.1:9/v1")  # a raw `/` in the password
+            == fingerprint_with("http://embed:abc/SECRET2@127.0.0.1:9/v1"))
     assert fingerprint_with("http://embed:SECRET1@127.0.0.2:9/v1") != base  # the host
 
 

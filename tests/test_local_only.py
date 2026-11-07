@@ -380,3 +380,25 @@ def test_an_endpoint_with_no_credentials_is_named_as_written():
         "embed_base_url='https://8.8.8.8/v1' (host 8.8.8.8 is publicly routable)",
         "verify_base_url='http://[::1/v1' (not a parseable URL: Invalid IPv6 URL)",
     ]
+
+
+def test_a_password_with_a_raw_slash_is_taken_out_whole():
+    # Its user and password run to the last `@` before whitespace, `?` or `#`, as `mnemiq.redact` reads them, so a `/`
+    # in a base64 token does not end them early. A parser reads a host from inside them, which is not named either.
+    s = _s(llm_base_url="http://127.0.0.1:8000/v1", llm_api_key="k",
+           embed_base_url="https://keyuser:abc/SECRET@api.example.com/v1")
+    with pytest.raises(RuntimeError) as exc:
+        s.assert_local_only()
+    msg = str(exc.value)
+    assert "SECRET" not in msg and "keyuser" not in msg
+    assert "embed_base_url='https://api.example.com/v1'" in msg
+
+
+@pytest.mark.parametrize("url", ["postgresql://svc:p/w@10.2.0.7/db", "https://u:a/b@host/v1?x=1",
+                                 "http://host/models@v2", "mysql://u:pw@h/db#t", "https://host/v1?user=a@b"])
+def test_the_user_and_password_end_where_redact_says(url):
+    from mnemiq.config import _split_userinfo
+    from mnemiq.redact import scrub_credentials
+
+    prefix, userinfo, rest = _split_userinfo(url)
+    assert scrub_credentials(url) == (url if userinfo is None else f"{prefix}***@{rest}")
