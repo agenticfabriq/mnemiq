@@ -538,7 +538,7 @@ def test_the_declared_sqlglot_floor_carries_the_symbols_the_guard_USES():
     25.34.1, and `check_shape` only wraps `sqlglot.parse` in a try -- so at the old declared floor
     of `>=25` an `AttributeError` would escape it and EVERY select would CRASH rather than refuse,
     not only star-bearing ones: `_is_star` reaches `exp.Columns` for the first projection of every
-    output select. uv.lock pins 30.12.0, so nothing resolved from the lock was affected; the
+    output select. uv.lock pinned 30.12.0 then, so nothing resolved from the lock was affected; the
     declaration was."""
     import re
     import tomllib
