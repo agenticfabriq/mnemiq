@@ -68,6 +68,11 @@ class SemanticJudge:
         self.unparsed = 0      # it answered, but no confidence could be read out of the reply
 
     @property
+    def client(self):
+        """The model client this judge calls, for a caller counting what a profile spent."""
+        return self._client
+
+    @property
     def fallbacks(self) -> int:
         """Scores that are the constant rather than a judgement -- errors plus unreadable replies."""
         return self.errors + self.unparsed

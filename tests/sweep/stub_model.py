@@ -191,6 +191,8 @@ class StubModel:
                     window error the client maps to `ContextTooLong`).
       confidence    what the result judge answers.
       window        the context window `/tokenize` and `/v1/models` report.
+      prompt_tokens the prompt tokens every chat reply reports, whatever was sent: a server that read only part of
+                    the prompt reports what it read.
 
     Calling a stub, `stub(**options)`, starts another that shares its cases and stops when it stops.
     """
@@ -199,8 +201,8 @@ class StubModel:
                  gold_when: Callable[[dict], bool] | None = None, sql: str | None = None, varies: bool = False,
                  seconds: float = 0.0, start_misses: int = 0, on_call: Callable[[int], None] | None = None,
                  fail_first: int = 0, fail_after: int | None = None, status: int | str = 500,
-                 confidence: float = 0.9, window: int = 32768, model: str = "stub-model",
-                 script: _Script | None = None) -> None:
+                 confidence: float = 0.9, window: int = 32768, prompt_tokens: int | None = None,
+                 model: str = "stub-model", script: _Script | None = None) -> None:
         if gold and gold_when is not None:
             raise ValueError("gold and gold_when say the same thing: pass one")
         if isinstance(status, bool) or not (isinstance(status, int) or status in ("connect", "context_too_long")):
@@ -219,6 +221,7 @@ class StubModel:
         self.status = status
         self.confidence = confidence
         self.window = window
+        self.prompt_tokens = prompt_tokens
         self.model = model
         # What a test reads.
         self.calls = 0  # chat requests, failed ones included
@@ -365,7 +368,8 @@ class StubModel:
 
     def _completion(self, body: dict, reply: str, n: int) -> dict:
         system, user = _messages(body)
-        prompt, completion = _tokens(len(system) + len(user)), max(1, len(reply) // 4)
+        prompt = self.prompt_tokens if self.prompt_tokens is not None else _tokens(len(system) + len(user))
+        completion = max(1, len(reply) // 4)
         return {
             "id": f"chatcmpl-stub-{n}", "object": "chat.completion", "created": 0,
             "model": body.get("model") or self.model,

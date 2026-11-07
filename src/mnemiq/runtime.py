@@ -76,6 +76,18 @@ class LoadedProfile:
     modes: dict[str, Mode]
     agents: dict[str, Agent]
     fitter: Any
+    # The model clients this profile calls, each once: its writer's, which its corrector, selector and prose share, and
+    # its judge's when the judge has a client of its own. What `Runtime.usage` sums.
+    clients: tuple[LLMClient, ...] = ()
+
+
+@dataclass(frozen=True)
+class Usage:
+    """What a profile's model clients have spent since the runtime was built, as the server counted it."""
+
+    calls: int
+    prompt_tokens: int
+    completion_tokens: int
 
 
 @dataclass
@@ -120,6 +132,16 @@ class Runtime:
         if loaded is None or not may_pick(loaded.profile, identity):
             raise UnknownProfile(offered_to(identity, {n: lp.profile for n, lp in self.profiles.items()}))
         return loaded
+
+    def usage(self, profile: str | None = None) -> Usage:
+        """The calls and tokens of `profile` (the default when None), summed over its writer's client and its judge's,
+        as `eval.engine.RunCost` sums an eval engine's. Another profile's calls are never in it."""
+        loaded = (self.profiles or {}).get(profile or self.default_profile)
+        if loaded is None:
+            raise UnknownProfile(sorted(self.profiles or ()))
+        return Usage(calls=sum(client.calls for client in loaded.clients),
+                     prompt_tokens=sum(client.prompt_tokens for client in loaded.clients),
+                     completion_tokens=sum(client.completion_tokens for client in loaded.clients))
 
     def reload_if_stale(self) -> None:
         """Hot-swap the in-memory snapshot when the shared version pointer has advanced to a
@@ -1013,6 +1035,9 @@ def build_runtime(settings: Settings) -> Runtime:
         # judge is built once and shared. MNEMIQ_VERIFY=0 forces off (byte-for-byte), =1 forces full.
         modes = modes_for(profile.settings)
         verifiers, _ = _build_mode_verifiers(profile.settings, client=kit.client, modes=modes)
+        # One judge at most, shared by every mode that runs it; a self-judge calls the writer's client.
+        judge = next((v.judge for v in verifiers.values() if v is not None and v.judge is not None), None)
+        clients = (kit.client,) if judge is None or judge.client is kit.client else (kit.client, judge.client)
         agents = {
             name: build_agent(
                 mode,
@@ -1031,7 +1056,7 @@ def build_runtime(settings: Settings) -> Runtime:
             for name, mode in modes.items()
         }
         loaded[profile_name] = LoadedProfile(profile, profile_version(profile.settings, dialect), profile.settings, modes,
-                                             agents, kit.fitter)
+                                             agents, kit.fitter, clients)
     default = loaded[default_profile]
     commit = read_engine_commit(settings.engine_commit)
     answer_log = build_answer_log(settings)

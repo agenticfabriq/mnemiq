@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 
 import httpx
-from openai import APIError, OpenAI
+from openai import APIConnectionError, APIError, APIStatusError, OpenAI
 
 from mnemiq.config import Settings
 
@@ -21,7 +21,19 @@ class ModelUnavailable(RuntimeError):
     Its own type so the agent can end in a stated failure instead of a traceback, and so
     the SDK's exception classes stop at this module. This is the model-side twin of the
     source refusing to serve us: something that happened TO us, never a decision we made.
+
+    `kind` says which, read from the provider's error where the client raises it, so a caller
+    can tell a server that stopped answering from one question's refusal without parsing the
+    provider's words: `connect` (no answer: a refused or dropped connection, or a timeout),
+    `status_<code>` (an HTTP status), `context_too_long`, `prompt_cut`, else `other`.
     """
+
+    kind: str = "other"
+
+    def __init__(self, *args: object, kind: str | None = None) -> None:
+        super().__init__(*args)
+        if kind is not None:
+            self.kind = kind
 
 
 _FIXED_SAMPLING = re.compile(r"(^|[./])(gpt-5|o[134](-|$))")
@@ -59,6 +71,17 @@ class ContextTooLong(ModelUnavailable):
     own type for a caller that can shorten the prompt: the server is up, a shorter request is served.
     """
 
+    kind = "context_too_long"
+
+
+def _kind(exc: APIError) -> str:
+    """What failed, as `ModelUnavailable.kind` names it. A timeout is the SDK's connection error too."""
+    if isinstance(exc, APIConnectionError):
+        return "connect"
+    if isinstance(exc, APIStatusError):
+        return f"status_{exc.status_code}"
+    return "other"
+
 
 def _context_too_long(exc: Exception) -> bool:
     if getattr(exc, "status_code", None) != 400:
@@ -76,6 +99,8 @@ class PromptCut(ModelUnavailable):
     ModelUnavailable because the model never saw the request it was sent -- but a configuration
     failure, not an outage: retrying sends the same prompt to the same window.
     """
+
+    kind = "prompt_cut"
 
 
 # Two signs that a server may have cut the prompt, because servers cut in two ways -- and neither
@@ -272,9 +297,10 @@ class LLMClient:
                 **kwargs,
             )
         except APIError as exc:
+            # Before the status: a prompt too long for the window arrives as a 400.
             if _context_too_long(exc):
                 raise ContextTooLong(str(exc)) from exc
-            raise ModelUnavailable(str(exc)) from exc
+            raise ModelUnavailable(str(exc), kind=_kind(exc)) from exc
         return resp
 
     def _count(self, resp) -> int:
