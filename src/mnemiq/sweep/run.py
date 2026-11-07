@@ -405,7 +405,7 @@ def run_arm(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder:
     if changed := _copy_stores(cfg, folder, db_ids, pinned):
         _write_json(folder / INVALID, {"changed": changed})
         return "invalid"
-    (folder / PROFILE).write_text(profile_text(cfg, arm), encoding="utf-8")
+    _replace(folder / PROFILE, profile_text(cfg, arm))
     runtimes: dict[str | None, Runtime] = {}
     try:
         for db_id in db_ids:

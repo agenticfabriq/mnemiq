@@ -16,6 +16,7 @@ import json
 import os
 import re
 import tomllib
+from collections.abc import Collection
 from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -386,13 +387,40 @@ def load_config(path: str | os.PathLike) -> SweepConfig:
     cfg._path = path
     for db_id in _deployment_ids(cfg):
         deployment_settings(cfg, db_id)
-    load_questions(cfg)
+    case_ids = {case.id for case in load_questions(cfg)}
     for model in cfg.models:
         _check_start(cfg, model)
     for control in cfg.control:
-        if not os.path.isfile(control.answers):
-            raise SweepConfigError(f"[[control]] {control.name!r}: its answers {control.answers} cannot be read")
+        control_answers(control, case_ids)
     return cfg
+
+
+def control_answers(control: Control, case_ids: Collection[str]) -> list[dict]:
+    """A control's answers, refused unless its file is a non-empty JSON list in which each answer is `{id, sql}`, with
+    SQL, or `{id, declined: true}`, and names a case of `case_ids` once. `load_config` reads them, so a control that
+    cannot be graded is refused before any arm runs."""
+    where = f"[[control]] {control.name!r}: its answers {control.answers}"
+    try:
+        raw = json.loads(Path(control.answers).read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise SweepConfigError(f"{where} cannot be read: {exc.strerror}") from None
+    except ValueError:
+        raise SweepConfigError(f"{where} are not JSON") from None
+    if not isinstance(raw, list) or not raw:
+        raise SweepConfigError(f"{where} must be a non-empty JSON list")
+    seen: set[str] = set()
+    for number, answer in enumerate(raw, start=1):
+        if not (isinstance(answer, dict) and isinstance(answer.get("id"), str) and (
+                (answer.keys() == {"id", "sql"} and isinstance(answer["sql"], str) and answer["sql"].strip())
+                or (answer.keys() == {"id", "declined"} and answer["declined"] is True))):
+            raise SweepConfigError(f"{where}: answer {number} is neither {{id, sql}} nor {{id, declined: true}}")
+        if answer["id"] not in case_ids:
+            raise SweepConfigError(f"{where}: answer {number} names case {answer['id']!r}, which the question file "
+                                   "does not hold")
+        if answer["id"] in seen:
+            raise SweepConfigError(f"{where}: case {answer['id']!r} is answered twice")
+        seen.add(answer["id"])
+    return raw
 
 
 def _deployment_ids(cfg: SweepConfig) -> list[str | None]:

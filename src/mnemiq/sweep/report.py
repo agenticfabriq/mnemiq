@@ -35,7 +35,7 @@ from mnemiq.contract import IdentityContext, Trace
 from mnemiq.eval.harness import CaseResult, Outcome, run_case
 from mnemiq.runtime import source_adapter
 from mnemiq.sweep.arms import ROUNDS, arm_from_profile
-from mnemiq.sweep.config import Control, SweepConfig, SweepConfigError, deployment_settings, load_questions
+from mnemiq.sweep.config import Control, SweepConfig, control_answers, deployment_settings, load_questions
 from mnemiq.sweep.run import INVALID, PROFILE, ROWS, _identity
 from mnemiq.sweep.split import split
 from mnemiq.sweep.stats import mcnemar_p, mcnemar_p_one_sided
@@ -48,8 +48,8 @@ _UNMEASURED = ("errors", "unjudged", "ungraded")
 _START_ROUND = {"grid": "screen"}
 # The part of the questions each round runs on, when it is not the tuning part.
 _ROUND_PART = {"confirm": "held_out"}
-_COLUMNS = ("Arm", "Valid", "Right", "Strict", "Wrong", "Made up", "Declined", "Failed", "Errors", "Ungraded",
-            "Unjudged", "Median s", "Median s to rows", "Prompt tokens")
+_COLUMNS = ("Right", "Strict", "Wrong", "Made up", "Declined", "Failed", "Errors", "Ungraded", "Unjudged", "Median s",
+            "Median s to rows", "Prompt tokens")
 _COUNTED = ("right", "strict", "wrong", "made_up", "declined", "failed", "errors", "ungraded", "unjudged")
 
 
@@ -173,25 +173,6 @@ def pair_runs(start_runs: Mapping[int, Sequence[Mapping]], arm_runs: Mapping[int
     return {number: pair(start_runs[number], arm_runs[number]) for number in sorted(arm_runs) if number in start_runs}
 
 
-def _answers(control: Control) -> list[dict]:
-    """A control's answers, refused unless each is `{id, sql}` or `{id, declined: true}`."""
-    where = f"[[control]] {control.name!r}: its answers {control.answers}"
-    try:
-        raw = json.loads(Path(control.answers).read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise SweepConfigError(f"{where} cannot be read: {exc.strerror}") from None
-    except ValueError:
-        raise SweepConfigError(f"{where} are not JSON") from None
-    if not isinstance(raw, list) or not raw:
-        raise SweepConfigError(f"{where} must be a non-empty JSON list")
-    for number, answer in enumerate(raw, start=1):
-        if not (isinstance(answer, dict) and isinstance(answer.get("id"), str) and (
-                (answer.keys() == {"id", "sql"} and isinstance(answer["sql"], str) and answer["sql"].strip())
-                or (answer.keys() == {"id", "declined"} and answer["declined"] is True))):
-            raise SweepConfigError(f"{where}: answer {number} is neither {{id, sql}} nor {{id, declined: true}}")
-    return raw
-
-
 def _answering(answer: dict, identity: IdentityContext):
     """An engine that gives `answer` to whatever it is asked: the control's SQL, as an answer's trace carries what ran,
     or a decline."""
@@ -215,19 +196,12 @@ def _control_error_kind(result: CaseResult) -> str | None:
 
 
 def grade_control(cfg: SweepConfig, control: Control) -> list[dict]:
-    """A control's answers, each run on its deployment's adapter and graded by `run_case`, as rows like an arm's with no
-    mode, no version, no time and no tokens. A decline is graded as a decline. The adapter is read-only whatever the
-    deployment allows, since nothing checks a control's SQL before it runs."""
-    answers = _answers(control)
+    """A control's answers, read as `load_config` checked them (`control_answers`), each run on its deployment's adapter
+    and graded by `run_case`, as rows like an arm's with no mode, no version, no time and no tokens. A decline is graded
+    as a decline. The adapter is read-only whatever the deployment allows, since nothing checks a control's SQL before
+    it runs."""
     cases = {case.id: case for case in load_questions(cfg)}
-    seen: set[str] = set()
-    for answer in answers:
-        if answer["id"] not in cases:
-            raise SweepConfigError(f"[[control]] {control.name!r} answers case {answer['id']!r}, which the question "
-                                   "file does not hold")
-        if answer["id"] in seen:
-            raise SweepConfigError(f"[[control]] {control.name!r} answers case {answer['id']!r} twice")
-        seen.add(answer["id"])
+    answers = control_answers(control, cases)
     identity = _identity(cfg)
     adapters: dict[str | None, object] = {}
     rows = []
@@ -315,14 +289,11 @@ def _against(pairs: dict[int, Pair], tallies: Mapping[int, Tally], start: Mappin
 
 
 def _table_records(cfg: SweepConfig, model: str, mode: str, round: str, owed: Mapping[str, str | None],
-                   controls: list[tuple[str, list[dict]]], repeats: int | None) -> tuple[list[dict], int]:
+                   controls: list[tuple[str, list[dict]]], repeats: int) -> list[dict]:
     start_round = _START_ROUND.get(round, round)
     start = next((folder for profile_id, _, folder in _arm_folders(cfg, model, start_round, mode)
                   if profile_id == "start"), None)
     arms = [found for found in _arm_folders(cfg, model, round, mode) if found[0] != "start"]
-    if repeats is None:
-        repeats = cfg.sweep.repeats if isinstance(cfg.sweep.repeats, int) else max(
-            (max(_run_numbers(folder), default=1) for _, _, folder in arms), default=1)
 
     def counted(runs: Mapping[int, _Run]) -> dict[int, Tally]:
         return {number: tally(runs[number].rows if number in runs else [], mode, cases=owed,
@@ -361,26 +332,32 @@ def _table_records(cfg: SweepConfig, model: str, mode: str, round: str, owed: Ma
         pairs = {number: pair(start_rows[number], stamped) for number in sorted(start_rows)}
         records.append(record(None, name, name, {}, {None: once},
                               _against(pairs, {number: once for number in pairs}, start_tallies)))
-    return records, repeats
+    return records
 
 
 def _seconds(ms: float | None) -> str:
     return "-" if ms is None else f"{ms / 1000:.1f}"
 
 
-def _cells(record: dict, repeats: int) -> list[str]:
+def _cells(record: dict, repeats: int, *, kept: str | None, one_sided: bool) -> list[str]:
+    """A record's row of the table. `kept` is its Kept cell, None in a round with no such column; `one_sided` shows each
+    run's one-sided p in place of the two-sided one."""
     def each(show) -> str:
         return " / ".join(show(run) for run in record["runs"])
 
     label = f"control: {record['label']}" if record["control"] is not None else record["label"]
-    cells = [label.replace("|", "\\|"), "yes" if record["valid"] else "no"]
+    cells = [label.replace("|", "\\|"), "yes" if record["valid"] else "no", *([kept] if kept is not None else [])]
     cells += [each(lambda run, name=name: str(run[name])) for name in _COUNTED]
     cells += [each(lambda run: _seconds(run["median_ms"])), each(lambda run: _seconds(run["median_rows_ms"])),
               each(lambda run: "-" if run["prompt_tokens"] is None else f"{run['prompt_tokens']:.0f}")]
     pairs = {found["run"]: found for found in record["pairs"]}
     for number in range(1, repeats + 1):
         found = pairs.get(number)
-        cells += [f"{found['only']}/{found['other']}", f"{found['p']:.3g}"] if found else ["-", "-"]
+        if found is None:
+            cells += ["-", "-"]
+            continue
+        p = mcnemar_p_one_sided(found["only"], found["other"]) if one_sided else found["p"]
+        cells += [f"{found['only']}/{found['other']}", f"{p:.3g}"]
     return cells
 
 
@@ -388,10 +365,22 @@ def _line(cells: Sequence[str]) -> str:
     return "| " + " | ".join(cells) + " |"
 
 
-def _table(model: str, mode: str, round: str, records: list[dict], repeats: int) -> str:
-    columns = [*_COLUMNS, *(f"Run {number} {what}" for number in range(1, repeats + 1) for what in ("only/other", "p"))]
+def _table(cfg: SweepConfig, model: str, mode: str, round: str, records: list[dict], repeats: int) -> str:
+    """One model and mode's table. The screen's shows the one-sided p it decides by, and marks each arm it keeps by
+    the rule `kept_values` keeps by."""
+    screen = round == "screen"
+    start = next((record for record in records if record["arm"] == "start"), None)
+    p = "p (one-sided)" if screen else "p"
+    columns = ["Arm", "Valid", *(["Kept"] if screen else []), *_COLUMNS,
+               *(f"Run {number} {what}" for number in range(1, repeats + 1) for what in ("only/other", p))]
     lines = [f"## {model}, {mode}: {round}", "", _line(columns), "|" + "|".join("---" for _ in columns) + "|"]
-    return "\n".join(lines + [_line(_cells(record, repeats)) for record in records])
+    for record in records:
+        kept = None
+        if screen:
+            arm = record["control"] is None and record["arm"] != "start"
+            kept = ("yes" if _kept(cfg, record, start) else "no") if arm else "-"
+        lines.append(_line(_cells(record, repeats, kept=kept, one_sided=screen)))
+    return "\n".join(lines)
 
 
 def report(cfg: SweepConfig, round: str, *, repeats: int | None = None) -> tuple[str, list[dict]]:
@@ -399,15 +388,17 @@ def report(cfg: SweepConfig, round: str, *, repeats: int | None = None) -> tuple
 
     A table holds the start, each arm the round ran, then each control. Its columns are Valid, Right, Strict, Wrong,
     Made up, Declined, Failed, Errors, Ungraded, Unjudged, Median s, Median s to rows and Prompt tokens (per question),
-    each cell giving every run's value in turn, and, against the start, only/other and p for each run. The grid's arms
-    are compared with the screen's start.
+    each cell giving every run's value in turn, and, against the start, only/other and p for each run. The screen's
+    table also marks the arms whose value it keeps (Kept), and its p is the one-sided p it decides by; every other
+    round's is the two-sided p. The grid's arms are compared with the screen's start. The timing round is refused: its
+    arms answer only the cases timed.
 
     Each arm's label and changes are read back from the profile file its run wrote (`arm_from_profile`), and an arm
     folder this config would not have written is refused.
 
     `repeats` is how many runs each arm owes, and an arm short of one is not valid. By default it is the config's
-    `repeats` when that is a number; under `auto`, pass what the first round decided, or it is read as the most runs
-    any arm in the table has, which cannot tell an arm's missing run from a second run no arm has had yet.
+    `repeats` when that is a number. Under `auto` it must be passed, as the first round decided it: the folders alone
+    cannot tell an arm's missing run from a second run no arm has had yet.
 
     A record holds the model, mode, round, `arm` (its profile id; None for a control), `label`, `control` (its name, or
     None), `changes` (each setting the arm changes from the start, to its value), `valid` (in every run), `runs` (each
@@ -416,16 +407,24 @@ def report(cfg: SweepConfig, round: str, *, repeats: int | None = None) -> tuple
     """
     if round not in ROUNDS:
         raise ValueError(f"{round!r} is not a round; the rounds are {', '.join(ROUNDS)}")
-    if repeats is not None and repeats < 1:
+    if round == "timing":
+        raise ValueError("the timing round is not reported: its arms answer only the cases timed, and this report does "
+                         "not know which those are")
+    if repeats is None:
+        if not isinstance(cfg.sweep.repeats, int):
+            raise ValueError('[sweep] repeats is "auto": pass repeats=, the number of runs the first round decided '
+                             "each arm owes")
+        repeats = cfg.sweep.repeats
+    if repeats < 1:
         raise ValueError("an arm owes at least one run")
     owed = _owed(cfg, round)
     controls = [(control.name, grade_control(cfg, control)) for control in cfg.control]
     tables, records = [], []
     for model in cfg.models:
         for mode in cfg.modes:
-            mine, count = _table_records(cfg, model, mode, round, owed, controls, repeats)
+            mine = _table_records(cfg, model, mode, round, owed, controls, repeats)
             if mine:
-                tables.append(_table(model, mode, round, mine, count))
+                tables.append(_table(cfg, model, mode, round, mine, repeats))
                 records += mine
     return "\n\n".join(tables) + ("\n" if tables else ""), records
 

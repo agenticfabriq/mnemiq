@@ -219,3 +219,23 @@ def test_an_arm_can_be_handed_to_a_process_of_its_own(tmp_path, stub_model):
     args = (cfg, arm, tuning(cfg), arm_folder(cfg, arm, 1))
     function, copied = pickle.loads(pickle.dumps((run_arm, args)))
     assert function is run_arm and copied == args and copied[0].path == cfg.path
+
+
+def test_a_resume_that_stops_while_writing_the_profile_file_leaves_the_last_one_whole(tmp_path, stub_model,
+                                                                                      monkeypatch):
+    cfg, arm = one_arm(tmp_path, stub_model(gold=True))
+    folder = arm_folder(cfg, arm, 1)
+    run_arm(cfg, arm, tuning(cfg)[:1], folder)
+    whole = (folder / "profile.toml").read_text()
+    write_text = Path.write_text
+
+    def stopped_halfway(self, text, *args, **kwargs):
+        if "profile.toml" in self.name:
+            write_text(self, text[:len(text) // 2], *args, **kwargs)
+            raise OSError("the process stopped here")
+        return write_text(self, text, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", stopped_halfway)
+    with pytest.raises(OSError, match="stopped here"):
+        run_arm(cfg, arm, tuning(cfg), folder)
+    assert (folder / "profile.toml").read_text() == whole

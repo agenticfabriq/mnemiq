@@ -3,6 +3,8 @@ what changes an answer and with nothing else."""
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from mnemiq.config import Settings
@@ -197,3 +199,21 @@ def test_an_endpoint_with_an_at_in_its_path_loads(tmp_path):
     cfg = load_config(write_config(tmp_path, models={"m": {"llm_model": "stub-model", "llm_base_url": url,
                                                             "api_key_env": KEY_ENV}}))
     assert cfg.models["m"].llm_base_url == url
+
+
+@pytest.mark.parametrize("answers, refusal", [
+    ([{"id": "no-such-case", "sql": "SELECT 1"}], "no-such-case"),
+    ([{"id": "book-count", "sql": "SELECT 1"}, {"id": "book-count", "declined": True}], "twice"),
+    ([{"id": "book-count", "sql": "SELECT 1", "declined": True}], "neither"),
+    ([{"id": "book-count", "declined": False}], "neither"),
+    ([{"id": "book-count", "SQL": "SELECT 1"}], "neither"),
+    ([{"id": "book-count", "sql": "  "}], "neither"),
+    ({"book-count": "SELECT 1"}, "non-empty JSON list"),
+    ([], "non-empty JSON list"),
+    ("not json", "not JSON"),
+])
+def test_a_control_whose_answers_cannot_be_graded_is_refused_before_any_arm_runs(tmp_path, answers, refusal):
+    path = tmp_path / "answers.json"
+    path.write_text(answers if isinstance(answers, str) else json.dumps(answers))
+    with pytest.raises(SweepConfigError, match=refusal):
+        load_config(write_config(tmp_path, control=[{"name": "current", "answers": str(path)}]))

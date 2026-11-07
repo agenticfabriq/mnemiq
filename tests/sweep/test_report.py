@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from mnemiq.sweep.arms import grid_arms
-from mnemiq.sweep.config import SweepConfigError, load_config
+from mnemiq.sweep.config import load_config
 from mnemiq.sweep.report import grade_control, kept_values, pair, pair_runs, report, tally
 from mnemiq.sweep.run import arm_folder
 from mnemiq.sweep.stats import mcnemar_p
@@ -242,21 +242,6 @@ def test_a_controls_sql_never_writes_to_the_source(tmp_path):
     assert (graded[0]["outcome"], graded[0]["error_kind"]) == ("error", "answer")
 
 
-@pytest.mark.parametrize("answers, refusal", [
-    ([{"id": "no-such-case", "sql": "SELECT 1"}], "no-such-case"),
-    ([{"id": "book-count", "sql": "SELECT 1"}, {"id": "book-count", "declined": True}], "twice"),
-    ([{"id": "book-count", "sql": "SELECT 1", "declined": True}], "neither"),
-    ([{"id": "book-count", "declined": False}], "neither"),
-    ([{"id": "book-count", "SQL": "SELECT 1"}], "neither"),
-])
-def test_a_control_file_that_cannot_be_graded_is_refused(tmp_path, answers, refusal):
-    path = tmp_path / "answers.json"
-    path.write_text(json.dumps(answers))
-    cfg = load_config(write_config(tmp_path, control=[{"name": "current", "answers": str(path)}]))
-    with pytest.raises(SweepConfigError, match=refusal):
-        grade_control(cfg, cfg.control[0])
-
-
 def test_the_table_shows_each_arm_and_control_with_what_it_changed(tmp_path):
     cfg = sweep_with_rows(tmp_path, arms={"writer_rules=none": dict(only=4, other=0)},
                           control=[{"name": "current", "answers": str(gold_answers(tmp_path))}])
@@ -270,13 +255,13 @@ def test_the_table_shows_each_arm_and_control_with_what_it_changed(tmp_path):
     control = _record(records, "current")
     assert control["control"] == "current" and control["valid"] is True and control["runs"][0]["versions"] == []
     assert (control["runs"][0]["cases"], control["runs"][0]["right"], control["pairs"][0]["only"]) == (11, 9, 9)
-    assert "| control: current | yes | 9 |" in table
+    assert "| control: current | yes | - | 9 |" in table
 
 
 def test_a_control_is_reported_before_any_arm_has_run(tmp_path):
     answers = answers_file(tmp_path, gold_for=6, declined=2)
     cfg = load_config(write_config(tmp_path, control=[{"name": "current", "answers": str(answers)}]))
-    table, records = report(cfg, "screen")
+    table, records = report(cfg, "screen", repeats=1)
     control = _record(records, "current")
     assert control["valid"] is True and control["runs"][0]["cases"] == len(tuning(cfg)) == 7
     assert control["runs"][0]["right"] == 5 and control["runs"][0]["versions"] == []
@@ -287,7 +272,7 @@ def test_a_sweep_over_two_deployments_holds_one_version_for_each(tmp_path, stub_
     reads = {case.id: case.db_id for case in tuning(cfg)}
     assert set(reads.values()) == {"lib-a", "lib-b"}
     write_run(cfg, start_of(cfg, "instant"), [row(case, "correct", version=f"v-{db}") for case, db in reads.items()])
-    assert _record(report(cfg, "screen")[1], "start")["valid"] is True
+    assert _record(report(cfg, "screen", repeats=1)[1], "start")["valid"] is True
 
 
 def test_the_grids_arms_are_compared_with_the_screens_start(tmp_path):
@@ -295,7 +280,9 @@ def test_the_grids_arms_are_compared_with_the_screens_start(tmp_path):
     kept = kept_values(cfg, report(cfg, "screen")[1])
     combined = next(arm for arm in grid_arms(cfg, kept) if arm.round == "grid")
     write_run(cfg, combined, read_rows(cfg, arm_with(cfg, writer_rules="none")))
-    records = report(cfg, "grid")[1]
+    table, records = report(cfg, "grid")
+    assert "| Arm | Valid | Right |" in table and "| Run 1 only/other | Run 1 p |" in table
+    assert "| 4/0 | 0.125 |" in table
     assert [r["label"] for r in records] == ["start", "retrieval_k=36 + writer_rules=none"]
     assert _record(records, "start")["round"] == "screen"
     assert _record(records, "retrieval_k=36 + writer_rules=none")["pairs"][0]["only"] == 4
@@ -304,7 +291,12 @@ def test_the_grids_arms_are_compared_with_the_screens_start(tmp_path):
 def test_the_screen_keeps_a_value_that_helps_and_drops_one_that_harms(tmp_path):
     cfg = sweep_with_rows(tmp_path, arms={"writer_rules=none": dict(only=4, other=0),
                                           "guided_sql=true": dict(only=4, other=0, more_wrong=1)})
-    assert kept_values(cfg, report(cfg, "screen")[1])[("m", "instant")] == {"writer_rules": ["none"]}
+    table, records = report(cfg, "screen")
+    assert kept_values(cfg, records)[("m", "instant")] == {"writer_rules": ["none"]}
+    # the screen's table shows the p it decides by, one-sided, and marks what it keeps
+    assert "| Arm | Valid | Kept | Right |" in table and "| Run 1 only/other | Run 1 p (one-sided) |" in table
+    assert "| writer_rules=none | yes | yes |" in table and "| guided_sql=true | yes | no |" in table
+    assert "| 4/0 | 0.0625 |" in table and "| start | yes | - |" in table
 
 
 @pytest.mark.parametrize("only, other, kept", [
@@ -315,13 +307,16 @@ def test_the_screen_keeps_a_value_that_helps_and_drops_one_that_harms(tmp_path):
 ])
 def test_the_screens_bar_is_a_one_sided_p_strictly_below_screen_alpha(tmp_path, only, other, kept):
     cfg = sweep_with_rows(tmp_path, arms={"retrieval_k=36": dict(only=only, other=other)})
-    assert kept_values(cfg, report(cfg, "screen")[1])[("m", "instant")] == ({"retrieval_k": [36]} if kept else {})
+    table, records = report(cfg, "screen")
+    assert kept_values(cfg, records)[("m", "instant")] == ({"retrieval_k": [36]} if kept else {})
+    assert f"| retrieval_k=36 | yes | {'yes' if kept else 'no'} |" in table
 
 
 def test_a_value_that_wins_no_more_than_it_loses_is_dropped_under_any_bar(tmp_path):
     # Four won and four lost: by chance at least four wins of eight is 0.637, under a bar of 0.9.
     cfg = sweep_with_rows(tmp_path, arms={"retrieval_k=36": dict(only=4, other=4)}, search={"screen_alpha": 0.9})
-    assert kept_values(cfg, report(cfg, "screen")[1])[("m", "instant")] == {}
+    table, records = report(cfg, "screen")
+    assert kept_values(cfg, records)[("m", "instant")] == {} and "| retrieval_k=36 | yes | no |" in table
 
 
 @pytest.mark.parametrize("propose, kept", [({}, False), ({"max_more_made_up": 1}, True)])
@@ -334,7 +329,7 @@ def test_the_screen_keeps_a_value_only_when_every_run_passes(tmp_path):
     cfg = sweep_with_rows(tmp_path, repeats=2, arms={"writer_rules=none": [dict(only=4, other=0), dict(only=1, other=1)],
                                                      "retrieval_k=36": [dict(only=4, other=0), dict(only=3, other=0)]})
     table, records = report(cfg, "screen")
-    assert "| Run 2 only/other | Run 2 p |" in table and "| writer_rules=none | yes | 5 / 1 |" in table
+    assert "| Run 2 only/other | Run 2 p (one-sided) |" in table and "| writer_rules=none | yes | no | 5 / 1 |" in table
     assert kept_values(cfg, records)[("m", "instant")] == {"retrieval_k": [36]}
 
 
@@ -373,6 +368,20 @@ def test_the_report_leaves_a_row_still_being_written_as_it_is(tmp_path):
     assert path.read_text() == before and _record(records, "writer_rules=none")["valid"] is True
 
 
+def test_a_report_under_auto_repeats_needs_the_count_the_first_round_decided(tmp_path):
+    cfg = load_config(write_config(tmp_path))
+    assert cfg.sweep.repeats == "auto"
+    with pytest.raises(ValueError, match="repeats"):
+        report(cfg, "screen")
+    assert report(cfg, "screen", repeats=1) == ("", [])
+
+
+def test_a_report_of_the_timing_round_is_refused(tmp_path):
+    cfg = load_config(write_config(tmp_path, sweep={"repeats": 1}))
+    with pytest.raises(ValueError, match="timing"):
+        report(cfg, "timing")
+
+
 def test_the_table_has_time_to_rows(tmp_path):
-    table, _ = report(sweep_with_rows_ms(tmp_path, rows_ms=[2000, 4000, 6000]), "screen")
+    table, _ = report(sweep_with_rows_ms(tmp_path, rows_ms=[2000, 4000, 6000]), "screen", repeats=1)
     assert "| Median s to rows |" in table and "| 4.0 |" in table
