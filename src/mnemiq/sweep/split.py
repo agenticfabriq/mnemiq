@@ -86,7 +86,11 @@ def saved_split(cfg: SweepConfig) -> dict[str, list[EvaluationCase]] | None:
                f"names {', '.join(sorted(named - known.keys()))}, which the question file does not hold"
                if named - known.keys() else ""]
         raise SweepConfigError(f"{path} {'; and '.join(reason for reason in why if reason)}")
-    if split_digest(ids) != json.loads(record.read_text(encoding="utf-8")).get("split_digest"):
+    recorded = json.loads(record.read_text(encoding="utf-8")).get("split_digest")
+    if recorded is None:
+        raise SweepConfigError(f"{record} records no digest for its split, so {path} cannot be checked against it. "
+                               "Start a new sweep in another out folder.")
+    if split_digest(ids) != recorded:
         raise SweepConfigError(f"{path} is not the split this sweep drew: its digest is not the one {record} recorded. "
                                "Put back the split.json the sweep wrote, or start a new sweep in another out folder.")
     return {part: [known[case_id] for case_id in ids[part]] for part in PARTS}

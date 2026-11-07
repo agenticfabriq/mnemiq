@@ -202,6 +202,16 @@ def test_a_split_that_is_not_the_one_drawn_is_refused_by_run_and_report(tmp_path
     assert stub.calls == asked and (out(cfg) / "sweep.json").read_text() == record   # refused before it wrote a thing
 
 
+def test_a_record_with_no_split_digest_says_so_rather_than_blame_the_split(tmp_path, stub_model):
+    cfg, start = one_arm(tmp_path, stub_model(gold=True))
+    write_rows(cfg, start, first=3)
+    record = sweep_json(cfg)
+    del record["split_digest"]   # a record written before sweeps kept one
+    (out(cfg) / "sweep.json").write_text(json.dumps(record))
+    with pytest.raises(SweepConfigError, match="records no digest"):
+        report(cfg, "screen", repeats=1)
+
+
 def test_run_and_report_owe_the_cases_of_the_one_saved_split(tmp_path, stub_model, monkeypatch):
     cfg = started_sweep(tmp_path, stub_model(gold=True))
     saved = json.loads((out(cfg) / "split.json").read_text())

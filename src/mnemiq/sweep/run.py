@@ -738,7 +738,7 @@ def _work(cfg: SweepConfig, arm: Arm, cases: list[EvaluationCase], folder: Path,
         try:
             outcome = run_arm(cfg, arm, cases, folder)
         except BaseException as exc:
-            with suppress(Exception):  # the parent may be gone
+            with suppress(BaseException):  # the parent may be gone, or a second interrupt may land mid-send
                 conn.send(("raised", _hidden(_exception_line(exc), secrets)))
             raise SystemExit(1) from None  # an int status, for which a worker process prints nothing
         conn.send(outcome)
