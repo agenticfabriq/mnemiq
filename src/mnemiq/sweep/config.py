@@ -27,7 +27,9 @@ from pydantic import (
 )
 
 from mnemiq.agent.modes import MODES
-from mnemiq.config import _SECRET_HINTS, ModeSettings, Settings, SourceSpec, without_credentials
+from mnemiq.config import (
+    _SECRET_HINTS, ModeSettings, Settings, SourceSpec, userinfo_unplaced, without_credentials,
+)
 from mnemiq.contract import EvaluationCase
 from mnemiq.profiles import _NAME, DEPLOYMENT_SETTINGS, PROFILE_SETTINGS, ProfileFileError
 from mnemiq.profiles import _read as _read_profile_file
@@ -80,9 +82,9 @@ def _endpoint_url(value: str | None, info: ValidationInfo) -> str | None:
     if value is None:
         return None
     key_env = "verify_api_key_env" if info.field_name.startswith("verify_") else "api_key_env"
-    # Checked before any parse, which can stop at a password first. Any `@` is refused, not only one a parser would
-    # read as a user's: a raw `?`, `#` or `/` in a password moves where a parser looks, and a base URL needs no `@`.
-    if "@" in value or without_credentials(value) != value:
+    # Checked before any parse, which can stop at a password first: a user or password wherever the engine places one,
+    # a credential in the query, or an `@` no reading places (a password holding a raw `?` or `#`).
+    if without_credentials(value) != value or userinfo_unplaced(value):
         raise ValueError("carries a credential (a user or password before an '@', or a key in its query). A key never "
                          f"goes in this file: name the environment variable that holds it in {key_env}")
     try:

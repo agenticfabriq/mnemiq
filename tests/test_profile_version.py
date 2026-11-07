@@ -158,8 +158,11 @@ def test_the_view_drops_a_password_whatever_it_holds(url):
     assert "planted" not in json.dumps(resolved_view(_settings(llm_base_url=url), "duckdb"))
 
 
-def test_a_setting_with_no_credential_is_logged_as_it_is(monkeypatch):
-    settings = _settings(llm_base_url="http://localhost:8000/v1?version=2", llm_model="vendor-model@2024-06-20",
+@pytest.mark.parametrize("url", ["http://localhost:8000/v1?version=2", "http://host/models@v2",
+                                 "https://api.example.com/models/claude@2024/v1", "https://host/v1?user=a@b",
+                                 "https://host/v1#frag@x"])
+def test_a_setting_with_no_credential_is_logged_as_it_is(monkeypatch, url):
+    settings = _settings(llm_base_url=url, llm_model="vendor-model@2024-06-20",
                          verify_base_url="https://Judge.Example.net:8443/v1")
     view, version = resolved_view(settings, "duckdb"), profile_version(settings, "duckdb")
     monkeypatch.setattr("mnemiq.profiles._no_credentials", lambda value: value)

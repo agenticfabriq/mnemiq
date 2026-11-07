@@ -174,13 +174,23 @@ def test_a_deployment_urls_credentials_stay_out_of_the_fingerprint_and_its_host_
     assert (fingerprint_with("http://embed:abc/SECRET1@127.0.0.1:9/v1")  # a raw `/` in the password
             == fingerprint_with("http://embed:abc/SECRET2@127.0.0.1:9/v1"))
     assert fingerprint_with("http://embed:SECRET1@127.0.0.2:9/v1") != base  # the host
+    # an `@` in a path is the path's: the host still decides
+    assert fingerprint_with("http://10.0.0.1:9/models/m@x") != fingerprint_with("http://10.0.0.2:9/models/m@x")
 
 
 def test_a_message_naming_a_deployment_url_shows_it_without_its_credentials():
     settings = Settings.model_construct(embed_base_url="http://embed:SECRET@embedder.example/v1?api_key=SECRET",
-                                        control_dsn="postgresql://sweep:SECRET@db.example/library")
+                                        control_dsn="postgresql://sweep:SECRET@db.example/library",
+                                        verify_base_url="http://10.0.0.1:9/models/m@x")
     raw = settings.embed_base_url
-    text = f"embed_base_url={raw!r}; {raw}; {settings.control_dsn}; llm_base_url='http://127.0.0.1:9/v1'"
+    text = f"embed_base_url={raw!r}; {raw}; {settings.control_dsn}; verify_base_url='http://10.0.0.1:9/models/m@x'"
     assert scrub_credentials(text, settings) == ("embed_base_url='http://embedder.example/v1'; "
                                                  "http://embedder.example/v1; postgresql://sweep@db.example/library; "
-                                                 "llm_base_url='http://127.0.0.1:9/v1'")
+                                                 "verify_base_url='http://10.0.0.1:9/models/m@x'")
+
+
+def test_an_endpoint_with_an_at_in_its_path_loads(tmp_path):
+    url = "https://api.example.com/models/claude@2024/v1"
+    cfg = load_config(write_config(tmp_path, models={"m": {"llm_model": "stub-model", "llm_base_url": url,
+                                                            "api_key_env": KEY_ENV}}))
+    assert cfg.models["m"].llm_base_url == url

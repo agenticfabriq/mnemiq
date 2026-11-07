@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from urllib.parse import unquote_plus
+from urllib.parse import unquote_plus, urlsplit
 
 from typing import Annotated, Literal
 
@@ -48,28 +48,52 @@ def names_a_credential(name: str) -> bool:
     return any(hint in name.lower() for hint in _CREDENTIAL_HINTS)
 
 
-def _split_userinfo(value: str) -> tuple[str, str | None, str]:
-    """`value` cut as (its `scheme://` or nothing, its user and password or None, what follows their `@`), read as a
-    string and never parsed.
+def _reads_as_host(value: str) -> bool:
+    """Whether `value`, read the standard way (`urlsplit`), has a netloc that is a host with an optional port that
+    parses."""
+    try:
+        parts = urlsplit(value)
+        _ = parts.port  # raises for a port that is not a number
+    except ValueError:
+        return False
+    return parts.hostname is not None
 
-    They run to the last `@` before whitespace, `?` or `#`, the rule `mnemiq.redact` documents for a source's words, so
-    a raw `/` or `@` in a password is taken whole. An `@` in a path is read as theirs too, which shows less, never
-    more. With no scheme, an Easy Connect string's `user/password@host` is read by the same rule.
+
+def _split_userinfo(value: str) -> tuple[str, str | None, str]:
+    """`value` cut as (its `scheme://` or nothing, its user and password or None, what follows their `@`).
+
+    A URL is read the standard way first. When its netloc is a host with a port that parses, that reading stands: the
+    user and password are whatever precedes the netloc's `@`, and an `@` in the path, query or fragment is theirs.
+    Otherwise (a password holding a raw `/` leaves a netloc such as `user:abc`, whose port does not parse) they run to
+    the last `@` before whitespace, `?` or `#`, the rule `mnemiq.redact` documents for a source's words, so the
+    password is taken whole. With no scheme, an Easy Connect string's `user/password@host` is read by that rule too.
     """
     scheme, sep, rest = value.partition("://")
+    if sep and _reads_as_host(value):
+        end = re.search(r"[/?#]", rest)
+        userinfo, at, _ = (rest[:end.start()] if end else rest).rpartition("@")
+        return (scheme + sep, userinfo, rest[len(userinfo) + 1:]) if at else (scheme + sep, None, rest)
     prefix, rest = (scheme + sep, rest) if sep else ("", value)
     end = re.search(r"[\s?#]", rest)
     at = rest.rfind("@", 0, end.start() if end else len(rest))
     return (prefix, rest[:at], rest[at + 1:]) if at != -1 else (prefix, None, rest)
 
 
+def userinfo_unplaced(value: str) -> bool:
+    """Whether `value` is a URL holding an `@` that neither reading places: its netloc is no host with a port, and
+    every `@` comes after a `?` or `#` (a password holding a raw `?` or `#`, or a broken URL)."""
+    return "://" in value and "@" in value and not _reads_as_host(value) and _split_userinfo(value)[1] is None
+
+
 def without_credentials(value: str) -> str:
     """A URL or DSN as a message, a log or a fingerprint may show it.
 
     No user or password before the host's `@` (a database URL keeps its user, which names who reads and is no secret),
-    no query parameter named like a credential, and no `password=` in a keyword DSN. Everything else stays as written,
-    so a value with no credential comes back unchanged. It is read as a string, never parsed, so a URL no parser
-    accepts loses its credentials too.
+    as `_split_userinfo` places them; no query parameter named like a credential; and no `password=` in a keyword DSN.
+    Everything else stays as written. So a URL whose netloc reads as a host and port comes back unchanged unless it
+    holds a credential, an `@` in its path, query or fragment included. A URL whose netloc does not read loses
+    everything up to the last `@` before whitespace, `?` or `#`, its credentials with it, even when no parser accepts
+    it.
     """
     if "://" not in value and _KEYWORD_PASSWORD.search(value):
         return " ".join(_KEYWORD_PASSWORD.sub(" ", value).split())
@@ -377,7 +401,7 @@ class Settings(BaseSettings):
                 continue
             # A parser reads a password holding a raw `/` as the host and a path, so the host it gives can be part of
             # the credential. Such a host is not named; the decision is the same either way.
-            userinfo = _split_userinfo(url)[1]
+            userinfo = None if _reads_as_host(url) else _split_userinfo(url)[1]
             if userinfo is not None and host in userinfo.lower():
                 host_named = None
             else:

@@ -395,10 +395,27 @@ def test_a_password_with_a_raw_slash_is_taken_out_whole():
 
 
 @pytest.mark.parametrize("url", ["postgresql://svc:p/w@10.2.0.7/db", "https://u:a/b@host/v1?x=1",
-                                 "http://host/models@v2", "mysql://u:pw@h/db#t", "https://host/v1?user=a@b"])
-def test_the_user_and_password_end_where_redact_says(url):
-    from mnemiq.config import _split_userinfo
+                                 "http://user:pass@[10.0.0.1]/v1", "mysql://u:p/w@h/db#t"])
+def test_where_a_url_reads_as_no_host_its_password_ends_where_redact_says(url):
+    from mnemiq.config import _reads_as_host, _split_userinfo
     from mnemiq.redact import scrub_credentials
 
+    assert not _reads_as_host(url)  # agreement is required only here
     prefix, userinfo, rest = _split_userinfo(url)
-    assert scrub_credentials(url) == (url if userinfo is None else f"{prefix}***@{rest}")
+    assert scrub_credentials(url) == f"{prefix}***@{rest}"
+
+
+_AT_OUTSIDE_THE_NETLOC = ["http://host/models@v2", "https://api.example.com/models/claude@2024/v1",
+                          "https://host/v1?user=a@b", "https://host/v1#frag@x"]
+
+
+@pytest.mark.parametrize("url", _AT_OUTSIDE_THE_NETLOC)
+def test_an_at_outside_the_netloc_leaves_the_url_as_it_is(url):
+    # The URL reads the standard way as a host, so that reading stands and its path, query and fragment are its own.
+    from mnemiq.config import without_credentials
+
+    assert without_credentials(url) == url
+    host = "api.example.com" if "api.example.com" in url else "host"
+    assert _s(llm_base_url=url, llm_api_key="k").local_only_offenders() == [
+        f"llm_base_url={url!r} (host {host!r} is a DNS name; this check does not resolve names, so it cannot confirm "
+        "one stays on this network)"]

@@ -22,7 +22,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 from mnemiq.agent import synthesize
 from mnemiq.agent.loop import STRATEGIES
 from mnemiq.agent.modes import MODES, modes_for
-from mnemiq.config import ModeSettings, Settings, without_credentials
+from mnemiq.config import ModeSettings, Settings, userinfo_unplaced, without_credentials
 from mnemiq.execute import select
 from mnemiq.execute.select import ClusterView
 from mnemiq.generate import correct, prompts
@@ -280,14 +280,11 @@ def _prompt_texts(settings: Settings, dialect: str) -> dict[str, str]:
 
 def _no_credentials(value):
     """A setting as it may be logged. A URL goes through the engine's one rule for that (`without_credentials`): no user
-    or password, and no query parameter named like a credential. A URL still holding an `@` after a `?` or `#` is not
-    logged at all, since a raw `?` or `#` in a password reads the same as a query or a fragment. Anything else, a model
-    name with an `@` in it included, is logged as it is."""
+    or password, and no query parameter named like a credential. A URL whose `@` no reading can place is not logged at
+    all. Anything else, a model name with an `@` in it included, is logged as it is."""
     if not isinstance(value, str) or "://" not in value:
         return value
-    shown = without_credentials(value)
-    end = re.search(r"[\s?#]", shown)
-    return "(unreadable url)" if end is not None and "@" in shown[end.start():] else shown
+    return "(unreadable url)" if userinfo_unplaced(value) else without_credentials(value)
 
 
 def resolved_view(settings: Settings, dialect: str) -> dict:
