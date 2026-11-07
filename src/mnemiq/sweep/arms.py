@@ -28,7 +28,9 @@ from mnemiq.agent.modes import MODES, modes_for
 from mnemiq.config import ModeSettings, Settings
 from mnemiq.profiles import PROFILE_SETTINGS, load_profiles
 from mnemiq.profiles import _read as _read_profile_file
-from mnemiq.sweep.config import ENDPOINT_FACTS, SweepConfig, _deployment_ids, deployment_settings, start_profile
+from mnemiq.sweep.config import (
+    ENDPOINT_FACTS, SweepConfig, _deployment_ids, deployment_settings, scrub_credentials, start_profile,
+)
 
 ROUNDS = ("screen", "grid", "timing", "confirm", "check")
 _MODE_FIELDS = tuple(ModeSettings.model_fields)
@@ -303,7 +305,9 @@ def refusal_under(cfg: SweepConfig, arm: Arm, deployments: list[tuple[str | None
                 profiles, default = load_profiles(settings.model_copy(update={"profiles_path": path}))
                 modes_for(profiles[default].settings)
             except ValueError as exc:  # the profile loader's refusals, and an unknown mode's
-                return f"the deployment for {db_id!r}: {exc}" if db_id is not None else str(exc)
+                # A refusal may name a deployment's setting by its value, and a sweep keeps and shows refusals.
+                why = scrub_credentials(str(exc), settings)
+                return f"the deployment for {db_id!r}: {why}" if db_id is not None else why
     return None
 
 
@@ -311,6 +315,7 @@ def engine_refusal(cfg: SweepConfig, arm: Arm) -> str | None:
     """Why the engine would refuse to run `arm`, in its own words, or None when it runs.
 
     The arm's profile file is loaded by the engine's profile loader over each deployment's `baseline`, as a run loads
-    it, and its modes are built. A key variable that is not set is named; its value never is.
+    it, and its modes are built. A key variable that is not set is named; its value never is, and a deployment URL the
+    message quotes is given without its credentials.
     """
     return refusal_under(cfg, arm, baselines(cfg))

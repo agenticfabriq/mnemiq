@@ -92,3 +92,30 @@ def test_an_env_files_setting_never_reaches_the_engines_check(tmp_path):
     cfg = load_config(write_config(tmp_path, deployment=d, models={
         "m": {"llm_model": "gpt-5-mini", "llm_base_url": UNREACHABLE, "api_key_env": KEY_ENV}}))
     assert engine_refusal(cfg, start_of(cfg, "instant")) is None
+
+
+def test_a_refusal_never_quotes_a_credential_from_a_deployment_url(tmp_path):
+    # Whatever an arm's refusal names, the sweep shows a deployment's URLs without their credentials. Here the refusal
+    # is the local-only check's, for an embedder on a DNS name.
+    d = tiny_files(tmp_path)
+    embedder = "MNEMIQ_EMBED_BASE_URL='http://embed:SECRET@embedder.example/v1?api_key=SECRET'"
+    env = d.env.read_text().replace(f"MNEMIQ_EMBED_BASE_URL='{UNREACHABLE}'", embedder)
+    d.env.write_text(env + "MNEMIQ_LOCAL_ONLY='true'\n")
+    cfg = load_config(write_config(tmp_path, deployment=d))
+    refusal = engine_refusal(cfg, start_of(cfg, "instant"))
+    assert "embed_base_url" in refusal and "embedder.example" in refusal and "SECRET" not in refusal
+
+
+def test_no_profile_text_carries_a_credential_from_a_deployment_url(tmp_path):
+    d = tiny_files(tmp_path)
+    with open(d.env, "a") as fh:
+        fh.write("MNEMIQ_LLM_BASE_URL='http://chat:SECRET@127.0.0.1:9/v1'\n"
+                 "MNEMIQ_VERIFY_BASE_URL='http://judge:SECRET@127.0.0.1:9/v1?api_key=SECRET'\n")
+    start = tmp_path / "start.toml"
+    start.write_text('default = "s"\n[profiles.s]\nllm_base_url = "http://start:SECRET@127.0.0.1:9/v1"\n')
+    cfg = load_config(write_config(tmp_path, deployment=d, modes=["instant", "thinking"],
+                                   start={"profile_file": str(start)}, space={"writer_rules": ["none"]}))
+    arms = screen_arms(cfg) + check_arms(cfg)
+    arms.append(assembled_arm(cfg, "m", {"instant": arm_with(cfg, writer_rules="none"),
+                                         "thinking": start_of(cfg, "thinking")})[0])
+    assert not [arm.label for arm in arms if "SECRET" in profile_text(cfg, arm)]

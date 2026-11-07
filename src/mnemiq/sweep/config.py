@@ -37,8 +37,8 @@ from mnemiq.profiles import _read as _read_profile_file
 ENDPOINT_FACTS = ("llm_model", "llm_base_url", "llm_context_window", "verify_model", "verify_base_url")
 # The names `[start]` reads as its own, so no model may take one.
 _START_KEYS = ("profile_file", "profile")
-# Settings fields whose value is a secret and is left out of the fingerprint. A DSN is kept with its password taken out,
-# since the rest of it names the database that is read.
+# Settings fields whose value is a secret and is left out of the fingerprint. A DSN or URL is kept with its credentials
+# taken out (`without_credentials`), since the rest of it names what is read.
 _KEY_HINTS = tuple(hint for hint in _SECRET_HINTS if hint != "dsn")
 # Sources the engine reads from a local file, which can be hashed. A live database cannot be.
 _FILE_SOURCES = ("sqlite", "duckdb")
@@ -47,6 +47,10 @@ _FILE_SOURCES = ("sqlite", "duckdb")
 _PLANNING = ("budget_hours", "budget_dollars", "seconds_per_question")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _KEYWORD_PASSWORD = re.compile(r"""(?i)(?:^|\s)password\s*=\s*(?:'(?:[^'\\]|\\.)*'|\S*)""")
+# A query parameter named like one of these holds a credential. Wider than the settings fields' hints: a query is
+# free-form, and `token`, `auth` and `sig` (a signed URL's signature) carry credentials there too.
+_CREDENTIAL_HINTS = (*_SECRET_HINTS, "key", "token", "auth", "sig")
+_WEB_SCHEMES = ("http", "https")
 
 
 class SweepConfigError(ValueError):
@@ -69,6 +73,32 @@ def _env_name(value: str) -> str:
     # The value is not quoted back: a key pasted here by mistake must not reach a log.
     if not _ENV_NAME.fullmatch(value):
         raise ValueError("must name an environment variable, such as MODEL_API_KEY; a key itself never goes in this file")
+    return value
+
+
+def _names_a_credential(name: str) -> bool:
+    return any(hint in name.lower() for hint in _CREDENTIAL_HINTS)
+
+
+def _endpoint_url(value: str | None, info: ValidationInfo) -> str | None:
+    """An endpoint as `[models]` and `[judge]` state it: an http or https URL with a host and no credential. Each arm's
+    profile file and the fingerprint hold it as written. It is never quoted back, since a credential is the likeliest
+    thing wrong with it."""
+    if value is None:
+        return None
+    key_env = "verify_api_key_env" if info.field_name.startswith("verify_") else "api_key_env"
+    try:
+        parts = urlsplit(value)
+        host, _ = parts.hostname, parts.port  # `port` raises for one that is not a number
+        query = parse_qsl(parts.query, keep_blank_values=True)
+    except ValueError:
+        raise ValueError("is not a URL that can be read") from None
+    # Without a scheme, a user and password read as the URL's path, where the check below would not look.
+    if parts.scheme not in _WEB_SCHEMES or not host:
+        raise ValueError("must be an http or https URL with a host, such as http://192.0.2.10:8000/v1")
+    if "@" in parts.netloc or any(_names_a_credential(name) for name, _ in query):
+        raise ValueError("carries a credential (a user or password before '@', or a key in its query). A key never "
+                         f"goes in this file: name the environment variable that holds it in {key_env}")
     return value
 
 
@@ -164,6 +194,8 @@ class ModelEntry(_NoKeys):
     price_in_per_mtok: _Price | None = None
     price_out_per_mtok: _Price | None = None
 
+    _endpoints = field_validator("llm_base_url", "verify_base_url")(_endpoint_url)
+
 
 class Judge(_NoKeys):
     """One judge for every model, replacing each model's own."""
@@ -171,6 +203,8 @@ class Judge(_NoKeys):
     verify_model: _VerifyModel = None
     verify_base_url: _VerifyBaseUrl = None
     verify_api_key_env: _EnvName | None = None
+
+    _endpoint = field_validator("verify_base_url")(_endpoint_url)
 
     @model_validator(mode="after")
     def _names_a_judge(self) -> Judge:
@@ -512,35 +546,53 @@ def pinned_files(cfg: SweepConfig) -> dict[str, str]:
     return {path: _sha256(path, files[path]) for path in sorted(files)}
 
 
-def _without_password(value: str) -> str:
-    """A DSN or URL with its password taken out and the rest kept: the user and the database still decide what is read."""
+def without_credentials(value: str) -> str:
+    """A DSN or URL as a fingerprint or a message may hold it: no password and no query parameter named like a
+    credential. On a web URL the user goes too, since there it is part of the credential; a database's user is kept,
+    since it still decides what is read."""
     if "://" not in value:
         return " ".join(_KEYWORD_PASSWORD.sub(" ", value).split())
     try:
         parts = urlsplit(value)
         netloc = parts.netloc
-        if parts.password is not None:
+        if "@" in netloc:
             userinfo, host = netloc.rsplit("@", 1)
-            netloc = f"{userinfo.split(':', 1)[0]}@{host}"
+            user = "" if parts.scheme in _WEB_SCHEMES else userinfo.split(":", 1)[0]
+            netloc = f"{user}@{host}" if user else host
         query = parts.query
         pairs = parse_qsl(query, keep_blank_values=True)
-        if any(key.lower() == "password" for key, _ in pairs):
-            query = urlencode([(key, item) for key, item in pairs if key.lower() != "password"])
+        if any(_names_a_credential(key) for key, _ in pairs):
+            query = urlencode([(key, item) for key, item in pairs if not _names_a_credential(key)])
         return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
     except ValueError:
         return "(an unreadable url)"
 
 
+def _holds_a_url(name: str) -> bool:
+    return name.endswith(("_dsn", "_url"))
+
+
+def scrub_credentials(text: str, settings: Settings) -> str:
+    """`text` with each DSN or URL of `settings` that carries a credential in its `without_credentials` form, as written
+    and as a Python repr writes it, for a message that may name a setting by its value."""
+    carried = {value for name in Settings.model_fields if _holds_a_url(name)
+               and isinstance(value := getattr(settings, name), str) and without_credentials(value) != value}
+    for value in sorted(carried, key=len, reverse=True):
+        clean = without_credentials(value)
+        text = text.replace(value, clean).replace(repr(value)[1:-1], clean)
+    return text
+
+
 def _answering_settings(settings: Settings) -> dict:
-    """A deployment's settings as the fingerprint holds them: no key, and no password in a DSN or URL."""
+    """A deployment's settings as the fingerprint holds them: no key, and no credential in a DSN or URL."""
     view: dict[str, Any] = {}
     for name, value in settings.model_dump(mode="json").items():
         if any(hint in name for hint in _KEY_HINTS):
             continue
-        if isinstance(value, str) and name.endswith(("_dsn", "_url")):
-            value = _without_password(value)
+        if isinstance(value, str) and _holds_a_url(name):
+            value = without_credentials(value)
         view[name] = value
-    view["sources"] = [asdict(spec) | {"target": _without_password(spec.target)} for spec in _source_specs(settings)]
+    view["sources"] = [asdict(spec) | {"target": without_credentials(spec.target)} for spec in _source_specs(settings)]
     return view
 
 
@@ -549,7 +601,8 @@ def fingerprint(cfg: SweepConfig) -> str:
 
     It covers the config, less `[search]`'s budgets and `seconds_per_question` and less `[[control]]` (a sweep may be
     resumed with a larger budget or a new estimate, or given a control afterwards), each deployment's settings without
-    its keys or passwords, the pinned files, and the split seed.
+    its keys or the credentials in its DSNs and URLs, the pinned files, and the split seed. The config's own endpoints
+    carry none: `load_config` refuses one that does.
     """
     config = cfg.model_dump(mode="json")
     config["search"] = {key: value for key, value in config["search"].items() if key not in _PLANNING}

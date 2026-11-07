@@ -17,7 +17,8 @@ from collections import Counter
 from dataclasses import dataclass, replace
 
 from mnemiq.config import Settings
-from mnemiq.sweep.arms import Arm, baselines, check_arms, grid_arms, refusal_under, screen_arms
+from mnemiq.runtime import _resolve_verify_level
+from mnemiq.sweep.arms import Arm, baselines, check_arms, grid_arms, refusal_under, screen_arms, start_settings
 from mnemiq.sweep.config import _FILE_SOURCES, SweepConfig, _source_specs, load_questions
 from mnemiq.sweep.split import split
 from mnemiq.sweep.stats import detectable_gain
@@ -26,6 +27,7 @@ from mnemiq.sweep.stats import detectable_gain
 # counts the start and one finalist for each model and mode, and says so.
 TIMING_ARMS_PER_MODE = 2
 _UNKNOWN = "unknown until the first questions run"
+_JUDGE_UNPRICED = "the judge's price is not known"
 # The rounds that compare arms on the tuning part, by strategy; timing and confirm follow a search.
 _ROUNDS_OF = {"screen-then-grid": ("screen", "grid"), "grid": ("grid",), "check": ("check",)}
 
@@ -37,7 +39,8 @@ class Estimate:
     `arms` counts each round's arms that run, refusals left out; the confirm round counts the assembled profile and
     the start once in each mode, and timing counts `TIMING_ARMS_PER_MODE`. `case_runs`, `hours` and `dollars` are
     keyed by how many times each arm runs: one and two when the first round decides, the configured count otherwise.
-    `detectable` and `compared` are per model and mode, for a sweep that searches.
+    `detectable` and `compared` are per model and mode, for a sweep that searches. `judged_elsewhere` names the models
+    whose judge runs on another endpoint or model, which leaves `dollars` unknown.
     """
 
     arms: dict[str, int]
@@ -52,6 +55,7 @@ class Estimate:
     refused: list[tuple[Arm, str]]
     rounds: dict[tuple[str, str], dict[str, list[Arm]]]
     parts: dict[str, tuple[int, int]]  # tuning and held_out: (cases, answerable)
+    judged_elsewhere: list[str]
 
 
 def _tried(arms: list[Arm]) -> dict[str, list[object]]:
@@ -119,8 +123,27 @@ def _searches(cfg: SweepConfig, rounds: dict[str, list[Arm]]) -> bool:
     return cfg.search.strategy != "check" and any(arm.changes for arms in rounds.values() for arm in arms)
 
 
+def _judged_elsewhere(cfg: SweepConfig, model: str, rounds: list[dict[str, list[Arm]]],
+                      deployments: list[tuple[str | None, Settings]]) -> bool:
+    """Whether an arm of `model` that runs calls a judge on another endpoint or model than its writer's. A run measures
+    tokens per question, not per endpoint, so the judge's tokens would be priced at the writer's rates. Which modes call
+    the judge is the engine's rule: those whose verify level, after the deployment's override, is "full"."""
+    start = start_settings(cfg, model)
+    writer = (start["llm_base_url"], start["llm_model"])
+    if (start["verify_base_url"] or writer[0], start["verify_model"] or writer[1]) == writer:
+        return False
+    overrides = {settings.verify_override for _, settings in deployments}
+    for arm in (arm for own in rounds for arms in own.values() for arm in arms):
+        values = start | dict(arm.changes)
+        if any(_resolve_verify_level(values[f"{mode}.verify"], override) == "full"
+               for mode in arm.modes for override in overrides):
+            return True
+    return False
+
+
 def estimate(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None = None) -> Estimate:
-    """The numbers `render` shows. `tokens` is what a run measured, per model: the mean tokens in and out of one question."""
+    """The numbers `render` shows. `tokens` is what a run measured, per model: the mean tokens in and out of one
+    question."""
     parts = split(cfg, load_questions(cfg))
     tuning, held_out = parts["tuning"], parts["held_out"]
     deployments = baselines(cfg)
@@ -157,8 +180,10 @@ def estimate(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None 
         seconds = cfg.search.seconds_per_question
         hours = {runs: sum(by_model[m][runs][0] / cfg.machine.parallel + by_model[m][runs][1] for m in cfg.models)
                  * seconds / 3600 for runs in runs_each}
+    judged_elsewhere = [m for m in cfg.models
+                        if _judged_elsewhere(cfg, m, [rounds[(m, mode)] for mode in cfg.modes], deployments)]
     dollars = None
-    if tokens is not None and all(_priced(cfg, m, tokens) for m in cfg.models):
+    if tokens is not None and not judged_elsewhere and all(_priced(cfg, m, tokens) for m in cfg.models):
         dollars = {runs: sum(sum(by_model[m][runs]) * _per_question(cfg, m, tokens) for m in cfg.models)
                    for runs in runs_each}
 
@@ -194,7 +219,8 @@ def estimate(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None 
     return Estimate(
         arms=dict(arms), case_runs=case_runs, hours=hours, dollars=dollars, detectable=detectable, compared=compared,
         room_bound=room_bound, store_bytes=store_bytes, unpinned_sources=unpinned, refused=refused, rounds=rounds,
-        parts={name: (len(part), sum(case.answerable for case in part)) for name, part in parts.items()})
+        parts={name: (len(part), sum(case.answerable for case in part)) for name, part in parts.items()},
+        judged_elsewhere=judged_elsewhere)
 
 
 def _priced(cfg: SweepConfig, model: str, tokens: dict[str, tuple[float, float]]) -> bool:
@@ -221,11 +247,11 @@ def _size(count: int) -> str:
     return f"{count} bytes" if unit == "bytes" else f"{size:.1f} {unit}"
 
 
-def _fit(budget: float | None, cost: dict[int, float] | None, show) -> str:
+def _fit(budget: float | None, cost: dict[int, float] | None, show, unknown: str = "the cost is not known yet") -> str:
     if budget is None:
         return ""
     if cost is None:
-        return f"{show(budget)}, which cannot be checked until the cost is known"
+        return f"{show(budget)}, which cannot be checked: {unknown}"
     verdicts = [f"{_runs(runs)}: {'fits' if value <= budget else 'goes over'} ({show(value)})"
                 for runs, value in cost.items()]
     return f"{show(budget)}; " + ", ".join(verdicts)
@@ -295,13 +321,18 @@ def render(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None = 
     if est.dollars is not None:
         dollars = ", ".join(f"{value:.2f} with {_runs(runs)}" for runs, value in est.dollars.items())
         lines.append(f"  dollars: {dollars}")
+    elif est.judged_elsewhere:
+        lines.append(f"  dollars: unknown: {_JUDGE_UNPRICED} ({', '.join(est.judged_elsewhere)} judged on another "
+                     "endpoint or model, and a run's tokens cannot be split between writer and judge)")
     elif tokens is None:
         lines.append(f"  dollars: {_UNKNOWN}")
     else:
         unpriced = [m for m in cfg.models if not _priced(cfg, m, tokens)]
         lines.append(f"  dollars: unknown, with no price or no measured tokens for {', '.join(unpriced)}")
     budget = [text for text in (_fit(cfg.search.budget_hours, est.hours, lambda v: f"{v:.1f} hours"),
-                                _fit(cfg.search.budget_dollars, est.dollars, lambda v: f"{v:.2f} dollars")) if text]
+                                _fit(cfg.search.budget_dollars, est.dollars, lambda v: f"{v:.2f} dollars",
+                                     _JUDGE_UNPRICED if est.judged_elsewhere else "the cost is not known yet"))
+              if text]
     lines.append("  budget: " + ("; ".join(budget) if budget else "none set"))
 
     lines += ["", f"What the search can show (exact McNemar test, Holm's correction at alpha {cfg.propose.alpha:g})"]

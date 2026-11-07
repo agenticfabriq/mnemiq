@@ -6,9 +6,11 @@ from __future__ import annotations
 import pytest
 
 from mnemiq.config import Settings
-from mnemiq.sweep.config import SweepConfigError, deployment_settings, fingerprint, load_config
+from mnemiq.sweep.config import SweepConfigError, deployment_settings, fingerprint, load_config, scrub_credentials
 
-from .conftest import STUB_KEY, alter, broken_questions, tiny_deployment, tiny_files, write_config
+from .conftest import (
+    KEY_ENV, STUB_KEY, UNREACHABLE, alter, broken_questions, tiny_deployment, tiny_files, write_config,
+)
 
 
 def test_a_value_of_the_wrong_type_is_refused(tmp_path):
@@ -120,3 +122,60 @@ def test_the_start_profile_files_content_is_pinned(tmp_path, stub_model):
     before = fingerprint(cfg)
     alter(cfg, "start_profile")
     assert fingerprint(load_config(cfg.path)) != before
+
+
+@pytest.mark.parametrize("where, url, key_env", [
+    ("chat", "http://user:SECRET@localhost/v1", "api_key_env"),
+    ("chat", "http://localhost/v1?api_key=SECRET", "api_key_env"),
+    ("model judge", "https://judge:SECRET@localhost/v1", "verify_api_key_env"),
+    ("judge table", "http://localhost/v1?access_token=SECRET", "verify_api_key_env"),
+])
+def test_an_endpoint_url_that_carries_a_credential_is_refused(tmp_path, where, url, key_env):
+    model = {"llm_model": "stub-model", "llm_base_url": UNREACHABLE, "api_key_env": KEY_ENV}
+    sections = {}
+    if where == "chat":
+        model["llm_base_url"] = url
+    elif where == "model judge":
+        model |= {"verify_base_url": url, "verify_api_key_env": KEY_ENV}
+    else:
+        sections["judge"] = {"verify_base_url": url, "verify_api_key_env": KEY_ENV}
+    with pytest.raises(SweepConfigError, match=key_env) as refused:
+        load_config(write_config(tmp_path, models={"m": model}, **sections))
+    assert "SECRET" not in str(refused.value) and url not in str(refused.value)
+
+
+@pytest.mark.parametrize("url", ["user:SECRET@localhost/v1", "localhost:8000/v1", "ftp://localhost/v1"])
+def test_an_endpoint_url_must_be_http_with_a_host(tmp_path, url):
+    # Without a scheme, a URL's user and password read as its path, where no check for them would look.
+    model = {"llm_model": "stub-model", "llm_base_url": url, "api_key_env": KEY_ENV}
+    with pytest.raises(SweepConfigError, match="http") as refused:
+        load_config(write_config(tmp_path, models={"m": model}))
+    assert "SECRET" not in str(refused.value) and url not in str(refused.value)
+
+
+def test_a_deployment_urls_credentials_stay_out_of_the_fingerprint_and_its_host_does_not(tmp_path, stub_model):
+    deployment = tiny_deployment(tmp_path, stub_model)
+    env = deployment.env.read_text()
+    assert f"MNEMIQ_EMBED_BASE_URL='{stub_model.url}'" in env
+
+    def fingerprint_with(url: str) -> str:
+        deployment.env.write_text(env.replace(f"MNEMIQ_EMBED_BASE_URL='{stub_model.url}'",
+                                              f"MNEMIQ_EMBED_BASE_URL='{url}'"))
+        return fingerprint(load_config(write_config(tmp_path, deployment=deployment)))
+
+    base = fingerprint_with("http://embed:SECRET1@127.0.0.1:9/v1")
+    assert fingerprint_with("http://embed:SECRET2@127.0.0.1:9/v1") == base  # the password
+    assert fingerprint_with("http://other:SECRET1@127.0.0.1:9/v1") == base  # on a web endpoint the user is a credential
+    assert (fingerprint_with("http://127.0.0.1:9/v1?api_key=SECRET1")
+            == fingerprint_with("http://127.0.0.1:9/v1?api_key=SECRET2"))
+    assert fingerprint_with("http://embed:SECRET1@127.0.0.2:9/v1") != base  # the host
+
+
+def test_a_message_naming_a_deployment_url_shows_it_without_its_credentials():
+    settings = Settings.model_construct(embed_base_url="http://embed:SECRET@embedder.example/v1?api_key=SECRET",
+                                        control_dsn="postgresql://sweep:SECRET@db.example/library")
+    raw = settings.embed_base_url
+    text = f"embed_base_url={raw!r}; {raw}; {settings.control_dsn}; llm_base_url='http://127.0.0.1:9/v1'"
+    assert scrub_credentials(text, settings) == ("embed_base_url='http://embedder.example/v1'; "
+                                                 "http://embedder.example/v1; postgresql://sweep@db.example/library; "
+                                                 "llm_base_url='http://127.0.0.1:9/v1'")

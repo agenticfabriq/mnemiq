@@ -80,3 +80,32 @@ def test_check_mode_has_no_timing_and_no_confirm_round(tmp_path):
     assert est.case_runs == {1: (2 + 1) * 8, 2: 2 * 2 * 8}  # every question; the start twice in the first round
     rounds = [line.strip() for line in render(cfg).splitlines()]  # the store's path holds this test's name
     assert not [line for line in rounds if line.startswith(("timing:", "confirm,"))]
+
+
+
+def _priced_model(**judge) -> dict:
+    return {"llm_model": "stub-model", "llm_base_url": UNREACHABLE, "api_key_env": KEY_ENV,
+            "price_in_per_mtok": 2.0, "price_out_per_mtok": 8.0, **judge}
+
+
+def test_a_judge_on_another_endpoint_leaves_dollars_unknown_where_a_mode_calls_it(tmp_path):
+    # Measured tokens cannot be split between the writer and the judge, so the judge's would be priced as the writer's.
+    tokens = {"m": (1000.0, 100.0)}
+    elsewhere = _priced_model(verify_base_url="http://127.0.0.1:9/judge/v1", verify_api_key_env=KEY_ENV)
+    for sections in ({"models": {"m": elsewhere}, "modes": ["thinking"]},
+                     {"models": {"m": _priced_model()}, "judge": {"verify_model": "a-judge-model"}, "modes": ["deep"]},
+                     {"models": {"m": elsewhere}, "modes": ["instant"], "space": {"instant": {"verify": ["full"]}}}):
+        cfg = load_config(write_config(tmp_path, search={"budget_dollars": 5.0}, **sections))
+        assert estimate(cfg, tokens=tokens).dollars is None, sections
+        lines = render(cfg, tokens=tokens).splitlines()
+        assert any("dollars: unknown" in line and "the judge's price is not known" in line for line in lines)
+        budget = next(line for line in lines if line.strip().startswith("budget:"))
+        assert "the judge's price is not known" in budget and "fits" not in budget
+
+
+def test_a_mode_that_never_calls_the_judge_is_priced(tmp_path):
+    tokens = {"m": (1000.0, 100.0)}
+    elsewhere = _priced_model(verify_base_url="http://127.0.0.1:9/judge/v1", verify_api_key_env=KEY_ENV)
+    est = estimate(load_config(write_config(tmp_path, models={"m": elsewhere}, modes=["instant"])), tokens=tokens)
+    per_case = (1000 * 2.0 + 100 * 8.0) / 1_000_000
+    assert est.dollars == {runs: pytest.approx(count * per_case) for runs, count in est.case_runs.items()}
