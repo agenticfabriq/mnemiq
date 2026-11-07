@@ -68,3 +68,15 @@ def test_when_the_engine_refuses_the_start_nothing_runs(tmp_path, monkeypatch):
     est = estimate(cfg)
     assert est.case_runs == {1: 0, 2: 0} and [arm.label for arm, _ in est.refused] == ["start"]
     assert "nothing runs" in render(cfg) and KEY_ENV in render(cfg)
+
+
+def test_check_mode_has_no_timing_and_no_confirm_round(tmp_path):
+    # A start profile that changes a setting gives the defaults arm changes, which a search would time and confirm.
+    start = tmp_path / "start.toml"
+    start.write_text('default = "tuned"\n[profiles.tuned]\nretrieval_k = 12\n')
+    cfg = load_config(write_config(tmp_path, start={"profile_file": str(start)}, search={"strategy": "check"}))
+    est = estimate(cfg)
+    assert est.arms == {"check": 2}
+    assert est.case_runs == {1: (2 + 1) * 8, 2: 2 * 2 * 8}  # every question; the start twice in the first round
+    rounds = [line.strip() for line in render(cfg).splitlines()]  # the store's path holds this test's name
+    assert not [line for line in rounds if line.startswith(("timing:", "confirm,"))]

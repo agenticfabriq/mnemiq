@@ -108,13 +108,15 @@ def _questions_asked(cfg: SweepConfig, rounds: dict[str, list[Arm]], tuning: int
         first = name in ("check", "screen") or cfg.search.strategy == "grid"
         count = 2 + (len(arms) - 1) * runs if first and decided else len(arms) * runs
         parallel += count * tuning
-    if cfg.search.strategy != "check" and _searches(rounds):
+    if _searches(cfg, rounds):
         alone += TIMING_ARMS_PER_MODE * tuning
     return parallel, alone
 
 
-def _searches(rounds: dict[str, list[Arm]]) -> bool:
-    return any(arm.changes for arms in rounds.values() for arm in arms)
+def _searches(cfg: SweepConfig, rounds: dict[str, list[Arm]]) -> bool:
+    """Whether these rounds search, so that timing and confirm follow. Check mode never does: its defaults arm has
+    changes whenever the start profile sets anything, and it is compared for harm, not searched."""
+    return cfg.search.strategy != "check" and any(arm.changes for arms in rounds.values() for arm in arms)
 
 
 def estimate(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None = None) -> Estimate:
@@ -135,7 +137,7 @@ def estimate(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None 
     by_model: dict[str, dict[int, tuple[int, int]]] = {}
     for model in cfg.models:
         own = {mode: rounds[(model, mode)] for mode in cfg.modes}
-        confirming = [mode for mode, r in own.items() if _searches(r)]
+        confirming = [mode for mode, r in own.items() if _searches(cfg, r)]
         totals = {}
         for runs in runs_each:
             parallel = alone = 0
@@ -164,10 +166,10 @@ def estimate(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None 
     for (model, mode), r in rounds.items():
         for name, kept in r.items():
             arms[name] += len(kept)
-        if cfg.search.strategy != "check" and _searches(r):
+        if _searches(cfg, r):
             arms["timing"] += TIMING_ARMS_PER_MODE
     for model in cfg.models:
-        if any(_searches(rounds[(model, mode)]) for mode in cfg.modes):
+        if any(_searches(cfg, rounds[(model, mode)]) for mode in cfg.modes):
             arms["confirm"] += 2 * sum(1 for mode in cfg.modes if any(rounds[(model, mode)].values()))
 
     room_bound = sum(case.answerable for case in tuning)
@@ -270,14 +272,13 @@ def render(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None = 
                 lines.append(f"    check: {labels}, on every question")
             else:
                 lines.append(f"    {name}: {len(arms)} arms: {labels}")
-        if not check and _searches(rounds):
+        if _searches(cfg, rounds):
             lines.append(f"    timing: the start and each finalist, once each and alone (the cost counts "
                          f"{TIMING_ARMS_PER_MODE}: the start and one finalist)")
-    if not check:
-        for model in cfg.models:
-            if any(_searches(est.rounds[(model, mode)]) for mode in cfg.modes):
-                lines.append(f"  confirm, {model}: the assembled profile against the start on the held-out part, in "
-                             f"each mode")
+    for model in cfg.models:
+        if any(_searches(cfg, est.rounds[(model, mode)]) for mode in cfg.modes):
+            lines.append(f"  confirm, {model}: the assembled profile against the start on the held-out part, in each "
+                         "mode")
     if est.refused:
         lines += ["", "Skipped, since the engine refuses them", *_refusals(est.refused)]
 
