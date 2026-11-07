@@ -179,8 +179,9 @@ class StubModel:
       gold          answer every question right. `gold_when(request)` answers right only where it returns true.
                     With neither, a stub answers wrong, unless `varies` or `start_misses` is passed.
       sql           answer every writer call with this SQL, whatever the question.
-      varies        repeated asks of one question get the answer's other spellings in turn, right or wrong, with the
-                    same rows (a case's `variants` or `wrong_variants`). Passed without `gold_when`, right elsewhere.
+      varies        every ask of one question gets a spelling of its own, right or wrong, with the same rows: the
+                    case's spellings in turn (`variants` or `wrong_variants`), each read from a derived table named
+                    for the ask, so no two asks are spelled alike. Passed without `gold_when`, right elsewhere.
       seconds       delay before each chat reply.
       start_misses  answer the first N answerable cases wrong on every request, however `gold` reads. Passed
                     without `gold_when`, right everywhere else.
@@ -327,9 +328,11 @@ class StubModel:
         return _proposal(self._spelled(case.wrong_sql, case.wrong_variants, asked))
 
     def _spelled(self, sql: str, variants: tuple[str, ...], asked: int) -> str:
-        """The `asked`-th spelling of an answer under `varies`, else the answer as scripted."""
-        spellings = (sql, *variants) if self.varies else (sql,)
-        return spellings[asked % len(spellings)]
+        """The answer as scripted, or under `varies` the `asked`-th ask's own spelling of it."""
+        if not self.varies:
+            return sql
+        spellings = (sql, *variants)
+        return f"SELECT * FROM ({spellings[asked % len(spellings)]}) AS ask_{asked}"
 
     # --- the doors --------------------------------------------------------------------------------------------------
 
