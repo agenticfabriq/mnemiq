@@ -19,7 +19,7 @@ import tomllib
 from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated, Any, Literal
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from pydantic import (
     AfterValidator, BaseModel, ConfigDict, Field, PrivateAttr, TypeAdapter, ValidationError, ValidationInfo,
@@ -27,7 +27,7 @@ from pydantic import (
 )
 
 from mnemiq.agent.modes import MODES
-from mnemiq.config import _SECRET_HINTS, ModeSettings, Settings, SourceSpec
+from mnemiq.config import _SECRET_HINTS, ModeSettings, Settings, SourceSpec, names_a_credential, without_credentials
 from mnemiq.contract import EvaluationCase
 from mnemiq.profiles import _NAME, DEPLOYMENT_SETTINGS, PROFILE_SETTINGS, ProfileFileError
 from mnemiq.profiles import _read as _read_profile_file
@@ -46,10 +46,7 @@ _FILE_SOURCES = ("sqlite", "duckdb")
 # so a sweep may be resumed under new ones.
 _PLANNING = ("budget_hours", "budget_dollars", "seconds_per_question")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-_KEYWORD_PASSWORD = re.compile(r"""(?i)(?:^|\s)password\s*=\s*(?:'(?:[^'\\]|\\.)*'|\S*)""")
-# A query parameter named like one of these holds a credential. Wider than the settings fields' hints: a query is
-# free-form, and `token`, `auth` and `sig` (a signed URL's signature) carry credentials there too.
-_CREDENTIAL_HINTS = (*_SECRET_HINTS, "key", "token", "auth", "sig")
+# The schemes an endpoint in `[models]` or `[judge]` may use: each is an OpenAI-compatible server.
 _WEB_SCHEMES = ("http", "https")
 
 
@@ -76,10 +73,6 @@ def _env_name(value: str) -> str:
     return value
 
 
-def _names_a_credential(name: str) -> bool:
-    return any(hint in name.lower() for hint in _CREDENTIAL_HINTS)
-
-
 def _endpoint_url(value: str | None, info: ValidationInfo) -> str | None:
     """An endpoint as `[models]` and `[judge]` state it: an http or https URL with a host and no credential. Each arm's
     profile file and the fingerprint hold it as written. It is never quoted back, since a credential is the likeliest
@@ -96,7 +89,7 @@ def _endpoint_url(value: str | None, info: ValidationInfo) -> str | None:
     # Without a scheme, a user and password read as the URL's path, where the check below would not look.
     if parts.scheme not in _WEB_SCHEMES or not host:
         raise ValueError("must be an http or https URL with a host, such as http://192.0.2.10:8000/v1")
-    if "@" in parts.netloc or any(_names_a_credential(name) for name, _ in query):
+    if "@" in parts.netloc or any(names_a_credential(name) for name, _ in query):
         raise ValueError("carries a credential (a user or password before '@', or a key in its query). A key never "
                          f"goes in this file: name the environment variable that holds it in {key_env}")
     return value
@@ -544,28 +537,6 @@ def pinned_files(cfg: SweepConfig) -> dict[str, str]:
             if spec.kind in _FILE_SOURCES:
                 files[os.path.abspath(spec.target)] = f"the source {spec.id!r}"
     return {path: _sha256(path, files[path]) for path in sorted(files)}
-
-
-def without_credentials(value: str) -> str:
-    """A DSN or URL as a fingerprint or a message may hold it: no password and no query parameter named like a
-    credential. On a web URL the user goes too, since there it is part of the credential; a database's user is kept,
-    since it still decides what is read."""
-    if "://" not in value:
-        return " ".join(_KEYWORD_PASSWORD.sub(" ", value).split())
-    try:
-        parts = urlsplit(value)
-        netloc = parts.netloc
-        if "@" in netloc:
-            userinfo, host = netloc.rsplit("@", 1)
-            user = "" if parts.scheme in _WEB_SCHEMES else userinfo.split(":", 1)[0]
-            netloc = f"{user}@{host}" if user else host
-        query = parts.query
-        pairs = parse_qsl(query, keep_blank_values=True)
-        if any(_names_a_credential(key) for key, _ in pairs):
-            query = urlencode([(key, item) for key, item in pairs if not _names_a_credential(key)])
-        return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
-    except ValueError:
-        return "(an unreadable url)"
 
 
 def _holds_a_url(name: str) -> bool:

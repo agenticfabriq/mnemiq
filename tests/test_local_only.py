@@ -346,3 +346,37 @@ def test_every_url_field_is_checked_or_explicitly_exempted():
         f"new _url field(s) {unaccounted} are neither checked by assert_local_only "
         "(_LOCAL_ONLY_CHECKED_URL_FIELDS) nor in this test's own EXEMPTED set"
     )
+
+
+# --- an endpoint is named without its credentials --------------------------------------------
+
+
+def test_a_refused_endpoint_is_named_without_its_credentials():
+    s = _s(llm_base_url="http://127.0.0.1:8000/v1", llm_api_key="k",
+           embed_base_url="https://embed:SECRET@api.example.com/v1?api_key=SECRET&version=2")
+    with pytest.raises(RuntimeError) as exc:
+        s.assert_local_only()
+    msg = str(exc.value)
+    assert "SECRET" not in msg and "embed:" not in msg
+    # The field, the host and the rest of the URL are still named, so the operator can find what to fix.
+    assert ("embed_base_url='https://api.example.com/v1?version=2' (host 'api.example.com' is a DNS name"
+            in msg)
+
+
+@pytest.mark.parametrize("bad_url", ["http://user:SECRET@[10.0.0.1]/v1", "http://user:SECRET@℀.com/v1"])
+def test_an_unparseable_endpoint_is_named_without_its_credentials(bad_url):
+    # The second's parse error quotes the URL's netloc, user and password included.
+    with pytest.raises(RuntimeError) as exc:
+        _s(llm_base_url=bad_url, llm_api_key="k").assert_local_only()
+    msg = str(exc.value)
+    assert "llm_base_url" in msg and "SECRET" not in msg and "user:" not in msg
+
+
+def test_an_endpoint_with_no_credentials_is_named_as_written():
+    assert _s(llm_base_url="http://vllm.corp.internal:8000/v1?version=2", llm_api_key="k",
+              embed_base_url="https://8.8.8.8/v1", verify_base_url="http://[::1/v1").local_only_offenders() == [
+        "llm_base_url='http://vllm.corp.internal:8000/v1?version=2' (host 'vllm.corp.internal' is a DNS name; this "
+        "check does not resolve names, so it cannot confirm one stays on this network)",
+        "embed_base_url='https://8.8.8.8/v1' (host 8.8.8.8 is publicly routable)",
+        "verify_base_url='http://[::1/v1' (not a parseable URL: Invalid IPv6 URL)",
+    ]

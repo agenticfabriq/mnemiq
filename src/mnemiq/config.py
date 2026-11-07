@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
+from urllib.parse import unquote_plus
 
 from typing import Annotated, Literal
 
@@ -34,6 +36,61 @@ DEFAULT_RETRIEVAL_K = 24
 DEFAULT_MAX_QUESTION_CHARS = 4_000
 
 _SECRET_HINTS = ("api_key", "dsn", "password", "secret")  # fields whose value is never printed in .env.example
+# A URL query parameter named like one of these carries a credential: the secret fields' hints, and the words a query
+# uses besides (`token`, `auth`, and `sig` for a signed URL's signature).
+_CREDENTIAL_HINTS = (*_SECRET_HINTS, "key", "token", "auth", "sig")
+_WEB_SCHEMES = ("http", "https")
+_KEYWORD_PASSWORD = re.compile(r"""(?i)(?:^|\s)password\s*=\s*(?:'(?:[^'\\]|\\.)*'|\S*)""")
+
+
+def names_a_credential(name: str) -> bool:
+    """Whether a URL query parameter called `name` carries a credential."""
+    return any(hint in name.lower() for hint in _CREDENTIAL_HINTS)
+
+
+def _authority(value: str) -> tuple[str, str, str, str]:
+    """`value` cut as (scheme, `://`, authority, the rest), as a string and never parsed. With no scheme, an Easy
+    Connect string's `user/password@host` puts a `/` before the `@`, so only `?` and `#` end the authority."""
+    scheme, sep, rest = value.partition("://")
+    if not sep:
+        scheme, rest = "", value
+    end = re.search(r"[/?#]" if sep else r"[?#]", rest)
+    cut = end.start() if end else len(rest)
+    return scheme, sep, rest[:cut], rest[cut:]
+
+
+def without_credentials(value: str) -> str:
+    """A URL or DSN as a message, a log or a fingerprint may show it.
+
+    No user or password before the host's `@` (a database URL keeps its user, which names who reads and is no secret),
+    no query parameter named like a credential, and no `password=` in a keyword DSN. Everything else stays as written,
+    so a value with no credential comes back unchanged. It is read as a string, never parsed, so a URL no parser
+    accepts loses its credentials too.
+    """
+    if "://" not in value and _KEYWORD_PASSWORD.search(value):
+        return " ".join(_KEYWORD_PASSWORD.sub(" ", value).split())
+    if "://" not in value and any(c.isspace() for c in value):
+        return value  # a keyword DSN with no password in it
+    scheme, sep, authority, rest = _authority(value)
+    userinfo, at, host = authority.rpartition("@")
+    if at:
+        user = userinfo.split(":", 1)[0]
+        authority = f"{user}@{host}" if sep and user and scheme.lower() not in _WEB_SCHEMES else host
+    before_fragment, hash_, fragment = rest.partition("#")
+    path, question, query = before_fragment.partition("?")
+    if question:
+        pairs = query.split("&")
+        kept = [pair for pair in pairs if not names_a_credential(unquote_plus(pair.split("=", 1)[0]))]
+        if len(kept) < len(pairs):
+            before_fragment = path + ("?" + "&".join(kept) if kept else "")
+    return f"{scheme}{sep}{authority}{before_fragment}{hash_}{fragment}"
+
+
+def _without_userinfo(text: str, url: str) -> str:
+    """`text`, a parser's message about `url`, with whatever `url` holds before its host's `@` taken out: a parse error
+    can quote the URL's netloc."""
+    userinfo, at, _ = _authority(url)[2].rpartition("@")
+    return text.replace(f"{userinfo}@", "") if at else text
 
 # Every `Settings` field `assert_local_only` checks, by name. Nothing enforces that a NEW field
 # whose name ends in `_url` gets added here -- a future verity_*_url (or any other) setting would
@@ -288,6 +345,8 @@ class Settings(BaseSettings):
             url = getattr(self, name, None)
             if not url:
                 continue
+            # Named without its credentials: this message reaches stderr and any log the operator keeps.
+            shown = without_credentials(url)
             try:
                 host = urlparse(url).hostname
             except ValueError as exc:
@@ -296,10 +355,10 @@ class Settings(BaseSettings):
                 # `host is None` case below, and one an earlier version of this method let
                 # propagate uncaught, discarding every offender already collected for a field
                 # visited before this one in loop order.
-                offenders.append(f"{name}={url!r} (not a parseable URL: {exc})")
+                offenders.append(f"{name}={shown!r} (not a parseable URL: {_without_userinfo(str(exc), url)})")
                 continue
             if host is None:
-                offenders.append(f"{name}={url!r} (no host could be parsed)")
+                offenders.append(f"{name}={shown!r} (no host could be parsed)")
                 continue
             if host in ("localhost", "localhost.localdomain"):
                 checked.append(name)
@@ -308,7 +367,7 @@ class Settings(BaseSettings):
                 addr = ipaddress.ip_address(host)
             except ValueError:
                 offenders.append(
-                    f"{name}={url!r} (host {host!r} is a DNS name; this check does not "
+                    f"{name}={shown!r} (host {host!r} is a DNS name; this check does not "
                     "resolve names, so it cannot confirm one stays on this network)"
                 )
                 continue
@@ -322,7 +381,7 @@ class Settings(BaseSettings):
             in_rfc1918 = v4_equivalent.version == 4 and any(v4_equivalent in net for net in rfc1918)
             in_ula = addr.version == 6 and addr in ula
             if not (v4_equivalent.is_loopback or in_rfc1918 or in_ula):
-                offenders.append(f"{name}={url!r} (host {host} is publicly routable)")
+                offenders.append(f"{name}={shown!r} (host {host} is publicly routable)")
                 continue
             checked.append(name)
         return offenders, checked
