@@ -9,12 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from mnemiq.sweep.config import load_config
+from mnemiq.sweep.config import deployment_settings, load_config
 from mnemiq.sweep.run import arm_folder, arm_settings, engine_build, identity_refusal, run_arm
 
 from .conftest import (
-    cancel_gold_once, copy_package, one_arm, out_files, read_rows, start_of, tiny_deployment, touch_store, tuning,
-    two_deployments, write_config,
+    cancel_gold_once, copy_package, judged_by, one_arm, out_files, read_rows, start_of, tiny_deployment, touch_store,
+    tuning, two_deployments, write_config,
 )
 
 
@@ -72,9 +72,23 @@ def test_an_identity_with_a_row_filter_is_refused(tmp_path, stub_model):
     assert "row filter" in identity_refusal(cfg)
 
 
+def test_an_identity_with_a_mask_is_refused(tmp_path, stub_model):
+    cfg = load_config(write_config(tmp_path, deployment=tiny_deployment(tmp_path, stub_model, mask=True)))
+    assert "mask" in identity_refusal(cfg)
+
+
 def test_a_case_whose_gold_reads_an_unseen_table_is_refused(tmp_path, stub_model):
     cfg = load_config(write_config(tmp_path, deployment=tiny_deployment(tmp_path, stub_model, withhold="loans")))
-    assert "loans" in identity_refusal(cfg)
+    refusal = identity_refusal(cfg)
+    assert "loans" in refusal
+    assert "loans-by-genre" in refusal and "open-loans" in refusal and "book-count" not in refusal   # by case id
+
+
+def test_an_access_policy_that_cannot_be_read_is_named_as_such(tmp_path, stub_model):
+    d = tiny_deployment(tmp_path, stub_model)
+    d.authz.write_text("{ not json")
+    refusal = identity_refusal(load_config(write_config(tmp_path, deployment=d)))
+    assert "cannot be read" in refusal and "book-count" not in refusal
 
 
 def test_an_identity_that_sees_every_gold_table_unfiltered_is_not_refused(tmp_path, stub_model):
@@ -87,6 +101,29 @@ def test_an_endpoint_that_stops_answering_stops_the_arm(tmp_path, stub_model, st
     cfg, arm = one_arm(tmp_path, stub_model(gold=True, fail_after=3, status=status))
     assert run_arm(cfg, arm, tuning(cfg), arm_folder(cfg, arm, 1)) == "endpoint"
     assert all(r["outcome"] != "error" for r in read_rows(cfg, arm))
+
+
+@pytest.mark.parametrize("status", [503, "connect"])
+def test_an_embedder_that_stops_answering_stops_the_arm(tmp_path, stub_model, status):
+    cfg, arm = one_arm(tmp_path, stub_model(gold=True, embed_status=status))   # retrieval embeds the question first
+    assert run_arm(cfg, arm, tuning(cfg), arm_folder(cfg, arm, 1)) == "endpoint"
+    assert read_rows(cfg, arm) == []
+
+
+@pytest.mark.parametrize("judge, ends", [(dict(fail_after=0, status=503), "endpoint"),
+                                         (dict(rule=lambda request: "no score in this reply"), "complete")])
+def test_a_judge_on_its_own_endpoint_stops_the_arm_only_when_it_stops_answering(tmp_path, stub_model, judge, ends):
+    judging = stub_model(**judge)
+    cfg, arm = one_arm(tmp_path, stub_model(gold=True), modes=["thinking"], judge=judged_by(judging))
+    assert run_arm(cfg, arm, tuning(cfg), arm_folder(cfg, arm, 1)) == ends and judging.calls >= 3
+
+
+def test_a_fail_open_judge_that_is_down_is_on_every_answered_row(tmp_path, stub_model):
+    judging = stub_model(fail_after=0, status=503)
+    cfg, arm = one_arm(tmp_path, stub_model(gold=True), env_extra={"MNEMIQ_VERIFY_FAIL_CLOSED": "0"},
+                       modes=["thinking"], judge=judged_by(judging))
+    assert run_arm(cfg, arm, tuning(cfg), arm_folder(cfg, arm, 1)) == "complete"
+    assert {r["verify_layer"] for r in read_rows(cfg, arm) if r["outcome"] == "correct"} == {"judge_unavailable"}
 
 
 def test_a_case_asked_again_after_an_endpoint_stop_keeps_its_error(tmp_path, stub_model):
@@ -105,11 +142,35 @@ def test_a_statement_cancelled_under_load_is_an_error_not_wrong(tmp_path, stub_m
     cancel_gold_once(monkeypatch)                    # the source raises its timeout on one gold query
     run_arm(cfg, arm, tuning(cfg), arm_folder(cfg, arm, 1))
     assert [r["outcome"] for r in read_rows(cfg, arm)].count("error") == 1
+    assert [r["error_kind"] for r in read_rows(cfg, arm) if r["outcome"] == "error"] == ["source"]
 
 
 def test_a_store_changed_during_an_arm_makes_it_invalid(tmp_path, stub_model):
     cfg, arm = one_arm(tmp_path, stub_model(gold=True, on_call=lambda n: n == 2 and touch_store(cfg, b"x")))
     assert run_arm(cfg, arm, tuning(cfg), arm_folder(cfg, arm, 1)) == "invalid"
+
+
+def test_a_pin_that_moves_between_a_stop_and_its_resume_makes_the_arm_invalid(tmp_path, stub_model):
+    stub = stub_model(gold=True, fail_after=3, status=500)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    assert run_arm(cfg, arm, tuning(cfg), folder) == "endpoint"
+    touch_store(cfg, b"x")
+    stub.recover()
+    assert run_arm(cfg, arm, tuning(cfg), folder) == "invalid"
+
+
+def test_an_invalid_arm_outranks_an_endpoint_stop_and_stays_invalid(tmp_path, stub_model):
+    stub = stub_model(gold=True, fail_after=3, status=500, on_call=lambda n: n == 2 and touch_store(cfg, b"x"))
+    cfg, arm = one_arm(tmp_path, stub)
+    store = Path(deployment_settings(cfg, None).store_path)
+    original = store.read_bytes()
+    folder = arm_folder(cfg, arm, 1)
+    assert run_arm(cfg, arm, tuning(cfg), folder) == "invalid"
+    store.write_bytes(original)   # put back, so only the arm's own record says the store moved
+    stub.recover()
+    asked = stub.calls
+    assert run_arm(cfg, arm, tuning(cfg), folder) == "invalid" and stub.calls == asked   # nothing asked again
 
 
 def test_the_source_hash_changes_with_the_source(tmp_path):

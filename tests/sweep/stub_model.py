@@ -193,6 +193,7 @@ class StubModel:
       window        the context window `/tokenize` and `/v1/models` report.
       prompt_tokens the prompt tokens every chat reply reports, whatever was sent: a server that read only part of
                     the prompt reports what it read.
+      embed_status  every embeddings request fails with this: an HTTP code or "connect".
 
     Calling a stub, `stub(**options)`, starts another that shares its cases and stops when it stops.
     """
@@ -202,11 +203,15 @@ class StubModel:
                  seconds: float = 0.0, start_misses: int = 0, on_call: Callable[[int], None] | None = None,
                  fail_first: int = 0, fail_after: int | None = None, status: int | str = 500,
                  confidence: float = 0.9, window: int = 32768, prompt_tokens: int | None = None,
-                 model: str = "stub-model", script: _Script | None = None) -> None:
+                 embed_status: int | str | None = None, model: str = "stub-model",
+                 script: _Script | None = None) -> None:
         if gold and gold_when is not None:
             raise ValueError("gold and gold_when say the same thing: pass one")
         if isinstance(status, bool) or not (isinstance(status, int) or status in ("connect", "context_too_long")):
             raise ValueError(f"status must be an HTTP code, 'connect' or 'context_too_long', not {status!r}")
+        if embed_status is not None and (isinstance(embed_status, bool)
+                                         or not (isinstance(embed_status, int) or embed_status == "connect")):
+            raise ValueError(f"embed_status must be an HTTP code or 'connect', not {embed_status!r}")
         self.rule = rule
         # `varies` and `start_misses` describe how a right model departs from right, so either alone means one.
         right = gold or (gold_when is None and (varies or start_misses > 0))
@@ -222,6 +227,7 @@ class StubModel:
         self.confidence = confidence
         self.window = window
         self.prompt_tokens = prompt_tokens
+        self.embed_status = embed_status
         self.model = model
         # What a test reads.
         self.calls = 0  # chat requests, failed ones included
@@ -432,6 +438,8 @@ class _Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/v1/chat/completions":
             stub._chat(self, body)
+        elif path == "/v1/embeddings" and stub.embed_status is not None:
+            self.fail(stub.embed_status)
         elif path == "/v1/embeddings":
             self.send_json(200, stub._embeddings(body))
         elif path == "/tokenize":

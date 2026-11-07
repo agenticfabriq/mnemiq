@@ -163,24 +163,27 @@ def tiny_files(tmp_path: Path) -> TinyDeployment:
     return d
 
 
-def _write_authz(d: TinyDeployment, *, withhold: str | None, row_filter: bool) -> None:
+def _write_authz(d: TinyDeployment, *, withhold: str | None, row_filter: bool, mask: bool) -> None:
     tables = [table for table in ("authors", "books", "loans") if table != withhold]
-    role = {"read": tables, "row_filters": {"loans": "returned = 1"}} if row_filter else tables
+    role: list | dict = tables
+    if row_filter or mask:
+        role = {"read": tables, **({"row_filters": {"loans": "returned = 1"}} if row_filter else {}),
+                **({"pii_mask": ["contact"]} if mask else {})}
     d.authz.write_text(json.dumps({"roles": {ROLE: role}}))
 
 
 def tiny_deployment(tmp_path: Path, stub: StubModel, *, env_extra: dict[str, str] | None = None,
-                    withhold: str | None = None, row_filter: bool = False) -> TinyDeployment:
+                    withhold: str | None = None, row_filter: bool = False, mask: bool = False) -> TinyDeployment:
     """The tiny deployment, its store built once per `tmp_path`: a second call returns what the first built, so a
     rebuilt store never moves a fingerprint. Its env file points at the first stub given, for chat and embeddings, and
     every stub given learns its cases. `env_extra` adds lines to the env file, as `{"MNEMIQ_NAME": "value"}`, and is
-    taken only by the call that builds the deployment. `withhold` takes one table out of the sweep's role, and
-    `row_filter` gives the role a row filter; the store does not depend on either."""
+    taken only by the call that builds the deployment. `withhold` takes one table out of the sweep's role, `row_filter`
+    gives the role a row filter, and `mask` a PII mask; the store depends on none of them."""
     from mnemiq.cli import _cmd_build, _cmd_enrich
 
     d = tiny_files(tmp_path)
-    if withhold is not None or row_filter:
-        _write_authz(d, withhold=withhold, row_filter=row_filter)
+    if withhold is not None or row_filter or mask:
+        _write_authz(d, withhold=withhold, row_filter=row_filter, mask=mask)
     if env_extra and d.store.exists():
         raise ValueError("env_extra is written when the deployment is built: pass it to the first call for this "
                          "tmp_path")
@@ -410,15 +413,21 @@ def two_deployments(tmp_path: Path, stub: StubModel) -> dict:
 
 def one_arm(tmp_path: Path, stub: StubModel, *, env_extra: dict[str, str] | None = None,
             api_key_env: str | None = None, **sections):
-    """A loaded config over the tiny deployment on `stub`, and the screen's start arm in instant mode. `env_extra` goes
-    to `tiny_deployment`, `api_key_env` names model `m`'s key variable, and each other keyword is a config section."""
+    """A loaded config over the tiny deployment on `stub`, and the screen's start arm in the config's first mode.
+    `env_extra` goes to `tiny_deployment`, `api_key_env` names model `m`'s key variable, and each other keyword is a
+    config section."""
     from mnemiq.sweep.config import load_config
 
     d = tiny_deployment(tmp_path, stub, env_extra=env_extra)
     if api_key_env is not None:
         sections["models"] = {"m": {"llm_model": "stub-model", "llm_base_url": stub.url, "api_key_env": api_key_env}}
     cfg = load_config(write_config(tmp_path, deployment=d, model=stub, **sections))
-    return cfg, start_of(cfg, "instant")
+    return cfg, start_of(cfg, cfg.modes[0])
+
+
+def judged_by(stub: StubModel) -> dict:
+    """A `[judge]` section naming `stub` as every model's judge."""
+    return {"verify_model": "judge-model", "verify_base_url": stub.url, "verify_api_key_env": KEY_ENV}
 
 
 def tuning(cfg) -> list[EvaluationCase]:
