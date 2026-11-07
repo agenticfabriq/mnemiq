@@ -1,0 +1,296 @@
+"""What every sweep test stands on: the scripted model, a tiny real deployment, and a config file around them.
+
+`tiny_deployment` is a real one: a SQLite source of three tables, a store enriched and indexed by the engine's own
+`enrich` and `build` commands, an access policy, an env file and graded cases. Only the model is scripted.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+
+import pytest
+
+from mnemiq.config import Settings
+
+from .stub_model import StubModel
+
+ROLE = "sweep-test"
+KEY_ENV = "SWEEP_TEST_KEY"
+STUB_KEY = "stub-key"
+# Nothing listens on the discard port: a config that names it loads, and anything that calls it fails at once.
+UNREACHABLE = "http://127.0.0.1:9/v1"
+
+_AUTHORS = [(1, "Ada Lindqvist", "Sweden"), (2, "Tomas Okafor", "Canada"), (3, "Mei Tanaka", "Japan"),
+            (4, "Rosa Ferreira", "Canada")]
+_BOOKS = [(1, 1, "The Quiet Harbour", 1938, "fiction"), (2, 1, "Salt and Iron", 1952, "history"),
+          (3, 2, "Northern Lights Field Guide", 1971, "science"), (4, 2, "The Long Portage", 1946, "fiction"),
+          (5, 3, "Tides of Kobe", 1989, "history"), (6, 3, "Paper Lanterns", 2004, "fiction"),
+          (7, 4, "Counting Stars", 1999, "science"), (8, 4, "A Map of Small Rivers", 2015, "fiction")]
+_LOANS = [(1, 1, "2026-01-04", 1), (2, 1, "2026-02-11", 1), (3, 2, "2026-01-19", 1), (4, 3, "2026-03-02", 0),
+          (5, 4, "2026-03-15", 1), (6, 5, "2026-04-01", 0), (7, 6, "2026-04-20", 1), (8, 6, "2026-05-05", 1),
+          (9, 6, "2026-06-12", 0), (10, 7, "2026-06-30", 1), (11, 8, "2026-07-08", 1), (12, 8, "2026-08-21", 0),
+          (13, 2, "2026-09-03", 1), (14, 5, "2026-09-27", 1), (15, 1, "2026-10-14", 0)]
+
+# Synthetic questions over the tables above. `wrong_sql` runs and returns other rows; `variants` return the gold rows.
+CASES: tuple[dict, ...] = (
+    {"id": "book-count", "question": "How many books does the library hold?",
+     "gold_sql": "SELECT COUNT(*) AS books FROM books",
+     "variants": ["SELECT COUNT(book_id) AS books FROM books"],
+     "wrong_sql": "SELECT COUNT(*) AS books FROM authors"},
+    {"id": "canadian-authors", "question": "How many authors come from Canada?",
+     "gold_sql": "SELECT COUNT(*) AS authors FROM authors WHERE country = 'Canada'",
+     "variants": ["SELECT COUNT(author_id) AS authors FROM authors WHERE country = 'Canada'"],
+     "wrong_sql": "SELECT COUNT(*) AS authors FROM authors"},
+    {"id": "before-1950", "question": "Which books were published before 1950?",
+     "gold_sql": "SELECT title FROM books WHERE published_year < 1950",
+     "variants": ["SELECT title FROM books WHERE published_year <= 1949"],
+     "wrong_sql": "SELECT title FROM books WHERE published_year > 1950"},
+    {"id": "loans-by-genre", "question": "How many loans has each genre had?",
+     "gold_sql": "SELECT b.genre, COUNT(l.loan_id) AS loans FROM loans l JOIN books b ON b.book_id = l.book_id "
+                 "GROUP BY b.genre",
+     "variants": ["SELECT books.genre, COUNT(*) AS loans FROM loans JOIN books ON books.book_id = loans.book_id "
+                  "GROUP BY books.genre"],
+     "wrong_sql": "SELECT genre, COUNT(*) AS loans FROM books GROUP BY genre"},
+    {"id": "open-loans", "question": "How many loans have not been returned?",
+     "gold_sql": "SELECT COUNT(*) AS open_loans FROM loans WHERE returned = 0",
+     "variants": ["SELECT COUNT(loan_id) AS open_loans FROM loans WHERE returned = 0"],
+     "wrong_sql": "SELECT COUNT(*) AS open_loans FROM loans"},
+    {"id": "newest-book", "question": "What is the title of the most recently published book?",
+     "gold_sql": "SELECT title FROM books ORDER BY published_year DESC LIMIT 1",
+     "variants": ["SELECT title FROM books WHERE published_year = (SELECT MAX(published_year) FROM books)"],
+     "wrong_sql": "SELECT title FROM books ORDER BY published_year ASC LIMIT 1"},
+    {"id": "book-prices", "question": "What does each book cost?", "gold_sql": None, "answerable": False,
+     "wrong_sql": "SELECT title, published_year AS cost FROM books"},
+    {"id": "top-members", "question": "Which members borrowed the most books?", "gold_sql": None, "answerable": False,
+     "wrong_sql": "SELECT book_id, COUNT(*) AS loans FROM loans GROUP BY book_id"},
+)
+_CASE_FIELDS = ("id", "question", "gold_sql", "answerable", "db_id")
+
+
+@dataclass(frozen=True)
+class TinyDeployment:
+    root: Path
+    source: Path  # the SQLite file
+    sources: Path  # the source manifest naming it
+    store: Path
+    authz: Path
+    env: Path
+    questions: Path
+    cases: tuple[dict, ...]
+
+
+class _GivenOnly(Settings):
+    """Settings from the values given and nothing else: no `MNEMIQ_*` variable of the process running the tests."""
+
+    @classmethod
+    def settings_customise_sources(cls, settings_cls, init_settings, env_settings, dotenv_settings,
+                                   file_secret_settings):
+        return (init_settings,)
+
+
+def _graded(case: dict) -> dict:
+    """A case as the question file holds it: the `EvaluationCase` fields, without what only the stub reads."""
+    return {name: case[name] for name in _CASE_FIELDS if name in case} | {"answerable": case.get("answerable", True)}
+
+
+def _write_source(path: Path) -> None:
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE authors (author_id INTEGER PRIMARY KEY, name TEXT, country TEXT)")
+    con.execute("CREATE TABLE books (book_id INTEGER PRIMARY KEY, author_id INTEGER REFERENCES authors(author_id), "
+                "title TEXT, published_year INTEGER, genre TEXT)")
+    con.execute("CREATE TABLE loans (loan_id INTEGER PRIMARY KEY, book_id INTEGER REFERENCES books(book_id), "
+                "loaned_on TEXT, returned INTEGER)")
+    con.executemany("INSERT INTO authors VALUES (?, ?, ?)", _AUTHORS)
+    con.executemany("INSERT INTO books VALUES (?, ?, ?, ?, ?)", _BOOKS)
+    con.executemany("INSERT INTO loans VALUES (?, ?, ?, ?)", _LOANS)
+    con.commit()
+    con.close()
+
+
+def _env_values(d: TinyDeployment, url: str | None) -> dict[str, str]:
+    values = {"sources_path": str(d.sources), "store_path": str(d.store), "authz_path": str(d.authz)}
+    if url:
+        values |= {"llm_base_url": url, "llm_api_key": STUB_KEY, "llm_model": "stub-model",
+                   "embed_base_url": url, "embed_api_key": STUB_KEY, "embed_model": "stub-embed"}
+    return values
+
+
+def _write_env(d: TinyDeployment, url: str | None) -> None:
+    d.env.write_text("".join(f"MNEMIQ_{name.upper()}='{value}'\n" for name, value in _env_values(d, url).items()))
+
+
+def tiny_files(tmp_path: Path) -> TinyDeployment:
+    """The deployment's files with no store and no model endpoint: what `load_config` reads, with no server running."""
+    root = tmp_path / "deployment"
+    root.mkdir(exist_ok=True)
+    d = TinyDeployment(root=root, source=root / "library.sqlite", sources=root / "sources.json",
+                       store=root / "store.duckdb", authz=root / "authz.json", env=root / "deployment.env",
+                       questions=root / "questions.json", cases=CASES)
+    if not d.source.exists():
+        _write_source(d.source)
+    if not d.sources.exists():
+        d.sources.write_text(json.dumps([{"id": "library", "kind": "sqlite", "target": str(d.source),
+                                          "catalog": "src", "schema": "main"}]))
+    if not d.authz.exists():
+        d.authz.write_text(json.dumps({"roles": {ROLE: ["authors", "books", "loans"]}}))
+    if not d.questions.exists():
+        d.questions.write_text(json.dumps([_graded(case) for case in CASES], indent=2))
+    if not d.env.exists():
+        _write_env(d, None)
+    return d
+
+
+def tiny_deployment(tmp_path: Path, stub: StubModel) -> TinyDeployment:
+    """The tiny deployment, its store built once per `tmp_path`: a second call returns what the first built, so a
+    rebuilt store never moves a fingerprint. Its env file points at the first stub given, for chat and embeddings, and
+    every stub given learns its cases."""
+    from mnemiq.cli import _cmd_build, _cmd_enrich
+
+    d = tiny_files(tmp_path)
+    if not d.store.exists():
+        # A stub of its own builds the store, so the one given counts and fails only for what the test asks. The
+        # vectors are a function of the text alone, so a question embedded by the given stub matches this index.
+        with StubModel() as builder:
+            settings = _GivenOnly(**_env_values(d, builder.url), llm_window_check=False)
+            if _cmd_enrich(settings) != 0 or _cmd_build(settings) != 0:
+                raise RuntimeError("the tiny deployment's store did not build; see the captured output")
+        _write_env(d, stub.url)
+    stub.learn(CASES)
+    return d
+
+
+def _toml_key(key: str) -> str:
+    return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else json.dumps(key)
+
+
+def _toml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, (str, Path)):
+        return json.dumps(str(value))
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{_toml_key(k)} = {_toml_value(v)}" for k, v in value.items() if v is not None) + "}"
+    raise TypeError(f"no TOML for {value!r}")
+
+
+def dump_toml(doc: dict) -> str:
+    """Each top-level key on a line of its own, its tables inline. Enough for a sweep config."""
+    return "".join(f"{_toml_key(key)} = {_toml_value(value)}\n" for key, value in doc.items() if value is not None)
+
+
+def write_config(tmp_path: Path, *, deployment: TinyDeployment | None = None, model: StubModel | None = None,
+                 questions: Path | None = None, **sections) -> Path:
+    """A sweep config over the tiny deployment, written to `tmp_path / "sweep.toml"`.
+
+    One model, `m`, keyed by `SWEEP_TEST_KEY`, at `model`'s URL (or one nothing answers), in instant mode, starting
+    from the engine's defaults. With `model` and no `deployment` it builds the tiny deployment on that stub; with
+    neither, it writes the deployment's files without a store, which loads without any server. Each other keyword
+    is a config section: `sweep` and `dataset` merge into the defaults, any other replaces its section.
+    """
+    if deployment is None:
+        deployment = tiny_deployment(tmp_path, model) if model is not None else tiny_files(tmp_path)
+    if model is not None:
+        model.learn(deployment.cases)
+    doc: dict = {
+        "sweep": {"name": "tiny", "out": str(tmp_path / "sweep-out")},
+        "dataset": {"questions": str(questions or deployment.questions), "env": str(deployment.env), "split_seed": 7,
+                    "identity": {"tenant": "local", "principal": "sweep", "roles": [ROLE]}},
+        "models": {"m": {"llm_model": "stub-model", "llm_base_url": model.url if model is not None else UNREACHABLE,
+                         "api_key_env": KEY_ENV}},
+        "modes": ["instant"],
+    }
+    for name, value in sections.items():
+        if name in ("sweep", "dataset") and isinstance(value, dict):
+            merged = {**doc[name], **value}
+            if name == "dataset" and "deployments" in value and "env" not in value:
+                merged.pop("env")
+            doc[name] = merged
+        else:
+            doc[name] = value
+    path = tmp_path / "sweep.toml"
+    path.write_text(dump_toml(doc))
+    return path
+
+
+def broken_questions(tmp_path: Path, bad: str) -> Path:
+    """The tiny cases with one fault that makes them ungradable, written beside the deployment."""
+    cases = [_graded(case) for case in CASES]
+    if bad == "duplicate_id":
+        cases[1]["id"] = cases[0]["id"]
+    elif bad == "answerable_without_gold":
+        cases[0]["gold_sql"] = None
+    elif bad == "unknown_db_id":
+        cases[0]["db_id"] = "nowhere"
+    else:
+        raise ValueError(f"no such fault: {bad}")
+    path = tmp_path / f"questions-{bad}.json"
+    path.write_text(json.dumps(cases))
+    return path
+
+
+def _rewrite_config(path: Path, change) -> None:
+    with open(path, "rb") as fh:
+        doc = tomllib.load(fh)
+    change(doc)
+    path.write_text(dump_toml(doc))
+
+
+def alter(cfg, change: str) -> None:
+    """Change one thing a loaded config depends on, on disk."""
+    from mnemiq.store.bootstrap import init_store
+    from mnemiq.sweep.config import deployment_settings
+
+    settings = deployment_settings(cfg, None)
+    if change == "store":
+        con = init_store(settings.store_path)
+        con.execute("CREATE TABLE sweep_test_marker (x INTEGER)")
+        con.close()
+    elif change == "authz":
+        policy = json.loads(Path(settings.authz_path).read_text())
+        policy["roles"]["another-role"] = ["books"]
+        Path(settings.authz_path).write_text(json.dumps(policy))
+    elif change == "env_setting":
+        with open(cfg.dataset.env, "a") as fh:
+            fh.write("MNEMIQ_MAX_QUESTION_CHARS=2000\n")
+    elif change == "start_profile":
+        if cfg.start.profile_file:
+            with open(cfg.start.profile_file, "a") as fh:
+                fh.write("writer_rules = \"none\"\n")
+        else:
+            profile = cfg.path.parent / "start-profiles.toml"
+            profile.write_text('default = "start"\n[profiles.start]\nretrieval_k = 12\n')
+            _rewrite_config(cfg.path, lambda doc: doc.update(start={"profile_file": str(profile), "profile": "start"}))
+    elif change == "questions":
+        path = Path(cfg.dataset.questions)
+        cases = json.loads(path.read_text())
+        cases[0]["question"] += " Count every copy."
+        path.write_text(json.dumps(cases))
+    elif change == "budget":
+        _rewrite_config(cfg.path, lambda doc: doc.setdefault("search", {}).update(budget_hours=12.5,
+                                                                                    budget_dollars=40.0))
+    elif change == "control":
+        answers = cfg.path.parent / "other-answers.json"
+        answers.write_text(json.dumps([{"id": CASES[0]["id"], "sql": CASES[0]["gold_sql"]}]))
+        _rewrite_config(cfg.path, lambda doc: doc.setdefault("control", []).append(
+            {"name": "another-system", "answers": str(answers)}))
+    else:
+        raise ValueError(f"no such change: {change}")
+
+
+@pytest.fixture
+def stub_model():
+    """A running scripted model. Call it, `stub_model(**options)`, to start another; all stop at teardown."""
+    stub = StubModel()
+    try:
+        yield stub
+    finally:
+        stub.stop()
