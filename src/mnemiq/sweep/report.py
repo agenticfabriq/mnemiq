@@ -36,7 +36,7 @@ from mnemiq.runtime import source_adapter
 from mnemiq.sweep.arms import ROUNDS, arm_from_profile
 from mnemiq.sweep.config import Control, SweepConfig, control_answers, deployment_settings, load_questions
 from mnemiq.sweep.run import INVALID, PROFILE, ROWS, _identity, _rows_so_far
-from mnemiq.sweep.split import split
+from mnemiq.sweep.split import saved_split, split
 from mnemiq.sweep.stats import mcnemar_p, mcnemar_p_one_sided
 
 _RIGHT = frozenset({Outcome.CORRECT, Outcome.CORRECT_FACTS})
@@ -263,8 +263,12 @@ def _start_round(cfg: SweepConfig, round: str) -> str:
 
 
 def _owed(cfg: SweepConfig, round: str) -> dict[str, str | None]:
-    """The cases each arm of `round` owes a row for, each to the deployment it reads."""
-    part = split(cfg, load_questions(cfg))[_ROUND_PART.get(round, "tuning")]
+    """The cases each arm of `round` owes a row for, each to the deployment it reads: from the split the sweep saved,
+    read back and verified (`saved_split`), once a run has started it, else as `split` draws it."""
+    parts = saved_split(cfg)
+    if parts is None:
+        parts = split(cfg, load_questions(cfg))
+    part = parts[_ROUND_PART.get(round, "tuning")]
     return {case.id: case.db_id if cfg.dataset.deployments is not None else None for case in part}
 
 

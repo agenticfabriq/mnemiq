@@ -6,17 +6,20 @@ from __future__ import annotations
 import fcntl
 import json
 import multiprocessing
+import os
 import re
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import mnemiq
 from mnemiq.config import DEFAULT_RETRIEVAL_K
 from mnemiq.sweep.arms import check_arms, grid_arms, screen_arms
 from mnemiq.sweep.config import SweepConfigError, load_config, load_questions
 from mnemiq.sweep.report import report
-from mnemiq.sweep.run import _begin, _rows_so_far, arm_folder, room, run
+from mnemiq.sweep.run import _begin, _parts, _rows_so_far, arm_folder, room, run
+from mnemiq.sweep.split import split_digest
 
 from .conftest import (
     CASES, KEY_ENV, alter, one_arm, out, read_rows, rewrite, start_of, started_sweep, sweep_json, tiny_dataset,
@@ -166,6 +169,48 @@ def test_a_new_sweep_draws_its_split_over_one_left_by_another(tmp_path, stub_mod
     _begin(cfg)
     assert json.loads((out(cfg) / "split.json").read_text())["tuning"] == [case.id for case in tuning(cfg)]
     assert len(tuning(cfg)) > 1
+
+
+@pytest.mark.parametrize("change, refused", [("another", "not the split this sweep drew"), ("twice", "twice"),
+                                            ("both", "in both parts"), ("missing", "does not name")])
+def test_a_split_that_is_not_the_one_drawn_is_refused_by_run_and_report(tmp_path, stub_model, change, refused):
+    stub = stub_model(gold=True)
+    cfg, start = one_arm(tmp_path, stub)
+    write_rows(cfg, start, first=3)   # a run stopped part way
+    path = out(cfg) / "split.json"
+    ids = json.loads(path.read_text())
+    tuning_ids, held = ids["tuning"], ids["held_out"]
+    if change == "another":   # every case once, in a part of its own: only the record can tell it from the one drawn
+        ids = {"tuning": tuning_ids[1:] + held, "held_out": tuning_ids[:1]}
+    elif change == "twice":
+        ids["tuning"] = tuning_ids + tuning_ids[:1]
+    elif change == "both":
+        ids["held_out"] = held + tuning_ids[:1]
+    else:
+        ids["tuning"] = tuning_ids[1:]
+    path.write_text(json.dumps(ids))
+    # A run stopped by its endpoint, which the next run would clear, were it to write the record before refusing.
+    record = sweep_json(cfg) | {"stopped": "endpoint"}
+    if change != "another":   # the record agrees with the file, so only the file's own checks can refuse it
+        record["split_digest"] = split_digest(ids)
+    (out(cfg) / "sweep.json").write_text(json.dumps(record))
+    asked, record = stub.calls, (out(cfg) / "sweep.json").read_text()
+    with pytest.raises(SweepConfigError, match=refused):
+        run(cfg, until="screen")
+    with pytest.raises(SweepConfigError, match=refused):
+        report(cfg, "screen", repeats=1)
+    assert stub.calls == asked and (out(cfg) / "sweep.json").read_text() == record   # refused before it wrote a thing
+
+
+def test_run_and_report_owe_the_cases_of_the_one_saved_split(tmp_path, stub_model, monkeypatch):
+    cfg = started_sweep(tmp_path, stub_model(gold=True))
+    saved = json.loads((out(cfg) / "split.json").read_text())
+    # Were either to draw the split again, it would owe every case.
+    for module in ("run", "report"):
+        monkeypatch.setattr(f"mnemiq.sweep.{module}.split", lambda cfg, cases: {"tuning": list(cases), "held_out": []})
+    (start,) = [record for record in report(cfg, "screen", repeats=1)[1] if record["arm"] == "start"]
+    assert [case.id for case in _parts(cfg)["tuning"]] == saved["tuning"]
+    assert start["valid"] and start["runs"][0]["cases"] == len(saved["tuning"])
 
 
 @pytest.mark.parametrize("lost", ["split.json", "sweep.json"])
@@ -382,6 +427,50 @@ def test_a_workers_exception_is_named_in_the_exit(tmp_path, stub_model):
     (arm_folder(cfg, start, 1) / "profile.toml").mkdir(parents=True)
     with pytest.raises(SystemExit, match=r"stopped without finishing: IsADirectoryError: .*profile\.toml"):
         run(cfg, until="screen")
+    assert sweep_json(cfg)["stopped"] == "worker"
+
+
+# Read by each worker process at its start, from the folder a test puts first on its PYTHONPATH: the arm raises an error
+# whose words, chained cause and note quote a source's password and the model's key, as a failed ATTACH can.
+_RAISING_WORKER = """
+import os
+
+if os.environ.get("SWEEP_TEST_WORKER_RAISES"):
+    import mnemiq.sweep.run as run
+
+    def run_arm(*args, **kwargs):
+        password, key = os.environ["SWEEP_TEST_PASSWORD"], os.environ["SWEEP_TEST_KEY"]
+        try:
+            raise ConnectionError(f"could not connect to postgresql://sweep:{password}@127.0.0.1:9/library ({key})")
+        except ConnectionError as cause:
+            error = RuntimeError(f"ATTACH failed: the source said {password} and the key {key} were refused, "
+                                 "as was postgresql://reader:never-configured@10.0.0.9/db with password=also-unknown")
+            error.add_note(f"a note that comes last: {password}")
+            raise error from cause
+
+    run.run_arm = run_arm
+"""
+
+
+def test_a_workers_error_never_shows_a_secret(tmp_path, stub_model, monkeypatch, capfd):
+    password, key = "pg-pass-for-this-test", "model-key-for-this-test"
+    stub = stub_model(gold=True)
+    d = tiny_deployment(tmp_path, stub, env_extra={"MNEMIQ_PG_DSN": f"postgresql://sweep:{password}@127.0.0.1:9/lib"})
+    cfg = load_config(write_config(tmp_path, deployment=d, model=stub))
+    hook = tmp_path / "worker-hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(_RAISING_WORKER)
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(hook), str(Path(mnemiq.__file__).parents[1])]))
+    monkeypatch.setenv("SWEEP_TEST_WORKER_RAISES", "1")
+    monkeypatch.setenv("SWEEP_TEST_PASSWORD", password)
+    monkeypatch.setenv(KEY_ENV, key)
+    with pytest.raises(SystemExit) as stopped:
+        run(cfg, until="screen")
+    said, child = str(stopped.value), capfd.readouterr().err
+    assert "stopped without finishing: RuntimeError: ATTACH failed" in said and "a note" not in said
+    # The known secrets by their values, and the ones no setting holds by where they stand in a URL or a field.
+    secrets = (password, key, "never-configured", "also-unknown")
+    assert not [secret for secret in secrets if secret in said or secret in child]
     assert sweep_json(cfg)["stopped"] == "worker"
 
 

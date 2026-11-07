@@ -38,18 +38,19 @@ import re
 import shutil
 import tempfile
 import time
-import traceback
 from collections import deque
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from multiprocessing.connection import wait
 from pathlib import Path
+from urllib.parse import unquote, unquote_plus
 
 from openai import APIError
 
 from mnemiq.agent.loop import AgentAnswer
-from mnemiq.config import Settings, without_credentials
+from mnemiq import redact
+from mnemiq.config import _KEYWORD_PASSWORD, Settings, _split_userinfo, names_a_credential, without_credentials
 from mnemiq.contract import DeferralReason, EvaluationCase, IdentityContext
 from mnemiq.eval.ablation import names_table
 from mnemiq.eval.harness import CaseResult, Outcome, run_case
@@ -59,11 +60,11 @@ from mnemiq.runtime import Runtime, _authz, build_runtime, load_current_snapshot
 from mnemiq.store.bootstrap import init_store
 from mnemiq.sweep.arms import Arm, arm_of, baseline, baselines, grid_arms, profile_text, refusal_under, screen_arms
 from mnemiq.sweep.config import (
-    RETRIES, SMOKE, SPLIT, SWEEP, SweepConfig, SweepConfigError, _deployment_ids, deployment_settings, fingerprint,
-    load_questions, pinned_files, scrub_credentials,
+    RETRIES, SMOKE, SPLIT, SWEEP, SweepConfig, SweepConfigError, _deployment_ids, _source_specs, deployment_settings,
+    fingerprint, load_questions, pinned_files,
 )
 from mnemiq.sweep.plan import _ROUNDS_OF, _judged_elsewhere, _refusals, _rounds
-from mnemiq.sweep.split import split
+from mnemiq.sweep.split import PARTS, saved_split, split, split_digest
 from mnemiq.sweep.stats import detectable_gain
 
 ROWS = "rows.jsonl"
@@ -513,18 +514,10 @@ def _left(folder: Path, owed: set[tuple[str, str]]) -> int:
 
 
 def _parts(cfg: SweepConfig) -> dict[str, list[EvaluationCase]]:
-    """The cases to tune on and those held out: read back from the sweep's `split.json` once a run has written it, else
-    drawn by `split`."""
-    cases = load_questions(cfg)
-    path = Path(cfg.sweep.out) / SPLIT
-    if not path.exists():
-        return split(cfg, cases)
-    ids = json.loads(path.read_text(encoding="utf-8"))
-    by_id = {case.id: case for case in cases}
-    unknown = sorted({case_id for part in ("tuning", "held_out") for case_id in ids[part]} - by_id.keys())
-    if unknown:
-        raise SweepConfigError(f"{path} names cases the question file does not hold: {', '.join(unknown)}")
-    return {part: [by_id[case_id] for case_id in ids[part]] for part in ("tuning", "held_out")}
+    """The cases to tune on and those held out: the sweep's saved split, read back and verified (`saved_split`), once a
+    run has started the sweep, else drawn by `split`."""
+    saved = saved_split(cfg)
+    return saved if saved is not None else split(cfg, load_questions(cfg))
 
 
 def _rows_exist(out: Path) -> bool:
@@ -541,8 +534,9 @@ def _begin(cfg: SweepConfig) -> dict:
     """The sweep's record, `sweep.json`, beside its split, `split.json`. A first run writes both. A later run refuses a
     sweep started under another config (the fingerprint) or another engine build (its source hash), and rows with no
     record or no split to read them by, all before any arm runs. A stop for the budget, a dead endpoint or a dead worker
-    is cleared, as this run resumes it. A new sweep draws its split, over any that another left; a sweep whose split is
-    gone may draw it again only before any row."""
+    is cleared, as this run resumes it. A new sweep draws its split, over any that another left, and records its
+    digest; a sweep whose split is gone may draw it again only before any row, and a saved split that is not the one
+    drawn is refused."""
     out = Path(cfg.sweep.out)
     record, parts = out / SWEEP, out / SPLIT
     found, build = fingerprint(cfg), engine_build()
@@ -560,6 +554,8 @@ def _begin(cfg: SweepConfig) -> dict:
                 f"{record}: this sweep was started under another engine build (source {started[:12]}, now "
                 f"{build['source_sha'][:12]}), and its rounds must match on the engine's source. Run the build it "
                 "started with, or start a new sweep in another out folder.")
+        if parts.exists():
+            saved_split(cfg)  # refuses a split that is not the one the sweep drew
     elif _rows_exist(out):
         raise SweepConfigError(f"{out} holds rows but no {SWEEP}, so the config they were written under cannot be "
                                "checked. Start a new sweep in another out folder.")
@@ -573,7 +569,9 @@ def _begin(cfg: SweepConfig) -> dict:
                                    "Start a new sweep in another out folder.")
         out.mkdir(parents=True, exist_ok=True)
         drawn = split(cfg, load_questions(cfg))
-        _write_json(parts, {part: [case.id for case in drawn[part]] for part in ("tuning", "held_out")})
+        ids = {part: [case.id for case in drawn[part]] for part in PARTS}
+        _write_json(parts, ids)
+        state["split_digest"] = split_digest(ids)
     if state.get("stopped") in _CLEARED:
         del state["stopped"]
     _write_json(record, state)
@@ -642,16 +640,107 @@ def _endpoints(cfg: SweepConfig, model: str) -> str:
     return "; ".join(f"{' and '.join(roles)} at {url}" for url, roles in by_url.items())
 
 
-def _work(cfg: SweepConfig, arm: Arm, cases: list[EvaluationCase], folder: Path, conn) -> None:
-    """What a worker process runs: one arm, then how it ended, sent back on `conn`: its outcome, or for an exception
-    `("raised", <the last line of its traceback>)` before it propagates. A worker killed outright sends nothing."""
+# A known secret shorter than this would match ordinary words; `redact.scrub_credentials` still hides one written as a
+# password field or a URL's userinfo.
+_SHORTEST_SECRET = 4
+_WEB = ("http", "https")
+
+
+def _credentials_in(locator: str) -> list[str]:
+    """The secret parts of a DSN or URL, read as `without_credentials` reads them: the password before its host's `@`
+    (the user too, for a web URL, whose user is part of its credential), each query value named like a credential, and
+    a keyword DSN's password. Each as written and decoded."""
+    found: list[str] = []
+    prefix, userinfo, rest = _split_userinfo(locator)
+    if userinfo:
+        user, colon, password = userinfo.partition(":")
+        if not colon:  # an Easy Connect string's user/password
+            user, _, password = userinfo.partition("/")
+        found += [password, unquote(password)]
+        if prefix[:-3].lower() in _WEB:
+            found += [user, unquote(user)]
+    for pair in filter(None, rest.partition("#")[0].partition("?")[2].split("&")):
+        name, _, value = pair.partition("=")
+        if names_a_credential(unquote_plus(name)):
+            found += [value, unquote_plus(value)]
+    for field in _KEYWORD_PASSWORD.finditer(locator):
+        value = field.group(0).split("=", 1)[1].strip()
+        found += [value, value.strip("'")]
+    return found
+
+
+def _known_secrets(cfg: SweepConfig) -> list[tuple[str, str]]:
+    """Each secret the sweep's settings and environment hold, longest first, with what a message shows in its place.
+
+    A key, password or secret field of each deployment's settings, and the value of each key variable the config names,
+    show as `***`. A DSN or URL field, and each source's target, shows without its credentials, and its password (its
+    user too, for a web URL) as `***`. Read once, at the start of a run, so a failure never reads an env file again.
+    """
+    found: dict[str, str] = {}
+
+    def hide(value: object) -> None:
+        if isinstance(value, str) and len(value) >= _SHORTEST_SECRET:
+            found[value] = "***"
+
+    def locate(value: object) -> None:
+        if not isinstance(value, str) or not value:
+            return
+        if (shown := without_credentials(value)) != value:
+            found.setdefault(value, shown)
+        for part in _credentials_in(value):
+            hide(part)
+
+    for db_id in _deployment_ids(cfg):
+        settings = deployment_settings(cfg, db_id)
+        for name in Settings.model_fields:
+            if name.endswith(("_dsn", "_url")):
+                locate(getattr(settings, name))
+            elif any(hint in name for hint in ("key", "password", "secret")):
+                hide(getattr(settings, name))
+        for spec in _source_specs(settings):
+            locate(spec.target)
+    for entry in (*cfg.models.values(), *([cfg.judge] if cfg.judge is not None else [])):
+        for variable in (getattr(entry, "api_key_env", None), entry.verify_api_key_env):
+            if variable:
+                hide(os.environ.get(variable))
+    return sorted(found.items(), key=lambda pair: len(pair[0]), reverse=True)
+
+
+def _hidden(text: str, secrets: Sequence[tuple[str, str]]) -> str:
+    """`text` as a message may show it: each known secret replaced (`_known_secrets`), then every URL's userinfo and
+    every password field, known or not (`redact.scrub_credentials`)."""
+    for value, shown in secrets:
+        text = text.replace(value, shown)
+    return redact.scrub_credentials(text)
+
+
+def _exception_line(exc: BaseException) -> str:
+    """An exception's own `Type: message` line, as a traceback names it, on one line: none of its notes, and none of the
+    causes chained to it."""
+    kind = type(exc)
+    name = kind.__qualname__
+    if kind.__module__ not in ("builtins", "__main__"):
+        name = f"{kind.__module__}.{name}"
+    words = " ".join(str(exc).split())
+    return f"{name}: {words}" if words else name
+
+
+def _work(cfg: SweepConfig, arm: Arm, cases: list[EvaluationCase], folder: Path, conn,
+          secrets: Sequence[tuple[str, str]]) -> None:
+    """What a worker process runs: one arm, then how it ended, sent back on `conn`.
+
+    No exception leaves it: the process would print the traceback, chained causes and all, and building a runtime
+    attaches each source with its DSN, which an error may quote. The exception's one line goes back instead, as
+    `("raised", line)`, hidden by `_hidden` with `secrets`, and the process exits with status 1, printing nothing. A
+    worker killed outright sends nothing.
+    """
     try:
         try:
             outcome = run_arm(cfg, arm, cases, folder)
         except BaseException as exc:
-            with suppress(OSError):  # the parent may be gone
-                conn.send(("raised", traceback.format_exception_only(exc)[-1].strip()))
-            raise
+            with suppress(Exception):  # the parent may be gone
+                conn.send(("raised", _hidden(_exception_line(exc), secrets)))
+            raise SystemExit(1) from None  # an int status, for which a worker process prints nothing
         conn.send(outcome)
     finally:
         conn.close()
@@ -740,6 +829,9 @@ class _Rounds:
                          for key, arms in self.arms.items()}
         if refused:
             _say("Skipped, since the engine refuses them:", *_refusals(refused))
+        # Read once, here, so saying what failed never reads an env file again.
+        self.secrets = _known_secrets(cfg)
+        self.endpoints = {model: _endpoints(cfg, model) for model in cfg.models}
         self.clock = time.monotonic()
         self.seconds = state.get("seconds", 0.0) if state is not None else 0.0
         self.halt: str | None = None
@@ -862,7 +954,8 @@ class _Rounds:
                         break
                     receiver, sender = context.Pipe(duplex=False)
                     process = context.Process(target=_work, name=f"mnemiq-sweep-{job.arm.profile_id}",
-                                              args=(self.cfg, job.arm, list(job.cases), job.folder, sender))
+                                              args=(self.cfg, job.arm, list(job.cases), job.folder, sender,
+                                                    self.secrets))
                     process.start()
                     sender.close()
                     running[process.sentinel] = (job, process, receiver, left)
@@ -902,22 +995,15 @@ class _Rounds:
             self._stop("endpoint")
         else:
             raised = isinstance(outcome, tuple) and outcome[0] == "raised"
-            how = f": {self._scrubbed(outcome[1])}" if raised else f" (exit code {exitcode})"
+            how = f": {_hidden(str(outcome[1]), self.secrets)}" if raised else f" (exit code {exitcode})"
             self.died.append(f"the worker running {job.name()} stopped without finishing{how}")
             self._stop("worker")
-
-    def _scrubbed(self, text: str) -> str:
-        """`text` with each deployment's DSNs and URLs that carry a credential shown without it: an exception's words
-        may quote one."""
-        for db_id in _deployment_ids(self.cfg):
-            text = scrub_credentials(text, deployment_settings(self.cfg, db_id))
-        return text
 
     def finish(self) -> None:
         """Exit non-zero when an endpoint stopped answering or a worker died, after the runs going on have finished."""
         self.save()
         if self.dead:
-            where = "; ".join(f"model {model!r}: {_endpoints(self.cfg, model)}" for model in self.dead)
+            where = "; ".join(f"model {model!r}: {self.endpoints[model]}" for model in self.dead)
             raise SystemExit(f"An endpoint stopped answering ({where}). The arms that were running have finished, and "
                              "no other arm was started. Run again once it answers: the sweep resumes where it stopped.")
         if self.died:
