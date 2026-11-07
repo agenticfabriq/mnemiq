@@ -3,6 +3,7 @@ search stopped when it has no room, the budget checked before each arm, and a st
 
 from __future__ import annotations
 
+import fcntl
 import json
 import multiprocessing
 import re
@@ -15,11 +16,11 @@ from mnemiq.config import DEFAULT_RETRIEVAL_K
 from mnemiq.sweep.arms import check_arms, grid_arms, screen_arms
 from mnemiq.sweep.config import SweepConfigError, load_config, load_questions
 from mnemiq.sweep.report import report
-from mnemiq.sweep.run import arm_folder, room, run
+from mnemiq.sweep.run import _begin, _rows_so_far, arm_folder, room, run
 
 from .conftest import (
-    CASES, alter, one_arm, out, read_rows, rewrite, start_of, started_sweep, sweep_json, tiny_dataset, tiny_deployment,
-    tuning, write_config, write_rows,
+    CASES, KEY_ENV, alter, one_arm, out, read_rows, rewrite, start_of, started_sweep, sweep_json, tiny_dataset,
+    tiny_deployment, tuning, write_config, write_rows,
 )
 
 
@@ -29,6 +30,14 @@ def roomy(tmp_path: Path, stub, *, known: bool = False, **sections):
     question it does not know, so the start misses every one; with `known` it learns them, each with a wrong answer."""
     dataset = tiny_dataset(tmp_path, cases=10, answerable=9, stub=stub if known else None)
     return load_config(write_config(tmp_path, model=stub, dataset=dataset, **sections))
+
+
+def priced(*stubs, price: float = 1e6) -> dict:
+    """A `[models]` section, a model for each stub (`m`, then `n`), each priced at `price` dollars a million tokens each
+    way. At the default a token costs a dollar, so any question costs more than a dollar, whatever runs it and however
+    fast."""
+    return {name: {"llm_model": "stub-model", "llm_base_url": stub.url, "api_key_env": KEY_ENV,
+                   "price_in_per_mtok": price, "price_out_per_mtok": price} for name, stub in zip("mn", stubs)}
 
 
 def all_cases(cfg) -> set[str]:
@@ -63,35 +72,36 @@ def every_first_round_arm_has_run(cfg, times: int) -> bool:
     return all(run_complete(cfg, arm, repeat) for arm in arms for repeat in range(1, times + 1))
 
 
-def _arm_dirs(cfg, round: str) -> list[Path]:
-    return [folder for model in cfg.models for folder in (out(cfg) / model / round).glob("*/*") if folder.is_dir()]
+def _arm_dirs(cfg, round: str, model: str | None = None) -> list[Path]:
+    models = cfg.models if model is None else [model]
+    return [folder for name in models for folder in (out(cfg) / name / round).glob("*/*") if folder.is_dir()]
 
 
 def grid_folders(cfg) -> list[Path]:
     return _arm_dirs(cfg, "grid")
 
 
-def arm_ids(cfg, round: str) -> set[str]:
-    return {folder.name for folder in _arm_dirs(cfg, round)}
+def arm_ids(cfg, round: str, model: str | None = None) -> set[str]:
+    return {folder.name for folder in _arm_dirs(cfg, round, model)}
 
 
 def rows_for(cfg, profile_id: str) -> set[str]:
     """The cases the first check run of the arm `profile_id` answered."""
     return {row["id"] for folder in _arm_dirs(cfg, "check") if folder.name == profile_id
-            for row in _rows(folder / "run-1" / "rows.jsonl")}
-
-
-def _rows(path: Path) -> list[dict]:
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
+            for row in _rows_so_far(folder / "run-1" / "rows.jsonl")}
 
 
 def smoke_rows(cfg) -> list[dict]:
-    return [row for path in (out(cfg) / "smoke").rglob("rows.jsonl") for row in _rows(path)]
+    return [row for path in (out(cfg) / "smoke").rglob("rows.jsonl") for row in _rows_so_far(path)]
 
 
 def round_rows(cfg, round: str) -> list[dict]:
     return [row for model in cfg.models for path in (out(cfg) / model / round).rglob("rows.jsonl")
-            for row in _rows(path)]
+            for row in _rows_so_far(path)]
+
+
+def all_rows(cfg) -> list[dict]:
+    return [row for path in out(cfg).rglob("rows.jsonl") for row in _rows_so_far(path)]
 
 
 def test_an_arm_resumes_and_drops_a_torn_line(tmp_path, stub_model):
@@ -115,15 +125,27 @@ def test_a_changed_input_is_refused_before_the_next_arm(tmp_path, stub_model, ch
 
 
 def test_a_larger_budget_resumes(tmp_path, stub_model):
-    cfg = roomy(tmp_path, stub_model(gold=True, seconds=0.2), arms_in_screen=1, search={"budget_hours": 0.0002})
+    stub = stub_model(gold=True)
+    cfg = roomy(tmp_path, stub, arms_in_screen=1, models=priced(stub), search={"budget_dollars": 1.0})
     run(cfg)
     assert sweep_json(cfg)["stopped"] == "budget"
-    runs, spent = sorted(out(cfg).rglob("run-*")), sweep_json(cfg)["seconds"]
-    run(cfg)   # the time the first run took counts against the same budget
+    runs = sorted(out(cfg).rglob("run-*"))
+    run(cfg)   # what the first run spent counts against the same budget
     assert sweep_json(cfg)["stopped"] == "budget" and sorted(out(cfg).rglob("run-*")) == runs
-    assert sweep_json(cfg)["seconds"] >= spent > 0
-    run(load_config(rewrite(cfg, search={"budget_hours": 1})))
+    run(load_config(rewrite(cfg, search={"budget_dollars": 1e15})))
     assert "stopped" not in sweep_json(cfg) and all(arm_complete(cfg, a) for a in screen_arms(cfg))
+
+
+def test_the_time_already_spent_counts_against_the_hours(tmp_path, stub_model):
+    stub = stub_model(gold=True, fail_after=3, status=500)
+    cfg, _ = one_arm(tmp_path, stub)
+    with pytest.raises(SystemExit):
+        run(cfg, until="screen")   # stopped part way through the start's first run, with its cases left to ask
+    spent = sweep_json(cfg)["seconds"]
+    stub.recover()
+    asked = stub.calls
+    run(load_config(rewrite(cfg, search={"budget_hours": spent / 2 / 3600})))
+    assert sweep_json(cfg)["stopped"] == "budget" and stub.calls == asked and sweep_json(cfg)["seconds"] >= spent > 0
 
 
 def test_the_split_is_written_once_and_read_back(tmp_path, stub_model, monkeypatch):
@@ -137,6 +159,15 @@ def test_the_split_is_written_once_and_read_back(tmp_path, stub_model, monkeypat
     assert not held_out & {r["id"] for r in read_rows(cfg, start_of(cfg, "instant"))}
 
 
+def test_a_new_sweep_draws_its_split_over_one_left_by_another(tmp_path, stub_model):
+    cfg = load_config(write_config(tmp_path, model=stub_model(gold=True)))
+    out(cfg).mkdir(parents=True)
+    (out(cfg) / "split.json").write_text(json.dumps({"tuning": ["book-count"], "held_out": []}))
+    _begin(cfg)
+    assert json.loads((out(cfg) / "split.json").read_text())["tuning"] == [case.id for case in tuning(cfg)]
+    assert len(tuning(cfg)) > 1
+
+
 @pytest.mark.parametrize("lost", ["split.json", "sweep.json"])
 def test_rows_without_the_sweeps_own_files_are_refused(tmp_path, stub_model, lost):
     cfg = started_sweep(tmp_path, stub_model(gold=True))
@@ -146,7 +177,8 @@ def test_rows_without_the_sweeps_own_files_are_refused(tmp_path, stub_model, los
 
 
 def test_the_budget_stops_before_an_arm_not_during_one(tmp_path, stub_model):
-    cfg = roomy(tmp_path, stub_model(gold=True, seconds=0.2), arms_in_screen=1, search={"budget_hours": 0.0002})
+    stub = stub_model(gold=True)
+    cfg = roomy(tmp_path, stub, arms_in_screen=1, models=priced(stub), search={"budget_dollars": 1.0})
     run(cfg)
     assert sweep_json(cfg)["stopped"] == "budget" and all(arm_complete_or_absent(cfg, a) for a in screen_arms(cfg))
     assert run_complete(cfg, start_of(cfg, "instant"), 1)   # the first arm ran: there was no pace to judge it by
@@ -160,19 +192,16 @@ def test_the_estimate_stops_the_first_arm_before_any_pace_is_measured(tmp_path, 
 
 
 def test_the_dollars_of_the_arms_running_count_before_another_starts(tmp_path, stub_model):
-    priced = {"m": {"llm_model": "stub-model", "llm_base_url": "", "api_key_env": "SWEEP_TEST_KEY",
-                    "price_in_per_mtok": 2.0, "price_out_per_mtok": 8.0}}
     stub = stub_model(gold=True)
-    priced["m"]["llm_base_url"] = stub.url
-    cfg = roomy(tmp_path, stub, arms_in_screen=3, models=priced, machine={"parallel": 2},
-                search={"budget_hours": 0.0002})
-    run(cfg)   # two arms at once, with no pace yet; then the hours are used
-    rows = [row for path in out(cfg).rglob("rows.jsonl") for row in _rows(path)]
-    spent = sum(row["prompt_tokens"] * 2.0 + row["completion_tokens"] * 8.0 for row in rows) / 1e6
-    arm = spent / len(rows) * len(tuning(cfg))
+    cfg = roomy(tmp_path, stub, arms_in_screen=3, models=priced(stub), machine={"parallel": 2},
+                search={"budget_dollars": 1.0})
+    run(cfg)   # two arms start at once, with no pace yet, and spend the dollar many times over
     before = sorted(out(cfg).rglob("run-*"))
+    rows = all_rows(cfg)
+    spent = sum(row["prompt_tokens"] + row["completion_tokens"] for row in rows)   # a dollar a token
+    arm = spent / len(rows) * len(tuning(cfg))
     # Room for one and a half arms more: the first starts, and the second would overspend beside it.
-    run(load_config(rewrite(cfg, search={"budget_hours": 1, "budget_dollars": spent + 1.5 * arm})))
+    run(load_config(rewrite(cfg, search={"budget_dollars": spent + 1.5 * arm})))
     assert len(before) == 2 and len(sorted(out(cfg).rglob("run-*"))) == 3 and sweep_json(cfg)["stopped"] == "budget"
 
 
@@ -183,6 +212,19 @@ def test_another_engine_build_is_refused(tmp_path, stub_model, monkeypatch):
         run(cfg)
 
 
+def test_a_second_run_on_the_same_out_folder_is_refused_at_once(tmp_path, stub_model):
+    stub = stub_model(gold=True)
+    cfg = load_config(write_config(tmp_path, model=stub))
+    out(cfg).mkdir(parents=True)
+    with open(out(cfg) / ".sweep.lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)   # as another run of the sweep holds it
+        with pytest.raises(SweepConfigError, match="in use by another run"):
+            run(cfg)
+        with pytest.raises(SweepConfigError, match="in use by another run"):
+            run(cfg, smoke=1)
+    assert stub.calls == 0 and not (out(cfg) / "sweep.json").exists()
+
+
 @pytest.mark.parametrize("strategy", ["screen-then-grid", "check"])
 def test_a_model_that_does_not_repeat_runs_twice(tmp_path, stub_model, strategy):
     stub = stub_model(varies=True, gold_when=lambda request: False)   # wrong everywhere, spelled anew each time
@@ -190,6 +232,16 @@ def test_a_model_that_does_not_repeat_runs_twice(tmp_path, stub_model, strategy)
     cfg = roomy(tmp_path, stub, known=True, search={"strategy": strategy}, **screen)
     run(cfg, until="screen" if strategy != "check" else None)
     assert sweep_json(cfg)["repeats"] == 2 and every_first_round_arm_has_run(cfg, 2)
+
+
+def test_every_arm_runs_once_before_any_runs_twice_with_the_starts_second_run_among_them(tmp_path, stub_model,
+                                                                                          capsys):
+    stub = stub_model(varies=True, gold_when=lambda request: False)
+    cfg = roomy(tmp_path, stub, known=True, arms_in_screen=2)
+    run(cfg, until="screen")
+    ran = re.findall(r"^m, instant, screen: (\S+), run (\d): complete$", capsys.readouterr().out, re.MULTILINE)
+    one, two = (f"retrieval_k={DEFAULT_RETRIEVAL_K + 4 * i}" for i in (1, 2))
+    assert ran == [("start", "1"), (one, "1"), ("start", "2"), (two, "1"), (one, "2"), (two, "2")]
 
 
 def test_no_room_stops_the_search(tmp_path, stub_model):
@@ -203,6 +255,16 @@ def test_no_room_stops_the_search(tmp_path, stub_model):
     assert arm_ids(cfg, "screen") == {"start"} and room(cfg, "m", "instant") == len(missed)
     assert sweep_json(cfg)["room"] == {"m": {"instant": {"misses": len(missed), "needed": None, "compared": 4,
                                                          "stopped": "no room"}}}
+
+
+def test_a_model_with_no_room_stops_while_another_searches_on(tmp_path, stub_model):
+    right, wrong = stub_model(gold=True), stub_model(gold_when=lambda request: False)
+    cfg = roomy(tmp_path, right, known=True, arms_in_screen=1, models=priced(right, wrong))
+    run(cfg, until="screen")
+    (arm,) = [arm.profile_id for arm in screen_arms(cfg) if arm.model == "n" and arm.changes]
+    assert arm_ids(cfg, "screen", "m") == {"start"} and arm_ids(cfg, "screen", "n") == {"start", arm}
+    assert sweep_json(cfg)["room"]["m"]["instant"]["stopped"] == "no room"
+    assert "stopped" not in sweep_json(cfg)["room"]["n"]["instant"] and "stopped" not in sweep_json(cfg)
 
 
 def test_check_mode_runs_two_arms_on_every_case(tmp_path, stub_model):
@@ -249,6 +311,31 @@ def test_a_smoke_is_never_read(tmp_path, stub_model):
     assert smoke_rows(cfg) and not round_rows(cfg, "screen")   # the report reads only the rounds' folders
     assert len(smoke_rows(cfg)) == 2 and report(cfg, "screen", repeats=1)[1] == []
     assert not (out(cfg) / "sweep.json").exists() and not (out(cfg) / "split.json").exists()
+    run(cfg, smoke=1)   # a folder a smoke made, which the next smoke replaces whole
+    assert len(smoke_rows(cfg)) == 1
+
+
+@pytest.mark.parametrize("found, refused", [("folder", "no mark of a smoke"), ("link", "symbolic link"),
+                                            ("file", "not a folder")])
+def test_a_smoke_leaves_a_smoke_folder_it_did_not_make_as_it_is(tmp_path, stub_model, found, refused):
+    stub = stub_model(gold=True)
+    cfg = load_config(write_config(tmp_path, model=stub))
+    theirs = tmp_path / "theirs"
+    theirs.mkdir()
+    (theirs / "notes.txt").write_text("not a smoke's")
+    smoke = out(cfg) / "smoke"
+    out(cfg).mkdir(parents=True)
+    if found == "folder":
+        theirs.rename(smoke)
+        theirs = smoke
+    elif found == "link":
+        smoke.symlink_to(theirs, target_is_directory=True)
+    else:
+        smoke.write_text("not a smoke's")
+    with pytest.raises(SweepConfigError, match=refused):
+        run(cfg, smoke=1)
+    assert (theirs / "notes.txt").read_text() == "not a smoke's" and stub.calls == 0
+    assert smoke.is_symlink() if found == "link" else smoke.exists()
 
 
 def test_a_dead_endpoint_stops_the_round_and_resume_finishes_it(tmp_path, stub_model):
@@ -283,18 +370,35 @@ def test_a_worker_that_dies_leaves_its_rows_and_the_next_run_resumes_it(tmp_path
     with pytest.raises(SystemExit, match="stopped without finishing"):
         run(cfg, until="screen")
     written = read_rows(cfg, start)
-    assert not arm_folder(cfg, start, 2).exists()   # no other run started after it
+    assert sweep_json(cfg)["stopped"] == "worker" and not arm_folder(cfg, start, 2).exists()   # no other run started
     run(cfg, until="screen")
     ids = [r["id"] for r in read_rows(cfg, start)]
-    assert written and len(ids) == len(set(ids)) == len(tuning(cfg))
+    assert written and len(ids) == len(set(ids)) == len(tuning(cfg)) and "stopped" not in sweep_json(cfg)
+
+
+def test_a_workers_exception_is_named_in_the_exit(tmp_path, stub_model):
+    cfg, start = one_arm(tmp_path, stub_model(gold=True))
+    # The arm cannot write its profile file over a folder, and raises in its own process.
+    (arm_folder(cfg, start, 1) / "profile.toml").mkdir(parents=True)
+    with pytest.raises(SystemExit, match=r"stopped without finishing: IsADirectoryError: .*profile\.toml"):
+        run(cfg, until="screen")
+    assert sweep_json(cfg)["stopped"] == "worker"
 
 
 @pytest.mark.parametrize("varies, repeats", [(False, 1), (True, 2)], ids=["repeats", "does-not-repeat"])
-def test_the_grid_combines_what_the_screen_kept_as_often_as_decided(tmp_path, stub_model, varies, repeats):
+def test_the_grid_combines_what_the_screen_kept_as_often_as_decided(tmp_path, stub_model, monkeypatch, varies,
+                                                                    repeats):
+    def graded(cfg, control):
+        raise AssertionError("a control was graded to decide the grid")
+
+    monkeypatch.setattr("mnemiq.sweep.report.grade_control", graded)
     # Either setting alone puts something in the writer's request that the stub answers right for.
     stub = stub_model(varies=varies, gold_when=lambda request: "response_format" in request or "seed" in request)
     space = {"guided_sql": [True], "llm_seed": [7]}
-    cfg = roomy(tmp_path, stub, known=True, space=space, machine={"parallel": 2})
+    answers = tmp_path / "other-system.json"
+    answers.write_text(json.dumps([{"id": "after-1900", "declined": True}]))
+    cfg = roomy(tmp_path, stub, known=True, space=space, machine={"parallel": 2},
+                control=[{"name": "another-system", "answers": str(answers)}])
     run(cfg, until="grid")
     (combined,) = [arm for arm in grid_arms(cfg, {("m", "instant"): space}) if arm.round == "grid"]
     assert sweep_json(cfg)["repeats"] == repeats and arm_ids(cfg, "grid") == {combined.profile_id}

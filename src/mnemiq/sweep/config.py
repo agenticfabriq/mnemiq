@@ -40,9 +40,15 @@ from mnemiq.profiles import _read as _read_profile_file
 ENDPOINT_FACTS = ("llm_model", "llm_base_url", "llm_context_window", "verify_model", "verify_base_url")
 # The names `[start]` reads as its own, so no model may take one.
 _START_KEYS = ("profile_file", "profile")
-# The folder in the out folder that a smoke replaces whole. Each model's arms live in a folder named for it, so no model
-# may take this name.
+# What a sweep keeps in its out folder beside each model's own folder, `<out>/<model>`, so no model may take one of these
+# names: the folder a smoke replaces whole, the proposal's folder, the sweep's record, its split and the cases its
+# endpoints left to ask again.
 SMOKE = "smoke"
+PROPOSAL = "proposal"
+SWEEP = "sweep.json"
+SPLIT = "split.json"
+RETRIES = "retries.json"
+OUT_ENTRIES = (SMOKE, PROPOSAL, SWEEP, SPLIT, RETRIES)
 # Settings fields whose value is a secret and is left out of the fingerprint. A DSN or URL is kept with its credentials
 # taken out (`without_credentials`), since the rest of it names what is read.
 _KEY_HINTS = tuple(hint for hint in _SECRET_HINTS if hint != "dsn")
@@ -352,9 +358,9 @@ class SweepConfig(BaseModel):
         for name in self.models:
             if name in _START_KEYS:
                 raise ValueError(f"models.{name}: [start] reads {name} as its own key, so no model can take the name")
-            if name == SMOKE:
-                raise ValueError(f"models.{name}: a smoke runs in the out folder's {SMOKE} folder, so no model can take "
-                                 "the name")
+            if name in OUT_ENTRIES:
+                raise ValueError(f"models.{name}: the sweep keeps its own {name} in its out folder, beside each model's "
+                                 "folder, so no model can take the name")
         for name in self.start.per_model:
             if name not in self.models:
                 raise ValueError(f"[start.{name}] names no model in [models]")

@@ -16,7 +16,7 @@ statement the source cancelled) is a counted error of the arm and never stops it
 
 An arm's first run records the pinned files in `pins.json`, and every run of it, a resume included, checks its store
 copies and the files it ends with against that record. A change makes the arm invalid for good: `invalid.json` is
-final.
+final. A run of an arm holds its folder's lock, so two processes never write one arm's rows.
 
 `run` drives the rounds, each arm in a worker process of its own started by the spawn method, so no worker inherits the
 parent's runtime, and every arm once before any arm twice. The first round (the screen, the check round, or a grid with
@@ -38,9 +38,10 @@ import re
 import shutil
 import tempfile
 import time
+import traceback
 from collections import deque
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from multiprocessing.connection import wait
 from pathlib import Path
@@ -58,8 +59,8 @@ from mnemiq.runtime import Runtime, _authz, build_runtime, load_current_snapshot
 from mnemiq.store.bootstrap import init_store
 from mnemiq.sweep.arms import Arm, arm_of, baseline, baselines, grid_arms, profile_text, refusal_under, screen_arms
 from mnemiq.sweep.config import (
-    SMOKE, SweepConfig, SweepConfigError, _deployment_ids, deployment_settings, fingerprint, load_questions,
-    pinned_files,
+    RETRIES, SMOKE, SPLIT, SWEEP, SweepConfig, SweepConfigError, _deployment_ids, deployment_settings, fingerprint,
+    load_questions, pinned_files, scrub_credentials,
 )
 from mnemiq.sweep.plan import _ROUNDS_OF, _judged_elsewhere, _refusals, _rounds
 from mnemiq.sweep.split import split
@@ -69,9 +70,11 @@ ROWS = "rows.jsonl"
 PROFILE = "profile.toml"
 INVALID = "invalid.json"
 PINS = "pins.json"
-RETRIES = "retries.json"
-SWEEP = "sweep.json"
-SPLIT = "split.json"
+# Each held by one process at a time: an arm's run folder by the worker running it, the out folder by one `run`.
+LOCK = ".lock"
+OUT_LOCK = ".sweep.lock"
+# What a smoke writes in the folder it makes, so it never replaces a folder it did not make.
+SMOKE_MARK = ".mnemiq-smoke"
 # The rounds that follow a search, which `run` leaves to their own code.
 _AFTER_SEARCH = ("timing", "confirm")
 # Endpoint errors in a row that stop an arm.
@@ -291,6 +294,24 @@ def _retries(cfg: SweepConfig) -> Iterator[dict]:
         _write_json(out / RETRIES, retries)
 
 
+class ArmInUse(RuntimeError):
+    """Another process holds the run folder of an arm: a worker still running it."""
+
+
+@contextmanager
+def _sole(path: Path, refusal: Exception) -> Iterator[None]:
+    """`path`'s lock, held until the caller is done; `refusal` is raised at once when another process holds it. The lock
+    is the process's, and is freed when it dies."""
+    import fcntl  # POSIX, as the retries lock
+
+    with open(path, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise refusal from None
+        yield
+
+
 def _retry_key(cfg: SweepConfig, folder: Path) -> str:
     return Path(os.path.relpath(folder, cfg.sweep.out)).as_posix()
 
@@ -421,10 +442,19 @@ def run_arm(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder:
     record.
 
     Returns `"invalid"` (a pinned file moved, in this run or before it), else `"endpoint"` (the endpoint stopped
-    answering; the rows stand, and the next run resumes), else `"complete"`.
+    answering; the rows stand, and the next run resumes), else `"complete"`. It holds the folder's lock while it runs,
+    and raises `ArmInUse` when another process holds it, such as a worker a stopped sweep left running.
     """
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
+    busy = ArmInUse(f"another process is running the arm in {folder}, as a worker a stopped sweep left running would; "
+                    "run again once it has ended")
+    with _sole(folder / LOCK, busy):
+        return _run_arm(cfg, arm, cases, folder)
+
+
+def _run_arm(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder: Path) -> str:
+    """`run_arm` itself, with the folder made and its lock held."""
     if (folder / INVALID).exists():
         return "invalid"
     if (folder / PINS).exists():
@@ -503,15 +533,21 @@ def _rows_exist(out: Path) -> bool:
     return any(out.glob(f"*/*/*/*/run-*/{ROWS}"))
 
 
+# The stops a later run clears, as it resumes the sweep: for the budget, a dead endpoint, a dead worker.
+_CLEARED = ("budget", "endpoint", "worker")
+
+
 def _begin(cfg: SweepConfig) -> dict:
     """The sweep's record, `sweep.json`, beside its split, `split.json`. A first run writes both. A later run refuses a
     sweep started under another config (the fingerprint) or another engine build (its source hash), and rows with no
-    record or no split to read them by, all before any arm runs. A stop for the budget or a dead endpoint is cleared, as
-    this run resumes it."""
+    record or no split to read them by, all before any arm runs. A stop for the budget, a dead endpoint or a dead worker
+    is cleared, as this run resumes it. A new sweep draws its split, over any that another left; a sweep whose split is
+    gone may draw it again only before any row."""
     out = Path(cfg.sweep.out)
     record, parts = out / SWEEP, out / SPLIT
     found, build = fingerprint(cfg), engine_build()
-    if record.exists():
+    new = not record.exists()
+    if not new:
         state = json.loads(record.read_text(encoding="utf-8"))
         if state.get("fingerprint") != found:
             raise SweepConfigError(
@@ -531,14 +567,14 @@ def _begin(cfg: SweepConfig) -> dict:
         state = {"fingerprint": found, "engine_build": build, "split_seed": cfg.dataset.split_seed}
         if isinstance(cfg.sweep.repeats, int):
             state["repeats"] = cfg.sweep.repeats
-    if not parts.exists():
-        if _rows_exist(out):
+    if new or not parts.exists():
+        if not new and _rows_exist(out):
             raise SweepConfigError(f"{out} holds rows but no {SPLIT}, so the cases they answered cannot be read back. "
                                    "Start a new sweep in another out folder.")
         out.mkdir(parents=True, exist_ok=True)
         drawn = split(cfg, load_questions(cfg))
         _write_json(parts, {part: [case.id for case in drawn[part]] for part in ("tuning", "held_out")})
-    if state.get("stopped") in ("budget", "endpoint"):
+    if state.get("stopped") in _CLEARED:
         del state["stopped"]
     _write_json(record, state)
     return state
@@ -574,8 +610,8 @@ def repeats_needed(cfg: SweepConfig) -> int:
 
 
 def room(cfg: SweepConfig, model: str, mode: str) -> int:
-    """The most an arm of `model` in `mode` can gain: the answerable cases to tune on that its start did not get right in
-    its first run of the first round, right as the report reads it."""
+    """The most an arm of `model` in `mode` can gain: the answerable cases to tune on that its start did not get right
+    in its first run of the first round, right as the report reads it."""
     from mnemiq.sweep.report import tally  # the report reads this module's files, so it is imported when needed
 
     first = _first_round(cfg)
@@ -607,9 +643,16 @@ def _endpoints(cfg: SweepConfig, model: str) -> str:
 
 
 def _work(cfg: SweepConfig, arm: Arm, cases: list[EvaluationCase], folder: Path, conn) -> None:
-    """What a worker process runs: one arm, then how it ended, sent back on `conn`. A worker that dies sends nothing."""
+    """What a worker process runs: one arm, then how it ended, sent back on `conn`: its outcome, or for an exception
+    `("raised", <the last line of its traceback>)` before it propagates. A worker killed outright sends nothing."""
     try:
-        conn.send(run_arm(cfg, arm, cases, folder))
+        try:
+            outcome = run_arm(cfg, arm, cases, folder)
+        except BaseException as exc:
+            with suppress(OSError):  # the parent may be gone
+                conn.send(("raised", traceback.format_exception_only(exc)[-1].strip()))
+            raise
+        conn.send(outcome)
     finally:
         conn.close()
 
@@ -737,9 +780,9 @@ class _Rounds:
         return self.halt is not None
 
     def _stop(self, why: str) -> None:
-        """Start no further arm. A stop for the budget or a dead endpoint is recorded; the next run clears it."""
+        """Start no further arm, and record why; the next run clears it."""
         self.halt = self.halt or why
-        if self.state is not None and why in ("budget", "endpoint"):
+        if self.state is not None:
             self.state["stopped"] = why
             self.save()
 
@@ -763,8 +806,8 @@ class _Rounds:
         return True
 
     def _over_budget(self, job: _Job, left: int, running: Sequence[tuple[_Job, int]]) -> str | None:
-        """Why running `job`'s `left` questions would take the sweep past its budget, or None. With no pace measured yet,
-        and none in `seconds_per_question`, the arm may start: only running one measures it.
+        """Why running `job`'s `left` questions would take the sweep past its budget, or None. With no pace measured
+        yet, and none in `seconds_per_question`, the arm may start: only running one measures it.
 
         The runs going on beside it, each with the questions it had left when it started, run in the same hours, but
         each spends its own dollars, which its rows show only once it ends: so they are counted as committed."""
@@ -858,8 +901,17 @@ class _Rounds:
                 self.dead.append(job.arm.model)
             self._stop("endpoint")
         else:
-            self.died.append(f"the worker running {job.name()} stopped without finishing (exit code {exitcode})")
-            self._stop("died")
+            raised = isinstance(outcome, tuple) and outcome[0] == "raised"
+            how = f": {self._scrubbed(outcome[1])}" if raised else f" (exit code {exitcode})"
+            self.died.append(f"the worker running {job.name()} stopped without finishing{how}")
+            self._stop("worker")
+
+    def _scrubbed(self, text: str) -> str:
+        """`text` with each deployment's DSNs and URLs that carry a credential shown without it: an exception's words
+        may quote one."""
+        for db_id in _deployment_ids(self.cfg):
+            text = scrub_credentials(text, deployment_settings(self.cfg, db_id))
+        return text
 
     def finish(self) -> None:
         """Exit non-zero when an endpoint stopped answering or a worker died, after the runs going on have finished."""
@@ -938,14 +990,15 @@ class _Rounds:
 
     def grid(self) -> None:
         """Every combination of the values the screen kept, for each model and mode still searching, each run as often
-        as the first round decided, which is also the count the screen's report reads the kept values at."""
+        as the first round decided, which is also the count the screen's report reads the kept values at. No control
+        decides a kept value, so none is graded for it."""
         from mnemiq.sweep.report import kept_values, report  # the report reads this module's files
 
         keys = [key for key in self.arms if self._active(key) and self.compared[key]]
         if not keys:
             return
         repeats = self.state["repeats"]
-        kept = kept_values(self.cfg, report(self.cfg, "screen", repeats=repeats)[1])
+        kept = kept_values(self.cfg, report(self.cfg, "screen", repeats=repeats, controls=False)[1])
         arms: list[Arm] = []
         refused: list[tuple[Arm, str]] = []
         for key in keys:
@@ -964,10 +1017,26 @@ class _Rounds:
 
 def _smoke(cfg: SweepConfig, count: int) -> None:
     """Each arm of the first round once, on the first `count` cases to tune on, in the out folder's smoke folder, which
-    each smoke replaces whole and nothing reads: whether every arm runs, with no budget, room or repeats."""
+    nothing reads: whether every arm runs, with no budget, room or repeats.
+
+    Each smoke replaces the folder whole, but only one a smoke made, which holds its mark: anything else at that path,
+    a link included, is refused and left as it is.
+    """
     folder = Path(cfg.sweep.out) / SMOKE
+    move = "Move it, or give [sweep] out another folder."
+    if folder.is_symlink():
+        raise SweepConfigError(f"{folder} is a symbolic link, which a smoke never makes, so it is left as it is. "
+                               f"{move}")
+    if folder.exists() and not folder.is_dir():
+        raise SweepConfigError(f"{folder} is not a folder, so a smoke did not make it, and it is left as it is. {move}")
+    if folder.exists() and not (folder / SMOKE_MARK).is_file():
+        raise SweepConfigError(f"{folder} holds no mark of a smoke ({SMOKE_MARK}), so a smoke did not make it, and it "
+                               f"is left as it is. {move}")
     if folder.exists():
         shutil.rmtree(folder)
+    folder.mkdir(parents=True)
+    (folder / SMOKE_MARK).write_text("A smoke made this folder, and the next smoke replaces it whole.\n",
+                                     encoding="utf-8")
     smoke = cfg.model_copy(update={"sweep": cfg.sweep.model_copy(update={"out": str(folder)})})
     sweep = _Rounds(smoke, None, {"tuning": _parts(cfg)["tuning"][:count], "held_out": []})
     sweep.drain(deque(sweep.job(arm, 1) for arms in sweep.arms.values() for arm in arms))
@@ -978,8 +1047,9 @@ def run(cfg: SweepConfig, until: str | None = None, smoke: int | None = None) ->
     """Run the sweep's rounds in order: through `until` when it names one, or, with `smoke`, each arm of the first round
     on that many cases.
 
-    Before anything runs, an identity the sweep cannot grade is refused (`identity_refusal`). Then the first round runs,
-    and, after a screen, the grid of the values it kept.
+    A run holds the out folder's lock throughout, so a second run on the same folder is refused at once. Before anything
+    runs, an identity the sweep cannot grade is refused (`identity_refusal`). Then the first round runs, and, after a
+    screen, the grid of the values it kept.
 
     A sweep resumes where it stopped, run after run:
     - `sweep.json` holds the fingerprint and the engine build the sweep started under. A run under another config (the
@@ -996,11 +1066,13 @@ def run(cfg: SweepConfig, until: str | None = None, smoke: int | None = None) ->
     `sweep.json` holds `fingerprint`, `engine_build` and `split_seed`; `repeats`, the runs each arm owes, once the first
     round has decided it or from the start when the config fixes it; `room`, by model and mode, the start's `misses`,
     the gain an arm `needed` (None when none can win), the arms `compared`, and `stopped: "no room"` when the search
-    stopped there; `seconds`, the time the sweep's runs have taken; and `stopped`, the sweep's own stop, `"budget"` or
-    `"endpoint"`, or `"no room"` once every model and mode that searches has stopped for it.
+    stopped there; `seconds`, the time the sweep's runs have taken; and `stopped`, the sweep's own stop: `"budget"`,
+    `"endpoint"` or `"worker"` (a worker that died), each cleared by the next run, or `"no room"` once every model and
+    mode that searches has stopped for it.
 
     A stop for the budget comes before an arm, never during one. When an endpoint stops answering, or a worker dies,
-    the runs going on finish, none starts, and `run` exits non-zero naming the endpoint or the run.
+    the runs going on finish, none starts, and `run` exits non-zero naming the endpoint, or the run and what its worker
+    raised.
     """
     strategy = cfg.search.strategy
     rounds = (*_ROUNDS_OF[strategy], *(_AFTER_SEARCH if strategy != "check" else ()))
@@ -1009,15 +1081,19 @@ def run(cfg: SweepConfig, until: str | None = None, smoke: int | None = None) ->
                          f"{', '.join(rounds)}")
     if smoke is not None and (isinstance(smoke, bool) or not isinstance(smoke, int) or smoke < 1):
         raise ValueError("a smoke asks each arm at least one case")
-    if (why := identity_refusal(cfg)) is not None:
-        raise SweepConfigError(f"the sweep's identity cannot be graded: {why}")
-    if smoke is not None:
-        _smoke(cfg, smoke)
-        return
-    state = _begin(cfg)
-    sweep = _Rounds(cfg, state, _parts(cfg))
-    sweep.first_round()
-    if not sweep.halted and until != sweep.first and strategy == "screen-then-grid":
-        sweep.grid()
-    # The rounds that follow a search, timing and then confirm, are called here, after the grid.
-    sweep.finish()
+    out = Path(cfg.sweep.out)
+    out.mkdir(parents=True, exist_ok=True)
+    with _sole(out / OUT_LOCK, SweepConfigError(f"{out} is in use by another run of a sweep; run again once it has "
+                                                "ended")):
+        if (why := identity_refusal(cfg)) is not None:
+            raise SweepConfigError(f"the sweep's identity cannot be graded: {why}")
+        if smoke is not None:
+            _smoke(cfg, smoke)
+            return
+        state = _begin(cfg)
+        sweep = _Rounds(cfg, state, _parts(cfg))
+        sweep.first_round()
+        if not sweep.halted and until != sweep.first and strategy == "screen-then-grid":
+            sweep.grid()
+        # The rounds that follow a search, timing and then confirm, are called here, after the grid.
+        sweep.finish()

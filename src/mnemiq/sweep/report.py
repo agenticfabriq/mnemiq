@@ -372,7 +372,8 @@ def _table(cfg: SweepConfig, model: str, mode: str, round: str, records: list[di
     return "\n".join(lines)
 
 
-def report(cfg: SweepConfig, round: str, *, repeats: int | None = None) -> tuple[str, list[dict]]:
+def report(cfg: SweepConfig, round: str, *, repeats: int | None = None,
+           controls: bool = True) -> tuple[str, list[dict]]:
     """A markdown table for each model and mode of `round`, and its rows as records.
 
     A table holds the start, each arm the round ran, then each control. Its columns are Valid, Right, Strict, Wrong,
@@ -384,6 +385,9 @@ def report(cfg: SweepConfig, round: str, *, repeats: int | None = None) -> tuple
 
     Each arm's label and changes are read back from the profile file its run wrote (`arm_from_profile`), and an arm
     folder this config would not have written is refused.
+
+    `controls=False` leaves the controls out, ungraded: no control decides what the screen keeps, so the grid reads its
+    kept values that way, without running a control's SQL.
 
     `repeats` is how many runs each arm owes, and an arm short of one is not valid. By default it is the config's
     `repeats` when that is a number. Under `auto` it must be passed, as the first round decided it: the folders alone
@@ -407,11 +411,11 @@ def report(cfg: SweepConfig, round: str, *, repeats: int | None = None) -> tuple
     if repeats < 1:
         raise ValueError("an arm owes at least one run")
     owed = _owed(cfg, round)
-    controls = [(control.name, grade_control(cfg, control)) for control in cfg.control]
+    graded = [(control.name, grade_control(cfg, control)) for control in cfg.control] if controls else []
     tables, records = [], []
     for model in cfg.models:
         for mode in cfg.modes:
-            mine = _table_records(cfg, model, mode, round, owed, controls, repeats)
+            mine = _table_records(cfg, model, mode, round, owed, graded, repeats)
             if mine:
                 tables.append(_table(cfg, model, mode, round, mine, repeats))
                 records += mine

@@ -3,6 +3,7 @@ stopped when its endpoint stops answering, never by one question's error."""
 
 from __future__ import annotations
 
+import fcntl
 import json
 import pickle
 from pathlib import Path
@@ -10,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from mnemiq.sweep.config import deployment_settings, load_config
-from mnemiq.sweep.run import arm_folder, arm_settings, engine_build, identity_refusal, run_arm
+from mnemiq.sweep.run import ArmInUse, arm_folder, arm_settings, engine_build, identity_refusal, run_arm
 
 from .conftest import (
     cancel_gold_once, copy_package, judged_by, one_arm, out_files, read_rows, source_down, start_of, tiny_deployment,
@@ -212,6 +213,18 @@ def test_each_deployment_answers_its_own_cases_on_its_own_copy(tmp_path, stub_mo
     assert len(versions) == 2 and len({version for _, version in versions}) == 2
     stores = {arm_settings(cfg, arm, folder, db_id).store_path for db_id in ("lib-a", "lib-b")}
     assert len(stores) == 2 and all(Path(store).is_file() for store in stores)
+
+
+def test_an_arm_another_process_is_running_is_refused_and_left_as_it_is(tmp_path, stub_model):
+    stub = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    folder.mkdir(parents=True)
+    with open(folder / ".lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)   # as a worker a stopped sweep left running holds it
+        with pytest.raises(ArmInUse, match="another process"):
+            run_arm(cfg, arm, tuning(cfg), folder)
+    assert stub.calls == 0 and not (folder / "rows.jsonl").exists() and not (folder / "pins.json").exists()
 
 
 def test_an_arm_can_be_handed_to_a_process_of_its_own(tmp_path, stub_model):

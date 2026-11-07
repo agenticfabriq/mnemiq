@@ -259,6 +259,16 @@ def test_the_table_shows_each_arm_and_control_with_what_it_changed(tmp_path):
     assert "| control: current | yes | - | 9 |" in table
 
 
+def test_a_report_can_leave_the_controls_out_ungraded(tmp_path, monkeypatch):
+    cfg = sweep_with_rows(tmp_path, arms={"writer_rules=none": dict(only=4, other=0)},
+                          control=[{"name": "current", "answers": str(gold_answers(tmp_path))}])
+    with_controls = report(cfg, "screen")[1]
+    monkeypatch.setattr("mnemiq.sweep.report.grade_control", lambda cfg, control: pytest.fail("a control was graded"))
+    table, records = report(cfg, "screen", controls=False)
+    assert records == [record for record in with_controls if record["control"] is None] and "current" not in table
+    assert kept_values(cfg, records) == kept_values(cfg, with_controls)
+
+
 def test_a_control_is_reported_before_any_arm_has_run(tmp_path):
     answers = answers_file(tmp_path, gold_for=6, declined=2)
     cfg = load_config(write_config(tmp_path, control=[{"name": "current", "answers": str(answers)}]))

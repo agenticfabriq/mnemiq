@@ -53,10 +53,11 @@ def test_a_question_file_that_cannot_be_graded_is_refused(tmp_path, bad):
         load_config(write_config(tmp_path, questions=broken_questions(tmp_path, bad)))
 
 
-def test_no_model_can_take_the_name_of_the_smoke_folder(tmp_path):
-    # A smoke replaces <out>/smoke whole, and a model's arms live in <out>/<model>.
-    models = {"smoke": {"llm_model": "stub-model", "llm_base_url": UNREACHABLE, "api_key_env": KEY_ENV}}
-    with pytest.raises(SweepConfigError, match="models.smoke"):
+@pytest.mark.parametrize("name", ["smoke", "proposal", "sweep.json", "split.json", "retries.json"])
+def test_no_model_can_take_the_name_of_what_the_sweep_keeps_in_its_out_folder(tmp_path, name):
+    # A model's arms live in <out>/<model>, beside the sweep's own files and folders.
+    models = {name: {"llm_model": "stub-model", "llm_base_url": UNREACHABLE, "api_key_env": KEY_ENV}}
+    with pytest.raises(SweepConfigError, match=f"models.{name}"):
         load_config(write_config(tmp_path, models=models))
 
 
