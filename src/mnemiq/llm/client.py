@@ -74,8 +74,9 @@ class ContextTooLong(ModelUnavailable):
     kind = "context_too_long"
 
 
-def _kind(exc: APIError) -> str:
-    """What failed, as `ModelUnavailable.kind` names it. A timeout is the SDK's connection error too."""
+def model_error_kind(exc: APIError) -> str:
+    """What failed, as `ModelUnavailable.kind` names it, for a provider error raised by the client or by any other
+    model call, such as the embedder's. A timeout is the SDK's connection error too."""
     if isinstance(exc, APIConnectionError):
         return "connect"
     if isinstance(exc, APIStatusError):
@@ -300,7 +301,7 @@ class LLMClient:
             # Before the status: a prompt too long for the window arrives as a 400.
             if _context_too_long(exc):
                 raise ContextTooLong(str(exc)) from exc
-            raise ModelUnavailable(str(exc), kind=_kind(exc)) from exc
+            raise ModelUnavailable(str(exc), kind=model_error_kind(exc)) from exc
         return resp
 
     def _count(self, resp) -> int:

@@ -27,6 +27,8 @@ class VerifyVerdict:
     # What the caller is told this was. Carried rather than derived from `layer`, so the engine
     # does not have to keep a second copy of this mapping in a branch.
     code: DeferralReason = DeferralReason.VERIFICATION
+    # On `judge_unavailable`, the kind of the judge's model failure, when it had one (`ModelUnavailable.kind`).
+    model_error: str | None = None
     #
     # `judge_unavailable` is the one value that is NOT a judgement. `SemanticJudge.score` fails
     # open -- an unreachable judge scores 1.0, which is exactly what approval scores -- so without

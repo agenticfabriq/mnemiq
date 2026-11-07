@@ -277,6 +277,18 @@ def _counts(results: Sequence[CaseResult]) -> dict[Outcome, int]:
 # -- running an arm -------------------------------------------------------------------------------
 
 
+def names_table(sql: str, table: str) -> bool:
+    """Whether `sql` names `table` -- the last part of a dotted name, in any case -- as a whole word, the reading of
+    which tables a gold query is about.
+
+    Whole words. A plain `in` makes a short table name match almost any query -- a table called
+    `c` is a substring of `count(*)` -- so a check built on it would pass on every snapshot and
+    guard nothing, which is the failure mode it was written to prevent, one level up.
+    """
+    name = table.split(".")[-1].lower()
+    return re.search(rf"\b{re.escape(name)}\b", sql.lower()) is not None
+
+
 def source_mismatch(snapshot, cases: Sequence[EvaluationCase]) -> str | None:
     """Is this snapshot even about the database the questions ask about?
 
@@ -294,11 +306,8 @@ def source_mismatch(snapshot, cases: Sequence[EvaluationCase]) -> str | None:
     }
     if not tables:
         return None  # nothing profiled; `enrich` has its own, better, complaint for that
-    wanted = " ".join(case.gold_sql or "" for case in cases).lower()
-    # Whole words. A plain `in` makes a short table name match almost any query -- a table called
-    # `c` is a substring of `count(*)` -- so the check would pass on every snapshot and guard
-    # nothing, which is the failure mode it was written to prevent, one level up.
-    if any(re.search(rf"\b{re.escape(table)}\b", wanted) for table in tables):
+    wanted = " ".join(case.gold_sql or "" for case in cases)
+    if any(names_table(wanted, table) for table in tables):
         return None
     return (
         f"the snapshot carries {sorted(tables)[:6]} and no gold query in this corpus names any of "

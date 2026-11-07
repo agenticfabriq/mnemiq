@@ -113,9 +113,10 @@ class AgentAnswer:
     # on -- and the eval harness graded it "safe: gave up on an answerable question" (M6).
     failed: bool = False
     reason_code: DeferralReason | None = None
-    # On an answer the model provider failed, which way it failed (`ModelUnavailable.kind`): a server that stopped
-    # answering (`connect`, `status_503`) reads apart from one question's refusal (`status_400`, `context_too_long`)
-    # without parsing the provider's words. None on every other answer.
+    # On an answer the model provider failed, the writer's model or the judge's, which way it failed
+    # (`ModelUnavailable.kind`): a server that stopped answering (`connect`, `status_503`) reads apart from one
+    # question's refusal (`status_400`, `context_too_long`) without parsing the provider's words. None on every other
+    # answer, a judge reply that could not be read included.
     model_error: str | None = None
     cached: bool = False
     agreement: float | None = None
@@ -757,6 +758,8 @@ class Agent:
             return AgentAnswer(answer=verdict.reason,
                                deferred=not verdict.failed, failed=verdict.failed,
                                reason_code=verdict.code,
+                               # The judge's model failing, as the writer's does in `answer`.
+                               model_error=verdict.model_error if verdict.failed else None,
                                verify_confidence=verdict.confidence,
                                verify_layer=verdict.layer,
                                # The query RAN before the verifier saw it, so the decision is a

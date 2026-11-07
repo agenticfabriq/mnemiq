@@ -5,9 +5,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import httpx
+import openai
 import pytest
 
-from mnemiq.llm.client import LLMClient, ModelUnavailable
+from mnemiq.contract import DeferralReason
 from mnemiq.runtime import build_runtime
 from tests.scripted_deployment import IDENTITY, SQL, deployment, retrieve_the_one_table
 from tests.sweep.stub_model import StubModel
@@ -34,11 +36,13 @@ def scripted_llm_error(tmp_path, monkeypatch):
         stub = _stub(raised)
         stubs.append(stub)
         if raised == "other":
-            # Raised with no kind, as any raise site outside the client does.
-            def complete(self, *args, **kwargs):
-                raise ModelUnavailable("the model did not reply")
+            # The provider's error is neither a connection's nor a status's: no reply over HTTP raises one, so the
+            # provider's own call raises it.
+            def create(self, *args, **kwargs):
+                raise openai.APIError("the provider sent no usable reply",
+                                      httpx.Request("POST", f"{stub.url}/chat/completions"), body=None)
 
-            monkeypatch.setattr(LLMClient, "complete", complete)
+            monkeypatch.setattr(openai.resources.chat.completions.Completions, "create", create)
         runtime = build_runtime(deployment(tmp_path, stub.url))
         return SimpleNamespace(ask=lambda question: runtime.ask(question, IDENTITY))
 
@@ -60,3 +64,14 @@ def test_an_answer_the_model_gave_has_no_model_error(tmp_path, monkeypatch):
     with StubModel(sql=SQL) as stub:
         answer = build_runtime(deployment(tmp_path, stub.url)).ask("q", IDENTITY)
     assert not answer.failed and answer.model_error is None
+
+
+@pytest.mark.parametrize("judge, kind", [(dict(fail_after=0, status=503), "status_503"),
+                                         (dict(rule=lambda request: "no score in this reply"), None)])
+def test_a_judge_on_its_own_endpoint_says_what_kind_of_model_error(tmp_path, monkeypatch, judge, kind):
+    retrieve_the_one_table(monkeypatch)
+    with StubModel(sql=SQL) as writer, StubModel(**judge) as judging:
+        settings = deployment(tmp_path, writer.url, verify_base_url=judging.url, verify_model="judge-model")
+        answer = build_runtime(settings).ask("q", IDENTITY, mode="thinking")
+    assert judging.calls >= 1 and answer.failed and answer.reason_code == DeferralReason.VERIFIER_UNAVAILABLE
+    assert answer.model_error == kind   # a reply that could not be read is not the endpoint failing
