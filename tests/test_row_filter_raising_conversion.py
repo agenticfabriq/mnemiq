@@ -1578,7 +1578,10 @@ def test_a_map_literals_bare_key_is_read_and_installed_as_the_engine_reads_it():
     reversed_ = "list_transform(tags, x -> MAP {X: x}[x] IS NULL) = [true]"
     assert con.execute(f"SELECT id FROM claim WHERE {reversed_}").fetchall() == []
     plain = sqlglot.parse_one(reversed_, read="duckdb").sql(dialect="duckdb")
-    assert "MAP {'X': x}" in plain and con.execute(f"SELECT id FROM claim WHERE {plain}").fetchall() == [(1,)]
+    plain_rows = con.execute(f"SELECT id FROM claim WHERE {plain}").fetchall()
+    # sqlglot 30.12 wrote the key back as the text, which keeps the row; 30.29 keeps it bare, the
+    # same rows as written (M228). Either way the verdicts below must hold.
+    assert ("MAP {'X': x}" in plain, plain_rows) in [(True, [(1,)]), (False, [])], plain
     verdict = _decide(reversed_, snapshot=_snapshot(types))
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
     for row_filter in ("list_transform(tags, x -> MAP {x: 1}[x] = 1) = [true]",   # the key is the parameter
