@@ -48,6 +48,14 @@ def worlds():
     return made
 
 
+def _parser_binds_intersect_tighter(dialect):
+    """Whether this sqlglot reads `A UNION ALL B INTERSECT C` as `A UNION ALL (B INTERSECT C)` in
+    the dialect, as DuckDB, Postgres and MySQL run it: 30.29 does, 30.12 folded left to right (M228)."""
+    import sqlglot
+    from sqlglot import exp
+    return isinstance(sqlglot.parse_one("SELECT 1 UNION ALL SELECT 2 INTERSECT SELECT 3", read=dialect), exp.Union)
+
+
 def _decide(sql, visible, policy=COMPLETE, registry=None):
     return decide(sql, visible, dialect="duckdb", target="duckdb", policy=policy, registry=registry)
 
@@ -286,15 +294,28 @@ def test_a_chain_the_parser_groups_differently_from_the_engine_is_refused_before
     recursive = "WITH RECURSIVE claim AS (SELECT 1 AS id UNION ALL SELECT id + 1 FROM claim WHERE id < 3 INTERSECT SELECT id + 1 FROM claim) SELECT id FROM claim"
     assert [con.execute(recursive).fetchall() for con in worlds] == [[(1,), (2,), (3,)]] * 2
     filtered = AccessPolicy(row_filters={"claim": "id = 99"}, policy_schema=SCHEMA)
-    for policy in (COMPLETE, filtered, AccessPolicy()):
-        verdict = _decide(recursive, SCHEMA, policy=policy)
-        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.PARSE_ERROR, (policy, verdict)
     derived = "SELECT d.id FROM (SELECT 1 AS id UNION ALL SELECT 2 AS id INTERSECT SELECT 2 AS id) d"
-    assert isinstance(_decide(derived, SCHEMA), Refusal)
     except_first = "SELECT d.id FROM (SELECT 1 AS id EXCEPT SELECT 2 AS id INTERSECT SELECT 2 AS id) d"
-    assert isinstance(_decide(except_first, SCHEMA), Refusal)
     write = "WITH RECURSIVE claim AS (SELECT 1 AS id UNION ALL SELECT id + 1 FROM claim WHERE id < 3 INTERSECT SELECT id + 1 FROM claim) INSERT INTO sink (i) SELECT id FROM claim"
-    assert isinstance(_decide_write(write, SCHEMA), Refusal)
+    if _parser_binds_intersect_tighter("duckdb"):
+        # Grouped as DuckDB groups it (sqlglot 30.29, M228): no shape to refuse, the statement
+        # approved with the grouping written out, and its answer the original's under every policy.
+        for policy in (COMPLETE, filtered, AccessPolicy()):
+            verdict = _decide(recursive, SCHEMA, policy=policy)
+            assert isinstance(verdict, Approved), (policy, verdict)
+            assert [sorted(con.execute(verdict.target_sql).fetchall()) for con in worlds] == [[(1,), (2,), (3,)]] * 2, verdict.target_sql
+        for sql in (derived, except_first):
+            verdict = _decide(sql, SCHEMA)
+            assert isinstance(verdict, Approved), (sql, verdict)
+            assert sorted(worlds[0].execute(verdict.target_sql).fetchall()) == sorted(worlds[0].execute(sql).fetchall()), verdict.target_sql
+        assert isinstance(_decide_write(write, SCHEMA), ApprovedWrite)
+    else:
+        for policy in (COMPLETE, filtered, AccessPolicy()):
+            verdict = _decide(recursive, SCHEMA, policy=policy)
+            assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.PARSE_ERROR, (policy, verdict)
+        assert isinstance(_decide(derived, SCHEMA), Refusal)
+        assert isinstance(_decide(except_first, SCHEMA), Refusal)
+        assert isinstance(_decide_write(write, SCHEMA), Refusal)
     # Grouped alike by both, or parenthesised: not this refusal.
     for sql in ("SELECT d.id FROM (SELECT 1 AS id INTERSECT SELECT 1 AS id UNION ALL SELECT 2 AS id) d",
                 "SELECT d.id FROM (SELECT 1 AS id UNION ALL (SELECT 2 AS id INTERSECT SELECT 2 AS id)) d",
@@ -350,11 +371,29 @@ def test_a_misgrouped_chain_is_refused_on_every_engine_that_binds_intersect_tigh
     # UNION and EXCEPT, and MySQL from 8.0.31 does the same, so the parser's left fold reads
     # those engines' chains wrongly too; SQLite and Oracle group left to right as the parser
     # does. The shape check alone, by the executing engine.
-    from mnemiq.sql.guard import check_shape
+    import sqlglot
+    from sqlglot import exp
+
+    from mnemiq.sql.guard import check_shape, misgrouped_set_chain
     chain = "SELECT d.id FROM (SELECT 1 AS id UNION ALL SELECT 2 AS id INTERSECT SELECT 2 AS id) d"
     for engine in ("duckdb", "postgres", "mysql"):
         verdict = check_shape(chain, dialect=engine, executes_as=engine)
-        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.PARSE_ERROR, (engine, verdict)
+        if _parser_binds_intersect_tighter(engine):  # grouped as the engine groups it (M228)
+            assert not (isinstance(verdict, Refusal) and verdict.code is RefusalCode.PARSE_ERROR), (engine, verdict)
+        else:
+            assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.PARSE_ERROR, (engine, verdict)
     for engine in ("oracle", "sqlite"):
         verdict = check_shape(chain, dialect=engine, executes_as=engine)
         assert not (isinstance(verdict, Refusal) and verdict.code is RefusalCode.PARSE_ERROR), (engine, verdict)
+    # The fold a parser before 30.29 builds, made by hand so the check is held on any sqlglot: no
+    # CI job installs one that builds it (M228).
+    one, two, three = (sqlglot.parse_one(f"SELECT {n} AS id") for n in (1, 2, 3))
+    for left in (exp.Union(this=one, expression=two, distinct=False), exp.Except(this=one, expression=two, distinct=True)):
+        folded = exp.Intersect(this=left, expression=three, distinct=True)
+        for engine in ("duckdb", "postgres", "mysql"):
+            refusal = misgrouped_set_chain(folded, engine)
+            assert isinstance(refusal, Refusal) and refusal.code is RefusalCode.PARSE_ERROR, (engine, folded.sql())
+        for engine in ("oracle", "sqlite"):
+            assert misgrouped_set_chain(folded, engine) is None, (engine, folded.sql())
+    grouped = exp.Intersect(this=exp.Subquery(this=exp.Union(this=one, expression=two, distinct=False)), expression=three, distinct=True)
+    assert misgrouped_set_chain(grouped, "duckdb") is None  # parenthesised: grouped as written
