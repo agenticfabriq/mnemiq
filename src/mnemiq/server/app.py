@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -98,7 +99,15 @@ def build_app(
 
     Scopes gate MCP's tools only, because no route here writes: `Runtime.write` is reached from MCP's `db_write`
     and the CLI alone. A write route added here would need the `db.write` scope too."""
-    app = FastAPI(title="mnemiq", version="v1")
+    lifespan = None
+    if mcp_app is not None:
+        @asynccontextmanager
+        async def lifespan(_app):
+            # The MCP app's session manager runs for the life of the server, stateless or not.
+            async with mcp_app.router.lifespan_context(mcp_app):
+                yield
+
+    app = FastAPI(title="mnemiq", version="v1", lifespan=lifespan)
     if doors is None:
         def caller() -> IdentityContext:
             return identity
@@ -151,6 +160,15 @@ def build_app(
         # same grant resolution as the cards, so the two cannot disagree (M32).
         return runtime.scope(who)
 
+    if mcp_app is not None:
+        from starlette.routing import Route
+
+        # Each of the MCP app's own paths, exactly: /mcp and its protected-resource metadata. Routed whole to that
+        # app, which sees the path unchanged, so its door is /mcp and never /mcp/mcp.
+        for path in [getattr(route, "path", None) for route in mcp_app.routes]:
+            if path:
+                app.router.routes.append(Route(path, endpoint=mcp_app))
+
     # Mounted last, so it can only claim paths no API route above already answered.
     built = static_dir if static_dir is not None else STATIC_DIR
     if (built / "index.html").is_file():
@@ -184,12 +202,16 @@ def serve_http(settings, host: str, port: int) -> None:
     # Before the runtime: a configuration the doors cannot enforce stops here, having opened nothing.
     cfg = auth_config_from_settings(settings) if settings is not None else None
     runtime = build_runtime(settings)
-    doors = None
+    doors = mcp_app = None
     if cfg is not None:
         from mnemiq.auth.doors import HttpDoors
         from mnemiq.auth.identity_map import IdentityMap, IdentityMapUnavailable
 
         doors = HttpDoors(cfg)
+        if cfg.mcp_http:
+            from mnemiq.mcp.server import mcp_http_app
+
+            mcp_app = mcp_http_app(runtime, cfg)
         if cfg.map_path:
             try:
                 IdentityMap.read(cfg.map_path, issuers=cfg.issuers,
@@ -201,7 +223,8 @@ def serve_http(settings, host: str, port: int) -> None:
     elif not _loopback(host):
         logger.warning("serving every caller on %s as the one identity in MNEMIQ_PRINCIPAL/MNEMIQ_ROLES; set "
                        "MNEMIQ_OIDC_ISSUER to take each request's identity from its own token", host)
-    _run_uvicorn(build_app(runtime, identity_from_settings(settings), doors=doors), host=host, port=port)
+    _run_uvicorn(build_app(runtime, identity_from_settings(settings), doors=doors, mcp_app=mcp_app),
+                 host=host, port=port)
 
 
 def _loopback(host: str) -> bool:

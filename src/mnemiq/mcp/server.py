@@ -1,13 +1,16 @@
-"""MCP server: the read plane as scoped tools. stdio transport.
+"""MCP server: the read plane as scoped tools, over stdio or streamable HTTP.
 
-This is the AF seam: standalone uses the local policy; AF (v1) fronts these same tools and
-injects a JWT-derived identity. The boundary is IdentityContext + AuthzProvider -- no AF here.
+Over stdio the process is the caller, so one identity from settings serves every call. Over HTTP (served at /mcp by
+`mnemiq serve --http`) each request carries its own bearer token, verified by `mnemiq.auth`, and each tool call is
+answered as that token's identity, gated by its scopes. The boundary is IdentityContext + AuthzProvider.
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
 from collections.abc import Callable
+from urllib.parse import urlsplit
 from threading import Lock
 
 from mnemiq.adapters.federated import UnfederatableSource
@@ -164,14 +167,19 @@ _SETUP = (SnapshotMissing, SourceUnconfigured, ExtensionNotInstalled, Extensions
           UnknownMode, UnknownProfile, UnfederatableSource, DriverMissing, TablesNotFound)
 
 
-def build_mcp(runtime: Runtime | Callable[[], Runtime], identity: IdentityContext):
+def build_mcp(runtime: Runtime | Callable[[], Runtime],
+              identity: IdentityContext | Callable[[str], IdentityContext], *, server_kwargs: dict | None = None):
     """Register tools without opening the database when given a runtime factory.
 
     Initialize on the first tool call and reuse the runtime. Failed initialization
     remains a tool error and can be retried after the operator completes setup.
+
+    `identity` is one IdentityContext for every call (stdio), or a resolver called on each tool call with the
+    scope that tool needs, which answers that request's own identity or raises the tool error (HTTP).
     """
     server_class, tool_error = _mcp_classes()
-    mcp = server_class("mnemiq")
+    mcp = server_class("mnemiq", **(server_kwargs or {}))
+    who = identity if callable(identity) else (lambda scope: identity)
     runtime_lock = Lock()
 
     def get_runtime() -> Runtime:
@@ -207,7 +215,7 @@ def build_mcp(runtime: Runtime | Callable[[], Runtime], identity: IdentityContex
         mode: 'instant' (cheapest, no retries), 'thinking' (default, self-repairing), or
         'deep' (5 candidates + judge + agreement gate -- highest precision, ~6x cost).
         profile: a model and its settings this deployment offers you; unset uses its default."""
-        return guarded(lambda: _db_read(get_runtime(), identity, question, mode=mode, profile=profile))
+        return guarded(lambda: _db_read(get_runtime(), who("db.read"), question, mode=mode, profile=profile))
 
     @mcp.tool()
     def db_write(sql: str) -> dict:
@@ -215,16 +223,85 @@ def build_mcp(runtime: Runtime | Callable[[], Runtime], identity: IdentityContex
         Refused by default: a write runs only when the identity has a write grant AND the
         deployment enabled writes. DDL and multi-statement input are never executed. Returns
         {approved, target, rows_affected, refusal, sql}; a governance plane records the result."""
-        return guarded(lambda: _db_write(get_runtime(), identity, sql))
+        return guarded(lambda: _db_write(get_runtime(), who("db.write"), sql))
 
     @mcp.tool()
     def get_schema() -> dict:
         """List the tables you are allowed to query."""
-        return guarded(lambda: _get_schema(get_runtime(), identity))
+        return guarded(lambda: _get_schema(get_runtime(), who("db.read")))
 
     return mcp
 
 
+def http_identity(cfg):
+    """The per-call resolver for MCP over HTTP: the identity of the token this request carried, gated by the scope
+    the tool needs. With no verified token in context it refuses; it never falls back to a settings identity."""
+    from mcp.server.auth.middleware.auth_context import get_access_token
+
+    from mnemiq.auth.resolve import identity_from_oidc
+    from mnemiq.auth.token import TokenRejected
+
+    _, tool_error = _mcp_classes()
+
+    def who(scope: str) -> IdentityContext:
+        token = get_access_token()
+        if token is None or not token.claims:
+            raise tool_error("no verified token")
+        if scope not in token.scopes:
+            raise tool_error(f"this token lacks the {scope} scope")
+        try:
+            return identity_from_oidc(token.claims, cfg)
+        except TokenRejected as exc:  # the map went unreadable since the transport checked it, say
+            raise tool_error(f"not permitted: {exc.reason}") from exc
+
+    return who
+
+
+def mcp_http_settings(cfg) -> dict:
+    """What MCP over HTTP is served with, on either mcp: the external path /mcp, stateless (each request is judged
+    by its own token, and no session outlives the token that opened it), and DNS-rebinding protection for the
+    audience's own host only, which a proxy in front preserves."""
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    parts = urlsplit(cfg.oidc.audience)
+    origin = f"{parts.scheme}://{parts.netloc}"
+    return {"streamable_http_path": "/mcp", "stateless_http": True,
+            "transport_security": TransportSecuritySettings(enable_dns_rebinding_protection=True,
+                                                            allowed_hosts=[parts.netloc], allowed_origins=[origin])}
+
+
+def _auth_settings(oidc):
+    from mcp.server.auth.settings import AuthSettings
+
+    kwargs = {"issuer_url": oidc.issuer, "resource_server_url": oidc.audience}
+    # The verifier checks `aud` itself, exactly; the SDK's own resource check is looser and is left off where the
+    # installed mcp has it.
+    if "validate_token_resource" in AuthSettings.model_fields:
+        kwargs["validate_token_resource"] = False
+    return AuthSettings(**kwargs)
+
+
+def mcp_http_app(runtime, cfg, *, fetch: Callable[[], dict] | None = None):
+    """The MCP door's Starlette app, which `server/app.py` mounts at exactly /mcp, with its protected-resource
+    metadata. The resource URL is MNEMIQ_OIDC_AUDIENCE itself, so the two cannot disagree. mcp 2.x moved the path,
+    statelessness and transport security from the server's constructor to `streamable_http_app()`; both are
+    handled here, as `_mcp_classes` handles the class's rename."""
+    from mnemiq.auth.resolve import identity_from_oidc
+    from mnemiq.auth.token import JwtIdentityVerifier
+
+    oidc = cfg.oidc
+    verifier = JwtIdentityVerifier(oidc, audience=oidc.audience, refuse_audience=oidc.openwebui_audience,
+                                   fetch=fetch, check=lambda claims: identity_from_oidc(claims, cfg))
+    server_class, _ = _mcp_classes()
+    http = mcp_http_settings(cfg)
+    server_kwargs = {"token_verifier": verifier, "auth": _auth_settings(oidc)}
+    if "streamable_http_path" in inspect.signature(server_class.streamable_http_app).parameters:  # mcp 2.x
+        return build_mcp(runtime, http_identity(cfg), server_kwargs=server_kwargs).streamable_http_app(**http)
+    return build_mcp(runtime, http_identity(cfg), server_kwargs={**server_kwargs, **http}).streamable_http_app()
+
+
 def serve(settings: Settings) -> None:
+    if settings.mcp_transport == "http":
+        raise SystemExit("MNEMIQ_MCP_TRANSPORT=http: MCP over HTTP is served by mnemiq serve --http, at /mcp")
     identity = _identity_from_settings(settings)
     build_mcp(lambda: build_runtime(settings), identity).run()  # stdio
