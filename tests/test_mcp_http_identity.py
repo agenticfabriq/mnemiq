@@ -289,3 +289,55 @@ def test_the_resolver_refuses_without_a_verified_token():
     _, tool_error = _mcp_classes()
     with pytest.raises(tool_error, match="no verified token"):
         http_identity(_config(8123))("db.read")
+
+
+# --- The same header rules as /v1, in front of the SDK's own check (final review) --------------------------------
+
+
+def _raw(url, headers: list[tuple[str, str]]) -> int:
+    import httpx
+
+    body = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "t", "version": "0"}}}
+    with httpx.Client() as client:
+        sent = [("accept", "application/json, text/event-stream"), *headers]
+        return client.post(url, json=body, headers=sent).status_code
+
+
+@pytest.mark.parametrize("extra", [
+    [("X-OpenWebUI-User-Id", "u")],
+    [("X-OpenWebUI-User-Email", "a@x.example")],
+    [("X-OpenWebUI-User-Jwt", "a.b.c")],
+    [("Authorization", "Bearer not-a-token")],
+])
+def test_a_valid_token_beside_another_identity_header_is_refused(extra):
+    """The SDK reads the first Authorization and nothing else, so this screen is what refuses the rest on /mcp."""
+    with _serving() as (base, aud, rt):
+        valid = [("Authorization", f"Bearer {_token(aud)}")]
+        assert _raw(aud, valid) == 200
+        assert _raw(aud, valid + extra) == 401
+        assert rt.served == []
+
+
+def test_a_malformed_authorization_is_refused_on_mcp():
+    with _serving() as (base, aud, rt):
+        assert _raw(aud, [("Authorization", "Basic dXNlcg==")]) == 401
+
+
+def test_the_screen_names_its_reason():
+    import httpx
+
+    with _serving() as (base, aud, rt):
+        r = httpx.post(aud, headers={"Authorization": f"Bearer {_token(aud)}", "X-OpenWebUI-User-Id": "u",
+                                     "accept": "application/json, text/event-stream"}, json={})
+        assert r.status_code == 401 and r.headers["www-authenticate"].startswith("Bearer")
+        assert "unsigned identity header" in r.json()["error_description"]
+
+
+def test_the_metadata_route_is_not_screened():
+    import httpx
+
+    with _serving() as (base, aud, rt):
+        r = httpx.get(f"{base}/.well-known/oauth-protected-resource/mcp", headers={"X-OpenWebUI-User-Id": "u"})
+        assert r.status_code == 200

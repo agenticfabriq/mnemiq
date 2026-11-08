@@ -281,6 +281,35 @@ def _auth_settings(oidc):
     return AuthSettings(**kwargs)
 
 
+class _HeaderScreen:
+    """ASGI middleware in front of the SDK's bearer check on /mcp, applying the header rules every door shares
+    (`mnemiq.auth.doors.screen`): the SDK reads the first Authorization header and ignores everything else, so a
+    valid token beside Open WebUI's headers, or beside a second Authorization, would otherwise be served."""
+
+    def __init__(self, app, cfg, path: str = "/mcp") -> None:
+        self.app, self.cfg, self.path = app, cfg, path
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") == self.path:
+            from mnemiq.auth.doors import DoorRefusal, screen
+
+            headers: dict[str, list[str]] = {}
+            for name, value in scope.get("headers", []):
+                headers.setdefault(name.decode("latin-1").lower(), []).append(value.decode("latin-1"))
+            try:
+                screen(self.cfg, self.path, headers)
+            except DoorRefusal as exc:
+                logger.info("refused on %s: %s", self.path, exc.reason)
+                from starlette.responses import JSONResponse
+
+                response = JSONResponse({"error": "invalid_request", "error_description": exc.reason},
+                                        status_code=exc.status,
+                                        headers={"WWW-Authenticate": 'Bearer error="invalid_request"'})
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 def mcp_http_app(runtime, cfg, *, fetch: Callable[[], dict] | None = None):
     """The MCP door's Starlette app, which `server/app.py` mounts at exactly /mcp, with its protected-resource
     metadata. The resource URL is MNEMIQ_OIDC_AUDIENCE itself, so the two cannot disagree. mcp 2.x moved the path,
@@ -296,8 +325,12 @@ def mcp_http_app(runtime, cfg, *, fetch: Callable[[], dict] | None = None):
     http = mcp_http_settings(cfg)
     server_kwargs = {"token_verifier": verifier, "auth": _auth_settings(oidc)}
     if "streamable_http_path" in inspect.signature(server_class.streamable_http_app).parameters:  # mcp 2.x
-        return build_mcp(runtime, http_identity(cfg), server_kwargs=server_kwargs).streamable_http_app(**http)
-    return build_mcp(runtime, http_identity(cfg), server_kwargs={**server_kwargs, **http}).streamable_http_app()
+        app = build_mcp(runtime, http_identity(cfg), server_kwargs=server_kwargs).streamable_http_app(**http)
+    else:
+        app = build_mcp(runtime, http_identity(cfg), server_kwargs={**server_kwargs, **http}).streamable_http_app()
+    # Added last, so it is the outermost layer and runs before the SDK's authentication middleware.
+    app.add_middleware(_HeaderScreen, cfg=cfg)
+    return app
 
 
 def serve(settings: Settings) -> None:

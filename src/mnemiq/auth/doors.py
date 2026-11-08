@@ -68,24 +68,8 @@ class HttpDoors:
 
     def _identity(self, door: str, headers: Headers) -> IdentityContext:
         cfg = self._cfg
-        signed = headers.get(cfg.jwt_header, [])
-        if any(headers.get(name) for name in cfg.user_headers):
-            if signed:
-                # Open WebUI sends the signed header instead of the plain ones, never beside them, so something
-                # else added these: a custom connection header or a proxy.
-                raise DoorRefusal(401, "conflicting identity headers: Open WebUI's unsigned user headers arrived "
-                                       "beside its signed one")
-            raise DoorRefusal(401, "unsigned identity header: Open WebUI's fallback, meaning its JWT minting failed "
-                                   "or no secret is set")
-        authorization = headers.get("authorization", [])
-        if len(authorization) > 1 or len(signed) > 1:
-            raise DoorRefusal(401, "ambiguous credential: a credential header was sent more than once")
-        bearer = _bearer(authorization[0]) if authorization else None
-
-        if door == "/v1":
-            if signed:
-                raise DoorRefusal(401, "the Open WebUI header is accepted on /openai/v1 only")
-        else:
+        bearer, signed = screen(cfg, door, headers)
+        if door == "/openai/v1":
             if bearer is not None and signed:
                 raise DoorRefusal(401, _two_credentials(bearer))
             if cfg.binding is not None:
@@ -107,6 +91,29 @@ class HttpDoors:
                 raise DoorRefusal(401, "no Bearer token is accepted here without MNEMIQ_OPENWEBUI_AUDIENCE")
             return identity_from_oidc(verifier.claims(bearer), cfg)
         raise DoorRefusal(401, "no credential")
+
+
+def screen(cfg: AuthConfig, door: str, headers: Headers) -> tuple[str | None, list[str]]:
+    """The checks that come before any credential is verified, the same on every door: Open WebUI's unsigned headers,
+    a credential sent twice, a malformed Authorization, and, on any door but /openai/v1, Open WebUI's signed header.
+    Returns the Bearer token (or None) and the signed header's values. The MCP door runs this in front of the SDK,
+    whose own check reads the first Authorization header and nothing else."""
+    signed = headers.get(cfg.jwt_header, [])
+    if any(headers.get(name) for name in cfg.user_headers):
+        if signed:
+            # Open WebUI sends the signed header instead of the plain ones, never beside them, so something
+            # else added these: a custom connection header or a proxy.
+            raise DoorRefusal(401, "conflicting identity headers: Open WebUI's unsigned user headers arrived "
+                                   "beside its signed one")
+        raise DoorRefusal(401, "unsigned identity header: Open WebUI's fallback, meaning its JWT minting failed "
+                               "or no secret is set")
+    authorization = headers.get("authorization", [])
+    if len(authorization) > 1 or len(signed) > 1:
+        raise DoorRefusal(401, "ambiguous credential: a credential header was sent more than once")
+    bearer = _bearer(authorization[0]) if authorization else None
+    if signed and door != "/openai/v1":
+        raise DoorRefusal(401, "the Open WebUI header is accepted on /openai/v1 only")
+    return bearer, signed
 
 
 def _bearer(value: str) -> str:
