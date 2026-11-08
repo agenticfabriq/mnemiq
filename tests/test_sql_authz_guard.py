@@ -678,8 +678,11 @@ def _values_branch_is_a_source() -> bool:
 
     from mnemiq.sql.views import unrecognised_source
 
-    return unrecognised_source(sqlglot.parse_one(
-        "WITH t(x) AS (VALUES (1) UNION ALL SELECT 2) SELECT x FROM t", read="duckdb")) is not None
+    from mnemiq.sql.reading import as_duckdb_reads
+
+    # Read as the decider reads it: 30.29 wraps the branch in a SELECT, which the reading unwraps (M228).
+    return unrecognised_source(as_duckdb_reads(sqlglot.parse_one(
+        "WITH t(x) AS (VALUES (1) UNION ALL SELECT 2) SELECT x FROM t", read="duckdb"))) is not None
 
 
 _CTE_NAMED_LIKE_THE_TABLE = (
@@ -738,6 +741,102 @@ def test_a_write_does_not_place_a_policy_where_a_cte_is_named_after_a_governed_t
         policy=_filtered(), dialect="duckdb", target="duckdb", writes_enabled=True,
     )
     assert isinstance(v, Refusal) and v.code == RefusalCode.UNMODELLED_SOURCE, v
+
+
+# --------------------------------------------------------------------------------------------
+# M228: sqlglot 30.29 writes a VALUES standing as a set-operation branch or a CTE body as
+# `SELECT * FROM (VALUES ...) AS _values`, where 30.12 kept the VALUES. Read as a star, the
+# parser's own star refused such a VALUES whose rows name a table, telling the model to name the
+# columns of a star it never wrote. The wrapper is read as the VALUES it replaces; a star the
+# statement writes, over a VALUES or inside one, is still refused.
+# --------------------------------------------------------------------------------------------
+
+def test_sqlglot_s_select_around_a_values_is_read_as_the_values():
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.sql.decide import decide
+    from mnemiq.sql.decide_write import decide_write
+    from mnemiq.sql.policy import AccessPolicy
+
+    visible = {"claim": {"id", "amount"}, "one": {"secret"}}
+
+    def read(sql):
+        return decide(sql, visible, dialect="duckdb", target="duckdb")
+
+    def write(sql):
+        return decide_write(sql, visible, GrantSet(frozenset(visible), writable=frozenset({"claim"})),
+                            policy=AccessPolicy(), dialect="duckdb", target="duckdb", writes_enabled=True)
+
+    def star(v):
+        return isinstance(v, Refusal) and v.code == RefusalCode.SELECT_STAR
+
+    for sql in ("WITH t(x) AS (SELECT amount FROM claim UNION ALL VALUES (1)) SELECT x FROM t",
+                "WITH t(x) AS (VALUES ((SELECT max(amount) FROM claim)) UNION ALL SELECT 1) SELECT x FROM t",
+                "SELECT x FROM (SELECT amount FROM claim UNION ALL VALUES ((SELECT max(id) FROM claim))) AS d(x)"):
+        assert not star(read(sql)), (sql, read(sql))
+    assert not star(write("INSERT INTO claim (id, amount) WITH t(a, b) AS (VALUES ((SELECT max(id) FROM claim), 1) "
+                          "UNION ALL SELECT 1, 2) SELECT a, b FROM t"))
+    # The statement's own stars: over a VALUES, under any alias, and inside a VALUES row. Under
+    # sqlglot's own alias too: written in the statement, `_values` is a star over a VALUES like any
+    # other, and its column list names what the ORDER BY reads (Codex's second review of the port:
+    # read as a bare VALUES, the first was approved and answered with the other row).
+    for sql in ("SELECT * FROM (VALUES (1, 2)) AS v(a, b)",
+                "WITH t(x) AS (SELECT * FROM (VALUES ((SELECT max(amount) FROM claim))) AS v UNION ALL SELECT 1) SELECT x FROM t",
+                "WITH t(x) AS (VALUES ((SELECT * FROM one)) UNION ALL SELECT 'a') SELECT x FROM t",
+                "(SELECT * FROM (VALUES (1, 2), (2, 1)) AS _values(col1, col0) ORDER BY col0 LIMIT 1) UNION ALL SELECT 3, 3",
+                "SELECT * FROM (VALUES (1)) AS _values UNION ALL SELECT 2"):
+        assert star(read(sql)), (sql, read(sql))
+    for sql in ("INSERT INTO claim (id, amount) WITH t(a, b) AS (VALUES ((SELECT * FROM one), 1) UNION ALL SELECT 1, 2) SELECT a, b FROM t",
+                "INSERT INTO claim (id, amount) WITH t(a, b) AS (SELECT * FROM (VALUES (1, 2)) AS v UNION ALL SELECT 1, 2) SELECT a, b FROM t"):
+        assert star(write(sql)), (sql, write(sql))
+
+
+def test_only_the_exact_select_sqlglot_writes_around_a_values_operand_is_read_as_the_values():
+    import sqlglot
+    from sqlglot import exp
+
+    from mnemiq.sql.reading import as_duckdb_reads, bare_values
+
+    def over(alias):
+        return exp.alias_(exp.Values(expressions=[exp.Tuple(expressions=[exp.Literal.number(1)])]), alias, table=True)
+
+    def operand(select, parenthesised=False):
+        """`select` as a UNION ALL's first operand, as sqlglot places it; returned for asking."""
+        exp.union(exp.Subquery(this=select) if parenthesised else select, exp.select("2"), distinct=False, copy=False)
+        return select
+
+    assert bare_values(operand(exp.select("*").from_(over("_values")))) is not None
+    assert bare_values(operand(exp.select("*").from_(over("_values")), parenthesised=True)) is not None
+    assert bare_values(operand(exp.select("*").from_(over("_values")).limit(1))) is not None  # a modifier moved off it
+    assert bare_values(exp.select("*").from_(over("_values"))) is None  # in no set operation
+    assert bare_values(operand(exp.select("*").from_(over("v")))) is None
+    listed = over("_values")
+    listed.args["alias"].set("columns", [exp.to_identifier("col1"), exp.to_identifier("col0")])
+    assert bare_values(operand(exp.select("*").from_(listed))) is None  # a column list is the statement's
+    quoted = over("_values")
+    quoted.args["alias"].set("this", exp.to_identifier("_values", quoted=True))
+    assert bare_values(operand(exp.select("*").from_(quoted))) is None
+    placed = over("_values")
+    placed.args["alias"].this.meta.update(start=30, end=36)  # a token of the text, not the parser's name
+    assert bare_values(operand(exp.select("*").from_(placed))) is None
+    assert bare_values(operand(exp.select("x").from_(over("_values")))) is None
+    assert bare_values(operand(exp.select("*", "x").from_(over("_values")))) is None
+    assert bare_values(operand(exp.select("*").from_(over("_values")).where("x = 1"))) is None
+    assert bare_values(operand(exp.select("*").from_(over("_values")).join("claim"))) is None
+    assert bare_values(operand(exp.select("*").from_("claim"))) is None
+    excluding = sqlglot.parse_one("SELECT * EXCLUDE (a) FROM t", read="duckdb").expressions[0]
+    assert bare_values(operand(exp.select(excluding).from_(over("_values")))) is None  # a star that drops a column
+    # A CTE body's VALUES, which sqlglot 30.12 wrapped the same way: left as both versions read it.
+    cte = sqlglot.parse_one("WITH t(x) AS (VALUES (1)) SELECT x FROM t", read="duckdb")
+    assert bare_values(cte.find(exp.CTE).this) is None
+    assert isinstance(as_duckdb_reads(cte).find(exp.CTE).this, exp.Select)
+    # A set operation's operand, parenthesised or not, is the VALUES again, its LIMIT on it.
+    import duckdb
+    for sql in ("SELECT 1 UNION ALL VALUES (2)", "(VALUES (2), (3) LIMIT 1) UNION ALL SELECT 1"):
+        read = as_duckdb_reads(sqlglot.parse_one(sql, read="duckdb"))
+        assert not any(bare_values(s) for s in read.find_all(exp.Select)), read.sql()
+        assert read.find(exp.Values) is not None, read.sql()
+        con = duckdb.connect()
+        assert sorted(con.execute(read.sql(dialect="duckdb")).fetchall()) == sorted(con.execute(sql).fetchall()), read.sql()
 
 
 def test_a_scope_that_does_not_resolve_at_all_is_refused_the_same_way(monkeypatch):

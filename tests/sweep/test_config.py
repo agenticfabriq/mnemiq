@@ -7,11 +7,15 @@ import json
 
 import pytest
 
-from mnemiq.config import Settings
-from mnemiq.sweep.config import SweepConfigError, deployment_settings, fingerprint, load_config, scrub_credentials
+from mnemiq.config import DEFAULT_RETRIEVAL_K, Settings
+from mnemiq.sweep.arms import start_settings
+from mnemiq.sweep.config import (
+    SweepConfigError, deployment_settings, fingerprint, load_config, load_questions, scrub_credentials, start_profile,
+)
 
 from .conftest import (
-    KEY_ENV, STUB_KEY, UNREACHABLE, alter, broken_questions, tiny_deployment, tiny_files, write_config,
+    CASES, KEY_ENV, STUB_KEY, UNREACHABLE, alter, broken_questions, start_that_differs, tiny_dataset, tiny_deployment,
+    tiny_files, write_config,
 )
 
 
@@ -47,10 +51,73 @@ def test_an_endpoint_fact_belongs_to_models(tmp_path, name):
         load_config(write_config(tmp_path, space={name: ["a", "b"]}))
 
 
-@pytest.mark.parametrize("bad", ["duplicate_id", "answerable_without_gold", "unknown_db_id"])
-def test_a_question_file_that_cannot_be_graded_is_refused(tmp_path, bad):
-    with pytest.raises(SweepConfigError):
+@pytest.mark.parametrize("bad, refusal", [("duplicate_id", "case id 'book-count' appears twice"),
+                                          ("answerable_without_gold", "is answerable and has no gold_sql"),
+                                          ("unknown_db_id", "names db_id 'nowhere', which is not one of")])
+def test_a_question_file_that_cannot_be_graded_is_refused(tmp_path, bad, refusal):
+    with pytest.raises(SweepConfigError, match=refusal):
         load_config(write_config(tmp_path, questions=broken_questions(tmp_path, bad)))
+
+
+def two_env_files(tmp_path, cases: list[dict]) -> dict:
+    """The tiny deployment's files read as two deployments, `lib-a` and `lib-b` (with a longer question limit), and
+    `cases` as the question file. Returned as the `[dataset]` keys that name them."""
+    d = tiny_files(tmp_path)
+    envs = {name: d.root / f"{name}.env" for name in ("lib-a", "lib-b")}
+    envs["lib-a"].write_text(d.env.read_text())
+    envs["lib-b"].write_text(d.env.read_text() + "MNEMIQ_MAX_QUESTION_CHARS='2000'\n")
+    questions = tmp_path / "questions-two-deployments.json"
+    questions.write_text(json.dumps(cases))
+    return {"questions": str(questions), "deployments": {name: str(env) for name, env in envs.items()}}
+
+
+def test_with_a_deployment_for_each_db_id_each_question_reads_one_it_names(tmp_path):
+    cases = [{"id": case["id"], "question": case["question"], "gold_sql": case.get("gold_sql"),
+              "answerable": case.get("answerable", True), "db_id": ("lib-a", "lib-b")[number % 2]}
+             for number, case in enumerate(CASES)]
+    cfg = load_config(write_config(tmp_path, dataset=two_env_files(tmp_path, cases)))
+    assert {case.db_id for case in load_questions(cfg)} == {"lib-a", "lib-b"}
+    assert deployment_settings(cfg, "lib-b").max_question_chars == 2000
+    assert deployment_settings(cfg, "lib-a").max_question_chars != 2000
+    with pytest.raises(SweepConfigError, match="a question must say which it reads"):
+        deployment_settings(cfg, None)
+    with pytest.raises(SweepConfigError, match="deployments has no db_id 'nowhere'"):
+        deployment_settings(cfg, "nowhere")
+    for fault in (None, "nowhere"):
+        cases[0]["db_id"] = fault
+        refusal = rf"names db_id {fault!r}, which is not one of \[dataset\] deployments"
+        with pytest.raises(SweepConfigError, match=refusal):
+            load_config(write_config(tmp_path, dataset=two_env_files(tmp_path, cases)))
+
+
+def test_a_models_own_start_replaces_the_shared_one_as_far_as_it_says(tmp_path):
+    shared = tmp_path / "shared.toml"
+    shared.write_text('default = "a"\n[profiles.a]\nretrieval_k = 12\n[profiles.b]\nretrieval_k = 16\n')
+    own = tmp_path / "own.toml"
+    own.write_text('default = "c"\n[profiles.c]\nretrieval_k = 20\n')
+    models = {name: {"llm_model": "stub-model", "llm_base_url": UNREACHABLE, "api_key_env": KEY_ENV}
+              for name in ("m", "n", "o")}
+    # n names only a profile, so it keeps [start]'s file; o names a file, which replaces both.
+    start = {"profile_file": str(shared), "n": {"profile": "b"}, "o": {"profile_file": str(own)}}
+    cfg = load_config(write_config(tmp_path, models=models, start=start))
+    assert {name: start_profile(cfg, name) for name in models} == {
+        "m": (str(shared), None), "n": (str(shared), "b"), "o": (str(own), None)}
+    assert {name: start_settings(cfg, name)["retrieval_k"] for name in models} == {"m": 12, "n": 16, "o": 20}
+
+
+def test_check_mode_with_a_start_no_different_from_the_defaults_is_refused(tmp_path):
+    with pytest.raises(SweepConfigError, match="starts from the engine's defaults.*two identical profiles"):
+        load_config(write_config(tmp_path, search={"strategy": "check"}))
+    same = tmp_path / "same.toml"
+    same.write_text(f'default = "start"\n[profiles.start]\nretrieval_k = {DEFAULT_RETRIEVAL_K}\n')
+    with pytest.raises(SweepConfigError, match="sets nothing in instant.*two identical profiles"):
+        load_config(write_config(tmp_path, search={"strategy": "check"}, start={"profile_file": str(same)}))
+    # A start that differs from the defaults in another mode only still compares two identical profiles in instant.
+    thinking = tmp_path / "thinking.toml"
+    thinking.write_text('default = "start"\n[profiles.start]\n[profiles.start.thinking]\nmax_attempts = 2\n')
+    with pytest.raises(SweepConfigError, match="sets nothing in instant"):
+        load_config(write_config(tmp_path, search={"strategy": "check"}, start={"profile_file": str(thinking)}))
+    assert load_config(write_config(tmp_path, search={"strategy": "check"}, start=start_that_differs(tmp_path)))
 
 
 @pytest.mark.parametrize("name", ["smoke", "proposal", "sweep.json", "split.json", "retries.json"])
@@ -161,6 +228,19 @@ def test_an_endpoint_url_that_carries_a_credential_is_refused(tmp_path, where, u
     assert "SECRET" not in str(refused.value) and url not in str(refused.value)
 
 
+@pytest.mark.parametrize("where", ["chat", "judge table"])
+@pytest.mark.parametrize("url", ["http://localhost/v1#SECRET", "http://localhost/v1#", "http://localhost#x=SECRET/v1"])
+def test_an_endpoint_url_with_a_fragment_is_refused(tmp_path, where, url):
+    # A base URL needs no fragment, and one written there would reach each arm's profile file and the evidence.
+    model = {"llm_model": "stub-model", "llm_base_url": UNREACHABLE, "api_key_env": KEY_ENV}
+    sections = {"judge": {"verify_base_url": url, "verify_api_key_env": KEY_ENV}} if where != "chat" else {}
+    if where == "chat":
+        model["llm_base_url"] = url
+    with pytest.raises(SweepConfigError, match="fragment") as refused:
+        load_config(write_config(tmp_path, models={"m": model}, **sections))
+    assert "SECRET" not in str(refused.value) and url not in str(refused.value)
+
+
 @pytest.mark.parametrize("url", ["localhost:8000/v1", "ftp://localhost/v1", "http:///v1"])
 def test_an_endpoint_url_must_be_http_with_a_host(tmp_path, url):
     model = {"llm_model": "stub-model", "llm_base_url": url, "api_key_env": KEY_ENV}
@@ -225,3 +305,21 @@ def test_a_control_whose_answers_cannot_be_graded_is_refused_before_any_arm_runs
     path.write_text(answers if isinstance(answers, str) else json.dumps(answers))
     with pytest.raises(SweepConfigError, match=refusal):
         load_config(write_config(tmp_path, control=[{"name": "current", "answers": str(path)}]))
+
+
+@pytest.mark.parametrize("strategy", ["screen-then-grid", "grid"])
+def test_a_search_that_holds_nothing_out_is_refused(tmp_path, strategy):
+    # A search confirms its pick on held-out questions, so it needs some.
+    with pytest.raises(SweepConfigError, match="held_out is 0"):
+        load_config(write_config(tmp_path, dataset={"held_out": 0.0}, search={"strategy": strategy}))
+
+
+def test_a_held_out_share_too_small_to_hold_a_question_is_refused(tmp_path):
+    # 0.3 of 3 answerable questions floors to none, and there are none to decline.
+    with pytest.raises(SweepConfigError, match="holds no question"):
+        load_config(write_config(tmp_path, dataset=tiny_dataset(tmp_path, cases=3, answerable=3)))
+
+
+def test_check_mode_holds_nothing_out(tmp_path):
+    assert load_config(write_config(tmp_path, dataset={"held_out": 0.0}, search={"strategy": "check"},
+                                    start=start_that_differs(tmp_path)))

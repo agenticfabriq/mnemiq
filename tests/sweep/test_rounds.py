@@ -22,8 +22,8 @@ from mnemiq.sweep.run import _begin, _parts, _rows_so_far, arm_folder, room, run
 from mnemiq.sweep.split import split_digest
 
 from .conftest import (
-    CASES, KEY_ENV, alter, one_arm, out, read_rows, rewrite, start_of, started_sweep, sweep_json, tiny_dataset,
-    tiny_deployment, tuning, write_config, write_rows,
+    CASES, KEY_ENV, alter, one_arm, out, read_rows, rewrite, start_of, start_that_differs, started_sweep, sweep_json,
+    tiny_dataset, tiny_deployment, tuning, write_config, write_rows,
 )
 
 
@@ -267,6 +267,18 @@ def test_another_engine_build_is_refused(tmp_path, stub_model, monkeypatch):
         run(cfg)
 
 
+def test_a_worker_on_another_engine_build_than_its_sweeps_stops_before_asking(tmp_path, stub_model, monkeypatch):
+    stub = stub_model(gold=True)
+    cfg = load_config(write_config(tmp_path, model=stub))
+    asked = stub.calls
+    # The sweep records the build its run started on, and each worker imports the engine afresh from disk, as it would
+    # after an edit or a pull during the sweep: here the record holds another build than the workers run.
+    monkeypatch.setattr("mnemiq.sweep.run.engine_build", lambda *a, **k: {"commit": None, "source_sha": "f" * 64})
+    with pytest.raises(SystemExit, match="engine build"):
+        run(cfg)
+    assert sweep_json(cfg)["stopped"] == "worker" and stub.calls == asked and not all_rows(cfg)
+
+
 def test_a_second_run_on_the_same_out_folder_is_refused_at_once(tmp_path, stub_model):
     stub = stub_model(gold=True)
     cfg = load_config(write_config(tmp_path, model=stub))
@@ -283,7 +295,7 @@ def test_a_second_run_on_the_same_out_folder_is_refused_at_once(tmp_path, stub_m
 @pytest.mark.parametrize("strategy", ["screen-then-grid", "check"])
 def test_a_model_that_does_not_repeat_runs_twice(tmp_path, stub_model, strategy):
     stub = stub_model(varies=True, gold_when=lambda request: False)   # wrong everywhere, spelled anew each time
-    screen = {"arms_in_screen": 1} if strategy != "check" else {}
+    screen = {"arms_in_screen": 1} if strategy != "check" else {"start": start_that_differs(tmp_path)}
     cfg = roomy(tmp_path, stub, known=True, search={"strategy": strategy}, **screen)
     run(cfg, until="screen" if strategy != "check" else None)
     assert sweep_json(cfg)["repeats"] == 2 and every_first_round_arm_has_run(cfg, 2)
@@ -323,10 +335,8 @@ def test_a_model_with_no_room_stops_while_another_searches_on(tmp_path, stub_mod
 
 
 def test_check_mode_runs_two_arms_on_every_case(tmp_path, stub_model):
-    profile = tmp_path / "start-profiles.toml"
-    profile.write_text('default = "start"\n[profiles.start]\nretrieval_k = 12\n')
     cfg = load_config(write_config(tmp_path, model=stub_model(gold=True), search={"strategy": "check"},
-                                   start={"profile_file": str(profile), "profile": "start"}))
+                                   start=start_that_differs(tmp_path)))
     run(cfg)
     assert arm_ids(cfg, "check") == {"start", "defaults"}
     assert all(rows_for(cfg, a) == all_cases(cfg) for a in ("start", "defaults"))
@@ -339,7 +349,7 @@ def test_check_mode_runs_two_arms_on_every_case(tmp_path, stub_model):
 
 def test_a_count_of_runs_the_config_fixes_is_run_by_every_arm(tmp_path, stub_model):
     cfg = load_config(write_config(tmp_path, model=stub_model(gold=True), search={"strategy": "check"},
-                                   sweep={"repeats": 2}))
+                                   sweep={"repeats": 2}, start=start_that_differs(tmp_path)))
     run(cfg)   # the start repeats itself exactly, which decides nothing here
     assert sweep_json(cfg)["repeats"] == 2 and every_first_round_arm_has_run(cfg, 2)
     assert not any(arm_folder(cfg, arm, 3).exists() for arm in check_arms(cfg))
@@ -403,6 +413,22 @@ def test_a_dead_endpoint_stops_the_round_and_resume_finishes_it(tmp_path, stub_m
     model.recover()
     run(cfg, until="screen")
     assert all(arm_complete(cfg, a) for a in screen_arms(cfg)) and "stopped" not in sweep_json(cfg)
+
+
+def test_a_resume_while_the_endpoint_is_still_down_loses_no_case(tmp_path, stub_model):
+    model = stub_model(gold=True, fail_after=5, status=500)
+    cfg = roomy(tmp_path, model, arms_in_screen=1)
+    with pytest.raises(SystemExit):
+        run(cfg, until="screen")
+    with pytest.raises(SystemExit, match="An endpoint stopped answering"):
+        run(cfg, until="screen")   # resumed too soon: the cases it held are held still, none kept as an error
+    assert sweep_json(cfg)["stopped"] == "endpoint" and all(row["error_kind"] != "endpoint" for row in all_rows(cfg))
+    assert not run_complete(cfg, start_of(cfg, "instant"), 1)
+    model.recover()
+    run(cfg, until="screen")
+    assert all(arm_complete(cfg, a) for a in screen_arms(cfg))
+    assert all(row["error_kind"] is None for row in all_rows(cfg))
+    assert all(record["valid"] for record in report(cfg, "screen", controls=False)[1])
 
 
 def test_a_dead_endpoint_is_named_without_its_credentials(tmp_path, stub_model):
@@ -525,7 +551,7 @@ def test_a_value_is_kept_only_when_every_run_the_sweep_decided_on_keeps_it(tmp_p
 
 
 def test_a_round_the_strategy_does_not_run_cannot_be_the_last(tmp_path):
-    cfg = load_config(write_config(tmp_path, search={"strategy": "check"}))
+    cfg = load_config(write_config(tmp_path, search={"strategy": "check"}, start=start_that_differs(tmp_path)))
     with pytest.raises(ValueError, match="check"):
         run(cfg, until="screen")
 

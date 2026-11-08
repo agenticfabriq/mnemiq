@@ -849,6 +849,50 @@ def test_every_duckdb_json_reader_that_quotes_malformed_text_is_refused():
     assert admitted == [], admitted
 
 
+@pytest.mark.parametrize("row_filter,raises", [
+    ("(VALUES (attrs) UNION ALL SELECT region LIMIT 1) IS NOT NULL", True),
+    ("(SELECT region UNION ALL VALUES (attrs) LIMIT 1) IS NOT NULL", True),
+    ("(VALUES (attrs) UNION ALL VALUES (region) LIMIT 1) IS NOT NULL", True),
+    ("region IN (SELECT 1 UNION ALL VALUES (attrs))", True),
+    ("EXISTS (VALUES (attrs) UNION ALL SELECT region)", False),  # runs here; refused as on 30.12
+])
+def test_a_values_operand_is_typed_by_its_rows(row_filter, raises):
+    """sqlglot 30.29 writes a VALUES standing as a set-operation operand as `SELECT * FROM (VALUES
+    ...) AS _values`, and the typer read the parser's star in place of the row, so a filter whose
+    branches unify JSON with text was approved and raised on the row, quoting it (Codex's review of
+    the port, M228). The reading unwraps it, and the operand is typed by its rows as on 30.12."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INT, region VARCHAR, attrs JSON); "
+                "INSERT INTO claim VALUES (1, 'north', '{\"a\": 1}')")
+    if raises:
+        with pytest.raises(duckdb.ConversionException, match="Malformed JSON"):
+            con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
+    verdict = _decide(row_filter)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
+def test_a_reader_sqlglot_gives_a_node_of_its_own_is_refused_like_its_untyped_spelling():
+    """sqlglot 30.29 parses `from_json` as `exp.FromJson`, where 30.12 left it `Anonymous`, and the
+    reader check named its readers on `Anonymous` alone, so the promoted call was approved and a
+    malformed row's text could reach the error (M228). A reader is named by the call the engine
+    makes, whatever node sqlglot gives it."""
+    assert isinstance(_decide("from_json(region, '\"INTEGER\"') IS NOT NULL"), Refusal)
+    from sqlglot import exp
+
+    from mnemiq.sql.rls import _call_args, _call_name
+
+    def args(node):
+        return [a.sql() for a in _call_args(node)]
+
+    untyped = exp.Anonymous(this="from_json", expressions=[exp.column("region"),
+                                                          exp.Literal.string('"INTEGER"')])
+    assert (_call_name(untyped), args(untyped)) == ("from_json", ["region", "'\"INTEGER\"'"])
+    if hasattr(exp, "FromJson"):  # the node of its own, on a sqlglot that has one
+        typed = exp.FromJson(this=exp.column("region"), expression=exp.Literal.string('"INTEGER"'))
+        assert (_call_name(typed), args(typed)) == ("from_json", ["region", "'\"INTEGER\"'"])
+    assert _call_name(exp.column("region")) is None  # not a call
+
+
 # --- refused --------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("engine,row_filter", [
@@ -1556,7 +1600,10 @@ def test_a_map_literals_bare_key_is_read_and_installed_as_the_engine_reads_it():
     reversed_ = "list_transform(tags, x -> MAP {X: x}[x] IS NULL) = [true]"
     assert con.execute(f"SELECT id FROM claim WHERE {reversed_}").fetchall() == []
     plain = sqlglot.parse_one(reversed_, read="duckdb").sql(dialect="duckdb")
-    assert "MAP {'X': x}" in plain and con.execute(f"SELECT id FROM claim WHERE {plain}").fetchall() == [(1,)]
+    plain_rows = con.execute(f"SELECT id FROM claim WHERE {plain}").fetchall()
+    # sqlglot 30.12 wrote the key back as the text, which keeps the row; 30.29 keeps it bare, the
+    # same rows as written (M228). Either way the verdicts below must hold.
+    assert ("MAP {'X': x}" in plain, plain_rows) in [(True, [(1,)]), (False, [])], plain
     verdict = _decide(reversed_, snapshot=_snapshot(types))
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
     for row_filter in ("list_transform(tags, x -> MAP {x: 1}[x] = 1) = [true]",   # the key is the parameter

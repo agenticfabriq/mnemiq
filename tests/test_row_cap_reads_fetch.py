@@ -64,6 +64,7 @@ def test_a_bound_over_the_cap_is_clamped_and_marked(engine, tail):
     ("oracle", "FETCH FIRST 10 PERCENT ROWS ONLY"),
     ("duckdb", "LIMIT 10%"),
     ("duckdb", "LIMIT 1 + 1"),
+    ("duckdb", 'LIMIT "all"'),  # quoted, a column and not the keyword `ALL` (M228)
 ])
 def test_a_bound_with_no_plain_count_is_refused_not_replaced(engine, tail):
     verdict = _decide(f"SELECT id FROM CLAIM ORDER BY amount DESC {tail}", engine)
@@ -77,6 +78,8 @@ def test_a_bound_with_no_plain_count_is_refused_not_replaced(engine, tail):
     ("sqlite", "LIMIT -1", f"LIMIT {MAX_ROWS}"),
     ("sqlite", "LIMIT -1 OFFSET 5", f"LIMIT {MAX_ROWS} OFFSET 5"),
     ("postgres", "LIMIT ALL", f"LIMIT {MAX_ROWS}"),
+    ("postgres", "LIMIT all OFFSET 5", f"LIMIT {MAX_ROWS} OFFSET 5"),
+    ("duckdb", "LIMIT ALL", f"LIMIT {MAX_ROWS}"),
 ])
 def test_a_spelling_of_no_bound_takes_the_cap_as_if_none_were_written(dialect, tail, runs):
     """On main SQLite's `LIMIT -1` was kept and ran uncapped (the ui lane's review of #156)."""

@@ -5,18 +5,25 @@ from __future__ import annotations
 
 import fcntl
 import json
+import multiprocessing
 import pickle
 from pathlib import Path
 
 import pytest
 
-from mnemiq.sweep.config import deployment_settings, load_config
-from mnemiq.sweep.run import ArmInUse, arm_folder, arm_settings, engine_build, identity_refusal, run_arm
+from mnemiq.agent.loop import Agent
+from mnemiq.config import DEFAULT_RETRIEVAL_K
+from mnemiq.runtime import Runtime
+from mnemiq.sweep.config import SweepConfigError, deployment_settings, load_config
+from mnemiq.sweep.run import (
+    ArmInUse, _Job, _Rounds, _work, arm_folder, arm_settings, engine_build, identity_refusal, run_arm,
+)
 
 from .conftest import (
-    cancel_gold_once, copy_package, judged_by, one_arm, out_files, read_rows, source_down, start_of, tiny_deployment,
-    touch_store, tuning, two_deployments, write_config,
+    arm_with, cancel_gold_once, copy_package, judged_by, one_arm, out_files, read_rows, source_down, start_of,
+    tiny_deployment, touch_store, tuning, two_deployments, write_config,
 )
+from .stub_model import _carries, _messages
 
 
 def test_an_arm_runs_the_product_path_and_stamps_one_version(tmp_path, stub_model):
@@ -136,15 +143,214 @@ def test_a_fail_open_judge_that_is_down_is_on_every_answered_row(tmp_path, stub_
     assert {r["verify_layer"] for r in read_rows(cfg, arm) if r["outcome"] == "correct"} == {"judge_unavailable"}
 
 
-def test_a_case_asked_again_after_an_endpoint_stop_keeps_its_error(tmp_path, stub_model):
-    cfg, arm = one_arm(tmp_path, stub_model(gold=True, fail_after=3, status=500))
+def held_for_retry(cfg) -> list[tuple[str, str]]:
+    """The cases and modes `retries.json` holds for the endpoint to be asked again, each as listed."""
+    path = Path(cfg.sweep.out) / "retries.json"
+    entries = json.loads(path.read_text()) if path.exists() else {}
+    return [(entry["id"], entry["mode"]) for listed in entries.values() for entry in listed]
+
+
+def test_a_resume_while_the_endpoint_is_still_down_writes_no_error_and_stops_again(tmp_path, stub_model):
+    stub = stub_model(gold=True, fail_after=3, status=500)
+    cfg, arm = one_arm(tmp_path, stub)
     folder = arm_folder(cfg, arm, 1)
     assert run_arm(cfg, arm, tuning(cfg), folder) == "endpoint"
-    retries = json.loads((Path(cfg.sweep.out) / "retries.json").read_text())
-    retried = {entry["id"] for entries in retries.values() for entry in entries}
-    run_arm(cfg, arm, tuning(cfg), folder)   # the endpoint is still down
-    errors = {r["id"] for r in read_rows(cfg, arm) if r["outcome"] == "error"}
-    assert len(retried) == 3 and retried <= errors
+    held = held_for_retry(cfg)
+    assert len(held) == 3
+    assert run_arm(cfg, arm, tuning(cfg), folder) == "endpoint"   # the endpoint is still down
+    # Nothing it failed was written, the held cases are held still, and none is listed twice.
+    assert all(r["outcome"] != "error" for r in read_rows(cfg, arm))
+    assert set(held) <= set(held_for_retry(cfg)) and len(held_for_retry(cfg)) == len(set(held_for_retry(cfg)))
+    assert not {case for case, _ in held} & {r["id"] for r in read_rows(cfg, arm)}
+    stub.recover()
+    assert run_arm(cfg, arm, tuning(cfg), folder) == "complete"
+    rows = read_rows(cfg, arm)
+    assert sorted(r["id"] for r in rows) == sorted(case.id for case in tuning(cfg))
+    assert all(r["error_kind"] is None for r in rows)
+
+
+def test_a_held_case_that_fails_again_once_the_endpoint_answers_others_keeps_its_error(tmp_path, stub_model):
+    stub = stub_model(gold=True, fail_after=3, status=500)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    assert run_arm(cfg, arm, tuning(cfg), folder) == "endpoint"
+    held = {case for case, _ in held_for_retry(cfg)}
+    questions = [case.question for case in tuning(cfg) if case.id in held]
+    # The endpoint answers again, except that each held question fails as a server error would: its own failure.
+    stub.recover()
+    stub.rule = lambda request: 500 if any(_carries(_messages(request)[1], q) for q in questions) else None
+    assert run_arm(cfg, arm, tuning(cfg), folder) == "complete"
+    errors = {r["id"] for r in read_rows(cfg, arm) if r["error_kind"] == "endpoint"}
+    assert len(read_rows(cfg, arm)) == len(tuning(cfg)) and errors == held
+
+
+def own_failures(stub, cfg, case_ids) -> None:
+    """From now on `stub` fails each of `case_ids`' questions with a 500 of its own, and answers every other request."""
+    questions = [case.question for case in tuning(cfg) if case.id in set(case_ids)]
+    stub.recover()
+    stub.rule = lambda request: 500 if any(_carries(_messages(request)[1], q) for q in questions) else None
+
+
+def dies_before(stub, case_ids):
+    """A `before` callback for `run_arm`: just before any of `case_ids` is asked, `stub` stops answering anything."""
+    def before(case_id: str, mode: str) -> None:
+        if case_id in set(case_ids):
+            stub.rule = lambda request: 500
+    return before
+
+
+def test_held_questions_left_alone_finish_once_a_probe_shows_the_endpoint_answers(tmp_path, stub_model):
+    stub = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    last = [case.id for case in tuning(cfg)[-3:]]
+    assert run_arm(cfg, arm, tuning(cfg), folder, before=dies_before(stub, last[:1])) == "endpoint"
+    held = [case for case, _ in held_for_retry(cfg)]
+    # Only the held questions are left, and each now fails on its own while the endpoint answers everything else.
+    assert held == last and len(read_rows(cfg, arm)) + len(held) == len(tuning(cfg))
+    own_failures(stub, cfg, held)
+    assert run_arm(cfg, arm, tuning(cfg), folder) == "complete"
+    assert sorted(r["id"] for r in read_rows(cfg, arm) if r["error_kind"] == "endpoint") == sorted(held)
+    assert held_for_retry(cfg) == []   # each entry left retries.json as its error became final
+
+
+def stopped_on_three_before_the_last(stub, cfg, arm, folder) -> list[str]:
+    """Run `arm` until the endpoint stops answering just before its fourth question from the end, which holds three
+    questions and leaves the last one never asked; then the endpoint answers again. The held questions, in order."""
+    assert run_arm(cfg, arm, tuning(cfg), folder, before=dies_before(stub, [tuning(cfg)[-4].id])) == "endpoint"
+    held = [case for case, _ in held_for_retry(cfg)]
+    assert held == [case.id for case in tuning(cfg)[-4:-1]]
+    stub.rule = None
+    return held
+
+
+def test_an_endpoint_that_dies_after_answering_one_question_keeps_the_held_questions_held(tmp_path, stub_model):
+    stub = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    held = stopped_on_three_before_the_last(stub, cfg, arm, folder)
+    # The one question never asked is answered, then the endpoint stops answering before the held ones are asked.
+    assert run_arm(cfg, arm, tuning(cfg), folder, before=dies_before(stub, held)) == "endpoint"
+    rows = read_rows(cfg, arm)
+    assert len(rows) == len(tuning(cfg)) - len(held) and all(r["error_kind"] is None for r in rows)
+    assert sorted(case for case, _ in held_for_retry(cfg)) == sorted(held)
+
+
+def test_a_streak_of_questions_failing_on_their_own_settles_on_the_next_resume(tmp_path, stub_model):
+    stub = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    last = [case.id for case in tuning(cfg)[-3:]]
+    own_failures(stub, cfg, last)   # three in a row, at the end: they look like an outage
+    assert run_arm(cfg, arm, tuning(cfg), folder) == "endpoint"
+    assert sorted(case for case, _ in held_for_retry(cfg)) == sorted(last)
+    assert run_arm(cfg, arm, tuning(cfg), folder) == "complete"
+    assert sorted(r["id"] for r in read_rows(cfg, arm) if r["error_kind"] == "endpoint") == sorted(last)
+    assert held_for_retry(cfg) == []
+
+
+def test_retries_lose_each_entry_as_it_settles(tmp_path, stub_model):
+    stub = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    first, second, third = stopped_on_three_before_the_last(stub, cfg, arm, folder)
+    # The first held question fails on its own and settles; the endpoint dies before the second is asked.
+    own_failures(stub, cfg, [first, second, third])
+    assert run_arm(cfg, arm, tuning(cfg), folder, before=dies_before(stub, [second])) == "endpoint"
+    assert [case for case, _ in held_for_retry(cfg)] == [second, third]
+    assert [r["id"] for r in read_rows(cfg, arm) if r["error_kind"] == "endpoint"] == [first]
+
+
+def test_an_endpoint_that_dies_on_the_arms_last_questions_leaves_them_held(tmp_path, stub_model):
+    stub = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    last = [case.id for case in tuning(cfg)[-2:]]   # two: too few for a streak
+    assert run_arm(cfg, arm, tuning(cfg), folder, before=dies_before(stub, last[:1])) == "endpoint"
+    assert all(r["error_kind"] is None for r in read_rows(cfg, arm))
+    assert sorted(case for case, _ in held_for_retry(cfg)) == sorted(last)
+
+
+def test_with_nothing_answered_to_replay_a_held_question_stays_held(tmp_path, stub_model):
+    stub = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    own_failures(stub, cfg, [case.id for case in tuning(cfg)])   # no question of this arm, its start, is answered
+    # Two streaks of three, then the last question beside the first held one: every question held, none written.
+    assert [run_arm(cfg, arm, tuning(cfg), folder) for _ in range(4)] == ["endpoint"] * 4
+    assert read_rows(cfg, arm) == [] and len(held_for_retry(cfg)) == len(tuning(cfg)) == 7
+
+
+def declined_unread(monkeypatch, question: str) -> None:
+    """From now on the engine declines `question` as too long to read whole, before any model call, wherever it is
+    asked."""
+    original = Agent.decline_if_too_long
+
+    def decline(self, asked: str):
+        return original(self, "x" * (self.max_question_chars + 1) if asked == question else asked)
+
+    monkeypatch.setattr(Agent, "decline_if_too_long", decline)
+
+
+def test_a_probe_replays_only_a_question_that_called_the_model(tmp_path, stub_model, monkeypatch):
+    stub = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    cases = tuning(cfg)
+    declined_unread(monkeypatch, cases[-4].question)   # the last question answered before the endpoint dies
+    last = [case.id for case in cases[-3:]]
+    assert run_arm(cfg, arm, cases, folder, before=dies_before(stub, last[:1])) == "endpoint"
+    assert read_rows(cfg, arm)[-1]["calls"] == 0 and [case for case, _ in held_for_retry(cfg)] == last
+    own_failures(stub, cfg, last)   # the endpoint answers everything else now
+    assert run_arm(cfg, arm, cases, folder) == "complete"
+    assert sorted(r["id"] for r in read_rows(cfg, arm) if r["error_kind"] == "endpoint") == sorted(last)
+
+
+def test_a_probe_falls_back_to_a_question_the_start_answered_with_the_model(tmp_path, stub_model, monkeypatch):
+    stub = stub_model(gold=True)
+    cfg, start = one_arm(tmp_path, stub)
+    cases = tuning(cfg)
+    declined_unread(monkeypatch, cases[0].question)   # the start's first row: answered with no model call
+    assert run_arm(cfg, start, cases, arm_folder(cfg, start, 1)) == "complete"
+    arm = arm_with(cfg, retrieval_k=DEFAULT_RETRIEVAL_K + 4)
+    folder = arm_folder(cfg, arm, 1)
+    mine = cases[2:5]   # not the start's second question, the first it answered by calling the model
+    ids = [case.id for case in mine]
+    # The arm asks three questions and the endpoint dies before the first, so no question of the arm's own is
+    # answered: a probe can replay only one the start answered.
+    assert run_arm(cfg, arm, mine, folder, before=dies_before(stub, ids[:1])) == "endpoint"
+    assert read_rows(cfg, arm) == [] and [case for case, _ in held_for_retry(cfg)] == ids
+    own_failures(stub, cfg, ids)
+    assert run_arm(cfg, arm, mine, folder) == "complete"
+    assert sorted(r["id"] for r in read_rows(cfg, arm) if r["error_kind"] == "endpoint") == sorted(ids)
+
+
+def test_a_probe_that_raises_leaves_the_held_questions_held_and_says_why(tmp_path, stub_model, monkeypatch, capsys):
+    stub = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    last = [case.id for case in tuning(cfg)[-3:]]
+    assert run_arm(cfg, arm, tuning(cfg), folder, before=dies_before(stub, last[:1])) == "endpoint"
+    own_failures(stub, cfg, last)
+    ask = Runtime.ask
+
+    def broken(self, question, identity, mode=None, emit=None, history=None, profile=None):
+        if emit is None:   # the probe passes none; every graded question does
+            raise RuntimeError("the probe broke reading postgresql://sweep:SECRETPW@db.example/library")
+        return ask(self, question, identity, mode=mode, emit=emit, history=history, profile=profile)
+
+    monkeypatch.setattr(Runtime, "ask", broken)
+    # As a worker runs it: what it sends back is an endpoint stop with the probe's failure, not a worker that died.
+    receiver, sender = multiprocessing.Pipe(duplex=False)
+    _work(cfg, arm, tuning(cfg), folder, sender, [])
+    outcome = receiver.recv()
+    assert outcome[0] == "endpoint" and "probe" in outcome[1] and "RuntimeError" in outcome[1]
+    assert "SECRETPW" not in outcome[1]
+    assert all(r["error_kind"] is None for r in read_rows(cfg, arm)) and [c for c, _ in held_for_retry(cfg)] == last
+    rounds = object.__new__(_Rounds)   # what the sweep does with it: an endpoint stop, said with its reason
+    rounds.meter, rounds.state, rounds.halt, rounds.secrets, rounds.dead, rounds.died = None, None, None, [], [], []
+    rounds._ended(_Job(arm, 1, tuple(tuning(cfg)), folder), outcome, 1)
+    assert rounds.dead == ["m"] and not rounds.died and outcome[1] in capsys.readouterr().out
 
 
 def test_a_statement_cancelled_under_load_is_an_error_not_wrong(tmp_path, stub_model, monkeypatch):
@@ -183,6 +389,21 @@ def test_an_invalid_arm_outranks_an_endpoint_stop_and_stays_invalid(tmp_path, st
     stub.recover()
     asked = stub.calls
     assert run_arm(cfg, arm, tuning(cfg), folder) == "invalid" and stub.calls == asked   # nothing asked again
+
+
+def test_an_arm_refuses_to_run_under_another_engine_build_than_its_sweeps(tmp_path, stub_model):
+    stub = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub)
+    out = Path(cfg.sweep.out)
+    out.mkdir(parents=True)
+    # As after an edit or a pull during the sweep: the worker imports the engine from disk, and it is another build.
+    (out / "sweep.json").write_text(json.dumps({"engine_build": {"commit": None, "source_sha": "f" * 64}}))
+    folder = arm_folder(cfg, arm, 1)
+    asked = stub.calls
+    with pytest.raises(SweepConfigError, match="engine build") as refused:
+        run_arm(cfg, arm, tuning(cfg), folder)
+    assert "ffffffffffff" in str(refused.value) and engine_build()["source_sha"][:12] in str(refused.value)
+    assert stub.calls == asked and not (folder / "rows.jsonl").exists() and not (folder / "pins.json").exists()
 
 
 def test_the_source_hash_changes_with_the_source(tmp_path):

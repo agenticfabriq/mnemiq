@@ -15,21 +15,29 @@ from __future__ import annotations
 import os
 from collections import Counter
 from dataclasses import dataclass, replace
+from pathlib import Path
+from statistics import fmean
 
 from mnemiq.config import Settings
 from mnemiq.runtime import _resolve_verify_level
 from mnemiq.sweep.arms import Arm, baselines, check_arms, grid_arms, refusal_under, screen_arms, start_settings
-from mnemiq.sweep.config import _FILE_SOURCES, SweepConfig, _source_specs, load_questions
+from mnemiq.sweep.config import _FILE_SOURCES, SMOKE, SweepConfig, _source_specs, load_questions
 from mnemiq.sweep.split import split
 from mnemiq.sweep.stats import detectable_gain
 
-# The timing round runs each finalist once, alone. How many finalists there are is known only after the grid; `plan`
-# counts the start and one finalist for each model and mode, and says so.
+# The timing round runs each finalist once, alone, on the first `TIMING_CASES` cases to tune on. How many finalists
+# there are is known only after the grid; `plan` counts the start and one finalist for each model and mode, and says so.
 TIMING_ARMS_PER_MODE = 2
+TIMING_CASES = 20
+# Before the timing round the sweep waits, at most this long, for the machine's load to fall under its core count,
+# reading it this often meanwhile.
+LOAD_WAIT_S = 300.0
+LOAD_WAIT_EVERY_S = 15.0
 _UNKNOWN = "unknown until the first questions run"
 _JUDGE_UNPRICED = "the judge's price is not known"
 # The rounds that compare arms on the tuning part, by strategy; timing and confirm follow a search.
 _ROUNDS_OF = {"screen-then-grid": ("screen", "grid"), "grid": ("grid",), "check": ("check",)}
+AFTER_SEARCH = ("timing", "confirm")
 
 
 @dataclass(frozen=True)
@@ -40,7 +48,8 @@ class Estimate:
     the start once in each mode, and timing counts `TIMING_ARMS_PER_MODE`. `case_runs`, `hours` and `dollars` are
     keyed by how many times each arm runs: one and two when the first round decides, the configured count otherwise.
     `detectable` and `compared` are per model and mode, for a sweep that searches. `judged_elsewhere` names the models
-    whose judge runs on another endpoint or model, which leaves `dollars` unknown.
+    whose judge runs on another endpoint or model, which leaves `dollars` unknown. `fails_open` names each deployment
+    (None for one env file) whose verifier fails open where an arm that runs calls the judge.
     """
 
     arms: dict[str, int]
@@ -56,6 +65,13 @@ class Estimate:
     rounds: dict[tuple[str, str], dict[str, list[Arm]]]
     parts: dict[str, tuple[int, int]]  # tuning and held_out: (cases, answerable)
     judged_elsewhere: list[str]
+    fails_open: list[str | None]
+
+
+def rounds_of(strategy: str) -> tuple[str, ...]:
+    """Every round a sweep of `strategy` runs, in order: the rounds that compare arms on the questions to tune on, then
+    timing and confirm for a strategy that searches. Check mode compares for harm and runs neither."""
+    return (*_ROUNDS_OF[strategy], *(AFTER_SEARCH if strategy != "check" else ()))
 
 
 def _tried(arms: list[Arm]) -> dict[str, list[object]]:
@@ -113,7 +129,7 @@ def _questions_asked(cfg: SweepConfig, rounds: dict[str, list[Arm]], tuning: int
         count = 2 + (len(arms) - 1) * runs if first and decided else len(arms) * runs
         parallel += count * tuning
     if _searches(cfg, rounds):
-        alone += TIMING_ARMS_PER_MODE * tuning
+        alone += TIMING_ARMS_PER_MODE * min(TIMING_CASES, tuning)
     return parallel, alone
 
 
@@ -138,6 +154,21 @@ def _judged_elsewhere(cfg: SweepConfig, model: str, rounds: list[dict[str, list[
         if any(_resolve_verify_level(values[f"{mode}.verify"], override) == "full"
                for mode in arm.modes for override in overrides):
             return True
+    return False
+
+
+def _calls_the_judge(cfg: SweepConfig, rounds: dict[tuple[str, str], dict[str, list[Arm]]],
+                     settings: Settings) -> bool:
+    """Whether an arm that runs calls the judge under the deployment `settings`: in a mode whose verify level, after
+    the deployment's override, is "full", the engine's rule."""
+    for model in cfg.models:
+        start = start_settings(cfg, model)
+        mine = [arm for (owner, _), own in rounds.items() if owner == model for arms in own.values() for arm in arms]
+        for arm in mine:
+            values = start | dict(arm.changes)
+            if any(_resolve_verify_level(values[f"{mode}.verify"], settings.verify_override) == "full"
+                   for mode in arm.modes):
+                return True
     return False
 
 
@@ -178,8 +209,9 @@ def estimate(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None 
     hours = None
     if cfg.search.seconds_per_question is not None:
         seconds = cfg.search.seconds_per_question
+        timed = any(_searches(cfg, r) for r in rounds.values())
         hours = {runs: sum(by_model[m][runs][0] / cfg.machine.parallel + by_model[m][runs][1] for m in cfg.models)
-                 * seconds / 3600 for runs in runs_each}
+                 * seconds / 3600 + (LOAD_WAIT_S / 3600 if timed else 0.0) for runs in runs_each}
     judged_elsewhere = [m for m in cfg.models
                         if _judged_elsewhere(cfg, m, [rounds[(m, mode)] for mode in cfg.modes], deployments)]
     dollars = None
@@ -208,19 +240,47 @@ def estimate(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None 
                 detectable[key] = detectable_gain(room_bound, count, cfg.propose.alpha)
 
     store_bytes: dict[str, int | None] = {}
-    unpinned: list[str] = []
-    for db_id, settings in deployments:
+    for _, settings in deployments:
         store = os.path.abspath(settings.store_path)
         store_bytes[store] = os.path.getsize(store) if os.path.isfile(store) else None
-        for spec in _source_specs(settings):
-            if spec.kind not in _FILE_SOURCES:
-                unpinned.append(f"{spec.id} ({spec.kind})" if db_id is None else f"{db_id}: {spec.id} ({spec.kind})")
+    unpinned = unpinned_sources(deployments)
+    fails_open = [db_id for db_id, settings in deployments
+                  if not settings.verify_fail_closed and _calls_the_judge(cfg, rounds, settings)]
 
     return Estimate(
         arms=dict(arms), case_runs=case_runs, hours=hours, dollars=dollars, detectable=detectable, compared=compared,
         room_bound=room_bound, store_bytes=store_bytes, unpinned_sources=unpinned, refused=refused, rounds=rounds,
         parts={name: (len(part), sum(case.answerable for case in part)) for name, part in parts.items()},
-        judged_elsewhere=judged_elsewhere)
+        judged_elsewhere=judged_elsewhere, fails_open=fails_open)
+
+
+def measured_tokens(cfg: SweepConfig) -> dict[str, tuple[float, float]] | None:
+    """The tokens one question took, per model, as the rows written in the sweep's out folder show them, a smoke's
+    included: the mean prompt and completion tokens over the rows that were answered and graded (no error). A model with
+    no such row is left out, and None is returned when no model has one, so `render` says the cost is not known yet."""
+    from mnemiq.sweep.run import ROWS, _rows_so_far  # the run reads this module, so it is imported when needed
+
+    out = Path(cfg.sweep.out)
+    found: dict[str, tuple[float, float]] = {}
+    for model in cfg.models:
+        counted = [(row["prompt_tokens"], row["completion_tokens"])
+                   for base in (out / model, out / SMOKE / model) for path in base.glob(f"*/*/*/run-*/{ROWS}")
+                   for row in _rows_so_far(path) if row.get("error_kind") is None
+                   and all(isinstance(row.get(name), int) for name in ("prompt_tokens", "completion_tokens"))]
+        if counted:
+            found[model] = (fmean(tokens for tokens, _ in counted), fmean(tokens for _, tokens in counted))
+    return found or None
+
+
+def unpinned_sources(deployments: list[tuple[str | None, Settings]]) -> list[str]:
+    """Each source of `deployments` (from `baselines`) that is not a file, and so cannot be pinned: by its id and kind,
+    after its deployment's db_id when there are several. Never by its target, which can hold a credential."""
+    unpinned = []
+    for db_id, settings in deployments:
+        for spec in _source_specs(settings):
+            if spec.kind not in _FILE_SOURCES:
+                unpinned.append(f"{spec.id} ({spec.kind})" if db_id is None else f"{db_id}: {spec.id} ({spec.kind})")
+    return unpinned
 
 
 def _priced(cfg: SweepConfig, model: str, tokens: dict[str, tuple[float, float]]) -> bool:
@@ -308,8 +368,10 @@ def render(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None = 
             else:
                 lines.append(f"    {name}: {len(arms)} arms: {labels}")
         if _searches(cfg, rounds):
-            lines.append(f"    timing: the start and each finalist, once each and alone (the cost counts "
-                         f"{TIMING_ARMS_PER_MODE}: the start and one finalist)")
+            lines.append(f"    timing: after waiting up to {LOAD_WAIT_S / 60:g} minutes for the machine's load to "
+                         f"fall, the start and each finalist, once each and alone, on the first {TIMING_CASES} cases "
+                         f"to tune on (the cost counts {TIMING_ARMS_PER_MODE}: the start and one finalist, and the "
+                         "wait)")
     for model in cfg.models:
         if any(_searches(cfg, est.rounds[(model, mode)]) for mode in cfg.modes):
             lines.append(f"  confirm, {model}: the assembled profile against the start on the held-out part, in each "
@@ -345,26 +407,27 @@ def render(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None = 
     lines.append("  budget: " + ("; ".join(budget) if budget else "none set"))
 
     lines += ["", f"What the search can show (exact McNemar test, Holm's correction at alpha {cfg.propose.alpha:g})"]
+    reasons = {key: _nothing_compared(est, key) for key in est.rounds if key not in est.detectable}
     if check:
         lines.append("  check mode: the start against the engine's defaults, for harm; no search, so no gain to detect")
-    elif not est.detectable:
-        reasons = {key: _nothing_compared(est, key) for key in est.rounds}
-        if len(set(reasons.values())) == 1:
-            lines.append(f"  nothing is compared with the start: {next(iter(reasons.values()))}")
-        else:
-            lines += [f"  {model}, {mode}: nothing is compared with the start: {why}"
-                      for (model, mode), why in reasons.items()]
-    for (model, mode), gain in est.detectable.items():
-        compared = est.compared[(model, mode)]
-        if gain is None:
-            lines.append(f"  {model}, {mode}: too small to search. With {compared} arms compared with the start, a win "
-                         f"takes more than the {est.room_bound} answerable questions there are to tune on. Use check "
-                         "mode ([search] strategy = \"check\"): the start against the engine's defaults on every "
-                         "question, for harm.")
-        else:
-            lines.append(f"  {model}, {mode}: an arm needs at least {gain} more right with none lost, with {compared} "
-                         f"arms compared with the start (the grid adds more). Room: at most {est.room_bound}, the "
-                         "answerable questions to tune on; the start's misses decide once it has run.")
+    elif not est.detectable and len(set(reasons.values())) == 1:
+        lines.append(f"  nothing is compared with the start: {next(iter(reasons.values()))}")
+    else:
+        # Each model and mode in turn, one that compares nothing beside one that does saying why.
+        for (model, mode) in est.rounds:
+            gain, compared = est.detectable.get((model, mode)), est.compared.get((model, mode))
+            if compared is None:
+                lines.append(f"  {model}, {mode}: nothing is compared with the start: {reasons[(model, mode)]}")
+            elif gain is None:
+                lines.append(f"  {model}, {mode}: too small to search. With {compared} arms compared with the start, a "
+                             f"win takes more than the {est.room_bound} answerable questions there are to tune on. Use "
+                             "check mode ([search] strategy = \"check\"): the start against the engine's defaults on "
+                             "every question, for harm.")
+            else:
+                lines.append(f"  {model}, {mode}: an arm needs at least {gain} more right with none lost, with "
+                             f"{compared} arms compared with the start (the grid adds more). Room: at most "
+                             f"{est.room_bound}, the answerable questions to tune on; the start's misses decide once "
+                             "it has run.")
 
     lines += ["", "Store"]
     for store, size in est.store_bytes.items():
@@ -373,6 +436,14 @@ def render(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None = 
                          "unknown")
         else:
             lines.append(f"  store copy: {_size(size)} for each arm running, of {store}")
+    if est.fails_open:
+        lines += ["", "Judge"]
+        for db_id in est.fails_open:
+            where = "the deployment" if db_id is None else f"the deployment for {db_id!r}"
+            lines.append(f"  {where}: the verifier fails open (MNEMIQ_VERIFY_FAIL_CLOSED=0), so a judge that stops "
+                         "answering never stops an arm. Its answers go out unjudged, each counts as not measured, and "
+                         "the arm ends not valid. Set MNEMIQ_VERIFY_FAIL_CLOSED=1 in the deployment's env file, so "
+                         "that a judge that stops answering stops the arm and the next run resumes it.")
     if est.unpinned_sources:
         lines += ["", "Sources"]
         lines += [f"  {source}: source not pinned. A live database cannot be hashed, so a change to it during the "

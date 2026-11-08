@@ -65,6 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--port", type=int, default=8080)
     sub.add_parser("metrics", help="print observability SLOs from the answer log")
 
+    _add_sweep(sub)
+
     e = sub.add_parser("eval", help="run the ACME golden set")
     e.add_argument("--golden", default="evals/acme.json")
     e.add_argument("--gate", action="store_true", help="exit non-zero on accuracy regression")
@@ -83,6 +85,166 @@ def build_parser() -> argparse.ArgumentParser:
                     help="the extensions to fetch (default: all mnemiq loads -- vss, fts, "
                          "postgres, sqlite)")
     return p
+
+
+def _add_sweep(sub) -> None:
+    """`mnemiq sweep`, whose actions each read one sweep's config file, which docs/sweeps.md explains."""
+    from mnemiq.sweep.arms import ROUNDS
+
+    s = sub.add_parser(
+        "sweep", help="measure settings on your questions and propose a profile for each model",
+        description="Measure settings on a question set with known answers, and propose a settings profile for "
+                    "each model, with its evidence, for a person to promote. See docs/sweeps.md.")
+    actions = s.add_subparsers(dest="sweep_command", required=True)
+    helps = {
+        "plan": "say what the sweep will run, what it will cost, and the smallest gain it could show; runs nothing",
+        "run": "run the sweep's rounds, resuming where an earlier run stopped",
+        "report": "print each round's table: every arm against the start, question by question",
+        "propose": "apply the config's rule to the finished sweep and write each model's profile and evidence",
+    }
+    epilogs = {"run": "Exit status: 0 once the rounds asked for have run; 3 when the budget stopped the sweep before "
+                      "an arm it could not cover (raise the budget in [search] and run again: it resumes); 1 for a "
+                      "refusal, an endpoint that stopped answering or a worker that died."}
+    parsers = {}
+    for name, text in helps.items():
+        parsers[name] = actions.add_parser(name, help=text, description=text[:1].upper() + text[1:] + ".",
+                                           epilog=epilogs.get(name))
+        parsers[name].add_argument("--config", required=True, help="the sweep's config file (TOML)")
+    parsers["run"].add_argument("--until", choices=ROUNDS, metavar="ROUND",
+                                help="stop after this round: one the strategy runs, of " + ", ".join(ROUNDS))
+    parsers["run"].add_argument("--smoke", type=int, metavar="N",
+                                help="instead, run each arm of the first round once on its first N questions to "
+                                     "tune on, in <out>/smoke, which nothing else reads")
+    parsers["report"].add_argument("--round", choices=ROUNDS, metavar="ROUND",
+                                   help="report this round only (default: every round that has run), of "
+                                        + ", ".join(ROUNDS))
+    parsers["propose"].add_argument(
+        "--choose", metavar="ARM",
+        help="a person's pick in place of the rule's: an arm's label as the report shows it, or start (or "
+             "defaults, in check mode). It applies to every model, and must name an arm that ran and is valid in "
+             "every run")
+
+
+# `mnemiq sweep run`'s exit status when the budget stopped the sweep: neither finished (0) nor failed (1).
+SWEEP_BUDGET_STOP = 3
+
+
+def _cmd_sweep(args) -> int:
+    """One action of `mnemiq sweep`. A refusal (`SweepConfigError`) is printed and exits 1 with no traceback, and so
+    does a run that stopped because an endpoint stopped answering or a worker died. A run the budget stopped exits
+    `SWEEP_BUDGET_STOP`."""
+    from mnemiq.sweep.config import SweepConfigError, load_config
+
+    try:
+        cfg = load_config(args.config)
+        if args.sweep_command == "plan":
+            from mnemiq.sweep.plan import measured_tokens, render
+
+            print(render(cfg, tokens=measured_tokens(cfg)), end="")
+        elif args.sweep_command == "run":
+            return _sweep_run(cfg, args)
+        elif args.sweep_command == "report":
+            _sweep_report(cfg, args)
+        elif args.sweep_command == "propose":
+            _sweep_propose(cfg, args)
+    except SweepConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    return 0
+
+
+def _sweep_record(cfg) -> dict:
+    """The sweep's `sweep.json`, or an empty record before a run has started the sweep."""
+    import json
+    from pathlib import Path
+
+    from mnemiq.sweep.config import SWEEP
+
+    record = Path(cfg.sweep.out) / SWEEP
+    return json.loads(record.read_text(encoding="utf-8")) if record.exists() else {}
+
+
+def _sweep_run(cfg, args) -> int:
+    from mnemiq.sweep.run import run
+
+    try:
+        run(cfg, until=args.until, smoke=args.smoke)
+    except SystemExit as exc:  # an endpoint stopped answering, or a worker died: `run` says which, and what to do
+        if not isinstance(exc.code, str):
+            return exc.code or 0
+        print(exc.code, file=sys.stderr)
+        return 1
+    state = _sweep_record(cfg)
+    if args.smoke is not None:
+        print(f"The smoke ran each arm of the first round on its first {args.smoke} questions to tune on, in "
+              f"{cfg.sweep.out}/smoke, which nothing else reads.")
+    elif state.get("stopped") == "budget":
+        print("The budget stopped the sweep before an arm it could not cover, as said above. Raise budget_hours or "
+              "budget_dollars in [search] and run again: a larger budget resumes the sweep where it stopped.")
+        return SWEEP_BUDGET_STOP
+    elif state.get("finished"):
+        print("The sweep has finished its rounds. `mnemiq sweep report` shows them, and `mnemiq sweep propose` "
+              "proposes a profile for each model.")
+    elif args.until is not None:
+        print(f"The sweep ran through the {args.until} round. Run it again without --until to go on: it resumes "
+              "where it stopped.")
+    return 0
+
+
+def _report_repeats(cfg) -> int:
+    """How many runs `report` reads each arm at: the config's own count, else the count the first round recorded in
+    `sweep.json`. Before anything has decided one (the first round has not ended, or no start ran), each arm is read at
+    one run, and that is said. A `sweep.json` written under another config is refused whatever the count."""
+    from mnemiq.sweep.config import SWEEP, SweepConfigError, fingerprint
+    from mnemiq.sweep.report import decided_repeats
+
+    state = _sweep_record(cfg)
+    if state and state.get("fingerprint") != fingerprint(cfg):
+        raise SweepConfigError(f"{cfg.sweep.out}/{SWEEP}: this sweep was run under another config, so its rows are "
+                               "not this config's to read. Put the config back, or report on another out folder.")
+    if isinstance(cfg.sweep.repeats, int):
+        return cfg.sweep.repeats
+    try:
+        return decided_repeats(cfg, state)
+    except SweepConfigError as exc:  # no start ran: the engine refused every one, and the message says why
+        why = str(exc)
+        print(f"{why[:1].upper()}{why[1:]}. With no count of runs decided, each arm is read at one run.\n")
+    except ValueError:
+        print('[sweep] repeats is "auto", and the first round has not yet decided how many runs each arm owes, so '
+              "each arm is read at one run.\n")
+    return 1
+
+
+def _sweep_report(cfg, args) -> None:
+    """The round asked for, or every round the strategy runs that has run an arm of its own: a grid that follows a
+    screen shows the screen's start, and with nothing kept to combine that is all it would show."""
+    from mnemiq.sweep.plan import rounds_of
+    from mnemiq.sweep.report import graded_controls, report
+
+    rounds = [args.round] if args.round else list(rounds_of(cfg.search.strategy))
+    repeats = _report_repeats(cfg)
+    controls = graded_controls(cfg)   # once, for every round
+    tables = []
+    for round in rounds:
+        text, records = report(cfg, round, repeats=repeats, controls=controls)
+        if text and (args.round or any(r["round"] == round and r["control"] is None for r in records)):
+            tables.append(text)
+    if tables:
+        print("\n".join(tables), end="")
+    else:
+        where = f"the {args.round} round" if args.round else "any round"
+        print(f"Nothing has run in {where} of this sweep yet.")
+
+
+def _sweep_propose(cfg, args) -> None:
+    from mnemiq.sweep.propose import propose
+
+    for model, result in propose(cfg, args.choose).items():
+        by = "a person" if result["chosen_by"] == "person" else "the rule"
+        print(f"{model}: {result['chosen'] or 'nothing'} (chosen by {by})")
+        print(f"  {result['why']}")
+        print(f"  profile: {result['profiles_file'] or 'none written'}")
+        print(f"  evidence: {result['evidence_file']}")
 
 
 def _identity(args, settings: Settings | None = None) -> IdentityContext:
@@ -566,12 +728,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "digest-ontology":  # likewise: TTL in, JSON out -- no source needed
         return _cmd_digest_ontology(args)
+    if args.command == "sweep":  # a sweep reads each deployment from the env file its config names, never this one's
+        return _cmd_sweep(args)
     settings = Settings.from_env()
     if args.command == "extensions":  # before the check: it is how a local-only machine passes it
         return _cmd_extensions(settings, args)
     # The one call site for every command that touches a source, a store or an endpoint --
     # `config` and `digest-ontology` never reach this line, which is why they are dispatched
-    # above it instead of after. Placed here, before the command dispatch below, an operator's
+    # above it instead of after. `sweep` does not reach it either: it reads no setting from
+    # this environment, only each deployment's own env file, and the engine's profile loader
+    # walks the same endpoints under that deployment's MNEMIQ_LOCAL_ONLY for every arm the
+    # sweep builds (`local_only_offenders`), refusing any arm that would leave the network.
+    # Placed here, before the command dispatch below, an operator's
     # mistyped base URL is a startup error instead of a run that quietly succeeds having sent
     # every schema card off the network. Caught and printed rather than left to surface as a raw
     # traceback: the point of the check is to hand a security reviewer a clean refusal, not a
