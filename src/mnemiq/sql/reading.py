@@ -208,15 +208,66 @@ def is_lambda_parameter(node: exp.Expression) -> bool:
     return False
 
 
+# What sqlglot's SELECT around a bare VALUES may carry besides its star and its source: the modifiers
+# it moved off the VALUES, which go back onto it.
+_VALUES_MODIFIERS = ("order", "limit", "offset")
+
+
+def bare_values(select: exp.Expression) -> exp.Values | None:
+    """The VALUES under the SELECT sqlglot 30.29 writes around a set operation's bare VALUES operand,
+    or None for any other node.
+
+    sqlglot 30.29 parses a VALUES that stands as a set-operation operand, parenthesised or not, as
+    `SELECT * FROM (VALUES ...) AS _values`, where 30.12 kept the VALUES itself, and DuckDB reads a
+    VALUES. The star is the parser's: the star walk refused it as a star reaching a table, and the
+    row filter's typer read the star in place of the row, so `(VALUES (attrs) UNION ALL SELECT
+    region LIMIT 1) IS NOT NULL` was approved and raised quoting the row (Codex's review of the port,
+    M228). Only that exact SELECT, in that place: a lone unqualified star over a VALUES aliased
+    `_values`, with nothing else but modifiers, as a set operation's operand. A CTE body's VALUES
+    both versions wrap the same way, and it is left as both read it; a star a statement writes over
+    a VALUES of its own keeps its own alias."""
+    if not isinstance(select, exp.Select):
+        return None
+    place = select.parent
+    while isinstance(place, (exp.Subquery, exp.Paren)) and not place.alias:
+        place = place.parent
+    if not isinstance(place, exp.SetOperation):
+        return None
+    source = select.args.get("from_") or select.args.get("from")
+    values = source.this if isinstance(source, exp.From) else None
+    star = select.expressions[0] if len(select.expressions) == 1 else None
+    allowed = {"expressions", "from", "from_", *_VALUES_MODIFIERS}
+    if (isinstance(values, exp.Values) and values.alias == "_values"
+            and isinstance(star, exp.Star) and not any(star.args.values())
+            and not any(value for key, value in select.args.items() if key not in allowed)):
+        return values
+    return None
+
+
 def as_duckdb_reads(ast: exp.Expression) -> exp.Expression:
-    """The tree re-read as DuckDB reads it, in place: a Lambda outside a lambda taker the JSON
-    extract over Columns, innermost first, and then every MAP literal's bare key the Column
-    it is, or the Var of an enclosing lambda's parameter spelled exactly. The Var carries the
+    """The tree re-read as DuckDB reads it, in place: every SELECT sqlglot writes around a set operation's
+    bare VALUES operand the VALUES again, its modifiers moved back (`bare_values`), as 30.12 parsed it; a Lambda
+    outside a lambda taker the JSON extract over Columns, innermost first; and then every MAP
+    literal's bare key the Column it is, or the Var of an enclosing lambda's parameter spelled
+    exactly. The Var carries the
     key's own Identifier, so its name compares bare and its render keeps the quotes: rendered
     by name, `"x.secret"` became `x.secret`, which the next parse reduced to `secret`, and
     `MAP {secret: 1}` ran against the column where the text read the parameter (Codex's
     forty-sixth review of #160); a doubled quote tokenized nowhere and raised out of the
     decider the same way."""
+    for select in list(ast.find_all(exp.Select)):
+        values = bare_values(select)
+        if values is None:
+            continue
+        select.args["from_" if "from_" in select.args else "from"].set("this", None)
+        values.set("alias", None)
+        for key in _VALUES_MODIFIERS:
+            if select.args.get(key) is not None:
+                values.set(key, select.args[key])
+        if select is ast:
+            ast = values
+        else:
+            select.replace(values)
     for lam in reversed(list(ast.find_all(exp.Lambda))):
         if not arrow_read_as_a_lambda(lam):
             continue

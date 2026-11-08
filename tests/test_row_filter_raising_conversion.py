@@ -849,6 +849,28 @@ def test_every_duckdb_json_reader_that_quotes_malformed_text_is_refused():
     assert admitted == [], admitted
 
 
+@pytest.mark.parametrize("row_filter,raises", [
+    ("(VALUES (attrs) UNION ALL SELECT region LIMIT 1) IS NOT NULL", True),
+    ("(SELECT region UNION ALL VALUES (attrs) LIMIT 1) IS NOT NULL", True),
+    ("(VALUES (attrs) UNION ALL VALUES (region) LIMIT 1) IS NOT NULL", True),
+    ("region IN (SELECT 1 UNION ALL VALUES (attrs))", True),
+    ("EXISTS (VALUES (attrs) UNION ALL SELECT region)", False),  # runs here; refused as on 30.12
+])
+def test_a_values_operand_is_typed_by_its_rows(row_filter, raises):
+    """sqlglot 30.29 writes a VALUES standing as a set-operation operand as `SELECT * FROM (VALUES
+    ...) AS _values`, and the typer read the parser's star in place of the row, so a filter whose
+    branches unify JSON with text was approved and raised on the row, quoting it (Codex's review of
+    the port, M228). The reading unwraps it, and the operand is typed by its rows as on 30.12."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INT, region VARCHAR, attrs JSON); "
+                "INSERT INTO claim VALUES (1, 'north', '{\"a\": 1}')")
+    if raises:
+        with pytest.raises(duckdb.ConversionException, match="Malformed JSON"):
+            con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
+    verdict = _decide(row_filter)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
 def test_a_reader_sqlglot_gives_a_node_of_its_own_is_refused_like_its_untyped_spelling():
     """sqlglot 30.29 parses `from_json` as `exp.FromJson`, where 30.12 left it `Anonymous`, and the
     reader check named its readers on `Anonymous` alone, so the promoted call was approved and a

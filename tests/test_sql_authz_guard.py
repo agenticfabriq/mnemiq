@@ -678,8 +678,11 @@ def _values_branch_is_a_source() -> bool:
 
     from mnemiq.sql.views import unrecognised_source
 
-    return unrecognised_source(sqlglot.parse_one(
-        "WITH t(x) AS (VALUES (1) UNION ALL SELECT 2) SELECT x FROM t", read="duckdb")) is not None
+    from mnemiq.sql.reading import as_duckdb_reads
+
+    # Read as the decider reads it: 30.29 wraps the branch in a SELECT, which the reading unwraps (M228).
+    return unrecognised_source(as_duckdb_reads(sqlglot.parse_one(
+        "WITH t(x) AS (VALUES (1) UNION ALL SELECT 2) SELECT x FROM t", read="duckdb"))) is not None
 
 
 _CTE_NAMED_LIKE_THE_TABLE = (
@@ -782,25 +785,45 @@ def test_sqlglot_s_select_around_a_values_is_read_as_the_values():
         assert star(write(sql)), (sql, write(sql))
 
 
-def test_only_the_exact_select_sqlglot_writes_around_a_values_is_its_wrapper():
+def test_only_the_exact_select_sqlglot_writes_around_a_values_operand_is_read_as_the_values():
     import sqlglot
     from sqlglot import exp
 
-    from mnemiq.sql.guard import _is_values_wrapper
+    from mnemiq.sql.reading import as_duckdb_reads, bare_values
 
     def over(alias):
         return exp.alias_(exp.Values(expressions=[exp.Tuple(expressions=[exp.Literal.number(1)])]), alias, table=True)
 
-    assert _is_values_wrapper(exp.select("*").from_(over("_values")))
-    assert _is_values_wrapper(exp.select("*").from_(over("_values")).limit(1))  # a modifier moved off the VALUES
-    assert not _is_values_wrapper(exp.select("*").from_(over("v")))
-    assert not _is_values_wrapper(exp.select("x").from_(over("_values")))
-    assert not _is_values_wrapper(exp.select("*", "x").from_(over("_values")))
-    assert not _is_values_wrapper(exp.select("*").from_(over("_values")).where("x = 1"))
-    assert not _is_values_wrapper(exp.select("*").from_(over("_values")).join("claim"))
-    assert not _is_values_wrapper(exp.select("*").from_("claim"))
-    excluding = sqlglot.parse_one("SELECT * EXCLUDE (a) FROM (VALUES (1, 2)) AS _values(a, b)", read="duckdb")
-    assert not _is_values_wrapper(excluding)
+    def operand(select, parenthesised=False):
+        """`select` as a UNION ALL's first operand, as sqlglot places it; returned for asking."""
+        exp.union(exp.Subquery(this=select) if parenthesised else select, exp.select("2"), distinct=False, copy=False)
+        return select
+
+    assert bare_values(operand(exp.select("*").from_(over("_values")))) is not None
+    assert bare_values(operand(exp.select("*").from_(over("_values")), parenthesised=True)) is not None
+    assert bare_values(operand(exp.select("*").from_(over("_values")).limit(1))) is not None  # a modifier moved off it
+    assert bare_values(exp.select("*").from_(over("_values"))) is None  # in no set operation
+    assert bare_values(operand(exp.select("*").from_(over("v")))) is None
+    assert bare_values(operand(exp.select("x").from_(over("_values")))) is None
+    assert bare_values(operand(exp.select("*", "x").from_(over("_values")))) is None
+    assert bare_values(operand(exp.select("*").from_(over("_values")).where("x = 1"))) is None
+    assert bare_values(operand(exp.select("*").from_(over("_values")).join("claim"))) is None
+    assert bare_values(operand(exp.select("*").from_("claim"))) is None
+    excluding = sqlglot.parse_one("SELECT * EXCLUDE (a) FROM (VALUES (1, 2)) AS _values(a, b) UNION ALL SELECT 1, 2",
+                                  read="duckdb")
+    assert bare_values(excluding.this) is None
+    # A CTE body's VALUES, which sqlglot 30.12 wrapped the same way: left as both versions read it.
+    cte = sqlglot.parse_one("WITH t(x) AS (VALUES (1)) SELECT x FROM t", read="duckdb")
+    assert bare_values(cte.find(exp.CTE).this) is None
+    assert isinstance(as_duckdb_reads(cte).find(exp.CTE).this, exp.Select)
+    # A set operation's operand, parenthesised or not, is the VALUES again, its LIMIT on it.
+    import duckdb
+    for sql in ("SELECT 1 UNION ALL VALUES (2)", "(VALUES (2), (3) LIMIT 1) UNION ALL SELECT 1"):
+        read = as_duckdb_reads(sqlglot.parse_one(sql, read="duckdb"))
+        assert not any(bare_values(s) for s in read.find_all(exp.Select)), read.sql()
+        assert read.find(exp.Values) is not None, read.sql()
+        con = duckdb.connect()
+        assert sorted(con.execute(read.sql(dialect="duckdb")).fetchall()) == sorted(con.execute(sql).fetchall()), read.sql()
 
 
 def test_a_scope_that_does_not_resolve_at_all_is_refused_the_same_way(monkeypatch):
