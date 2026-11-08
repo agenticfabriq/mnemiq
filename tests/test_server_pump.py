@@ -92,3 +92,45 @@ def test_a_hang_up_closes_cleanly_and_the_worker_finishes(caplog):
         anyio.run(scenario)
     assert finished.is_set() and emit_errors == []
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_a_pump_runs_once():
+    """A second iteration would start a second worker and orphan the first run's answer. `events()` is an async
+    generator, so its body, and the refusal, run only when it is iterated."""
+    calls = []
+
+    def run(emit):
+        calls.append(1)
+        return "first"
+
+    async def scenario():
+        pump = EnginePump(run, heartbeat_s=5)
+        await _drain(pump)
+        with pytest.raises(RuntimeError, match="runs once"):
+            await _drain(pump)
+        return pump
+
+    pump = anyio.run(scenario)
+    assert calls == [1] and pump.result() == "first"
+
+
+def test_result_before_the_run_ends_says_so():
+    """After a hang-up the worker is still running: `result()` says the run has not ended, rather than asyncio's
+    InvalidStateError. After a full drain it returns, since the done sentinel follows the run's end."""
+    release = threading.Event()
+
+    def run(emit):
+        emit({"stage": "first"})
+        release.wait(5)
+        return "answer"
+
+    async def scenario():
+        pump = EnginePump(run, heartbeat_s=5)
+        events = pump.events()
+        await events.__anext__()
+        await events.aclose()
+        with pytest.raises(RuntimeError, match="has not ended"):
+            pump.result()
+        release.set()
+
+    anyio.run(scenario)

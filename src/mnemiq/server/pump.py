@@ -35,7 +35,10 @@ class EnginePump(Generic[T]):
 
     async def events(self) -> AsyncIterator[dict | object]:
         """Starts the worker on first iteration, so a stream's opening frame goes out before the engine starts.
-        Yields each emitted event in order, `HEARTBEAT` after each quiet `heartbeat_s`, and ends when the run does."""
+        Yields each emitted event in order, `HEARTBEAT` after each quiet `heartbeat_s`, and ends when the run does.
+        A pump runs once: iterating it again would start a second worker and orphan the first run's answer."""
+        if self._future is not None:
+            raise RuntimeError("a pump runs once: build another EnginePump for another run")
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
 
@@ -58,6 +61,6 @@ class EnginePump(Generic[T]):
 
     def result(self) -> T:
         """The run's return value, or its exception raised. Read once `events()` has ended."""
-        if self._future is None:
-            raise RuntimeError("the pump has not run: iterate events() first")
+        if self._future is None or not self._future.done():
+            raise RuntimeError("the run has not ended: read result() once events() has ended")
         return self._future.result()
