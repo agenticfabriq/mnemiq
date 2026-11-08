@@ -740,6 +740,69 @@ def test_a_write_does_not_place_a_policy_where_a_cte_is_named_after_a_governed_t
     assert isinstance(v, Refusal) and v.code == RefusalCode.UNMODELLED_SOURCE, v
 
 
+# --------------------------------------------------------------------------------------------
+# M228: sqlglot 30.29 writes a VALUES standing as a set-operation branch or a CTE body as
+# `SELECT * FROM (VALUES ...) AS _values`, where 30.12 kept the VALUES. Read as a star, the
+# parser's own star refused such a VALUES whose rows name a table, telling the model to name the
+# columns of a star it never wrote. The wrapper is read as the VALUES it replaces; a star the
+# statement writes, over a VALUES or inside one, is still refused.
+# --------------------------------------------------------------------------------------------
+
+def test_sqlglot_s_select_around_a_values_is_read_as_the_values():
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.sql.decide import decide
+    from mnemiq.sql.decide_write import decide_write
+    from mnemiq.sql.policy import AccessPolicy
+
+    visible = {"claim": {"id", "amount"}, "one": {"secret"}}
+
+    def read(sql):
+        return decide(sql, visible, dialect="duckdb", target="duckdb")
+
+    def write(sql):
+        return decide_write(sql, visible, GrantSet(frozenset(visible), writable=frozenset({"claim"})),
+                            policy=AccessPolicy(), dialect="duckdb", target="duckdb", writes_enabled=True)
+
+    def star(v):
+        return isinstance(v, Refusal) and v.code == RefusalCode.SELECT_STAR
+
+    for sql in ("WITH t(x) AS (SELECT amount FROM claim UNION ALL VALUES (1)) SELECT x FROM t",
+                "WITH t(x) AS (VALUES ((SELECT max(amount) FROM claim)) UNION ALL SELECT 1) SELECT x FROM t",
+                "SELECT x FROM (SELECT amount FROM claim UNION ALL VALUES ((SELECT max(id) FROM claim))) AS d(x)"):
+        assert not star(read(sql)), (sql, read(sql))
+    assert not star(write("INSERT INTO claim (id, amount) WITH t(a, b) AS (VALUES ((SELECT max(id) FROM claim), 1) "
+                          "UNION ALL SELECT 1, 2) SELECT a, b FROM t"))
+    # The statement's own stars: over a VALUES, under any alias, and inside a VALUES row.
+    for sql in ("SELECT * FROM (VALUES (1, 2)) AS v(a, b)",
+                "WITH t(x) AS (SELECT * FROM (VALUES ((SELECT max(amount) FROM claim))) AS v UNION ALL SELECT 1) SELECT x FROM t",
+                "WITH t(x) AS (VALUES ((SELECT * FROM one)) UNION ALL SELECT 'a') SELECT x FROM t"):
+        assert star(read(sql)), (sql, read(sql))
+    for sql in ("INSERT INTO claim (id, amount) WITH t(a, b) AS (VALUES ((SELECT * FROM one), 1) UNION ALL SELECT 1, 2) SELECT a, b FROM t",
+                "INSERT INTO claim (id, amount) WITH t(a, b) AS (SELECT * FROM (VALUES (1, 2)) AS v UNION ALL SELECT 1, 2) SELECT a, b FROM t"):
+        assert star(write(sql)), (sql, write(sql))
+
+
+def test_only_the_exact_select_sqlglot_writes_around_a_values_is_its_wrapper():
+    import sqlglot
+    from sqlglot import exp
+
+    from mnemiq.sql.guard import _is_values_wrapper
+
+    def over(alias):
+        return exp.alias_(exp.Values(expressions=[exp.Tuple(expressions=[exp.Literal.number(1)])]), alias, table=True)
+
+    assert _is_values_wrapper(exp.select("*").from_(over("_values")))
+    assert _is_values_wrapper(exp.select("*").from_(over("_values")).limit(1))  # a modifier moved off the VALUES
+    assert not _is_values_wrapper(exp.select("*").from_(over("v")))
+    assert not _is_values_wrapper(exp.select("x").from_(over("_values")))
+    assert not _is_values_wrapper(exp.select("*", "x").from_(over("_values")))
+    assert not _is_values_wrapper(exp.select("*").from_(over("_values")).where("x = 1"))
+    assert not _is_values_wrapper(exp.select("*").from_(over("_values")).join("claim"))
+    assert not _is_values_wrapper(exp.select("*").from_("claim"))
+    excluding = sqlglot.parse_one("SELECT * EXCLUDE (a) FROM (VALUES (1, 2)) AS _values(a, b)", read="duckdb")
+    assert not _is_values_wrapper(excluding)
+
+
 def test_a_scope_that_does_not_resolve_at_all_is_refused_the_same_way(monkeypatch):
     """The other fallback: a scope that does not resolve gives `base_tables` every table node too,
     CTE references included, so the rewrite would misplace the policy the same way. sqlglot's own

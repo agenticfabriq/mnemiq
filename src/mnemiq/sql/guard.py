@@ -251,9 +251,12 @@ def _output_selects(ast: exp.Expression) -> list[exp.Select]:
     For a UNION that is every branch; for a plain query it is just the root. Inner SELECTs
     (subqueries, CTE bodies, EXISTS) do not return columns to the caller -- whatever they
     project is bounded by the explicit projection that wraps them.
+
+    The SELECT sqlglot writes around a bare VALUES is read as the VALUES it replaces, which has no
+    projection to decompose (`_is_values_wrapper`).
     """
     if isinstance(ast, exp.Select):
-        return [ast]
+        return [] if _is_values_wrapper(ast) else [ast]
     # SetOperation, not Union: EXCEPT and INTERSECT are its SIBLINGS in sqlglot, not its
     # subclasses, so keying on Union read `... EXCEPT ...` as having no output projection at all.
     if isinstance(ast, exp.SetOperation):
@@ -261,6 +264,25 @@ def _output_selects(ast: exp.Expression) -> list[exp.Select]:
     if isinstance(ast, exp.Subquery):
         return _output_selects(ast.this)  # redundant parentheses nest Subquery in Subquery
     return []
+
+
+# What sqlglot's VALUES wrapper may carry: its star, its source, and the modifiers it moves off the VALUES.
+_VALUES_WRAPPER_ARGS = frozenset({"expressions", "from", "from_", "order", "limit", "offset"})
+
+
+def _is_values_wrapper(select: exp.Select) -> bool:
+    """Whether this is the SELECT sqlglot 30.29 writes around a VALUES that stands as a set-operation
+    branch or a CTE body, `SELECT * FROM (VALUES ...) AS _values`, where 30.12 kept the VALUES itself
+    (M228). Its star is the parser's, not the statement's: read as a star, such a VALUES in a body
+    that names a table was refused as a star reaching one, with advice to name the columns of a star
+    the statement never wrote, and in a write as a star no check reads. Only that exact shape; a
+    star a statement writes over a VALUES of its own, or inside one, is still refused as on 30.12."""
+    source = select.args.get("from_") or select.args.get("from")
+    values = source.this if isinstance(source, exp.From) else None
+    star = select.expressions[0] if len(select.expressions) == 1 else None
+    return (isinstance(values, exp.Values) and values.alias == "_values"
+            and isinstance(star, exp.Star) and not any(star.args.values())
+            and not any(value for key, value in select.args.items() if key not in _VALUES_WRAPPER_ARGS))
 
 
 # The engines that bind INTERSECT tighter than UNION and EXCEPT, against the parser's left fold.
@@ -846,6 +868,8 @@ def unnamed_read(ast: exp.Expression, engine: str, write: bool = False) -> Refus
     for star in ast.find_all(exp.Star):
         if isinstance(star.parent, exp.Columns):
             continue  # `COLUMNS(*)`: the COLUMNS loop above ruled on it (Codex's fifth review)
+        if isinstance(star.parent, exp.Select) and _is_values_wrapper(star.parent):
+            continue  # sqlglot's star over a bare VALUES, which carries only its rows' expressions
         if _projection_is_read(star, write):
             continue
         return Refusal(
