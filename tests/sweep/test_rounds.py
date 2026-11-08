@@ -405,6 +405,22 @@ def test_a_dead_endpoint_stops_the_round_and_resume_finishes_it(tmp_path, stub_m
     assert all(arm_complete(cfg, a) for a in screen_arms(cfg)) and "stopped" not in sweep_json(cfg)
 
 
+def test_a_resume_while_the_endpoint_is_still_down_loses_no_case(tmp_path, stub_model):
+    model = stub_model(gold=True, fail_after=5, status=500)
+    cfg = roomy(tmp_path, model, arms_in_screen=1)
+    with pytest.raises(SystemExit):
+        run(cfg, until="screen")
+    with pytest.raises(SystemExit, match="An endpoint stopped answering"):
+        run(cfg, until="screen")   # resumed too soon: the cases it held are held still, none kept as an error
+    assert sweep_json(cfg)["stopped"] == "endpoint" and all(row["error_kind"] != "endpoint" for row in all_rows(cfg))
+    assert not run_complete(cfg, start_of(cfg, "instant"), 1)
+    model.recover()
+    run(cfg, until="screen")
+    assert all(arm_complete(cfg, a) for a in screen_arms(cfg))
+    assert all(row["error_kind"] is None for row in all_rows(cfg))
+    assert all(record["valid"] for record in report(cfg, "screen", controls=False)[1])
+
+
 def test_a_dead_endpoint_is_named_without_its_credentials(tmp_path, stub_model):
     stub = stub_model(gold=True)
     # The embedder is asked first, and nothing listens on the discard port.

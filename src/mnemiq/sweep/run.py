@@ -7,12 +7,14 @@ is one line of `rows.jsonl` in the arm's folder, written as soon as it is graded
 stopped.
 
 An endpoint that fails 3 questions in a row is taken to have stopped answering: the arm stops, leaves those 3 out of its
-rows, and lists them in the sweep's `retries.json`, so the next run asks them again. A case listed there that fails
-again keeps its error. Only a model endpoint's failure counts toward the stop: the writer's or the judge's, read from
-the engine's `AgentAnswer.model_error`, or a provider error raised out of `Runtime.ask` (the embedder's), read by the
-client's own mapping. Never from an answer's words: one question's error (a prompt too long, SQL the source rejects, a
-statement the source cancelled) is a counted error of the arm and never stops it. Each error row says who failed it, in
-`error_kind`: the endpoint, the source, or the arm's own answer.
+rows, and lists them in the sweep's `retries.json`, so the next run asks them again, after the others. A case listed
+there that fails again keeps its error once the endpoint has answered another question in that run; until then it is
+held as before, so a run made while the endpoint is still down stops again and loses nothing. Only a model endpoint's
+failure counts toward the stop: the writer's or the judge's, read from the engine's `AgentAnswer.model_error`, or a
+provider error raised out of `Runtime.ask` (the embedder's), read by the client's own mapping. Never from an answer's
+words: one question's error (a prompt too long, SQL the source rejects, a statement the source cancelled) is a counted
+error of the arm and never stops it. Each error row says who failed it, in `error_kind`: the endpoint, the source, or
+the arm's own answer.
 
 An arm's first run records the pinned files in `pins.json`, and every run of it, a resume included, checks its store
 copies and the files it ends with against that record. A change makes the arm invalid for good: `invalid.json` is
@@ -392,42 +394,54 @@ def _ask(runtime: Runtime, case: EvaluationCase, mode: str, arm: Arm, identity: 
 def _answer_all(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder: Path,
                 runtimes: dict[str | None, Runtime], build: dict, before: Callable[[str, str], None] | None) -> bool:
     """Ask every case and mode not yet in `rows.jsonl`, calling `before` with the case's id and the mode just before
-    each is asked; True when the endpoint stopped answering."""
+    each is asked; True when the endpoint stopped answering.
+
+    The cases and modes an earlier stop left in `retries.json` are asked after the others, so the endpoint has answered
+    something in this run before they are. An endpoint error on one of them is its own, and written, only once the
+    endpoint has answered another question in this run. Before that it is held with the streak, as any endpoint error
+    is, and stays in `retries.json`: an endpoint still down stops the arm again, with nothing lost, even when only held
+    cases are left to ask."""
     identity = _identity(cfg)
     rows = folder / ROWS
     done = {(row.get("id"), row.get("mode")) for row in _read_rows(rows)}
     key = _retry_key(cfg, folder)
     retried = {(entry["id"], entry["mode"]) for entry in _read_retries(cfg).get(key, [])}
+    owed = [(case, mode) for case in cases for mode in arm.modes if (case.id, mode) not in done]
+    owed.sort(key=lambda pair: (pair[0].id, pair[1]) in retried)  # stable: each part keeps the cases' order
     held: list[dict] = []  # endpoint errors in a row, not yet written
+    answered = False  # whether the endpoint has answered a question in this run
     with open(rows, "a", encoding="utf-8") as out:
         def write(row: dict) -> None:
             out.write(json.dumps(row) + "\n")
             out.flush()
 
-        for case in cases:
+        def stop() -> bool:
+            with _retries(cfg) as retries:
+                listed = retries.setdefault(key, [])
+                known = {(entry["id"], entry["mode"]) for entry in listed}
+                listed.extend({"id": error["id"], "mode": error["mode"], "model_error": error["model_error"]}
+                              for error in held if (error["id"], error["mode"]) not in known)
+            return True
+
+        for case, mode in owed:
             runtime = runtimes[case.db_id if cfg.dataset.deployments is not None else None]
-            for mode in arm.modes:
-                if (case.id, mode) in done:
-                    continue
-                if before is not None:
-                    before(case.id, mode)
-                row = _ask(runtime, case, mode, arm, identity, build)
-                if row["error_kind"] == "endpoint" and (case.id, mode) in retried:
-                    write(row)  # failed again after a stop: kept as an error, and no part of a new streak
-                    continue
-                if row["error_kind"] == "endpoint":
-                    held.append(row)
-                    if len(held) == _STREAK:
-                        with _retries(cfg) as retries:
-                            retries.setdefault(key, []).extend(
-                                {"id": error["id"], "mode": error["mode"], "model_error": error["model_error"]}
-                                for error in held)
-                        return True
-                    continue
+            if before is not None:
+                before(case.id, mode)
+            row = _ask(runtime, case, mode, arm, identity, build)
+            if row["error_kind"] != "endpoint":
+                answered = True
                 for error in held:  # the streak ended: each was that question's own error
                     write(error)
                 held.clear()
                 write(row)
+            elif answered and (case.id, mode) in retried:
+                write(row)  # failed again while the endpoint answers others: the question's own error
+            else:
+                held.append(row)
+                if len(held) == _STREAK:
+                    return stop()
+        if any((error["id"], error["mode"]) in retried for error in held):
+            return stop()  # the endpoint has answered nothing since the stop that held this case
         for error in held:
             write(error)
     return False

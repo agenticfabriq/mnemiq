@@ -371,7 +371,9 @@ the start did not measure counts as one the start got wrong, and can read as a w
 
 An endpoint that fails three questions in a row is taken to have stopped answering. The arm stops and leaves those
 three out, the arms running finish, no other starts, and `run` exits naming the endpoint (without its credentials).
-The next run asks those questions again.
+The next run asks those questions again, after the arm's others. One that fails again counts as that question's own
+error only once the endpoint has answered another question in that run. Until then it is held as before, so a run
+made while the endpoint is still down stops again the same way, and no question is lost to it.
 
 ## The report
 

@@ -17,6 +17,7 @@ from .conftest import (
     cancel_gold_once, copy_package, judged_by, one_arm, out_files, read_rows, source_down, start_of, tiny_deployment,
     touch_store, tuning, two_deployments, write_config,
 )
+from .stub_model import _carries, _messages
 
 
 def test_an_arm_runs_the_product_path_and_stamps_one_version(tmp_path, stub_model):
@@ -136,15 +137,45 @@ def test_a_fail_open_judge_that_is_down_is_on_every_answered_row(tmp_path, stub_
     assert {r["verify_layer"] for r in read_rows(cfg, arm) if r["outcome"] == "correct"} == {"judge_unavailable"}
 
 
-def test_a_case_asked_again_after_an_endpoint_stop_keeps_its_error(tmp_path, stub_model):
-    cfg, arm = one_arm(tmp_path, stub_model(gold=True, fail_after=3, status=500))
+def held_for_retry(cfg) -> list[tuple[str, str]]:
+    """The cases and modes `retries.json` holds for the endpoint to be asked again, each as listed."""
+    path = Path(cfg.sweep.out) / "retries.json"
+    entries = json.loads(path.read_text()) if path.exists() else {}
+    return [(entry["id"], entry["mode"]) for listed in entries.values() for entry in listed]
+
+
+def test_a_resume_while_the_endpoint_is_still_down_writes_no_error_and_stops_again(tmp_path, stub_model):
+    stub = stub_model(gold=True, fail_after=3, status=500)
+    cfg, arm = one_arm(tmp_path, stub)
     folder = arm_folder(cfg, arm, 1)
     assert run_arm(cfg, arm, tuning(cfg), folder) == "endpoint"
-    retries = json.loads((Path(cfg.sweep.out) / "retries.json").read_text())
-    retried = {entry["id"] for entries in retries.values() for entry in entries}
-    run_arm(cfg, arm, tuning(cfg), folder)   # the endpoint is still down
-    errors = {r["id"] for r in read_rows(cfg, arm) if r["outcome"] == "error"}
-    assert len(retried) == 3 and retried <= errors
+    held = held_for_retry(cfg)
+    assert len(held) == 3
+    assert run_arm(cfg, arm, tuning(cfg), folder) == "endpoint"   # the endpoint is still down
+    # Nothing it failed was written, the held cases are held still, and none is listed twice.
+    assert all(r["outcome"] != "error" for r in read_rows(cfg, arm))
+    assert set(held) <= set(held_for_retry(cfg)) and len(held_for_retry(cfg)) == len(set(held_for_retry(cfg)))
+    assert not {case for case, _ in held} & {r["id"] for r in read_rows(cfg, arm)}
+    stub.recover()
+    assert run_arm(cfg, arm, tuning(cfg), folder) == "complete"
+    rows = read_rows(cfg, arm)
+    assert sorted(r["id"] for r in rows) == sorted(case.id for case in tuning(cfg))
+    assert all(r["error_kind"] is None for r in rows)
+
+
+def test_a_held_case_that_fails_again_once_the_endpoint_answers_others_keeps_its_error(tmp_path, stub_model):
+    stub = stub_model(gold=True, fail_after=3, status=500)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    assert run_arm(cfg, arm, tuning(cfg), folder) == "endpoint"
+    held = {case for case, _ in held_for_retry(cfg)}
+    questions = [case.question for case in tuning(cfg) if case.id in held]
+    # The endpoint answers again, except that each held question fails as a server error would: its own failure.
+    stub.recover()
+    stub.rule = lambda request: 500 if any(_carries(_messages(request)[1], q) for q in questions) else None
+    assert run_arm(cfg, arm, tuning(cfg), folder) == "complete"
+    errors = {r["id"] for r in read_rows(cfg, arm) if r["error_kind"] == "endpoint"}
+    assert len(read_rows(cfg, arm)) == len(tuning(cfg)) and errors == held
 
 
 def test_a_statement_cancelled_under_load_is_an_error_not_wrong(tmp_path, stub_model, monkeypatch):
