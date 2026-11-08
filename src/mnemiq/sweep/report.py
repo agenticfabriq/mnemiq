@@ -51,6 +51,8 @@ _READ = _RIGHT | _DECLINED | {Outcome.WRONG, Outcome.ERROR}
 _UNMEASURED = ("errors", "unjudged", "ungraded")
 # The part of the questions each round runs on, when it is not the tuning part.
 _ROUND_PART = {"confirm": "held_out"}
+# The rounds that search, which a model and mode leaves once its start shows it has no room.
+_SEARCH_ROUNDS = ("screen", "grid")
 _COLUMNS = ("Right", "Strict", "Wrong", "Made up", "Declined", "Failed", "Errors", "Ungraded", "Unjudged", "Median s",
             "Median s to rows", "Prompt tokens")
 _COUNTED = ("right", "strict", "wrong", "made_up", "declined", "failed", "errors", "ungraded", "unjudged")
@@ -293,6 +295,14 @@ def _owed(cfg: SweepConfig, round: str) -> dict[str, str | None]:
     return {case.id: case.db_id if cfg.dataset.deployments is not None else None for case in part}
 
 
+def _out_of_room(cfg: SweepConfig) -> set[tuple[str, str]]:
+    """Each model and mode whose search the sweep's record, `sweep.json`, says stopped for want of room."""
+    record = Path(cfg.sweep.out) / SWEEP
+    state = json.loads(record.read_text(encoding="utf-8")) if record.exists() else {}
+    return {(model, mode) for model, modes in (state.get("room") or {}).items() for mode, room in modes.items()
+            if isinstance(room, dict) and room.get("stopped") == "no room"}
+
+
 def decided_repeats(cfg: SweepConfig, state: dict | None = None) -> int:
     """How many runs each arm owes: the config's count, or under `auto` the count the first round decided, as the
     sweep's record (`state`, by default its `sweep.json`) holds it.
@@ -474,7 +484,10 @@ def report(cfg: SweepConfig, round: str, *, repeats: int | None = None,
     `repeats` is how many runs each arm owes, and an arm short of one is not valid. By default it is the config's
     `repeats` when that is a number, else the count the first round decided, from the sweep's record
     (`decided_repeats`); one run when the search stopped for want of room before it decided. Before then it must be
-    passed: the folders alone cannot tell an arm's missing run from a second run no arm has had yet.
+    passed: the folders alone cannot tell an arm's missing run from a second run no arm has had yet. In the screen and
+    the grid, a model and mode whose search the record says stopped for want of room is read at one run whatever
+    `repeats` says: the search stopped once its start's first run was in, so that run is all its arms owed, and a
+    valid first run is a valid start there.
 
     A record holds the model, mode, round, `arm` (its profile id; None for a control), `label`, `control` (its name, or
     None), `changes` (each setting the arm changes from the start, to its value), `valid` (in every run), `runs` (each
@@ -490,6 +503,7 @@ def report(cfg: SweepConfig, round: str, *, repeats: int | None = None,
     if repeats < 1:
         raise ValueError("an arm owes at least one run")
     owed = _owed(cfg, round)
+    stopped = _out_of_room(cfg) if round in _SEARCH_ROUNDS else set()
     if isinstance(controls, bool):
         graded = graded_controls(cfg) if controls else []
     else:
@@ -497,9 +511,10 @@ def report(cfg: SweepConfig, round: str, *, repeats: int | None = None,
     tables, records = [], []
     for model in cfg.models:
         for mode in cfg.modes:
-            mine = _table_records(cfg, model, mode, round, owed, graded, repeats)
+            runs = 1 if (model, mode) in stopped else repeats
+            mine = _table_records(cfg, model, mode, round, owed, graded, runs)
             if mine:
-                tables.append(_table(cfg, model, mode, round, mine, repeats))
+                tables.append(_table(cfg, model, mode, round, mine, runs))
                 records += mine
     return "\n\n".join(tables) + ("\n" if tables else ""), records
 

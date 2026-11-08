@@ -477,6 +477,10 @@ def test_a_start_out_of_room_under_two_fixed_runs_is_read_at_the_one_run_it_owed
     assert result["chosen"] == "start" and "no room" in result["why"] and "not measured" not in result["why"]
     assert evidence(cfg)["start_valid"] is True and proposal_file(cfg).exists()
     assert [each["run"] for each in evidence(cfg)["candidates"]["instant"]["start"]] == [1]
+    # The report reads it the same way: one run, valid, and no column for a run it never owed.
+    table, records = report(cfg, "screen", controls=False)
+    start = next(record for record in records if record["arm"] == "start")
+    assert start["valid"] is True and [each["run"] for each in start["runs"]] == [1] and "Run 2" not in table
 
 
 def test_a_model_out_of_room_beside_one_that_decided_two_runs_proposes_its_start(tmp_path, stub_model, monkeypatch):

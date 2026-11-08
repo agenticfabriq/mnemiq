@@ -235,24 +235,15 @@ def _out_of_room(state: dict, model: str, mode: str) -> dict | None:
     return room if room.get("stopped") == "no room" else None
 
 
-def _first_run(record: dict | None) -> dict | None:
-    """`record` read at its first run alone, and valid when that run is."""
-    if record is None:
-        return None
-    runs = [run for run in record["runs"] if run["run"] == 1]
-    return record | {"runs": runs, "pairs": [pair for pair in record["pairs"] if pair["run"] == 1],
-                     "valid": bool(runs) and all(run["valid"] for run in runs)}
-
-
 def _judged(cfg: SweepConfig, records: Sequence[dict], state: dict) -> dict[tuple[str, str], dict]:
     """For each model and mode, its start's record and every arm compared with it, judged by the rule: each arm's mean
     right and prompt tokens, whether its p passes Holm in each run, and why it is not a candidate. Arms are sorted by
     mean right, the most first.
 
-    A model and mode whose search the record (`state`) says stopped for want of room has no candidate. Its start and
-    its arms are read at the one run they owed: the search stopped once the start's first run was in, and the runs it
-    did not start were stopped on purpose, so a valid first run is a valid start there. The arms that were running
-    beside that run, and finished, are judged all the same, and each says the search stopped there."""
+    A model and mode whose search the record (`state`) says stopped for want of room has no candidate. Its records come
+    from `report`, which reads its start and arms at the one run they owed, so a valid first run is a valid start
+    there. The arms that were running beside that run, and finished, are judged all the same, and each says the search
+    stopped there."""
     alpha, bounds = cfg.propose.alpha, cfg.propose
     judged: dict[tuple[str, str], dict] = {}
     for model in cfg.models:
@@ -262,8 +253,6 @@ def _judged(cfg: SweepConfig, records: Sequence[dict], state: dict) -> dict[tupl
             start = next((record for record in mine if record["arm"] == "start"), None)
             arms = [record for record in mine if record["arm"] != "start"]
             room = _out_of_room(state, model, mode)
-            if room is not None:
-                start, arms = _first_run(start), [_first_run(record) for record in arms]
             runs = len(start["runs"]) if start is not None else max((len(record["runs"]) for record in arms), default=0)
             passed = [holm({record["arm"]: _p(record, run) for record in arms}, alpha) for run in range(1, runs + 1)]
             entries = []
