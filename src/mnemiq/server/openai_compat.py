@@ -22,11 +22,10 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from starlette.concurrency import run_in_threadpool
-from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from mnemiq.agent.modes import MODES
 from mnemiq.agent.route import UnknownMode
@@ -166,6 +165,10 @@ def _under_prefix(request: Request) -> bool:
 
 
 def _install_handlers(app: FastAPI) -> None:
+    # Starlette's base class, which the router raises for 404 and 405; imported here, as `server/app.py` imports
+    # Starlette, since the server extra declares FastAPI and not Starlette itself.
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+
     async def on_openai_error(request: Request, exc: OpenAIError):
         return _shaped(exc.status, exc.message, code=exc.code, param=exc.param, headers=exc.headers)
 
