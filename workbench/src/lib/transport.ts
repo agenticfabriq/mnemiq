@@ -141,8 +141,8 @@ export async function* streamChat(
 
 export type Scope = { tables: SchemaTable[]; starters: string[] };
 
-export async function fetchScope(): Promise<Scope> {
-  const response = await v1("/v1/schema");
+export async function fetchScope(signal?: AbortSignal): Promise<Scope> {
+  const response = await v1("/v1/schema", { signal });
   if (!response.ok) return { tables: [], starters: [] };
   const body = (await response.json()) as { tables?: SchemaTable[]; starters?: string[] };
   return { tables: body.tables ?? [], starters: body.starters ?? [] };

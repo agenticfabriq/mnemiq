@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AssistantRuntimeProvider } from "@assistant-ui/react";
 
 import { HistoryPanel } from "./components/HistoryPanel";
@@ -6,9 +6,10 @@ import { Mark } from "./components/Mark";
 import { ModeSelector } from "./components/ModeSelector";
 import { ScopePanel, useScope } from "./components/ScopePanel";
 import { Thread } from "./components/Thread";
-import { enter, mayReload, namespaceOf, signOut } from "./lib/identity";
+import { enter, MARKER, mayReload, namespaceOf, signOut } from "./lib/identity";
 import { useWorkbench } from "./lib/runtime";
 import { fetchWhoami, NOTICE, Refused, type Refusal } from "./lib/transport";
+import type { Whoami } from "./lib/types";
 
 type Theme = "system" | "light" | "dark";
 
@@ -52,6 +53,20 @@ const NAVIGATE = (url: string) => globalThis.location.assign(url);
 
 /** The sign-in proxy's own sign-out, which ends its session and sends the browser back. */
 const SIGN_OUT = "/oauth2/sign_out";
+
+/**
+ * The identity this tab holds threads for, as of its last check. The proxy's session is the
+ * browser's, not the tab's: someone else can sign in through another tab while this one stays
+ * open, and its next request then carries their credentials. So a question is preceded by a
+ * fresh check when the tab has been hidden since, or the last check is older than `IDLE_MS`.
+ * The raw id stays in memory here and is never stored.
+ */
+type Checked = { who: string; ns: string | null; at: number; hidden: boolean };
+
+const IDLE_MS = 60_000;
+
+const whoKey = (who: Whoami | null): string =>
+  who === null ? "" : JSON.stringify([who.tenant_id, who.principal_id, who.verified]);
 
 /** A verified user on a page that cannot hash their identity gets no saved threads. Said,
  *  so that history vanishing on reload is not mistaken for a fault. */
@@ -102,6 +117,18 @@ export default function App({
   const [session, setSession] = useState<Session>({ state: "resolving" });
   // A refusal once the workbench is up (the schema's): said above it, the threads kept.
   const [notice, setNotice] = useState<Notice | null>(null);
+  const checked = useRef<Checked | null>(null);
+  // Bumped to ask the engine again who is asking.
+  const [attempt, setAttempt] = useState(0);
+
+  /** The browser now answers for someone else: drop everything this tab holds (unmounting the
+   *  workbench cancels its questions in flight) and ask again who is asking. */
+  const changed = useCallback(() => {
+    checked.current = null;
+    setNotice(null);
+    setSession({ state: "resolving" });
+    setAttempt((n) => n + 1);
+  }, []);
 
   const refused = useCallback(
     (refusal: Refusal) => {
@@ -109,6 +136,7 @@ export default function App({
         setNotice(refusal);
         return;
       }
+      checked.current = null;
       // An expired session clears the screen and this tab's memory, and keeps the saved
       // threads. The same user usually signs straight back in, and a refusal can arrive late,
       // from a tab opened before someone else signed in, where a purge would erase the new
@@ -131,10 +159,12 @@ export default function App({
   useEffect(() => {
     let live = true;
     fetchWhoami()
-      .then(async (who) => ({ ns: await namespaceOf(who), verified: who !== null && who.verified }))
-      .then(({ ns, verified }) => {
+      .then(async (who) => ({ who, ns: await namespaceOf(who) }))
+      .then(({ who, ns }) => {
         if (!live) return;
-        setSession({ state: "ready", ns, shelf: enter(ns), verified });
+        const shelf = enter(ns);
+        checked.current = { who: whoKey(who), ns, at: Date.now(), hidden: false };
+        setSession({ state: "ready", ns, shelf, verified: who !== null && who.verified });
       })
       .catch((error: unknown) => {
         if (!live) return;
@@ -145,9 +175,54 @@ export default function App({
     return () => {
       live = false;
     };
-  }, [refused]);
+  }, [refused, attempt]);
+
+  // Another tab that loads as someone else writes the identity marker, and the browser tells
+  // every other tab. (A cleared storage reads as a change too.)
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.storageArea && event.storageArea !== globalThis.localStorage) return;
+      if (event.key !== null && event.key !== MARKER) return;
+      const mine = checked.current;
+      if (mine && event.newValue !== mine.ns) changed();
+    };
+    globalThis.addEventListener("storage", onStorage);
+    return () => globalThis.removeEventListener("storage", onStorage);
+  }, [changed]);
+
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden" && checked.current) checked.current.hidden = true;
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, []);
+
+  /** Whether the user is still the one this tab holds threads for; asked before a question. */
+  const confirm = useCallback(async (): Promise<boolean> => {
+    const mine = checked.current;
+    if (!mine) return false;
+    if (!mine.hidden && Date.now() - mine.at < IDLE_MS) return true;
+    let who: Whoami | null;
+    try {
+      who = await fetchWhoami();
+    } catch (error) {
+      // Nothing is sent without a confirmed identity, so a failed check sends nothing.
+      if (checked.current === mine) refused(error instanceof Refused ? error.refusal : "unavailable");
+      return false;
+    }
+    if (checked.current !== mine) return false; // the page moved on while asking
+    if (whoKey(who) !== mine.who) {
+      changed();
+      return false;
+    }
+    mine.at = Date.now();
+    mine.hidden = false;
+    return true;
+  }, [changed, refused]);
 
   const signOutNow = useCallback(() => {
+    checked.current = null;
     setSession((current) => (current.state === "ready" ? { state: "leaving", ns: current.ns } : current));
   }, []);
 
@@ -166,6 +241,7 @@ export default function App({
         shelf={session.shelf}
         notice={notice}
         onRefused={refused}
+        confirm={confirm}
         onSignOut={session.verified ? signOutNow : null}
       />
     );
@@ -188,15 +264,17 @@ function Workbench({
   shelf,
   notice,
   onRefused,
+  confirm,
   onSignOut,
 }: {
   shelf: string | null;
   notice: Notice | null;
   onRefused: (refusal: Refusal) => void;
+  confirm: () => Promise<boolean>;
   onSignOut: (() => void) | null;
 }) {
   const { runtime, mode, setMode, ask, threads, activeId, selectThread, newChat, deleteThread } =
-    useWorkbench(shelf, onRefused);
+    useWorkbench(shelf, onRefused, confirm);
   const scope = useScope(onRefused);
 
   const [scopeOpen, setScopeOpen] = useState<boolean>(

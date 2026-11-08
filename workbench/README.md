@@ -48,7 +48,10 @@ It is kept per user. Before it shows anything, the workbench asks the engine who
 is asking (`GET /v1/whoami`), keeps that user's threads and mode under a namespace
 named by a hash of the identity (never the id itself), and purges every other
 user's when a different one loads. An engine without that route, or one serving
-its one configured identity, keeps a single history, as before.
+its one configured identity, keeps a single history, as before. A tab left open
+while someone else signs in drops what it holds and asks again: it hears another
+tab load as someone else, and it checks who is asking before sending a question
+after being hidden or idle for a minute.
 
 Behind a sign-in proxy, a verified user gets a **Sign out** control: it clears
 their threads and mode, then sends the browser to the proxy's own sign-out. A

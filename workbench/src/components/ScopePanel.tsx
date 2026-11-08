@@ -30,7 +30,8 @@ export function useScope(onRefused: (refusal: Refusal) => void) {
   const [scope, setScope] = useState<Scope | null>(null);
   useEffect(() => {
     let live = true;
-    fetchScope()
+    const controller = new AbortController();
+    fetchScope(controller.signal)
       .then((next) => live && setScope(next))
       .catch((error: unknown) => {
         if (!live) return;
@@ -41,6 +42,7 @@ export function useScope(onRefused: (refusal: Refusal) => void) {
       });
     return () => {
       live = false;
+      controller.abort();
     };
   }, [onRefused]);
   return scope;

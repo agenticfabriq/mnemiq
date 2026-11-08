@@ -67,7 +67,7 @@ describe("SqlBlock", () => {
 });
 
 function Workbench() {
-  const { runtime } = useWorkbench(SINGLE, () => {});
+  const { runtime } = useWorkbench(SINGLE, () => {}, async () => true);
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <Thread starters={[]} onPick={() => {}} />

@@ -61,10 +61,16 @@ function convertMessage(turn: Turn): ThreadMessageLike {
 /**
  * `shelf` is where the identity's threads and mode are kept (`enter` in identity.ts), fixed
  * for the life of the hook: the page mounts a fresh workbench for a different identity rather
- * than switching this one over. `onRefused` hears a question's sign-out, which ends the run
- * before any event arrives.
+ * than switching this one over, and every question still running is cancelled when this one
+ * goes. `onRefused` hears a question's sign-out, which ends the run before any event arrives.
+ * `confirm` is asked before each question and answers whether the user is still the one this
+ * workbench holds threads for.
  */
-export function useWorkbench(shelf: string | null, onRefused: (refusal: Refusal) => void) {
+export function useWorkbench(
+  shelf: string | null,
+  onRefused: (refusal: Refusal) => void,
+  confirm: () => Promise<boolean>,
+) {
   const restored = useMemo(() => {
     const stored = load(shelf);
     return stored.length ? stored : [emptyThread()];
@@ -93,6 +99,16 @@ export function useWorkbench(shelf: string | null, onRefused: (refusal: Refusal)
     save(shelf, threads);
   }, [shelf, threads]);
 
+  // Questions in flight. Cancelled when the workbench goes, which the page does when the user
+  // changes: an answer must not land in, or be saved under, the previous user's threads.
+  const inflight = useRef(new Set<AbortController>());
+  useEffect(() => {
+    const running = inflight.current;
+    return () => {
+      for (const controller of running) controller.abort();
+    };
+  }, []);
+
   const active = threads.find((t) => t.id === activeId) ?? threads[0]!;
 
   const updateTurns = useCallback(
@@ -112,22 +128,30 @@ export function useWorkbench(shelf: string | null, onRefused: (refusal: Refusal)
 
   const ask = useCallback(
     async (question: string) => {
+      // Before anything is shown or sent: a tab whose user changed must not send this user's
+      // history under the next user's credentials.
+      if (!(await confirm())) return;
       const threadId = activeRef.current;
       // Read before the user turn is appended: the history is what came BEFORE this ask.
       const before = threadsRef.current.find((t) => t.id === threadId)?.turns ?? [];
       const history = historyFrom(before);
       updateTurns(threadId, (current) => [...current, userTurn(question)]);
+      const controller = new AbortController();
+      inflight.current.add(controller);
       try {
-        for await (const event of streamChat(question, modeRef.current, history)) {
+        for await (const event of streamChat(question, modeRef.current, history, controller.signal)) {
           updateTurns(threadId, (current) => reduce(current, event));
         }
       } catch (error) {
+        if (controller.signal.aborted) return; // the workbench went; nothing is left to tell
         // Only a sign-out is thrown; every other refusal arrives as a failed run.
         if (!(error instanceof Refused)) throw error;
         onRefused(error.refusal);
+      } finally {
+        inflight.current.delete(controller);
       }
     },
-    [updateTurns, onRefused],
+    [updateTurns, onRefused, confirm],
   );
 
   const newChat = useCallback(() => {

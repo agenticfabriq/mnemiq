@@ -1,9 +1,9 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
 import { SCALAR_ANSWER } from "./test/fixtures";
-import { enter, keyFor, LEGACY, mayReload, namespaceOf, SINGLE } from "./lib/identity";
+import { enter, keyFor, LEGACY, MARKER, mayReload, namespaceOf, SINGLE } from "./lib/identity";
 import { NOTICE } from "./lib/transport";
 import type { Thread } from "./lib/threads";
 
@@ -45,11 +45,11 @@ const SCOPE = () => json({ tables: [{ object_id: "claim", card: "" }], starters:
 
 type Route = "/v1/whoami" | "/v1/schema" | "/v1/chat";
 
-function serve(routes: Partial<Record<Route, () => Response>>) {
-  const fetchMock = vi.fn(async (url: string) => {
+function serve(routes: Partial<Record<Route, (init?: RequestInit) => Response | Promise<Response>>>) {
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
     const route = routes[url as Route];
     if (!route) throw new Error(`no route for ${url}`);
-    return route();
+    return route(init);
   });
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
@@ -80,6 +80,15 @@ const workbench = () => screen.findByRole("button", { name: "+ New chat" });
 /** Let pending effects and microtasks run, so a write that would happen does. */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
 
+const calls = (fetchMock: ReturnType<typeof serve>, route: Route) =>
+  fetchMock.mock.calls.filter(([url]) => url === route).length;
+
+/** Hide or show the tab, as switching to another tab or window does. */
+function setVisibility(state: DocumentVisibilityState) {
+  Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+  document.dispatchEvent(new Event("visibilitychange"));
+}
+
 beforeAll(() => {
   // assistant-ui's viewport observes its own size; jsdom has no ResizeObserver.
   globalThis.ResizeObserver ??= class {
@@ -99,6 +108,8 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+  delete (document as unknown as Record<string, unknown>).visibilityState;
 });
 
 describe("whose threads the page shows", () => {
@@ -187,6 +198,115 @@ describe("whose threads the page shows", () => {
 
     expect(Object.keys(snapshot()).length).toBeGreaterThan(0);
     for (const key of Object.keys(snapshot())) expect(key).not.toContain("alice");
+  });
+});
+
+describe("a tab left open across a change of user", () => {
+  it("drops the old user's threads and cancels their question when another tab loads as someone else", async () => {
+    const alice = await signedInBefore(ALICE, "alice's question");
+    let who = ALICE;
+    let chatSignal: AbortSignal | undefined;
+    const fetchMock = serve({
+      "/v1/whoami": () => json(who),
+      "/v1/schema": SCOPE,
+      "/v1/chat": (init) => {
+        chatSignal = init?.signal ?? undefined;
+        return new Promise<Response>(() => {}); // still being answered
+      },
+    });
+    const tabA = within(render(<App reload={vi.fn()} />).container);
+    expect(await tabA.findAllByText("alice's question")).not.toHaveLength(0);
+    fireEvent.click(await tabA.findByRole("button", { name: "+ New chat" }));
+    fireEvent.click(await tabA.findByRole("button", { name: STARTER }));
+    await waitFor(() => expect(chatSignal).toBeDefined());
+
+    // Bob signs in through another tab, which loads the workbench as him.
+    who = BOB;
+    const tabB = within(render(<App reload={vi.fn()} />).container);
+    await tabB.findByRole("button", { name: "+ New chat" });
+    // What the browser tells every other tab when that one writes the identity marker.
+    const bob = (await namespaceOf(BOB))!;
+    window.dispatchEvent(
+      new StorageEvent("storage", { key: MARKER, oldValue: alice, newValue: bob, storageArea: localStorage }),
+    );
+
+    await waitFor(() => expect(tabA.queryAllByText("alice's question")).toHaveLength(0));
+    expect(chatSignal!.aborted).toBe(true);
+    // Tab A asks again who is asking, and is Bob's now.
+    await tabA.findByRole("button", { name: "+ New chat" });
+    expect(calls(fetchMock, "/v1/whoami")).toBe(3);
+    await settle();
+    expect(localStorage.getItem(keyFor(alice, "threads"))).toBeNull();
+  });
+
+  it("checks who is asking before sending from a tab that was hidden, and sends nothing when it changed", async () => {
+    await signedInBefore(ALICE, "alice's question");
+    let who = ALICE;
+    const chat = vi.fn(() => new Response("", { status: 500 }));
+    const fetchMock = serve({ "/v1/whoami": () => json(who), "/v1/schema": SCOPE, "/v1/chat": chat });
+    render(<App reload={vi.fn()} />);
+    expect(await screen.findAllByText("alice's question")).not.toHaveLength(0);
+
+    // Hidden while Bob signs in somewhere that never loads the workbench, then shown again.
+    setVisibility("hidden");
+    who = BOB;
+    setVisibility("visible");
+    fireEvent.click(await workbench());
+    fireEvent.click(await screen.findByRole("button", { name: STARTER }));
+
+    await waitFor(() => expect(screen.queryAllByText("alice's question")).toHaveLength(0));
+    await workbench();
+    await settle();
+    expect(chat).not.toHaveBeenCalled();
+    expect(calls(fetchMock, "/v1/whoami")).toBe(3); // the load, the check, and asking again
+  });
+
+  it("sends once the check finds the same user, after the tab sat idle", async () => {
+    await signedInBefore(ALICE, "alice's question");
+    const chat = vi.fn(() => new Response("", { status: 500 }));
+    const fetchMock = serve({ "/v1/whoami": () => json(ALICE), "/v1/schema": SCOPE, "/v1/chat": chat });
+    render(<App reload={vi.fn()} />);
+    expect(await screen.findAllByText("alice's question")).not.toHaveLength(0);
+
+    const later = Date.now() + 61_000;
+    vi.spyOn(Date, "now").mockReturnValue(later);
+    fireEvent.click(await workbench());
+    fireEvent.click(await screen.findByRole("button", { name: STARTER }));
+
+    await waitFor(() => expect(chat).toHaveBeenCalledTimes(1));
+    expect(calls(fetchMock, "/v1/whoami")).toBe(2);
+    expect(screen.getAllByText("alice's question")).not.toHaveLength(0);
+  });
+
+  it("clears the tab and reloads, sending nothing, when the check finds the session expired", async () => {
+    await signedInBefore(ALICE, "alice's question");
+    let whoami = () => json(ALICE);
+    const chat = vi.fn(() => new Response("", { status: 500 }));
+    serve({ "/v1/whoami": () => whoami(), "/v1/schema": SCOPE, "/v1/chat": chat });
+    const reload = vi.fn();
+    render(<App reload={reload} />);
+    expect(await screen.findAllByText("alice's question")).not.toHaveLength(0);
+
+    setVisibility("hidden");
+    whoami = () => new Response("", { status: 401 });
+    setVisibility("visible");
+    fireEvent.click(await workbench());
+    fireEvent.click(await screen.findByRole("button", { name: STARTER }));
+
+    await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
+    expect(chat).not.toHaveBeenCalled();
+    expect(screen.queryAllByText("alice's question")).toHaveLength(0);
+  });
+
+  it("adds no round trip before a question from a tab in use", async () => {
+    const chat = vi.fn(() => new Response("", { status: 500 }));
+    const fetchMock = serve({ "/v1/whoami": () => json(ALICE), "/v1/schema": SCOPE, "/v1/chat": chat });
+    render(<App reload={vi.fn()} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: STARTER }));
+
+    await waitFor(() => expect(chat).toHaveBeenCalledTimes(1));
+    expect(calls(fetchMock, "/v1/whoami")).toBe(1);
   });
 });
 
