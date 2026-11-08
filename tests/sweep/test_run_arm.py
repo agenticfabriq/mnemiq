@@ -178,6 +178,103 @@ def test_a_held_case_that_fails_again_once_the_endpoint_answers_others_keeps_its
     assert len(read_rows(cfg, arm)) == len(tuning(cfg)) and errors == held
 
 
+def own_failures(stub, cfg, case_ids) -> None:
+    """From now on `stub` fails each of `case_ids`' questions with a 500 of its own, and answers every other request."""
+    questions = [case.question for case in tuning(cfg) if case.id in set(case_ids)]
+    stub.recover()
+    stub.rule = lambda request: 500 if any(_carries(_messages(request)[1], q) for q in questions) else None
+
+
+def dies_before(stub, case_ids):
+    """A `before` callback for `run_arm`: just before any of `case_ids` is asked, `stub` stops answering anything."""
+    def before(case_id: str, mode: str) -> None:
+        if case_id in set(case_ids):
+            stub.rule = lambda request: 500
+    return before
+
+
+def test_held_questions_left_alone_finish_once_a_probe_shows_the_endpoint_answers(tmp_path, stub_model):
+    stub = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    last = [case.id for case in tuning(cfg)[-3:]]
+    assert run_arm(cfg, arm, tuning(cfg), folder, before=dies_before(stub, last[:1])) == "endpoint"
+    held = [case for case, _ in held_for_retry(cfg)]
+    # Only the held questions are left, and each now fails on its own while the endpoint answers everything else.
+    assert held == last and len(read_rows(cfg, arm)) + len(held) == len(tuning(cfg))
+    own_failures(stub, cfg, held)
+    assert run_arm(cfg, arm, tuning(cfg), folder) == "complete"
+    assert sorted(r["id"] for r in read_rows(cfg, arm) if r["error_kind"] == "endpoint") == sorted(held)
+    assert held_for_retry(cfg) == []   # each entry left retries.json as its error became final
+
+
+def stopped_on_three_before_the_last(stub, cfg, arm, folder) -> list[str]:
+    """Run `arm` until the endpoint stops answering just before its fourth question from the end, which holds three
+    questions and leaves the last one never asked; then the endpoint answers again. The held questions, in order."""
+    assert run_arm(cfg, arm, tuning(cfg), folder, before=dies_before(stub, [tuning(cfg)[-4].id])) == "endpoint"
+    held = [case for case, _ in held_for_retry(cfg)]
+    assert held == [case.id for case in tuning(cfg)[-4:-1]]
+    stub.rule = None
+    return held
+
+
+def test_an_endpoint_that_dies_after_answering_one_question_keeps_the_held_questions_held(tmp_path, stub_model):
+    stub = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    held = stopped_on_three_before_the_last(stub, cfg, arm, folder)
+    # The one question never asked is answered, then the endpoint stops answering before the held ones are asked.
+    assert run_arm(cfg, arm, tuning(cfg), folder, before=dies_before(stub, held)) == "endpoint"
+    rows = read_rows(cfg, arm)
+    assert len(rows) == len(tuning(cfg)) - len(held) and all(r["error_kind"] is None for r in rows)
+    assert sorted(case for case, _ in held_for_retry(cfg)) == sorted(held)
+
+
+def test_a_streak_of_questions_failing_on_their_own_settles_on_the_next_resume(tmp_path, stub_model):
+    stub = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    last = [case.id for case in tuning(cfg)[-3:]]
+    own_failures(stub, cfg, last)   # three in a row, at the end: they look like an outage
+    assert run_arm(cfg, arm, tuning(cfg), folder) == "endpoint"
+    assert sorted(case for case, _ in held_for_retry(cfg)) == sorted(last)
+    assert run_arm(cfg, arm, tuning(cfg), folder) == "complete"
+    assert sorted(r["id"] for r in read_rows(cfg, arm) if r["error_kind"] == "endpoint") == sorted(last)
+    assert held_for_retry(cfg) == []
+
+
+def test_retries_lose_each_entry_as_it_settles(tmp_path, stub_model):
+    stub = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    first, second, third = stopped_on_three_before_the_last(stub, cfg, arm, folder)
+    # The first held question fails on its own and settles; the endpoint dies before the second is asked.
+    own_failures(stub, cfg, [first, second, third])
+    assert run_arm(cfg, arm, tuning(cfg), folder, before=dies_before(stub, [second])) == "endpoint"
+    assert [case for case, _ in held_for_retry(cfg)] == [second, third]
+    assert [r["id"] for r in read_rows(cfg, arm) if r["error_kind"] == "endpoint"] == [first]
+
+
+def test_an_endpoint_that_dies_on_the_arms_last_questions_leaves_them_held(tmp_path, stub_model):
+    stub = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    last = [case.id for case in tuning(cfg)[-2:]]   # two: too few for a streak
+    assert run_arm(cfg, arm, tuning(cfg), folder, before=dies_before(stub, last[:1])) == "endpoint"
+    assert all(r["error_kind"] is None for r in read_rows(cfg, arm))
+    assert sorted(case for case, _ in held_for_retry(cfg)) == sorted(last)
+
+
+def test_with_nothing_answered_to_replay_a_held_question_stays_held(tmp_path, stub_model):
+    stub = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    own_failures(stub, cfg, [case.id for case in tuning(cfg)])   # no question of this arm, its start, is answered
+    # Two streaks of three, then the last question beside the first held one: every question held, none written.
+    assert [run_arm(cfg, arm, tuning(cfg), folder) for _ in range(4)] == ["endpoint"] * 4
+    assert read_rows(cfg, arm) == [] and len(held_for_retry(cfg)) == len(tuning(cfg)) == 7
+
+
 def test_a_statement_cancelled_under_load_is_an_error_not_wrong(tmp_path, stub_model, monkeypatch):
     cfg, arm = one_arm(tmp_path, stub_model(gold=True))
     cancel_gold_once(monkeypatch)                    # the source raises its timeout on one gold query

@@ -383,11 +383,15 @@ not moved, and its answers on each deployment carry one profile version. Paired 
 it is not: failed, declined, wrong, an error and unjudged are all not right. So with `max_errors` above 0, a question
 the start did not measure counts as one the start got wrong, and can read as a win for an arm.
 
-An endpoint that fails three questions in a row is taken to have stopped answering. The arm stops and leaves those
-three out, the arms running finish, no other starts, and `run` exits naming the endpoint (without its credentials).
-The next run asks those questions again, after the arm's others. One that fails again counts as that question's own
-error only once the endpoint has answered another question in that run. Until then it is held as before, so a run
-made while the endpoint is still down stops again the same way, and no question is lost to it.
+An endpoint error counts as that question's own only once the endpoint is seen answering after it: a later question
+answered, or one probe that asks again a question the arm, or its model's start, has already answered, and writes
+nothing. An endpoint that fails three questions in a row is taken to have stopped answering. The arm stops and leaves
+those three out, the arms running finish, no other starts, and `run` exits naming the endpoint (without its
+credentials). The next run asks those questions again, after the arm's others. One that fails again is probed before
+its error is kept: answered, the probe shows the error is the question's own; failed, or with nothing answered to
+replay, it leaves the question held and stops the arm again, so no question is lost to an endpoint that is down. The
+same probe settles the endpoint errors still held when an arm's questions run out. `retries.json` lists each held
+question until it is answered or its error is kept.
 
 ## The report
 
