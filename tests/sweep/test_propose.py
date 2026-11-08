@@ -181,6 +181,39 @@ def test_a_sweep_with_no_room_anywhere_proposes_its_start(tmp_path):
     assert [record["label"] for record in report(cfg, "screen", controls=False)[1]] == ["start"]
 
 
+def test_an_arm_that_ran_beside_a_start_with_no_room_is_no_candidate(tmp_path):
+    # The record says the search stopped for want of room. The arm that was running beside the start's first run
+    # finished, and its numbers alone would pass the rule.
+    cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0)}, no_room=("instant",))
+    result = propose(cfg)
+    assert result["m"]["chosen"] == "start" and "no room" in result["m"]["why"]
+    (arm,) = evidence(cfg)["candidates"]["instant"]["arms"]
+    assert arm["label"] == "writer_rules=none" and arm["holm_passed"] == [True]   # it would have passed the rule
+    assert arm["candidate"] is False and "want of room" in arm["why_not"][0]
+    assert candidates(cfg, report(cfg, "screen", controls=False)[1]) == {("m", "instant"): []}
+    # Nothing of that mode was timed or confirmed, and the evidence says so.
+    assert evidence(cfg)["timing"] == {} and evidence(cfg)["confirm"] is None and evidence(cfg)["numbers"] is None
+    assert not (out(cfg) / "m" / "timing").exists() and confirm_arms_run(cfg) == 0
+
+
+def test_a_mode_that_ran_out_of_room_with_arms_running_beside_its_start_proposes_the_start(tmp_path, stub_model,
+                                                                                          monkeypatch):
+    monkeypatch.setattr(proposal, "LOAD_WAIT_S", 0.0)
+    stub = stub_model(gold_when=lambda request: "response_format" in request)   # guided SQL is right, else wrong
+    dataset = tiny_dataset(tmp_path, cases=10, answerable=9, stub=stub)
+    # Four arms leave no room for a win on 7 answerable questions, and four at a time start beside the start's run.
+    cfg = load_config(write_config(tmp_path, model=stub, dataset=dataset, machine={"parallel": 4},
+                                   space={"guided_sql": [True], "retrieval_k": [16, 28, 36]}))
+    run(cfg)
+    assert sweep_json(cfg)["room"]["m"]["instant"]["stopped"] == "no room"
+    assert propose(cfg)["m"]["chosen"] == "start"
+    ran = evidence(cfg)["candidates"]["instant"]["arms"]
+    assert "guided_sql=true" in [arm["label"] for arm in ran]   # an arm that gets every question right ran beside it
+    assert not any(arm["candidate"] for arm in ran) and all("want of room" in arm["why_not"][0] for arm in ran)
+    assert not (out(cfg) / "m" / "timing").exists() and confirm_arms_run(cfg) == 0
+    assert evidence(cfg)["confirm"] is None and evidence(cfg)["timing"] == {}
+
+
 def test_a_proposal_is_refused_under_another_config(tmp_path):
     cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0)})
     with pytest.raises(SweepConfigError, match="another config"):

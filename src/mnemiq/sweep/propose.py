@@ -4,9 +4,11 @@ promote.
 The rule is the config's `[propose]`, fixed before any row was written. An arm is a candidate in its mode when it is
 valid in every run and, in every run, gets more right than the start where the two differ, with an exact McNemar p that
 passes Holm's correction at `alpha` over every distinct arm compared with that start on the cases to tune on, screen and
-grid together, and adds no more wrong or made-up answers than `[propose]` allows. The candidates with the most right
-answers on average are timed, each once and alone on the first cases to tune on, beside the start. A tie goes to the
-lower median time of a reading that was taken on a server that publishes its load, then to fewer prompt tokens.
+grid together, and adds no more wrong or made-up answers than `[propose]` allows. A model and mode whose search the
+sweep's record says stopped for want of room has no candidate, whatever the arms that ran beside its start's first run
+scored. The candidates with the most right answers on average are timed, each once and alone on the first cases to
+tune on, beside the start. A tie goes to the lower median time of a reading that was taken on a server that publishes
+its load, then to fewer prompt tokens.
 
 A profile holds every mode, so each mode's pick is assembled into one profile (`assembled_arm`), a profile-wide setting
 the picks disagree on keeping the start's value. That one arm is confirmed against the start on the held-out cases, in
@@ -216,10 +218,26 @@ def _p(record: dict, run: int) -> float:
     return next((pair["p"] for pair in record["pairs"] if pair["run"] == run), 1.0)
 
 
-def _judged(cfg: SweepConfig, records: Sequence[dict]) -> dict[tuple[str, str], dict]:
+def _record(cfg: SweepConfig) -> dict:
+    """The sweep's `sweep.json`, or an empty record before a run has started the sweep."""
+    path = Path(cfg.sweep.out) / SWEEP
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def _out_of_room(state: dict, model: str, mode: str) -> dict | None:
+    """The room the record says `model` in `mode` ran out of, when its search stopped for want of room; else None."""
+    room = state.get("room", {}).get(model, {}).get(mode, {})
+    return room if room.get("stopped") == "no room" else None
+
+
+def _judged(cfg: SweepConfig, records: Sequence[dict], state: dict) -> dict[tuple[str, str], dict]:
     """For each model and mode, its start's record and every arm compared with it, judged by the rule: each arm's mean
     right and prompt tokens, whether its p passes Holm in each run, and why it is not a candidate. Arms are sorted by
-    mean right, the most first."""
+    mean right, the most first.
+
+    A model and mode whose search the record (`state`) says stopped for want of room has no candidate. The arms that
+    were running beside the start's first run when that was found, and finished, are judged all the same, and each
+    says the search stopped there."""
     alpha, bounds = cfg.propose.alpha, cfg.propose
     judged: dict[tuple[str, str], dict] = {}
     for model in cfg.models:
@@ -230,10 +248,15 @@ def _judged(cfg: SweepConfig, records: Sequence[dict]) -> dict[tuple[str, str], 
             arms = [record for record in mine if record["arm"] != "start"]
             runs = len(start["runs"]) if start is not None else max((len(record["runs"]) for record in arms), default=0)
             passed = [holm({record["arm"]: _p(record, run) for record in arms}, alpha) for run in range(1, runs + 1)]
+            room = _out_of_room(state, model, mode)
             entries = []
             for record in arms:
                 pairs = {pair["run"]: pair for pair in record["pairs"]}
                 why = []
+                if room is not None:
+                    why.append(f"the search stopped in {mode} for want of room once the start's first run was in: the "
+                               f"start missed {room.get('misses')} of the questions to tune on, fewer than an arm "
+                               "must gain to win, so no arm there is a candidate, whatever it scored")
                 if start is None or not start["valid"]:
                     why.append("the start is not valid in every run")
                 if not record["valid"]:
@@ -267,11 +290,13 @@ def _judged(cfg: SweepConfig, records: Sequence[dict]) -> dict[tuple[str, str], 
     return judged
 
 
-def candidates(cfg: SweepConfig, records: Sequence[dict]) -> dict[tuple[str, str], list[str]]:
+def candidates(cfg: SweepConfig, records: Sequence[dict],
+               state: dict | None = None) -> dict[tuple[str, str], list[str]]:
     """For each model and mode, the labels of its candidate arms, the most right on average first. `records` are the
-    search's, as `report` gives them for the screen and the grid."""
+    search's, as `report` gives them for the screen and the grid; `state` is the sweep's record, by default its
+    `sweep.json`."""
     return {key: [entry["label"] for entry in found["arms"] if entry["candidate"]]
-            for key, found in _judged(cfg, records).items()}
+            for key, found in _judged(cfg, records, _record(cfg) if state is None else state).items()}
 
 
 def _top(found: dict) -> list[dict]:
@@ -373,7 +398,7 @@ def pick(cfg: SweepConfig, model: str, mode: str) -> Arm | None:
     """The top candidate of `model` in `mode`, as its round built it, or None when no arm is a candidate. A tie on mean
     right goes to the lower median time of a taken reading that is not indicative, when every tied arm has one, then to
     fewer prompt tokens (a mean over the runs that tuned it)."""
-    judged = _judged(cfg, _tuning_records(cfg, decided_repeats(cfg)))
+    judged = _judged(cfg, _tuning_records(cfg, decided_repeats(cfg)), _record(cfg))
     entry, _ = _pick(judged[(model, mode)], _timing(cfg, judged).get((model, mode)))
     return None if entry is None else _arm_of(model, mode, entry)
 
@@ -486,7 +511,7 @@ def _time_and_confirm(sweep, until: str | None, running: dict[str, list[str]]) -
     """The timing round, then (unless `until` is "timing") the confirm round; True when both ran to their end."""
     cfg = sweep.cfg
     repeats = decided_repeats(cfg, sweep.state)
-    judged = _judged(cfg, _tuning_records(cfg, repeats))
+    judged = _judged(cfg, _tuning_records(cfg, repeats), sweep.state)
     cases = sweep.parts["tuning"][:TIMING_CASES]
     timed = [sweep.job(arm, 1, cases=cases, before=TimingCheck(cfg.models[arm.model].llm_base_url,
                                                                 str(arm_folder(cfg, arm, 1) / CHECKS)))
@@ -1078,7 +1103,7 @@ def _verdicts(cfg: SweepConfig, state: dict, ran: dict, repeats: int) -> dict[st
             arms = _check_arms(cfg, model, verdict["rule"], ran[model][0]) if verdict["rule"] else None
             verdict |= {"rule_arms": arms, "confirmed": None, "picks": {}, "conflicts": [], "failed_mode": None}
         return verdicts
-    judged = _judged(cfg, _tuning_records(cfg, repeats))
+    judged = _judged(cfg, _tuning_records(cfg, repeats), state)
     timing = _timing(cfg, judged)
     confirm = report(cfg, "confirm", repeats=repeats, controls=False)[1]
     return {model: _search(cfg, model, state, judged, timing, confirm, repeats, *ran[model]) for model in cfg.models}

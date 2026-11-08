@@ -303,6 +303,10 @@ After the start's first run, the sweep counts the answerable questions to tune o
 gain more than that. When it is fewer than the smallest gain that could pass (the next section), no arm can win, so
 the search stops for that model and mode, and the start is proposed there. The search goes on for the others.
 
+With `parallel` above 1, other arms start beside the start's first run, before its room is known, and those already
+running finish. They appear in the report and the evidence, but none is a candidate where the search stopped: each
+says why, nothing of that mode is timed, and its pick in the confirm round is the start.
+
 ## What a sweep can show
 
 With no question lost, an arm right alone on k questions has a two-sided p of 2 / 2^k. Holm's correction over m arms
