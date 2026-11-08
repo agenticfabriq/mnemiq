@@ -138,7 +138,15 @@ export type AguiEvent =
   | { type: "TEXT_MESSAGE_END"; messageId: string }
   | { type: "CUSTOM"; name: string; value: unknown }
   | { type: "RUN_FINISHED"; runId: string }
-  | { type: "RUN_ERROR"; message: string; runId?: string }
+  // `code` is AG-UI's optional error code. The engine sends none; the workbench sets
+  // "unavailable" on a run the service failed before it started (transport.ts).
+  | { type: "RUN_ERROR"; message: string; runId?: string; code?: string }
   | { type: string & Record<never, never> };
 
 export type SchemaTable = { object_id: string; card: string };
+
+/**
+ * Who the engine says is asking (`GET /v1/whoami`). `verified` is true when the identity came
+ * from a verified token, false for the deployment's one configured identity.
+ */
+export type Whoami = { principal_id: string; tenant_id: string | null; verified: boolean };

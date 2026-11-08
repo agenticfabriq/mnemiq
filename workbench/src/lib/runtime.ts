@@ -19,7 +19,7 @@ import {
 } from "@assistant-ui/react";
 
 import { historyFrom } from "./history";
-import { streamChat } from "./transport";
+import { Refused, streamChat, type Refusal } from "./transport";
 import { isRunning, reduce, userTurn, type Turn } from "./store";
 import { emptyThread, isBlank, load, save, titleFor, type Thread } from "./threads";
 import { loadMode, saveMode } from "./mode";
@@ -58,17 +58,29 @@ function convertMessage(turn: Turn): ThreadMessageLike {
   };
 }
 
-export function useWorkbench() {
+/**
+ * `shelf` is where the identity's threads and mode are kept (`enter` in identity.ts), fixed
+ * for the life of the hook: the page mounts a fresh workbench for a different identity rather
+ * than switching this one over, and every question still running is cancelled when this one
+ * goes. `onRefused` hears a question's sign-out, which ends the run before any event arrives.
+ * `confirm` is asked before each question and answers whether the user is still the one this
+ * workbench holds threads for.
+ */
+export function useWorkbench(
+  shelf: string | null,
+  onRefused: (refusal: Refusal) => void,
+  confirm: () => Promise<boolean>,
+) {
   const restored = useMemo(() => {
-    const stored = load();
+    const stored = load(shelf);
     return stored.length ? stored : [emptyThread()];
-  }, []);
+  }, [shelf]);
 
   const [threads, setThreads] = useState<Thread[]>(restored);
   const [activeId, setActiveId] = useState<string>(restored[0]!.id);
   // Restored, not defaulted: mode is what a question costs, and a reload that quietly
   // moves a reader from `deep` back to `thinking` changes the answer they get next.
-  const [mode, setMode] = useState<Mode>(loadMode);
+  const [mode, setMode] = useState<Mode>(() => loadMode(shelf));
 
   // Read at send time so switching thread or mode mid-run never retargets a run
   // already in flight.
@@ -80,12 +92,22 @@ export function useWorkbench() {
   threadsRef.current = threads;
 
   useEffect(() => {
-    saveMode(mode);
-  }, [mode]);
+    saveMode(shelf, mode);
+  }, [shelf, mode]);
 
   useEffect(() => {
-    save(threads);
-  }, [threads]);
+    save(shelf, threads);
+  }, [shelf, threads]);
+
+  // Questions in flight. Cancelled when the workbench goes, which the page does when the user
+  // changes: an answer must not land in, or be saved under, the previous user's threads.
+  const inflight = useRef(new Set<AbortController>());
+  useEffect(() => {
+    const running = inflight.current;
+    return () => {
+      for (const controller of running) controller.abort();
+    };
+  }, []);
 
   const active = threads.find((t) => t.id === activeId) ?? threads[0]!;
 
@@ -106,16 +128,30 @@ export function useWorkbench() {
 
   const ask = useCallback(
     async (question: string) => {
+      // Before anything is shown or sent: a tab whose user changed must not send this user's
+      // history under the next user's credentials.
+      if (!(await confirm())) return;
       const threadId = activeRef.current;
       // Read before the user turn is appended: the history is what came BEFORE this ask.
       const before = threadsRef.current.find((t) => t.id === threadId)?.turns ?? [];
       const history = historyFrom(before);
       updateTurns(threadId, (current) => [...current, userTurn(question)]);
-      for await (const event of streamChat(question, modeRef.current, history)) {
-        updateTurns(threadId, (current) => reduce(current, event));
+      const controller = new AbortController();
+      inflight.current.add(controller);
+      try {
+        for await (const event of streamChat(question, modeRef.current, history, controller.signal)) {
+          updateTurns(threadId, (current) => reduce(current, event));
+        }
+      } catch (error) {
+        if (controller.signal.aborted) return; // the workbench went; nothing is left to tell
+        // Only a sign-out is thrown; every other refusal arrives as a failed run.
+        if (!(error instanceof Refused)) throw error;
+        onRefused(error.refusal);
+      } finally {
+        inflight.current.delete(controller);
       }
     },
-    [updateTurns],
+    [updateTurns, onRefused, confirm],
   );
 
   const newChat = useCallback(() => {

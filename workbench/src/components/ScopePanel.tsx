@@ -8,7 +8,7 @@
 
 import { useEffect, useState } from "react";
 
-import { fetchScope, type Scope } from "../lib/transport";
+import { fetchScope, Refused, type Refusal, type Scope } from "../lib/transport";
 import type { SchemaTable } from "../lib/types";
 
 const NOTHING: Scope = { tables: [], starters: [] };
@@ -26,17 +26,25 @@ const loadFilter = (): string => {
 
 /** One fetch for both, because the engine scopes them together (M32). `null` means the
  *  answer has not arrived yet, which the panel renders differently from an empty scope. */
-export function useScope() {
+export function useScope(onRefused: (refusal: Refusal) => void) {
   const [scope, setScope] = useState<Scope | null>(null);
   useEffect(() => {
     let live = true;
-    fetchScope()
+    const controller = new AbortController();
+    fetchScope(controller.signal)
       .then((next) => live && setScope(next))
-      .catch(() => live && setScope(NOTHING));
+      .catch((error: unknown) => {
+        if (!live) return;
+        // A refusal is the page's to report, and the scope stays unknown: an empty one says
+        // nothing is granted to this identity, which neither an outage nor a sign-out means.
+        if (error instanceof Refused) onRefused(error.refusal);
+        else setScope(NOTHING);
+      });
     return () => {
       live = false;
+      controller.abort();
     };
-  }, []);
+  }, [onRefused]);
   return scope;
 }
 

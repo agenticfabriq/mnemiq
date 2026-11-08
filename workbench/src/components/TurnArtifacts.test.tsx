@@ -28,6 +28,25 @@ describe("TurnArtifacts", () => {
     expect(screen.getByText(/Writing the answer/)).toBeInTheDocument();
   });
 
+  it("says the engine is still serving when a run fails on the engine", () => {
+    show({ status: "error", error: "the run failed" });
+    expect(screen.getByText(/The engine is still serving/)).toBeInTheDocument();
+  });
+
+  it("says a service problem is one, rather than that the engine is still serving", () => {
+    // A 503 or a request that never got an answer: the engine is exactly what is not serving.
+    show({ status: "error", error: "The service is unavailable.", errorCode: "unavailable" });
+    expect(screen.getByText(/service problem/)).toBeInTheDocument();
+    expect(screen.queryByText(/still serving/)).not.toBeInTheDocument();
+  });
+
+  it("says a refusal is not one to ask again, rather than that the engine is still serving", () => {
+    // A 403: this sign-in may not ask, so asking again changes nothing.
+    show({ status: "error", error: "This sign-in is not permitted here.", errorCode: "not-permitted" });
+    expect(screen.getByText(/asking again will not help/)).toBeInTheDocument();
+    expect(screen.queryByText(/still serving/)).not.toBeInTheDocument();
+  });
+
   it("shows only progress before the rows arrive", () => {
     show({});
     expect(screen.queryByText("only-row-value")).not.toBeInTheDocument();

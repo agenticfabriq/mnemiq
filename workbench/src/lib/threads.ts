@@ -2,14 +2,14 @@
  * Conversation history.
  *
  * Threads live in localStorage: they survive a reload, which is what makes a history
- * panel worth having, without inventing a server-side store or a per-identity
- * schema. The consequence is worth stating plainly -- history is per browser, not
- * per principal, and it is not a record of what the engine was asked.
+ * panel worth having, without inventing a server-side store. Each identity's threads sit
+ * in that identity's namespace (identity.ts), so a shared browser never shows one user
+ * another's answers. History is still not a record of what the engine was asked.
  */
 
+import { keyFor } from "./identity";
 import type { Turn } from "./store";
 
-const KEY = "mnemiq.threads.v1";
 const MAX_THREADS = 25;
 
 export type Thread = {
@@ -40,9 +40,11 @@ export function titleFor(thread: Thread): string {
 
 export const isBlank = (thread: Thread): boolean => thread.turns.length === 0;
 
-export function load(): Thread[] {
+/** `ns` null: a user with no namespace (identity.ts), for whom nothing is kept. */
+export function load(ns: string | null): Thread[] {
+  if (ns === null) return [];
   try {
-    const raw = globalThis.localStorage?.getItem(KEY);
+    const raw = globalThis.localStorage?.getItem(keyFor(ns, "threads"));
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -56,11 +58,12 @@ export function load(): Thread[] {
   }
 }
 
-export function save(threads: Thread[]): void {
+export function save(ns: string | null, threads: Thread[]): void {
+  if (ns === null) return;
   const keep = threads.filter((t) => !isBlank(t)).slice(0, MAX_THREADS);
   for (let attempt = keep.length; attempt >= 0; attempt--) {
     try {
-      globalThis.localStorage?.setItem(KEY, JSON.stringify(keep.slice(0, attempt)));
+      globalThis.localStorage?.setItem(keyFor(ns, "threads"), JSON.stringify(keep.slice(0, attempt)));
       return;
     } catch {
       // Over quota: a result preview can be large, so drop the oldest and retry.
