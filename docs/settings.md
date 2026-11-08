@@ -217,6 +217,15 @@ with a message naming the setting to change. A token needs the `db.read` scope o
 `db_read` and `get_schema`, and `db.write` gates `db_write`. A scope only narrows: what a token may read is still its
 roles' grants.
 
+**The OpenAI-compatible endpoint.** `GET /openai/v1/models` and `POST /openai/v1/chat/completions` serve Open WebUI,
+or any OpenAI client, each request as its own verified caller, with one model per profile that caller may pick. They
+are served only where the endpoint can verify a caller of its own: `openwebui_jwt_secret` (Open WebUI's signed user
+header) or `openwebui_audience` (a provider token for this endpoint). Otherwise every path under `/openai/v1` answers
+404, and a startup line says why. Every request must carry the header `openwebui_task_header` names: Open WebUI fills
+it from `{{TASK}}`, empty for a question, and a request whose value is not empty is a background task, such as a
+title, answered empty without asking the engine. The question is the last user message's text, and
+`reasoning_effort` picks the mode: `low` instant, `medium` thinking, `high` deep.
+
 | Setting | Default | What it does |
 |---|---|---|
 | `oidc_issuer` | unset | The identity provider whose tokens the HTTP API and MCP over HTTP verify, matched exactly against the token's `iss`. Unset, the settings identity above serves every caller. |
@@ -234,7 +243,7 @@ roles' grants.
 | `openwebui_user_headers` | `"X-OpenWebUI-User-Id,X-OpenWebUI-User-Email,X-OpenWebUI-User-Name,X-OpenWebUI-User-Role"` | Open WebUI's unsigned user headers. A request carrying any of them is refused once an issuer is configured. |
 | `openwebui_connection_key_header` | unset | The custom header on mnemiq's Open WebUI connection that carries the connection key. |
 | `openwebui_connection_key` | unset | The connection key, at least 32 bytes, which tells mnemiq a request came through its own Open WebUI connection. Required with the signed user header. |
-| `openwebui_task_header` | `X-Mnemiq-Task` | The custom header on mnemiq's Open WebUI connection that carries `{{TASK}}`. Every `/openai/v1` request must carry it, empty for a chat turn; a request whose value is not empty is a background task, such as title generation, and gets an empty completion without reaching the engine. It must be a header of its own. |
+| `openwebui_task_header` | `"X-Mnemiq-Task"` | The custom header on mnemiq's Open WebUI connection that carries `{{TASK}}`. Every `/openai/v1` request must carry it, empty for a chat turn; a request whose value is not empty is a background task, such as title generation, and gets an empty completion without reaching the engine. It must be a header of its own. |
 | `identity_map_path` | unset | A JSON file mapping each issuer's subjects, groups and verified emails to roles, for tokens that carry no roles claim. |
 | `mcp_transport` | `"stdio"` | `stdio` runs the MCP server for one local caller. `http` serves it at `/mcp` on the HTTP API, each request judged by its own token. |
 
