@@ -56,7 +56,7 @@ def _fetch():
 
 
 @contextmanager
-def _serving(rt=None, **over):
+def _serving(rt=None, root_path: str = "", **over):
     """The whole HTTP app, MCP mounted, served by uvicorn on a loopback port; yields (base URL, audience, rt)."""
     from mnemiq.auth.doors import HttpDoors
     from mnemiq.mcp.server import mcp_http_app
@@ -67,7 +67,8 @@ def _serving(rt=None, **over):
     rt = rt or _RT()
     app = build_app(rt, SETTINGS_IDENTITY, doors=HttpDoors(cfg, fetch=_fetch),
                     mcp_app=mcp_http_app(rt, cfg, fetch=_fetch))
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", lifespan="on"))
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", lifespan="on",
+                                           root_path=root_path))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     deadline = time.monotonic() + 10
@@ -341,3 +342,12 @@ def test_the_metadata_route_is_not_screened():
     with _serving() as (base, aud, rt):
         r = httpx.get(f"{base}/.well-known/oauth-protected-resource/mcp", headers={"X-OpenWebUI-User-Id": "u"})
         assert r.status_code == 200
+
+
+def test_the_screen_holds_under_a_root_path():
+    """Behind a proxy that sets a root path, the ASGI path carries the prefix while routing strips it; the screen
+    must judge the same path the router does (found in review: it was skipped, and a plain header got through)."""
+    with _serving(root_path="/pfx") as (base, aud, rt):
+        valid = [("Authorization", f"Bearer {_token(aud)}")]
+        assert _raw(aud, valid) == 200
+        assert _raw(aud, valid + [("X-OpenWebUI-User-Id", "u")]) == 401

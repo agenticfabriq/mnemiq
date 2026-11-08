@@ -290,7 +290,11 @@ class _HeaderScreen:
         self.app, self.cfg, self.path = app, cfg, path
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope.get("path") == self.path:
+        # The path routing sees: a proxy's root path is part of the ASGI path, and Starlette strips it to route.
+        path, root = scope.get("path", ""), scope.get("root_path", "")
+        if root and path.startswith(root):
+            path = path[len(root):]
+        if scope["type"] == "http" and path == self.path:
             from mnemiq.auth.doors import DoorRefusal, screen
 
             headers: dict[str, list[str]] = {}
