@@ -19,6 +19,7 @@ from mnemiq.agent.modes import MODES
 from mnemiq.agent.route import UnknownMode
 from mnemiq.profiles import UnknownProfile
 from mnemiq.contract import HistoryTurn, IdentityContext
+from mnemiq.server.openai_compat import mount_openai
 from mnemiq.server.serialize import answer_payload
 from mnemiq.server.sse import chat_stream
 
@@ -171,6 +172,8 @@ def build_app(
         for path in [getattr(route, "path", None) for route in mcp_app.routes]:
             if path:
                 app.router.routes.append(Route(path, endpoint=mcp_app))
+
+    mount_openai(app, runtime, doors, heartbeat_s=heartbeat_s)
 
     # Mounted last, so it can only claim paths no API route above already answered.
     built = static_dir if static_dir is not None else STATIC_DIR
