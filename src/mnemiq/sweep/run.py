@@ -1121,7 +1121,9 @@ class _Rounds:
         elif outcome == "invalid":
             _say(_not_valid(job))
         elif outcome == "endpoint" or (isinstance(outcome, tuple) and outcome[0] == "endpoint"):
-            said = f": {_hidden(str(outcome[1]), self.secrets)}" if isinstance(outcome, tuple) else ""
+            # The worker hid every known secret before sending its line (`_work`), so the parent, which prints it,
+            # never handles secret values itself: it adds only the pattern scrub, for any credential still shaped as one.
+            said = f": {redact.scrub_credentials(str(outcome[1]))}" if isinstance(outcome, tuple) else ""
             _say(f"{job.name()}: stopped, since an endpoint stopped answering or could not be shown to answer{said}"
                  if said else f"{job.name()}: stopped, since an endpoint stopped answering")
             if job.arm.model not in self.dead:
@@ -1129,7 +1131,7 @@ class _Rounds:
             self._stop("endpoint")
         else:
             raised = isinstance(outcome, tuple) and outcome[0] == "raised"
-            how = f": {_hidden(str(outcome[1]), self.secrets)}" if raised else f" (exit code {exitcode})"
+            how = f": {redact.scrub_credentials(str(outcome[1]))}" if raised else f" (exit code {exitcode})"
             self.died.append(f"the worker running {job.name()} stopped without finishing{how}")
             self._stop("worker")
 
