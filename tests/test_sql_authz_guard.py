@@ -775,10 +775,15 @@ def test_sqlglot_s_select_around_a_values_is_read_as_the_values():
         assert not star(read(sql)), (sql, read(sql))
     assert not star(write("INSERT INTO claim (id, amount) WITH t(a, b) AS (VALUES ((SELECT max(id) FROM claim), 1) "
                           "UNION ALL SELECT 1, 2) SELECT a, b FROM t"))
-    # The statement's own stars: over a VALUES, under any alias, and inside a VALUES row.
+    # The statement's own stars: over a VALUES, under any alias, and inside a VALUES row. Under
+    # sqlglot's own alias too: written in the statement, `_values` is a star over a VALUES like any
+    # other, and its column list names what the ORDER BY reads (Codex's second review of the port:
+    # read as a bare VALUES, the first was approved and answered with the other row).
     for sql in ("SELECT * FROM (VALUES (1, 2)) AS v(a, b)",
                 "WITH t(x) AS (SELECT * FROM (VALUES ((SELECT max(amount) FROM claim))) AS v UNION ALL SELECT 1) SELECT x FROM t",
-                "WITH t(x) AS (VALUES ((SELECT * FROM one)) UNION ALL SELECT 'a') SELECT x FROM t"):
+                "WITH t(x) AS (VALUES ((SELECT * FROM one)) UNION ALL SELECT 'a') SELECT x FROM t",
+                "(SELECT * FROM (VALUES (1, 2), (2, 1)) AS _values(col1, col0) ORDER BY col0 LIMIT 1) UNION ALL SELECT 3, 3",
+                "SELECT * FROM (VALUES (1)) AS _values UNION ALL SELECT 2"):
         assert star(read(sql)), (sql, read(sql))
     for sql in ("INSERT INTO claim (id, amount) WITH t(a, b) AS (VALUES ((SELECT * FROM one), 1) UNION ALL SELECT 1, 2) SELECT a, b FROM t",
                 "INSERT INTO claim (id, amount) WITH t(a, b) AS (SELECT * FROM (VALUES (1, 2)) AS v UNION ALL SELECT 1, 2) SELECT a, b FROM t"):
@@ -804,14 +809,22 @@ def test_only_the_exact_select_sqlglot_writes_around_a_values_operand_is_read_as
     assert bare_values(operand(exp.select("*").from_(over("_values")).limit(1))) is not None  # a modifier moved off it
     assert bare_values(exp.select("*").from_(over("_values"))) is None  # in no set operation
     assert bare_values(operand(exp.select("*").from_(over("v")))) is None
+    listed = over("_values")
+    listed.args["alias"].set("columns", [exp.to_identifier("col1"), exp.to_identifier("col0")])
+    assert bare_values(operand(exp.select("*").from_(listed))) is None  # a column list is the statement's
+    quoted = over("_values")
+    quoted.args["alias"].set("this", exp.to_identifier("_values", quoted=True))
+    assert bare_values(operand(exp.select("*").from_(quoted))) is None
+    placed = over("_values")
+    placed.args["alias"].this.meta.update(start=30, end=36)  # a token of the text, not the parser's name
+    assert bare_values(operand(exp.select("*").from_(placed))) is None
     assert bare_values(operand(exp.select("x").from_(over("_values")))) is None
     assert bare_values(operand(exp.select("*", "x").from_(over("_values")))) is None
     assert bare_values(operand(exp.select("*").from_(over("_values")).where("x = 1"))) is None
     assert bare_values(operand(exp.select("*").from_(over("_values")).join("claim"))) is None
     assert bare_values(operand(exp.select("*").from_("claim"))) is None
-    excluding = sqlglot.parse_one("SELECT * EXCLUDE (a) FROM (VALUES (1, 2)) AS _values(a, b) UNION ALL SELECT 1, 2",
-                                  read="duckdb")
-    assert bare_values(excluding.this) is None
+    excluding = sqlglot.parse_one("SELECT * EXCLUDE (a) FROM t", read="duckdb").expressions[0]
+    assert bare_values(operand(exp.select(excluding).from_(over("_values")))) is None  # a star that drops a column
     # A CTE body's VALUES, which sqlglot 30.12 wrapped the same way: left as both versions read it.
     cte = sqlglot.parse_one("WITH t(x) AS (VALUES (1)) SELECT x FROM t", read="duckdb")
     assert bare_values(cte.find(exp.CTE).this) is None

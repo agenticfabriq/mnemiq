@@ -224,8 +224,10 @@ def bare_values(select: exp.Expression) -> exp.Values | None:
     region LIMIT 1) IS NOT NULL` was approved and raised quoting the row (Codex's review of the port,
     M228). Only that exact SELECT, in that place: a lone unqualified star over a VALUES aliased
     `_values`, with nothing else but modifiers, as a set operation's operand. A CTE body's VALUES
-    both versions wrap the same way, and it is left as both read it; a star a statement writes over
-    a VALUES of its own keeps its own alias."""
+    both versions wrap the same way, and it is left as both read it. The alias must be the parser's:
+    no column list and no place in the text. A statement may write `AS _values(col1, col0)` itself,
+    and read as a bare VALUES its column list was dropped, so its ORDER BY read another column and
+    the approved statement answered with another row (Codex's second review of the port)."""
     if not isinstance(select, exp.Select):
         return None
     place = select.parent
@@ -237,8 +239,11 @@ def bare_values(select: exp.Expression) -> exp.Values | None:
     values = source.this if isinstance(source, exp.From) else None
     star = select.expressions[0] if len(select.expressions) == 1 else None
     allowed = {"expressions", "from", "from_", *_VALUES_MODIFIERS}
-    if (isinstance(values, exp.Values) and values.alias == "_values"
-            and isinstance(star, exp.Star) and not any(star.args.values())
+    alias = values.args.get("alias") if isinstance(values, exp.Values) else None
+    parsers = (isinstance(alias, exp.TableAlias) and isinstance(alias.this, exp.Identifier)
+               and alias.this.name == "_values" and not alias.this.quoted
+               and not alias.columns and "start" not in alias.this.meta)
+    if (parsers and isinstance(star, exp.Star) and not any(star.args.values())
             and not any(value for key, value in select.args.items() if key not in allowed)):
         return values
     return None
