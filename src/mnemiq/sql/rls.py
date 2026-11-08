@@ -725,6 +725,34 @@ def _json_returners() -> frozenset[str]:
     return _JSON_RETURNERS
 
 
+def _call_name(node: exp.Expression) -> str | None:
+    """The name of the call the engine makes, lowercased, whether sqlglot parses it as `Anonymous`
+    or gives it a node of its own; None for anything not a call. sqlglot promotes calls to nodes of
+    their own between releases (30.29 parses `from_json` as `exp.FromJson`, which 30.12 left
+    `Anonymous`), so a name matched on `Anonymous` alone lets a promoted call walk past the check
+    that names it, which fails open (M228)."""
+    if isinstance(node, exp.Anonymous):  # first: `Anonymous` is itself a `Func`
+        return node.name.lower()
+    if isinstance(node, exp.Func):
+        return node.sql_name().lower()
+    return None
+
+
+def _call_args(node: exp.Expression) -> list[exp.Expression]:
+    """A call's arguments in order: `Anonymous` keeps them in `expressions`, a node of its own in
+    its named args, in the order the node declares them (`FromJson`: this, expression, options)."""
+    if isinstance(node, exp.Anonymous):
+        return list(node.expressions)
+    args: list[exp.Expression] = []
+    for key in node.arg_types:
+        value = node.args.get(key)
+        if isinstance(value, list):
+            args.extend(v for v in value if isinstance(v, exp.Expression))
+        elif isinstance(value, exp.Expression):
+            args.append(value)
+    return args
+
+
 def _is_json_call(node: exp.Expression) -> bool:
     return isinstance(node, _JSON_CALL_NODES) or (
         isinstance(node, exp.Anonymous) and node.name.lower() in _json_returners())
@@ -1120,8 +1148,9 @@ _LIST_CONSTRUCTORS = frozenset({"array_value", "list_pack"})  # `list_value` par
 # [attrs])) = map_values(MAP(['a'], [region]))`, `list_extract([attrs], 1) = region` and the
 # struct and key twins were of unknown type on both sides, and parsed region as JSON on the
 # hidden row); by sqlglot's node where it has one, by name where it does not.
+_ARRAY_SORT = getattr(exp, "ArraySort", None) or getattr(exp, "SortArray")  # renamed in sqlglot 30.29 (M228)
 _PURE_CALL_NODES = (exp.MapKeys, exp.StructExtract, exp.ArrayDistinct, exp.MapFromEntries,
-                    exp.ArraySlice, exp.SortArray, exp.Flatten, exp.ArrayReverse)
+                    exp.ArraySlice, _ARRAY_SORT, exp.Flatten, exp.ArrayReverse)
 _PURE_CALLS = frozenset({"map_values", "map_entries", "list_extract", "array_extract", "list_element",
                          "array_element", "list_slice", "list_reverse", "list_unique",
                          "list_distinct", "array_distinct", "map_keys", "struct_extract",
@@ -2401,12 +2430,14 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
                     or _json_inside_a_container(column, type_of)) for column in columns):
                 return node  # per output position, whatever the width (the twenty-fifth
                 # review); a VALUES list's rows unify as a set operation's branches do (the gate)
-        if engine == "duckdb" and (isinstance(node, _JSON_PARSES) or (
-                isinstance(node, exp.Anonymous) and node.name.lower() in _UNTYPED_JSON_PARSES)):
+        called = _call_name(node)
+        if engine == "duckdb" and (isinstance(node, _JSON_PARSES) or called in _UNTYPED_JSON_PARSES):
             # The typed readers parse their first argument; an untyped one may parse any (both of
-            # `json_contains` and `json_merge_patch` do), so each argument must be safe.
-            sources = [node.this] if isinstance(node, _JSON_PARSES) else node.expressions
-            if isinstance(node, exp.Anonymous) and node.name.lower() in _STRICT_JSON_TRANSFORMS:
+            # `json_contains` and `json_merge_patch` do), so each argument must be safe. An untyped
+            # reader is named by the engine's call, never by sqlglot's node: sqlglot promotes
+            # readers to nodes of their own between releases (`from_json` in 30.29, M228).
+            sources = [node.this] if isinstance(node, _JSON_PARSES) else _call_args(node)
+            if called in _STRICT_JSON_TRANSFORMS:
                 if any(_reads_a_column(source) for source in sources):
                     return node  # raises on a well-formed value too, see _STRICT_JSON_TRANSFORMS
                 continue

@@ -843,8 +843,9 @@ def test_a_cte_read_twice_is_not_merged_known_limit():
 @pytest.mark.parametrize("form, arg", [("ROLLUP (d.region)", "rollup"), ("CUBE (d.region)", "cube"),
                                        ("GROUPING SETS ((d.region), ())", "grouping_sets")])
 def test_subtotal_forms_are_found_where_newer_sqlglot_keeps_them(form, arg):
-    """sqlglot 30.19 moved these nodes from their own Group args into `expressions`; the lock pins
-    30.12, so build the newer shape by hand and check both readers see it on any version (M121)."""
+    """sqlglot 30.19 moved these nodes from their own Group args into `expressions`; the lock
+    pinned 30.12 when this was written, so both shapes are built by hand and both readers checked on
+    any version (M121)."""
     from mnemiq.sql.fanout_check import _grouping, _subtotal_forms
 
     select = sqlglot.parse_one(_BY_REGION + form, read="duckdb")

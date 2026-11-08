@@ -8,6 +8,10 @@ into the deciding thread, the decision unwinds, and the door refuses. Time the d
 waiting on its source does not count, since a source call has its own timeout.
 
 Each case also runs under an alarm, so a deadline that fails fails its test rather than hanging the run.
+
+sqlglot 30.29 refuses the struct literal as a parse error at once (M228), and a deadline proved only on
+one parser's bug proves nothing on the next, so the deadline's own cases run on a parse that never
+returns made by hand (`parse_never_returns`), on any sqlglot.
 """
 
 from __future__ import annotations
@@ -61,45 +65,83 @@ def _timed_out(verdict):
     return isinstance(verdict, Refusal) and verdict.code is RefusalCode.DECISION_TIMEOUT
 
 
+NEVER = "never_returns"  # a statement naming it is one whose parse never returns, under the fixture
+
+
+@pytest.fixture
+def parse_never_returns(monkeypatch):
+    """sqlglot's parser, spinning on any statement that names `NEVER`, in bytecode where the timeout
+    lands, as 30.12's DuckDB parser spun on the struct literal; every other statement parses as ever."""
+    from sqlglot.parser import Parser
+
+    def _spin_if_named(raw_tokens):
+        if any(token.text.lower() == NEVER for token in raw_tokens):
+            while True:
+                sum(range(1000))
+
+    parse, parse_into = Parser.parse, Parser.parse_into
+
+    def spinning_parse(self, raw_tokens, *args, **kwargs):
+        _spin_if_named(raw_tokens)
+        return parse(self, raw_tokens, *args, **kwargs)
+
+    def spinning_parse_into(self, expression_types, raw_tokens, *args, **kwargs):
+        _spin_if_named(raw_tokens)
+        return parse_into(self, expression_types, raw_tokens, *args, **kwargs)
+
+    monkeypatch.setattr(Parser, "parse", spinning_parse)
+    monkeypatch.setattr(Parser, "parse_into", spinning_parse_into)
+
+
 @pytest.mark.parametrize("shape", LOOPED)
-def test_a_read_whose_parse_never_returns_is_refused_at_the_deadline(shape):
+def test_the_struct_literal_is_refused_in_time_whatever_the_parser_does(shape):
+    # On 30.12 the parse never returns and the deadline refuses it; on 30.29 it is a parse error at
+    # once. A decision that hung would trip the safety net.
     started = time.monotonic()
     with _safety_net():
         verdict = decide(f"SELECT {shape} FROM claim", SCHEMA, dialect="duckdb", target="duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code in (RefusalCode.DECISION_TIMEOUT, RefusalCode.PARSE_ERROR), verdict
+    assert time.monotonic() - started < 5, "refused, but long after the deadline"
+
+
+def test_a_read_whose_parse_never_returns_is_refused_at_the_deadline(parse_never_returns):
+    started = time.monotonic()
+    with _safety_net():
+        verdict = decide(f"SELECT {NEVER} FROM claim", SCHEMA, dialect="duckdb", target="duckdb")
     assert _timed_out(verdict), verdict
     assert time.monotonic() - started < 5, "refused, but long after the deadline"
 
 
-def test_a_write_whose_parse_never_returns_is_refused_at_the_deadline():
+def test_a_write_whose_parse_never_returns_is_refused_at_the_deadline(parse_never_returns):
     grants = GrantSet(frozenset(SCHEMA), writable=frozenset(SCHEMA))
     with _safety_net():
-        verdict = decide_write("INSERT INTO scratch (id, region) SELECT struct(id, not), region FROM claim",
+        verdict = decide_write(f"INSERT INTO scratch (id, region) SELECT {NEVER}, region FROM claim",
                                SCHEMA, grants, dialect="duckdb", target="duckdb",
                                policy=AccessPolicy(policy_schema=SCHEMA), writes_enabled=True)
     assert _timed_out(verdict), verdict
 
 
-def test_a_row_filter_whose_parse_never_returns_is_refused_at_the_deadline():
-    policy = AccessPolicy(row_filters={"claim": "struct(id, not) IS NOT NULL"}, policy_schema=SCHEMA)
+def test_a_row_filter_whose_parse_never_returns_is_refused_at_the_deadline(parse_never_returns):
+    policy = AccessPolicy(row_filters={"claim": f"{NEVER} IS NOT NULL"}, policy_schema=SCHEMA)
     with _safety_net():
         verdict = decide("SELECT id FROM claim", SCHEMA, dialect="duckdb", target="duckdb", policy=policy)
     assert _timed_out(verdict), verdict
 
 
-def test_off_the_main_thread_as_a_door_runs_it_the_thread_is_freed():
+def test_off_the_main_thread_as_a_door_runs_it_the_thread_is_freed(parse_never_returns):
     # The server decides in a thread pool, where no signal reaches: the deadline is per thread.
     out = []
     worker = threading.Thread(target=lambda: out.append(
-        decide("SELECT struct(id, not) FROM claim", SCHEMA, dialect="duckdb", target="duckdb")), daemon=True)
+        decide(f"SELECT {NEVER} FROM claim", SCHEMA, dialect="duckdb", target="duckdb")), daemon=True)
     worker.start()
     worker.join(SAFETY_S)
     assert not worker.is_alive(), "the deciding thread is still running"
     assert out and _timed_out(out[0]), out
 
 
-def test_the_thread_decides_normally_after_a_timeout():
+def test_the_thread_decides_normally_after_a_timeout(parse_never_returns):
     with _safety_net():
-        assert _timed_out(decide("SELECT struct(id, not) FROM claim", SCHEMA, dialect="duckdb", target="duckdb"))
+        assert _timed_out(decide(f"SELECT {NEVER} FROM claim", SCHEMA, dialect="duckdb", target="duckdb"))
         assert isinstance(decide("SELECT id FROM claim", SCHEMA, dialect="duckdb", target="duckdb"), Approved)
 
 
@@ -289,7 +331,7 @@ def test_waiting_on_a_shared_reader_does_not_count(module, lock, sql, policy, re
         assert isinstance(verdict, Refusal) and verdict.code is refused_as, verdict
 
 
-def test_a_timeout_landing_in_the_cleanup_leaves_the_thread_with_no_stale_deadline(monkeypatch):
+def test_a_timeout_landing_in_the_cleanup_leaves_the_thread_with_no_stale_deadline(monkeypatch, parse_never_returns):
     # Landing at the start of `within`'s cleanup skipped the rest of it, and the thread kept a clock
     # every later decision read as an outer deadline, so ran with none (Codex's second review). The
     # landing is made deterministic with a trace hook that raises there once, as the timer would.
@@ -319,7 +361,7 @@ def test_a_timeout_landing_in_the_cleanup_leaves_the_thread_with_no_stale_deadli
         assert raised, "the cleanup line was never reached, so this shows nothing"
         assert _timed_out(first_verdict), first_verdict
         assert getattr(deadline._active, "clock", None) is None
-        assert _timed_out(decide("SELECT struct(id, not) FROM claim", SCHEMA, dialect="duckdb", target="duckdb"))
+        assert _timed_out(decide(f"SELECT {NEVER} FROM claim", SCHEMA, dialect="duckdb", target="duckdb"))
 
 
 def test_a_clock_fires_once_and_a_resume_after_it_arms_nothing():

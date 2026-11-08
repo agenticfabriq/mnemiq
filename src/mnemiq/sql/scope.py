@@ -13,6 +13,12 @@ from mnemiq.sql.identifiers import (resolve, resolve_identifier, resolve_name, r
 from mnemiq.sql.qualify import object_key
 
 
+def _set_op_scopes(scope):
+    """A set-operation scope's branch scopes. sqlglot renamed Scope.union_scopes to
+    set_operation_scopes in 30.19; read whichever this version has (M228)."""
+    return getattr(scope, "set_operation_scopes", None) or getattr(scope, "union_scopes", None) or []
+
+
 def _unscoped_ctes(ast: exp.Expression, root) -> bool:
     """True when the statement holds CTEs the scope builder will not descend into.
 
@@ -693,8 +699,8 @@ def fields_as_members(ast: exp.Expression, dialect: str | None = None,
     def columns_of(source) -> set[str]:
         if isinstance(source, exp.Table):
             return set(known.get(object_key(source), ()))  # a copy: EXCLUDE edits it per source
-        if source.union_scopes:
-            return set().union(*(columns_of(branch) for branch in source.union_scopes))
+        if _set_op_scopes(source):
+            return set().union(*(columns_of(branch) for branch in _set_op_scopes(source)))
         found: set[str] = set()
         for select in source.expression.selects:
             star = select if isinstance(select, exp.Star) else (
@@ -741,6 +747,15 @@ def fields_as_members(ast: exp.Expression, dialect: str | None = None,
         scopes = list(root.traverse())
         try:
             selected = {id(scope): resolved(scope.selected_sources) for scope in scopes}
+            # sqlglot 30.17+ gives an UPDATE/DELETE a parent scope that `root.traverse()` does not
+            # yield, so a write's subquery chains up to it; include those parents so the chain walk
+            # below does not KeyError. Their sources are the write's, already carried in `targets`,
+            # so this adds only what the write scope itself selects (e.g. an UPDATE ... FROM) (M228).
+            for scope in scopes:
+                parent = scope.parent
+                while parent is not None and id(parent) not in selected:
+                    selected[id(parent)] = resolved(parent.selected_sources)
+                    parent = parent.parent
         except OptimizeError:
             # Two sources of one scope go by one name, which DuckDB runs (`FROM claim, claim`), so
             # which one a qualifier reads cannot be told: refused, not read as either.
@@ -1118,8 +1133,8 @@ def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None
         # AS (SELECT 1)` read bare and qualified went unexposed and fell closed outward); a star
         # there is read by position, which `bound_by_position` refuses where it reaches a base
         # table, so nothing is exposed under the name here.
-        if scope.union_scopes:
-            return _exposure(scope.union_scopes[0], name, column, columns, dialect, seen, listed)
+        if _set_op_scopes(scope):
+            return _exposure(_set_op_scopes(scope)[0], name, column, columns, dialect, seen, listed)
         index = listed.index(name)
         selects = scope.expression.selects
         if index < len(selects) and _star_of(selects[index]) is None:
@@ -1132,18 +1147,18 @@ def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None
     # position, which `bound_by_position` refuses where it reaches a base table.
     renamed = len(listed) if listed else 0
     seen = seen | {id(scope)}
-    if scope.union_scopes:
+    if _set_op_scopes(scope):
         # The branches' names are the first branch's. A star in a branch binds by position,
         # which no name can read: `check_shape` refuses it (M183); here, fail-closed, the first
         # base table under the branches.
-        for branch in scope.union_scopes:
+        for branch in _set_op_scopes(scope):
             for projection in branch.expression.selects:
                 if _star_of(projection) is not None:
                     first = next((object_key(source)
                                   for _, source in branch.selected_sources.values()
                                   if isinstance(source, exp.Table)), None)
                     return ("first", first) if first else _NAMED
-        return _exposure(scope.union_scopes[0], name, column, columns, dialect, seen)
+        return _exposure(_set_op_scopes(scope)[0], name, column, columns, dialect, seen)
     for position, projection in enumerate(scope.expression.selects):
         star = _star_of(projection)
         if position < renamed:
@@ -1317,8 +1332,8 @@ def _projected_names(scope, columns, dialect: str | None, seen: frozenset[int]) 
     if id(scope) in seen:
         return None
     seen = seen | {id(scope)}
-    if scope.union_scopes:
-        return _projected_names(scope.union_scopes[0], columns, dialect, seen)
+    if _set_op_scopes(scope):
+        return _projected_names(_set_op_scopes(scope)[0], columns, dialect, seen)
     names: list[str] = []
     for projection in scope.expression.selects:
         star = _star_of(projection)

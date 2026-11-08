@@ -45,12 +45,14 @@ def _duck():
 
 
 def test_sqlglot_s_print_of_the_filter_keeps_a_row_the_text_does_not():
-    # The defect's control: the text keeps nothing, sqlglot's print of it keeps every row.
+    # The defect's control: the text keeps nothing, sqlglot 30.12's print of it keeps every row.
+    # 30.29 prints the null order and keeps what the text keeps (M228); the filter is installed as
+    # written either way, so a print that loses an argument again changes nothing.
     printed = sqlglot.transpile(LOSSY, read="duckdb", write="duckdb")[0]
-    assert "NULLS FIRST" not in printed, printed
     con = _duck()
     assert con.execute(f"SELECT id FROM claim WHERE {LOSSY}").fetchall() == []
-    assert con.execute(f"SELECT id FROM claim WHERE {printed} ORDER BY id").fetchall() == [(1,), (2,), (3,)]
+    printed_rows = con.execute(f"SELECT id FROM claim WHERE {printed} ORDER BY id").fetchall()
+    assert ("NULLS FIRST" in printed, printed_rows) in [(False, [(1,), (2,), (3,)]), (True, [])], printed
 
 
 def test_a_governed_read_runs_the_filter_as_written():
@@ -504,9 +506,11 @@ def test_a_quoted_name_the_parse_drops_is_never_excused_as_a_keyword(filt):
 
 
 def test_a_quoted_name_is_held_only_by_a_quoted_name_in_the_parse():
-    # An unquoted `d` the parse keeps does not stand in for the quoted `"d"` it dropped.
+    # An unquoted `d` the parse keeps does not stand in for the quoted `"d"` it dropped. `encode`'s
+    # second argument is dropped by sqlglot 30.12 and 30.29 alike; `list_reverse_sort`'s, which this
+    # test used, is kept by 30.29 (M228).
     from mnemiq.sql import rls
-    filt = 'list_reverse_sort([id], "d") IS NOT NULL AND d > 0'
+    filt = 'encode(region, "d") IS NOT NULL AND d > 0'
     assert rls._unaccounted_names(filt, "duckdb") == ["d"]
 
 

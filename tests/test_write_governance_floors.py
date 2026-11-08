@@ -369,7 +369,7 @@ def test_runtime_write_supplies_the_view_snapshot_to_the_decider():
 def test_the_with_floor_is_not_keyed_on_a_sqlglot_arg_name():
     """The floor must survive the arg being spelled differently, because it is.
 
-    `pyproject.toml` declares `sqlglot>=25`; the pinned 30.12.0 calls this arg `with_` and
+    `pyproject.toml` declares `sqlglot>=25`; 30.12.0 and later (30.29 as locked) call this arg `with_` and
     25.34.1 calls it `with`. A lookup by name returns None on the other spelling, the floor never
     fires, and the statement is approved with no guard having run -- failing OPEN, silently,
     on a dependency bump rather than on a code change.
