@@ -1693,10 +1693,14 @@ def _states_no_bound(limit: exp.Expression, engine: str) -> bool:
     written and ran uncapped (the ui lane's review of #156). Only a negative PLAIN NUMBER: `-(-5)` is
     five rows and `-0` none, so anything else under the minus is left to `_written_count`, which
     refuses it. Keyed on the engine that runs the statement, like the rest of this module; elsewhere
-    a negative LIMIT is an error, and it is refused there too. `LIMIT ALL` parses as no limit."""
+    a negative LIMIT is an error, and it is refused there too. `LIMIT ALL` means no bound as well:
+    sqlglot 30.12 parsed it as no limit, and 30.29 keeps it as the keyword, a `Var`, where the dialect
+    reads it as one (Postgres, DuckDB); a quoted `"all"` is a column, and refused (M228)."""
     if isinstance(limit, exp.Fetch):
         return False
     if isinstance(limit.expression, exp.Null):
+        return True
+    if isinstance(limit.expression, exp.Var) and limit.expression.name.upper() == "ALL":
         return True
     minus = limit.expression
     if not isinstance(minus, exp.Neg) or engine.lower() != "sqlite":
