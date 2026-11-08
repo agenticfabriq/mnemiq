@@ -1,5 +1,7 @@
 """Every identity configuration the doors cannot enforce refuses to start, each with a message naming what to change."""
 
+import json
+
 import pytest
 
 from mnemiq.config import Settings
@@ -206,3 +208,23 @@ def test_the_error_is_a_clean_exit():
     from mnemiq.auth.config import AuthConfigError
 
     assert issubclass(AuthConfigError, SystemExit)
+
+
+def test_a_jwks_file_with_no_usable_key_refuses_to_start(tmp_path):
+    for body in ('{"keys": []}', "{broken", '{"keys": [{"kty": "oct", "k": "AAAA"}]}'):
+        path = tmp_path / "jwks.json"
+        path.write_text(body)
+        _refused("MNEMIQ_OIDC_JWKS_FILE", **{**OIDC, "oidc_jwks_file": str(path)})
+    _refused("MNEMIQ_OIDC_JWKS_FILE", **{**OIDC, "oidc_jwks_file": str(tmp_path / "missing.json")})
+
+
+def test_a_jwks_file_with_a_signing_key_starts(tmp_path):
+    from tests.auth_keys import jwks_for, rsa_key
+
+    path = tmp_path / "jwks.json"
+    path.write_text(json.dumps(jwks_for((rsa_key(), "k1"))))
+    assert _cfg(**{**OIDC, "oidc_jwks_file": str(path)}).oidc.jwks_file == str(path)
+
+
+def test_an_issuer_named_like_open_webuis_refuses_to_start():
+    _refused("MNEMIQ_OIDC_ISSUER", **{**OIDC, "oidc_issuer": "open-webui"})

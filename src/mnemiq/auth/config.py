@@ -96,6 +96,22 @@ def check_mcp_audience(audience: str) -> None:
             f"{problem} (got {audience!r})")
 
 
+def _check_jwks_file(path: str) -> None:
+    import json
+
+    import jwt
+
+    from mnemiq.auth.jwks import usable_keys
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            keys = usable_keys(json.load(fh))
+    except (OSError, ValueError, jwt.PyJWTError) as exc:
+        raise AuthConfigError(f"MNEMIQ_OIDC_JWKS_FILE could not be read as a key set ({type(exc).__name__})") from exc
+    if not keys:
+        raise AuthConfigError("MNEMIQ_OIDC_JWKS_FILE holds no usable signing key: each needs a `kid`")
+
+
 def _blank(value: str | None) -> bool:
     return value is None or not value.strip()
 
@@ -137,8 +153,13 @@ def auth_config_from_settings(settings, *, validate_map=None) -> AuthConfig | No
         if _blank(settings.oidc_audience):
             raise AuthConfigError("MNEMIQ_OIDC_AUDIENCE is required with MNEMIQ_OIDC_ISSUER: the `aud` a token "
                                   "for this deployment carries, so a token minted for another service is refused")
+        if settings.oidc_issuer.strip() == OPENWEBUI_ISSUER:
+            raise AuthConfigError(f"MNEMIQ_OIDC_ISSUER cannot be {OPENWEBUI_ISSUER!r}: that is Open WebUI's own issuer, "
+                                  "and the identity map and principals keep the two apart by it")
         if settings.oidc_jwks_url and settings.oidc_jwks_file:
             raise AuthConfigError("set MNEMIQ_OIDC_JWKS_URL or MNEMIQ_OIDC_JWKS_FILE, not both")
+        if settings.oidc_jwks_file:
+            _check_jwks_file(settings.oidc_jwks_file)
         if settings.openwebui_audience is not None and settings.openwebui_audience == settings.oidc_audience:
             raise AuthConfigError("MNEMIQ_OPENWEBUI_AUDIENCE must differ from MNEMIQ_OIDC_AUDIENCE: each door "
                                   "refuses a token carrying the other's audience, so equal values refuse every token")

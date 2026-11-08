@@ -12,6 +12,7 @@ from __future__ import annotations
 import jwt
 
 from mnemiq.auth.config import OPENWEBUI_ISSUER, OpenWebUISettings
+from mnemiq.auth.jwks import INVALID_SUBJECT
 from mnemiq.auth.token import TokenRejected
 
 
@@ -38,9 +39,13 @@ class OpenWebUIVerifier:
             raise TokenRejected("wrong issuer") from exc
         except jwt.MissingRequiredClaimError as exc:
             raise TokenRejected(f"token is missing {exc.claim}") from exc
+        except INVALID_SUBJECT as exc:
+            raise TokenRejected("token sub is not a non-empty string") from exc
         except (jwt.PyJWTError, ValueError, TypeError) as exc:
             raise TokenRejected("invalid token") from exc
-        sub = str(found["sub"])
+        if not isinstance(found["sub"], str) or not found["sub"].strip():
+            raise TokenRejected("token sub is not a non-empty string")
+        sub = found["sub"]
         if found["exp"] - found["iat"] > self._ow.max_lifetime_s:
             raise TokenRejected("token lifetime above the maximum", sub=sub)
         if found.get("role") == "pending":

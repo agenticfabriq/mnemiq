@@ -112,3 +112,8 @@ def test_the_email_is_never_logged(caplog):
 def test_a_rejection_names_the_sub_only_after_the_signature_verified():
     assert _rejected(hs256(owui_claims(role="pending"), SECRET), "pending").sub == "owui-user-1"
     assert _rejected(hs256(owui_claims(), b"t" * 32), "signature").sub is None
+
+
+@pytest.mark.parametrize("sub", ["", 7])
+def test_an_open_webui_sub_that_is_not_a_non_empty_string_is_rejected(sub):
+    _rejected(hs256(owui_claims(sub=sub), SECRET), "sub")

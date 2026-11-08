@@ -357,3 +357,20 @@ def test_a_hung_fetch_is_not_started_twice():
     release.set()
     v._keys._executor.shutdown(wait=True)  # anything queued behind the hung fetch has now run
     assert fetch.calls == 1
+
+
+def test_a_jwks_file_with_no_usable_key_denies_rather_than_fails(tmp_path, caplog):
+    """Startup refuses such a file; one that changes after startup still denies with a reason, never a 500."""
+    from mnemiq.auth.token import JwtIdentityVerifier
+
+    path = tmp_path / "jwks.json"
+    path.write_text('{"keys": []}')
+    v = JwtIdentityVerifier(_oidc(jwks_url=None, jwks_file=str(path)), audience=AUDIENCE, refuse_audience=None)
+    with caplog.at_level(logging.ERROR, logger="mnemiq.auth"):
+        _rejected(v, mint(claims()), "signing keys unavailable")
+    assert "JWKS" in caplog.text
+
+
+@pytest.mark.parametrize("sub", ["", 7, ["user-1"]])
+def test_a_sub_that_is_not_a_non_empty_string_is_rejected(sub):
+    _rejected(_verifier(), mint(claims(sub=sub)), "sub")

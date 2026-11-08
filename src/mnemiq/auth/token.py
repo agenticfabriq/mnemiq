@@ -17,6 +17,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import jwt
 
 from mnemiq.auth.config import OidcSettings
+from mnemiq.auth.jwks import INVALID_SUBJECT, usable_keys
 
 logger = logging.getLogger("mnemiq.auth")
 
@@ -65,7 +66,7 @@ class _KeySet:
         if self._file is not None:
             with self._state:
                 if not self._loaded_file:
-                    self._keys = self._parse(self._read_file())
+                    self._keys = self._read_file()
                     self._loaded_file = True
                 found = self._keys.get(kid)
             if found is None:
@@ -105,21 +106,22 @@ class _KeySet:
         with self._state:
             self._keys, self._fetched_at = keys, now
 
-    def _read_file(self) -> dict:
+    def _read_file(self) -> dict[str, jwt.PyJWK]:
+        """Startup refuses a file it cannot use; one that changed since still denies with a reason, never a 500."""
         try:
-            with open(self._file) as fh:
-                return json.load(fh)
-        except (OSError, json.JSONDecodeError) as exc:
+            with open(self._file, encoding="utf-8") as fh:
+                keys = usable_keys(json.load(fh))
+        except (OSError, ValueError, jwt.PyJWTError) as exc:
             logger.error("JWKS file %s could not be read (%s); denying every token", self._file, type(exc).__name__)
             raise TokenRejected("signing keys unavailable") from exc
+        if not keys:
+            logger.error("JWKS file %s holds no usable signing key; denying every token", self._file)
+            raise TokenRejected("signing keys unavailable")
+        return keys
 
     @staticmethod
     def _parse(data: dict) -> dict[str, jwt.PyJWK]:
-        keys = {}
-        for entry in jwt.PyJWKSet.from_dict(data).keys:
-            if entry.key_id and entry.public_key_use in (None, "sig"):
-                keys[entry.key_id] = entry
-        return keys
+        return usable_keys(data)
 
 
 class JwtIdentityVerifier:
@@ -166,8 +168,12 @@ class JwtIdentityVerifier:
             raise TokenRejected("wrong issuer") from exc
         except jwt.MissingRequiredClaimError as exc:
             raise TokenRejected(f"token is missing {exc.claim}") from exc
+        except INVALID_SUBJECT as exc:
+            raise TokenRejected("token sub is not a non-empty string") from exc
         except (jwt.PyJWTError, ValueError, TypeError) as exc:
             raise TokenRejected("invalid token") from exc
+        if not isinstance(found["sub"], str) or not found["sub"].strip():
+            raise TokenRejected("token sub is not a non-empty string")
         sub, jti = str(found["sub"]), found.get("jti") if isinstance(found.get("jti"), str) else None
         audiences = found["aud"] if isinstance(found["aud"], list) else [found["aud"]]
         if self._refuse is not None and self._refuse in audiences:
