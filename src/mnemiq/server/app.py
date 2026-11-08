@@ -5,9 +5,11 @@ Deferrals are 200s with deferred=true -- refusal is an answer, not a transport e
 
 from __future__ import annotations
 
+import ipaddress
+import logging
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -15,9 +17,11 @@ from pydantic import BaseModel
 from mnemiq.agent.modes import MODES
 from mnemiq.agent.route import UnknownMode
 from mnemiq.profiles import UnknownProfile
-from mnemiq.contract import HistoryTurn
+from mnemiq.contract import HistoryTurn, IdentityContext
 from mnemiq.server.serialize import answer_payload
 from mnemiq.server.sse import chat_stream
+
+logger = logging.getLogger(__name__)
 
 # The built workbench lands inside the package so a wheel picks it up with no manifest
 # entry. It is gitignored: the repo carries the source, the build carries the bundle.
@@ -63,20 +67,58 @@ class _Workbench(StaticFiles):
         return response
 
 
+def caller_dependency(doors, door: str = "v1"):
+    """The FastAPI dependency that turns a request into its verified caller at `door` ("v1" or "openai"), or into
+    the door's refusal: 401 with `WWW-Authenticate: Bearer`, 403 for another tenant, 503 for an unreadable map.
+
+    Every value of every header goes to the door, keyed by lowercase name, so a credential sent twice is seen as
+    sent twice. A plain function, so FastAPI runs it in a worker thread: a key fetch may block."""
+    from mnemiq.auth.doors import DoorRefusal
+
+    judge = getattr(doors, door)
+
+    def caller(request: Request) -> IdentityContext:
+        headers: dict[str, list[str]] = {}
+        for name, value in request.headers.items():
+            headers.setdefault(name.lower(), []).append(value)
+        try:
+            return judge(headers)
+        except DoorRefusal as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.reason,
+                                headers={"WWW-Authenticate": "Bearer"} if exc.status == 401 else None) from None
+
+    return caller
+
+
 def build_app(
-    runtime, identity, heartbeat_s: float = 15.0, static_dir: Path | None = None
+    runtime, identity, heartbeat_s: float = 15.0, static_dir: Path | None = None, *, doors=None, mcp_app=None
 ) -> FastAPI:
+    """`identity` serves every caller when `doors` is None (no issuer configured). With doors, every /v1 route
+    takes the caller its token names, and `identity` is never used.
+
+    Scopes gate MCP's tools only, because no route here writes: `Runtime.write` is reached from MCP's `db_write`
+    and the CLI alone. A write route added here would need the `db.write` scope too."""
     app = FastAPI(title="mnemiq", version="v1")
+    if doors is None:
+        def caller() -> IdentityContext:
+            return identity
+    else:
+        caller = caller_dependency(doors, "v1")
 
     @app.get("/healthz")
     def healthz() -> dict:
         return {"ok": True}
 
+    @app.get("/v1/whoami")
+    def whoami(who: IdentityContext = Depends(caller)) -> dict:
+        # What the workbench keys its stored threads by, so one browser never shows a user another's.
+        return {"principal_id": who.principal_id, "tenant_id": who.tenant_id}
+
     @app.post("/v1/ask")
-    def ask(body: AskBody) -> dict:
+    def ask(body: AskBody, who: IdentityContext = Depends(caller)) -> dict:
         try:
             return answer_payload(
-                runtime.ask(body.question, identity, mode=body.mode, history=body.history, profile=body.profile)
+                runtime.ask(body.question, who, mode=body.mode, history=body.history, profile=body.profile)
             )
         except UnknownProfile as exc:
             # Composed from what this caller may pick. Unknown and forbidden read alike, and neither repeats the name.
@@ -94,19 +136,20 @@ def build_app(
             ) from exc
 
     @app.post("/v1/chat")
-    def chat(body: AskBody) -> StreamingResponse:
+    def chat(body: AskBody, who: IdentityContext = Depends(caller)) -> StreamingResponse:
+        # The caller is resolved before the stream starts, so a refusal is a plain 401, never an error frame.
         return StreamingResponse(
-            chat_stream(runtime, identity, body.question, body.mode,
+            chat_stream(runtime, who, body.question, body.mode,
                         heartbeat_s=heartbeat_s, history=body.history, profile=body.profile),
             media_type="text/event-stream",
             headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
         )
 
     @app.get("/v1/schema")
-    def schema() -> dict:
+    def schema(who: IdentityContext = Depends(caller)) -> dict:
         # `scope` rather than `schema`: the opening screen's starters are access-scoped from the
         # same grant resolution as the cards, so the two cannot disagree (M32).
-        return runtime.scope(identity)
+        return runtime.scope(who)
 
     # Mounted last, so it can only claim paths no API route above already answered.
     built = static_dir if static_dir is not None else STATIC_DIR
@@ -134,8 +177,37 @@ def serve_http(settings, host: str, port: int) -> None:
         raise SystemExit(
             "the HTTP server needs the server extra: uv sync --extra server"
         ) from exc
+    from mnemiq.auth.config import auth_config_from_settings
     from mnemiq.config import identity_from_settings
     from mnemiq.runtime import build_runtime
 
+    # Before the runtime: a configuration the doors cannot enforce stops here, having opened nothing.
+    cfg = auth_config_from_settings(settings) if settings is not None else None
     runtime = build_runtime(settings)
-    _run_uvicorn(build_app(runtime, identity_from_settings(settings)), host=host, port=port)
+    doors = None
+    if cfg is not None:
+        from mnemiq.auth.doors import HttpDoors
+        from mnemiq.auth.identity_map import IdentityMap, IdentityMapUnavailable
+
+        doors = HttpDoors(cfg)
+        if cfg.map_path:
+            try:
+                IdentityMap.read(cfg.map_path, issuers=cfg.issuers,
+                                 groups_passthrough=bool(cfg.oidc and cfg.oidc.groups_claim),
+                                 oidc_issuer=cfg.oidc.issuer if cfg.oidc else None,
+                                 ).warn_undeclared_roles(getattr(runtime, "authz", None))
+            except IdentityMapUnavailable:
+                pass  # logged where it was read; every request is refused until it is fixed
+    elif not _loopback(host):
+        logger.warning("serving every caller on %s as the one identity in MNEMIQ_PRINCIPAL/MNEMIQ_ROLES; set "
+                       "MNEMIQ_OIDC_ISSUER to take each request's identity from its own token", host)
+    _run_uvicorn(build_app(runtime, identity_from_settings(settings), doors=doors), host=host, port=port)
+
+
+def _loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
