@@ -1,28 +1,19 @@
 """AG-UI-vocabulary SSE framing.
 
-The engine is synchronous and runs on a worker thread, so progress reaches this
-generator through one asyncio.Queue per request. The engine's `emit` callback is a
-plain sync function whose whole body schedules a thread-safe put; the queue is then
-the single ordering point for everything that reaches the client, and the only thing
-the HTTP layer has to know about.
-
-The engine's completion is itself queued, as a sentinel pushed by a done-callback.
-That keeps ordering honest -- every step already emitted sits ahead of it in the FIFO
--- and removes any race between "is the future done" and "is the queue drained".
+The engine's progress reaches this generator through `server/pump.py`'s `EnginePump`: the worker thread, the
+queue, the heartbeat and the completion sentinel. This module frames what it yields.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from uuid import uuid4
 
 from mnemiq.agent.route import UnknownMode
 from mnemiq.profiles import UnknownProfile
+from mnemiq.server.pump import HEARTBEAT, EnginePump
 from mnemiq.server.serialize import answer_payload, result_payload
-
-_DONE = object()
 
 
 def frame(payload: dict) -> str:
@@ -79,33 +70,20 @@ async def chat_stream(runtime, identity, question: str, mode: str | None,
     run_id, msg_id = uuid4().hex, uuid4().hex
     yield frame({"type": "RUN_STARTED", "runId": run_id})
 
-    loop = asyncio.get_running_loop()
-    queue: asyncio.Queue = asyncio.Queue()
-
-    def emit(event: dict) -> None:
-        # Called from the engine's worker thread -- never touch the queue directly.
-        loop.call_soon_threadsafe(queue.put_nowait, event)
-
-    fut = loop.run_in_executor(
-        None, lambda: runtime.ask(question, identity, mode=mode, emit=emit, history=history, profile=profile)
+    pump = EnginePump(
+        lambda emit: runtime.ask(question, identity, mode=mode, emit=emit, history=history, profile=profile),
+        heartbeat_s,
     )
-    fut.add_done_callback(lambda _: queue.put_nowait(_DONE))
-
-    while True:
-        try:
-            item = await asyncio.wait_for(queue.get(), timeout=heartbeat_s)
-        except TimeoutError:  # the engine is just slow: keep the proxy path open
+    async for item in pump.events():
+        if item is HEARTBEAT:  # the engine is just slow: keep the proxy path open
             yield ": keep-alive\n\n"
-            continue
-        if item is _DONE:
-            break
-        if item.get("kind") == "result":  # the verified rows, ahead of the prose
+        elif item.get("kind") == "result":  # the verified rows, ahead of the prose
             yield frame({"type": "CUSTOM", "name": "mnemiq.result", "value": result_payload(item)})
         else:
             yield frame(step_frame(item))
 
     try:
-        ans = fut.result()
+        ans = pump.result()
     except Exception as exc:  # engine failure -> in-band error, stream ends
         # Logged with the traceback and the run id BEFORE anything is yielded, so a
         # failure is diagnosable even if the client hangs up on the next frame.
