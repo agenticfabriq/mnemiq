@@ -50,12 +50,15 @@ named by a hash of the identity (never the id itself), and purges every other
 user's when a different one loads. An engine without that route, or one serving
 its one configured identity, keeps a single history, as before.
 
-Behind a sign-in proxy, a `401` or a redirect to sign in means the session ended:
-the workbench purges that user's threads and reloads, so the proxy signs them in
-again. A second time within 30 seconds it asks instead, so a misconfigured proxy
-cannot loop the page. A `403` reads as not permitted, and a `503` or a request
-that never got an answer as the service being unavailable; neither reloads or
-touches the saved threads.
+Behind a sign-in proxy, a verified user gets a **Sign out** control: it clears
+their threads and mode, then sends the browser to the proxy's own sign-out. A
+`401` or a redirect to sign in means only that the session expired: the
+workbench clears the screen, keeps the saved threads, and reloads so the proxy
+signs the user in again (the same user gets their threads back; anyone else
+purges them on load). A second time within 30 seconds it asks instead, so a
+misconfigured proxy cannot loop the page. A `403` reads as not permitted, and a
+`503` or a request that never got an answer as the service being unavailable;
+neither reloads or touches the saved threads.
 
 ## Streaming: stages, not tokens
 

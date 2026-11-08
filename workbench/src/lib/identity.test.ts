@@ -254,16 +254,27 @@ describe("moving the legacy history near the storage quota", () => {
 });
 
 describe("signOut", () => {
-  it("purges the signed-in user's threads and mode", async () => {
+  it("purges the signing-out user's threads and mode", async () => {
     const ns = (await namespaceOf(ALICE))!;
     enter(ns);
     localStorage.setItem(keyFor(ns, "threads"), "[alice's]");
     localStorage.setItem(keyFor(ns, "mode"), "deep");
 
-    signOut();
+    signOut(ns);
 
     expect(localStorage.getItem(keyFor(ns, "threads"))).toBeNull();
     expect(localStorage.getItem(keyFor(ns, "mode"))).toBeNull();
+  });
+
+  it("touches no other namespace", async () => {
+    const alice = (await namespaceOf(ALICE))!;
+    const bob = (await namespaceOf(BOB))!;
+    localStorage.setItem(keyFor(alice, "threads"), "[alice's]");
+    localStorage.setItem(keyFor(bob, "threads"), "[bob's]");
+
+    signOut(alice);
+
+    expect(localStorage.getItem(keyFor(bob, "threads"))).toBe("[bob's]");
   });
 });
 

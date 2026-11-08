@@ -247,20 +247,24 @@ describe("a malformed identity", () => {
 });
 
 describe("signed out", () => {
-  it("purges the user's threads and reloads when whoami answers 401", async () => {
+  // An expired session is not a sign-out: the screen and the tab's memory are cleared, the
+  // saved threads are kept, and the page reloads to sign in again.
+  it("clears the screen and reloads, keeping the saved threads, when whoami answers 401", async () => {
     await signedInBefore(ALICE, "alice's question");
+    const before = snapshot();
     serve({ "/v1/whoami": () => new Response("", { status: 401 }) });
     const reload = vi.fn();
 
     render(<App reload={reload} />);
 
     await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
-    expect(namespaced()).toEqual([]);
+    await settle();
+    expect(snapshot()).toEqual(before);
     expect(screen.queryAllByText("alice's question")).toHaveLength(0);
   });
 
-  it("purges and reloads when the schema request is redirected to sign in", async () => {
-    await signedInBefore(ALICE, "alice's question");
+  it("clears the screen and reloads, keeping the saved threads, when the schema request is redirected", async () => {
+    const alice = await signedInBefore(ALICE, "alice's question");
     serve({ "/v1/whoami": () => json(ALICE), "/v1/schema": () => OPAQUE_REDIRECT });
     const reload = vi.fn();
 
@@ -268,12 +272,12 @@ describe("signed out", () => {
 
     await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
     await settle();
-    expect(namespaced()).toEqual([]);
     expect(screen.queryAllByText("alice's question")).toHaveLength(0);
+    expect(localStorage.getItem(keyFor(alice, "threads"))).toContain("alice's question");
   });
 
-  it("purges and reloads when a question is answered 401, and writes nothing back", async () => {
-    await signedInBefore(ALICE, "alice's question");
+  it("clears the screen and reloads, keeping the saved threads, when a question is answered 401", async () => {
+    const alice = await signedInBefore(ALICE, "alice's question");
     serve({
       "/v1/whoami": () => json(ALICE),
       "/v1/schema": SCOPE,
@@ -288,13 +292,50 @@ describe("signed out", () => {
 
     await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
     await settle();
-    expect(namespaced()).toEqual([]);
     expect(screen.queryAllByText("alice's question")).toHaveLength(0);
+    expect(localStorage.getItem(keyFor(alice, "threads"))).toContain("alice's question");
+  });
+
+  it("gives the same user their threads back once they have signed in again", async () => {
+    await signedInBefore(ALICE, "alice's question");
+    serve({ "/v1/whoami": () => new Response("", { status: 401 }) });
+    const reload = vi.fn();
+    render(<App reload={reload} />);
+    await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
+    cleanup();
+
+    serve({ "/v1/whoami": () => json(ALICE), "/v1/schema": SCOPE });
+    render(<App reload={vi.fn()} />);
+
+    expect(await screen.findAllByText("alice's question")).not.toHaveLength(0);
+  });
+
+  it("never lets a late refusal, from a tab opened before someone else signed in, erase their history", async () => {
+    await signedInBefore(ALICE, "alice's question");
+    serve({
+      "/v1/whoami": () => json(ALICE),
+      "/v1/schema": SCOPE,
+      "/v1/chat": () => new Response("", { status: 401 }),
+    });
+    const reload = vi.fn();
+    render(<App reload={reload} />);
+    await workbench();
+
+    // Bob signs in through another tab, which loads the workbench as him.
+    const bob = await signedInBefore(BOB, "bob's question");
+    // Alice's old tab asks a question; the proxy now holds no session for her.
+    fireEvent.click(await workbench());
+    fireEvent.click(await screen.findByRole("button", { name: STARTER }));
+
+    await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
+    await settle();
+    expect(localStorage.getItem(keyFor(bob, "threads"))).toContain("bob's question");
+    expect(localStorage.getItem(keyFor(bob, "mode"))).toBe("deep");
   });
 
   it("asks the user to sign in instead of reloading again within 30 seconds", async () => {
     mayReload(Date.now() - 5_000); // the page reloaded to sign in five seconds ago
-    await signedInBefore(ALICE, "alice's question");
+    const alice = await signedInBefore(ALICE, "alice's question");
     serve({ "/v1/whoami": () => new Response("", { status: 401 }) });
     const reload = vi.fn();
 
@@ -303,11 +344,46 @@ describe("signed out", () => {
     const button = await screen.findByRole("button", { name: "Sign in again" });
     expect(screen.getByText(/session has ended/i)).toBeInTheDocument();
     expect(reload).not.toHaveBeenCalled();
-    expect(namespaced()).toEqual([]);
+    expect(localStorage.getItem(keyFor(alice, "threads"))).toContain("alice's question");
 
     fireEvent.click(button);
     expect(reload).toHaveBeenCalledTimes(1);
   });
+});
+
+describe("signing out", () => {
+  it("offers a verified user a Sign out that clears their threads and mode, then signs out at the proxy", async () => {
+    const alice = await signedInBefore(ALICE, "alice's question");
+    serve({ "/v1/whoami": () => json(ALICE), "/v1/schema": SCOPE });
+    const navigate = vi.fn();
+    const reload = vi.fn();
+    render(<App reload={reload} navigate={navigate} />);
+    expect(await screen.findAllByText("alice's question")).not.toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+
+    // The proxy's own sign-out, sent back to this page afterwards.
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith("/oauth2/sign_out?rd=%2F"));
+    await settle();
+    expect(localStorage.getItem(keyFor(alice, "threads"))).toBeNull();
+    expect(localStorage.getItem(keyFor(alice, "mode"))).toBeNull();
+    expect(screen.queryAllByText("alice's question")).toHaveLength(0);
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  for (const [what, whoami] of [
+    ["an engine without the whoami route", () => new Response("", { status: 404 })],
+    ["the settings identity", () => json({ principal_id: "analyst", tenant_id: "local", verified: false })],
+  ] as const) {
+    it(`offers no Sign out to ${what}, which has no sign-in to end`, async () => {
+      serve({ "/v1/whoami": whoami, "/v1/schema": SCOPE });
+
+      render(<App reload={vi.fn()} navigate={vi.fn()} />);
+
+      await workbench();
+      expect(screen.queryByRole("button", { name: "Sign out" })).not.toBeInTheDocument();
+    });
+  }
 });
 
 describe("refusals that are not a sign-out", () => {

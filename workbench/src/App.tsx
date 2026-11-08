@@ -41,11 +41,17 @@ type Notice = Exclude<Refusal, "signed-out">;
 /** What the page shows before, or instead of, a user's workbench. */
 type Session =
   | { state: "resolving" }
-  | { state: "ready"; shelf: string | null }
+  // `ns` is the identity's namespace, `shelf` where its items are kept (`enter`).
+  | { state: "ready"; ns: string | null; shelf: string | null; verified: boolean }
   | { state: "signed-out"; prompt: boolean }
+  | { state: "leaving"; ns: string | null }
   | { state: "refused"; refusal: Notice };
 
 const RELOAD = () => globalThis.location.reload();
+const NAVIGATE = (url: string) => globalThis.location.assign(url);
+
+/** The sign-in proxy's own sign-out, which ends its session and sends the browser back. */
+const SIGN_OUT = "/oauth2/sign_out";
 
 /** A verified user on a page that cannot hash their identity gets no saved threads. Said,
  *  so that history vanishing on reload is not mistaken for a fault. */
@@ -83,9 +89,16 @@ function SessionNotice({
 
 /**
  * Nothing of anyone's is rendered until the engine says who is asking: the namespace, and the
- * purge of every other one, come first. `reload` is a prop so a test can watch it.
+ * purge of every other one, come first. `reload` and `navigate` are props so a test can watch
+ * them.
  */
-export default function App({ reload = RELOAD }: { reload?: () => void }) {
+export default function App({
+  reload = RELOAD,
+  navigate = NAVIGATE,
+}: {
+  reload?: () => void;
+  navigate?: (url: string) => void;
+}) {
   const [session, setSession] = useState<Session>({ state: "resolving" });
   // A refusal once the workbench is up (the schema's): said above it, the threads kept.
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -96,7 +109,12 @@ export default function App({ reload = RELOAD }: { reload?: () => void }) {
         setNotice(refusal);
         return;
       }
-      signOut();
+      // An expired session clears the screen and this tab's memory, and keeps the saved
+      // threads. The same user usually signs straight back in, and a refusal can arrive late,
+      // from a tab opened before someone else signed in, where a purge would erase the new
+      // user's history. A different user's threads are purged when that user loads (`enter`);
+      // the Sign out control clears the user's own.
+      //
       // Reloading goes back through the sign-in proxy, which signs the user in again. A proxy
       // that cannot would send every load straight back here, so a second reload within the
       // guard window asks the user instead.
@@ -113,10 +131,10 @@ export default function App({ reload = RELOAD }: { reload?: () => void }) {
   useEffect(() => {
     let live = true;
     fetchWhoami()
-      .then(namespaceOf)
-      .then((ns) => {
+      .then(async (who) => ({ ns: await namespaceOf(who), verified: who !== null && who.verified }))
+      .then(({ ns, verified }) => {
         if (!live) return;
-        setSession({ state: "ready", shelf: enter(ns) });
+        setSession({ state: "ready", ns, shelf: enter(ns), verified });
       })
       .catch((error: unknown) => {
         if (!live) return;
@@ -129,8 +147,28 @@ export default function App({ reload = RELOAD }: { reload?: () => void }) {
     };
   }, [refused]);
 
+  const signOutNow = useCallback(() => {
+    setSession((current) => (current.state === "ready" ? { state: "leaving", ns: current.ns } : current));
+  }, []);
+
+  useEffect(() => {
+    if (session.state !== "leaving") return;
+    // Run once the workbench is gone, so nothing is left to write the threads back.
+    signOut(session.ns);
+    const back = `${globalThis.location.pathname}${globalThis.location.search}`;
+    navigate(`${SIGN_OUT}?rd=${encodeURIComponent(back)}`);
+  }, [session, navigate]);
+
   if (session.state === "ready") {
-    return <Workbench key={session.shelf ?? ""} shelf={session.shelf} notice={notice} onRefused={refused} />;
+    return (
+      <Workbench
+        key={session.shelf ?? ""}
+        shelf={session.shelf}
+        notice={notice}
+        onRefused={refused}
+        onSignOut={session.verified ? signOutNow : null}
+      />
+    );
   }
   if (session.state === "refused") return <SessionNotice message={NOTICE[session.refusal]} />;
   if (session.state === "signed-out" && session.prompt) {
@@ -141,18 +179,21 @@ export default function App({ reload = RELOAD }: { reload?: () => void }) {
       />
     );
   }
-  return null; // resolving, or reloading
+  return null; // resolving, reloading, or leaving
 }
 
-/** `shelf`: where this identity's threads and mode are kept (`enter`); null keeps nothing. */
+/** `shelf`: where this identity's threads and mode are kept (`enter`); null keeps nothing.
+ *  `onSignOut`: present when there is a sign-in to end, that is, the identity is verified. */
 function Workbench({
   shelf,
   notice,
   onRefused,
+  onSignOut,
 }: {
   shelf: string | null;
   notice: Notice | null;
   onRefused: (refusal: Refusal) => void;
+  onSignOut: (() => void) | null;
 }) {
   const { runtime, mode, setMode, ask, threads, activeId, selectThread, newChat, deleteThread } =
     useWorkbench(shelf, onRefused);
@@ -187,6 +228,15 @@ function Workbench({
               {scope === null ? "Tables" : `${scope.tables.length} tables`}
             </button>
             <ThemeToggle />
+            {onSignOut && (
+              <button
+                type="button"
+                onClick={onSignOut}
+                className="label border border-rule px-2 py-1 hover:text-ink"
+              >
+                Sign out
+              </button>
+            )}
           </div>
         </header>
 

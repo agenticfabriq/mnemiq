@@ -62,15 +62,19 @@ export async function namespaceOf(who: Whoami | null): Promise<string | null> {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function removeKeys(storage: Storage, doomed: (key: string) => boolean): void {
+  const keys: string[] = [];
+  for (let i = 0; i < storage.length; i++) {
+    const key = storage.key(i);
+    if (key !== null && doomed(key)) keys.push(key);
+  }
+  for (const key of keys) storage.removeItem(key);
+}
+
 /** Remove every namespaced item except those of `keep`. */
 function purgeNamespaces(storage: Storage, keep: string | null): void {
   const own = keep === null ? null : `${PREFIX}${keep}.`;
-  const doomed: string[] = [];
-  for (let i = 0; i < storage.length; i++) {
-    const key = storage.key(i);
-    if (key?.startsWith(PREFIX) && !(own && key.startsWith(own))) doomed.push(key);
-  }
-  for (const key of doomed) storage.removeItem(key);
+  removeKeys(storage, (key) => key.startsWith(PREFIX) && !(own && key.startsWith(own)));
 }
 
 function purgeLegacy(storage: Storage): void {
@@ -153,14 +157,16 @@ export function enter(ns: string | null): string | null {
   return shelf;
 }
 
-/** Signed out: nobody's threads should remain. The remembered namespace stays, so the next
- *  load can tell whether the same user came back. */
-export function signOut(): void {
+/**
+ * An explicit sign-out: the signing-out user's threads and mode go, and nothing else. Nothing
+ * but the Sign out control purges on signing out; an expired session keeps the threads (the
+ * page's handling of a refusal says why).
+ */
+export function signOut(ns: string | null): void {
+  if (ns === null) return;
   try {
     const storage = globalThis.localStorage;
-    if (!storage) return;
-    purgeNamespaces(storage, null);
-    purgeLegacy(storage);
+    if (storage) removeKeys(storage, (key) => key.startsWith(`${PREFIX}${ns}.`));
   } catch {
     // Storage denied: there is nothing in it to purge.
   }
