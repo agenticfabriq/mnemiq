@@ -16,7 +16,7 @@ from mnemiq.sweep.stats import detectable_gain
 
 from .conftest import (
     KEY_ENV, STUB_KEY, UNREACHABLE, answers_file, evidence, graded_sweep, json_lines, out, proposal_file,
-    start_refused_in_instant, tiny_deployment, tiny_files, write_config,
+    start_refused_in_instant, start_that_differs, tiny_deployment, tiny_files, write_config,
 )
 
 REPO = Path(__file__).resolve().parents[2]
@@ -156,7 +156,7 @@ def test_a_refusal_prints_its_reason_and_exits_non_zero(tmp_path, capsys):
 
 
 def test_a_round_the_strategy_does_not_run_is_refused_by_the_command(tmp_path, capsys):
-    cfg_path = write_config(tmp_path, search={"strategy": "check"})
+    cfg_path = write_config(tmp_path, search={"strategy": "check"}, start=start_that_differs(tmp_path))
     assert main(["sweep", "run", "--config", str(cfg_path), "--until", "screen"]) == 1
     assert "with strategy 'check' it runs check" in capsys.readouterr().err
 

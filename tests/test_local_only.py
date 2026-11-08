@@ -421,6 +421,22 @@ def test_an_at_outside_the_netloc_leaves_the_url_as_it_is(url, host):
         "one stays on this network)"]
 
 
+@pytest.mark.parametrize("name", ["pwd", "PWD", "passwd", "user_pwd", "pass", "db_pass", "Pass", "user-pass"])
+def test_a_query_parameter_named_for_a_password_loses_its_value(name):
+    from mnemiq.config import without_credentials
+
+    assert without_credentials(f"https://host/v1?{name}=SECRET&mode=x") == "https://host/v1?mode=x"
+
+
+@pytest.mark.parametrize("name", ["passfile", "bypass", "compass", "passthrough", "holm_passed", "passport"])
+def test_a_query_parameter_holding_pass_inside_a_longer_word_is_kept(name):
+    # `pass` names a password only as a word of the name of its own: inside a longer word it names something else.
+    from mnemiq.config import without_credentials
+
+    url = f"postgresql://reader@host/db?{name}=x"
+    assert without_credentials(url) == url
+
+
 @pytest.mark.parametrize("url", ["http://[::1]:8000/v1", "http://[::1]:8000/models@v2",
                                  "http://[fe80::1%25eth0]:8000/models@v2", "http://10.0.0.7:8000/models@v2",
                                  "http://model_server:8000/models@v2", "https://Api.Example.com/models@v2"])

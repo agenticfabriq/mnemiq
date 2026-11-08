@@ -300,6 +300,14 @@ def write_config(tmp_path: Path, *, deployment: TinyDeployment | None = None, mo
     return path
 
 
+def start_that_differs(tmp_path: Path) -> dict:
+    """A `[start]` section naming a profile that sets retrieval_k to 12, away from the engine's default. Check mode
+    compares a start with the engine's defaults, so its start must differ from them."""
+    path = tmp_path / "start-profiles.toml"
+    path.write_text('default = "start"\n[profiles.start]\nretrieval_k = 12\n')
+    return {"profile_file": str(path), "profile": "start"}
+
+
 def start_refused_in_instant(tmp_path: Path) -> dict:
     """A `[start]` section naming a profile that sets min_agreement on instant's one candidate, which the engine refuses
     in instant and accepts in thinking."""
@@ -903,7 +911,8 @@ def checked_sweep(tmp_path: Path, *, start: dict, defaults: dict, modes=("instan
     tmp_path.mkdir(parents=True, exist_ok=True)
     cfg = load_config(write_config(tmp_path, deployment=_idle_deployment(tmp_path), modes=list(modes),
                                    dataset=tiny_dataset(tmp_path, cases=26, answerable=17),
-                                   search={"strategy": "check"}, sweep={"repeats": 1}))
+                                   search={"strategy": "check"}, sweep={"repeats": 1},
+                                   start=start_that_differs(tmp_path)))
     state = _begin(cfg) | {"starts": {"m": {mode: None for mode in modes}}}   # as the first round's plan records it
     (out(cfg) / "sweep.json").write_text(json.dumps(state))
     for arm in check_arms(cfg):

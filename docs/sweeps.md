@@ -178,7 +178,8 @@ leave the network. Its store must be built (`mnemiq enrich` and `mnemiq build`) 
 One table per model, `[models.<name>]`. The name is the profile's name in the proposal unless `[propose]` gives
 another, so it follows the profile name rule, `[a-z0-9][a-z0-9._-]*`.
 
-- `llm_model`, `llm_base_url`: where the model is served, an `http` or `https` URL with no credential in it.
+- `llm_model`, `llm_base_url`: where the model is served, an `http` or `https` URL with no credential and no
+  fragment (`#...`) in it.
 - `api_key_env`: the environment variable holding the model's key. It must be set when the sweep runs and when it
   proposes: each refuses, naming it, when it is not.
 - `llm_context_window`, `verify_model`, `verify_base_url`, `verify_api_key_env`: as in a profile, optional.
@@ -336,7 +337,9 @@ evidence says how many it holds and what gain it could show.
 undoes whatever the start profile sets) on every question, with none held out, and compares them for harm. It proposes
 the start when, in every run, the start's wrong and made-up answers exceed the defaults' by no more than `[propose]`
 allows; the defaults otherwise; and nothing unless both arms are valid in every run. Use it when the question set is
-too small to search, as `plan` says, or to check a profile you already run. `[space]` plays no part in it.
+too small to search, as `plan` says, or to check a profile you already run. `[space]` plays no part in it. Its start
+must differ from the engine's defaults in each mode it runs: with no start profile, or one that sets nothing in a mode,
+the two arms would be the same profile, and the config is refused.
 
 ## Controls: another system's answers
 

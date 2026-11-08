@@ -87,9 +87,9 @@ def _env_name(value: str) -> str:
 
 
 def _endpoint_url(value: str | None, info: ValidationInfo) -> str | None:
-    """An endpoint as `[models]` and `[judge]` state it: an http or https URL with a host and no credential. Each arm's
-    profile file and the fingerprint hold it as written. It is never quoted back, since a credential is the likeliest
-    thing wrong with it."""
+    """An endpoint as `[models]` and `[judge]` state it: an http or https URL with a host, no credential and no
+    fragment. Each arm's profile file and the fingerprint hold it as written. It is never quoted back, since a
+    credential is the likeliest thing wrong with it."""
     if value is None:
         return None
     key_env = "verify_api_key_env" if info.field_name.startswith("verify_") else "api_key_env"
@@ -99,6 +99,10 @@ def _endpoint_url(value: str | None, info: ValidationInfo) -> str | None:
     if without_credentials(value) != value or userinfo_unplaced(value) or _AT_AFTER_QUERY_OR_FRAGMENT.search(value):
         raise ValueError("carries a credential (a user or password before an '@', or a key in its query), or an '@' "
                          "after a '?' or '#', which a password holding either leaves. A key never goes in this file: "
+                         f"name the environment variable that holds it in {key_env}")
+    if "#" in value:
+        raise ValueError("holds a fragment (a '#' and what follows it), which a base URL never needs, and which each "
+                         "arm's profile file and the evidence would hold as written. A key never goes in this file: "
                          f"name the environment variable that holds it in {key_env}")
     try:
         parts = urlsplit(value)
@@ -415,6 +419,8 @@ def load_config(path: str | os.PathLike) -> SweepConfig:
                                    "held-out questions: raise held_out or add questions")
     for model in cfg.models:
         _check_start(cfg, model)
+    if cfg.search.strategy == "check":
+        _check_differs(cfg)
     for control in cfg.control:
         control_answers(control, case_ids)
     return cfg
@@ -562,6 +568,21 @@ def unset_keys(cfg: SweepConfig, models: Collection[str]) -> list[str]:
         unset += [f"{variable} (model {model!r})" for variable in (entry.api_key_env, judge.verify_api_key_env)
                   if variable and not os.environ.get(variable)]
     return unset
+
+
+def _check_differs(cfg: SweepConfig) -> None:
+    """Refuse a check-mode sweep whose start, for some model and mode, is the engine's defaults: check mode compares the
+    two, so it would compare two identical profiles."""
+    from mnemiq.sweep.arms import check_arms  # the arms read this module
+
+    for arm in check_arms(cfg):
+        if arm.profile_id == "defaults" and not arm.changes:
+            own = start_profile(cfg, arm.model)[0] is not None
+            where = (f"the start profile of model {arm.model!r} sets nothing in {arm.mode} that the engine's defaults "
+                     "do not" if own else f"model {arm.model!r} starts from the engine's defaults")
+            raise SweepConfigError(f"{cfg.path}: {where}, and check mode compares the start with those defaults, so it "
+                                   "would compare two identical profiles. Start from a profile that differs from them "
+                                   f"([start] or [start.{arm.model}]), or search ([search] strategy).")
 
 
 def _check_start(cfg: SweepConfig, model: str) -> None:
