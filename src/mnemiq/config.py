@@ -37,15 +37,21 @@ DEFAULT_MAX_QUESTION_CHARS = 4_000
 
 _SECRET_HINTS = ("api_key", "dsn", "password", "secret")  # fields whose value is never printed in .env.example
 # A URL query parameter named like one of these carries a credential: the secret fields' hints, and the words a query
-# uses besides (`token`, `auth`, and `sig` for a signed URL's signature).
-_CREDENTIAL_HINTS = (*_SECRET_HINTS, "key", "token", "auth", "sig")
+# uses besides (`token`, `auth`, `sig` for a signed URL's signature, and `pwd` and `passwd` for a password).
+_CREDENTIAL_HINTS = (*_SECRET_HINTS, "key", "token", "auth", "sig", "pwd", "passwd")
+# Names a credential only as a whole word of the name (`pass`, `db_pass`): inside a longer word (`passfile`, `bypass`)
+# it names something else.
+_CREDENTIAL_WORDS = frozenset({"pass"})
+_NAME_WORDS = re.compile(r"[a-z0-9]+")
 _WEB_SCHEMES = ("http", "https")
 _KEYWORD_PASSWORD = re.compile(r"""(?i)(?:^|\s)password\s*=\s*(?:'(?:[^'\\]|\\.)*'|\S*)""")
 
 
 def names_a_credential(name: str) -> bool:
     """Whether a URL query parameter called `name` carries a credential."""
-    return any(hint in name.lower() for hint in _CREDENTIAL_HINTS)
+    lowered = name.lower()
+    return (any(hint in lowered for hint in _CREDENTIAL_HINTS)
+            or not _CREDENTIAL_WORDS.isdisjoint(_NAME_WORDS.findall(lowered)))
 
 
 _HOST_CHARACTERS = re.compile(r"[\w.-]+")  # letters, digits, `_`, `.` and `-`: a name or an IPv4 address

@@ -5,9 +5,9 @@ from __future__ import annotations
 import pytest
 
 from mnemiq.sweep.config import load_config
-from mnemiq.sweep.plan import estimate, render
+from mnemiq.sweep.plan import LOAD_WAIT_S, estimate, render
 
-from .conftest import KEY_ENV, UNREACHABLE, live_postgres_env, tiny_dataset, write_config
+from .conftest import KEY_ENV, UNREACHABLE, live_postgres_env, tiny_dataset, tiny_files, write_config
 
 
 def test_the_plan_says_when_a_set_is_too_small_to_search(tmp_path):
@@ -36,8 +36,11 @@ def test_the_cost_counts_each_round(tmp_path):
     timing = 2 * 19  # the start and one finalist, once each, alone
     confirm_one = 2 * 7  # the assembled profile and the start, on the held-out part
     assert est.case_runs == {1: screen_one + timing + confirm_one, 2: screen_two + timing + 2 * confirm_one}
-    assert est.hours == {1: pytest.approx(((screen_one + confirm_one) / 2 + timing) * 36 / 3600),
-                         2: pytest.approx(((screen_two + 2 * confirm_one) / 2 + timing) * 36 / 3600)}
+    # The timing round first waits, at most LOAD_WAIT_S, for the machine's load to fall.
+    assert est.hours == {1: pytest.approx(((screen_one + confirm_one) / 2 + timing) * 36 / 3600 + LOAD_WAIT_S / 3600),
+                         2: pytest.approx(((screen_two + 2 * confirm_one) / 2 + timing) * 36 / 3600
+                                          + LOAD_WAIT_S / 3600)}
+    assert "waiting up to 5 minutes" in render(cfg)
 
 
 def test_dollars_wait_for_measured_tokens(tmp_path):
@@ -98,6 +101,29 @@ def test_check_mode_has_no_timing_and_no_confirm_round(tmp_path):
     assert est.case_runs == {1: (2 + 1) * 8, 2: 2 * 2 * 8}  # every question; the start twice in the first round
     rounds = [line.strip() for line in render(cfg).splitlines()]  # the store's path holds this test's name
     assert not [line for line in rounds if line.startswith(("timing:", "confirm,"))]
+
+
+def test_the_plan_says_why_a_mode_compares_nothing_when_another_does(tmp_path):
+    cfg = load_config(write_config(tmp_path, modes=["instant", "thinking"], space={"thinking": {"corrector": [False]}}))
+    lines = [line.strip() for line in render(cfg).splitlines()]
+    assert "m, instant: nothing is compared with the start: the space has no value to try" in lines
+    assert [line for line in lines if line.startswith("m, thinking: ")]
+
+
+def test_the_plan_warns_when_a_judge_that_stops_answering_would_never_stop_an_arm(tmp_path):
+    d = tiny_files(tmp_path)
+    d.env.write_text(d.env.read_text() + "MNEMIQ_VERIFY_FAIL_CLOSED='0'\n")
+
+    def warned(folder=tmp_path, **sections) -> list[str]:
+        return [line for line in render(load_config(write_config(folder, **sections))).splitlines()
+                if "fails open" in line]
+
+    (line,) = warned(deployment=d, modes=["thinking"])   # thinking calls the judge
+    assert "MNEMIQ_VERIFY_FAIL_CLOSED" in line and "never stops an arm" in line and "not valid" in line
+    assert not warned(deployment=d, modes=["instant"])   # instant never calls it
+    closed = tmp_path / "closed"
+    closed.mkdir()
+    assert not warned(closed, modes=["thinking"])        # the engine's default fails closed
 
 
 def _priced_model(**judge) -> dict:

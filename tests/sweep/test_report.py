@@ -12,14 +12,14 @@ from pathlib import Path
 import pytest
 
 from mnemiq.sweep.arms import grid_arms
-from mnemiq.sweep.config import load_config
+from mnemiq.sweep.config import SweepConfigError, load_config
 from mnemiq.sweep.report import grade_control, kept_values, pair, pair_runs, report, tally
 from mnemiq.sweep.run import arm_folder
 from mnemiq.sweep.stats import mcnemar_p
 
 from .conftest import (
-    answers_file, arm_with, cancel_gold_once, read_rows, row, start_of, tiny_dataset, tiny_deployment, tiny_files,
-    tuning, two_deployments, write_config, write_run,
+    answers_file, arm_with, cancel_gold_once, graded_sweep, read_rows, row, start_of, start_that_differs, tiny_dataset,
+    tiny_deployment, tiny_files, tuning, two_deployments, write_config, write_run,
 )
 
 _KINDS = {"correct": ("correct", {}), "correct_facts": ("correct_facts", {}), "wrong": ("wrong", {}),
@@ -102,8 +102,9 @@ def sweep_with_rows(tmp_path, *, arms: dict, repeats: int = 1, **sections):
 
 def sweep_with_rows_ms(tmp_path, *, rows_ms: list[float]):
     """A screen whose start alone has run, on one answerable case per time to rows given, each answer taking 1.5 s
-    longer in all than its time to rows."""
-    dataset = tiny_dataset(tmp_path, cases=len(rows_ms), answerable=len(rows_ms)) | {"held_out": 0.0}
+    longer in all than its time to rows. One more answerable case is held out."""
+    count = len(rows_ms) + 1
+    dataset = tiny_dataset(tmp_path, cases=count, answerable=count) | {"held_out": 1 / count}
     cfg = load_config(write_config(tmp_path, dataset=dataset))
     write_run(cfg, start_of(cfg, "instant"), [row(case.id, "correct", ms=ms + 1500, rows_ms=ms)
                                               for case, ms in zip(tuning(cfg), rows_ms, strict=True)])
@@ -399,12 +400,27 @@ def test_a_report_under_auto_repeats_needs_the_count_the_first_round_decided(tmp
     assert report(cfg, "screen", repeats=1) == ("", [])
 
 
-def test_a_report_of_the_timing_round_is_refused(tmp_path):
-    cfg = load_config(write_config(tmp_path, sweep={"repeats": 1}))
-    with pytest.raises(ValueError, match="timing"):
-        report(cfg, "timing")
+def test_a_timing_round_is_read_against_its_first_20_cases_once(tmp_path):
+    cfg = load_config(write_config(tmp_path, dataset=tiny_dataset(tmp_path, cases=30, answerable=30),
+                                   sweep={"repeats": 2}))
+    start = replace(start_of(cfg, "instant"), round="timing")
+    write_run(cfg, start, [row(case.id, "correct") for case in tuning(cfg)[:20]])
+    (record,) = report(cfg, "timing")[1]
+    # One run, of 20 cases, though every arm of this sweep runs twice on its 21 cases to tune on.
+    assert len(tuning(cfg)) == 21
+    assert record["valid"] is True and [(run["run"], run["cases"]) for run in record["runs"]] == [(1, 20)]
 
 
 def test_the_table_has_time_to_rows(tmp_path):
     table, _ = report(sweep_with_rows_ms(tmp_path, rows_ms=[2000, 4000, 6000]), "screen", repeats=1)
     assert "| Median s to rows |" in table and "| 4.0 |" in table
+
+
+def test_a_start_profile_file_that_is_gone_is_named_as_the_start_not_as_an_arm(tmp_path):
+    cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=4, other=0)}, start=start_that_differs(tmp_path),
+                       play=False)
+    start_file = Path(cfg.start.profile_file)
+    start_file.unlink()   # every arm's changes are read against the start's settings, from this file
+    with pytest.raises(SweepConfigError, match="the start profile file of model 'm'") as refused:
+        report(cfg, "screen", repeats=1, controls=False)
+    assert str(start_file) in str(refused.value) and "of an arm that ran" not in str(refused.value)

@@ -87,9 +87,9 @@ def _env_name(value: str) -> str:
 
 
 def _endpoint_url(value: str | None, info: ValidationInfo) -> str | None:
-    """An endpoint as `[models]` and `[judge]` state it: an http or https URL with a host and no credential. Each arm's
-    profile file and the fingerprint hold it as written. It is never quoted back, since a credential is the likeliest
-    thing wrong with it."""
+    """An endpoint as `[models]` and `[judge]` state it: an http or https URL with a host, no credential and no
+    fragment. Each arm's profile file and the fingerprint hold it as written. It is never quoted back, since a
+    credential is the likeliest thing wrong with it."""
     if value is None:
         return None
     key_env = "verify_api_key_env" if info.field_name.startswith("verify_") else "api_key_env"
@@ -99,6 +99,10 @@ def _endpoint_url(value: str | None, info: ValidationInfo) -> str | None:
     if without_credentials(value) != value or userinfo_unplaced(value) or _AT_AFTER_QUERY_OR_FRAGMENT.search(value):
         raise ValueError("carries a credential (a user or password before an '@', or a key in its query), or an '@' "
                          "after a '?' or '#', which a password holding either leaves. A key never goes in this file: "
+                         f"name the environment variable that holds it in {key_env}")
+    if "#" in value:
+        raise ValueError("holds a fragment (a '#' and what follows it), which a base URL never needs, and which each "
+                         "arm's profile file and the evidence would hold as written. A key never goes in this file: "
                          f"name the environment variable that holds it in {key_env}")
     try:
         parts = urlsplit(value)
@@ -367,6 +371,10 @@ class SweepConfig(BaseModel):
         names = [control.name for control in self.control]
         if len(set(names)) != len(names):
             raise ValueError("[[control]] names one control twice")
+        if self.search.strategy != "check" and self.dataset.held_out == 0:
+            raise ValueError(f"[dataset] held_out is 0, and a search (strategy {self.search.strategy!r}) confirms its "
+                             "pick on held-out questions: set held_out above 0, or use check mode ([search] strategy "
+                             '= "check"), which holds none out')
         return self
 
 
@@ -399,9 +407,20 @@ def load_config(path: str | os.PathLike) -> SweepConfig:
     cfg._path = path
     for db_id in _deployment_ids(cfg):
         deployment_settings(cfg, db_id)
-    case_ids = {case.id for case in load_questions(cfg)}
+    cases = load_questions(cfg)
+    case_ids = {case.id for case in cases}
+    if cfg.search.strategy != "check":
+        from mnemiq.sweep.split import split  # the split reads this module
+
+        if not split(cfg, cases)["held_out"]:
+            raise SweepConfigError(f"{path}: [dataset] held_out {cfg.dataset.held_out:g} holds no question of the "
+                                   f"{len(cases)} the question file has (it takes held_out of each group, those with "
+                                   "an answer and those without, rounded down), and a search confirms its pick on "
+                                   "held-out questions: raise held_out or add questions")
     for model in cfg.models:
         _check_start(cfg, model)
+    if cfg.search.strategy == "check":
+        _check_differs(cfg)
     for control in cfg.control:
         control_answers(control, case_ids)
     return cfg
@@ -537,6 +556,33 @@ def start_profile(cfg: SweepConfig, model: str) -> tuple[str | None, str | None]
         return own.profile_file, own.profile
     profile = own.profile if own is not None and own.profile is not None else cfg.start.profile
     return cfg.start.profile_file, profile
+
+
+def unset_keys(cfg: SweepConfig, models: Collection[str]) -> list[str]:
+    """Each key variable `models` name, their judge's included, that this process's environment does not set, after
+    the model naming it. Named, never quoted: the engine's profile loader refuses a profile whose variable is unset."""
+    unset = []
+    for model in models:
+        entry = cfg.models[model]
+        judge = cfg.judge if cfg.judge is not None else entry
+        unset += [f"{variable} (model {model!r})" for variable in (entry.api_key_env, judge.verify_api_key_env)
+                  if variable and not os.environ.get(variable)]
+    return unset
+
+
+def _check_differs(cfg: SweepConfig) -> None:
+    """Refuse a check-mode sweep whose start, for some model and mode, is the engine's defaults: check mode compares the
+    two, so it would compare two identical profiles."""
+    from mnemiq.sweep.arms import check_arms  # the arms read this module
+
+    for arm in check_arms(cfg):
+        if arm.profile_id == "defaults" and not arm.changes:
+            own = start_profile(cfg, arm.model)[0] is not None
+            where = (f"the start profile of model {arm.model!r} sets nothing in {arm.mode} that the engine's defaults "
+                     "do not" if own else f"model {arm.model!r} starts from the engine's defaults")
+            raise SweepConfigError(f"{cfg.path}: {where}, and check mode compares the start with those defaults, so it "
+                                   "would compare two identical profiles. Start from a profile that differs from them "
+                                   f"([start] or [start.{arm.model}]), or search ([search] strategy).")
 
 
 def _check_start(cfg: SweepConfig, model: str) -> None:

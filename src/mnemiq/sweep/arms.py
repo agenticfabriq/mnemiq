@@ -209,18 +209,25 @@ def check_arms(cfg: SweepConfig) -> list[Arm]:
     return arms
 
 
-def assembled_arm(cfg: SweepConfig, model: str, picks: Mapping[str, Arm]) -> tuple[Arm, list[str]]:
-    """One profile from each swept mode's pick, to be measured whole in every swept mode.
+def assembled_arm(cfg: SweepConfig, model: str, picks: Mapping[str, Arm],
+                  modes: Iterable[str] | None = None) -> tuple[Arm, list[str]]:
+    """One profile from each swept mode's pick, to be measured whole in each of those modes: `modes`, in the config's
+    order, by default every mode the sweep runs.
 
     A profile holds one value of a profile-wide setting, so a setting the picks disagree on (one mode's pick changed it
     and another's did not, or changed it otherwise) keeps the start's value. Returned beside the arm, sorted.
     """
-    if set(picks) != set(cfg.modes):
-        raise ValueError(f"an assembled profile takes one pick for each mode the sweep runs ({', '.join(cfg.modes)}), "
+    wanted = set(cfg.modes if modes is None else modes)
+    modes = tuple(mode for mode in cfg.modes if mode in wanted)
+    if not modes or wanted - set(modes):
+        raise ValueError(f"an assembled profile spans modes the sweep runs ({', '.join(cfg.modes)}), not "
+                         f"{', '.join(sorted(wanted)) or 'none'}")
+    if set(picks) != set(modes):
+        raise ValueError(f"an assembled profile takes one pick for each of its modes ({', '.join(modes)}), "
                          f"not for {', '.join(sorted(picks)) or 'none'}")
     start = start_settings(cfg, model)
     changes: dict[str, object] = {}
-    for mode in cfg.modes:
+    for mode in modes:
         pick = picks[mode]
         if pick.model != model or pick.mode != mode:
             raise ValueError(f"the pick for {model} in {mode} is an arm of {pick.model} in {pick.mode}")
@@ -233,12 +240,12 @@ def assembled_arm(cfg: SweepConfig, model: str, picks: Mapping[str, Arm]) -> tup
     conflicts: list[str] = []
     wide = sorted({name for pick in picks.values() for name, _ in pick.changes if _mode_of(name) is None})
     for name in wide:
-        values = [dict(picks[mode].changes).get(name, start[name]) for mode in cfg.modes]
+        values = [dict(picks[mode].changes).get(name, start[name]) for mode in modes]
         if any(value != values[0] for value in values[1:]):
             conflicts.append(name)
         elif values[0] != start[name]:
             changes[name] = values[0]
-    return _arm(model, cfg.modes[0], "confirm", changes, modes=cfg.modes, assembled=True), conflicts
+    return _arm(model, modes[0], "confirm", changes, modes=modes, assembled=True), conflicts
 
 
 def _toml(value: object) -> str:

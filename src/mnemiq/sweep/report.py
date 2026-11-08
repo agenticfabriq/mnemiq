@@ -22,6 +22,7 @@ unjudged are all not right.
 
 from __future__ import annotations
 
+import json
 import statistics
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
@@ -29,12 +30,17 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import NamedTuple
 
+from mnemiq import redact
 from mnemiq.agent.loop import AgentAnswer
 from mnemiq.contract import IdentityContext, Trace
 from mnemiq.eval.harness import CaseResult, Outcome, run_case
 from mnemiq.runtime import source_adapter
-from mnemiq.sweep.arms import ROUNDS, arm_from_profile
-from mnemiq.sweep.config import Control, SweepConfig, control_answers, deployment_settings, load_questions
+from mnemiq.sweep.arms import ROUNDS, arm_from_profile, start_settings
+from mnemiq.sweep.config import (
+    SWEEP, Control, SweepConfig, SweepConfigError, control_answers, deployment_settings, fingerprint, load_questions,
+    scrub_credentials, start_profile,
+)
+from mnemiq.sweep.plan import TIMING_CASES
 from mnemiq.sweep.run import INVALID, PROFILE, ROWS, _identity, _rows_so_far
 from mnemiq.sweep.split import saved_split, split
 from mnemiq.sweep.stats import mcnemar_p, mcnemar_p_one_sided
@@ -45,6 +51,8 @@ _READ = _RIGHT | _DECLINED | {Outcome.WRONG, Outcome.ERROR}
 _UNMEASURED = ("errors", "unjudged", "ungraded")
 # The part of the questions each round runs on, when it is not the tuning part.
 _ROUND_PART = {"confirm": "held_out"}
+# The rounds that search, which a model and mode leaves once its start shows it has no room.
+_SEARCH_ROUNDS = ("screen", "grid")
 _COLUMNS = ("Right", "Strict", "Wrong", "Made up", "Declined", "Failed", "Errors", "Ungraded", "Unjudged", "Median s",
             "Median s to rows", "Prompt tokens")
 _COUNTED = ("right", "strict", "wrong", "made_up", "declined", "failed", "errors", "ungraded", "unjudged")
@@ -70,6 +78,11 @@ class Tally:
     median_rows_ms: float | None
     prompt_tokens: float | None  # per question
     versions: list[str]
+
+
+class ArmFileError(SweepConfigError):
+    """An arm's own profile file cannot be read back as the arm its folder names: it cannot be read, or it holds another
+    arm's settings. Its rows cannot be read against it."""
 
 
 class Pair(NamedTuple):
@@ -207,7 +220,14 @@ def grade_control(cfg: SweepConfig, control: Control) -> list[dict]:
             case = cases[answer["id"]]
             db_id = case.db_id if cfg.dataset.deployments is not None else None
             if db_id not in adapters:
-                adapters[db_id] = source_adapter(deployment_settings(cfg, db_id), read_only=True)
+                settings = deployment_settings(cfg, db_id)
+                try:
+                    adapters[db_id] = source_adapter(settings, read_only=True)
+                except Exception as exc:  # noqa: BLE001 -- an attach error can quote a DSN, so none is passed on as it is
+                    where = f"the deployment for {db_id!r}" if db_id is not None else "the deployment"
+                    said = redact.scrub_credentials(scrub_credentials(str(exc), settings))
+                    raise SweepConfigError(f"{where}'s source cannot be opened to grade the control {control.name!r}: "
+                                           f"{said}") from None
             result = run_case(case, _answering(answer, identity), adapters[db_id])
             rows.append({
                 "id": case.id, "mode": None, "outcome": str(result.outcome),
@@ -264,12 +284,54 @@ def _start_round(cfg: SweepConfig, round: str) -> str:
 
 def _owed(cfg: SweepConfig, round: str) -> dict[str, str | None]:
     """The cases each arm of `round` owes a row for, each to the deployment it reads: from the split the sweep saved,
-    read back and verified (`saved_split`), once a run has started it, else as `split` draws it."""
+    read back and verified (`saved_split`), once a run has started it, else as `split` draws it. The timing round owes
+    the first `TIMING_CASES` cases to tune on."""
     parts = saved_split(cfg)
     if parts is None:
         parts = split(cfg, load_questions(cfg))
     part = parts[_ROUND_PART.get(round, "tuning")]
+    if round == "timing":
+        part = part[:TIMING_CASES]
     return {case.id: case.db_id if cfg.dataset.deployments is not None else None for case in part}
+
+
+def _out_of_room(cfg: SweepConfig) -> set[tuple[str, str]]:
+    """Each model and mode whose search the sweep's record, `sweep.json`, says stopped for want of room."""
+    record = Path(cfg.sweep.out) / SWEEP
+    state = json.loads(record.read_text(encoding="utf-8")) if record.exists() else {}
+    return {(model, mode) for model, modes in (state.get("room") or {}).items() for mode, room in modes.items()
+            if isinstance(room, dict) and room.get("stopped") == "no room"}
+
+
+def decided_repeats(cfg: SweepConfig, state: dict | None = None) -> int:
+    """How many runs each arm owes: the config's count, or under `auto` the count the first round decided, as the
+    sweep's record (`state`, by default its `sweep.json`) holds it.
+
+    A search that stopped for want of room everywhere ran each start once and never decided, and is read at one run.
+    Raises when nothing has decided yet, and refuses a `sweep.json` written under another config, whatever `repeats`
+    says: its rows are not this config's to read.
+    """
+    if state is None:
+        record = Path(cfg.sweep.out) / SWEEP
+        state = json.loads(record.read_text(encoding="utf-8")) if record.exists() else {}
+        if state and state.get("fingerprint") != fingerprint(cfg):
+            raise SweepConfigError(f"{record}: this sweep was run under another config, so its rows, and how many runs "
+                                   "its arms owe, are not this config's to read. Put the config back, or pass "
+                                   "repeats=.")
+    if isinstance(cfg.sweep.repeats, int):
+        return cfg.sweep.repeats
+    if "repeats" in state:
+        return state["repeats"]
+    if state.get("stopped") == "no room":
+        return 1
+    starts = state.get("starts")
+    if isinstance(starts, dict) and starts and all(why is not None for known in starts.values()
+                                                   for why in known.values()):
+        reasons = "; ".join(f"{model}, {mode}: {why}" for model, known in starts.items() for mode, why in known.items())
+        raise SweepConfigError(f"no start ran in this sweep: the engine refused the start of every model in every mode "
+                               f"({reasons}), so there is nothing to read")
+    raise ValueError('[sweep] repeats is "auto", and the first round has not decided yet how many runs each arm owes: '
+                     "pass repeats=, or run the first round to its end")
 
 
 def _against(pairs: dict[int, Pair], tallies: Mapping[int, Tally], start: Mapping[int, Tally]) -> list[dict]:
@@ -279,6 +341,20 @@ def _against(pairs: dict[int, Pair], tallies: Mapping[int, Tally], start: Mappin
              "more_wrong": tallies[number].wrong - start[number].wrong,
              "more_made_up": tallies[number].made_up - start[number].made_up}
             for number, found in pairs.items()]
+
+
+def _start_readable(cfg: SweepConfig, model: str) -> None:
+    """Refuse, naming it, a start profile file of `model` that cannot be read: each arm's changes are read against the
+    start's settings, so the fault is the start's, not the arm's file's."""
+    path = start_profile(cfg, model)[0]
+    if path is None:
+        return
+    try:
+        start_settings(cfg, model)
+    except (OSError, ValueError, KeyError) as exc:   # the engine's reader refusing the file included
+        why = "it is gone" if not Path(path).is_file() else str(exc)
+        raise SweepConfigError(f"{path}, the start profile file of model {model!r}, cannot be read ({why}), so no "
+                               "arm's changes from the start can be read back") from None
 
 
 def _table_records(cfg: SweepConfig, model: str, mode: str, round: str, owed: Mapping[str, str | None],
@@ -300,6 +376,8 @@ def _table_records(cfg: SweepConfig, model: str, mode: str, round: str, owed: Ma
                 "valid": all(each.valid for each in runs.values()),
                 "runs": [{"run": number, **asdict(each)} for number, each in runs.items()], "pairs": against}
 
+    if arms:
+        _start_readable(cfg, model)
     records = []
     start_runs = _runs(start, mode, repeats) if start is not None else {}
     start_tallies = counted(start_runs)
@@ -310,7 +388,11 @@ def _table_records(cfg: SweepConfig, model: str, mode: str, round: str, owed: Ma
     for profile_id, modes, folder in arms:
         profile = next((folder / f"run-{number}" / PROFILE for number in _run_numbers(folder)
                         if (folder / f"run-{number}" / PROFILE).exists()), None)
-        arm = arm_from_profile(cfg, model, round, modes, profile_id, profile) if profile is not None else None
+        try:
+            arm = arm_from_profile(cfg, model, round, modes, profile_id, profile) if profile is not None else None
+        except (OSError, ValueError) as exc:  # the engine's reader refusing the file included (`ProfileFileError`)
+            raise ArmFileError(f"{profile}, the profile file of an arm that ran, cannot be read back as that arm "
+                               f"({exc}), so its rows cannot be read against it") from None
         runs = _runs(folder, mode, repeats)
         tallies = counted(runs)
         pairs = pair_runs(start_rows, {number: run.rows for number, run in runs.items()})
@@ -376,8 +458,13 @@ def _table(cfg: SweepConfig, model: str, mode: str, round: str, records: list[di
     return "\n".join(lines)
 
 
+def graded_controls(cfg: SweepConfig) -> list[tuple[str, list[dict]]]:
+    """Each control's name and its rows, graded once (`grade_control`), for `report` to read in several rounds."""
+    return [(control.name, grade_control(cfg, control)) for control in cfg.control]
+
+
 def report(cfg: SweepConfig, round: str, *, repeats: int | None = None,
-           controls: bool = True) -> tuple[str, list[dict]]:
+           controls: bool | Sequence[tuple[str, list[dict]]] = True) -> tuple[str, list[dict]]:
     """A markdown table for each model and mode of `round`, and its rows as records.
 
     A table holds the start, each arm the round ran, then each control. Its columns are Valid, Right, Strict, Wrong,
@@ -385,17 +472,22 @@ def report(cfg: SweepConfig, round: str, *, repeats: int | None = None,
     each cell giving every run's value in turn, and, against the start, only/other and p for each run. The screen's
     table also marks the arms whose value it keeps (Kept), and its p is the one-sided p it decides by; every other
     round's is the two-sided p. A grid that follows a screen is compared with the screen's start. The timing round is
-    refused: its arms answer only the cases timed.
+    read against the first `TIMING_CASES` cases to tune on, which is all it times, and at one run, which is all it runs.
 
-    Each arm's label and changes are read back from the profile file its run wrote (`arm_from_profile`), and an arm
-    folder this config would not have written is refused.
+    Each arm's label and changes are read back from the profile file its run wrote (`arm_from_profile`). A file that
+    cannot be read, or that this config would not have written for that folder, is refused (`ArmFileError`).
 
     `controls=False` leaves the controls out, ungraded: no control decides what the screen keeps, so the grid reads its
-    kept values that way, without running a control's SQL.
+    kept values that way, without running a control's SQL. `controls` may also be the controls as `graded_controls`
+    gave them, so that several rounds are read on one grading.
 
     `repeats` is how many runs each arm owes, and an arm short of one is not valid. By default it is the config's
-    `repeats` when that is a number. Under `auto` it must be passed, as the first round decided it: the folders alone
-    cannot tell an arm's missing run from a second run no arm has had yet.
+    `repeats` when that is a number, else the count the first round decided, from the sweep's record
+    (`decided_repeats`); one run when the search stopped for want of room before it decided. Before then it must be
+    passed: the folders alone cannot tell an arm's missing run from a second run no arm has had yet. In the screen and
+    the grid, a model and mode whose search the record says stopped for want of room is read at one run whatever
+    `repeats` says: the search stopped once its start's first run was in, so that run is all its arms owed, and a
+    valid first run is a valid start there.
 
     A record holds the model, mode, round, `arm` (its profile id; None for a control), `label`, `control` (its name, or
     None), `changes` (each setting the arm changes from the start, to its value), `valid` (in every run), `runs` (each
@@ -405,23 +497,24 @@ def report(cfg: SweepConfig, round: str, *, repeats: int | None = None,
     if round not in ROUNDS:
         raise ValueError(f"{round!r} is not a round; the rounds are {', '.join(ROUNDS)}")
     if round == "timing":
-        raise ValueError("the timing round is not reported: its arms answer only the cases timed, and this report does "
-                         "not know which those are")
-    if repeats is None:
-        if not isinstance(cfg.sweep.repeats, int):
-            raise ValueError('[sweep] repeats is "auto": pass repeats=, the number of runs the first round decided '
-                             "each arm owes")
-        repeats = cfg.sweep.repeats
+        repeats = 1
+    elif repeats is None:
+        repeats = decided_repeats(cfg)
     if repeats < 1:
         raise ValueError("an arm owes at least one run")
     owed = _owed(cfg, round)
-    graded = [(control.name, grade_control(cfg, control)) for control in cfg.control] if controls else []
+    stopped = _out_of_room(cfg) if round in _SEARCH_ROUNDS else set()
+    if isinstance(controls, bool):
+        graded = graded_controls(cfg) if controls else []
+    else:
+        graded = list(controls)
     tables, records = [], []
     for model in cfg.models:
         for mode in cfg.modes:
-            mine = _table_records(cfg, model, mode, round, owed, graded, repeats)
+            runs = 1 if (model, mode) in stopped else repeats
+            mine = _table_records(cfg, model, mode, round, owed, graded, runs)
             if mine:
-                tables.append(_table(cfg, model, mode, round, mine, repeats))
+                tables.append(_table(cfg, model, mode, round, mine, runs))
                 records += mine
     return "\n\n".join(tables) + ("\n" if tables else ""), records
 
