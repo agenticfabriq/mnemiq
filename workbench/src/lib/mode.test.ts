@@ -1,7 +1,10 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
+import { keyFor, SINGLE } from "./identity";
 import { loadMode, saveMode } from "./mode";
 import { DEFAULT_MODE, MODES } from "./types";
+
+const NS = SINGLE;
 
 beforeEach(() => localStorage.clear());
 
@@ -10,13 +13,13 @@ describe("mode persistence", () => {
     // The bug, verbatim: pick `deep`, refresh, and the workbench is back on `thinking`.
     // Mode was plain component state, so every reload discarded the choice and silently
     // changed what the next question would cost.
-    saveMode("deep");
+    saveMode(NS, "deep");
 
-    expect(loadMode()).toBe("deep");
+    expect(loadMode(NS)).toBe("deep");
   });
 
   it("starts on the default when nothing was chosen", () => {
-    expect(loadMode()).toBe(DEFAULT_MODE);
+    expect(loadMode(NS)).toBe(DEFAULT_MODE);
   });
 
   it("refuses a stored value that is not a mode", () => {
@@ -24,25 +27,39 @@ describe("mode persistence", () => {
     // unrecognised value must fall back rather than reach the engine as a mode it has
     // never heard of -- the engine would refuse the question, and the reason would look
     // like the question's fault.
-    localStorage.setItem("mnemiq.mode.v1", "turbo");
+    localStorage.setItem(keyFor(NS, "mode"), "turbo");
 
-    expect(loadMode()).toBe(DEFAULT_MODE);
+    expect(loadMode(NS)).toBe(DEFAULT_MODE);
   });
 
   it("survives storage that cannot be read at all", () => {
     // `threads.ts` treats unreadable history as "no history" rather than a failure to
     // start; the same rule applies to a preference.
-    localStorage.setItem("mnemiq.mode.v1", "");
+    localStorage.setItem(keyFor(NS, "mode"), "");
 
-    expect(loadMode()).toBe(DEFAULT_MODE);
+    expect(loadMode(NS)).toBe(DEFAULT_MODE);
   });
 
   it("round-trips every mode the engine offers", () => {
     // Non-vacuity: a `loadMode` that always answered `thinking` would pass the first
     // test above by accident if the default ever changed to `deep`.
     for (const mode of MODES) {
-      saveMode(mode);
-      expect(loadMode()).toBe(mode);
+      saveMode(NS, mode);
+      expect(loadMode(NS)).toBe(mode);
     }
+  });
+
+  it("remembers each identity's mode apart", () => {
+    saveMode("ns-a", "deep");
+
+    expect(loadMode("ns-b")).toBe(DEFAULT_MODE);
+    expect(loadMode("ns-a")).toBe("deep");
+  });
+
+  it("keeps no mode for a user who has no namespace", () => {
+    saveMode(null, "deep");
+
+    expect(loadMode(null)).toBe(DEFAULT_MODE);
+    expect(localStorage.length).toBe(0);
   });
 });

@@ -4,6 +4,7 @@ import { afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { SCALAR_ANSWER } from "../test/fixtures";
 import type { AnswerPayload } from "../lib/types";
+import { SINGLE } from "../lib/identity";
 import { useWorkbench } from "../lib/runtime";
 import { save } from "../lib/threads";
 import { SqlBlock } from "./SqlBlock";
@@ -66,7 +67,7 @@ describe("SqlBlock", () => {
 });
 
 function Workbench() {
-  const { runtime } = useWorkbench();
+  const { runtime } = useWorkbench(SINGLE, () => {});
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <Thread starters={[]} onPick={() => {}} />
@@ -86,7 +87,7 @@ describe("the transcript", () => {
   afterEach(() => localStorage.clear());
 
   function store(answer: AnswerPayload) {
-    save([
+    save(SINGLE, [
       {
         id: "thread-1",
         title: "policies",

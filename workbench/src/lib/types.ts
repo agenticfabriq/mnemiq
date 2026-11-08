@@ -142,3 +142,9 @@ export type AguiEvent =
   | { type: string & Record<never, never> };
 
 export type SchemaTable = { object_id: string; card: string };
+
+/**
+ * Who the engine says is asking (`GET /v1/whoami`). `verified` is true when the identity came
+ * from a verified token, false for the deployment's one configured identity.
+ */
+export type Whoami = { principal_id: string; tenant_id: string | null; verified: boolean };

@@ -41,9 +41,21 @@ History on the left, transcript in the middle, the tables in scope on the right
 (hidable — the toggle sits in the header, and the choice is remembered).
 
 History lives in this browser's `localStorage`, which is what makes it survive a
-reload without inventing a server-side store. Two consequences worth knowing: it
-is per browser rather than per principal, and it is **not** an audit record of
+reload without inventing a server-side store. It is **not** an audit record of
 what the engine was asked — the engine's own answer log is.
+
+It is kept per user. Before it shows anything, the workbench asks the engine who
+is asking (`GET /v1/whoami`), keeps that user's threads and mode under a namespace
+named by a hash of the identity (never the id itself), and purges every other
+user's when a different one loads. An engine without that route, or one serving
+its one configured identity, keeps a single history, as before.
+
+Behind a sign-in proxy, a `401` or a redirect to sign in means the session ended:
+the workbench purges that user's threads and reloads, so the proxy signs them in
+again. A second time within 30 seconds it asks instead, so a misconfigured proxy
+cannot loop the page. A `403` reads as not permitted, and a `503` or a request
+that never got an answer as the service being unavailable; neither reloads or
+touches the saved threads.
 
 ## Streaming: stages, not tokens
 

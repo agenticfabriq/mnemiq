@@ -19,7 +19,7 @@ import {
 } from "@assistant-ui/react";
 
 import { historyFrom } from "./history";
-import { streamChat } from "./transport";
+import { Refused, streamChat, type Refusal } from "./transport";
 import { isRunning, reduce, userTurn, type Turn } from "./store";
 import { emptyThread, isBlank, load, save, titleFor, type Thread } from "./threads";
 import { loadMode, saveMode } from "./mode";
@@ -58,17 +58,22 @@ function convertMessage(turn: Turn): ThreadMessageLike {
   };
 }
 
-export function useWorkbench() {
+/**
+ * `ns` is the identity's namespace (identity.ts), fixed for the life of the hook: the page
+ * mounts a fresh workbench for a different identity rather than switching this one over.
+ * `onRefused` hears a question's sign-out, which ends the run before any event arrives.
+ */
+export function useWorkbench(ns: string | null, onRefused: (refusal: Refusal) => void) {
   const restored = useMemo(() => {
-    const stored = load();
+    const stored = load(ns);
     return stored.length ? stored : [emptyThread()];
-  }, []);
+  }, [ns]);
 
   const [threads, setThreads] = useState<Thread[]>(restored);
   const [activeId, setActiveId] = useState<string>(restored[0]!.id);
   // Restored, not defaulted: mode is what a question costs, and a reload that quietly
   // moves a reader from `deep` back to `thinking` changes the answer they get next.
-  const [mode, setMode] = useState<Mode>(loadMode);
+  const [mode, setMode] = useState<Mode>(() => loadMode(ns));
 
   // Read at send time so switching thread or mode mid-run never retargets a run
   // already in flight.
@@ -80,12 +85,12 @@ export function useWorkbench() {
   threadsRef.current = threads;
 
   useEffect(() => {
-    saveMode(mode);
-  }, [mode]);
+    saveMode(ns, mode);
+  }, [ns, mode]);
 
   useEffect(() => {
-    save(threads);
-  }, [threads]);
+    save(ns, threads);
+  }, [ns, threads]);
 
   const active = threads.find((t) => t.id === activeId) ?? threads[0]!;
 
@@ -111,11 +116,17 @@ export function useWorkbench() {
       const before = threadsRef.current.find((t) => t.id === threadId)?.turns ?? [];
       const history = historyFrom(before);
       updateTurns(threadId, (current) => [...current, userTurn(question)]);
-      for await (const event of streamChat(question, modeRef.current, history)) {
-        updateTurns(threadId, (current) => reduce(current, event));
+      try {
+        for await (const event of streamChat(question, modeRef.current, history)) {
+          updateTurns(threadId, (current) => reduce(current, event));
+        }
+      } catch (error) {
+        // Only a sign-out is thrown; every other refusal arrives as a failed run.
+        if (!(error instanceof Refused)) throw error;
+        onRefused(error.refusal);
       }
     },
-    [updateTurns],
+    [updateTurns, onRefused],
   );
 
   const newChat = useCallback(() => {

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { SCALAR_ANSWER } from "../test/fixtures";
+import { keyFor, SINGLE } from "./identity";
 import { userTurn, type Turn } from "./store";
 import { emptyThread, isBlank, load, save, titleFor, uid } from "./threads";
 
@@ -13,6 +14,8 @@ const assistantTurn = (): Turn => ({
 });
 
 const withTurns = (...turns: Turn[]) => ({ ...emptyThread(), turns });
+
+const NS = SINGLE;
 
 beforeEach(() => localStorage.clear());
 
@@ -41,32 +44,32 @@ describe("titleFor", () => {
 describe("persistence", () => {
   it("round-trips a thread with its answer payload intact", () => {
     const thread = withTurns(userTurn("how many claims are there?"), assistantTurn());
-    save([thread]);
+    save(NS, [thread]);
 
-    const [restored] = load();
+    const [restored] = load(NS);
     expect(restored!.id).toBe(thread.id);
     expect(restored!.turns).toHaveLength(2);
     expect(restored!.turns[1]!.answer?.sql).toBe(SCALAR_ANSWER.sql);
   });
 
   it("does not persist a thread nothing was asked in", () => {
-    save([emptyThread(), withTurns(userTurn("q"))]);
-    expect(load()).toHaveLength(1);
+    save(NS, [emptyThread(), withTurns(userTurn("q"))]);
+    expect(load(NS)).toHaveLength(1);
   });
 
   it("starts empty rather than throwing on unreadable history", () => {
-    localStorage.setItem("mnemiq.threads.v1", "{not json");
-    expect(load()).toEqual([]);
+    localStorage.setItem(keyFor(NS, "threads"), "{not json");
+    expect(load(NS)).toEqual([]);
   });
 
   it("ignores entries that are not threads", () => {
-    localStorage.setItem("mnemiq.threads.v1", JSON.stringify([{ id: "x" }, null, 7]));
-    expect(load()).toEqual([]);
+    localStorage.setItem(keyFor(NS, "threads"), JSON.stringify([{ id: "x" }, null, 7]));
+    expect(load(NS)).toEqual([]);
   });
 
   it("keeps at most 25 threads", () => {
-    save(Array.from({ length: 40 }, (_, i) => withTurns(userTurn(`q${i}`))));
-    expect(load()).toHaveLength(25);
+    save(NS, Array.from({ length: 40 }, (_, i) => withTurns(userTurn(`q${i}`))));
+    expect(load(NS)).toHaveLength(25);
   });
 
   it("drops the oldest rather than losing everything when storage is full", () => {
@@ -78,11 +81,34 @@ describe("persistence", () => {
       return real.call(this, key, value);
     };
     try {
-      save([withTurns(userTurn("a")), withTurns(userTurn("b")), withTurns(userTurn("c"))]);
+      save(NS, [withTurns(userTurn("a")), withTurns(userTurn("b")), withTurns(userTurn("c"))]);
     } finally {
       Storage.prototype.setItem = real;
     }
-    expect(load()).toHaveLength(1);
+    expect(load(NS)).toHaveLength(1);
+  });
+});
+
+describe("per identity", () => {
+  it("never reads one namespace's threads from another", () => {
+    const thread = withTurns(userTurn("a's question"));
+    save("ns-a", [thread]);
+
+    expect(load("ns-b")).toEqual([]);
+    expect(load("ns-a").map((t) => t.id)).toEqual([thread.id]);
+  });
+
+  it("no longer reads the legacy key: only a namespace is ever rendered", () => {
+    localStorage.setItem("mnemiq.threads.v1", JSON.stringify([withTurns(userTurn("legacy"))]));
+
+    expect(load(NS)).toEqual([]);
+  });
+
+  it("keeps nothing for a user who has no namespace", () => {
+    save(null, [withTurns(userTurn("q"))]);
+
+    expect(load(null)).toEqual([]);
+    expect(localStorage.length).toBe(0);
   });
 });
 
