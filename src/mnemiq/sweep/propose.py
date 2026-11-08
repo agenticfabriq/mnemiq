@@ -60,7 +60,7 @@ import httpx
 
 from mnemiq import redact
 from mnemiq.config import without_credentials
-from mnemiq.profiles import load_profiles, profile_version
+from mnemiq.profiles import ProfileFileError, load_profiles, profile_version
 from mnemiq.runtime import source_adapter
 from mnemiq.sweep.arms import Arm, _endpoint, _mode_of, _show, _toml, arm_of, assembled_arm, baselines, check_arms
 from mnemiq.sweep.config import (
@@ -90,7 +90,7 @@ class _Stale(SweepConfigError):
     """A refusal that shows an earlier proposal no longer holds, so its files are removed."""
 
 
-# --- the timing round's checks -----------------------------------------------------------------------------------------
+# --- the timing round's checks ----------------------------------------------------------------------------------------
 
 
 def server_running(base_url: str) -> int | None:
@@ -191,7 +191,7 @@ def _sampling(path: Path) -> Iterator[None]:
         sampler.join()
 
 
-# --- the candidates ----------------------------------------------------------------------------------------------------
+# --- the candidates ---------------------------------------------------------------------------------------------------
 
 
 def _mean(values: Iterable[float | None]) -> float | None:
@@ -292,7 +292,7 @@ def _arm_of(model: str, mode: str, entry: dict) -> Arm:
     return arm
 
 
-# --- the timing round --------------------------------------------------------------------------------------------------
+# --- the timing round -------------------------------------------------------------------------------------------------
 
 
 def _timed(cfg: SweepConfig, judged: dict[tuple[str, str], dict]) -> dict[tuple[str, str], list[Arm]]:
@@ -387,8 +387,9 @@ def _ran(cfg: SweepConfig, state: dict) -> dict[str, tuple[list[str], dict[str, 
     whose environment or build may have moved since."""
     starts = state.get("starts")
     if not isinstance(starts, dict) or any(not isinstance(starts.get(model), dict) for model in cfg.models):
-        raise SweepConfigError(f"{Path(cfg.sweep.out) / SWEEP} does not record which modes the start ran in. Run the "
-                               "sweep again: it resumes, records them, and has nothing else left to do.")
+        raise SweepConfigError(f"{Path(cfg.sweep.out) / SWEEP} was written before this build kept which modes the "
+                               "start ran in, so no proposal can be read from it: start a new sweep in another out "
+                               "folder.")
     found = {}
     for model in cfg.models:
         known = starts[model]
@@ -412,8 +413,9 @@ def _profile_wide(arms: tuple[Arm, ...] | None) -> dict | None:
 
 def _refused_note(refused: dict[str, str], wide: dict | None) -> str:
     """What the reason says of the modes the engine refused the start in, or nothing. With a profile written (`wide`,
-    its whole-profile changes from the start), each such mode keeps the engine's own per-mode settings, having no section
-    of its own, and runs under the profile's whole-profile settings, whose changes were never measured there."""
+    its whole-profile changes from the start), each such mode keeps the engine's own per-mode settings, having no
+    section of its own, and runs under the profile's whole-profile settings, whose changes were never measured
+    there."""
     if not refused:
         return ""
     modes = list(refused)
@@ -437,13 +439,13 @@ def _refused_everywhere(refused: dict[str, str]) -> str:
     return f"Nothing is proposed: the engine refuses the start in every mode ({named}), so nothing ran."
 
 
-# --- the confirm round -------------------------------------------------------------------------------------------------
+# --- the confirm round ------------------------------------------------------------------------------------------------
 
 
 def _confirming(cfg: SweepConfig, model: str, judged: dict, timing: dict,
                 running: Sequence[str]) -> tuple[Arm | None, Arm | None, dict, list[str]]:
     """The assembled arm the confirm round measures for `model` (None when no mode has a candidate), the start it is
-    measured against (None when the engine runs the start in no mode), each in every mode of `running`, each of those
+    measured against (None when no mode is recorded as having run), each in every mode of `running`, each of those
     modes' pick (None for the start) and what decided it, and the profile-wide settings the picks disagreed on."""
     picks = {mode: _pick(judged[(model, mode)], timing.get((model, mode))) for mode in running}
     if not running:
@@ -451,7 +453,8 @@ def _confirming(cfg: SweepConfig, model: str, judged: dict, timing: dict,
     start = replace(arm_of(model, running[0], {}, round="confirm"), modes=tuple(running))
     if not any(entry for entry, _ in picks.values()):
         return None, start, picks, []
-    arms = {mode: _arm_of(model, mode, entry) if entry else arm_of(model, mode, {}) for mode, (entry, _) in picks.items()}
+    arms = {mode: _arm_of(model, mode, entry) if entry else arm_of(model, mode, {})
+            for mode, (entry, _) in picks.items()}
     assembled, conflicts = assembled_arm(cfg, model, arms, modes=running)
     return assembled, start, picks, conflicts
 
@@ -468,7 +471,7 @@ def after_search(sweep, until: str | None) -> None:
     follows it.
 
     The confirm round then runs, for each model with a candidate in any mode, the one profile assembled from each mode's
-    pick and the start, each in every mode whose start the engine runs, on the held-out cases, once per repeat.
+    pick and the start, each in every mode recorded as having run its start, on the held-out cases, once per repeat.
     """
     cfg = sweep.cfg
     if cfg.search.strategy != "check":
@@ -536,14 +539,19 @@ def _confirm_failure(cfg: SweepConfig, start: dict | None, arm: dict | None, run
     return None
 
 
-# --- the files -----------------------------------------------------------------------------------------------------------
+# --- the files --------------------------------------------------------------------------------------------------------
 
 
 def _renamed(path: Path, name: str) -> str:
     """The profiles file at `path`, its one profile renamed to `name`, and refused unless that is all that changed."""
-    text = path.read_text(encoding="utf-8")
-    raw = tomllib.loads(text)
-    old, new = _toml(raw["default"]), _toml(name)
+    try:
+        text = path.read_text(encoding="utf-8")
+        raw = tomllib.loads(text)
+        old, new = _toml(raw["default"]), _toml(name)
+        raw["profiles"][raw["default"]]
+    except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError):
+        raise _Stale(f"{path}, the profile file of an arm that ran, is missing or cannot be read, so the profile "
+                     "proposed cannot be checked against its rows") from None
     lines = []
     for line in text.splitlines(keepends=True):
         bare = line.rstrip("\n")
@@ -601,9 +609,9 @@ def _versions(cfg: SweepConfig, path: Path, dialects: dict) -> dict[str | None, 
                 adapter = source_adapter(settings, read_only=True)
             except Exception as exc:  # noqa: BLE001 -- an attach error can quote a DSN, so none is passed on as it is
                 where = f"the deployment for {db_id!r}" if db_id is not None else "the deployment"
+                said = redact.scrub_credentials(scrub_credentials(str(exc), settings))
                 raise SweepConfigError(f"{where}'s source cannot be opened to read its dialect, which a profile's "
-                                       f"version holds: {redact.scrub_credentials(scrub_credentials(str(exc), settings))}"
-                                       ) from None
+                                       f"version holds: {said}") from None
             try:
                 dialects[db_id] = getattr(adapter, "dialect", "duckdb")
             finally:
@@ -624,8 +632,8 @@ def _stamped(cfg: SweepConfig, arm: Arm, repeats: int, mode: str | None = None) 
             if mode is None or row.get("mode") == mode:
                 held[reads.get(row.get("id"))].add(row.get("profile_version"))
     if not held or any(len(versions) != 1 or None in versions for versions in held.values()):
-        raise _Stale(f"the rows of {arm.label} in the {arm.round} round do not hold one version for each deployment, so "
-                     "the profile proposed cannot be checked against them")
+        raise _Stale(f"the rows of {arm.label} in the {arm.round} round do not hold one version for each deployment, "
+                     "so the profile proposed cannot be checked against them")
     return {db_id: next(iter(versions)) for db_id, versions in held.items()}
 
 
@@ -715,7 +723,7 @@ def _write(cfg: SweepConfig, model: str, draft: _Draft, evidence: dict) -> None:
     _write_json(folder / EVIDENCE, evidence)
 
 
-# --- the proposal ------------------------------------------------------------------------------------------------------
+# --- the proposal -----------------------------------------------------------------------------------------------------
 
 
 def _finished(cfg: SweepConfig) -> dict:
@@ -725,8 +733,9 @@ def _finished(cfg: SweepConfig) -> dict:
         raise SweepConfigError(f"{cfg.sweep.out} holds no sweep ({SWEEP}): run the sweep before proposing from it")
     state = json.loads(record.read_text(encoding="utf-8"))
     if state.get("fingerprint") != fingerprint(cfg):
-        raise SweepConfigError(f"{record}: this sweep was run under another config. The rule a proposal applies is part "
-                               "of the config, so it is read under the config the sweep ran under, or not at all.")
+        raise SweepConfigError(f"{record}: this sweep was run under another config. The rule a proposal applies is "
+                               "part of the config, so it is read under the config the sweep ran under, or not at "
+                               "all.")
     if not state.get("finished"):
         stop = f" (it stopped: {state['stopped']})" if state.get("stopped") in ("budget", "endpoint", "worker") else ""
         raise _Stale(f"{record}: the sweep has not finished its rounds{stop}. Run it again: it resumes where it "
@@ -759,9 +768,9 @@ def _build_warning(state: dict, packaged: dict) -> list[str]:
     if ran == packaged["source_sha"]:
         return []
     return [f"The sweep's arms ran on engine build {ran[:12]} (by source), and this proposal is packaged by build "
-            f"{packaged['source_sha'][:12]}. The rows were measured on the first. The profile's version is recomputed by "
-            "this one and must still be the one the rows were stamped with, so a change to what the profile resolves "
-            "to is refused."]
+            f"{packaged['source_sha'][:12]}. The rows were measured on the first. The profile's version is recomputed "
+            "by this one and must still be the one the rows were stamped with, so a change to what the profile "
+            "resolves to is refused."]
 
 
 def _head(cfg: SweepConfig, model: str, state: dict, repeats: int, packaged: dict) -> dict:
@@ -812,7 +821,7 @@ def _unmeasured(run: dict, max_errors: int) -> str:
 
 def _check(cfg: SweepConfig, model: str, records: Sequence[dict], running: Sequence[str],
            refused: dict[str, str]) -> dict:
-    """Check mode's verdict for `model`, over the modes whose start the engine runs: the start, the defaults, or
+    """Check mode's verdict for `model`, over the modes recorded as having run its start: the start, the defaults, or
     nothing."""
     bounds = cfg.propose
     numbers, invalid, harm = {}, [], []
@@ -845,11 +854,13 @@ def _check(cfg: SweepConfig, model: str, records: Sequence[dict], running: Seque
         rule, why = None, ("Nothing is proposed: " + "; ".join(invalid) + ". Check mode proposes only between two "
                            "arms valid in every run.")
     elif harm:
-        rule, why = "defaults", ("The defaults are proposed: " + "; ".join(harm) + f", beyond what [propose] allows "
-                                 f"(max_more_wrong {bounds.max_more_wrong}, max_more_made_up {bounds.max_more_made_up}).")
+        rule, why = "defaults", ("The defaults are proposed: " + "; ".join(harm) + ", beyond what [propose] allows "
+                                 f"(max_more_wrong {bounds.max_more_wrong}, "
+                                 f"max_more_made_up {bounds.max_more_made_up}).")
     else:
         rule, why = "start", ("The start is proposed: in every mode and run its wrong and made-up answers exceed the "
-                              "defaults' by no more than [propose] allows. Both arms' right answers are in the evidence.")
+                              "defaults' by no more than [propose] allows. Both arms' right answers are in the "
+                              "evidence.")
     return {"rule": rule, "why": why, "check": numbers, "valid": valid}
 
 
@@ -865,8 +876,8 @@ def _first_starts(cfg: SweepConfig, model: str, modes: Sequence[str]) -> tuple[A
 
 def _search(cfg: SweepConfig, model: str, state: dict, judged: dict, timing: dict, confirm: Sequence[dict],
             repeats: int, running: list[str], refused: dict[str, str]) -> dict:
-    """The rule's verdict for `model` in a sweep that searched, over the modes whose start the engine runs, with what
-    its evidence shows."""
+    """The rule's verdict for `model` in a sweep that searched, over the modes recorded as having run its start, with
+    what its evidence shows."""
     room = state.get("room", {}).get(model, {})
     no_room = [mode for mode in running if room.get(mode, {}).get("stopped") == "no room"]
     assembled, start, picks, conflicts = _confirming(cfg, model, judged, timing, running)
@@ -932,8 +943,8 @@ def _search(cfg: SweepConfig, model: str, state: dict, judged: dict, timing: dic
                                  "the start's right answers and no more wrong or made-up answers than [propose] "
                                  f"allows.{lost}"}
     return verdict | {"rule": "start", "rule_arms": (start,), "confirmed": False,
-                      "why": f"The one profile assembled from each mode's pick ({shown}) failed on the held-out part in "
-                             f"{failed}: {failures[failed]}. No other candidate is tried, since that would make the "
+                      "why": f"The one profile assembled from each mode's pick ({shown}) failed on the held-out part "
+                             f"in {failed}: {failures[failed]}. No other candidate is tried, since that would make the "
                              f"held-out part part of the search, so the start is proposed.{lost}"}
 
 
@@ -1018,18 +1029,11 @@ def _drafts(cfg: SweepConfig, chosen: str | None) -> dict[str, tuple[_Draft, dic
     for warning in warnings:
         _say(warning)
     repeats = decided_repeats(cfg, state) if any(running for running, _ in ran.values()) else 1
-    if cfg.search.strategy == "check":
-        records = report(cfg, "check", repeats=repeats, controls=False)[1]
-        verdicts = {model: _check(cfg, model, records, *ran[model]) for model in cfg.models}
-        for model, verdict in verdicts.items():
-            arms = _check_arms(cfg, model, verdict["rule"], ran[model][0]) if verdict["rule"] else None
-            verdict |= {"rule_arms": arms, "confirmed": None, "picks": {}, "conflicts": [], "failed_mode": None}
-    else:
-        judged = _judged(cfg, _tuning_records(cfg, repeats))
-        timing = _timing(cfg, judged)
-        confirm = report(cfg, "confirm", repeats=repeats, controls=False)[1]
-        verdicts = {model: _search(cfg, model, state, judged, timing, confirm, repeats, *ran[model])
-                    for model in cfg.models}
+    try:
+        verdicts = _verdicts(cfg, state, ran, repeats)
+    except ProfileFileError as exc:  # an arm's own file, read back by the report, that cannot be read
+        raise _Stale(f"the profile file of an arm that ran cannot be read ({exc}), so its rows cannot be read "
+                     "against it") from None
     picked = {model: _chosen_arms(cfg, model, verdicts[model], chosen, running) if chosen and running else None
               for model, (running, _) in ran.items()}
     drafts = {}
@@ -1063,3 +1067,18 @@ def _drafts(cfg: SweepConfig, chosen: str | None) -> dict[str, tuple[_Draft, dic
         draft = _draft(cfg, model, arms, repeats, running)
         drafts[model] = (draft, evidence | draft.shown)
     return drafts
+
+
+def _verdicts(cfg: SweepConfig, state: dict, ran: dict, repeats: int) -> dict[str, dict]:
+    """The rule's verdict for each model, read from the rows of the modes recorded as having run its start."""
+    if cfg.search.strategy == "check":
+        records = report(cfg, "check", repeats=repeats, controls=False)[1]
+        verdicts = {model: _check(cfg, model, records, *ran[model]) for model in cfg.models}
+        for model, verdict in verdicts.items():
+            arms = _check_arms(cfg, model, verdict["rule"], ran[model][0]) if verdict["rule"] else None
+            verdict |= {"rule_arms": arms, "confirmed": None, "picks": {}, "conflicts": [], "failed_mode": None}
+        return verdicts
+    judged = _judged(cfg, _tuning_records(cfg, repeats))
+    timing = _timing(cfg, judged)
+    confirm = report(cfg, "confirm", repeats=repeats, controls=False)[1]
+    return {model: _search(cfg, model, state, judged, timing, confirm, repeats, *ran[model]) for model in cfg.models}

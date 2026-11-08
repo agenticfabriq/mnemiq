@@ -322,9 +322,10 @@ def render(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None = 
             else:
                 lines.append(f"    {name}: {len(arms)} arms: {labels}")
         if _searches(cfg, rounds):
-            lines.append(f"    timing: after waiting up to {LOAD_WAIT_S / 60:g} minutes for the machine's load to fall, "
-                         f"the start and each finalist, once each and alone, on the first {TIMING_CASES} cases to tune "
-                         f"on (the cost counts {TIMING_ARMS_PER_MODE}: the start and one finalist, and the wait)")
+            lines.append(f"    timing: after waiting up to {LOAD_WAIT_S / 60:g} minutes for the machine's load to "
+                         f"fall, the start and each finalist, once each and alone, on the first {TIMING_CASES} cases "
+                         f"to tune on (the cost counts {TIMING_ARMS_PER_MODE}: the start and one finalist, and the "
+                         "wait)")
     for model in cfg.models:
         if any(_searches(cfg, est.rounds[(model, mode)]) for mode in cfg.modes):
             lines.append(f"  confirm, {model}: the assembled profile against the start on the held-out part, in each "

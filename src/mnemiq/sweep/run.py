@@ -1186,8 +1186,8 @@ def run(cfg: SweepConfig, until: str | None = None, smoke: int | None = None) ->
     stopped there; `starts`, by model and mode, None where the engine runs the start, else why it refuses it, as the
     first round's plan found it (a mode once run stays so); `seconds`, the time the sweep's runs have taken; `stopped`,
     the sweep's own stop: `"budget"`, `"endpoint"` or `"worker"` (a worker that died), each cleared by the next run, or
-    `"no room"` once every model and mode that searches has stopped for it; and `finished`, true once the strategy's last round has run, which a
-    proposal waits for.
+    `"no room"` once every model and mode that searches has stopped for it; and `finished`, true once the strategy's
+    last round has run, which a proposal waits for.
 
     A stop for the budget comes before an arm, never during one. When an endpoint stops answering, or a worker dies,
     the runs going on finish, none starts, and `run` exits non-zero naming the endpoint, or the run and what its worker

@@ -450,3 +450,30 @@ def test_a_mode_once_run_stays_recorded_when_a_later_plan_refuses_it(tmp_path, s
     monkeypatch.delenv(KEY_ENV)   # the next run's plan finds the engine refusing the start
     run(cfg)
     assert sweep_json(cfg)["starts"] == {"m": {"instant": None}}
+
+
+def test_a_record_from_before_starts_were_kept_points_to_a_new_sweep(tmp_path):
+    cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0)})
+    propose(cfg)
+    before = _proposal_files(cfg)
+    state = sweep_json(cfg)
+    del state["starts"]   # as a build that did not keep which modes ran wrote it
+    (out(cfg) / "sweep.json").write_text(json.dumps(state))
+    with pytest.raises(SweepConfigError, match="start a new sweep in another out folder") as refused:
+        propose(cfg)
+    assert "Run the sweep again" not in str(refused.value) and _proposal_files(cfg) == before
+
+
+@pytest.mark.parametrize("damage", ["missing", "unparseable"])
+def test_an_arm_file_that_cannot_be_read_withdraws_the_earlier_proposal(tmp_path, damage):
+    cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0)})
+    propose(cfg)
+    (assembled,) = (out(cfg) / "m" / "confirm" / "instant").glob("assembled-*")
+    profile = assembled / "run-1" / "profile.toml"
+    if damage == "missing":
+        profile.unlink()
+    else:
+        profile.write_text("default = \n[profiles.\n")
+    with pytest.raises(SweepConfigError, match="profile"):
+        propose(cfg)
+    assert not proposal_file(cfg).exists() and not (out(cfg) / "proposal" / "m" / "evidence.json").exists()
