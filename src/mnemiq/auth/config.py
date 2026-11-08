@@ -48,6 +48,8 @@ class AuthConfig:
     user_headers: tuple[str, ...]  # Open WebUI's unsigned user headers (lowercase), refused on every door
     map_path: str | None
     mcp_http: bool
+    # The signed header's name (lowercase), known even with that verifier off, so /v1 can refuse it by name.
+    jwt_header: str = "x-openwebui-user-jwt"
 
     @property
     def issuers(self) -> set[str]:
@@ -193,7 +195,8 @@ def auth_config_from_settings(settings, *, validate_map=None) -> AuthConfig | No
 
     config = AuthConfig(
         tenant=tenant, oidc=oidc, openwebui=openwebui, binding=binding,
-        user_headers=user_headers, map_path=settings.identity_map_path or None, mcp_http=mcp_http)
+        user_headers=user_headers, map_path=settings.identity_map_path or None, mcp_http=mcp_http,
+        jwt_header=settings.openwebui_jwt_header.strip().lower())
     if config.map_path:
         if validate_map is None:
             from mnemiq.auth.identity_map import IdentityMap
