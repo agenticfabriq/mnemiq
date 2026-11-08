@@ -403,6 +403,58 @@ def test_the_screen_skips_only_the_metadata_route():
     assert anyio.run(status, metadata) is None and reached == [metadata]
 
 
+METADATA = "/.well-known/oauth-protected-resource/mcp"
+
+
+def test_only_the_metadata_routes_go_unscreened():
+    from mnemiq.mcp.server import _unscreened
+
+    assert _unscreened(["/mcp", METADATA], "/mcp") == frozenset({METADATA})
+
+
+def test_an_sdk_route_neither_the_door_nor_its_metadata_refuses_to_start():
+    """A route a later SDK adds would otherwise be served unscreened by default, since every MCP app path is routed."""
+    from mnemiq.auth.config import AuthConfigError
+    from mnemiq.mcp.server import _unscreened
+
+    with pytest.raises(AuthConfigError, match="/mcp/extra"):
+        _unscreened(["/mcp", METADATA, "/mcp/extra"], "/mcp")
+    with pytest.raises(AuthConfigError, match="/mcp"):
+        _unscreened([METADATA], "/mcp")  # no door at all
+
+
+def test_the_metadata_route_is_unscreened_under_a_root_the_path_carries():
+    """The screen reads the path as the router does, so the metadata route stays open behind a proxy prefix."""
+    import httpx
+
+    with _serving(root_path="/api") as (base, aud, rt):
+        r = httpx.get(f"{base}{METADATA}", headers={"X-OpenWebUI-User-Id": "u"})
+        assert r.status_code == 200, r.text
+        valid = [("Authorization", f"Bearer {_token(aud)}")]
+        assert _raw(aud, valid + [("X-OpenWebUI-User-Id", "u")]) == 401
+
+
+def test_the_metadata_route_is_unscreened_under_a_root_that_only_spells_its_prefix():
+    """A root the path does not carry, and that is a string prefix of the metadata path but not at a slash: the
+    router serves the metadata route unchanged, so the screen must read it as that route and let it through."""
+    import httpx
+
+    from mnemiq.auth.doors import HttpDoors
+    from mnemiq.mcp.server import mcp_http_app
+    from mnemiq.server.app import build_app
+
+    port = _free_port()
+    cfg, rt = _config(port), _RT()
+    app = build_app(rt, SETTINGS_IDENTITY, doors=HttpDoors(cfg, fetch=_fetch), mcp_app=mcp_http_app(rt, cfg, fetch=_fetch))
+
+    async def get():
+        transport = httpx.ASGITransport(app=app, root_path="/.well", raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await client.get(f"http://127.0.0.1:{port}{METADATA}", headers={"X-OpenWebUI-User-Id": "u"})
+
+    assert anyio.run(get).status_code == 200
+
+
 def test_the_screen_holds_under_a_root_path():
     """Behind a proxy that sets a root path, the ASGI path carries the prefix while routing strips it; the screen
     must judge the same path the router does (found in review: it was skipped, and a plain header got through)."""

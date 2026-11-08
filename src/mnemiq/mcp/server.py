@@ -281,6 +281,25 @@ def _auth_settings(oidc):
     return AuthSettings(**kwargs)
 
 
+METADATA_PREFIX = "/.well-known/oauth-protected-resource"
+
+
+def _unscreened(paths, door: str) -> frozenset[str]:
+    """The routes the header screen lets through: the protected-resource metadata, which a client reads before it
+    holds a credential, and nothing else. An allow-list, so a route a later SDK adds is never served unscreened by
+    default: any route that is neither the door nor that metadata stops the server at startup."""
+    from mnemiq.auth.config import AuthConfigError
+
+    paths = [p for p in paths if p]
+    unscreened = frozenset(p for p in paths if p.startswith(METADATA_PREFIX))
+    unknown = sorted(set(paths) - unscreened - {door})
+    if unknown or door not in paths:
+        raise AuthConfigError(f"MCP over HTTP: the installed mcp serves {sorted(set(paths))}, and this server screens "
+                              f"only its door {door} and the protected-resource metadata; the routes {unknown} "
+                              "would be served without the header rules. Pin an mcp release this server supports")
+    return unscreened
+
+
 def _route_path(scope) -> str:
     """The path Starlette routes by: a root path is stripped only where a slash follows it (Starlette's own
     `get_route_path`, private to it, so restated here). Used only to recognise a route the screen skips."""
@@ -342,10 +361,10 @@ def mcp_http_app(runtime, cfg, *, fetch: Callable[[], dict] | None = None):
         app = build_mcp(runtime, http_identity(cfg), server_kwargs=server_kwargs).streamable_http_app(**http)
     else:
         app = build_mcp(runtime, http_identity(cfg), server_kwargs={**server_kwargs, **http}).streamable_http_app()
-    # Added last, so it is the outermost layer and runs before the SDK's authentication middleware. Only the
-    # protected-resource metadata goes unscreened, which a client reads before it holds any credential.
-    unscreened = frozenset(path for route in app.routes if (path := getattr(route, "path", None)) and path != "/mcp")
-    app.add_middleware(_HeaderScreen, cfg=cfg, unscreened=unscreened)
+    # Added last, so it is the outermost layer and runs before the SDK's authentication middleware.
+    door = http["streamable_http_path"]
+    unscreened = _unscreened([getattr(route, "path", None) for route in app.routes], door)
+    app.add_middleware(_HeaderScreen, cfg=cfg, unscreened=unscreened, path=door)
     return app
 
 
