@@ -752,6 +752,7 @@ version = "0.1.0.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "cachetools" },
+    { name = "cryptography" },
     { name = "duckdb" },
     { name = "httpx" },
     { name = "mcp" },
@@ -804,6 +805,7 @@ warehouse = [
 [package.metadata]
 requires-dist = [
     { name = "cachetools", specifier = ">=5" },
+    { name = "cryptography", specifier = ">=3.4.0" },
     { name = "cryptography", marker = "extra == 'snowflake'", specifier = ">=42" },
     { name = "cryptography", marker = "extra == 'warehouse'", specifier = ">=42" },
     { name = "databricks-sdk", marker = "extra == 'databricks'", specifier = ">=0.30" },

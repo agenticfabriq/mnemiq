@@ -39,6 +39,9 @@ dependencies = [
   # another package's choice of dependencies. The floor is mcp's own; capped at the newest release the suite passes
   # on (M121), and `crypto` brings the RSA and EC support an identity provider's keys need.
   "pyjwt[crypto]>=2.10.1,<2.16",
+  # `auth/jwks.py` checks a key's type and curve with it, so it is declared here and not left to `pyjwt[crypto]`;
+  # the floor is that extra's own.
+  "cryptography>=3.4.0",
 ]
 
 [project.optional-dependencies]

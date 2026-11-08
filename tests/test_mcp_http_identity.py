@@ -344,6 +344,65 @@ def test_the_metadata_route_is_not_screened():
         assert r.status_code == 200
 
 
+@pytest.mark.parametrize("root_path", ["/m", "/mc", "/"])
+def test_the_screen_runs_wherever_the_router_sends_mcp(root_path):
+    """An ASGI server may set a root path that the path does not carry. Starlette strips a root path only at a slash,
+    so with one of these it still routes /mcp to the door, and the screen must still run there (found in review: the
+    screen stripped the prefix by spelling and let a plain header through)."""
+    import httpx
+
+    from mnemiq.auth.doors import HttpDoors
+    from mnemiq.mcp.server import mcp_http_app
+    from mnemiq.server.app import build_app
+
+    port = _free_port()  # names the audience only; nothing listens on it
+    cfg, rt = _config(port), _RT()
+    app = build_app(rt, SETTINGS_IDENTITY, doors=HttpDoors(cfg, fetch=_fetch), mcp_app=mcp_http_app(rt, cfg, fetch=_fetch))
+    aud = f"http://127.0.0.1:{port}/mcp"
+
+    async def post():
+        transport = httpx.ASGITransport(app=app, root_path=root_path, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await client.post(aud, json={}, headers={"Authorization": f"Bearer {_token(aud)}",
+                                                            "X-OpenWebUI-User-Id": "u",
+                                                            "accept": "application/json, text/event-stream"})
+
+    r = anyio.run(post)
+    assert r.status_code == 401, r.status_code
+    assert "unsigned identity header" in r.json()["error_description"]
+    assert rt.served == []
+
+
+def test_the_screen_skips_only_the_metadata_route():
+    """It screens every request the MCP app is handed but the metadata route, so a path read differently from the
+    router can over-screen that route but never let a request past it to the door."""
+    from mnemiq.mcp.server import _HeaderScreen
+
+    metadata, reached = "/.well-known/oauth-protected-resource/mcp", []
+
+    async def door(scope, receive, send):
+        reached.append(scope["path"])
+
+    screen = _HeaderScreen(door, _config(_free_port()), unscreened=frozenset({metadata}))
+
+    async def status(path):
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        await screen({"type": "http", "method": "POST", "path": path, "root_path": "", "query_string": b"",
+                      "headers": [(b"x-openwebui-user-id", b"u")]}, receive, send)
+        return sent[0]["status"] if sent else None
+
+    for path in ("/mcp", "/mcp/", "/cp", ""):
+        assert anyio.run(status, path) == 401, path
+    assert anyio.run(status, metadata) is None and reached == [metadata]
+
+
 def test_the_screen_holds_under_a_root_path():
     """Behind a proxy that sets a root path, the ASGI path carries the prefix while routing strips it; the screen
     must judge the same path the router does (found in review: it was skipped, and a plain header got through)."""
