@@ -263,3 +263,11 @@ def test_v1_needs_the_db_read_scope(tmp_path):
     rejected = _refused(doors.v1, _bearer(mint(claims(scope="openid"))), 403, "lacks db.read")
     assert rejected.challenge == 'Bearer error="insufficient_scope", scope="db.read"'
     assert doors.v1(_bearer(mint(claims(scope="openid db.read")))).principal_id == "user-1"
+
+
+def test_openai_takes_a_bearer_without_db_read_until_its_rule_is_decided(tmp_path):
+    """Pinned on purpose: whether /openai/v1's Bearer tokens need db.read, as /v1's do, is decided with the endpoint
+    itself, and that decision should change this test rather than pass unnoticed. Open WebUI's signed header carries
+    no scopes at all."""
+    doors = _doors(tmp_path, **OPTION_A)
+    assert doors.openai(_bearer(mint(claims(aud=OWUI_AUDIENCE, scope="openid")))).principal_id == "user-1"
