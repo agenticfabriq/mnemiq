@@ -58,16 +58,23 @@ PREVIEW_ROWS = 20
 # table cell, backslash-escaped, which CommonMark allows for any ASCII punctuation. Never `[` or `(`: Open WebUI's
 # KaTeX reads `\[` and `\(` as the start of math. Neither needs escaping, since an escaped `]` and `!` break every
 # link and image, `\<` every tag, and `\$` with each backslash of the data doubled every formula. Not character
-# references either: Open WebUI shows `&#36;` as written in a table cell.
-_INERT = {char: "\\" + char for char in "\\`*]!<>|$&~_"}
+# references either: Open WebUI shows `&#36;` as written in a table cell. `:` and `@` too, and the `.` after `www`:
+# GFM makes a bare `scheme://`, `www.` or email address a link, in a cell as in a paragraph, and an escape breaks each.
+_INERT = {char: "\\" + char for char in "\\`*]!<>|$&~_:@"}
 _STATUS = {"judged": "verified by the judge", "basic": "basic checks only, not judged",
            "unavailable": "not verified: the judge could not be reached", "unknown": "verification state unknown"}
 
 
 def _inert(text: str, *, cell: bool) -> str:
-    """`text` with nothing in it that renders: one pass, so a reference is never escaped again. In a table cell a
-    line break becomes a space, since a row is one line."""
-    return "".join(_INERT.get(char) or (" " if cell and char in "\r\n" else char) for char in text)
+    """`text` with nothing in it that renders: one pass, so an escape is never escaped again. In a table cell a line
+    break becomes a space, since a row is one line."""
+    out = []
+    for at, char in enumerate(text):
+        if char == "." and text[max(0, at - 3):at].lower() == "www":
+            out.append("\\.")
+        else:
+            out.append(_INERT.get(char) or (" " if cell and char in "\r\n" else char))
+    return "".join(out)
 
 
 def _prose(text: str) -> str:

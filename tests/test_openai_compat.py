@@ -473,7 +473,7 @@ def test_data_and_prose_never_render_as_a_link_image_html_or_math(tmp_path):
     assert not MATH_START.search(outside), outside
     assert not UNESCAPED.search(outside), outside
     for raw, shown in (("$1,200 and $3,400", "\\$1,200 and \\$3,400"), ("![x](https://h.example/?q=1)",
-                                                                       "\\![x\\](https://h.example/?q=1)"),
+                                                                       "\\![x\\](https\\://h.example/?q=1)"),
                        ("<img src=x>", "\\<img src=x\\>"), ("a\\(b\\)", "a\\\\(b\\\\)"), ("A&B $5", "A\\&B \\$5")):
         assert shown in _content(tmp_path, _answer(columns=("v",), rows=[[raw]])), (raw, shown)
     # `(` and `[` stay as written: escaping either would open math in Open WebUI. The `]` is escaped, and renders as `]`.
@@ -487,10 +487,24 @@ def test_an_answer_never_carries_a_backslash_that_can_open_math(tmp_path):
     that opens nothing: a backslash the answer itself holds becomes the full-width one."""
     for raw in ("\\[x\\]", "see \\[x+1\\] here", "\\begin{equation}x\\end{equation}", "a\\(b\\)", "C:\\code\\path", "\\\\[x]"):
         prose = _content(tmp_path, _answer(answer=raw)).split("\n\n**Status:**")[0]
-        assert not re.search(r"\\(?![`*\]!<>|$&~_])", prose), (raw, prose)
+        assert not re.search(r"\\(?![`*\]!<>|$&~_:@.])", prose), (raw, prose)
     assert _content(tmp_path, _answer(answer="\\[x\\]")).startswith("\uff3c[x\uff3c\\]")
     # A cell keeps the data's backslashes, doubled: Marked lexes a cell inline only, where a doubled one is safe.
     assert "| a\\\\(b\\\\) |" in _content(tmp_path, _answer(columns=("v",), rows=[["a\\(b\\)"]]))
+
+
+@pytest.mark.parametrize("raw, shown", [("go to https://evil.example/x", "go to https\\://evil.example/x"),
+                                        ("ftp://evil.example/f", "ftp\\://evil.example/f"),
+                                        ("go to www.evil.example", "go to www\\.evil.example"),
+                                        ("WWW.evil.example", "WWW\\.evil.example"),
+                                        ("mail a@evil.example", "mail a\\@evil.example")])
+def test_a_bare_url_or_email_never_becomes_a_link(tmp_path, raw, shown):
+    """GFM turns a bare `scheme://`, `www.` or email address into a link, in a cell as in a paragraph (found in
+    review, reproduced with Marked 9). An escaped `:`, `.` after `www` or `@` breaks each, and opens no math."""
+    content = _content(tmp_path, _answer(answer=raw, columns=(raw,), rows=[[raw]]))
+    assert content.splitlines()[0] == shown
+    assert f"| {shown} |" in content.splitlines()  # the header
+    assert content.count(shown) == 3  # answer, header and cell
 
 
 def test_the_sql_fence_outlasts_backticks_in_the_sql(tmp_path):
