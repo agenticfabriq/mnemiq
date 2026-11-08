@@ -294,8 +294,12 @@ def test_a_mode_whose_start_the_engine_refuses_is_left_out_of_the_profile_confir
     assert sweep_json(cfg)["starts"]["m"]["thinking"] is None and "min_agreement" in sweep_json(cfg)["starts"]["m"]["instant"]
     refused = evidence(cfg)["refused_modes"]["instant"]
     assert "min_agreement" in refused["why"] and refused["unmeasured_profile_wide"] == {"writer_rules": "none"}
-    # Instant keeps the engine's per-mode settings, yet runs under the profile's writer_rules, never measured there.
+    # Instant runs the engine's per-mode settings, not the start's own section for it, which the profile drops, and
+    # the profile's writer_rules, never measured there.
     assert "writer_rules=none" in result["m"]["why"] and "never measured" in result["m"]["why"]
+    assert refused["dropped_start_section"] == {"min_agreement": 0.6}
+    note = result["m"]["why"].split("The engine refused the start in instant", 1)[1].split("The sweep did not search")[0]
+    assert "start's instant section (min_agreement=0.6)" in note and "it runs the engine's own" in note
     written = read_profile_file(str(proposal_file(cfg))).profiles["m"]
     assert written.instant is None and written.thinking is not None and written.writer_rules == "none"
 

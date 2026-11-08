@@ -442,30 +442,41 @@ def _profile_wide(arms: tuple[Arm, ...] | None) -> dict | None:
     return {name: value for name, value in arms[0].changes if _mode_of(name) is None}
 
 
-def _unmeasured_there(modes: Sequence[str], wide: dict, verb: str = "keeps") -> str:
-    """What a profile written with the whole-profile changes `wide` does in `modes`, which hold no section of it."""
+def _unmeasured_there(modes: Sequence[str], wide: dict, dropped: dict[str, dict] | None = None) -> str:
+    """What a profile written with the whole-profile changes `wide` does in `modes`, which hold no section of it. A
+    start's own section for one of them (`dropped`, from `_start_sections`) is not in the profile, which holds a
+    section only for the modes that ran, so promoting the profile moves that mode off it, and the note says so."""
+    dropped = dropped or {}
     one = len(modes) == 1
+    verb = "runs" if any(dropped.get(mode) for mode in modes) else "keeps"
     note = (f" The profile holds no section for {'that mode' if one else 'those modes'}, so "
             f"{'it' if one else 'each'} {verb} the engine's own per-mode settings, and runs under the profile's "
             "whole-profile settings")
     if not wide:
-        return note + ", which change nothing from the start."
-    changes = ", ".join(f"{name}={_show(value)}" for name, value in sorted(wide.items()))
-    return note + (f", whose {'change' if len(wide) == 1 else 'changes'} from the start ({changes}) "
-                   f"{'was' if len(wide) == 1 else 'were'} never measured there.")
+        note += ", which change nothing from the start."
+    else:
+        changes = ", ".join(f"{name}={_show(value)}" for name, value in sorted(wide.items()))
+        note += (f", whose {'change' if len(wide) == 1 else 'changes'} from the start ({changes}) "
+                 f"{'was' if len(wide) == 1 else 'were'} never measured there.")
+    for mode in modes:
+        if dropped.get(mode):
+            settings = ", ".join(f"{name}={_show(value)}" for name, value in dropped[mode].items())
+            note += (f" The start's {mode} section ({settings}) is not in the profile, so promoting it moves {mode} "
+                     "from those settings to the engine's own.")
+    return note
 
 
-def _refused_note(refused: dict[str, str], wide: dict | None) -> str:
+def _refused_note(refused: dict[str, str], wide: dict | None, dropped: dict[str, dict] | None = None) -> str:
     """What the reason says of the modes the engine refused the start in, or nothing. With a profile written (`wide`,
-    its whole-profile changes from the start), each such mode keeps the engine's own per-mode settings, having no
-    section of its own, and runs under the profile's whole-profile settings, whose changes were never measured
-    there."""
+    its whole-profile changes from the start), each such mode has no section of its own, so it takes the engine's own
+    per-mode settings, not the start's section for it (`dropped`), and runs under the profile's whole-profile settings,
+    whose changes were never measured there."""
     if not refused:
         return ""
     modes = list(refused)
     note = (f" The engine refused the start in {_joined(modes)} "
             f"({'; '.join(f'{mode}: {why}' for mode, why in refused.items())}), so nothing ran there.")
-    return note if wide is None else note + _unmeasured_there(modes, wide)
+    return note if wide is None else note + _unmeasured_there(modes, wide, dropped)
 
 
 def _start_sections(cfg: SweepConfig, model: str, modes: Sequence[str]) -> dict[str, dict]:
@@ -486,17 +497,10 @@ def _start_sections(cfg: SweepConfig, model: str, modes: Sequence[str]) -> dict[
 
 def _unsearched_note(unsearched: Sequence[str], wide: dict | None, dropped: dict[str, dict]) -> str:
     """What the reason says of the engine's modes the sweep did not search, or nothing: with a profile written, as of
-    a mode the engine refused the start in. A start's own section for such a mode (`dropped`) is not in the profile,
-    which holds a section only for the modes that ran, so promoting the profile moves that mode off it."""
+    a mode the engine refused the start in."""
     if not unsearched or wide is None:
         return ""
-    note = f" The sweep did not search {_joined(unsearched)}." + _unmeasured_there(unsearched, wide, "runs")
-    for mode in unsearched:
-        if dropped.get(mode):
-            settings = ", ".join(f"{name}={_show(value)}" for name, value in dropped[mode].items())
-            note += (f" The start's {mode} section ({settings}) is not in the profile, so promoting it moves {mode} "
-                     "from those settings to the engine's own.")
-    return note
+    return f" The sweep did not search {_joined(unsearched)}." + _unmeasured_there(unsearched, wide, dropped)
 
 
 def _refused_everywhere(refused: dict[str, str]) -> str:
@@ -1066,9 +1070,10 @@ def _chosen_arms(cfg: SweepConfig, model: str, verdict: dict, chosen: str,
         raise SweepConfigError(f"{chosen!r} is not an arm of {model} that ran and is valid in every run: those are "
                                f"start, {', '.join(sorted(set(valid))) or 'no other'}")
     if unmeasured := [arm.mode for arm in arms if not arm.changes and not verdict["start_valid_in"][arm.mode]]:
-        raise SweepConfigError(f"{chosen!r} ran in {_joined([arm.mode for arm in arms if arm.changes])} alone, so the "
-                               f"profile would hold the start in {_joined(unmeasured)}, and the start of {model} is not "
-                               f"valid in every run it owed there: a person cannot choose it")
+        ran = _joined([arm.mode for arm in arms if arm.changes])
+        raise SweepConfigError(f"{chosen!r} ran in {ran} alone, so the profile would hold the start in "
+                               f"{_joined(unmeasured)}, and the start of {model} is not valid in every run it owed "
+                               "there: a person cannot choose it")
     return tuple(arms), False
 
 
@@ -1156,18 +1161,19 @@ def _drafts(cfg: SweepConfig, chosen: str | None) -> dict[str, tuple[_Draft, dic
             if chosen:
                 why += f" A person's choice, {chosen}, does not apply here, since nothing ran."
         wide = _profile_wide(arms)
-        dropped = _start_sections(cfg, model, unsearched) if arms is not None else {mode: {} for mode in unsearched}
+        outside = [*refused, *unsearched]   # the modes the profile holds no section for
+        dropped = _start_sections(cfg, model, outside) if arms is not None else {mode: {} for mode in outside}
         evidence = _head(cfg, model, state, repeats, packaged) | {
             "start_valid": verdict["start_valid"],
             "chosen": chosen if picked[model] is not None else verdict["rule"],
             "chosen_by": "person" if picked[model] is not None else "rule",
             "rule_pick": verdict["rule"], "confirmed": confirmed,
-            "why": why + (_refused_note(refused, wide) + _unsearched_note(unsearched, wide, dropped) if running
-                          else ""),
+            "why": why + (_refused_note(refused, wide, dropped) + _unsearched_note(unsearched, wide, dropped)
+                          if running else ""),
             "warnings": warnings, "picks": verdict["picks"], "conflicts": verdict["conflicts"],
             "failed_mode": verdict["failed_mode"],
-            "refused_modes": {mode: {"why": reason, "unmeasured_profile_wide": wide or {}}
-                              for mode, reason in refused.items()},
+            "refused_modes": {mode: {"why": reason, "unmeasured_profile_wide": wide or {},
+                                     "dropped_start_section": dropped[mode]} for mode, reason in refused.items()},
             "unsearched_modes": {mode: {"unmeasured_profile_wide": wide or {}, "dropped_start_section": dropped[mode]}
                                  for mode in unsearched},
         }

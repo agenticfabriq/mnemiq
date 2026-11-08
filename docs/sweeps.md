@@ -438,9 +438,10 @@ stamped with) removes it, so none is left looking current.
 ### A mode the engine refuses the start in
 
 When the engine refuses a model's start in one mode, nothing runs there. That mode is left out of the confirm round,
-and the proposed profile has no section for it: in that mode the profile keeps the engine's own per-mode settings, and
-runs under the profile's whole-profile settings, which were never measured there. The evidence names the mode, the
-engine's reason, and those whole-profile changes. The same holds for each of the engine's modes that `modes` leaves
+and the proposed profile has no section for it: in that mode the profile takes the engine's own per-mode settings, not
+any section the start profile holds for it, and runs under the profile's whole-profile settings, which were never
+measured there. The evidence names the mode, the engine's reason, those whole-profile changes, and the start's section
+it drops (`dropped_start_section`). The same holds for each of the engine's modes that `modes` leaves
 out: the profile has no section for it, and the evidence (`unsearched_modes`) and its reason name it, with the
 whole-profile changes never measured there. A section the start profile holds for such a mode is not carried into the
 proposal, so promoting it moves that mode from the start's settings to the engine's own; the evidence names that
