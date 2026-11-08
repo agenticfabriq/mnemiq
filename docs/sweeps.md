@@ -307,7 +307,9 @@ any arm runs twice. A number in `repeats` fixes the count for every arm.
 
 After the start's first run, the sweep counts the answerable questions to tune on that the start got wrong. No arm can
 gain more than that. When it is fewer than the smallest gain that could pass (the next section), no arm can win, so
-the search stops for that model and mode, and the start is proposed there. The search goes on for the others.
+the search stops for that model and mode, and the start is proposed there. The search goes on for the others. Its
+later runs are stopped with the search, whatever count of runs the arms owe elsewhere, so there the start is read at
+its first run alone: a valid first run is a valid start.
 
 With `parallel` above 1, other arms start beside the start's first run, before its room is known, and those already
 running finish. They appear in the report and the evidence, but none is a candidate where the search stopped: each

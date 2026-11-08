@@ -234,14 +234,24 @@ def _out_of_room(state: dict, model: str, mode: str) -> dict | None:
     return room if room.get("stopped") == "no room" else None
 
 
+def _first_run(record: dict | None) -> dict | None:
+    """`record` read at its first run alone, and valid when that run is."""
+    if record is None:
+        return None
+    runs = [run for run in record["runs"] if run["run"] == 1]
+    return record | {"runs": runs, "pairs": [pair for pair in record["pairs"] if pair["run"] == 1],
+                     "valid": bool(runs) and all(run["valid"] for run in runs)}
+
+
 def _judged(cfg: SweepConfig, records: Sequence[dict], state: dict) -> dict[tuple[str, str], dict]:
     """For each model and mode, its start's record and every arm compared with it, judged by the rule: each arm's mean
     right and prompt tokens, whether its p passes Holm in each run, and why it is not a candidate. Arms are sorted by
     mean right, the most first.
 
-    A model and mode whose search the record (`state`) says stopped for want of room has no candidate. The arms that
-    were running beside the start's first run when that was found, and finished, are judged all the same, and each
-    says the search stopped there."""
+    A model and mode whose search the record (`state`) says stopped for want of room has no candidate. Its start and
+    its arms are read at the one run they owed: the search stopped once the start's first run was in, and the runs it
+    did not start were stopped on purpose, so a valid first run is a valid start there. The arms that were running
+    beside that run, and finished, are judged all the same, and each says the search stopped there."""
     alpha, bounds = cfg.propose.alpha, cfg.propose
     judged: dict[tuple[str, str], dict] = {}
     for model in cfg.models:
@@ -250,9 +260,11 @@ def _judged(cfg: SweepConfig, records: Sequence[dict], state: dict) -> dict[tupl
                     if (record["model"], record["mode"]) == (model, mode) and record["control"] is None]
             start = next((record for record in mine if record["arm"] == "start"), None)
             arms = [record for record in mine if record["arm"] != "start"]
+            room = _out_of_room(state, model, mode)
+            if room is not None:
+                start, arms = _first_run(start), [_first_run(record) for record in arms]
             runs = len(start["runs"]) if start is not None else max((len(record["runs"]) for record in arms), default=0)
             passed = [holm({record["arm"]: _p(record, run) for record in arms}, alpha) for run in range(1, runs + 1)]
-            room = _out_of_room(state, model, mode)
             entries = []
             for record in arms:
                 pairs = {pair["run"]: pair for pair in record["pairs"]}
@@ -924,13 +936,16 @@ def _search(cfg: SweepConfig, model: str, state: dict, judged: dict, timing: dic
         elif not start["valid"]:
             runs = "; ".join(_unmeasured(run, cfg.sweep.max_errors) for run in start["runs"] if not run["valid"])
             said.append(f"in {mode}, {runs}")
-    failed = ("The one profile assembled from each mode's pick failed on the held-out part in "
-              f"{verdict['failed_mode']}, and the start it falls back to is not valid. "
-              if verdict["confirmed"] is False else "")
-    return verdict | {"rule": None, "rule_arms": None, "confirmed": None,
-                      "why": f"{failed}Nothing is proposed: the start is not valid in every run "
-                             f"({'; '.join(said)}), so nothing can be compared with it, and a start that was not "
-                             "measured is not proposed."}
+    if verdict["confirmed"] is False:
+        why = (f"The one profile assembled from each mode's pick failed on the held-out part in "
+               f"{verdict['failed_mode']}, so the rule falls back to the confirm round's start. Nothing is proposed: "
+               "the start the arms were compared with on the questions to tune on is not valid in every run it owed "
+               f"({'; '.join(said)}), so the search measured nothing against it.")
+    else:
+        why = (f"Nothing is proposed: the start is not valid in every run it owed on the questions to tune on "
+               f"({'; '.join(said)}), so nothing can be compared with it, and a start that was not measured is not "
+               "proposed.")
+    return verdict | {"rule": None, "rule_arms": None, "confirmed": None, "why": why}
 
 
 def _searched(cfg: SweepConfig, model: str, state: dict, judged: dict, timing: dict, confirm: Sequence[dict],

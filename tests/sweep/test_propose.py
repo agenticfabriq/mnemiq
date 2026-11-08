@@ -16,7 +16,7 @@ from mnemiq.sweep.arms import arm_of, engine_refusal
 from mnemiq.sweep.config import SweepConfigError, load_config
 from mnemiq.sweep.propose import candidates, pick, propose, quiet_machine, server_running
 from mnemiq.sweep.report import report
-from mnemiq.sweep.run import _begin, _parts, run
+from mnemiq.sweep.run import _begin, _parts, arm_folder, run
 
 from .conftest import (
     KEY_ENV, STUB_KEY, UNREACHABLE, checked_sweep, confirm_arms_run, confirm_modes, evidence, graded_rows,
@@ -464,6 +464,50 @@ def test_a_search_whose_start_is_not_valid_proposes_nothing(tmp_path):
     assert result["chosen"] is None and "nothing can be compared with it" in result["why"]
     assert "run 1 did not measure 1 cases" in result["why"]
     assert evidence(cfg)["start_valid"] is False and not proposal_file(cfg).exists()
+
+
+def test_a_start_out_of_room_under_two_fixed_runs_is_read_at_the_one_run_it_owed(tmp_path, stub_model):
+    cfg = load_config(write_config(tmp_path, model=stub_model(start_misses=2), arms_in_screen=4,
+                                   sweep={"repeats": 2}))
+    run(cfg)
+    # The search stopped after the start's first run, so its second never ran, on purpose.
+    assert sweep_json(cfg)["room"]["m"]["instant"]["stopped"] == "no room"
+    assert not arm_folder(cfg, start_of(cfg, "instant"), 2).exists()
+    result = propose(cfg)["m"]
+    assert result["chosen"] == "start" and "no room" in result["why"] and "not measured" not in result["why"]
+    assert evidence(cfg)["start_valid"] is True and proposal_file(cfg).exists()
+    assert [each["run"] for each in evidence(cfg)["candidates"]["instant"]["start"]] == [1]
+
+
+def test_a_model_out_of_room_beside_one_that_decided_two_runs_proposes_its_start(tmp_path, stub_model, monkeypatch):
+    monkeypatch.setattr(proposal, "LOAD_WAIT_S", 0.0)
+    right, wrong = stub_model(gold=True), stub_model(varies=True, gold_when=lambda request: False)
+    models = {name: {"llm_model": "stub-model", "llm_base_url": stub.url, "api_key_env": KEY_ENV}
+              for name, stub in zip("mn", (right, wrong))}
+    cfg = load_config(write_config(tmp_path, model=right, models=models, arms_in_screen=1,
+                                   dataset=tiny_dataset(tmp_path, cases=10, answerable=9, stub=right)))
+    run(cfg)
+    # m's start gets every question right, so m has no room; n's start does not repeat itself, so every arm owes two
+    # runs, and m's start, its search stopped, ran one.
+    assert sweep_json(cfg)["repeats"] == 2 and sweep_json(cfg)["room"]["m"]["instant"]["stopped"] == "no room"
+    result = propose(cfg)["m"]
+    assert result["chosen"] == "start" and "not measured" not in result["why"]
+    assert evidence(cfg, "m")["start_valid"] is True and proposal_file(cfg, "m").exists()
+
+
+def test_a_failed_confirm_over_a_start_not_valid_says_which_start(tmp_path):
+    cfg = graded_sweep(tmp_path, modes=["instant", "thinking"], arms={"writer_rules=none": dict(only=9, other=0)},
+                       held_out={"assembled": dict(more_wrong=1)}, play=False)
+    start = arm_of("m", "thinking", {}, round="screen")
+    rows = read_rows(cfg, start)
+    rows[0] |= {"outcome": "error", "error_kind": "endpoint", "model_error": "status_503"}   # one case not measured
+    write_run(cfg, start, rows)
+    play_after_search(cfg, held_out={"assembled": dict(more_wrong=1)})
+    result = propose(cfg)["m"]
+    assert result["chosen"] is None and evidence(cfg)["failed_mode"] is not None
+    assert "the confirm round's start" in result["why"] and "questions to tune on" in result["why"]
+    assert "in thinking, run 1 did not measure 1 cases" in result["why"]
+    assert "the start it falls back to is not valid" not in result["why"]
 
 
 def test_the_evidence_names_the_modes_the_sweep_did_not_search(tmp_path):
