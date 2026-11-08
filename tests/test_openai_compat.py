@@ -3,6 +3,7 @@ verified caller, one model per profile that caller may pick."""
 
 import json
 import logging
+import re
 import threading
 import time
 from types import SimpleNamespace
@@ -105,10 +106,13 @@ def test_no_issuer_means_no_endpoint(tmp_path, caplog):
     assert "MNEMIQ_OPENWEBUI_JWT_SECRET" in said and "MNEMIQ_OPENWEBUI_AUDIENCE" in said
 
 
-@pytest.mark.parametrize("method", ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
-def test_an_unmounted_endpoint_is_a_404_for_every_method(tmp_path, method):
-    r = _client(tmp_path, doors=None).request(method, "/openai/v1/chat/completions")
-    assert r.status_code == 404, (method, r.status_code)
+@pytest.mark.parametrize("path", ["/openai/v1/chat/completions", "/openai/v1"])
+@pytest.mark.parametrize("method", ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "PROPFIND"])
+def test_an_unmounted_endpoint_is_a_404_for_every_method(tmp_path, method, path):
+    """Every method, an extension method included, and the bare prefix too: none may fall through to the
+    workbench mount, which answers a non-GET with 405."""
+    r = _client(tmp_path, doors=None).request(method, path)
+    assert r.status_code == 404, (method, path, r.status_code)
 
 
 def test_an_issuer_without_an_openai_verifier_means_no_endpoint(tmp_path):
@@ -171,6 +175,9 @@ def test_every_openai_error_has_openai_shape(tmp_path):
     _error(post_models, 405)
     assert post_models.headers["allow"] == "GET"
     _error(client.post("/openai/v1/embeddings", headers=_as(), json={}), 404)
+    _error(client.post("/openai/v1", headers=_as(), json={}), 404)
+    trace = client.request("TRACE", "/openai/v1/models", headers=_as())
+    assert trace.status_code == 405 and trace.headers["allow"] == "GET"
 
     class Broken(_RT):
         @property
@@ -434,32 +441,43 @@ def test_a_cell_cannot_break_the_table(tmp_path):
     content = _content(tmp_path, _answer(columns=("v",), rows=[["a|b"], ["a\nb"], ["a\rb"], ["tail\\"], [None]]))
     table = [line for line in content.splitlines() if line.startswith("|")]
     assert len(table) == 2 + 5, table  # header, separator, five rows: nothing split or merged
-    assert all(line.count("|") == 2 for line in table), table
-    assert "| a&#124;b |" in table and "| a b |" in table and "| tail&#92; |" in table and "|  |" in table
+    assert all(len(re.findall(r"(?<!\\)\|", line)) == 2 for line in table), table  # an escaped pipe splits nothing
+    assert "| a\\|b |" in table and "| a b |" in table and "| tail\\\\ |" in table and "|  |" in table
 
 
-ESCAPED = "\\`*[]!<>|$&~"
+ESCAPED = "\\`*]!<>|$&~_"
 
 
 @pytest.mark.parametrize("char", list(ESCAPED))
 def test_every_escaped_character_is_inert_in_cells_headers_and_prose(tmp_path, char):
     """Each character that starts a link, an image, HTML, math, a code span, emphasis or strikethrough, or splits a
-    cell, arrives as its numeric character reference, in the answer text, a column header and a cell alike."""
-    ref = f"&#{ord(char)};"
+    cell, arrives backslash-escaped, in the answer text, a column header and a cell alike. Not as a character
+    reference, which Open WebUI shows as written in a table cell (found in the live check)."""
+    ref = "\\" + char
     lines = _content(tmp_path, _answer(answer=f"a{char}b", columns=(f"h{char}h",), rows=[[f"c{char}c"]])).splitlines()
     assert lines[0] == f"a{ref}b"
     table = [line for line in lines if line.startswith("|")]
     assert table == [f"| h{ref}h |", "| --- |", f"| c{ref}c |"], table
 
 
+# An odd run of backslashes before `(` or `[`: what Open WebUI's KaTeX reads as the start of math.
+MATH_START = re.compile(r"(?<!\\)(?:\\\\)*\\[([]")
+# A `$`, `<`, `!` or `]` with no backslash escaping it: math, HTML, an image or the end of a link.
+UNESCAPED = re.compile(r"(?<!\\)(?:\\\\)*[$<!\]]")
+
+
 def test_data_and_prose_never_render_as_a_link_image_html_or_math(tmp_path):
-    values = ["![x](https://h.example/?q=1)", "<img src=x>", "$1,200 and $3,400", "a\\(b\\)"]
+    values = ["![x](https://h.example/?q=1)", "<img src=x>", "$1,200 and $3,400", "a\\(b\\)", "\\[x\\]"]
     content = _content(tmp_path, _answer(answer=" ".join(values), columns=(values[0],), rows=[[v] for v in values]))
     outside = content.split("```")[0] + content.split("```")[-1]
-    for char in "[<$\\":
-        assert char not in outside, (char, outside)
-    assert "revenue (net) 1.5" in _content(tmp_path, _answer(answer="revenue (net) 1.5"))
-    assert "A&#38;B &#36;5" in _content(tmp_path, _answer(columns=("v",), rows=[["A&B $5"]]))  # one pass
+    assert not MATH_START.search(outside), outside
+    assert not UNESCAPED.search(outside), outside
+    for raw, shown in (("$1,200 and $3,400", "\\$1,200 and \\$3,400"), ("![x](https://h.example/?q=1)",
+                                                                       "\\![x\\](https://h.example/?q=1)"),
+                       ("<img src=x>", "\\<img src=x\\>"), ("a\\(b\\)", "a\\\\(b\\\\)"), ("A&B $5", "A\\&B \\$5")):
+        assert shown in _content(tmp_path, _answer(columns=("v",), rows=[[raw]])), (raw, shown)
+    # `(` and `[` stay as written: escaping either would open math in Open WebUI. The `]` is escaped, and renders as `]`.
+    assert "revenue (net) 1.5 [draft\\]" in _content(tmp_path, _answer(answer="revenue (net) 1.5 [draft]"))
 
 
 def test_the_sql_fence_outlasts_backticks_in_the_sql(tmp_path):

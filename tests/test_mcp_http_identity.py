@@ -5,9 +5,11 @@ Runs on mcp 1.x (the lock) and 2.x (the mcp-2x workflow), so it touches the SDK 
 
 import json
 import socket
+import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
+from pathlib import Path
 
 import anyio
 import pytest
@@ -65,8 +67,9 @@ def _serving(rt=None, root_path: str = "", **over):
     port = _free_port()
     cfg = _config(port, **over)
     rt = rt or _RT()
+    # An empty static folder: a built workbench, mounted at /, would answer what the door does not.
     app = build_app(rt, SETTINGS_IDENTITY, doors=HttpDoors(cfg, fetch=_fetch),
-                    mcp_app=mcp_http_app(rt, cfg, fetch=_fetch))
+                    mcp_app=mcp_http_app(rt, cfg, fetch=_fetch), static_dir=Path(tempfile.mkdtemp()))
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", lifespan="on",
                                            root_path=root_path))
     thread = threading.Thread(target=server.run, daemon=True)

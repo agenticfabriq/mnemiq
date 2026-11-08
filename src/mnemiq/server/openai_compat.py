@@ -38,7 +38,6 @@ logger = logging.getLogger(__name__)
 
 PREFIX = "/openai/v1"
 _ROUTES = {"models": "GET", "chat/completions": "POST"}  # each path this endpoint serves, and its one method
-_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]  # a route with none is GET-only
 _TYPE = {400: "invalid_request_error", 401: "authentication_error", 403: "permission_error",
          404: "invalid_request_error", 405: "invalid_request_error", 503: "server_error", 500: "server_error"}
 _OPAQUE = "The engine could not complete this request"
@@ -56,10 +55,11 @@ _OPEN_WEBUI_TASKS = frozenset({"title_generation", "follow_up_generation", "tags
 
 PREVIEW_ROWS = 20
 # Every character that starts a link, an image, HTML, math, a code span, emphasis or strikethrough, or splits a
-# table cell, as its numeric character reference. Not a backslash escape: Open WebUI renders `\(`, `\[` and `$...$`
-# as math, so an escaped bracket would itself open a formula. Without `[` there is no link or image, without `<` no
-# HTML, and without `$` and `\` no math; parentheses, `.`, `-` and `#` stay as they are.
-_INERT = {char: f"&#{ord(char)};" for char in "\\`*[]!<>|$&~"}
+# table cell, backslash-escaped, which CommonMark allows for any ASCII punctuation. Never `[` or `(`: Open WebUI's
+# KaTeX reads `\[` and `\(` as the start of math. Neither needs escaping, since an escaped `]` and `!` break every
+# link and image, `\<` every tag, and `\$` with each backslash of the data doubled every formula. Not character
+# references either: Open WebUI shows `&#36;` as written in a table cell.
+_INERT = {char: "\\" + char for char in "\\`*]!<>|$&~_"}
 _STATUS = {"judged": "verified by the judge", "basic": "basic checks only, not judged",
            "unavailable": "not verified: the judge could not be reached", "unknown": "verification state unknown"}
 
@@ -184,17 +184,24 @@ def _install_handlers(app: FastAPI) -> None:
 
 
 def _catch_all(app: FastAPI, *, mounted: bool) -> None:
-    """Claims every other /openai/v1 path and method. Registered after the real routes, and before the workbench's
-    `/` mount, which would otherwise answer a POST with 405. A full path match wins over the router's method check,
-    so this answers the known paths' wrong methods itself."""
+    """Claims the prefix and every path under it, for every method, an extension method included. Both are served by
+    an ASGI app rather than a function, since Starlette gives a function endpoint GET alone: a route for the bare
+    prefix and a mount for what is under it. Added after the real routes, so they answer only what those do not, and
+    before the workbench's `/` mount, which would answer a non-GET with 405. A known path's wrong method reaches them
+    too, and gets 405 with Allow."""
+    from starlette.routing import Mount, Route  # here, as server/app.py imports Starlette: the extra names FastAPI
 
-    def elsewhere(rest: str, request: Request):
-        allowed = _ROUTES.get(rest.strip("/")) if mounted else None
-        if allowed is not None:
-            raise OpenAIError(405, f"{PREFIX}/{rest.strip('/')} takes {allowed} only", headers={"Allow": allowed})
-        raise OpenAIError(404, "not found" if mounted else "this deployment does not serve /openai/v1")
+    class Elsewhere:
+        async def __call__(self, scope, receive, send):
+            rest = scope["path"].split(PREFIX, 1)[-1].strip("/")
+            allowed = _ROUTES.get(rest) if mounted else None
+            if allowed is not None:
+                response = _shaped(405, f"{PREFIX}/{rest} takes {allowed} only", headers={"Allow": allowed})
+            else:
+                response = _shaped(404, "not found" if mounted else "this deployment does not serve /openai/v1")
+            await response(scope, receive, send)
 
-    app.add_api_route(PREFIX + "/{rest:path}", elsewhere, methods=_METHODS, include_in_schema=False)
+    app.router.routes += [Route(PREFIX, Elsewhere(), include_in_schema=False), Mount(PREFIX, app=Elsewhere())]
 
 
 def _offered(runtime, identity: IdentityContext) -> list[str]:
