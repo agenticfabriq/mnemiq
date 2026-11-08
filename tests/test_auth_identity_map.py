@@ -113,11 +113,21 @@ def test_the_same_group_under_two_issuers_maps_only_under_its_own(tmp_path):
         "store1_manager"]
 
 
-def test_email_matching_case_folds_both_sides(tmp_path):
+def test_email_matching_folds_ascii_case_on_both_sides(tmp_path):
     m = _read(_write(tmp_path, {ISSUER: {"email": {"Ana@Example.com": ["analyst"], "Straße@x.example": ["viewer"]}}}))
     assert m.roles_for(ISSUER, sub="x", email="ana@example.COM", groups=[], roles_claim_present=False) == ["analyst"]
-    assert m.roles_for(ISSUER, sub="x", email="strasse@x.example", groups=[], roles_claim_present=False) == [
+    assert m.roles_for(ISSUER, sub="x", email="STRAßE@X.example", groups=[], roles_claim_present=False) == [
         "viewer"]
+
+
+@pytest.mark.parametrize("rule, sent", [
+    ("ana@fass.de", "ana@faß.de"),  # two registrable domains under IDNA2008
+    ("strasse@x.example", "Straße@x.example"),
+    ("kai@x.example", "\u212aai@x.example"),  # the Kelvin sign folds to k under Unicode case folding
+])
+def test_email_matching_never_merges_distinct_unicode_addresses(tmp_path, rule, sent):
+    m = _read(_write(tmp_path, {ISSUER: {"email": {rule: ["analyst"]}}}))
+    assert m.roles_for(ISSUER, sub="x", email=sent, groups=[], roles_claim_present=False) == []
 
 
 def test_sub_and_group_match_exactly(tmp_path):

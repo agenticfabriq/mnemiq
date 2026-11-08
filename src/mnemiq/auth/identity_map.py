@@ -31,6 +31,13 @@ class IdentityMapUnavailable(TokenRejected):
         super().__init__("identity map unavailable")
 
 
+def fold_email(address: str) -> str:
+    """ASCII letters lowercased, everything else kept as written. Unicode case folding would merge addresses that are
+    different mailboxes: `ß` folds to `ss` (`faß.de` and `fass.de` are separately registrable domains) and the
+    Kelvin sign to `k`."""
+    return "".join(c.lower() if c.isascii() else c for c in address)
+
+
 class _Conflict(ValueError):
     """A rule that contradicts the deployment's configuration, which refuses to start rather than deny."""
 
@@ -100,7 +107,7 @@ class IdentityMap:
                     if not isinstance(roles, list) or not all(isinstance(r, str) for r in roles):
                         raise ValueError(f"a {claim!r} rule under {issuer!r} maps to something other than a list "
                                          "of role names")
-                    key = value.casefold() if claim == "email" else value
+                    key = fold_email(value) if claim == "email" else value
                     rules.setdefault(issuer, {}).setdefault(claim, {}).setdefault(key, []).extend(
                         normalize_roles(roles))
         return rules
@@ -115,7 +122,7 @@ class IdentityMap:
         if not roles_claim_present:
             found.update(rules.get("sub", {}).get(sub, ()))
             if email is not None:
-                found.update(rules.get("email", {}).get(email.casefold(), ()))
+                found.update(rules.get("email", {}).get(fold_email(email), ()))
         for group in groups:
             found.update(rules.get("groups", {}).get(group, ()))
         return sorted(found)
