@@ -849,6 +849,28 @@ def test_every_duckdb_json_reader_that_quotes_malformed_text_is_refused():
     assert admitted == [], admitted
 
 
+def test_a_reader_sqlglot_gives_a_node_of_its_own_is_refused_like_its_untyped_spelling():
+    """sqlglot 30.29 parses `from_json` as `exp.FromJson`, where 30.12 left it `Anonymous`, and the
+    reader check named its readers on `Anonymous` alone, so the promoted call was approved and a
+    malformed row's text could reach the error (M228). A reader is named by the call the engine
+    makes, whatever node sqlglot gives it."""
+    assert isinstance(_decide("from_json(region, '\"INTEGER\"') IS NOT NULL"), Refusal)
+    from sqlglot import exp
+
+    from mnemiq.sql.rls import _call_args, _call_name
+
+    def args(node):
+        return [a.sql() for a in _call_args(node)]
+
+    untyped = exp.Anonymous(this="from_json", expressions=[exp.column("region"),
+                                                          exp.Literal.string('"INTEGER"')])
+    assert (_call_name(untyped), args(untyped)) == ("from_json", ["region", "'\"INTEGER\"'"])
+    if hasattr(exp, "FromJson"):  # the node of its own, on a sqlglot that has one
+        typed = exp.FromJson(this=exp.column("region"), expression=exp.Literal.string('"INTEGER"'))
+        assert (_call_name(typed), args(typed)) == ("from_json", ["region", "'\"INTEGER\"'"])
+    assert _call_name(exp.column("region")) is None  # not a call
+
+
 # --- refused --------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("engine,row_filter", [
