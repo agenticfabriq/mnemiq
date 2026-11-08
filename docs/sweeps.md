@@ -18,7 +18,8 @@ settings.
 2. Write a config file naming that file, a deployment, the models and the values to try
    ([the config file](#the-config-file)).
 3. Set each key variable the config names, for example `export LOCAL_LLM_KEY=...`. A server that takes no key still
-   needs the variable to hold some value. No key is ever written in a file.
+   needs the variable to hold some value. No key is ever written in a file. `run` refuses to start, naming the
+   variable, while one is not set.
 4. Read the plan, which runs nothing:
 
    ```bash
@@ -179,7 +180,7 @@ another, so it follows the profile name rule, `[a-z0-9][a-z0-9._-]*`.
 
 - `llm_model`, `llm_base_url`: where the model is served, an `http` or `https` URL with no credential in it.
 - `api_key_env`: the environment variable holding the model's key. It must be set when the sweep runs and when it
-  proposes.
+  proposes: each refuses, naming it, when it is not.
 - `llm_context_window`, `verify_model`, `verify_base_url`, `verify_api_key_env`: as in a profile, optional.
 - `price_in_per_mtok`, `price_out_per_mtok`: dollars per million prompt and completion tokens. Without both, the
   sweep cannot price the model or check a dollar budget.
@@ -285,7 +286,8 @@ McNemar test asks how likely a split at least that uneven would be if either sid
    in every mode and run, it is valid, gets at least as many of the differing questions right as the start, and adds
    no more wrong or made-up answers than `[propose]` allows. Then it is proposed. When it fails, the start is
    proposed: confirm runs once, with no second try, since trying another candidate would make the held-out questions
-   part of the search.
+   part of the search. Wherever the rule falls back to the start, it proposes nothing instead when the start is not
+   valid in every run, as check mode does: nothing could be compared with it.
 
 With `strategy = "grid"`, the grid runs every combination of the space at once, its own start among them, with no
 screen. Fine for a small space; the screen exists because combinations multiply.
@@ -395,8 +397,8 @@ each run's `only/other` and p. The screen's p is the one-sided p it keeps by; ev
   that wrote the proposal, the split seed and each part's size, the identity, each model's endpoints without
   credentials, the rule (strategy, `alpha`, `screen_alpha`, the bounds, `max_errors`, the runs each arm owed and
   whether the first round decided them), and the sources it could not pin;
-- **the verdict**: what was chosen and by whom (the rule or a person), the rule's own pick, whether it was confirmed,
-  why in words, and any warnings;
+- **the verdict**: whether the start is valid in every run (`start_valid`), what was chosen and by whom (the rule or a
+  person), the rule's own pick, whether it was confirmed, why in words, and any warnings;
 - **each mode**: its pick and what decided it, its room (the start's misses, the gain needed, the arms compared), and
   every arm compared with the start, with its runs, its pairs, whether it passed Holm in each run and why it is not a
   candidate when it is not;
@@ -407,23 +409,27 @@ each run's `only/other` and p. The screen's p is the one-sided p it keeps by; ev
 - **the profile**: its name, which arm's file it is, how it was measured (whole, or mode by mode when each mode ran an
   arm of its own), and its `version`, recomputed by the engine and checked against the version the measured arm's
   answers were stamped with;
-- **modes the engine refused** (below), and in check mode the start and the defaults side by side.
+- **modes the engine refused and modes the sweep did not search** (below), and in check mode the start and the
+  defaults side by side.
 
 `propose` writes both files only once every check has passed. It opens each deployment's source to read its
 dialect, which a profile's version holds, so it needs the same access to the source as the run, and each key variable
 the models name must be set, since the engine's loader reads them to recompute each version. Packaged by another engine
 build than the one the arms ran on, it warns and goes on: the version check still refuses a profile that would resolve
 to anything other than what was measured. A refusal for what was asked (a `--choose` that names no arm that ran and is
-valid, a config edited since the sweep ran, a key variable not set) leaves an earlier proposal as it was. A refusal
-that shows an earlier proposal no longer holds (the sweep has not finished its rounds, its split is not the one it
-drew, an arm's file is not the profile its answers were stamped with) removes it, so none is left looking current.
+valid, a config edited since the sweep ran, a key variable not set, the out folder in use by a run or another
+`propose`) leaves an earlier proposal as it was. A refusal that shows an earlier proposal no longer holds (the sweep
+has not finished its rounds, its split is not the one it drew, an arm's file is not the profile its answers were
+stamped with) removes it, so none is left looking current.
 
 ### A mode the engine refuses the start in
 
 When the engine refuses a model's start in one mode, nothing runs there. That mode is left out of the confirm round,
 and the proposed profile has no section for it: in that mode the profile keeps the engine's own per-mode settings, and
 runs under the profile's whole-profile settings, which were never measured there. The evidence names the mode, the
-engine's reason, and those whole-profile changes.
+engine's reason, and those whole-profile changes. The same holds for each of the engine's modes that `modes` leaves
+out: the profile has no section for it, and the evidence (`unsearched_modes`) and its reason name it, with the
+whole-profile changes never measured there.
 
 ## Identities, and why row filters are refused
 
@@ -464,7 +470,8 @@ until the sweep ends. Build the snapshot deployment's store from the snapshot, a
 
 ## Running, resuming and smoke
 
-- **One run at a time per out folder.** A second `run` on the same folder is refused at once.
+- **One run at a time per out folder.** A second `run` on the same folder is refused at once, and so is a `propose`
+  while a run goes on, or beside another `propose`.
 - **Resume.** A stopped run, whether by the budget, an endpoint, a worker, Ctrl-C or the machine, resumes where it
   stopped: each arm from the answers it wrote, and what the first round decided (the runs each arm owes, each start's
   room) read back. A resumed config may change only `budget_hours`, `budget_dollars`, `seconds_per_question` and its

@@ -300,6 +300,14 @@ def write_config(tmp_path: Path, *, deployment: TinyDeployment | None = None, mo
     return path
 
 
+def start_refused_in_instant(tmp_path: Path) -> dict:
+    """A `[start]` section naming a profile that sets min_agreement on instant's one candidate, which the engine refuses
+    in instant and accepts in thinking."""
+    path = tmp_path / "start-refused-in-instant.toml"
+    path.write_text('default = "tuned"\n[profiles.tuned]\n[profiles.tuned.instant]\nmin_agreement = 0.6\n')
+    return {"profile_file": str(path)}
+
+
 def broken_questions(tmp_path: Path, bad: str) -> Path:
     """The tiny cases with one fault that makes them ungradable, written beside the deployment."""
     cases = [_graded(case) for case in CASES]

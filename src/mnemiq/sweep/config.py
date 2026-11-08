@@ -552,6 +552,18 @@ def start_profile(cfg: SweepConfig, model: str) -> tuple[str | None, str | None]
     return cfg.start.profile_file, profile
 
 
+def unset_keys(cfg: SweepConfig, models: Collection[str]) -> list[str]:
+    """Each key variable `models` name, their judge's included, that this process's environment does not set, after
+    the model naming it. Named, never quoted: the engine's profile loader refuses a profile whose variable is unset."""
+    unset = []
+    for model in models:
+        entry = cfg.models[model]
+        judge = cfg.judge if cfg.judge is not None else entry
+        unset += [f"{variable} (model {model!r})" for variable in (entry.api_key_env, judge.verify_api_key_env)
+                  if variable and not os.environ.get(variable)]
+    return unset
+
+
 def _check_start(cfg: SweepConfig, model: str) -> None:
     path, profile = start_profile(cfg, model)
     if path is None:

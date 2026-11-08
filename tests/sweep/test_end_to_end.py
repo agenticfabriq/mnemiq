@@ -15,8 +15,8 @@ from mnemiq.sweep.config import Control, Search, SweepConfig, fingerprint, load_
 from mnemiq.sweep.stats import detectable_gain
 
 from .conftest import (
-    KEY_ENV, STUB_KEY, UNREACHABLE, answers_file, evidence, graded_sweep, json_lines, out, proposal_file, tiny_deployment,
-    tiny_files, write_config,
+    KEY_ENV, STUB_KEY, UNREACHABLE, answers_file, evidence, graded_sweep, json_lines, out, proposal_file,
+    start_refused_in_instant, tiny_deployment, tiny_files, write_config,
 )
 
 REPO = Path(__file__).resolve().parents[2]
@@ -176,14 +176,26 @@ def test_a_report_before_any_decision_reads_each_arm_at_one_run(tmp_path, capsys
     assert "one run" in said and "Nothing has run" in said
 
 
-def test_a_report_says_why_when_the_engine_refused_every_start(tmp_path, stub_model, monkeypatch, capsys):
-    cfg_path = write_config(tmp_path, model=stub_model(gold=True), arms_in_screen=1)
-    monkeypatch.delenv(KEY_ENV)   # every profile names a key variable that is not set
+def test_a_report_says_why_when_the_engine_refused_every_start(tmp_path, stub_model, capsys):
+    cfg_path = write_config(tmp_path, model=stub_model(gold=True), arms_in_screen=1,
+                            start=start_refused_in_instant(tmp_path))   # instant is the sweep's one mode
     assert main(["sweep", "run", "--config", str(cfg_path)]) == 0
     capsys.readouterr()
     assert main(["sweep", "report", "--config", str(cfg_path), "--round", "screen"]) == 0
     said = capsys.readouterr().out
-    assert "No start ran" in said and "one run" in said and KEY_ENV in said
+    assert "No start ran" in said and "one run" in said and "min_agreement" in said
+
+
+def test_a_run_with_a_key_variable_unset_is_refused_naming_it(tmp_path, stub_model, monkeypatch, capsys):
+    stub = stub_model(gold=True)
+    cfg_path = write_config(tmp_path, model=stub)
+    monkeypatch.delenv(KEY_ENV)
+    asked = stub.calls
+    for action in (["run"], ["run", "--smoke", "1"]):
+        assert main(["sweep", *action, "--config", str(cfg_path)]) == 1
+        said = capsys.readouterr()
+        assert KEY_ENV in said.err and "not set" in said.err and "finished" not in said.out
+    assert stub.calls == asked and not (out(load_config(cfg_path)) / "sweep.json").exists()
 
 
 def test_plan_prices_the_sweep_from_the_tokens_a_smoke_measured(tmp_path, stub_model, capsys):

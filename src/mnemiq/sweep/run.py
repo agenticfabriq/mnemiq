@@ -63,7 +63,7 @@ from mnemiq.store.bootstrap import init_store
 from mnemiq.sweep.arms import Arm, arm_of, baseline, baselines, grid_arms, profile_text, refusal_under, screen_arms
 from mnemiq.sweep.config import (
     RETRIES, SMOKE, SPLIT, SWEEP, SweepConfig, SweepConfigError, _deployment_ids, _source_specs, deployment_settings,
-    fingerprint, load_questions, pinned_files,
+    fingerprint, load_questions, pinned_files, unset_keys,
 )
 from mnemiq.sweep.plan import AFTER_SEARCH, _ROUNDS_OF, _judged_elsewhere, _refusals, _rounds, rounds_of
 from mnemiq.sweep.split import PARTS, saved_split, split, split_digest
@@ -1195,10 +1195,11 @@ def run(cfg: SweepConfig, until: str | None = None, smoke: int | None = None) ->
     """Run the sweep's rounds in order: through `until` when it names one, or, with `smoke`, each arm of the first round
     on that many cases.
 
-    A run holds the out folder's lock throughout, so a second run on the same folder is refused at once. Before anything
-    runs, an identity the sweep cannot grade is refused (`identity_refusal`). Then the first round runs, and, after a
-    screen, the grid of the values it kept. A search ends with the timing round and the confirm round
-    (`mnemiq.sweep.propose.after_search`).
+    A key variable a model names that is not set is refused first, by its name: the engine would refuse every arm of
+    that model. A run holds the out folder's lock throughout, so a second run on the same folder, or a proposal from it,
+    is refused at once. Before anything runs, an identity the sweep cannot grade is refused (`identity_refusal`). Then
+    the first round runs, and, after a screen, the grid of the values it kept. A search ends with the timing round and
+    the confirm round (`mnemiq.sweep.propose.after_search`).
 
     A sweep resumes where it stopped, run after run:
     - `sweep.json` holds the fingerprint and the engine build the sweep started under. A run under another config (the
@@ -1232,10 +1233,13 @@ def run(cfg: SweepConfig, until: str | None = None, smoke: int | None = None) ->
                                f"{', '.join(rounds)}")
     if smoke is not None and (isinstance(smoke, bool) or not isinstance(smoke, int) or smoke < 1):
         raise SweepConfigError("a smoke asks each arm at least one case")
+    if unset := unset_keys(cfg, cfg.models):
+        raise SweepConfigError(f"a key variable the sweep needs is not set: {', '.join(unset)}. Each arm's profile "
+                               "names it, so the engine would refuse every arm of that model; set it and run again.")
     out = Path(cfg.sweep.out)
     out.mkdir(parents=True, exist_ok=True)
-    with _sole(out / OUT_LOCK, SweepConfigError(f"{out} is in use by another run of a sweep; run again once it has "
-                                                "ended")):
+    with _sole(out / OUT_LOCK, SweepConfigError(f"{out} is in use by another run or a proposal of this sweep; run "
+                                                "again once it has ended")):
         if (why := identity_refusal(cfg)) is not None:
             raise SweepConfigError(f"the sweep's identity cannot be graded: {why}")
         if smoke is not None:

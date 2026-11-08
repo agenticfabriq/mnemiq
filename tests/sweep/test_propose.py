@@ -3,14 +3,16 @@ mode's pick and confirmed on the held-out part, check mode's verdict, and the fi
 
 from __future__ import annotations
 
+import fcntl
 import json
 from pathlib import Path
 
 import pytest
 
+from mnemiq.agent.modes import MODES
 from mnemiq.profiles import _read as read_profile_file
 from mnemiq.sweep import propose as proposal
-from mnemiq.sweep.arms import arm_of
+from mnemiq.sweep.arms import arm_of, engine_refusal
 from mnemiq.sweep.config import SweepConfigError, load_config
 from mnemiq.sweep.propose import candidates, pick, propose, quiet_machine, server_running
 from mnemiq.sweep.report import report
@@ -18,8 +20,8 @@ from mnemiq.sweep.run import _begin, _parts, run
 
 from .conftest import (
     KEY_ENV, STUB_KEY, UNREACHABLE, checked_sweep, confirm_arms_run, confirm_modes, evidence, graded_rows,
-    graded_sweep, json_lines, out, play_after_search, proposal_file, rewrite, stamped_version, sweep_json,
-    tiny_dataset, tiny_deployment, tuning, write_config, write_run,
+    graded_sweep, json_lines, out, play_after_search, proposal_file, read_rows, rewrite, stamped_version, start_of,
+    start_refused_in_instant, sweep_json, tiny_dataset, tiny_deployment, tuning, write_config, write_run,
 )
 
 # Settings a profile can change, each tried at one value other than the engine's default.
@@ -308,14 +310,14 @@ def test_with_no_candidate_the_start_is_proposed_where_the_engine_runs_it(tmp_pa
     assert written.instant is None and written.thinking is not None
 
 
-def test_when_the_engine_refuses_every_start_the_run_ends_and_propose_says_why(tmp_path, stub_model, monkeypatch):
-    cfg = load_config(write_config(tmp_path, model=stub_model(gold=True), arms_in_screen=2))
-    monkeypatch.delenv(KEY_ENV)   # every profile names a key variable that is not set
+def test_when_the_engine_refuses_every_start_the_run_ends_and_propose_says_why(tmp_path, stub_model):
+    cfg = load_config(write_config(tmp_path, model=stub_model(gold=True), arms_in_screen=2,
+                                   start=start_refused_in_instant(tmp_path)))   # instant is the sweep's one mode
     run(cfg)
     assert sweep_json(cfg)["finished"] is True and "repeats" not in sweep_json(cfg)
     result = propose(cfg)
     assert result["m"]["chosen"] is None and "refuses the start in every mode" in result["m"]["why"]
-    assert KEY_ENV in result["m"]["why"] and not proposal_file(cfg).exists()
+    assert "min_agreement" in result["m"]["why"] and not proposal_file(cfg).exists()
     # The report and the pick say that no start ran, not that the first round has yet to decide.
     with pytest.raises(SweepConfigError, match="no start ran"):
         report(cfg, "screen", controls=False)
@@ -435,27 +437,65 @@ def test_an_unset_key_variable_at_propose_time_is_named_and_changes_nothing(tmp_
     assert "refuses the start" not in str(refused.value) and _proposal_files(cfg) == before
 
 
-def test_what_ran_is_read_from_the_record_not_checked_again(tmp_path, monkeypatch):
+def test_what_ran_is_read_from_the_record_not_checked_again(tmp_path):
+    cfg = graded_sweep(tmp_path, modes=["instant", "thinking"], arms={"writer_rules=none": dict(only=9, other=0)},
+                       play=False)
+    # Today's engine runs the start in both modes, and rows of both are on disk. The record, written when the first
+    # round was planned, says the engine refused thinking's start then: what ran is what the record says.
+    assert all(engine_refusal(cfg, start_of(cfg, mode)) is None for mode in cfg.modes)
+    state = sweep_json(cfg)
+    state["starts"]["m"]["thinking"] = "refused by the build the first round ran on"
+    (out(cfg) / "sweep.json").write_text(json.dumps(state))
+    play_after_search(cfg)
+    result = propose(cfg)["m"]
+    assert result["picks"] == {"instant": "writer_rules=none"} and confirm_modes(cfg) == ["instant"]
+    assert evidence(cfg)["refused_modes"]["thinking"]["why"] == "refused by the build the first round ran on"
+    assert read_profile_file(str(proposal_file(cfg))).profiles["m"].thinking is None
+
+
+def test_a_search_whose_start_is_not_valid_proposes_nothing(tmp_path):
+    cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=3, other=1)}, play=False)
+    start = arm_of("m", "instant", {}, round="screen")
+    rows = read_rows(cfg, start)
+    rows[0] |= {"outcome": "error", "error_kind": "endpoint", "model_error": "status_503"}   # one case not measured
+    write_run(cfg, start, rows)
+    play_after_search(cfg)
+    result = propose(cfg)["m"]
+    assert result["chosen"] is None and "nothing can be compared with it" in result["why"]
+    assert "run 1 did not measure 1 cases" in result["why"]
+    assert evidence(cfg)["start_valid"] is False and not proposal_file(cfg).exists()
+
+
+def test_the_evidence_names_the_modes_the_sweep_did_not_search(tmp_path):
     cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0)})
-    first = propose(cfg)["m"]
-    # A build whose engine would refuse every start now: the sweep ran them, and the proposal reports what ran.
-    monkeypatch.setattr("mnemiq.sweep.arms.refusal_under", lambda *args, **kwargs: "refused by a later build")
-    monkeypatch.setattr("mnemiq.sweep.propose.refusal_under", lambda *args, **kwargs: "refused by a later build",
-                        raising=False)
-    again = propose(cfg)["m"]
-    assert (again["chosen"], again["picks"]) == (first["chosen"], first["picks"]) == ("writer_rules=none",
-                                                                                     {"instant": "writer_rules=none"})
-    assert evidence(cfg)["refused_modes"] == {}
+    result = propose(cfg)["m"]
+    unsearched = [mode for mode in MODES if mode != "instant"]
+    assert sorted(evidence(cfg)["unsearched_modes"]) == sorted(unsearched)
+    assert all(entry["unmeasured_profile_wide"] == {"writer_rules": "none"}
+               for entry in evidence(cfg)["unsearched_modes"].values())
+    said = result["why"].split("did not search", 1)[1]
+    assert " and ".join(unsearched) in result["why"] and "writer_rules=none" in said and "never measured" in said
 
 
-def test_a_model_that_ran_nothing_does_not_block_a_persons_choice_for_another(tmp_path, stub_model, monkeypatch):
+def test_a_proposal_waits_for_no_run_and_no_other_proposal_of_the_same_sweep(tmp_path):
+    cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0)})
+    propose(cfg)
+    before = _proposal_files(cfg)
+    with open(out(cfg) / ".sweep.lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)   # as a run, or another proposal, of the sweep holds it
+        with pytest.raises(SweepConfigError, match="in use"):
+            propose(cfg)
+    assert _proposal_files(cfg) == before
+    assert propose(cfg)["m"]["chosen"] == "writer_rules=none"   # once it is free
+
+
+def test_a_model_that_ran_nothing_does_not_block_a_persons_choice_for_another(tmp_path, stub_model):
     stub = stub_model(gold_when=lambda request: False)   # wrong everywhere, so m's start leaves room to search
-    models = {"m": {"llm_model": "stub-model", "llm_base_url": stub.url, "api_key_env": KEY_ENV},
-              "n": {"llm_model": "stub-model", "llm_base_url": stub.url, "api_key_env": "SWEEP_TEST_OTHER_KEY"}}
-    monkeypatch.delenv("SWEEP_TEST_OTHER_KEY", raising=False)   # so the engine refuses every start of n
+    models = {name: {"llm_model": "stub-model", "llm_base_url": stub.url, "api_key_env": KEY_ENV} for name in "mn"}
+    # n's own start, in instant, the sweep's one mode, is one the engine refuses, so nothing of n runs.
     cfg = load_config(write_config(tmp_path, model=stub, models=models, space={"writer_rules": ["none"]},
                                    dataset=tiny_dataset(tmp_path, cases=10, answerable=9, stub=stub),
-                                   sweep={"repeats": 1}))
+                                   sweep={"repeats": 1}, start={"n": start_refused_in_instant(tmp_path)}))
     run(cfg)
     result = propose(cfg, chosen="writer_rules=none")
     assert result["m"]["chosen"] == "writer_rules=none" and result["m"]["chosen_by"] == "person"
@@ -480,7 +520,10 @@ def test_a_mode_once_run_stays_recorded_when_a_later_plan_refuses_it(tmp_path, s
     cfg = load_config(write_config(tmp_path, model=stub_model(gold=True), sweep={"repeats": 1}))
     run(cfg)
     assert sweep_json(cfg)["starts"] == {"m": {"instant": None}}
-    monkeypatch.delenv(KEY_ENV)   # the next run's plan finds the engine refusing the start
+    # The next run's plan finds the engine refusing the start: a stray MNEMIQ_PROFILE in the shell refuses every
+    # profile, and changes nothing the sweep's record checks.
+    monkeypatch.setenv("MNEMIQ_PROFILE", "elsewhere")
+    assert engine_refusal(cfg, start_of(cfg, "instant")) is not None
     run(cfg)
     assert sweep_json(cfg)["starts"] == {"m": {"instant": None}}
 
