@@ -65,12 +65,13 @@ import httpx
 from mnemiq import redact
 from mnemiq.agent.modes import MODES
 from mnemiq.config import without_credentials
+from mnemiq.profiles import _read as _read_profile_file
 from mnemiq.profiles import load_profiles, profile_version
 from mnemiq.runtime import source_adapter
 from mnemiq.sweep.arms import Arm, _endpoint, _mode_of, _show, _toml, arm_of, assembled_arm, baselines, check_arms
 from mnemiq.sweep.config import (
     ENDPOINT_FACTS, PROPOSAL, SWEEP, SweepConfig, SweepConfigError, fingerprint, load_questions, scrub_credentials,
-    unset_keys,
+    start_profile, unset_keys,
 )
 from mnemiq.sweep.plan import _ROUNDS_OF, LOAD_WAIT_EVERY_S, LOAD_WAIT_S, TIMING_CASES, unpinned_sources
 from mnemiq.sweep.report import ArmFileError, decided_repeats, report
@@ -452,11 +453,11 @@ def _profile_wide(arms: tuple[Arm, ...] | None) -> dict | None:
     return {name: value for name, value in arms[0].changes if _mode_of(name) is None}
 
 
-def _unmeasured_there(modes: Sequence[str], wide: dict) -> str:
+def _unmeasured_there(modes: Sequence[str], wide: dict, verb: str = "keeps") -> str:
     """What a profile written with the whole-profile changes `wide` does in `modes`, which hold no section of it."""
     one = len(modes) == 1
     note = (f" The profile holds no section for {'that mode' if one else 'those modes'}, so "
-            f"{'it keeps' if one else 'each keeps'} the engine's own per-mode settings, and runs under the profile's "
+            f"{'it' if one else 'each'} {verb} the engine's own per-mode settings, and runs under the profile's "
             "whole-profile settings")
     if not wide:
         return note + ", which change nothing from the start."
@@ -478,12 +479,35 @@ def _refused_note(refused: dict[str, str], wide: dict | None) -> str:
     return note if wide is None else note + _unmeasured_there(modes, wide)
 
 
-def _unsearched_note(unsearched: Sequence[str], wide: dict | None) -> str:
+def _start_sections(cfg: SweepConfig, model: str, modes: Sequence[str]) -> dict[str, dict]:
+    """For each of `modes`, what the start profile's own section for it sets: empty with no start profile or no such
+    section."""
+    path, name = start_profile(cfg, model)
+    entry = None
+    if path is not None:
+        read = _read_profile_file(path)
+        entry = read.profiles[name or read.default]
+    found = {}
+    for mode in modes:
+        section = getattr(entry, mode) if entry is not None else None
+        found[mode] = ({field: getattr(section, field) for field in sorted(section.model_fields_set)}
+                       if section is not None else {})
+    return found
+
+
+def _unsearched_note(unsearched: Sequence[str], wide: dict | None, dropped: dict[str, dict]) -> str:
     """What the reason says of the engine's modes the sweep did not search, or nothing: with a profile written, as of
-    a mode the engine refused the start in."""
+    a mode the engine refused the start in. A start's own section for such a mode (`dropped`) is not in the profile,
+    which holds a section only for the modes that ran, so promoting the profile moves that mode off it."""
     if not unsearched or wide is None:
         return ""
-    return f" The sweep did not search {_joined(unsearched)}." + _unmeasured_there(unsearched, wide)
+    note = f" The sweep did not search {_joined(unsearched)}." + _unmeasured_there(unsearched, wide, "runs")
+    for mode in unsearched:
+        if dropped.get(mode):
+            settings = ", ".join(f"{name}={_show(value)}" for name, value in dropped[mode].items())
+            note += (f" The start's {mode} section ({settings}) is not in the profile, so promoting it moves {mode} "
+                     "from those settings to the engine's own.")
+    return note
 
 
 def _refused_everywhere(refused: dict[str, str]) -> str:
@@ -1143,17 +1167,20 @@ def _drafts(cfg: SweepConfig, chosen: str | None) -> dict[str, tuple[_Draft, dic
             if chosen:
                 why += f" A person's choice, {chosen}, does not apply here, since nothing ran."
         wide = _profile_wide(arms)
+        dropped = _start_sections(cfg, model, unsearched) if arms is not None else {mode: {} for mode in unsearched}
         evidence = _head(cfg, model, state, repeats, packaged) | {
             "start_valid": verdict["start_valid"],
             "chosen": chosen if picked[model] is not None else verdict["rule"],
             "chosen_by": "person" if picked[model] is not None else "rule",
             "rule_pick": verdict["rule"], "confirmed": confirmed,
-            "why": why + (_refused_note(refused, wide) + _unsearched_note(unsearched, wide) if running else ""),
+            "why": why + (_refused_note(refused, wide) + _unsearched_note(unsearched, wide, dropped) if running
+                          else ""),
             "warnings": warnings, "picks": verdict["picks"], "conflicts": verdict["conflicts"],
             "failed_mode": verdict["failed_mode"],
             "refused_modes": {mode: {"why": reason, "unmeasured_profile_wide": wide or {}}
                               for mode, reason in refused.items()},
-            "unsearched_modes": {mode: {"unmeasured_profile_wide": wide or {}} for mode in unsearched},
+            "unsearched_modes": {mode: {"unmeasured_profile_wide": wide or {}, "dropped_start_section": dropped[mode]}
+                                 for mode in unsearched},
         }
         if cfg.search.strategy == "check":
             evidence["check"] = verdict["check"]

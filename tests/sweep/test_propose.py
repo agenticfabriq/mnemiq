@@ -544,6 +544,21 @@ def test_the_evidence_names_the_modes_the_sweep_did_not_search(tmp_path):
     assert " and ".join(unsearched) in result["why"] and "writer_rules=none" in said and "never measured" in said
 
 
+def test_a_mode_never_searched_names_the_section_of_the_start_the_profile_drops(tmp_path):
+    start = tmp_path / "start-profiles.toml"
+    start.write_text('default = "start"\n[profiles.start]\nretrieval_k = 12\n'
+                     '[profiles.start.thinking]\nmax_attempts = 2\n')
+    cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0)}, start={"profile_file": str(start)})
+    result = propose(cfg)["m"]
+    unsearched = evidence(cfg)["unsearched_modes"]
+    assert unsearched["thinking"]["dropped_start_section"] == {"max_attempts": 2}
+    assert unsearched["deep"]["dropped_start_section"] == {}
+    # Promoting the profile moves thinking from the start's section to the engine's settings, and the reason says so.
+    assert read_profile_file(str(proposal_file(cfg))).profiles["m"].thinking is None
+    said = result["why"].split("did not search", 1)[1]
+    assert "start's thinking section (max_attempts=2)" in said and "engine's own" in said
+
+
 def test_a_proposal_waits_for_no_run_and_no_other_proposal_of_the_same_sweep(tmp_path):
     cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0)})
     propose(cfg)

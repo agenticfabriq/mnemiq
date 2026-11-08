@@ -441,7 +441,9 @@ and the proposed profile has no section for it: in that mode the profile keeps t
 runs under the profile's whole-profile settings, which were never measured there. The evidence names the mode, the
 engine's reason, and those whole-profile changes. The same holds for each of the engine's modes that `modes` leaves
 out: the profile has no section for it, and the evidence (`unsearched_modes`) and its reason name it, with the
-whole-profile changes never measured there.
+whole-profile changes never measured there. A section the start profile holds for such a mode is not carried into the
+proposal, so promoting it moves that mode from the start's settings to the engine's own; the evidence names that
+section (`dropped_start_section`), and so does the reason.
 
 ## Identities, and why row filters are refused
 
