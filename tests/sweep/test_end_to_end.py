@@ -9,13 +9,16 @@ import tomllib
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from mnemiq.cli import SWEEP_BUDGET_STOP, main
 from mnemiq.sweep import propose as proposal
-from mnemiq.sweep.config import Control, Search, SweepConfig, fingerprint, load_config
+from mnemiq.sweep.config import Control, Search, SweepConfig, SweepConfigError, fingerprint, load_config
+from mnemiq.sweep.report import report
 from mnemiq.sweep.stats import detectable_gain
 
 from .conftest import (
-    KEY_ENV, STUB_KEY, UNREACHABLE, answers_file, evidence, graded_sweep, json_lines, out, proposal_file,
+    KEY_ENV, STUB_KEY, UNREACHABLE, answers_file, evidence, graded_sweep, json_lines, out, proposal_file, rewrite,
     start_refused_in_instant, start_that_differs, tiny_deployment, tiny_files, write_config,
 )
 
@@ -246,6 +249,17 @@ def test_a_control_whose_source_cannot_be_opened_is_refused_without_its_password
     said = capfd.readouterr()
     assert "cannot be opened to grade the control 'current'" in said.err
     assert "SECRETPW" not in said.out + said.err and "Traceback" not in said.err
+    # The attach error is passed on, its DSN without the password: the scrub ran on the text that holds it.
+    assert "postgresql://***@127.0.0.1:1/library" in said.err
+
+
+def test_a_report_under_a_fixed_count_of_runs_reads_no_other_configs_sweep(tmp_path, capsys):
+    cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0)})   # repeats = 1, fixed
+    edited = load_config(rewrite(cfg, propose={"alpha": 0.1}))   # its sweep.json holds the earlier config's record
+    with pytest.raises(SweepConfigError, match="another config"):
+        report(edited, "screen", controls=False)
+    assert main(["sweep", "report", "--config", str(edited.path)]) == 1
+    assert "another config" in capsys.readouterr().err
 
 
 def test_an_arm_file_edited_by_hand_is_refused_by_report_and_withdraws_the_proposal(tmp_path, capsys):

@@ -191,19 +191,19 @@ def _sweep_run(cfg, args) -> int:
     return 0
 
 
-def _report_repeats(cfg) -> int | None:
-    """How many runs `report` reads each arm at: None for the config's own count, else the count the first round
-    recorded in `sweep.json`. Before anything has decided one (the first round has not ended, or no start ran), each
-    arm is read at one run, and that is said."""
+def _report_repeats(cfg) -> int:
+    """How many runs `report` reads each arm at: the config's own count, else the count the first round recorded in
+    `sweep.json`. Before anything has decided one (the first round has not ended, or no start ran), each arm is read at
+    one run, and that is said. A `sweep.json` written under another config is refused whatever the count."""
     from mnemiq.sweep.config import SWEEP, SweepConfigError, fingerprint
     from mnemiq.sweep.report import decided_repeats
 
-    if isinstance(cfg.sweep.repeats, int):
-        return None
     state = _sweep_record(cfg)
     if state and state.get("fingerprint") != fingerprint(cfg):
         raise SweepConfigError(f"{cfg.sweep.out}/{SWEEP}: this sweep was run under another config, so its rows are "
                                "not this config's to read. Put the config back, or report on another out folder.")
+    if isinstance(cfg.sweep.repeats, int):
+        return cfg.sweep.repeats
     try:
         return decided_repeats(cfg, state)
     except SweepConfigError as exc:  # no start ran: the engine refused every one, and the message says why
@@ -738,7 +738,8 @@ def main(argv: list[str] | None = None) -> int:
     # above it instead of after. `sweep` does not reach it either: it reads no setting from
     # this environment, only each deployment's own env file, and the engine's profile loader
     # walks the same endpoints under that deployment's MNEMIQ_LOCAL_ONLY for every arm the
-    # sweep builds (`local_only_offenders`), refusing any arm that would leave the network. Placed here, before the command dispatch below, an operator's
+    # sweep builds (`local_only_offenders`), refusing any arm that would leave the network.
+    # Placed here, before the command dispatch below, an operator's
     # mistyped base URL is a startup error instead of a run that quietly succeeds having sent
     # every schema card off the network. Caught and printed rather than left to surface as a raw
     # traceback: the point of the check is to hand a security reviewer a clean refusal, not a

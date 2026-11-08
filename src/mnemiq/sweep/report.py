@@ -35,10 +35,10 @@ from mnemiq.agent.loop import AgentAnswer
 from mnemiq.contract import IdentityContext, Trace
 from mnemiq.eval.harness import CaseResult, Outcome, run_case
 from mnemiq.runtime import source_adapter
-from mnemiq.sweep.arms import ROUNDS, arm_from_profile
+from mnemiq.sweep.arms import ROUNDS, arm_from_profile, start_settings
 from mnemiq.sweep.config import (
     SWEEP, Control, SweepConfig, SweepConfigError, control_answers, deployment_settings, fingerprint, load_questions,
-    scrub_credentials,
+    scrub_credentials, start_profile,
 )
 from mnemiq.sweep.plan import TIMING_CASES
 from mnemiq.sweep.run import INVALID, PROFILE, ROWS, _identity, _rows_so_far
@@ -298,17 +298,18 @@ def decided_repeats(cfg: SweepConfig, state: dict | None = None) -> int:
     sweep's record (`state`, by default its `sweep.json`) holds it.
 
     A search that stopped for want of room everywhere ran each start once and never decided, and is read at one run.
-    Raises when nothing has decided yet, and refuses a `sweep.json` written under another config, whose decision is not
-    this config's to read.
+    Raises when nothing has decided yet, and refuses a `sweep.json` written under another config, whatever `repeats`
+    says: its rows are not this config's to read.
     """
-    if isinstance(cfg.sweep.repeats, int):
-        return cfg.sweep.repeats
     if state is None:
         record = Path(cfg.sweep.out) / SWEEP
         state = json.loads(record.read_text(encoding="utf-8")) if record.exists() else {}
         if state and state.get("fingerprint") != fingerprint(cfg):
-            raise SweepConfigError(f"{record}: this sweep was run under another config, so how many runs its arms owe "
-                                   "is not this config's to read. Put the config back, or pass repeats=.")
+            raise SweepConfigError(f"{record}: this sweep was run under another config, so its rows, and how many runs "
+                                   "its arms owe, are not this config's to read. Put the config back, or pass "
+                                   "repeats=.")
+    if isinstance(cfg.sweep.repeats, int):
+        return cfg.sweep.repeats
     if "repeats" in state:
         return state["repeats"]
     if state.get("stopped") == "no room":
@@ -332,6 +333,20 @@ def _against(pairs: dict[int, Pair], tallies: Mapping[int, Tally], start: Mappin
             for number, found in pairs.items()]
 
 
+def _start_readable(cfg: SweepConfig, model: str) -> None:
+    """Refuse, naming it, a start profile file of `model` that cannot be read: each arm's changes are read against the
+    start's settings, so the fault is the start's, not the arm's file's."""
+    path = start_profile(cfg, model)[0]
+    if path is None:
+        return
+    try:
+        start_settings(cfg, model)
+    except (OSError, ValueError, KeyError) as exc:   # the engine's reader refusing the file included
+        why = "it is gone" if not Path(path).is_file() else str(exc)
+        raise SweepConfigError(f"{path}, the start profile file of model {model!r}, cannot be read ({why}), so no "
+                               "arm's changes from the start can be read back") from None
+
+
 def _table_records(cfg: SweepConfig, model: str, mode: str, round: str, owed: Mapping[str, str | None],
                    controls: list[tuple[str, list[dict]]], repeats: int) -> list[dict]:
     start_round = _start_round(cfg, round)
@@ -351,6 +366,8 @@ def _table_records(cfg: SweepConfig, model: str, mode: str, round: str, owed: Ma
                 "valid": all(each.valid for each in runs.values()),
                 "runs": [{"run": number, **asdict(each)} for number, each in runs.items()], "pairs": against}
 
+    if arms:
+        _start_readable(cfg, model)
     records = []
     start_runs = _runs(start, mode, repeats) if start is not None else {}
     start_tallies = counted(start_runs)

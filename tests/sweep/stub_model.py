@@ -42,7 +42,6 @@ CONTEXT_TOO_LONG = (
     "This model's maximum context length is 32768 tokens. However, you requested 36864 tokens (32768 in the "
     "messages, 4096 in the completion). Please reduce the length of the messages or completion."
 )
-EMBED_DIM = 32
 # The reply format that ends every form of the writer's system prompt (`generate.prompts.system_prompt`).
 _WRITER = '{"sql": "<the SELECT, or null>"'
 _DECLINE = "the tables on the cards hold no data for that"

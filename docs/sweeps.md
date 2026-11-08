@@ -28,7 +28,9 @@ settings.
 
    It lists the arms of each round, the arms the engine refuses (they are skipped), the questions it will ask, the
    hours and dollars when it can price them, the store copy each running arm makes, and the smallest gain the search
-   could show. When that gain needs more questions than you have, it says so, and check mode is the run to make.
+   could show. When that gain needs more questions than you have, it says so, and check mode is the run to make. It
+   warns when a deployment's verifier fails open (`MNEMIQ_VERIFY_FAIL_CLOSED=0`) where an arm calls the judge: a judge
+   that stops answering would then never stop an arm, and its answers would count as not measured.
 5. Run a smoke: each arm of the first round once, on its first few questions, to see that every arm runs.
 
    ```bash
@@ -70,7 +72,8 @@ that the budget stopped says so and exits 3, so a script can tell it from one th
 again, and the sweep resumes where it stopped.
 
 Under `repeats = "auto"`, `report` reads each arm at the number of runs the first round decided, which the sweep
-records. Before that is decided, or when no start ran, it reads each arm at one run and says so.
+records. Before that is decided, or when no start ran, it reads each arm at one run and says so. Whatever `repeats`
+says, `report` refuses an out folder whose sweep ran under another config.
 
 ## The question file
 
@@ -457,7 +460,10 @@ folder grows by one copy per arm run.
 
 Start at `parallel = 1`, watch one arm's memory during the smoke, and raise `parallel` while that many arms fit with
 room to spare. The model server batches the arms' requests together, so more arms also load the server. That is why the
-timing round runs alone, and why the times of the parallel rounds are not compared.
+timing round runs alone, and why the times of the parallel rounds are not compared. With a live source, more arms also
+load the database, and raise how often the engine cancels a statement at its 30-second bound: the arm's own statement
+cancelled that way counts as Failed, the arm's own failure, while a gold query or a grading that times out counts as a
+source error, a question not measured.
 
 ## Sweeping a live source: only from a snapshot
 
@@ -470,6 +476,8 @@ So sweep a snapshot: a copy that nothing writes while the sweep runs. A SQLite o
 to it is caught. A frozen copy in the database's own engine keeps the SQL dialect the profile will run against, which
 the writer's prompt and the profile's version both depend on; it is not pinned, so keep everything else away from it
 until the sweep ends. Build the snapshot deployment's store from the snapshot, and write the gold SQL in its dialect.
+Every arm running at once queries it, so `parallel` raises how often a statement is cancelled at the engine's 30-second
+bound ([sizing `parallel`](#sizing-parallel-to-memory)).
 
 ## Running, resuming and smoke
 

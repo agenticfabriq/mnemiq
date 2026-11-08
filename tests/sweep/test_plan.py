@@ -7,7 +7,7 @@ import pytest
 from mnemiq.sweep.config import load_config
 from mnemiq.sweep.plan import LOAD_WAIT_S, estimate, render
 
-from .conftest import KEY_ENV, UNREACHABLE, live_postgres_env, tiny_dataset, write_config
+from .conftest import KEY_ENV, UNREACHABLE, live_postgres_env, tiny_dataset, tiny_files, write_config
 
 
 def test_the_plan_says_when_a_set_is_too_small_to_search(tmp_path):
@@ -101,6 +101,29 @@ def test_check_mode_has_no_timing_and_no_confirm_round(tmp_path):
     assert est.case_runs == {1: (2 + 1) * 8, 2: 2 * 2 * 8}  # every question; the start twice in the first round
     rounds = [line.strip() for line in render(cfg).splitlines()]  # the store's path holds this test's name
     assert not [line for line in rounds if line.startswith(("timing:", "confirm,"))]
+
+
+def test_the_plan_says_why_a_mode_compares_nothing_when_another_does(tmp_path):
+    cfg = load_config(write_config(tmp_path, modes=["instant", "thinking"], space={"thinking": {"corrector": [False]}}))
+    lines = [line.strip() for line in render(cfg).splitlines()]
+    assert "m, instant: nothing is compared with the start: the space has no value to try" in lines
+    assert [line for line in lines if line.startswith("m, thinking: ")]
+
+
+def test_the_plan_warns_when_a_judge_that_stops_answering_would_never_stop_an_arm(tmp_path):
+    d = tiny_files(tmp_path)
+    d.env.write_text(d.env.read_text() + "MNEMIQ_VERIFY_FAIL_CLOSED='0'\n")
+
+    def warned(folder=tmp_path, **sections) -> list[str]:
+        return [line for line in render(load_config(write_config(folder, **sections))).splitlines()
+                if "fails open" in line]
+
+    (line,) = warned(deployment=d, modes=["thinking"])   # thinking calls the judge
+    assert "MNEMIQ_VERIFY_FAIL_CLOSED" in line and "never stops an arm" in line and "not valid" in line
+    assert not warned(deployment=d, modes=["instant"])   # instant never calls it
+    closed = tmp_path / "closed"
+    closed.mkdir()
+    assert not warned(closed, modes=["thinking"])        # the engine's default fails closed
 
 
 def _priced_model(**judge) -> dict:
