@@ -363,12 +363,17 @@ def test_a_jwks_file_with_no_usable_key_denies_rather_than_fails(tmp_path, caplo
     """Startup refuses such a file; one that changes after startup still denies with a reason, never a 500."""
     from mnemiq.auth.token import JwtIdentityVerifier
 
-    path = tmp_path / "jwks.json"
-    path.write_text('{"keys": []}')
-    v = JwtIdentityVerifier(_oidc(jwks_url=None, jwks_file=str(path)), audience=AUDIENCE, refuse_audience=None)
-    with caplog.at_level(logging.ERROR, logger="mnemiq.auth"):
-        _rejected(v, mint(claims()), "signing keys unavailable")
-    assert "JWKS" in caplog.text
+    import json
+
+    no_kid = {k: v for k, v in jwks_for((rsa_key(), "k1"))["keys"][0].items() if k != "kid"}
+    for body in ('{"keys": []}', json.dumps({"keys": [no_kid]})):
+        path = tmp_path / "jwks.json"
+        path.write_text(body)
+        v = JwtIdentityVerifier(_oidc(jwks_url=None, jwks_file=str(path)), audience=AUDIENCE, refuse_audience=None)
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger="mnemiq.auth"):
+            _rejected(v, mint(claims()), "signing keys unavailable")
+        assert "JWKS" in caplog.text
 
 
 @pytest.mark.parametrize("sub", ["", 7, ["user-1"]])
