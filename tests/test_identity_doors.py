@@ -256,3 +256,10 @@ def test_the_binding_key_is_compared_in_constant_time():
                     continue  # a count, not a value
                 compared |= {name.id for name in ast.walk(operand) if isinstance(name, ast.Name)}
     assert not compared & {"key", "sent"}, compared
+
+
+def test_v1_needs_the_db_read_scope(tmp_path):
+    doors = _doors(tmp_path, **OPTION_A)
+    rejected = _refused(doors.v1, _bearer(mint(claims(scope="openid"))), 403, "lacks db.read")
+    assert rejected.challenge == 'Bearer error="insufficient_scope", scope="db.read"'
+    assert doors.v1(_bearer(mint(claims(scope="openid db.read")))).principal_id == "user-1"

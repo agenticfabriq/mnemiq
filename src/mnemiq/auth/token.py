@@ -124,6 +124,13 @@ class _KeySet:
         return usable_keys(data)
 
 
+def token_scopes(found: dict) -> list[str]:
+    """A token's scopes, from its space-separated `scope` claim (RFC 8693, as identity providers send it). Anything
+    else is no scopes at all: a list, a number, an absent claim."""
+    scope = found.get("scope")
+    return scope.split() if isinstance(scope, str) else []
+
+
 class JwtIdentityVerifier:
     """Verifies one door's Bearer tokens. `claims` is the HTTP API's synchronous check; `verify_token` is the MCP
     SDK's `TokenVerifier`, run in a worker thread because a JWKS fetch blocks."""
@@ -196,7 +203,6 @@ class JwtIdentityVerifier:
         except TokenRejected as exc:
             logger.info("MCP token refused: %s (sub=%r jti=%r)", exc.reason, exc.sub, exc.jti)
             return None
-        scope = found.get("scope")
         return AccessToken(token=token, client_id=str(found.get("azp") or found.get("client_id") or ""),
-                           scopes=scope.split() if isinstance(scope, str) else [],
+                           scopes=token_scopes(found),
                            expires_at=int(found["exp"]), subject=str(found["sub"]), claims=found)

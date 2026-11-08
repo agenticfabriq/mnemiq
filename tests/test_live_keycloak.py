@@ -82,6 +82,16 @@ def test_no_token_is_refused():
     assert _client().get("/v1/schema").status_code == 401
 
 
+def test_a_real_token_without_db_read_is_a_403():
+    """The client signing users in to the workbench must request db.read; one that does not gets a 403."""
+    import jwt
+
+    token = _token("ana", "mnemiq-no-scope-cli")
+    assert "db.read" not in jwt.decode(token, options={"verify_signature": False}).get("scope", "").split()
+    r = _client().get("/v1/schema", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 403 and "db.read" in r.json()["detail"]
+
+
 def test_a_rotated_key_verifies_after_one_refetch():
     """Keycloak signs with a new key; the verifier, which already holds the old set, refetches once its interval has
     passed and verifies the new token. Within the interval, the new `kid` is refused without a fetch."""
@@ -105,7 +115,7 @@ def test_a_rotated_key_verifies_after_one_refetch():
     oidc = auth_config_from_settings(_settings()).oidc
     verifier = JwtIdentityVerifier(oidc, audience="mnemiq-api", refuse_audience="mnemiq-openwebui", clock=clock)
     old = _token("ana")
-    assert verifier.claims(old)["preferred_username"] == "ana"
+    ana = verifier.claims(old)["sub"]
 
     admin = httpx.post(f"{URL}/realms/master/protocol/openid-connect/token",
                        data={"grant_type": "password", "client_id": "admin-cli", "username": "admin",
@@ -124,5 +134,5 @@ def test_a_rotated_key_verifies_after_one_refetch():
     with pytest.raises(TokenRejected, match="unknown signing key"):
         verifier.claims(new)  # within the refetch interval: refused, no fetch
     clock.now += 61
-    assert verifier.claims(new)["preferred_username"] == "ana"
-    assert verifier.claims(old)["preferred_username"] == "ana"  # the old key is still published, still valid
+    assert verifier.claims(new)["sub"] == ana
+    assert verifier.claims(old)["sub"] == ana  # the old key is still published, still valid

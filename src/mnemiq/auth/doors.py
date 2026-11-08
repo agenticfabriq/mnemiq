@@ -23,18 +23,23 @@ from mnemiq.auth.config import AuthConfig
 from mnemiq.auth.identity_map import IdentityMapUnavailable
 from mnemiq.auth.openwebui import OpenWebUIVerifier
 from mnemiq.auth.resolve import TenantMismatch, identity_from_oidc, identity_from_openwebui
-from mnemiq.auth.token import JwtIdentityVerifier, TokenRejected
+from mnemiq.auth.token import JwtIdentityVerifier, TokenRejected, token_scopes
 from mnemiq.contract import IdentityContext
 
 logger = logging.getLogger("mnemiq.auth")
 
 Headers = Mapping[str, list[str]]  # every value of each header, keyed by its lowercase name
 
+V1_SCOPE = "db.read"  # what /v1 requires of a token, as MCP's read tools do
+
 
 class DoorRefusal(Exception):
-    def __init__(self, status: int, reason: str) -> None:
+    """`challenge` is the `WWW-Authenticate` value for a refusal that carries one beyond the plain `Bearer` a 401
+    sends: an insufficient scope's (RFC 6750)."""
+
+    def __init__(self, status: int, reason: str, *, challenge: str | None = None) -> None:
         super().__init__(reason)
-        self.status, self.reason = status, reason
+        self.status, self.reason, self.challenge = status, reason, challenge
 
 
 class HttpDoors:
@@ -89,7 +94,13 @@ class HttpDoors:
                 if door == "/v1":
                     raise DoorRefusal(401, "no identity provider is configured to verify a Bearer token on /v1")
                 raise DoorRefusal(401, "no Bearer token is accepted here without MNEMIQ_OPENWEBUI_AUDIENCE")
-            return identity_from_oidc(verifier.claims(bearer), cfg)
+            found = verifier.claims(bearer)
+            identity = identity_from_oidc(found, cfg)
+            # A 403, not a 401: the caller is known and not permitted, which signing in again would not change.
+            if door == "/v1" and V1_SCOPE not in token_scopes(found):
+                raise DoorRefusal(403, f"insufficient scope: this token lacks {V1_SCOPE}",
+                                  challenge=f'Bearer error="insufficient_scope", scope="{V1_SCOPE}"')
+            return identity
         raise DoorRefusal(401, "no credential")
 
 

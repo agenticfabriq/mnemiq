@@ -70,7 +70,8 @@ class _Workbench(StaticFiles):
 
 def caller_dependency(doors, door: str = "v1"):
     """The FastAPI dependency that turns a request into its verified caller at `door` ("v1" or "openai"), or into
-    the door's refusal: 401 with `WWW-Authenticate: Bearer`, 403 for another tenant, 503 for an unreadable map.
+    the door's refusal: 401 with `WWW-Authenticate: Bearer`, 403 for another tenant or a token without the
+    `db.read` scope (with RFC 6750's insufficient-scope challenge), 503 for an unreadable map.
 
     Every value of every header goes to the door, keyed by lowercase name, so a credential sent twice is seen as
     sent twice. A plain function, so FastAPI runs it in a worker thread: a key fetch may block."""
@@ -85,8 +86,9 @@ def caller_dependency(doors, door: str = "v1"):
         try:
             return judge(headers)
         except DoorRefusal as exc:
+            challenge = exc.challenge or ("Bearer" if exc.status == 401 else None)
             raise HTTPException(status_code=exc.status, detail=exc.reason,
-                                headers={"WWW-Authenticate": "Bearer"} if exc.status == 401 else None) from None
+                                headers={"WWW-Authenticate": challenge} if challenge else None) from None
 
     return caller
 
@@ -95,10 +97,10 @@ def build_app(
     runtime, identity, heartbeat_s: float = 15.0, static_dir: Path | None = None, *, doors=None, mcp_app=None
 ) -> FastAPI:
     """`identity` serves every caller when `doors` is None (no issuer configured). With doors, every /v1 route
-    takes the caller its token names, and `identity` is never used.
+    takes the caller its token names, needs the `db.read` scope as MCP's read tools do, and `identity` is never used.
 
-    Scopes gate MCP's tools only, because no route here writes: `Runtime.write` is reached from MCP's `db_write`
-    and the CLI alone. A write route added here would need the `db.write` scope too."""
+    No route here writes: `Runtime.write` is reached from MCP's `db_write` and the CLI alone. A write route added
+    here would need the `db.write` scope too."""
     lifespan = None
     if mcp_app is not None:
         @asynccontextmanager
@@ -120,8 +122,9 @@ def build_app(
 
     @app.get("/v1/whoami")
     def whoami(who: IdentityContext = Depends(caller)) -> dict:
-        # What the workbench keys its stored threads by, so one browser never shows a user another's.
-        return {"principal_id": who.principal_id, "tenant_id": who.tenant_id}
+        # What the workbench keys its stored threads by, so one browser never shows a user another's. `verified`
+        # tells a token's identity from the one settings identity, whose threads the browser may keep.
+        return {"principal_id": who.principal_id, "tenant_id": who.tenant_id, "verified": doors is not None}
 
     @app.post("/v1/ask")
     def ask(body: AskBody, who: IdentityContext = Depends(caller)) -> dict:

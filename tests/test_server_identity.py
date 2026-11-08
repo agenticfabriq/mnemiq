@@ -90,11 +90,12 @@ def test_every_v1_route_serves_the_tokens_identity_never_the_settings_one(method
 
 def test_whoami_returns_the_verified_caller():
     r = _client(_RT(), _doors()).get("/v1/whoami", headers=_auth(sub="user-7"))
-    assert r.json() == {"principal_id": "user-7", "tenant_id": "acme"}
+    assert r.json() == {"principal_id": "user-7", "tenant_id": "acme", "verified": True}
 
 
 def test_whoami_returns_the_settings_identity_with_no_issuer():
-    assert _client(_RT()).get("/v1/whoami").json() == {"principal_id": "settings-user", "tenant_id": "local"}
+    assert _client(_RT()).get("/v1/whoami").json() == {"principal_id": "settings-user", "tenant_id": "local",
+                                                        "verified": False}
 
 
 def test_with_no_issuer_chat_and_schema_serve_the_settings_identity():
@@ -246,3 +247,29 @@ def test_serve_http_warns_about_a_mapped_role_the_policy_lacks(monkeypatch, capl
         server_app.serve_http(Settings(tenant="acme", oidc_issuer=ISSUER, oidc_audience=AUDIENCE,
                                        identity_map_path=str(path)), host="127.0.0.1", port=8080)
     assert "anlyst" in caplog.text
+
+
+# --- /v1 needs the db.read scope (the owner's decision, 2026-11-08) ----------------------------------------------
+
+
+@pytest.mark.parametrize("method, path, body", ROUTES)
+def test_every_v1_route_refuses_a_token_without_db_read(method, path, body):
+    """A 403, not a 401: the caller is signed in and not permitted, so the workbench must not loop on sign-in."""
+    rt = _RT()
+    r = _call(_client(rt, _doors()), method, path, body, _auth(scope="openid profile"))
+    assert r.status_code == 403
+    assert r.json()["detail"] == "insufficient scope: this token lacks db.read"
+    assert r.headers["www-authenticate"] == 'Bearer error="insufficient_scope", scope="db.read"'
+    assert rt.served == []
+
+
+@pytest.mark.parametrize("scope", [None, "", "db.reader", "db.write", ["db.read"]])
+def test_only_a_space_separated_scope_naming_db_read_passes(scope):
+    r = _client(_RT(), _doors()).get("/v1/schema", headers=_auth(scope=scope))
+    assert r.status_code == 403
+
+
+@pytest.mark.parametrize("method, path, body", ROUTES)
+def test_every_v1_route_serves_a_token_with_db_read(method, path, body):
+    r = _call(_client(_RT(), _doors()), method, path, body, _auth(scope="openid db.read profile"))
+    assert r.status_code == 200
