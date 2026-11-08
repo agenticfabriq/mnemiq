@@ -64,8 +64,9 @@ Each action takes `--config`, the sweep's config file.
 | `mnemiq sweep propose` | Applies the config's rule to the finished sweep and writes each model's proposed profile and its evidence. `--choose ARM` writes a person's pick instead: an arm's label as the report shows it, `start`, or in check mode `defaults`. One pick applies to every model, and must name an arm that ran and is valid in every run there. |
 
 A command exits 0 when it did what it was asked. It exits 1 with the reason, and no traceback, when the config or
-the sweep's files refuse it, and when `run` stopped because an endpoint stopped answering or a worker died. A run
-that stops for its budget says so and exits 0: raise the budget and run again.
+the sweep's files refuse it, and when `run` stopped because an endpoint stopped answering or a worker died. A `run`
+that the budget stopped says so and exits 3, so a script can tell it from one that finished: raise the budget and run
+again, and the sweep resumes where it stopped.
 
 Under `repeats = "auto"`, `report` reads each arm at the number of runs the first round decided, which the sweep
 records. Before that is decided, or when no start ran, it reads each arm at one run and says so.
@@ -73,8 +74,9 @@ records. Before that is decided, or when no start ran, it reads each arm at one 
 ## The question file
 
 A JSON list of cases. Each has an `id` (unique), a `question`, and either `gold_sql`, the query whose result is the
-right answer, or `"answerable": false` for a question the data cannot answer, where declining is right. With several
-deployments, each case's `db_id` names the one it reads.
+right answer, or `"answerable": false` for a question the data cannot answer, which the engine should decline. A
+decline there counts as Declined, never as Right, and an answer to it counts as Made up. With several deployments,
+each case's `db_id` names the one it reads.
 
 ```json
 [
@@ -166,8 +168,9 @@ written as `1.5` or `"2"`), or a value outside a setting's limits is refused wit
   least one). See [identities](#identities-and-why-row-filters-are-refused).
 
 The deployment's env file is the only place its settings come from: `MNEMIQ_*` variables in the shell running the
-sweep are ignored, so the sweep measures the deployment its file names. Its store must be built (`mnemiq enrich` and
-`mnemiq build`) before the sweep runs.
+sweep are ignored, so the sweep measures the deployment its file names. That holds for `MNEMIQ_LOCAL_ONLY` too: set
+it in the deployment's env file, and the engine's profile loader refuses any arm whose writer, judge or embedder would
+leave the network. Its store must be built (`mnemiq enrich` and `mnemiq build`) before the sweep runs.
 
 ### `[models]`
 
@@ -227,11 +230,12 @@ and one it refuses (a judge on a mode with one candidate, say) is skipped and li
   screen first) or `"check"` ([check mode](#check-mode)).
 - `screen_alpha` (default `0.25`): the screen's bar ([the rounds](#the-rounds)).
 - `budget_hours`, `budget_dollars`: checked before each arm, never during one. A run stops before an arm the budget
-  cannot cover, and says so.
+  cannot cover, says so, and exits 3.
 - `seconds_per_question`: an estimate of one question's time. `plan` reckons its hours from it, and the hour budget
   uses it until the sweep has measured its own pace.
 
-None of these changes an answer, so a sweep can be resumed after changing them.
+`budget_hours`, `budget_dollars` and `seconds_per_question` change no answer, so a sweep can be resumed after
+changing them. Changing `strategy` or `screen_alpha` needs a new sweep, in another out folder.
 
 ### `[propose]`
 
@@ -457,9 +461,9 @@ until the sweep ends. Build the snapshot deployment's store from the snapshot, a
 - **One run at a time per out folder.** A second `run` on the same folder is refused at once.
 - **Resume.** A stopped run, whether by the budget, an endpoint, a worker, Ctrl-C or the machine, resumes where it
   stopped: each arm from the answers it wrote, and what the first round decided (the runs each arm owes, each start's
-  room) read back. A resumed config may change only the budgets, `seconds_per_question` and the controls. Anything else
-  (the config, a deployment's settings, a pinned file) or another engine build is refused before any arm: put it back,
-  or start a new sweep in another out folder.
+  room) read back. A resumed config may change only `budget_hours`, `budget_dollars`, `seconds_per_question` and its
+  `[[control]]` tables. Anything else (the config, a deployment's settings, a pinned file) or another engine build is
+  refused before any arm: put it back, or start a new sweep in another out folder.
 - **Smoke.** `--smoke N` runs each arm of the first round once on its first N questions to tune on, in
   `<out>/smoke/`, which nothing else reads, with no budget, room or repeats. Each smoke replaces that folder whole, and
   only a folder a smoke made.

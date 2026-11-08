@@ -34,9 +34,9 @@ be one a run stamped, since it hashes every mode, and the evidence says the prof
 
 A proposal's two files, the profile and its evidence, are written together after every check has passed. A refusal
 for what was asked, or for a sweep that has not moved, leaves an earlier proposal as it was. A refusal that shows an
-earlier proposal no longer holds (an arm's file whose version is not the one its rows were stamped with, a split that is
-not the one drawn, a record that is not finished), or a failure while the files are written, removes it, so none is left
-looking current.
+earlier proposal no longer holds (an arm's file that cannot be read back as that arm, or whose version is not the one
+its rows were stamped with, a split that is not the one drawn, a record that is not finished), or a failure while the
+files are written, removes it, so none is left looking current.
 """
 
 from __future__ import annotations
@@ -60,14 +60,14 @@ import httpx
 
 from mnemiq import redact
 from mnemiq.config import without_credentials
-from mnemiq.profiles import ProfileFileError, load_profiles, profile_version
+from mnemiq.profiles import load_profiles, profile_version
 from mnemiq.runtime import source_adapter
 from mnemiq.sweep.arms import Arm, _endpoint, _mode_of, _show, _toml, arm_of, assembled_arm, baselines, check_arms
 from mnemiq.sweep.config import (
     ENDPOINT_FACTS, PROPOSAL, SWEEP, SweepConfig, SweepConfigError, fingerprint, load_questions, scrub_credentials,
 )
 from mnemiq.sweep.plan import _ROUNDS_OF, LOAD_WAIT_EVERY_S, LOAD_WAIT_S, TIMING_CASES, unpinned_sources
-from mnemiq.sweep.report import decided_repeats, report
+from mnemiq.sweep.report import ArmFileError, decided_repeats, report
 from mnemiq.sweep.run import (
     PROFILE, ROWS, _first_round, _replace, _rows_so_far, _say, _write_json, arm_folder, engine_build,
 )
@@ -991,7 +991,8 @@ def propose(cfg: SweepConfig, chosen: str | None = None) -> dict:
     Refused, leaving an earlier proposal as it was, for a sweep run under another config, a record that does not say
     which modes the start ran in, a key variable that is not set, or a choice that names no arm that ran and is valid.
     Refused, removing an earlier proposal, when the sweep has not finished, its split is not the one drawn, or an arm's
-    file is not the profile its rows were stamped with; and the files are removed when writing them fails, however.
+    file cannot be read back as that arm or is not the profile its rows were stamped with; and the files are removed
+    when writing them fails, however.
     A proposal packaged by another engine build than the one the arms ran on is written with a warning, its version
     still checked. Returns, for each model, what was chosen and by whom, the rule's pick, each mode's pick, the
     conflicts, the mode that failed the confirm round, how the profile was measured, why, any warnings, and the files
@@ -1031,9 +1032,8 @@ def _drafts(cfg: SweepConfig, chosen: str | None) -> dict[str, tuple[_Draft, dic
     repeats = decided_repeats(cfg, state) if any(running for running, _ in ran.values()) else 1
     try:
         verdicts = _verdicts(cfg, state, ran, repeats)
-    except ProfileFileError as exc:  # an arm's own file, read back by the report, that cannot be read
-        raise _Stale(f"the profile file of an arm that ran cannot be read ({exc}), so its rows cannot be read "
-                     "against it") from None
+    except ArmFileError as exc:  # an arm's own file, read back by the report, that is not the arm its rows were of
+        raise _Stale(str(exc)) from None
     picked = {model: _chosen_arms(cfg, model, verdicts[model], chosen, running) if chosen and running else None
               for model, (running, _) in ran.items()}
     drafts = {}

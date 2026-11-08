@@ -63,7 +63,7 @@ from mnemiq.sweep.config import (
     RETRIES, SMOKE, SPLIT, SWEEP, SweepConfig, SweepConfigError, _deployment_ids, _source_specs, deployment_settings,
     fingerprint, load_questions, pinned_files,
 )
-from mnemiq.sweep.plan import _ROUNDS_OF, _judged_elsewhere, _refusals, _rounds
+from mnemiq.sweep.plan import AFTER_SEARCH, _ROUNDS_OF, _judged_elsewhere, _refusals, _rounds, rounds_of
 from mnemiq.sweep.split import PARTS, saved_split, split, split_digest
 from mnemiq.sweep.stats import detectable_gain
 
@@ -76,8 +76,6 @@ LOCK = ".lock"
 OUT_LOCK = ".sweep.lock"
 # What a smoke writes in the folder it makes, so it never replaces a folder it did not make.
 SMOKE_MARK = ".mnemiq-smoke"
-# The rounds that follow a search, which `run` leaves to their own code.
-_AFTER_SEARCH = ("timing", "confirm")
 # Endpoint errors in a row that stop an arm.
 _STREAK = 3
 # Statuses that fail every question alike: a wrong or revoked key, a model name the server does not serve, a rate
@@ -972,7 +970,7 @@ class _Rounds:
                     left = job.left()
                     if not left and (job.folder / INVALID).exists():
                         _say(_not_valid(job))
-                    searching = job.arm.round not in _AFTER_SEARCH
+                    searching = job.arm.round not in AFTER_SEARCH
                     if not left or (self.state is not None and searching
                                     and not self._active((job.arm.model, job.arm.mode))):
                         continue
@@ -1194,7 +1192,7 @@ def run(cfg: SweepConfig, until: str | None = None, smoke: int | None = None) ->
     raised.
     """
     strategy = cfg.search.strategy
-    rounds = (*_ROUNDS_OF[strategy], *(_AFTER_SEARCH if strategy != "check" else ()))
+    rounds = rounds_of(strategy)
     if until is not None and until not in rounds:
         raise SweepConfigError(f"{until!r} is not a round this sweep runs: with strategy {strategy!r} it runs "
                                f"{', '.join(rounds)}")
@@ -1214,7 +1212,7 @@ def run(cfg: SweepConfig, until: str | None = None, smoke: int | None = None) ->
         sweep.first_round()
         if not sweep.halted and until != sweep.first and strategy == "screen-then-grid":
             sweep.grid()
-        if not sweep.halted and until in (None, "check", *_AFTER_SEARCH):
+        if not sweep.halted and until in (None, "check", *AFTER_SEARCH):
             from mnemiq.sweep.propose import after_search  # the proposal reads this module's files
 
             after_search(sweep, until)

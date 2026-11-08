@@ -30,6 +30,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import NamedTuple
 
+from mnemiq import redact
 from mnemiq.agent.loop import AgentAnswer
 from mnemiq.contract import IdentityContext, Trace
 from mnemiq.eval.harness import CaseResult, Outcome, run_case
@@ -37,6 +38,7 @@ from mnemiq.runtime import source_adapter
 from mnemiq.sweep.arms import ROUNDS, arm_from_profile
 from mnemiq.sweep.config import (
     SWEEP, Control, SweepConfig, SweepConfigError, control_answers, deployment_settings, fingerprint, load_questions,
+    scrub_credentials,
 )
 from mnemiq.sweep.plan import TIMING_CASES
 from mnemiq.sweep.run import INVALID, PROFILE, ROWS, _identity, _rows_so_far
@@ -74,6 +76,11 @@ class Tally:
     median_rows_ms: float | None
     prompt_tokens: float | None  # per question
     versions: list[str]
+
+
+class ArmFileError(SweepConfigError):
+    """An arm's own profile file cannot be read back as the arm its folder names: it cannot be read, or it holds another
+    arm's settings. Its rows cannot be read against it."""
 
 
 class Pair(NamedTuple):
@@ -211,7 +218,14 @@ def grade_control(cfg: SweepConfig, control: Control) -> list[dict]:
             case = cases[answer["id"]]
             db_id = case.db_id if cfg.dataset.deployments is not None else None
             if db_id not in adapters:
-                adapters[db_id] = source_adapter(deployment_settings(cfg, db_id), read_only=True)
+                settings = deployment_settings(cfg, db_id)
+                try:
+                    adapters[db_id] = source_adapter(settings, read_only=True)
+                except Exception as exc:  # noqa: BLE001 -- an attach error can quote a DSN, so none is passed on as it is
+                    where = f"the deployment for {db_id!r}" if db_id is not None else "the deployment"
+                    said = redact.scrub_credentials(scrub_credentials(str(exc), settings))
+                    raise SweepConfigError(f"{where}'s source cannot be opened to grade the control {control.name!r}: "
+                                           f"{said}") from None
             result = run_case(case, _answering(answer, identity), adapters[db_id])
             rows.append({
                 "id": case.id, "mode": None, "outcome": str(result.outcome),
@@ -347,7 +361,11 @@ def _table_records(cfg: SweepConfig, model: str, mode: str, round: str, owed: Ma
     for profile_id, modes, folder in arms:
         profile = next((folder / f"run-{number}" / PROFILE for number in _run_numbers(folder)
                         if (folder / f"run-{number}" / PROFILE).exists()), None)
-        arm = arm_from_profile(cfg, model, round, modes, profile_id, profile) if profile is not None else None
+        try:
+            arm = arm_from_profile(cfg, model, round, modes, profile_id, profile) if profile is not None else None
+        except (OSError, ValueError) as exc:  # the engine's reader refusing the file included (`ProfileFileError`)
+            raise ArmFileError(f"{profile}, the profile file of an arm that ran, cannot be read back as that arm "
+                               f"({exc}), so its rows cannot be read against it") from None
         runs = _runs(folder, mode, repeats)
         tallies = counted(runs)
         pairs = pair_runs(start_rows, {number: run.rows for number, run in runs.items()})
@@ -413,8 +431,13 @@ def _table(cfg: SweepConfig, model: str, mode: str, round: str, records: list[di
     return "\n".join(lines)
 
 
+def graded_controls(cfg: SweepConfig) -> list[tuple[str, list[dict]]]:
+    """Each control's name and its rows, graded once (`grade_control`), for `report` to read in several rounds."""
+    return [(control.name, grade_control(cfg, control)) for control in cfg.control]
+
+
 def report(cfg: SweepConfig, round: str, *, repeats: int | None = None,
-           controls: bool = True) -> tuple[str, list[dict]]:
+           controls: bool | Sequence[tuple[str, list[dict]]] = True) -> tuple[str, list[dict]]:
     """A markdown table for each model and mode of `round`, and its rows as records.
 
     A table holds the start, each arm the round ran, then each control. Its columns are Valid, Right, Strict, Wrong,
@@ -424,11 +447,12 @@ def report(cfg: SweepConfig, round: str, *, repeats: int | None = None,
     round's is the two-sided p. A grid that follows a screen is compared with the screen's start. The timing round is
     read against the first `TIMING_CASES` cases to tune on, which is all it times, and at one run, which is all it runs.
 
-    Each arm's label and changes are read back from the profile file its run wrote (`arm_from_profile`), and an arm
-    folder this config would not have written is refused.
+    Each arm's label and changes are read back from the profile file its run wrote (`arm_from_profile`). A file that
+    cannot be read, or that this config would not have written for that folder, is refused (`ArmFileError`).
 
     `controls=False` leaves the controls out, ungraded: no control decides what the screen keeps, so the grid reads its
-    kept values that way, without running a control's SQL.
+    kept values that way, without running a control's SQL. `controls` may also be the controls as `graded_controls`
+    gave them, so that several rounds are read on one grading.
 
     `repeats` is how many runs each arm owes, and an arm short of one is not valid. By default it is the config's
     `repeats` when that is a number, else the count the first round decided, from the sweep's record
@@ -449,7 +473,10 @@ def report(cfg: SweepConfig, round: str, *, repeats: int | None = None,
     if repeats < 1:
         raise ValueError("an arm owes at least one run")
     owed = _owed(cfg, round)
-    graded = [(control.name, grade_control(cfg, control)) for control in cfg.control] if controls else []
+    if isinstance(controls, bool):
+        graded = graded_controls(cfg) if controls else []
+    else:
+        graded = list(controls)
     tables, records = [], []
     for model in cfg.models:
         for mode in cfg.modes:

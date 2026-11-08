@@ -37,6 +37,7 @@ _UNKNOWN = "unknown until the first questions run"
 _JUDGE_UNPRICED = "the judge's price is not known"
 # The rounds that compare arms on the tuning part, by strategy; timing and confirm follow a search.
 _ROUNDS_OF = {"screen-then-grid": ("screen", "grid"), "grid": ("grid",), "check": ("check",)}
+AFTER_SEARCH = ("timing", "confirm")
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,12 @@ class Estimate:
     rounds: dict[tuple[str, str], dict[str, list[Arm]]]
     parts: dict[str, tuple[int, int]]  # tuning and held_out: (cases, answerable)
     judged_elsewhere: list[str]
+
+
+def rounds_of(strategy: str) -> tuple[str, ...]:
+    """Every round a sweep of `strategy` runs, in order: the rounds that compare arms on the questions to tune on, then
+    timing and confirm for a strategy that searches. Check mode compares for harm and runs neither."""
+    return (*_ROUNDS_OF[strategy], *(AFTER_SEARCH if strategy != "check" else ()))
 
 
 def _tried(arms: list[Arm]) -> dict[str, list[object]]:
