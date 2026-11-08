@@ -94,4 +94,5 @@ version.
 
 The best profile for a model and a dataset is found by measuring, not by guessing: run the candidate settings over
 questions with known answers, keep what moves the score by more than the run-to-run noise, and check the result on
-questions the search did not use before relying on it.
+questions the search did not use before relying on it. `mnemiq sweep` does exactly this and proposes a profile for each
+model, with its evidence, for you to promote: see [sweeps.md](sweeps.md).

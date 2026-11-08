@@ -1196,10 +1196,10 @@ def run(cfg: SweepConfig, until: str | None = None, smoke: int | None = None) ->
     strategy = cfg.search.strategy
     rounds = (*_ROUNDS_OF[strategy], *(_AFTER_SEARCH if strategy != "check" else ()))
     if until is not None and until not in rounds:
-        raise ValueError(f"{until!r} is not a round this sweep runs: with strategy {strategy!r} it runs "
-                         f"{', '.join(rounds)}")
+        raise SweepConfigError(f"{until!r} is not a round this sweep runs: with strategy {strategy!r} it runs "
+                               f"{', '.join(rounds)}")
     if smoke is not None and (isinstance(smoke, bool) or not isinstance(smoke, int) or smoke < 1):
-        raise ValueError("a smoke asks each arm at least one case")
+        raise SweepConfigError("a smoke asks each arm at least one case")
     out = Path(cfg.sweep.out)
     out.mkdir(parents=True, exist_ok=True)
     with _sole(out / OUT_LOCK, SweepConfigError(f"{out} is in use by another run of a sweep; run again once it has "

@@ -174,13 +174,46 @@ def _write_authz(d: TinyDeployment, *, withhold: str | None, row_filter: bool, m
     d.authz.write_text(json.dumps({"roles": {ROLE: role}}))
 
 
+def more_cases(count: int) -> tuple[dict, ...]:
+    """`count` synthetic questions over the tiny tables, beside `CASES`. Three in four ask how many books were published
+    after a year before the first book was, and their wrong answer counts the books published before it, which is none.
+    The rest ask what the library paid for a book, which no table holds, and their wrong answer makes one up."""
+    written: list[dict] = []
+    for i in range(count):
+        if i % 4 == 3:
+            made_up = f"SELECT title, published_year AS paid FROM books WHERE book_id = {i % len(_BOOKS) + 1}"
+            written.append({"id": f"paid-{i}", "question": f"What did the library pay for book number {i}?",
+                            "gold_sql": None, "answerable": False, "wrong_sql": made_up})
+            continue
+        year = 1900 + i
+        if year >= min(published for _, _, _, published, _ in _BOOKS):
+            raise ValueError(f"{count} synthetic cases reach {year}, where the wrong answer would count some books")
+        written.append({"id": f"after-{year}", "question": f"How many books were published after {year}?",
+                        "gold_sql": f"SELECT COUNT(*) AS books FROM books WHERE published_year > {year}",
+                        "wrong_sql": f"SELECT COUNT(*) AS books FROM books WHERE published_year < {year}"})
+    return tuple(written)
+
+
+def _with_cases(d: TinyDeployment, count: int) -> TinyDeployment:
+    """The deployment with a question file of `count` cases: `CASES`, then `more_cases` up to `count`."""
+    if count < len(CASES):
+        raise ValueError(f"cases= counts the tiny deployment's own {len(CASES)} cases, so it is at least that")
+    written = CASES + more_cases(count - len(CASES))
+    path = d.root / f"questions-{count}.json"
+    if not path.exists():
+        path.write_text(json.dumps([_graded(case) for case in written], indent=2))
+    return replace(d, questions=path, cases=written)
+
+
 def tiny_deployment(tmp_path: Path, stub: StubModel, *, env_extra: dict[str, str] | None = None,
-                    withhold: str | None = None, row_filter: bool = False, mask: bool = False) -> TinyDeployment:
+                    withhold: str | None = None, row_filter: bool = False, mask: bool = False,
+                    cases: int | None = None) -> TinyDeployment:
     """The tiny deployment, its store built once per `tmp_path`: a second call returns what the first built, so a
     rebuilt store never moves a fingerprint. Its env file points at the first stub given, for chat and embeddings, and
     every stub given learns its cases. `env_extra` adds lines to the env file, as `{"MNEMIQ_NAME": "value"}`, and is
     taken only by the call that builds the deployment. `withhold` takes one table out of the sweep's role, `row_filter`
-    gives the role a row filter, and `mask` a PII mask; the store depends on none of them."""
+    gives the role a row filter, and `mask` a PII mask; the store depends on none of them. `cases=N` gives it a question
+    file of N cases (`CASES`, then `more_cases`), which the store does not depend on either."""
     from mnemiq.cli import _cmd_build, _cmd_enrich
 
     d = tiny_files(tmp_path)
@@ -198,7 +231,9 @@ def tiny_deployment(tmp_path: Path, stub: StubModel, *, env_extra: dict[str, str
                 raise RuntimeError(f"the tiny deployment's store did not build ({builder.errors!r}); see the "
                                    "captured output")
         _write_env(d, stub.url, env_extra)
-    stub.learn(CASES)
+    if cases is not None:
+        d = _with_cases(d, cases)
+    stub.learn(d.cases)
     return d
 
 

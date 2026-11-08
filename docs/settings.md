@@ -15,7 +15,8 @@ mnemiq is one engine with many ways to run it. This page explains every setting 
 
 Which techniques help depends on the model and the data, so the way to choose is to measure: run each candidate
 profile as one arm of an experiment, beside the others, over questions with known answers.
-[Finding the right settings](profiles.md#finding-the-right-settings) says how.
+[Finding the right settings](profiles.md#finding-the-right-settings) says how, and `mnemiq sweep` runs such an
+experiment for you: see [sweeps.md](sweeps.md).
 
 ## Where a setting is set
 

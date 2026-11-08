@@ -15,11 +15,13 @@ from __future__ import annotations
 import os
 from collections import Counter
 from dataclasses import dataclass, replace
+from pathlib import Path
+from statistics import fmean
 
 from mnemiq.config import Settings
 from mnemiq.runtime import _resolve_verify_level
 from mnemiq.sweep.arms import Arm, baselines, check_arms, grid_arms, refusal_under, screen_arms, start_settings
-from mnemiq.sweep.config import _FILE_SOURCES, SweepConfig, _source_specs, load_questions
+from mnemiq.sweep.config import _FILE_SOURCES, SMOKE, SweepConfig, _source_specs, load_questions
 from mnemiq.sweep.split import split
 from mnemiq.sweep.stats import detectable_gain
 
@@ -224,6 +226,24 @@ def estimate(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None 
         room_bound=room_bound, store_bytes=store_bytes, unpinned_sources=unpinned, refused=refused, rounds=rounds,
         parts={name: (len(part), sum(case.answerable for case in part)) for name, part in parts.items()},
         judged_elsewhere=judged_elsewhere)
+
+
+def measured_tokens(cfg: SweepConfig) -> dict[str, tuple[float, float]] | None:
+    """The tokens one question took, per model, as the rows written in the sweep's out folder show them, a smoke's
+    included: the mean prompt and completion tokens over the rows that were answered and graded (no error). A model with
+    no such row is left out, and None is returned when no model has one, so `render` says the cost is not known yet."""
+    from mnemiq.sweep.run import ROWS, _rows_so_far  # the run reads this module, so it is imported when needed
+
+    out = Path(cfg.sweep.out)
+    found: dict[str, tuple[float, float]] = {}
+    for model in cfg.models:
+        counted = [(row["prompt_tokens"], row["completion_tokens"])
+                   for base in (out / model, out / SMOKE / model) for path in base.glob(f"*/*/*/run-*/{ROWS}")
+                   for row in _rows_so_far(path) if row.get("error_kind") is None
+                   and all(isinstance(row.get(name), int) for name in ("prompt_tokens", "completion_tokens"))]
+        if counted:
+            found[model] = (fmean(tokens for tokens, _ in counted), fmean(tokens for _, tokens in counted))
+    return found or None
 
 
 def unpinned_sources(deployments: list[tuple[str | None, Settings]]) -> list[str]:
