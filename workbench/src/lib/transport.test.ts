@@ -159,6 +159,15 @@ describe("fetchWhoami", () => {
     expect((await fetchWhoami())!.tenant_id).toBeNull();
   });
 
+  it("reads a tenant that is neither a string nor null as the service failing", async () => {
+    // Read as null, the same principal in two tenants would share one namespace, and a
+    // malformed answer could set off the purge of another identity's threads.
+    for (const tenant_id of [undefined, 7, { id: "tenant-a" }]) {
+      stubFetch(json({ principal_id: "alice@example.com", tenant_id, verified: true }));
+      expect(await refusalOf(fetchWhoami())).toBe("unavailable");
+    }
+  });
+
   it("reads an answer that names nobody as the service failing", async () => {
     stubFetch(json({ tenant_id: "tenant-a", verified: true }));
     expect(await refusalOf(fetchWhoami())).toBe("unavailable");

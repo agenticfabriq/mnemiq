@@ -190,6 +190,29 @@ describe("whose threads the page shows", () => {
   });
 });
 
+describe("a malformed identity", () => {
+  for (const [what, tenant_id] of [
+    ["no tenant", undefined],
+    ["a numeric tenant", 7],
+    ["an object for a tenant", { id: "tenant-a" }],
+  ] as const) {
+    it(`reads ${what} as the service unavailable, touching no stored history`, async () => {
+      await signedInBefore(ALICE, "alice's question");
+      localStorage.setItem(LEGACY.threads, stored("how many policies are there?"));
+      const before = snapshot();
+      serve({ "/v1/whoami": () => json({ principal_id: "bob@example.com", tenant_id, verified: true }) });
+      const reload = vi.fn();
+
+      render(<App reload={reload} />);
+
+      expect(await screen.findByText(NOTICE.unavailable)).toBeInTheDocument();
+      await settle();
+      expect(snapshot()).toEqual(before);
+      expect(reload).not.toHaveBeenCalled();
+    });
+  }
+});
+
 describe("signed out", () => {
   it("purges the user's threads and reloads when whoami answers 401", async () => {
     await signedInBefore(ALICE, "alice's question");

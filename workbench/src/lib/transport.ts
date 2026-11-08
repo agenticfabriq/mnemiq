@@ -78,9 +78,13 @@ export async function fetchWhoami(): Promise<Whoami | null> {
     throw new Refused("unavailable");
   }
   if (typeof body?.principal_id !== "string") throw new Refused("unavailable");
+  // A string or an explicit null, nothing else. Folded to null, a missing or malformed tenant
+  // would put the same principal in two tenants into one namespace, and would be acted on
+  // (another identity's threads purged) before anyone noticed the answer was wrong.
+  if (body.tenant_id !== null && typeof body.tenant_id !== "string") throw new Refused("unavailable");
   return {
     principal_id: body.principal_id,
-    tenant_id: typeof body.tenant_id === "string" ? body.tenant_id : null,
+    tenant_id: body.tenant_id,
     // Only an explicit false is unverified. Read the other way, an engine that left the field
     // out would hand a verified user the history of whoever used this browser before.
     verified: body.verified !== false,
