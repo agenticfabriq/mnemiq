@@ -190,6 +190,39 @@ describe("whose threads the page shows", () => {
   });
 });
 
+describe("the legacy history near the storage quota", () => {
+  it("keeps showing and keeping it until it can be moved, never an empty list in its place", async () => {
+    localStorage.setItem(LEGACY.threads, stored("how many policies are there?"));
+    // Full storage: no room to copy the history into its namespace, room for an empty list.
+    const real = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (key: string, value: string) {
+      if (key.startsWith("mnemiq.ns.") && value.length > 2) {
+        throw new DOMException("quota", "QuotaExceededError");
+      }
+      return real.call(this, key, value);
+    };
+    try {
+      serve({ "/v1/whoami": () => new Response("", { status: 404 }), "/v1/schema": SCOPE });
+      render(<App reload={vi.fn()} />);
+
+      expect(await screen.findAllByText("how many policies are there?")).not.toHaveLength(0);
+      await settle();
+      expect(localStorage.getItem(LEGACY.threads)).toContain("how many policies are there?");
+      expect(localStorage.getItem(keyFor(SINGLE, "threads"))).toBeNull();
+    } finally {
+      Storage.prototype.setItem = real;
+    }
+    cleanup();
+
+    // The next load, with room again, moves it.
+    render(<App reload={vi.fn()} />);
+
+    expect(await screen.findAllByText("how many policies are there?")).not.toHaveLength(0);
+    expect(localStorage.getItem(LEGACY.threads)).toBeNull();
+    expect(localStorage.getItem(keyFor(SINGLE, "threads"))).toContain("how many policies are there?");
+  });
+});
+
 describe("a malformed identity", () => {
   for (const [what, tenant_id] of [
     ["no tenant", undefined],

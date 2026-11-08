@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   LEGACY,
+  LEGACY_SHELF,
   RELOAD_GUARD_MS,
   SINGLE,
   enter,
@@ -169,6 +170,86 @@ describe("enter", () => {
       expect(key).not.toContain("alice");
       expect(localStorage.getItem(key)).not.toContain("alice");
     }
+  });
+});
+
+/** Storage that is full: it refuses any write to a key `refuse` picks. Returns the undo. */
+function fullFor(refuse: (key: string, value: string) => boolean): () => void {
+  const real = Storage.prototype.setItem;
+  Storage.prototype.setItem = function (key: string, value: string) {
+    if (refuse(key, value)) throw new DOMException("quota", "QuotaExceededError");
+    return real.call(this, key, value);
+  };
+  return () => {
+    Storage.prototype.setItem = real;
+  };
+}
+
+describe("moving the legacy history near the storage quota", () => {
+  it("answers where the history lives: the namespace once moved", () => {
+    localStorage.setItem(LEGACY.threads, "[legacy]");
+    expect(enter(SINGLE)).toBe(SINGLE);
+  });
+
+  it("leaves the legacy history exactly as it was when the move cannot be written, and says so", () => {
+    localStorage.setItem(LEGACY.threads, "[legacy]");
+    localStorage.setItem(LEGACY.mode, "deep");
+    const undo = fullFor((key) => key.startsWith("mnemiq.ns."));
+    let shelf: string | null;
+    try {
+      shelf = enter(SINGLE);
+    } finally {
+      undo();
+    }
+
+    expect(shelf).toBe(LEGACY_SHELF);
+    expect(localStorage.getItem(LEGACY.threads)).toBe("[legacy]");
+    expect(localStorage.getItem(LEGACY.mode)).toBe("deep");
+    expect(keys().filter((key) => key.startsWith("mnemiq.ns."))).toEqual([]);
+  });
+
+  it("leaves no half-moved copy when only the second item cannot be written", () => {
+    localStorage.setItem(LEGACY.threads, "[legacy]");
+    localStorage.setItem(LEGACY.mode, "deep");
+    const undo = fullFor((key) => key === keyFor(SINGLE, "mode"));
+    try {
+      expect(enter(SINGLE)).toBe(LEGACY_SHELF);
+    } finally {
+      undo();
+    }
+
+    expect(keys().filter((key) => key.startsWith("mnemiq.ns."))).toEqual([]);
+    expect(localStorage.getItem(LEGACY.threads)).toBe("[legacy]");
+  });
+
+  it("moves it on a later load, once there is room", () => {
+    localStorage.setItem(LEGACY.threads, "[legacy]");
+    const undo = fullFor((key) => key.startsWith("mnemiq.ns."));
+    try {
+      enter(SINGLE);
+    } finally {
+      undo();
+    }
+
+    expect(enter(SINGLE)).toBe(SINGLE);
+    expect(localStorage.getItem(keyFor(SINGLE, "threads"))).toBe("[legacy]");
+    expect(localStorage.getItem(LEGACY.threads)).toBeNull();
+  });
+
+  it("moves the legacy history over an empty list rather than deleting it", () => {
+    // An empty list is no history: it must never be what stops the move and lets the
+    // original be deleted.
+    localStorage.setItem(keyFor(SINGLE, "threads"), "[]");
+    localStorage.setItem(LEGACY.threads, "[legacy]");
+
+    enter(SINGLE);
+
+    expect(localStorage.getItem(keyFor(SINGLE, "threads"))).toBe("[legacy]");
+  });
+
+  it("reads and writes the legacy keys themselves while the history waits to move", () => {
+    expect(keyFor(LEGACY_SHELF, "threads")).toBe(LEGACY.threads);
+    expect(keyFor(LEGACY_SHELF, "mode")).toBe(LEGACY.mode);
   });
 });
 

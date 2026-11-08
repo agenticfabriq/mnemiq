@@ -15,7 +15,7 @@ import type { Whoami } from "./types";
 const PREFIX = "mnemiq.ns.";
 
 /** The namespace of whoever loaded the page last, so a load can tell the user changed. */
-const CURRENT = "mnemiq.identity.v1";
+export const MARKER = "mnemiq.identity.v1";
 
 /** Where threads and the mode lived before they were per identity. */
 export const LEGACY = { threads: "mnemiq.threads.v1", mode: "mnemiq.mode.v1" } as const;
@@ -30,10 +30,19 @@ export type Item = keyof typeof LEGACY;
  */
 export const SINGLE = "single";
 
+/**
+ * Where the one identity's items stay while its legacy history cannot be moved (storage full):
+ * the legacy keys themselves. Read and written there as before, and moved on a later load.
+ */
+export const LEGACY_SHELF = "legacy";
+
+const ITEMS = Object.keys(LEGACY) as Item[];
+
 export const RELOAD_GUARD_MS = 30_000;
 const RELOADED_AT = "mnemiq.signin-reload.v1";
 
-export const keyFor = (ns: string, item: Item): string => `${PREFIX}${ns}.${item}.v1`;
+export const keyFor = (ns: string, item: Item): string =>
+  ns === LEGACY_SHELF ? LEGACY[item] : `${PREFIX}${ns}.${item}.v1`;
 
 /**
  * The namespace for the identity the engine reported, or `null` when there is no safe name for
@@ -68,37 +77,80 @@ function purgeLegacy(storage: Storage): void {
   for (const key of Object.values(LEGACY)) storage.removeItem(key);
 }
 
+/** No history to keep: absent, or an empty list of threads. */
+const holdsNothing = (item: Item, raw: string | null): boolean =>
+  raw === null || (item === "threads" && raw === "[]");
+
+/**
+ * Move the legacy items into the one identity's namespace, all or none. The legacy items are
+ * removed only after every copy is written; when one cannot be (storage full), the copies made
+ * so far are taken back and the legacy items stay exactly as they were. Answers whether the
+ * history now lives in the namespace.
+ */
+function moveLegacy(storage: Storage): boolean {
+  const copied: string[] = [];
+  try {
+    for (const item of ITEMS) {
+      const legacy = storage.getItem(LEGACY[item]);
+      if (legacy === null) continue;
+      // Unless the namespace already has its own history: a tab still on the old bundle can
+      // write the legacy key after the move. An empty list is not history, so it never
+      // stands in the way.
+      const target = keyFor(SINGLE, item);
+      if (!holdsNothing(item, storage.getItem(target))) continue;
+      storage.setItem(target, legacy);
+      copied.push(target);
+    }
+  } catch {
+    for (const key of copied) storage.removeItem(key);
+    return false;
+  }
+  purgeLegacy(storage);
+  return true;
+}
+
 /**
  * Make `ns` the page's namespace. Runs before anything is rendered, so another identity's
- * threads are gone before they could be shown.
+ * threads are gone before they could be shown. Answers where this identity's items are read
+ * and written: `ns`, or `LEGACY_SHELF` while the one identity's legacy history cannot be moved.
  */
-export function enter(ns: string | null): void {
+export function enter(ns: string | null): string | null {
+  let storage: Storage | undefined;
   try {
-    const storage = globalThis.localStorage;
-    if (!storage) return;
+    storage = globalThis.localStorage;
+  } catch {
+    return ns; // storage denied: nothing was stored to leak, and nothing can be
+  }
+  if (!storage) return ns;
+
+  try {
     // A different identity than last time, or no record of one: whatever other namespaces
     // hold belongs to someone else.
-    if (ns === null || storage.getItem(CURRENT) !== ns) purgeNamespaces(storage, ns);
+    if (ns === null || storage.getItem(MARKER) !== ns) purgeNamespaces(storage, ns);
+  } catch {
+    // Storage denied part way: what could not be read could not be shown either.
+  }
 
+  let shelf = ns;
+  try {
     if (ns === SINGLE) {
-      // The legacy items are this identity's own history. Moved, unless the namespace already
-      // has its own: a tab still on the old bundle can write the legacy key after the move.
-      for (const item of Object.keys(LEGACY) as Item[]) {
-        const legacy = storage.getItem(LEGACY[item]);
-        if (legacy === null) continue;
-        if (storage.getItem(keyFor(ns, item)) === null) storage.setItem(keyFor(ns, item), legacy);
-        storage.removeItem(LEGACY[item]);
-      }
+      // The legacy items are this identity's own history.
+      if (!moveLegacy(storage)) shelf = LEGACY_SHELF;
     } else {
       // Whoever used this browser before an issuer: never handed to a verified user.
       purgeLegacy(storage);
     }
-
-    if (ns === null) storage.removeItem(CURRENT);
-    else storage.setItem(CURRENT, ns);
   } catch {
-    // Storage denied: nothing was stored to leak, and nothing can be.
+    shelf = ns === SINGLE ? LEGACY_SHELF : ns;
   }
+
+  try {
+    if (ns === null) storage.removeItem(MARKER);
+    else storage.setItem(MARKER, ns);
+  } catch {
+    // Full: the next load compares against the older marker and purges again, which is safe.
+  }
+  return shelf;
 }
 
 /** Signed out: nobody's threads should remain. The remembered namespace stays, so the next

@@ -41,7 +41,7 @@ type Notice = Exclude<Refusal, "signed-out">;
 /** What the page shows before, or instead of, a user's workbench. */
 type Session =
   | { state: "resolving" }
-  | { state: "ready"; ns: string | null }
+  | { state: "ready"; shelf: string | null }
   | { state: "signed-out"; prompt: boolean }
   | { state: "refused"; refusal: Notice };
 
@@ -116,8 +116,7 @@ export default function App({ reload = RELOAD }: { reload?: () => void }) {
       .then(namespaceOf)
       .then((ns) => {
         if (!live) return;
-        enter(ns);
-        setSession({ state: "ready", ns });
+        setSession({ state: "ready", shelf: enter(ns) });
       })
       .catch((error: unknown) => {
         if (!live) return;
@@ -131,7 +130,7 @@ export default function App({ reload = RELOAD }: { reload?: () => void }) {
   }, [refused]);
 
   if (session.state === "ready") {
-    return <Workbench key={session.ns ?? ""} ns={session.ns} notice={notice} onRefused={refused} />;
+    return <Workbench key={session.shelf ?? ""} shelf={session.shelf} notice={notice} onRefused={refused} />;
   }
   if (session.state === "refused") return <SessionNotice message={NOTICE[session.refusal]} />;
   if (session.state === "signed-out" && session.prompt) {
@@ -145,17 +144,18 @@ export default function App({ reload = RELOAD }: { reload?: () => void }) {
   return null; // resolving, or reloading
 }
 
+/** `shelf`: where this identity's threads and mode are kept (`enter`); null keeps nothing. */
 function Workbench({
-  ns,
+  shelf,
   notice,
   onRefused,
 }: {
-  ns: string | null;
+  shelf: string | null;
   notice: Notice | null;
   onRefused: (refusal: Refusal) => void;
 }) {
   const { runtime, mode, setMode, ask, threads, activeId, selectThread, newChat, deleteThread } =
-    useWorkbench(ns, onRefused);
+    useWorkbench(shelf, onRefused);
   const scope = useScope(onRefused);
 
   const [scopeOpen, setScopeOpen] = useState<boolean>(
@@ -195,7 +195,7 @@ function Workbench({
             {NOTICE[notice]}
           </p>
         )}
-        {ns === null && (
+        {shelf === null && (
           <p role="status" className="border-b border-rule px-5 py-1.5 text-[12px] text-graphite">
             {UNSAVED}
           </p>

@@ -59,21 +59,22 @@ function convertMessage(turn: Turn): ThreadMessageLike {
 }
 
 /**
- * `ns` is the identity's namespace (identity.ts), fixed for the life of the hook: the page
- * mounts a fresh workbench for a different identity rather than switching this one over.
- * `onRefused` hears a question's sign-out, which ends the run before any event arrives.
+ * `shelf` is where the identity's threads and mode are kept (`enter` in identity.ts), fixed
+ * for the life of the hook: the page mounts a fresh workbench for a different identity rather
+ * than switching this one over. `onRefused` hears a question's sign-out, which ends the run
+ * before any event arrives.
  */
-export function useWorkbench(ns: string | null, onRefused: (refusal: Refusal) => void) {
+export function useWorkbench(shelf: string | null, onRefused: (refusal: Refusal) => void) {
   const restored = useMemo(() => {
-    const stored = load(ns);
+    const stored = load(shelf);
     return stored.length ? stored : [emptyThread()];
-  }, [ns]);
+  }, [shelf]);
 
   const [threads, setThreads] = useState<Thread[]>(restored);
   const [activeId, setActiveId] = useState<string>(restored[0]!.id);
   // Restored, not defaulted: mode is what a question costs, and a reload that quietly
   // moves a reader from `deep` back to `thinking` changes the answer they get next.
-  const [mode, setMode] = useState<Mode>(() => loadMode(ns));
+  const [mode, setMode] = useState<Mode>(() => loadMode(shelf));
 
   // Read at send time so switching thread or mode mid-run never retargets a run
   // already in flight.
@@ -85,12 +86,12 @@ export function useWorkbench(ns: string | null, onRefused: (refusal: Refusal) =>
   threadsRef.current = threads;
 
   useEffect(() => {
-    saveMode(ns, mode);
-  }, [ns, mode]);
+    saveMode(shelf, mode);
+  }, [shelf, mode]);
 
   useEffect(() => {
-    save(ns, threads);
-  }, [ns, threads]);
+    save(shelf, threads);
+  }, [shelf, threads]);
 
   const active = threads.find((t) => t.id === activeId) ?? threads[0]!;
 
