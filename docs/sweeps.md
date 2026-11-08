@@ -64,7 +64,7 @@ Each action takes `--config`, the sweep's config file.
 | `mnemiq sweep plan` | Says what the sweep will run, what it will cost and the smallest gain it could show. Runs nothing and calls no model. |
 | `mnemiq sweep run` | Runs the rounds in order, resuming where an earlier run stopped. `--until ROUND` stops after that round. `--smoke N` runs each arm of the first round once on its first N questions to tune on, in `<out>/smoke/`, instead of the sweep. |
 | `mnemiq sweep report` | Prints a table for each model and mode of every round that has run, or of one with `--round ROUND`. |
-| `mnemiq sweep propose` | Applies the config's rule to the finished sweep and writes each model's proposed profile and its evidence. `--choose ARM` writes a person's pick instead: an arm's label as the report shows it, `start`, or in check mode `defaults`. One pick applies to every model, and must name an arm that ran and is valid in every run there. |
+| `mnemiq sweep propose` | Applies the config's rule to the finished sweep and writes each model's proposed profile and its evidence. `--choose ARM` writes a person's pick instead: an arm's label as the report shows it, `start`, or in check mode `defaults`. One pick applies to every model, and must name an arm that ran and is valid in every run there; in a mode the arm did not run in, the profile holds the start, which must be valid there too. |
 
 A command exits 0 when it did what it was asked. It exits 1 with the reason, and no traceback, when the config or
 the sweep's files refuse it, and when `run` stopped because an endpoint stopped answering or a worker died. A `run`

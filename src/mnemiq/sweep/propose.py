@@ -966,6 +966,7 @@ def _searched(cfg: SweepConfig, model: str, state: dict, judged: dict, timing: d
         # The start's own file: the confirm round's, measured in every mode, when that round ran.
         "start_arms": (start,) if assembled is not None else _first_starts(cfg, model, running),
         "start_valid": bool(running) and all((judged[(model, mode)]["start"] or {}).get("valid") for mode in running),
+        "start_valid_in": {mode: bool((judged[(model, mode)]["start"] or {}).get("valid")) for mode in running},
         "assembled": None, "assembled_valid": False,
     }
     if not running:
@@ -1024,7 +1025,9 @@ def _searched(cfg: SweepConfig, model: str, state: dict, judged: dict, timing: d
 def _chosen_arms(cfg: SweepConfig, model: str, verdict: dict, chosen: str,
                  running: Sequence[str]) -> tuple[tuple[Arm, ...], bool]:
     """The arms whose own files make up a person's choice for `model`, and whether that choice is the confirmed arm.
-    Refused unless it names an arm that ran and is valid in every run."""
+    Refused unless it names an arm that ran and is valid in every run. An arm that ran in some modes alone leaves the
+    start in each other one, which must be valid in every run it owed there (read as the rule reads it), or the choice
+    would publish a start the rule refuses."""
     if cfg.search.strategy == "check":
         if chosen not in ("start", "defaults") or chosen not in verdict["valid"]:
             raise SweepConfigError(f"{chosen!r} is not an arm of {model} valid in every run: check mode's are "
@@ -1049,6 +1052,10 @@ def _chosen_arms(cfg: SweepConfig, model: str, verdict: dict, chosen: str,
     if all(not arm.changes for arm in arms):
         raise SweepConfigError(f"{chosen!r} is not an arm of {model} that ran and is valid in every run: those are "
                                f"start, {', '.join(sorted(set(valid))) or 'no other'}")
+    if unmeasured := [arm.mode for arm in arms if not arm.changes and not verdict["start_valid_in"][arm.mode]]:
+        raise SweepConfigError(f"{chosen!r} ran in {_joined([arm.mode for arm in arms if arm.changes])} alone, so the "
+                               f"profile would hold the start in {_joined(unmeasured)}, and the start of {model} is not "
+                               f"valid in every run it owed there: a person cannot choose it")
     return tuple(arms), False
 
 

@@ -510,6 +510,29 @@ def test_a_failed_confirm_over_a_start_not_valid_says_which_start(tmp_path):
     assert "the start it falls back to is not valid" not in result["why"]
 
 
+@pytest.mark.parametrize("fault", ["errors", "invalid"])
+def test_a_persons_choice_is_refused_where_the_start_it_would_hold_is_not_valid(tmp_path, fault):
+    cfg = graded_sweep(tmp_path, modes=["instant", "thinking"], arms={"writer_rules=none": dict(only=9, other=0)},
+                       play=False)
+    # An arm of instant's own setting, valid where it ran: chosen, the profile holds the start's section elsewhere.
+    mine = arm_of("m", "instant", {"instant.prose": False}, round="screen")
+    write_run(cfg, mine, graded_rows(mine, _parts(cfg)["tuning"], right=0, version=stamped_version(cfg, mine),
+                                     spec=dict(only=2, other=0)))
+    start = arm_of("m", "thinking", {}, round="screen")
+    if fault == "errors":
+        rows = read_rows(cfg, start)
+        rows[0] |= {"outcome": "error", "error_kind": "endpoint", "model_error": "status_503"}   # over max_errors 0
+        write_run(cfg, start, rows)
+    else:   # a file it pins moved
+        (arm_folder(cfg, start, 1) / "invalid.json").write_text(json.dumps({"changed": ["the store"]}))
+    play_after_search(cfg)
+    propose(cfg)
+    before = _proposal_files(cfg)
+    with pytest.raises(SweepConfigError, match="thinking") as refused:
+        propose(cfg, chosen="instant.prose=false")
+    assert "not valid" in str(refused.value) and _proposal_files(cfg) == before
+
+
 def test_the_evidence_names_the_modes_the_sweep_did_not_search(tmp_path):
     cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0)})
     result = propose(cfg)["m"]
