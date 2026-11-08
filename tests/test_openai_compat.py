@@ -354,3 +354,155 @@ def test_a_malformed_body_is_an_openai_400(tmp_path, raw):
 def test_a_malformed_body_without_a_credential_is_still_a_401(tmp_path):
     r = _client(tmp_path).post("/openai/v1/chat/completions", headers={"X-Mnemiq-Task": ""}, content="not json")
     _error(r, 401)
+
+
+# --- Task 4: the reply -----------------------------------------------------------------------------------------
+
+
+def _answer(answer="There were 25 claims.", sql="SELECT id FROM claim", columns=("id",), rows=None, row_count=None,
+            truncated=False, capped=False, **over):
+    from mnemiq.agent.loop import ResultPreview
+    from mnemiq.contract.seams import Trace
+
+    rows = rows if rows is not None else [[i] for i in range(3)]
+    trace = Trace(question="q", plan_sql=sql, target_sql=sql, asked_sql=sql, result_shape="table", timing={},
+                  enrichment_version="e1", identity=IdentityContext(tenant_id="acme", principal_id="p"))
+    preview = ResultPreview(columns=list(columns), rows=rows, row_count=len(rows) if row_count is None else row_count,
+                            truncated=truncated, capped=capped)
+    return AgentAnswer(answer=answer, trace=trace, preview=preview, mode="thinking", **over)
+
+
+def _content(tmp_path, answer, **body):
+    r = _chat(_client(tmp_path, _RT(answer=answer)), **body)
+    assert r.status_code == 200, r.text
+    return r.json()["choices"][0]["message"]["content"]
+
+
+def test_the_reply_reads_in_the_specs_order(tmp_path):
+    r = _chat(_client(tmp_path, _RT(answer=_answer(verify_layer="judge"))))
+    content, run_id = r.json()["choices"][0]["message"]["content"], r.json()["id"].removeprefix("chatcmpl-")
+    at = [content.index(part) for part in ("There were 25 claims", "**Status:**", "```sql", "| id |", f"run {run_id}")]
+    assert at == sorted(at), content
+    assert r.json()["object"] == "chat.completion" and r.json()["choices"][0]["finish_reason"] == "stop"
+    assert "usage" not in r.json()
+
+
+@pytest.mark.parametrize("layer, line", [
+    ("judge", "**Status:** verified by the judge"),
+    ("sanity", "**Status:** basic checks only, not judged"),
+    ("judge_unavailable", "**Status:** not verified: the judge could not be reached"),
+    ("a-new-layer", "**Status:** verification state unknown"),
+    (None, "**Status:** not verified"),
+])
+def test_the_status_line(tmp_path, layer, line):
+    content = _content(tmp_path, _answer(verify_layer=layer))
+    assert line in content.splitlines(), content
+    if layer != "judge":
+        assert "verified by" not in content
+
+
+def test_a_deferral_and_a_failure_say_so(tmp_path):
+    from mnemiq.contract import DeferralReason
+
+    deferred = AgentAnswer(answer="No table holds salary.", deferred=True, reason_code=DeferralReason.NO_TABLES)
+    assert "**Status:** deferred (no_tables)" in _content(tmp_path, deferred).splitlines()
+    failed = AgentAnswer(answer="The source did not answer.", failed=True,
+                         reason_code=DeferralReason.EXECUTION_FAILED)
+    assert "**Status:** failed (execution_failed)" in _content(tmp_path, failed).splitlines()
+
+
+def test_the_table_shows_twenty_rows_of_n(tmp_path):
+    content = _content(tmp_path, _answer(rows=[[i] for i in range(25)]))
+    assert "| 19 |" in content and "| 20 |" not in content
+    assert "20 of 25 rows" in content
+
+
+def test_a_capped_result_says_at_least(tmp_path):
+    content = _content(tmp_path, _answer(rows=[[i] for i in range(25)], row_count=1000, truncated=True, capped=True))
+    assert "20 of at least 1,000 rows" in content
+
+
+def test_a_short_result_says_its_count(tmp_path):
+    assert "3 rows" in _content(tmp_path, _answer()).splitlines()
+    assert "1 row" in _content(tmp_path, _answer(rows=[[1]])).splitlines()
+    assert "0 rows" in _content(tmp_path, _answer(rows=[])).splitlines()
+
+
+def test_a_cell_cannot_break_the_table(tmp_path):
+    content = _content(tmp_path, _answer(columns=("v",), rows=[["a|b"], ["a\nb"], ["a\rb"], ["tail\\"], [None]]))
+    table = [line for line in content.splitlines() if line.startswith("|")]
+    assert len(table) == 2 + 5, table  # header, separator, five rows: nothing split or merged
+    assert all(line.count("|") == 2 for line in table), table
+    assert "| a&#124;b |" in table and "| a b |" in table and "| tail&#92; |" in table and "|  |" in table
+
+
+ESCAPED = "\\`*[]!<>|$&~"
+
+
+@pytest.mark.parametrize("char", list(ESCAPED))
+def test_every_escaped_character_is_inert_in_cells_headers_and_prose(tmp_path, char):
+    """Each character that starts a link, an image, HTML, math, a code span, emphasis or strikethrough, or splits a
+    cell, arrives as its numeric character reference, in the answer text, a column header and a cell alike."""
+    ref = f"&#{ord(char)};"
+    lines = _content(tmp_path, _answer(answer=f"a{char}b", columns=(f"h{char}h",), rows=[[f"c{char}c"]])).splitlines()
+    assert lines[0] == f"a{ref}b"
+    table = [line for line in lines if line.startswith("|")]
+    assert table == [f"| h{ref}h |", "| --- |", f"| c{ref}c |"], table
+
+
+def test_data_and_prose_never_render_as_a_link_image_html_or_math(tmp_path):
+    values = ["![x](https://h.example/?q=1)", "<img src=x>", "$1,200 and $3,400", "a\\(b\\)"]
+    content = _content(tmp_path, _answer(answer=" ".join(values), columns=(values[0],), rows=[[v] for v in values]))
+    outside = content.split("```")[0] + content.split("```")[-1]
+    for char in "[<$\\":
+        assert char not in outside, (char, outside)
+    assert "revenue (net) 1.5" in _content(tmp_path, _answer(answer="revenue (net) 1.5"))
+    assert "A&#38;B &#36;5" in _content(tmp_path, _answer(columns=("v",), rows=[["A&B $5"]]))  # one pass
+
+
+def test_the_sql_fence_outlasts_backticks_in_the_sql(tmp_path):
+    content = _content(tmp_path, _answer(sql="SELECT '```' AS ticks"))
+    assert "````sql\nSELECT '```' AS ticks\n````" in content
+    assert "```sql\nSELECT id FROM claim\n```" in _content(tmp_path, _answer())
+
+
+def test_the_answer_keeps_its_lines_without_indentation(tmp_path):
+    content = _content(tmp_path, _answer(answer="First line.\n        indented line\r\nlast"))
+    assert content.startswith("First line.\nindented line\nlast")
+
+
+def test_a_decline_is_a_200_whose_text_is_the_reason(tmp_path):
+    from mnemiq.contract import DeferralReason
+
+    declined = _answer(answer="No table holds salary.", deferred=True, reason_code=DeferralReason.NO_TABLES)
+    content = _content(tmp_path, declined)
+    assert content.startswith("No table holds salary.") and "```" not in content and "| id |" not in content
+
+
+def test_model_error_never_reaches_the_wire(tmp_path):
+    r = _chat(_client(tmp_path, _RT(answer=_answer(model_error="connect: 10.0.0.5:8000"))))
+    assert r.status_code == 200 and "10.0.0.5" not in r.text and "connect:" not in r.text
+
+
+def test_an_over_long_question_is_a_400(tmp_path):
+    from mnemiq.contract import DeferralReason
+
+    text = "Your question is 9,001 characters long; the limit is 9,000."
+    rt = _RT(answer=AgentAnswer(answer=text, deferred=True, reason_code=DeferralReason.QUESTION_TOO_LONG))
+    error = _error(_chat(_client(tmp_path, rt)), 400, "question_too_long")
+    assert error["message"] == text and rt.calls == 1
+
+
+@pytest.mark.parametrize("raised, status, code", [(None, 404, "model_not_found"), ("mode", 400, None),
+                                                  ("boom", 500, None)])
+def test_engine_refusals_are_composed(tmp_path, raised, status, code):
+    from mnemiq.agent.route import UnknownMode
+    from mnemiq.profiles import UnknownProfile
+
+    exc = {None: UnknownProfile(["default"]), "mode": UnknownMode("the store at /srv/x is gone"),
+           "boom": RuntimeError("the store at /srv/x is gone")}[raised]
+    r = _chat(_client(tmp_path, _RT(raises=exc)))
+    error = _error(r, status, code)
+    assert "/srv/x" not in r.text
+    if status == 500:
+        assert "run " in error["message"]

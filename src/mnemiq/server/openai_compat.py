@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Any
 from uuid import uuid4
@@ -29,7 +30,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from mnemiq.agent.modes import MODES
 from mnemiq.agent.route import UnknownMode
-from mnemiq.contract import IdentityContext
+from mnemiq.contract import DeferralReason, IdentityContext
 from mnemiq.profiles import UnknownProfile, offered_to
 from mnemiq.server.serialize import answer_payload
 
@@ -51,6 +52,76 @@ _RAG_MARKERS = ("### Task:", "<context>", "</context>")
 _OPEN_WEBUI_TASKS = frozenset({"title_generation", "follow_up_generation", "tags_generation", "emoji_generation",
                                "query_generation", "image_prompt_generation", "autocomplete_generation",
                                "function_calling", "moa_response_generation"})
+
+
+PREVIEW_ROWS = 20
+# Every character that starts a link, an image, HTML, math, a code span, emphasis or strikethrough, or splits a
+# table cell, as its numeric character reference. Not a backslash escape: Open WebUI renders `\(`, `\[` and `$...$`
+# as math, so an escaped bracket would itself open a formula. Without `[` there is no link or image, without `<` no
+# HTML, and without `$` and `\` no math; parentheses, `.`, `-` and `#` stay as they are.
+_INERT = {char: f"&#{ord(char)};" for char in "\\`*[]!<>|$&~"}
+_STATUS = {"judged": "verified by the judge", "basic": "basic checks only, not judged",
+           "unavailable": "not verified: the judge could not be reached", "unknown": "verification state unknown"}
+
+
+def _inert(text: str, *, cell: bool) -> str:
+    """`text` with nothing in it that renders: one pass, so a reference is never escaped again. In a table cell a
+    line break becomes a space, since a row is one line."""
+    return "".join(_INERT.get(char) or (" " if cell and char in "\r\n" else char) for char in text)
+
+
+def _prose(text: str) -> str:
+    # Each line's leading whitespace goes, so no line of the answer becomes an indented code block, where a
+    # character reference would show as written.
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    return "\n".join(_inert(line.lstrip(), cell=False) for line in lines)
+
+
+def _cell(value) -> str:
+    return "" if value is None else _inert(str(value), cell=True)
+
+
+def _fence(sql: str) -> str:
+    """The SQL in a fence longer than any run of backticks inside it, and at least three. Nothing renders in a fence."""
+    ticks = "`" * max(3, 1 + max((len(run) for run in re.findall(r"`+", sql)), default=0))
+    return f"{ticks}sql\n{sql}\n{ticks}"
+
+
+def _status(payload: dict) -> str:
+    # Only a judged answer says "verified": `verified_state` keeps the others apart so that none reads as a check.
+    for flag, word in (("failed", "failed"), ("deferred", "deferred")):
+        if payload[flag]:
+            return f"**Status:** {word} ({payload['reason_code']})" if payload["reason_code"] else f"**Status:** {word}"
+    state = payload["verified"]
+    return "**Status:** " + (_STATUS.get(state, _STATUS["unknown"]) if state is not None else "not verified")
+
+
+def _table(preview: dict) -> list[str]:
+    """The first `PREVIEW_ROWS` rows as a Markdown table, then how many rows the query returned. A capped result's
+    count is a floor, so it reads "at least"."""
+    columns, shown, total = preview["columns"], preview["rows"][:PREVIEW_ROWS], preview["row_count"]
+    lines = ["| " + " | ".join(_cell(c) for c in columns) + " |", "|" + " --- |" * len(columns)]
+    lines += ["| " + " | ".join(_cell(v) for v in row) + " |" for row in shown]
+    if preview["capped"]:
+        count = f"{len(shown)} of at least {total:,} rows"
+    elif total > len(shown):
+        count = f"{len(shown)} of {total:,} rows"
+    else:
+        count = f"{total:,} row" + ("" if total == 1 else "s")
+    return ["\n".join(lines), count]
+
+
+def render(payload: dict, run_id: str) -> str:
+    """A completion's content, from `answer_payload`: the answer, its status, its SQL, up to `PREVIEW_ROWS` rows and
+    the run id, in that order. A decline is its reason and its status alone."""
+    parts = [_prose(payload["answer"] or ""), _status(payload)]
+    if not payload["deferred"] and not payload["failed"]:
+        if payload["sql"]:
+            parts.append(_fence(payload["sql"]))
+        if payload["preview"] and payload["preview"]["columns"]:
+            parts += _table(payload["preview"])
+    parts.append(f"run {run_id}")
+    return "\n\n".join(parts)
 
 
 class _Message(BaseModel):
@@ -287,7 +358,10 @@ def mount_openai(app: FastAPI, runtime, doors, *, heartbeat_s: float) -> bool:
         except Exception:
             logger.exception("run %s: the engine failed", run_id)
             raise OpenAIError(500, f"{_OPAQUE} (run {run_id}).") from None
-        return _completion(run_id, body.model, answer_payload(answer)["answer"])
+        if answer.reason_code == DeferralReason.QUESTION_TOO_LONG:
+            # The engine's own decline, which states the cap and recorded the question as declined: a 400 here.
+            raise OpenAIError(400, answer.answer, code="question_too_long", param="messages")
+        return _completion(run_id, body.model, render(answer_payload(answer), run_id))
 
     _catch_all(app, mounted=True)
     return True
