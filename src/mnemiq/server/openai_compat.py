@@ -21,7 +21,7 @@ import time
 from typing import Any
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -358,21 +358,6 @@ def _not_offered(offered: list[str]) -> OpenAIError:
                        code="model_not_found", param="model")
 
 
-def _door(doors):
-    """The `/openai/v1` door as a dependency: `caller_dependency`'s, with its refusal re-raised for OpenAI's shape."""
-    from mnemiq.server.app import caller_dependency
-
-    judge = caller_dependency(doors, "openai")
-
-    def caller(request: Request) -> IdentityContext:
-        try:
-            return judge(request)
-        except HTTPException as exc:
-            raise OpenAIError(exc.status_code, str(exc.detail), headers=exc.headers) from None
-
-    return caller
-
-
 def mount_openai(app: FastAPI, runtime, doors, *, heartbeat_s: float) -> bool:
     """Adds `/openai/v1` to `app` when its door can verify a caller, and a 404 for every path under it otherwise.
     Returns whether the endpoint is served."""
@@ -383,7 +368,10 @@ def mount_openai(app: FastAPI, runtime, doors, *, heartbeat_s: float) -> bool:
         _catch_all(app, mounted=False)
         return False
 
-    caller, task_header = _door(doors), doors.task_header
+    from mnemiq.server.app import caller_dependency  # here: app.py imports this module
+
+    # The door's refusals are HTTPExceptions, which `_install_handlers` answers in OpenAI's shape under the prefix.
+    caller, task_header = caller_dependency(doors, "openai"), doors.task_header
 
     @app.get(PREFIX + "/models", include_in_schema=False)
     def models(request: Request, who: IdentityContext = Depends(caller)) -> dict:
