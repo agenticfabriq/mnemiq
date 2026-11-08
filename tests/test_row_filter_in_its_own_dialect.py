@@ -35,15 +35,20 @@ def decide(sql, visible, *, dialect="duckdb", target="postgres", policy=None, **
     policy = policy_keyed(policy, target, *SCHEMA) if policy is not None else None
     return _decide(as_stored(sql, target, *SCHEMA), keyed(visible, target, *SCHEMA),
                    dialect=dialect, target=target, policy=policy, **kwargs)
-DRIFTING = ["greatest(id, NULL) IS NULL", "concat(region, NULL) IS NULL"]
-ROWS = "CREATE TABLE claim (id INT, region VARCHAR); INSERT INTO claim VALUES (1, 'west')"
+# The reported case. sqlglot 30.12 prints both for SQLite as above; 30.29 prints both faithfully
+# (M228), so the defect's control is measured on drifts 30.12 and 30.29 print alike: SQLite's LIKE
+# ignores case under the same spelling, and its CAST gives 0 where DuckDB's TRY_CAST gives NULL.
+REPORTED = ["greatest(id, NULL) IS NULL", "concat(region, NULL) IS NULL"]
+STILL_DRIFTING = ["region LIKE 'W%'", "try_cast(region AS INT) IS NOT NULL"]
+DRIFTING = REPORTED + STILL_DRIFTING
+ROWS ="CREATE TABLE claim (id INT, region VARCHAR); INSERT INTO claim VALUES (1, 'west')"
 
 
 def _filtered(filt: str) -> AccessPolicy:
     return AccessPolicy(row_filters={"claim": filt}, policy_schema=SCHEMA)
 
 
-@pytest.mark.parametrize("filt", DRIFTING)
+@pytest.mark.parametrize("filt", STILL_DRIFTING)
 def test_the_translation_changes_which_rows_the_filter_keeps(filt):
     # The defect, measured on both engines: DuckDB keeps no row, SQLite's rendering keeps it.
     duck = duckdb.connect()
