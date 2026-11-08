@@ -74,7 +74,9 @@ export function TurnArtifacts({ data }: DataMessagePartProps<Turn>) {
               serving, and the question was never the problem. */}
           {turn.errorCode === "unavailable"
             ? "→ A service problem, not the question. Ask again shortly."
-            : "→ The engine is still serving. Ask again."}
+            : turn.errorCode === "not-permitted"
+              ? "→ This sign-in is not permitted here; asking again will not help."
+              : "→ The engine is still serving. Ask again."}
         </p>
       </section>
     );

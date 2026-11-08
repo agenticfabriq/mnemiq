@@ -40,6 +40,13 @@ describe("TurnArtifacts", () => {
     expect(screen.queryByText(/still serving/)).not.toBeInTheDocument();
   });
 
+  it("says a refusal is not one to ask again, rather than that the engine is still serving", () => {
+    // A 403: this sign-in may not ask, so asking again changes nothing.
+    show({ status: "error", error: "This sign-in is not permitted here.", errorCode: "not-permitted" });
+    expect(screen.getByText(/asking again will not help/)).toBeInTheDocument();
+    expect(screen.queryByText(/still serving/)).not.toBeInTheDocument();
+  });
+
   it("shows only progress before the rows arrive", () => {
     show({});
     expect(screen.queryByText("only-row-value")).not.toBeInTheDocument();

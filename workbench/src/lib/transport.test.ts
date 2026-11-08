@@ -233,8 +233,9 @@ describe("streamChat before the stream starts", () => {
         {
           type: "RUN_ERROR",
           message: NOTICE[refusal as Exclude<Refusal, "signed-out">],
-          // Only a service problem is coded: the card says so instead of "still serving".
+          // A service problem and a refusal are coded, so the card says which instead of "still serving".
           ...(refusal === "unavailable" && { code: "unavailable" }),
+          ...((refusal === "not-permitted" || refusal === "insufficient-scope") && { code: "not-permitted" }),
         },
       ]);
     });
