@@ -187,3 +187,170 @@ def test_every_openai_error_has_openai_shape(tmp_path):
 def test_v1_errors_keep_their_own_shape(tmp_path):
     r = _client(tmp_path, doors=None).post("/v1/ask", json={})
     assert r.status_code == 422 and "detail" in r.json()
+
+
+# --- Task 3: from request to Runtime.ask ------------------------------------------------------------------------
+
+
+def _chat(client, body=None, headers=None, **over):
+    body = body if body is not None else {"model": "default", "messages": [{"role": "user", "content": "how many?"}]}
+    return client.post("/openai/v1/chat/completions", headers=headers if headers is not None else _as(),
+                       json={**body, **over})
+
+
+def _refused(r, rt, status, code, *echo):
+    error = _error(r, status, code)
+    for text in echo:
+        assert text not in r.text, (text, r.text)
+    assert rt.calls == 0
+    return error
+
+
+def test_the_question_is_the_last_user_message_only(tmp_path):
+    rt = _RT()
+    messages = [{"role": "system", "content": "SYSTEM-SECRET"}, {"role": "user", "content": "an earlier turn"},
+                {"role": "assistant", "content": "an earlier answer"}, {"role": "user", "content": "how many?"}]
+    assert _chat(_client(tmp_path, rt), {"model": "default", "messages": messages}).status_code == 200
+    assert [a.question for a in rt.asked] == ["how many?"]
+
+
+def test_the_last_message_must_be_the_users(tmp_path):
+    rt = _RT()
+    r = _chat(_client(tmp_path, rt), messages=[{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}])
+    _refused(r, rt, 400, "invalid_last_message")
+
+
+def test_an_image_part_is_a_400(tmp_path):
+    rt = _RT()
+    parts = [{"type": "text", "text": "what is this?"},
+             {"type": "image_url", "image_url": {"url": "https://h.example/p.png"}}]
+    error = _refused(_chat(_client(tmp_path, rt), messages=[{"role": "user", "content": parts}]), rt, 400,
+                     "unsupported_content", "h.example", "what is this")
+    assert "image" in error["message"]
+
+
+def test_any_other_part_type_is_a_400(tmp_path):
+    rt = _RT()
+    parts = [{"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}]
+    _refused(_chat(_client(tmp_path, rt), messages=[{"role": "user", "content": parts}]), rt, 400,
+             "unsupported_content")
+
+
+def test_text_parts_are_joined_by_a_newline(tmp_path):
+    rt = _RT()
+    parts = [{"type": "text", "text": "claims"}, {"type": "text", "text": "by month"}]
+    assert _chat(_client(tmp_path, rt), messages=[{"role": "user", "content": parts}]).status_code == 200
+    assert rt.asked[0].question == "claims\nby month"
+
+
+def test_an_empty_question_is_a_400(tmp_path):
+    rt = _RT()
+    _refused(_chat(_client(tmp_path, rt), messages=[{"role": "user", "content": "   "}]), rt, 400, "empty_question")
+
+
+def test_a_message_with_the_rag_templates_markers_is_a_400(tmp_path):
+    rt = _RT()
+    templated = "### Task:\nRespond using the context.\n<context>\nPolicy 12 was cancelled.\n</context>\nhow many?"
+    error = _refused(_chat(_client(tmp_path, rt), messages=[{"role": "user", "content": templated}]), rt, 400,
+                     "retrieval_template", "Policy 12")
+    assert "knowledge" in error["message"] and "web search" in error["message"]
+    assert _chat(_client(tmp_path, rt), messages=[{"role": "user", "content": "### Task: count claims"}]).status_code == 200
+    assert rt.calls == 1
+
+
+@pytest.mark.parametrize("effort, mode", [("low", "instant"), ("medium", "thinking"), ("high", "deep"), (None, None)])
+def test_reasoning_effort_picks_the_mode(tmp_path, effort, mode):
+    rt = _RT()
+    body = {"model": "default", "messages": [{"role": "user", "content": "q"}]}
+    if effort is not None:
+        body["reasoning_effort"] = effort
+    assert _chat(_client(tmp_path, rt), body).status_code == 200
+    assert rt.asked[0].mode == mode
+
+
+def test_another_effort_is_a_400_listing_the_offered(tmp_path):
+    rt = _RT()
+    error = _refused(_chat(_client(tmp_path, rt), reasoning_effort="minimal"), rt, 400, "invalid_reasoning_effort",
+                     "minimal")
+    assert "['high', 'low', 'medium']" in error["message"]
+
+
+@pytest.mark.parametrize("field, value", [("tools", [{"type": "function", "function": {"name": "f"}}]),
+                                          ("functions", [{"name": "f"}]), ("function_call", "auto")])
+def test_tools_are_refused(tmp_path, field, value):
+    rt = _RT()
+    _refused(_chat(_client(tmp_path, rt), **{field: value}), rt, 400, "unsupported_parameter")
+
+
+def test_more_than_one_choice_is_refused(tmp_path):
+    rt = _RT()
+    _refused(_chat(_client(tmp_path, rt), n=2), rt, 400, "unsupported_parameter")
+
+
+def test_ignored_parameters_change_nothing(tmp_path):
+    rt = _RT()
+    r = _chat(_client(tmp_path, rt), temperature=0.1, top_p=0.5, max_tokens=5, stop=["\n"], user="x",
+              tool_choice="none", stream_options={"include_usage": True})
+    assert r.status_code == 200 and rt.calls == 1
+
+
+def test_a_background_task_never_reaches_the_engine(tmp_path, caplog):
+    rt = _RT()
+    with caplog.at_level(logging.INFO, logger="mnemiq.server.openai_compat"):
+        r = _chat(_client(tmp_path, rt), headers=_as(task="title_generation"))
+    assert r.status_code == 200 and rt.calls == 0
+    assert r.json()["choices"][0]["message"]["content"] == "" and r.json()["choices"][0]["finish_reason"] == "stop"
+    assert any("title_generation" in rec.getMessage() for rec in caplog.records)
+
+
+def test_a_task_name_outside_open_webuis_is_logged_as_other(tmp_path, caplog):
+    rt = _RT()
+    with caplog.at_level(logging.INFO, logger="mnemiq.server.openai_compat"):
+        assert _chat(_client(tmp_path, rt), headers=_as(task="<script>alert(1)</script>")).status_code == 200
+    said = " ".join(rec.getMessage() for rec in caplog.records)
+    assert "<script>" not in said and "(other)" in said and rt.calls == 0
+
+
+def test_a_chat_turn_carries_an_empty_task_header(tmp_path):
+    rt = _RT()
+    assert _chat(_client(tmp_path, rt), headers=_as(task="")).status_code == 200 and rt.calls == 1
+
+
+def test_a_missing_task_header_is_a_400(tmp_path):
+    rt = _RT()
+    _refused(_chat(_client(tmp_path, rt), headers=_as(task=None)), rt, 400, "missing_task_header")
+
+
+def test_an_unpickable_model_is_a_404_that_does_not_echo_it(tmp_path):
+    rt = _RT()
+    error = _refused(_chat(_client(tmp_path, rt), model="secret-profile"), rt, 404, "model_not_found",
+                     "secret-profile")
+    assert "['default', 'finance']" in error["message"]
+    _refused(_chat(_client(tmp_path, rt), headers=_as("u-ops"), model="finance"), rt, 404, "model_not_found")
+
+
+def test_a_pickable_profile_reaches_ask_by_name(tmp_path):
+    rt = _RT()
+    assert _chat(_client(tmp_path, rt), model="finance").status_code == 200
+    assert rt.asked[0].profile == "finance" and rt.asked[0].identity.principal_id == "open-webui:u-fin"
+
+
+def test_a_hand_built_runtime_asks_its_default_as_no_profile(tmp_path):
+    rt = _RT()
+    rt.profiles = None
+    assert _chat(_client(tmp_path, rt)).status_code == 200 and rt.asked[0].profile is None
+
+
+@pytest.mark.parametrize("raw", ["not json", "[1, 2]", '{"model": "default"}', '{"model": "default", "messages": []}',
+                                 '{"model": "default", "messages": [{"content": "q"}]}',
+                                 '{"messages": [{"role": "user", "content": "q"}]}'])
+def test_a_malformed_body_is_an_openai_400(tmp_path, raw):
+    rt = _RT()
+    r = _client(tmp_path, rt).post("/openai/v1/chat/completions", headers={**_as(), "content-type": "application/json"},
+                                   content=raw)
+    _refused(r, rt, 400, "invalid_body")
+
+
+def test_a_malformed_body_without_a_credential_is_still_a_401(tmp_path):
+    r = _client(tmp_path).post("/openai/v1/chat/completions", headers={"X-Mnemiq-Task": ""}, content="not json")
+    _error(r, 401)
