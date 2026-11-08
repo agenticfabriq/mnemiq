@@ -211,7 +211,9 @@ verified token, and the `principal` and `roles` above are never used. A tenant i
 once any verifier is configured, and every token must carry it, or `*` accepts any. Roles come from the token's roles
 claim when it has one, and from the identity map when it has none. A token's groups grant nothing unless the map
 names them or `oidc_groups_claim` opts in. Every setting here that a door cannot enforce stops the server at startup,
-with a message naming the setting to change.
+with a message naming the setting to change. Scopes gate MCP's tools only: `db.read` for `db_read` and `get_schema`, and
+`db.write` for `db_write`. `/v1` checks no scopes, so a token carrying `oidc_audience` reads through `/v1` whatever
+scopes it holds; what it may read is still its roles' grants.
 
 | Setting | Default | What it does |
 |---|---|---|
