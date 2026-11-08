@@ -202,7 +202,29 @@ the environment.
 | `write_enabled` | `false` | Attaches the source read-write, for governed writes. |
 | `principal` | unset | The identity's principal id, for the MCP server run on its own. |
 | `roles` | unset | The identity's roles, comma-separated, for the MCP server run on its own. |
-| `tenant` | unset | The identity's tenant id, for the MCP server run on its own. |
+| `tenant` | unset | The identity's tenant id, for the MCP server run on its own. With a token verifier configured it is required, and every verified token must carry this tenant; `*` accepts any. |
+
+### Identity from tokens
+
+| Setting | Default | What it does |
+|---|---|---|
+| `oidc_issuer` | unset | The identity provider whose tokens the HTTP API and MCP over HTTP verify, matched exactly against the token's `iss`. Unset, the settings identity above serves every caller. |
+| `oidc_audience` | unset | The `aud` a token must carry on `/v1` and on MCP. Under `mcp_transport = "http"` it is the MCP door's own URL, `https://<host>/mcp`. |
+| `oidc_jwks_url` | unset | Where the provider's signing keys are fetched. Unset, it is `<issuer>/protocol/openid-connect/certs`. |
+| `oidc_jwks_file` | unset | A JWKS file read instead of fetching the keys, for a deployment that may not reach the provider. |
+| `oidc_tenant_claim` | `"tenant"` | The token claim holding the caller's tenant. |
+| `oidc_roles_claim` | `"realm_access.roles"` | The dotted path of the token's roles claim. A token without it takes its roles from the identity map. |
+| `oidc_groups_claim` | unset | Opt-in: passes this claim's groups through as the identity's groups, for a provider whose groups only administrators control. Unset, a token's groups grant nothing except through the identity map. |
+| `oidc_leeway_s` | `30.0` | Clock leeway, in seconds, on a token's `exp`, `nbf` and `iat`. |
+| `openwebui_audience` | unset | The `aud` an identity provider's token must carry on Open WebUI's endpoint, distinct from `oidc_audience`. Unset, that endpoint accepts no Bearer token. |
+| `openwebui_jwt_secret` | unset | Turns on Open WebUI's signed user header: the HS256 secret it shares with Open WebUI, at least 32 bytes. |
+| `openwebui_jwt_header` | `"X-OpenWebUI-User-Jwt"` | The header carrying Open WebUI's signed user token. |
+| `openwebui_jwt_max_lifetime_s` | `300` | The longest lifetime, `exp` minus `iat`, accepted on Open WebUI's signed user token. |
+| `openwebui_user_headers` | `"X-OpenWebUI-User-Id,X-OpenWebUI-User-Email,X-OpenWebUI-User-Name,X-OpenWebUI-User-Role"` | Open WebUI's unsigned user headers. A request carrying any of them is refused once an issuer is configured. |
+| `openwebui_connection_key_header` | unset | The custom header on mnemiq's Open WebUI connection that carries the connection key. |
+| `openwebui_connection_key` | unset | The connection key, at least 32 bytes, which tells mnemiq a request came through its own Open WebUI connection. Required with the signed user header. |
+| `identity_map_path` | unset | A JSON file mapping each issuer's subjects, groups and verified emails to roles, for tokens that carry no roles claim. |
+| `mcp_transport` | `"stdio"` | `stdio` runs the MCP server for one local caller. `http` serves it at `/mcp` on the HTTP API, each request judged by its own token. |
 
 ### The data source
 
