@@ -394,13 +394,16 @@ def _ask(runtime: Runtime, case: EvaluationCase, mode: str, arm: Arm, identity: 
 def _replay(cfg: SweepConfig, arm: Arm, folder: Path,
             runtimes: dict[str | None, Runtime]) -> tuple[EvaluationCase, str, Runtime] | None:
     """A question that already succeeded, to ask again, with its mode and the runtime that answers it: the latest one
-    this run of the arm answered with no error, else the first the sweep's start of this model and mode answered so in
-    its first run. None when neither has one this arm's runtimes can ask."""
+    this run of the arm answered with no error and at least one model call, else the first the sweep's start of this
+    model and mode answered so in its first run. A question answered with no call (one declined as too long to read,
+    before retrieval) would call no model again, and show nothing of the endpoint. None when neither has one this arm's
+    runtimes can ask."""
     start = arm_folder(cfg, arm_of(arm.model, arm.mode, {}, round=_first_round(cfg)), 1)
     cases: dict[str, EvaluationCase] | None = None
     for rows in (reversed(_rows_so_far(folder / ROWS)), _rows_so_far(start / ROWS)):
         for row in rows:
-            if row.get("outcome") is None or row.get("error_kind") is not None or row.get("mode") not in arm.modes:
+            if (row.get("outcome") is None or row.get("error_kind") is not None or row.get("mode") not in arm.modes
+                    or not isinstance(row.get("calls"), int) or row["calls"] < 1):
                 continue
             if cases is None:
                 cases = {case.id: case for case in load_questions(cfg)}
@@ -412,11 +415,12 @@ def _replay(cfg: SweepConfig, arm: Arm, folder: Path,
 
 
 def _answers_now(cfg: SweepConfig, arm: Arm, folder: Path, runtimes: dict[str | None, Runtime],
-                 identity: IdentityContext) -> bool:
+                 identity: IdentityContext, told: Callable[[str], None] | None) -> bool:
     """Whether the endpoint answers now: one question that already succeeded (`_replay`) is asked again, once, as any
     question is, and bounded as any question is, and its answer is neither graded nor written. True only when the model
-    was called and no model failed it the way an outage fails every question; False when nothing has succeeded to
-    replay."""
+    was called and no model failed it the way an outage fails every question. False when nothing has succeeded to
+    replay, and when the probe raised: a provider error, or anything else, which leaves it unknown whether the endpoint
+    answers, and is said to `told`, credentials scrubbed, so the arm stops naming it rather than its worker dying."""
     replay = _replay(cfg, arm, folder, runtimes)
     if replay is None:
         return False
@@ -426,12 +430,18 @@ def _answers_now(cfg: SweepConfig, arm: Arm, folder: Path, runtimes: dict[str | 
         answer = runtime.ask(case.question, identity, mode=mode, profile=arm.profile_id)
     except (APIError, ModelUnavailable):  # a provider error raised rather than answered, as the embedder's
         return False
+    except Exception as exc:  # noqa: BLE001 -- inconclusive, as `run_case` holds any exception of a graded question
+        if told is not None:
+            told(_hidden(f"the probe asking {case.id} again in {mode} raised {_exception_line(exc)}, so whether the "
+                         "endpoint answers is not known, and the held questions stay held", _known_secrets(cfg)))
+        return False
     error = answer.model_error
     return runtime.usage(arm.profile_id).calls > calls and not (error is not None and _endpoint(error))
 
 
 def _answer_all(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder: Path,
-                runtimes: dict[str | None, Runtime], build: dict, before: Callable[[str, str], None] | None) -> bool:
+                runtimes: dict[str | None, Runtime], build: dict, before: Callable[[str, str], None] | None,
+                told: Callable[[str], None] | None = None) -> bool:
     """Ask every case and mode not yet in `rows.jsonl`, calling `before` with the case's id and the mode just before
     each is asked; True when the endpoint stopped answering.
 
@@ -492,19 +502,19 @@ def _answer_all(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], fol
                 continue
             held.append(row)
             if (case.id, mode) in retried:
-                if not _answers_now(cfg, arm, folder, runtimes, identity):
+                if not _answers_now(cfg, arm, folder, runtimes, identity, told):
                     return settle(True)
                 final()
             elif len(held) == _STREAK:
                 return settle(True)
-        if held and not _answers_now(cfg, arm, folder, runtimes, identity):
+        if held and not _answers_now(cfg, arm, folder, runtimes, identity, told):
             return settle(True)
         final()
     return settle(False)
 
 
 def run_arm(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder: Path,
-            before: Callable[[str, str], None] | None = None) -> str:
+            before: Callable[[str, str], None] | None = None, told: Callable[[str], None] | None = None) -> str:
     """Run `arm` on `cases` into `folder`, resuming from the rows already there.
 
     Refused (`SweepConfigError`) before anything is read or asked when the sweep's `sweep.json` beside it names another
@@ -517,7 +527,9 @@ def run_arm(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder:
     moved from the record.
 
     Returns `"invalid"` (a pinned file moved, in this run or before it), else `"endpoint"` (the endpoint stopped
-    answering; the rows stand, and the next run resumes), else `"complete"`. It holds the folder's lock while it runs,
+    answering, or a probe of it could not tell; the rows stand, and the next run resumes), else `"complete"`. `told`,
+    when given, is called with a line for the person running the sweep, such as why a probe could not tell. It holds
+    the folder's lock while it runs,
     and raises `ArmInUse` when another process holds it, such as a worker a stopped sweep left running.
     """
     folder = Path(folder)
@@ -525,7 +537,7 @@ def run_arm(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder:
     busy = ArmInUse(f"another process is running the arm in {folder}, as a worker a stopped sweep left running would; "
                     "run again once it has ended")
     with _sole(folder / LOCK, busy):
-        return _run_arm(cfg, arm, cases, folder, before)
+        return _run_arm(cfg, arm, cases, folder, before, told)
 
 
 def _same_build(cfg: SweepConfig, build: dict) -> None:
@@ -546,7 +558,7 @@ def _same_build(cfg: SweepConfig, build: dict) -> None:
 
 
 def _run_arm(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder: Path,
-             before: Callable[[str, str], None] | None) -> str:
+             before: Callable[[str, str], None] | None, told: Callable[[str], None] | None = None) -> str:
     """`run_arm` itself, with the folder made and its lock held."""
     build = engine_build()
     _same_build(cfg, build)
@@ -569,7 +581,7 @@ def _run_arm(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder
     try:
         for db_id in db_ids:
             runtimes[db_id] = build_runtime(arm_settings(cfg, arm, folder, db_id))
-        stopped = _answer_all(cfg, arm, cases, folder, runtimes, build, before)
+        stopped = _answer_all(cfg, arm, cases, folder, runtimes, build, before, told)
     finally:
         for runtime in runtimes.values():
             runtime.con.close()
@@ -826,16 +838,18 @@ def _work(cfg: SweepConfig, arm: Arm, cases: list[EvaluationCase], folder: Path,
     No exception leaves it: the process would print the traceback, chained causes and all, and building a runtime
     attaches each source with its DSN, which an error may quote. The exception's one line goes back instead, as
     `("raised", line)`, hidden by `_hidden` with `secrets`, and the process exits with status 1, printing nothing. A
-    worker killed outright sends nothing.
+    worker killed outright sends nothing. An endpoint stop the arm said a reason for goes back as `("endpoint", line)`,
+    hidden the same way.
     """
+    told: list[str] = []
     try:
         try:
-            outcome = run_arm(cfg, arm, cases, folder, before)
+            outcome = run_arm(cfg, arm, cases, folder, before, told.append)
         except BaseException as exc:
             with suppress(BaseException):  # the parent may be gone, or a second interrupt may land mid-send
                 conn.send(("raised", _hidden(_exception_line(exc), secrets)))
             raise SystemExit(1) from None  # an int status, for which a worker process prints nothing
-        conn.send(outcome)
+        conn.send((outcome, _hidden(told[-1], secrets)) if outcome == "endpoint" and told else outcome)
     finally:
         conn.close()
 
@@ -1106,8 +1120,10 @@ class _Rounds:
             _say(f"{job.name()}: complete")
         elif outcome == "invalid":
             _say(_not_valid(job))
-        elif outcome == "endpoint":
-            _say(f"{job.name()}: stopped, since an endpoint stopped answering")
+        elif outcome == "endpoint" or (isinstance(outcome, tuple) and outcome[0] == "endpoint"):
+            said = f": {_hidden(str(outcome[1]), self.secrets)}" if isinstance(outcome, tuple) else ""
+            _say(f"{job.name()}: stopped, since an endpoint stopped answering or could not be shown to answer{said}"
+                 if said else f"{job.name()}: stopped, since an endpoint stopped answering")
             if job.arm.model not in self.dead:
                 self.dead.append(job.arm.model)
             self._stop("endpoint")

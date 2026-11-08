@@ -5,17 +5,23 @@ from __future__ import annotations
 
 import fcntl
 import json
+import multiprocessing
 import pickle
 from pathlib import Path
 
 import pytest
 
+from mnemiq.agent.loop import Agent
+from mnemiq.config import DEFAULT_RETRIEVAL_K
+from mnemiq.runtime import Runtime
 from mnemiq.sweep.config import SweepConfigError, deployment_settings, load_config
-from mnemiq.sweep.run import ArmInUse, arm_folder, arm_settings, engine_build, identity_refusal, run_arm
+from mnemiq.sweep.run import (
+    ArmInUse, _Job, _Rounds, _work, arm_folder, arm_settings, engine_build, identity_refusal, run_arm,
+)
 
 from .conftest import (
-    cancel_gold_once, copy_package, judged_by, one_arm, out_files, read_rows, source_down, start_of, tiny_deployment,
-    touch_store, tuning, two_deployments, write_config,
+    arm_with, cancel_gold_once, copy_package, judged_by, one_arm, out_files, read_rows, source_down, start_of,
+    tiny_deployment, touch_store, tuning, two_deployments, write_config,
 )
 from .stub_model import _carries, _messages
 
@@ -273,6 +279,78 @@ def test_with_nothing_answered_to_replay_a_held_question_stays_held(tmp_path, st
     # Two streaks of three, then the last question beside the first held one: every question held, none written.
     assert [run_arm(cfg, arm, tuning(cfg), folder) for _ in range(4)] == ["endpoint"] * 4
     assert read_rows(cfg, arm) == [] and len(held_for_retry(cfg)) == len(tuning(cfg)) == 7
+
+
+def declined_unread(monkeypatch, question: str) -> None:
+    """From now on the engine declines `question` as too long to read whole, before any model call, wherever it is
+    asked."""
+    original = Agent.decline_if_too_long
+
+    def decline(self, asked: str):
+        return original(self, "x" * (self.max_question_chars + 1) if asked == question else asked)
+
+    monkeypatch.setattr(Agent, "decline_if_too_long", decline)
+
+
+def test_a_probe_replays_only_a_question_that_called_the_model(tmp_path, stub_model, monkeypatch):
+    stub = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    cases = tuning(cfg)
+    declined_unread(monkeypatch, cases[-4].question)   # the last question answered before the endpoint dies
+    last = [case.id for case in cases[-3:]]
+    assert run_arm(cfg, arm, cases, folder, before=dies_before(stub, last[:1])) == "endpoint"
+    assert read_rows(cfg, arm)[-1]["calls"] == 0 and [case for case, _ in held_for_retry(cfg)] == last
+    own_failures(stub, cfg, last)   # the endpoint answers everything else now
+    assert run_arm(cfg, arm, cases, folder) == "complete"
+    assert sorted(r["id"] for r in read_rows(cfg, arm) if r["error_kind"] == "endpoint") == sorted(last)
+
+
+def test_a_probe_falls_back_to_a_question_the_start_answered_with_the_model(tmp_path, stub_model, monkeypatch):
+    stub = stub_model(gold=True)
+    cfg, start = one_arm(tmp_path, stub)
+    cases = tuning(cfg)
+    declined_unread(monkeypatch, cases[0].question)   # the start's first row: answered with no model call
+    assert run_arm(cfg, start, cases, arm_folder(cfg, start, 1)) == "complete"
+    arm = arm_with(cfg, retrieval_k=DEFAULT_RETRIEVAL_K + 4)
+    folder = arm_folder(cfg, arm, 1)
+    mine = cases[2:5]   # not the start's second question, the first it answered by calling the model
+    ids = [case.id for case in mine]
+    # The arm asks three questions and the endpoint dies before the first, so no question of the arm's own is
+    # answered: a probe can replay only one the start answered.
+    assert run_arm(cfg, arm, mine, folder, before=dies_before(stub, ids[:1])) == "endpoint"
+    assert read_rows(cfg, arm) == [] and [case for case, _ in held_for_retry(cfg)] == ids
+    own_failures(stub, cfg, ids)
+    assert run_arm(cfg, arm, mine, folder) == "complete"
+    assert sorted(r["id"] for r in read_rows(cfg, arm) if r["error_kind"] == "endpoint") == sorted(ids)
+
+
+def test_a_probe_that_raises_leaves_the_held_questions_held_and_says_why(tmp_path, stub_model, monkeypatch, capsys):
+    stub = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub)
+    folder = arm_folder(cfg, arm, 1)
+    last = [case.id for case in tuning(cfg)[-3:]]
+    assert run_arm(cfg, arm, tuning(cfg), folder, before=dies_before(stub, last[:1])) == "endpoint"
+    own_failures(stub, cfg, last)
+    ask = Runtime.ask
+
+    def broken(self, question, identity, mode=None, emit=None, history=None, profile=None):
+        if emit is None:   # the probe passes none; every graded question does
+            raise RuntimeError("the probe broke reading postgresql://sweep:SECRETPW@db.example/library")
+        return ask(self, question, identity, mode=mode, emit=emit, history=history, profile=profile)
+
+    monkeypatch.setattr(Runtime, "ask", broken)
+    # As a worker runs it: what it sends back is an endpoint stop with the probe's failure, not a worker that died.
+    receiver, sender = multiprocessing.Pipe(duplex=False)
+    _work(cfg, arm, tuning(cfg), folder, sender, [])
+    outcome = receiver.recv()
+    assert outcome[0] == "endpoint" and "probe" in outcome[1] and "RuntimeError" in outcome[1]
+    assert "SECRETPW" not in outcome[1]
+    assert all(r["error_kind"] is None for r in read_rows(cfg, arm)) and [c for c, _ in held_for_retry(cfg)] == last
+    rounds = object.__new__(_Rounds)   # what the sweep does with it: an endpoint stop, said with its reason
+    rounds.meter, rounds.state, rounds.halt, rounds.secrets, rounds.dead, rounds.died = None, None, None, [], [], []
+    rounds._ended(_Job(arm, 1, tuple(tuning(cfg)), folder), outcome, 1)
+    assert rounds.dead == ["m"] and not rounds.died and outcome[1] in capsys.readouterr().out
 
 
 def test_a_statement_cancelled_under_load_is_an_error_not_wrong(tmp_path, stub_model, monkeypatch):
