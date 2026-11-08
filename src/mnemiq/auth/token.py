@@ -12,6 +12,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import jwt
 
@@ -21,7 +22,13 @@ logger = logging.getLogger("mnemiq.auth")
 
 ALGORITHMS = ("RS256", "ES256")
 REFETCH_INTERVAL_S = 60.0  # at most one JWKS fetch per interval, so unknown `kid`s cannot make us hammer the issuer
-FETCH_TIMEOUT_S = 5.0
+FETCH_TIMEOUT_S = 5.0  # the whole fetch, not each socket read: a server trickling bytes is cut here too
+# An issuer revokes a key by no longer publishing it, so a fetched set is refreshed once this old: a removed key stops
+# verifying within this plus the interval.
+KEYS_REFRESH_AFTER_S = 300.0
+# Past this with no successful refresh, every token is denied: an issuer outage ends in denials, never in keys
+# trusted for ever.
+KEYS_MAX_AGE_S = 900.0
 
 
 class TokenRejected(Exception):
@@ -34,39 +41,69 @@ class TokenRejected(Exception):
 
 
 class _KeySet:
-    """The issuer's signing keys by `kid`, fetched lazily, re-fetched at most once per interval for an unknown
-    `kid` or after a failure, or read once from a file."""
+    """The issuer's signing keys by `kid`, or read once from a file.
 
-    def __init__(self, fetch: Callable[[], dict] | None, file: str | None, clock: Callable[[], float]) -> None:
-        self._fetch, self._file, self._clock = fetch, file, clock
+    A fetched set is refreshed when a token names an unknown `kid` or once the set is `KEYS_REFRESH_AFTER_S` old, at
+    most once per `REFETCH_INTERVAL_S`, and denied outright once it is `KEYS_MAX_AGE_S` old. The fetch runs on its own
+    thread under a deadline for the whole fetch, one at a time, and no check ever waits for it: a token naming a
+    random `kid` can start a fetch once a minute, and it must not hold up anyone else's check.
+    """
+
+    def __init__(self, fetch: Callable[[], dict] | None, file: str | None, clock: Callable[[], float],
+                 timeout_s: float = FETCH_TIMEOUT_S) -> None:
+        self._fetch, self._file, self._clock, self._timeout_s = fetch, file, clock, timeout_s
         self._keys: dict[str, jwt.PyJWK] = {}
         self._loaded_file = False
-        self._last_fetch: float | None = None
-        self._lock = threading.Lock()
+        self._fetched_at: float | None = None
+        self._last_attempt: float | None = None
+        self._state = threading.Lock()  # guards the fields above, and is never held across a fetch
+        self._fetching = threading.Lock()  # one fetch at a time, never waited on
+        self._pending: Future | None = None
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mnemiq-jwks")
 
     def key(self, kid: str) -> jwt.PyJWK:
-        with self._lock:
-            if kid in self._keys:
-                return self._keys[kid]
-            if self._file is not None:
+        if self._file is not None:
+            with self._state:
                 if not self._loaded_file:
                     self._keys = self._parse(self._read_file())
                     self._loaded_file = True
-            else:
-                now = self._clock()
-                if self._last_fetch is None or now - self._last_fetch >= REFETCH_INTERVAL_S:
-                    self._last_fetch = now
-                    try:
-                        self._keys = self._parse(self._fetch())
-                    except Exception as exc:  # any fetch or parse failure denies; the reason is logged, not sent
-                        logger.warning("JWKS fetch failed (%s); denying until the next fetch", type(exc).__name__)
-                        if not self._keys:
-                            raise TokenRejected("signing keys unavailable") from exc
-                elif not self._keys:
-                    raise TokenRejected("signing keys unavailable")
-            if kid in self._keys:
-                return self._keys[kid]
-        raise TokenRejected("unknown signing key")
+                found = self._keys.get(kid)
+            if found is None:
+                raise TokenRejected("unknown signing key")
+            return found
+
+        now = self._clock()
+        with self._state:
+            stale = self._fetched_at is None or now - self._fetched_at >= KEYS_REFRESH_AFTER_S
+            due = stale or kid not in self._keys
+            allowed = self._last_attempt is None or now - self._last_attempt >= REFETCH_INTERVAL_S
+        if due and allowed and self._fetching.acquire(blocking=False):
+            try:
+                self._refresh(now)
+            finally:
+                self._fetching.release()
+        with self._state:
+            if self._fetched_at is None or now - self._fetched_at >= KEYS_MAX_AGE_S:
+                raise TokenRejected("signing keys unavailable")
+            found = self._keys.get(kid)
+        if found is None:
+            raise TokenRejected("unknown signing key")
+        return found
+
+    def _refresh(self, now: float) -> None:
+        with self._state:
+            self._last_attempt = now
+            if self._pending is not None and not self._pending.done():
+                return  # an earlier fetch is still hung: never start a second behind it
+            self._pending = future = self._executor.submit(self._fetch)
+        try:
+            keys = self._parse(future.result(timeout=self._timeout_s))
+        except Exception as exc:  # a timeout, a connection or parse failure: logged, never sent to the caller
+            logger.warning("JWKS fetch failed (%s); keeping keys fetched in the last %d s, if any",
+                           type(exc).__name__, int(KEYS_MAX_AGE_S))
+            return
+        with self._state:
+            self._keys, self._fetched_at = keys, now
 
     def _read_file(self) -> dict:
         try:
@@ -97,7 +134,7 @@ class JwtIdentityVerifier:
         self.fetch_timeout_s = fetch_timeout_s
         self._check = check
         self._keys = _KeySet(fetch or (lambda: self._jwks_client().fetch_data()),
-                             oidc.jwks_file if oidc.jwks_file else None, clock)
+                             oidc.jwks_file if oidc.jwks_file else None, clock, fetch_timeout_s)
 
     def _jwks_client(self) -> jwt.PyJWKClient:
         # Caching is _KeySet's, so the client fetches exactly when asked to.

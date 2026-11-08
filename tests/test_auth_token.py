@@ -253,3 +253,106 @@ def test_the_token_is_never_logged(caplog):
             anyio.run(v.verify_token, token)
     for token in tokens:
         assert token not in caplog.text and token.split(".")[2] not in caplog.text
+
+
+# --- The key set's lifetime, and a fetch that can never stall a check (final review) -----------------------------
+
+
+def test_a_known_key_is_refetched_after_its_lifetime():
+    fetch, clock = _Fetch(jwks_for((rsa_key(), "k1"))), _Clock()
+    v = _verifier(fetch, clock=clock)
+    v.claims(mint(claims()))
+    clock.now += 299
+    v.claims(mint(claims()))
+    assert fetch.calls == 1
+    clock.now += 2
+    v.claims(mint(claims()))
+    assert fetch.calls == 2
+
+
+def test_a_key_removed_from_the_jwks_stops_verifying():
+    """How an issuer revokes a compromised key: it stops publishing it."""
+    fetch, clock = _Fetch(jwks_for((rsa_key(), "k1"))), _Clock()
+    v = _verifier(fetch, clock=clock)
+    v.claims(mint(claims()))
+    fetch.jwks = jwks_for((rsa_key("b"), "k2"))
+    clock.now += 301
+    _rejected(v, mint(claims()), "unknown signing key")
+
+
+def test_an_issuer_outage_denies_once_the_keys_are_too_old():
+    from jwt import PyJWKClientConnectionError
+
+    fetch, clock = _Fetch(jwks_for((rsa_key(), "k1"))), _Clock()
+    v = _verifier(fetch, clock=clock)
+    v.claims(mint(claims()))
+    fetch.error = PyJWKClientConnectionError("down")
+    clock.now += 301
+    assert v.claims(mint(claims()))["sub"] == "user-1"  # a failed refresh keeps a set that is not yet too old
+    clock.now += 600
+    _rejected(v, mint(claims()), "signing keys unavailable")
+
+
+def test_a_slow_fetch_never_blocks_a_known_key():
+    """Anyone can send a token naming an unknown kid; the fetch it sets off must not hold up anyone else's check."""
+    release, fetching = threading.Event(), threading.Event()
+
+    class Slow(_Fetch):
+        def __call__(self):
+            self.calls += 1
+            if self.calls > 1:
+                fetching.set()
+                release.wait(10)
+            return self.jwks
+
+    fetch, clock = Slow(jwks_for((rsa_key(), "k1"))), _Clock()
+    v = _verifier(fetch, clock=clock)
+    v.claims(mint(claims()))
+    clock.now += 61
+    stranger = threading.Thread(target=lambda: pytest.raises(Exception, v.claims,
+                                                             mint(claims(), rsa_key("b"), kid="k9")))
+    stranger.start()
+    assert fetching.wait(5)
+    started = time.monotonic()
+    assert v.claims(mint(claims()))["sub"] == "user-1"
+    assert time.monotonic() - started < 0.5
+    release.set()
+    stranger.join(10)
+
+
+def test_a_fetch_is_cut_at_its_total_deadline():
+    """The client's timeout bounds each socket read; a server trickling bytes must still not hold a check."""
+    from mnemiq.auth.token import JwtIdentityVerifier
+
+    class Trickle(_Fetch):
+        def __call__(self):
+            self.calls += 1
+            time.sleep(2)
+            return jwks_for((rsa_key(), "k1"))
+
+    v = JwtIdentityVerifier(_oidc(), audience=AUDIENCE, refuse_audience=None, fetch=Trickle(), clock=_Clock(),
+                            fetch_timeout_s=0.3)
+    started = time.monotonic()
+    _rejected(v, mint(claims()), "signing keys unavailable")
+    assert time.monotonic() - started < 1.5
+
+
+def test_a_hung_fetch_is_not_started_twice():
+    release = threading.Event()
+
+    class Hung(_Fetch):
+        def __call__(self):
+            self.calls += 1
+            release.wait(10)
+            return jwks_for((rsa_key(), "k1"))
+
+    from mnemiq.auth.token import JwtIdentityVerifier
+
+    fetch, clock = Hung(), _Clock()
+    v = JwtIdentityVerifier(_oidc(), audience=AUDIENCE, refuse_audience=None, fetch=fetch, clock=clock,
+                            fetch_timeout_s=0.2)
+    _rejected(v, mint(claims()), "signing keys unavailable")
+    clock.now += 61
+    _rejected(v, mint(claims()), "signing keys unavailable")
+    assert fetch.calls == 1
+    release.set()
