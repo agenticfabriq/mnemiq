@@ -354,5 +354,6 @@ def test_a_hung_fetch_is_not_started_twice():
     _rejected(v, mint(claims()), "signing keys unavailable")
     clock.now += 61
     _rejected(v, mint(claims()), "signing keys unavailable")
-    assert fetch.calls == 1
     release.set()
+    v._keys._executor.shutdown(wait=True)  # anything queued behind the hung fetch has now run
+    assert fetch.calls == 1
