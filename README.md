@@ -177,6 +177,16 @@ and defers, which is the correct behaviour and the first thing people mistake fo
 no grants, no snapshot — no data. The policy format, and what row filters do and do not cover, is
 in [docs/access-policy.md](docs/access-policy.md).
 
+`MNEMIQ_ROLES` gives every caller one identity, which is right for one person on one machine. A
+shared deployment sets `MNEMIQ_OIDC_ISSUER`, `MNEMIQ_OIDC_AUDIENCE` and `MNEMIQ_TENANT` instead, and
+the HTTP API (and MCP over HTTP at `/mcp`, with `MNEMIQ_MCP_TRANSPORT=http`) then takes each
+request's identity from its own verified token: roles from the token's roles claim, or from an
+identity map for a token without one. Once an issuer is set, the one configured identity is never
+used. Open WebUI's signed user header is accepted on its own endpoint only, which a later release
+adds. The settings are in [docs/settings.md](docs/settings.md#identity-from-tokens). Per-user
+identity does not make the database enforce anything per user: every query still runs under the
+deployment's own database login, and the engine's guard is the control.
+
 ### Which LLM endpoints work
 
 **Any OpenAI-compatible `/v1` endpoint.** mnemiq talks to `MNEMIQ_LLM_BASE_URL` through the
@@ -318,14 +328,18 @@ time-limited or feature-gated build, and no capability is stubbed out pending a 
 Specifically open, because these are the parts people assume are held back: the enrichment
 pipeline including the LLM pass and coded-value grounding (`src/mnemiq/enrichment/`), the verifier
 and its judge (`src/mnemiq/verify/`), the access checks (`src/mnemiq/authz/`, `src/mnemiq/sql/`),
+token verification (`src/mnemiq/auth/`),
 the result grader (`src/mnemiq/eval/grade.py`), and the benchmark harness that produced the
 published numbers (`scripts/`).
 
 Commercial are two things that sit *around* the engine rather than inside it: **Verity**, a managed
-grading and drift service, and the **Agentic Fabriq control plane** — identity, vaulted
-credentials, per-group grants and audit across many sources. Both talk to the engine through the
-open contract (`mnemiq-contract`), so a self-hosted deployment is not a degraded one; it is the
-same read path without a managed service in front of it.
+grading and drift service, and the **Agentic Fabriq control plane**, which manages identity across
+many sources: users and groups, vaulted credentials, per-group grants and audit. The engine itself
+verifies who is asking (an identity provider's token, or Open WebUI's signed header) and enforces
+the grants for that identity. It does not manage users. Per-user identity does not make the
+database itself enforce anything per user: the engine's guard is the control. Both talk to the
+engine through the open contract (`mnemiq-contract`), so a self-hosted deployment is not a degraded
+one; it is the same read path without a managed service in front of it.
 
 Read the code rather than taking this on trust — that is the point of shipping it.
 
