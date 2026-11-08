@@ -23,7 +23,7 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -32,6 +32,7 @@ from mnemiq.agent.modes import MODES
 from mnemiq.agent.route import UnknownMode
 from mnemiq.contract import DeferralReason, IdentityContext
 from mnemiq.profiles import UnknownProfile, offered_to
+from mnemiq.server.pump import HEARTBEAT, EnginePump
 from mnemiq.server.serialize import answer_payload
 
 logger = logging.getLogger(__name__)
@@ -286,6 +287,71 @@ def _completion(run_id: str, model: str, content: str) -> dict:
             "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}]}
 
 
+_END = object()
+_STREAM_HEADERS = {"cache-control": "no-cache", "x-accel-buffering": "no"}
+
+
+def _refusal(exc: Exception, run_id: str) -> OpenAIError:
+    """What a caller is told when `ask` raised: composed from the exception's type, never its text."""
+    if isinstance(exc, UnknownProfile):
+        return _not_offered(exc.offered)
+    if isinstance(exc, UnknownMode):
+        return OpenAIError(400, f"unknown mode; this deployment offers: {sorted(MODES)}",
+                           code="invalid_reasoning_effort", param="reasoning_effort")
+    logger.error("run %s: the engine failed", run_id, exc_info=exc)
+    return OpenAIError(500, f"{_OPAQUE} (run {run_id}).")
+
+
+def _checked(answer):
+    if answer.reason_code == DeferralReason.QUESTION_TOO_LONG:
+        # The engine's own decline, which states the cap and recorded the question as declined: a 400 here.
+        raise OpenAIError(400, answer.answer, code="question_too_long", param="messages")
+    return answer
+
+
+def _chunk(run_id: str, created: int, model: str, delta: dict, finish: str | None = None) -> str:
+    return "data: " + json.dumps({"id": f"chatcmpl-{run_id}", "object": "chat.completion.chunk", "created": created,
+                                  "model": model, "choices": [{"index": 0, "delta": delta,
+                                                               "finish_reason": finish}]}) + "\n\n"
+
+
+def _stage(event: dict) -> str:
+    failed = "" if event.get("ok", True) else " failed"
+    return f"{event.get('stage')}{failed} ({round(event.get('ms') or 0)} ms)\n"
+
+
+async def chat_chunks(pump: EnginePump, events, first, run_id: str, model: str):
+    """The stream: the role, a reasoning delta per finished stage, an empty one as each heartbeat's keep-alive (not
+    an SSE comment, whose handling in Open WebUI is not known), the answer as one content delta, then `stop` and
+    `[DONE]`. A failure after the stream opened becomes a composed content delta."""
+    created = int(time.time())
+    try:
+        yield _chunk(run_id, created, model, {"role": "assistant", "content": ""})
+        item = first
+        while item is not _END:
+            if item is HEARTBEAT:
+                yield _chunk(run_id, created, model, {"reasoning_content": ""})
+            elif item.get("phase") == "finished":  # the early `result` event carries no phase, and is not shown
+                yield _chunk(run_id, created, model, {"reasoning_content": _stage(item)})
+            item = await anext(events, _END)
+        try:
+            content = render(answer_payload(pump.result()), run_id)
+        except Exception as exc:  # noqa: BLE001 -- composed below; the traceback goes to the log with the run id
+            content = _refusal(exc, run_id).message
+        yield _chunk(run_id, created, model, {"content": content})
+        yield _chunk(run_id, created, model, {}, "stop")
+        yield "data: [DONE]\n\n"
+    finally:
+        await events.aclose()
+
+
+async def _empty_stream(run_id: str, model: str):
+    created = int(time.time())
+    yield _chunk(run_id, created, model, {"role": "assistant", "content": ""})
+    yield _chunk(run_id, created, model, {}, "stop")
+    yield "data: [DONE]\n\n"
+
+
 def _not_offered(offered: list[str]) -> OpenAIError:
     # Composed from what this caller may pick: an unknown model and a forbidden one read alike, and neither is named.
     return OpenAIError(404, f"that model does not exist or you may not use it; you may pick: {offered}",
@@ -340,6 +406,9 @@ def mount_openai(app: FastAPI, runtime, doors, *, heartbeat_s: float) -> bool:
             # An Open WebUI background task (a title, tags, follow-ups): answered empty, never asked, never a question.
             name = sent_task if sent_task in _OPEN_WEBUI_TASKS else "other"
             logger.info("run %s: a background task (%s), answered with an empty completion", run_id, name)
+            if data.get("stream") is True:
+                return StreamingResponse(_empty_stream(run_id, str(data.get("model", ""))),
+                                         media_type="text/event-stream", headers=_STREAM_HEADERS)
             return _completion(run_id, str(data.get("model", "")), "")
         body = _chat_body(data)
         _refuse_parameters(body)
@@ -348,20 +417,28 @@ def mount_openai(app: FastAPI, runtime, doors, *, heartbeat_s: float) -> bool:
             raise _not_offered(offered)
         question, mode = _question(body.messages), _mode(body.reasoning_effort)
         profile = None if runtime.profiles is None else body.model
+        if body.stream:
+            pump = EnginePump(lambda emit: runtime.ask(question, who, mode=mode, emit=emit, profile=profile),
+                              heartbeat_s)
+            events = pump.events()
+            # The status stays open until the run shows its first event, or a heartbeat passes: a run that ends
+            # before emitting anything (a decline before retrieval, an unknown profile) gets the status it would
+            # get unstreamed, not a 200 already on the wire.
+            first = await anext(events, _END)
+            if first is _END:
+                try:
+                    _checked(pump.result())
+                except OpenAIError:
+                    raise
+                except Exception as exc:
+                    raise _refusal(exc, run_id) from None
+            return StreamingResponse(chat_chunks(pump, events, first, run_id, body.model),
+                                     media_type="text/event-stream", headers=_STREAM_HEADERS)
         try:
             answer = await run_in_threadpool(lambda: runtime.ask(question, who, mode=mode, profile=profile))
-        except UnknownProfile as exc:
-            raise _not_offered(exc.offered) from None
-        except UnknownMode:
-            raise OpenAIError(400, f"unknown mode; this deployment offers: {sorted(MODES)}",
-                              code="invalid_reasoning_effort", param="reasoning_effort") from None
-        except Exception:
-            logger.exception("run %s: the engine failed", run_id)
-            raise OpenAIError(500, f"{_OPAQUE} (run {run_id}).") from None
-        if answer.reason_code == DeferralReason.QUESTION_TOO_LONG:
-            # The engine's own decline, which states the cap and recorded the question as declined: a 400 here.
-            raise OpenAIError(400, answer.answer, code="question_too_long", param="messages")
-        return _completion(run_id, body.model, render(answer_payload(answer), run_id))
+        except Exception as exc:
+            raise _refusal(exc, run_id) from None
+        return _completion(run_id, body.model, render(answer_payload(_checked(answer)), run_id))
 
     _catch_all(app, mounted=True)
     return True

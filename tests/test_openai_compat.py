@@ -3,6 +3,8 @@ verified caller, one model per profile that caller may pick."""
 
 import json
 import logging
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -506,3 +508,178 @@ def test_engine_refusals_are_composed(tmp_path, raised, status, code):
     assert "/srv/x" not in r.text
     if status == 500:
         assert "run " in error["message"]
+
+
+# --- Task 5: the stream ----------------------------------------------------------------------------------------
+
+
+class _Streaming(_RT):
+    """Emits `events` (a float is a pause, in seconds), then answers, or raises `raises_after`."""
+
+    def __init__(self, events=(), raises_after=None, **kw):
+        super().__init__(**kw)
+        self.events, self.raises_after = list(events), raises_after
+
+    def ask(self, question, identity, mode=None, emit=None, history=None, profile=None):
+        self.asked.append(SimpleNamespace(question=question, identity=identity, mode=mode, profile=profile))
+        if self.raises is not None:
+            raise self.raises
+        for event in self.events:
+            if isinstance(event, float):
+                time.sleep(event)
+            else:
+                emit(event)
+        if self.raises_after is not None:
+            raise self.raises_after
+        return self.answer
+
+
+STAGES = [{"phase": "started", "stage": "retrieve", "id": 1},
+          {"phase": "finished", "stage": "retrieve", "id": 1, "ms": 12.3456, "ok": True},
+          {"kind": "result", "trace": None, "preview": None, "notes": []},
+          {"phase": "finished", "stage": "generate", "id": 2, "ms": 340.0, "ok": True}]
+
+
+def _sse(r) -> list:
+    out = []
+    for line in r.text.splitlines():
+        assert not line.startswith(":"), "no SSE comment lines: Open WebUI's handling of them is not verified"
+        if line.startswith("data: "):
+            payload = line.removeprefix("data: ")
+            out.append(payload if payload == "[DONE]" else json.loads(payload))
+    return out
+
+
+def _deltas(chunks) -> list[dict]:
+    return [c["choices"][0]["delta"] for c in chunks if c != "[DONE]"]
+
+
+def test_a_stream_is_role_progress_answer_stop_done(tmp_path):
+    rt = _Streaming(STAGES, answer=_answer(verify_layer="judge"))
+    r = _chat(_client(tmp_path, rt), stream=True)
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/event-stream")
+    chunks = _sse(r)
+    run_id = chunks[0]["id"].removeprefix("chatcmpl-")
+    assert all(c["object"] == "chat.completion.chunk" and c["model"] == "default" for c in chunks[:-1])
+    deltas = _deltas(chunks)
+    assert deltas[0] == {"role": "assistant", "content": ""}
+    assert deltas[1:3] == [{"reasoning_content": "retrieve (12 ms)\n"}, {"reasoning_content": "generate (340 ms)\n"}]
+    from mnemiq.server.openai_compat import render
+    from mnemiq.server.serialize import answer_payload
+
+    assert deltas[3] == {"content": render(answer_payload(rt.answer), run_id)}
+    assert chunks[-2]["choices"][0]["finish_reason"] == "stop" and deltas[-1] == {}
+    assert chunks[-1] == "[DONE]" and len(chunks) == 6
+
+
+def test_a_failed_stage_says_so(tmp_path):
+    failed = {"phase": "finished", "stage": "execute", "id": 3, "ms": 5.0, "ok": False}
+    deltas = _deltas(_sse(_chat(_client(tmp_path, _Streaming([failed])), stream=True)))
+    assert {"reasoning_content": "execute failed (5 ms)\n"} in deltas
+
+
+def test_a_slow_engine_gets_empty_reasoning_keepalives(tmp_path):
+    rt = _Streaming([STAGES[1], 0.15])
+    client = TestClient(build_app(rt, SETTINGS_IDENTITY, heartbeat_s=0.02, static_dir=_static(tmp_path),
+                                  doors=_doors(tmp_path)))
+    deltas = _deltas(_sse(_chat(client, stream=True)))
+    assert deltas.count({"reasoning_content": ""}) >= 2, deltas
+
+
+def test_an_engine_failure_mid_stream_is_a_composed_message_then_stop(tmp_path):
+    rt = _Streaming([STAGES[1]], raises_after=RuntimeError("the store at /srv/secret is gone"))
+    r = _chat(_client(tmp_path, rt), stream=True)
+    chunks = _sse(r)
+    run_id = chunks[0]["id"].removeprefix("chatcmpl-")
+    content = [d["content"] for d in _deltas(chunks) if d.get("content")]
+    assert content == [f"The engine could not complete this request (run {run_id})."]
+    assert "/srv/secret" not in r.text and chunks[-1] == "[DONE]"
+    assert chunks[-2]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_a_task_streams_empty(tmp_path):
+    rt = _Streaming(STAGES)
+    chunks = _sse(_chat(_client(tmp_path, rt), headers=_as(task="title_generation"), stream=True))
+    assert _deltas(chunks) == [{"role": "assistant", "content": ""}, {}] and chunks[-1] == "[DONE]"
+    assert rt.calls == 0
+
+
+def test_a_streamed_over_long_question_is_a_400(tmp_path):
+    from mnemiq.contract import DeferralReason
+
+    text = "Your question is 9,001 characters long; the limit is 9,000."
+    rt = _Streaming(answer=AgentAnswer(answer=text, deferred=True, reason_code=DeferralReason.QUESTION_TOO_LONG))
+    assert _error(_chat(_client(tmp_path, rt), stream=True), 400, "question_too_long")["message"] == text
+
+
+def test_a_streamed_refusal_before_any_event_has_its_status(tmp_path):
+    from mnemiq.profiles import UnknownProfile
+
+    r = _chat(_client(tmp_path, _Streaming(raises=UnknownProfile(["default"]))), stream=True)
+    _error(r, 404, "model_not_found")
+
+
+def test_a_stream_of_an_engine_that_reports_nothing_still_answers(tmp_path):
+    rt = _Streaming([], answer=_answer())
+    deltas = _deltas(_sse(_chat(_client(tmp_path, rt), stream=True)))
+    assert deltas[0] == {"role": "assistant", "content": ""} and "There were 25 claims" in deltas[1]["content"]
+
+
+@pytest.mark.parametrize("how", ["disconnect", "send-raises"])
+def test_a_client_hanging_up_mid_stream_logs_no_error(tmp_path, caplog, how):
+    """TestClient runs the app to completion before it answers, so the hang-up is driven through ASGI directly:
+    a `receive` that reports the disconnect after the first chunk (ASGI 2.3, where Starlette listens for it), or a
+    `send` that raises as a closed socket does (ASGI 2.4)."""
+    import anyio
+
+    release, finished = threading.Event(), threading.Event()
+
+    class Held(_RT):
+        """Emits a stage, waits until the client has gone, emits another, and answers."""
+
+        def ask(self, question, identity, mode=None, emit=None, history=None, profile=None):
+            self.asked.append(SimpleNamespace(question=question))
+            emit(STAGES[1])
+            release.wait(5)
+            emit(STAGES[3])  # onto a queue nobody reads any more
+            finished.set()
+            return self.answer
+
+    rt = Held()
+    app = build_app(rt, SETTINGS_IDENTITY, static_dir=_static(tmp_path), doors=_doors(tmp_path))
+    body = json.dumps({"model": "default", "messages": [{"role": "user", "content": "q"}], "stream": True}).encode()
+    headers = [(k.lower().encode(), v.encode()) for k, v in _as().items()] + [(b"content-type", b"application/json")]
+    scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.3" if how == "disconnect" else "2.4"},
+             "http_version": "1.1", "method": "POST", "scheme": "http", "path": "/openai/v1/chat/completions",
+             "raw_path": b"/openai/v1/chat/completions", "root_path": "", "query_string": b"", "headers": headers,
+             "client": ("127.0.0.1", 1), "server": ("testserver", 80), "state": {}}
+
+    async def scenario():
+        bodies, read, first = [], [False], anyio.Event()
+
+        async def receive():
+            if not read[0]:
+                read[0] = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            await first.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            if message["type"] == "http.response.body" and message.get("body"):
+                bodies.append(message["body"])
+                if how == "send-raises" and len(bodies) >= 2:
+                    raise OSError("the client went away")
+                first.set()
+
+        try:
+            await app(scope, receive, send)
+        except Exception:  # noqa: BLE001 -- what the server does with a hang-up is the server's; logging is ours
+            pass
+        release.set()
+        await anyio.to_thread.run_sync(finished.wait, 5)
+        return bodies
+
+    with caplog.at_level(logging.DEBUG):
+        bodies = anyio.run(scenario)
+    assert bodies and finished.is_set()
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR and r.name.startswith("mnemiq")]
