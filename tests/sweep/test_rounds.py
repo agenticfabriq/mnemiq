@@ -267,6 +267,18 @@ def test_another_engine_build_is_refused(tmp_path, stub_model, monkeypatch):
         run(cfg)
 
 
+def test_a_worker_on_another_engine_build_than_its_sweeps_stops_before_asking(tmp_path, stub_model, monkeypatch):
+    stub = stub_model(gold=True)
+    cfg = load_config(write_config(tmp_path, model=stub))
+    asked = stub.calls
+    # The sweep records the build its run started on, and each worker imports the engine afresh from disk, as it would
+    # after an edit or a pull during the sweep: here the record holds another build than the workers run.
+    monkeypatch.setattr("mnemiq.sweep.run.engine_build", lambda *a, **k: {"commit": None, "source_sha": "f" * 64})
+    with pytest.raises(SystemExit, match="engine build"):
+        run(cfg)
+    assert sweep_json(cfg)["stopped"] == "worker" and stub.calls == asked and not all_rows(cfg)
+
+
 def test_a_second_run_on_the_same_out_folder_is_refused_at_once(tmp_path, stub_model):
     stub = stub_model(gold=True)
     cfg = load_config(write_config(tmp_path, model=stub))

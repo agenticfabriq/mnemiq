@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from mnemiq.sweep.config import deployment_settings, load_config
+from mnemiq.sweep.config import SweepConfigError, deployment_settings, load_config
 from mnemiq.sweep.run import ArmInUse, arm_folder, arm_settings, engine_build, identity_refusal, run_arm
 
 from .conftest import (
@@ -214,6 +214,21 @@ def test_an_invalid_arm_outranks_an_endpoint_stop_and_stays_invalid(tmp_path, st
     stub.recover()
     asked = stub.calls
     assert run_arm(cfg, arm, tuning(cfg), folder) == "invalid" and stub.calls == asked   # nothing asked again
+
+
+def test_an_arm_refuses_to_run_under_another_engine_build_than_its_sweeps(tmp_path, stub_model):
+    stub = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub)
+    out = Path(cfg.sweep.out)
+    out.mkdir(parents=True)
+    # As after an edit or a pull during the sweep: the worker imports the engine from disk, and it is another build.
+    (out / "sweep.json").write_text(json.dumps({"engine_build": {"commit": None, "source_sha": "f" * 64}}))
+    folder = arm_folder(cfg, arm, 1)
+    asked = stub.calls
+    with pytest.raises(SweepConfigError, match="engine build") as refused:
+        run_arm(cfg, arm, tuning(cfg), folder)
+    assert "ffffffffffff" in str(refused.value) and engine_build()["source_sha"][:12] in str(refused.value)
+    assert stub.calls == asked and not (folder / "rows.jsonl").exists() and not (folder / "pins.json").exists()
 
 
 def test_the_source_hash_changes_with_the_source(tmp_path):

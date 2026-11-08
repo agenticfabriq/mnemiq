@@ -469,7 +469,9 @@ until the sweep ends. Build the snapshot deployment's store from the snapshot, a
   stopped: each arm from the answers it wrote, and what the first round decided (the runs each arm owes, each start's
   room) read back. A resumed config may change only `budget_hours`, `budget_dollars`, `seconds_per_question` and its
   `[[control]]` tables. Anything else (the config, a deployment's settings, a pinned file) or another engine build is
-  refused before any arm: put it back, or start a new sweep in another out folder.
+  refused before any arm: put it back, or start a new sweep in another out folder. Each worker checks the build again
+  as it starts an arm, so an edit or a pull while the sweep runs stops it with nothing of that arm asked, rather than
+  writing rows under another build.
 - **Smoke.** `--smoke N` runs each arm of the first round once on its first N questions to tune on, in
   `<out>/smoke/`, which nothing else reads, with no budget, room or repeats. Each smoke replaces that folder whole, and
   only a folder a smoke made.

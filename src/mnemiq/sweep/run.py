@@ -451,12 +451,14 @@ def run_arm(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder:
             before: Callable[[str, str], None] | None = None) -> str:
     """Run `arm` on `cases` into `folder`, resuming from the rows already there.
 
-    An arm with an `invalid.json` is not run again. Its first run records the pinned files in `pins.json`; every run
-    checks the files against that record, copies each store the cases read and checks each copy against it, writes the
-    arm's `profile.toml`, and builds one runtime per deployment. Each case not yet answered is asked as the config's
-    identity in each of the arm's modes, graded by `run_case`, and appended to `rows.jsonl` as one flushed row per case
-    and mode, `before` (when given) called with the case's id and the mode just before it is asked. When the run ends,
-    the pinned files are read again, and `invalid.json` records any that moved from the record.
+    Refused (`SweepConfigError`) before anything is read or asked when the sweep's `sweep.json` beside it names another
+    engine build than this process runs. An arm with an `invalid.json` is not run again. Its first run records the
+    pinned files in `pins.json`; every run checks the files against that record, copies each store the cases read and
+    checks each copy against it, writes the arm's `profile.toml`, and builds one runtime per deployment. Each case not
+    yet answered is asked as the config's identity in each of the arm's modes, graded by `run_case`, and appended to
+    `rows.jsonl` as one flushed row per case and mode, `before` (when given) called with the case's id and the mode
+    just before it is asked. When the run ends, the pinned files are read again, and `invalid.json` records any that
+    moved from the record.
 
     Returns `"invalid"` (a pinned file moved, in this run or before it), else `"endpoint"` (the endpoint stopped
     answering; the rows stand, and the next run resumes), else `"complete"`. It holds the folder's lock while it runs,
@@ -470,9 +472,28 @@ def run_arm(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder:
         return _run_arm(cfg, arm, cases, folder, before)
 
 
+def _same_build(cfg: SweepConfig, build: dict) -> None:
+    """Refuse when the sweep's record, `sweep.json`, names another engine build than `build`, the one this process
+    runs. A worker imports the engine from disk as it starts, so an edit or a pull during a long sweep would write its
+    rows under another build than the record names. An arm run with no record beside it, as a smoke's, is not checked:
+    there is no sweep to match."""
+    record = Path(cfg.sweep.out) / SWEEP
+    if not record.exists():
+        return
+    started = str((json.loads(record.read_text(encoding="utf-8")).get("engine_build") or {}).get("source_sha"))
+    if started != build["source_sha"]:
+        raise SweepConfigError(
+            f"{record} names engine build {started[:12]} (by source), and this worker runs build "
+            f"{build['source_sha'][:12]}: the engine's source changed while the sweep ran, and the arm's rows would be "
+            "written under another build than the sweep's, so nothing was asked. Run the build the sweep started with "
+            "(the sweep resumes where it stopped), or start a new sweep in another out folder.")
+
+
 def _run_arm(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder: Path,
              before: Callable[[str, str], None] | None) -> str:
     """`run_arm` itself, with the folder made and its lock held."""
+    build = engine_build()
+    _same_build(cfg, build)
     if (folder / INVALID).exists():
         return "invalid"
     if (folder / PINS).exists():
@@ -483,7 +504,6 @@ def _run_arm(cfg: SweepConfig, arm: Arm, cases: Sequence[EvaluationCase], folder
     if moved := _changed_since(cfg, pinned):
         _write_json(folder / INVALID, moved)
         return "invalid"
-    build = engine_build()
     db_ids = [None] if cfg.dataset.deployments is None else sorted({case.db_id for case in cases})
     if changed := _copy_stores(cfg, folder, db_ids, pinned):
         _write_json(folder / INVALID, {"changed": changed})
