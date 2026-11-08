@@ -358,6 +358,7 @@ class Settings(BaseSettings):
     openwebui_user_headers: str = Field(default="X-OpenWebUI-User-Id,X-OpenWebUI-User-Email,X-OpenWebUI-User-Name,X-OpenWebUI-User-Role", description="Open WebUI's unsigned user headers, comma-separated; a request carrying any of them is refused once an issuer is configured")
     openwebui_connection_key_header: str | None = Field(default=None, description="the custom header on mnemiq's Open WebUI connection that carries the connection key")
     openwebui_connection_key: str | None = Field(default=None, description="the connection key, at least 32 bytes, which tells mnemiq a request came through its own Open WebUI connection; required with the signed user header")
+    openwebui_task_header: str = Field(default="X-Mnemiq-Task", description="the custom header on mnemiq's Open WebUI connection that carries `{{TASK}}`: every /openai/v1 request must carry it, empty for a chat turn, and a request whose value is not empty is a background task, answered with an empty completion and never asked")
     identity_map_path: str | None = Field(default=None, description="a JSON file mapping each issuer's subjects, groups and verified emails to roles, for tokens that carry no roles claim")
     mcp_transport: Literal["stdio", "http"] = Field(default="stdio", description="stdio runs the MCP server for one local caller; http serves it at /mcp on the HTTP API, each request judged by its own token")
     # --- verifier ---

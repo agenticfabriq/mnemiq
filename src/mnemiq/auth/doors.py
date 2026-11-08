@@ -53,6 +53,17 @@ class HttpDoors:
                                             fetch=fetch) if oidc and oidc.openwebui_audience else None)
         self._owui = OpenWebUIVerifier(cfg.openwebui) if cfg.openwebui else None
 
+    @property
+    def openai_enabled(self) -> bool:
+        """Whether /openai/v1 can verify a caller: Open WebUI's signed header, or a provider token for its own
+        audience. Without either the endpoint is not mounted, so a deployment cannot serve it as one identity."""
+        return self._owui is not None or self._openai is not None
+
+    @property
+    def task_header(self) -> str:
+        """The header (lowercase) whose non-empty value marks an Open WebUI background task on /openai/v1."""
+        return self._cfg.task_header
+
     def v1(self, headers: Headers) -> IdentityContext:
         return self._judge("/v1", headers)
 

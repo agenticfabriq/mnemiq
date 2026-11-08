@@ -50,6 +50,7 @@ class AuthConfig:
     mcp_http: bool
     # The signed header's name (lowercase), known even with that verifier off, so /v1 can refuse it by name.
     jwt_header: str = "x-openwebui-user-jwt"
+    task_header: str = "x-mnemiq-task"  # marks an Open WebUI background task on /openai/v1 (lowercase)
 
     @property
     def issuers(self) -> set[str]:
@@ -214,10 +215,19 @@ def auth_config_from_settings(settings, *, validate_map=None) -> AuthConfig | No
                                   "the key binds the connection, it is not a credential")
         binding = (binding_header.strip().lower(), binding_key.encode())
 
+    # Blank reads as unset, as for every identity setting: the field's own default.
+    task_header = ((settings.openwebui_task_header or "").strip()
+                   or type(settings).model_fields["openwebui_task_header"].default).lower()
+    if task_header in {"authorization", settings.openwebui_jwt_header.strip().lower(), *user_headers,
+                       *([binding[0]] if binding else [])}:
+        raise AuthConfigError("MNEMIQ_OPENWEBUI_TASK_HEADER must be a header of its own, not Authorization, the signed "
+                              "user header, one of Open WebUI's plain user headers or the connection key's header: it "
+                              "only marks a background task")
+
     config = AuthConfig(
         tenant=tenant, oidc=oidc, openwebui=openwebui, binding=binding,
         user_headers=user_headers, map_path=settings.identity_map_path or None, mcp_http=mcp_http,
-        jwt_header=settings.openwebui_jwt_header.strip().lower())
+        jwt_header=settings.openwebui_jwt_header.strip().lower(), task_header=task_header)
     if config.map_path:
         if validate_map is None:
             from mnemiq.auth.identity_map import IdentityMap

@@ -35,6 +35,16 @@ OPTION_A = dict(tenant="acme", oidc_issuer=ISSUER, oidc_audience=AUDIENCE, openw
 MAP = {ISSUER: {}, "open-webui": {"sub": {"owui-user-1": ["store1_manager"]}}}
 
 
+def test_the_openai_door_is_enabled_by_its_own_verifier_only(tmp_path):
+    """/openai/v1 is served only where its door can verify a caller: Open WebUI's secret or its own audience."""
+    v1_only = dict(tenant="acme", oidc_issuer=ISSUER, oidc_audience=AUDIENCE)
+    assert not _doors(tmp_path, **v1_only).openai_enabled
+    assert _doors(tmp_path, **OPTION_A).openai_enabled
+    assert _doors(tmp_path, tenant="acme", openwebui_jwt_secret=SECRET, openwebui_connection_key_header="X-Mnemiq-Connection",
+                  openwebui_connection_key=KEY).openai_enabled
+    assert _doors(tmp_path, **OPTION_A).task_header == "x-mnemiq-task"
+
+
 def _bearer(token):
     return {"authorization": [f"Bearer {token}"]}
 

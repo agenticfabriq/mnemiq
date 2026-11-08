@@ -234,6 +234,7 @@ roles' grants.
 | `openwebui_user_headers` | `"X-OpenWebUI-User-Id,X-OpenWebUI-User-Email,X-OpenWebUI-User-Name,X-OpenWebUI-User-Role"` | Open WebUI's unsigned user headers. A request carrying any of them is refused once an issuer is configured. |
 | `openwebui_connection_key_header` | unset | The custom header on mnemiq's Open WebUI connection that carries the connection key. |
 | `openwebui_connection_key` | unset | The connection key, at least 32 bytes, which tells mnemiq a request came through its own Open WebUI connection. Required with the signed user header. |
+| `openwebui_task_header` | `X-Mnemiq-Task` | The custom header on mnemiq's Open WebUI connection that carries `{{TASK}}`. Every `/openai/v1` request must carry it, empty for a chat turn; a request whose value is not empty is a background task, such as title generation, and gets an empty completion without reaching the engine. It must be a header of its own. |
 | `identity_map_path` | unset | A JSON file mapping each issuer's subjects, groups and verified emails to roles, for tokens that carry no roles claim. |
 | `mcp_transport` | `"stdio"` | `stdio` runs the MCP server for one local caller. `http` serves it at `/mcp` on the HTTP API, each request judged by its own token. |
 
