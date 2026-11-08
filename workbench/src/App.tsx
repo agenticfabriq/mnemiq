@@ -47,6 +47,11 @@ type Session =
 
 const RELOAD = () => globalThis.location.reload();
 
+/** A verified user on a page that cannot hash their identity gets no saved threads. Said,
+ *  so that history vanishing on reload is not mistaken for a fault. */
+const UNSAVED =
+  "Saved threads are off on this page: keeping each user's threads apart needs a secure context, such as HTTPS.";
+
 function SessionNotice({
   message,
   action,
@@ -188,6 +193,11 @@ function Workbench({
         {notice && (
           <p role="status" className="border-b border-rule bg-crimson-wash px-5 py-1.5 text-[12px] text-crimson">
             {NOTICE[notice]}
+          </p>
+        )}
+        {ns === null && (
+          <p role="status" className="border-b border-rule px-5 py-1.5 text-[12px] text-graphite">
+            {UNSAVED}
           </p>
         )}
 

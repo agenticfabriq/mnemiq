@@ -70,7 +70,11 @@ export function TurnArtifacts({ data }: DataMessagePartProps<Turn>) {
         <h3 className="text-[13px] font-medium text-crimson">The run did not finish</h3>
         <p className="mt-1.5 text-[12px]">{turn.error}</p>
         <p className="label mt-2.5 normal-case tracking-normal text-[11px]">
-          → The engine is still serving. Ask again.
+          {/* A 503, or a request that never got an answer: the engine is exactly what is not
+              serving, and the question was never the problem. */}
+          {turn.errorCode === "unavailable"
+            ? "→ A service problem, not the question. Ask again shortly."
+            : "→ The engine is still serving. Ask again."}
         </p>
       </section>
     );

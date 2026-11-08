@@ -348,9 +348,49 @@ describe("refusals that are not a sign-out", () => {
     fireEvent.click(await screen.findByRole("button", { name: STARTER }));
 
     expect(await screen.findByText(NOTICE.unavailable)).toBeInTheDocument();
+    expect(screen.getByText(/service problem/)).toBeInTheDocument();
+    expect(screen.queryByText(/still serving/)).not.toBeInTheDocument();
     await settle();
     expect(reload).not.toHaveBeenCalled();
     expect(screen.getAllByText("alice's question")).not.toHaveLength(0);
     expect(namespaced().length).toBeGreaterThan(0);
+  });
+});
+
+describe("a page that cannot keep users apart", () => {
+  it("says saved threads are off, and why, when it cannot hash a verified user's identity", async () => {
+    // crypto.subtle exists only in a secure context. Without it the user gets no saved
+    // threads, and that must not happen silently.
+    const real = globalThis.crypto;
+    vi.stubGlobal("crypto", { randomUUID: () => real.randomUUID() });
+    serve({ "/v1/whoami": () => json(ALICE), "/v1/schema": SCOPE });
+
+    render(<App reload={vi.fn()} />);
+
+    expect(await screen.findByText(/Saved threads are off on this page/)).toBeInTheDocument();
+    expect(screen.getByText(/secure context, such as HTTPS/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("radio", { name: "deep" }));
+    await settle();
+    expect(namespaced()).toEqual([]);
+  });
+
+  it("says nothing of the kind where it can", async () => {
+    serve({ "/v1/whoami": () => json(ALICE), "/v1/schema": SCOPE });
+
+    render(<App reload={vi.fn()} />);
+
+    await workbench();
+    expect(screen.queryByText(/Saved threads are off/)).not.toBeInTheDocument();
+  });
+
+  it("says nothing of the kind to a deployment that verifies nobody, which needs no hash", async () => {
+    const real = globalThis.crypto;
+    vi.stubGlobal("crypto", { randomUUID: () => real.randomUUID() });
+    serve({ "/v1/whoami": () => new Response("", { status: 404 }), "/v1/schema": SCOPE });
+
+    render(<App reload={vi.fn()} />);
+
+    await workbench();
+    expect(screen.queryByText(/Saved threads are off/)).not.toBeInTheDocument();
   });
 });

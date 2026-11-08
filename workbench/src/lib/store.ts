@@ -24,6 +24,8 @@ export type Turn = {
   /** The phases this answer passed through, in the order the engine reported them. */
   steps?: Step[];
   error?: string;
+  /** The RUN_ERROR's code, when it had one: "unavailable" is a service problem. */
+  errorCode?: string;
   status: TurnStatus;
 };
 
@@ -126,7 +128,13 @@ export function reduce(turns: Turn[], event: AguiEvent): Turn[] {
 
     case "RUN_ERROR": {
       const message = "message" in event ? String(event.message) : "the run failed";
-      return patchLast(turns, (t) => ({ ...t, status: "error", error: message }));
+      const code = (event as { code?: unknown }).code;
+      return patchLast(turns, (t) => ({
+        ...t,
+        status: "error",
+        error: message,
+        ...(typeof code === "string" && { errorCode: code }),
+      }));
     }
 
     // TEXT_MESSAGE_START/END carry no state we keep, and a server that later emits

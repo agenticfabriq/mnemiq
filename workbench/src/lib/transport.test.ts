@@ -221,7 +221,12 @@ describe("streamChat before the stream starts", () => {
 
       expect(await drain(streamChat("q", "thinking"))).toEqual([
         { type: "RUN_STARTED", runId: "" },
-        { type: "RUN_ERROR", message: NOTICE[refusal as Exclude<Refusal, "signed-out">] },
+        {
+          type: "RUN_ERROR",
+          message: NOTICE[refusal as Exclude<Refusal, "signed-out">],
+          // Only a service problem is coded: the card says so instead of "still serving".
+          ...(refusal === "unavailable" && { code: "unavailable" }),
+        },
       ]);
     });
   }
@@ -231,7 +236,7 @@ describe("streamChat before the stream starts", () => {
 
     expect(await drain(streamChat("q", "thinking"))).toEqual([
       { type: "RUN_STARTED", runId: "" },
-      { type: "RUN_ERROR", message: NOTICE.unavailable },
+      { type: "RUN_ERROR", message: NOTICE.unavailable, code: "unavailable" },
     ]);
   });
 

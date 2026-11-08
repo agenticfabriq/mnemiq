@@ -87,13 +87,14 @@ export async function fetchWhoami(): Promise<Whoami | null> {
   };
 }
 
-/** A run that failed before the engine started one. */
-function* failedRun(message: string): Generator<AguiEvent> {
+/** A run that failed before the engine started one. `code` "unavailable" marks a service
+ *  problem, so the card does not tell the reader the engine is still serving. */
+function* failedRun(message: string, code?: "unavailable"): Generator<AguiEvent> {
   // The reducer patches the last assistant turn, and this run has none yet: without a start,
   // the error would land on the previous question's answer, or nowhere. No run id, since the
   // engine never issued one; the reducer names the turn itself.
   yield { type: "RUN_STARTED", runId: "" };
-  yield { type: "RUN_ERROR", message };
+  yield { type: "RUN_ERROR", message, ...(code && { code }) };
 }
 
 export async function* streamChat(
@@ -114,7 +115,7 @@ export async function* streamChat(
     // Signed out is thrown on to the caller: the page purges this user's threads next, and
     // no event may reach a thread after that.
     if (!(error instanceof Refused) || error.refusal === "signed-out") throw error;
-    yield* failedRun(NOTICE[error.refusal]);
+    yield* failedRun(NOTICE[error.refusal], error.refusal === "unavailable" ? "unavailable" : undefined);
     return;
   }
 

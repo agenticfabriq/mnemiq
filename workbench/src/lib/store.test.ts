@@ -51,6 +51,15 @@ describe("reduce", () => {
     expect(turns[0]!.status).toBe("error");
     expect(turns[0]!.error).toBe("boom");
     expect(turns[0]!.answer).toBeUndefined();
+    expect(turns[0]!.errorCode).toBeUndefined();
+  });
+
+  it("keeps the error's code, which says what kind of failure it was", () => {
+    const turns = run([
+      { type: "RUN_STARTED", runId: "" },
+      { type: "RUN_ERROR", message: "The service is unavailable.", code: "unavailable" },
+    ]);
+    expect(turns[0]!.errorCode).toBe("unavailable");
   });
 
   it("appends after a user turn without disturbing it", () => {
