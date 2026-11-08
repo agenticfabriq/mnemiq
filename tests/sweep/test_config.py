@@ -11,7 +11,7 @@ from mnemiq.config import Settings
 from mnemiq.sweep.config import SweepConfigError, deployment_settings, fingerprint, load_config, scrub_credentials
 
 from .conftest import (
-    KEY_ENV, STUB_KEY, UNREACHABLE, alter, broken_questions, tiny_deployment, tiny_files, write_config,
+    KEY_ENV, STUB_KEY, UNREACHABLE, alter, broken_questions, tiny_dataset, tiny_deployment, tiny_files, write_config,
 )
 
 
@@ -225,3 +225,20 @@ def test_a_control_whose_answers_cannot_be_graded_is_refused_before_any_arm_runs
     path.write_text(answers if isinstance(answers, str) else json.dumps(answers))
     with pytest.raises(SweepConfigError, match=refusal):
         load_config(write_config(tmp_path, control=[{"name": "current", "answers": str(path)}]))
+
+
+@pytest.mark.parametrize("strategy", ["screen-then-grid", "grid"])
+def test_a_search_that_holds_nothing_out_is_refused(tmp_path, strategy):
+    # A search confirms its pick on held-out questions, so it needs some.
+    with pytest.raises(SweepConfigError, match="held_out is 0"):
+        load_config(write_config(tmp_path, dataset={"held_out": 0.0}, search={"strategy": strategy}))
+
+
+def test_a_held_out_share_too_small_to_hold_a_question_is_refused(tmp_path):
+    # 0.3 of 3 answerable questions floors to none, and there are none to decline.
+    with pytest.raises(SweepConfigError, match="holds no question"):
+        load_config(write_config(tmp_path, dataset=tiny_dataset(tmp_path, cases=3, answerable=3)))
+
+
+def test_check_mode_holds_nothing_out(tmp_path):
+    assert load_config(write_config(tmp_path, dataset={"held_out": 0.0}, search={"strategy": "check"}))

@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import tempfile
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -741,16 +742,21 @@ class ScriptedRounds:
 
 
 def play_after_search(cfg, *, held_out: dict | None = None, hosted: bool = False, server_running: int = 0,
-                      load: float = 0.5) -> ScriptedRounds:
+                      load: float | Callable[[], float] = 0.5, wait_s: float = 0.0) -> ScriptedRounds:
     """The timing and confirm rounds of a sweep whose search is written, played by `ScriptedRounds` through the code
     `run` calls. The server reads `server_running` requests running before each timed case, or publishes no count when
-    `hosted`, and the sweep machine's 1-minute load reads `load` on its 8 cores."""
+    `hosted`. The sweep machine has 8 cores, and its 1-minute load reads `load`, or each value `load()` returns in turn.
+    Before the timing round the sweep waits up to `wait_s` for that load to fall under the cores, reading it again at
+    once each time."""
     from mnemiq.sweep import propose
 
+    read = load if callable(load) else (lambda: load)
     rounds = ScriptedRounds(cfg, sweep_json(cfg), held_out or {})
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(propose, "server_running", lambda base_url: None if hosted else server_running)
-        patch.setattr(propose, "machine_load", lambda: (load, 8))
+        patch.setattr(propose, "machine_load", lambda: (read(), 8))
+        patch.setattr(propose, "LOAD_WAIT_S", wait_s)
+        patch.setattr(propose, "LOAD_WAIT_EVERY_S", 0.0)
         propose.after_search(rounds, None)
     return rounds
 

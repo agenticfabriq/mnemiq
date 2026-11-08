@@ -102,8 +102,9 @@ def sweep_with_rows(tmp_path, *, arms: dict, repeats: int = 1, **sections):
 
 def sweep_with_rows_ms(tmp_path, *, rows_ms: list[float]):
     """A screen whose start alone has run, on one answerable case per time to rows given, each answer taking 1.5 s
-    longer in all than its time to rows."""
-    dataset = tiny_dataset(tmp_path, cases=len(rows_ms), answerable=len(rows_ms)) | {"held_out": 0.0}
+    longer in all than its time to rows. One more answerable case is held out."""
+    count = len(rows_ms) + 1
+    dataset = tiny_dataset(tmp_path, cases=count, answerable=count) | {"held_out": 1 / count}
     cfg = load_config(write_config(tmp_path, dataset=dataset))
     write_run(cfg, start_of(cfg, "instant"), [row(case.id, "correct", ms=ms + 1500, rows_ms=ms)
                                               for case, ms in zip(tuning(cfg), rows_ms, strict=True)])
@@ -400,12 +401,13 @@ def test_a_report_under_auto_repeats_needs_the_count_the_first_round_decided(tmp
 
 
 def test_a_timing_round_is_read_against_its_first_20_cases_once(tmp_path):
-    dataset = tiny_dataset(tmp_path, cases=30, answerable=30) | {"held_out": 0.0}
-    cfg = load_config(write_config(tmp_path, dataset=dataset, sweep={"repeats": 2}))
+    cfg = load_config(write_config(tmp_path, dataset=tiny_dataset(tmp_path, cases=30, answerable=30),
+                                   sweep={"repeats": 2}))
     start = replace(start_of(cfg, "instant"), round="timing")
     write_run(cfg, start, [row(case.id, "correct") for case in tuning(cfg)[:20]])
     (record,) = report(cfg, "timing")[1]
-    # One run, of 20 cases, though every arm of this sweep runs twice on its 30 cases to tune on.
+    # One run, of 20 cases, though every arm of this sweep runs twice on its 21 cases to tune on.
+    assert len(tuning(cfg)) == 21
     assert record["valid"] is True and [(run["run"], run["cases"]) for run in record["runs"]] == [(1, 20)]
 
 

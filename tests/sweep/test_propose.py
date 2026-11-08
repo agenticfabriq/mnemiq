@@ -9,13 +9,17 @@ from pathlib import Path
 import pytest
 
 from mnemiq.profiles import _read as read_profile_file
+from mnemiq.sweep import propose as proposal
+from mnemiq.sweep.arms import arm_of
 from mnemiq.sweep.config import SweepConfigError, load_config
-from mnemiq.sweep.propose import candidates, pick, propose, server_running
+from mnemiq.sweep.propose import candidates, pick, propose, quiet_machine, server_running
 from mnemiq.sweep.report import report
+from mnemiq.sweep.run import _begin, _parts, run
 
 from .conftest import (
-    KEY_ENV, STUB_KEY, UNREACHABLE, checked_sweep, confirm_arms_run, confirm_modes, evidence, graded_sweep,
-    json_lines, out, play_after_search, proposal_file, rewrite, sweep_json, tuning,
+    KEY_ENV, STUB_KEY, UNREACHABLE, checked_sweep, confirm_arms_run, confirm_modes, evidence, graded_rows,
+    graded_sweep, json_lines, out, play_after_search, proposal_file, rewrite, stamped_version, sweep_json,
+    tiny_dataset, tiny_deployment, tuning, write_config, write_run,
 )
 
 # Settings a profile can change, each tried at one value other than the engine's default.
@@ -153,12 +157,14 @@ def test_the_timing_round_runs_alone_on_the_first_20_cases_to_tune_on(tmp_path):
 
 def test_a_proposal_whose_version_is_not_the_one_stamped_is_refused(tmp_path):
     cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0)})
+    assert propose(cfg)["m"]["measured"] == "whole" and proposal_file(cfg).exists()   # an earlier proposal
     (assembled,) = (out(cfg) / "m" / "confirm" / "instant").glob("assembled-*")
     rows = assembled / "run-1" / "rows.jsonl"
     rows.write_text("".join(json.dumps(row | {"profile_version": "0123456789ab"}) + "\n" for row in json_lines(rows)))
     with pytest.raises(SweepConfigError, match="version"):
         propose(cfg)
-    assert not proposal_file(cfg).exists()
+    # Neither file is left to look current.
+    assert not proposal_file(cfg).exists() and not (out(cfg) / "proposal" / "m" / "evidence.json").exists()
 
 
 def test_a_sweep_with_no_room_anywhere_proposes_its_start(tmp_path):
@@ -221,3 +227,124 @@ def _fingerprint(cfg) -> str:
     from mnemiq.sweep.config import fingerprint
 
     return fingerprint(cfg)
+
+
+# --- a start the engine refuses, the machine's load, the build, and what a person may choose ------------------------
+
+
+def refused_in_instant(tmp_path, stub, *, only: int):
+    """A two-mode sweep whose start sets min_agreement on instant's one candidate, which the engine refuses there and
+    accepts in thinking, loaded. Thinking's screen is written as rows: a start that gets nothing right, and
+    writer_rules=none `only` more right."""
+    start = tmp_path / "start-profiles.toml"
+    start.write_text('default = "tuned"\n[profiles.tuned]\n[profiles.tuned.instant]\nmin_agreement = 0.6\n')
+    cfg = load_config(write_config(tmp_path, deployment=tiny_deployment(tmp_path, stub), model=stub,
+                                   dataset=tiny_dataset(tmp_path, cases=14, answerable=12, stub=stub),
+                                   space={"writer_rules": ["none"]}, modes=["instant", "thinking"],
+                                   sweep={"repeats": 1}, start={"profile_file": str(start)}))
+    _begin(cfg)
+    tuned = _parts(cfg)["tuning"]
+    for changes, spec in (({}, None), ({"writer_rules": "none"}, {"only": only, "other": 0})):
+        arm = arm_of("m", "thinking", changes, round="screen")
+        write_run(cfg, arm, graded_rows(arm, tuned, right=0, version=stamped_version(cfg, arm), spec=spec))
+    return cfg
+
+
+def test_a_mode_whose_start_the_engine_refuses_is_left_out_of_the_profile_confirmed(tmp_path, stub_model):
+    cfg = refused_in_instant(tmp_path, stub_model, only=9)
+    run(cfg)   # ends normally: the confirm round runs where the start runs
+    result = propose(cfg)
+    assert result["m"]["chosen"] == "writer_rules=none" and evidence(cfg)["confirm"]["modes"] == ["thinking"]
+    assert "min_agreement" in evidence(cfg)["refused_modes"]["instant"] and "instant" in result["m"]["why"]
+    written = read_profile_file(str(proposal_file(cfg))).profiles["m"]
+    assert written.instant is None and written.thinking is not None
+
+
+def test_with_no_candidate_the_start_is_proposed_where_the_engine_runs_it(tmp_path, stub_model):
+    cfg = refused_in_instant(tmp_path, stub_model, only=0)
+    run(cfg)
+    result = propose(cfg)
+    assert result["m"]["chosen"] == "start" and "the engine refuses the start" in result["m"]["why"]
+    assert "not valid" not in result["m"]["why"]
+    written = read_profile_file(str(proposal_file(cfg))).profiles["m"]
+    assert written.instant is None and written.thinking is not None
+
+
+def test_when_the_engine_refuses_every_start_the_run_ends_and_propose_says_why(tmp_path, stub_model, monkeypatch):
+    cfg = load_config(write_config(tmp_path, model=stub_model(gold=True), arms_in_screen=2))
+    monkeypatch.delenv(KEY_ENV)   # every profile names a key variable that is not set
+    run(cfg)
+    assert sweep_json(cfg)["finished"] is True and "repeats" not in sweep_json(cfg)
+    result = propose(cfg)
+    assert result["m"]["chosen"] is None and "refuses the start in every mode" in result["m"]["why"]
+    assert KEY_ENV in result["m"]["why"] and not proposal_file(cfg).exists()
+
+
+def test_a_real_sweep_with_no_room_proposes_its_start(tmp_path, stub_model):
+    cfg = load_config(write_config(tmp_path, model=stub_model(start_misses=2), arms_in_screen=4))
+    run(cfg)
+    assert sweep_json(cfg)["stopped"] == "no room" and "repeats" not in sweep_json(cfg)
+    result = propose(cfg)
+    assert result["m"]["chosen"] == "start" and "no room" in result["m"]["why"]
+    assert evidence(cfg)["rule"]["repeats_decided"] is False
+
+
+def test_the_wait_for_a_quiet_machine_ends_when_the_load_falls(capsys):
+    loads, now = iter([9.0, 9.0, 3.0]), [0.0]
+    quiet = quiet_machine(load=lambda: (next(loads), 8), clock=lambda: now[0],
+                          sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
+    assert quiet is True and now[0] == 2 * proposal.LOAD_WAIT_EVERY_S and "waiting" in capsys.readouterr().out
+
+
+def test_the_wait_for_a_quiet_machine_is_bounded(capsys):
+    now = [0.0]
+    quiet = quiet_machine(load=lambda: (9.0, 8), clock=lambda: now[0],
+                          sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
+    assert quiet is False and proposal.LOAD_WAIT_S <= now[0] < proposal.LOAD_WAIT_S + proposal.LOAD_WAIT_EVERY_S
+    assert "timing anyway" in capsys.readouterr().out
+
+
+def test_the_timing_round_waits_for_the_machine_to_quieten_first(tmp_path, capsys):
+    cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0)}, play=False)
+    reads = iter([9.0, 9.0])   # the load the grid left, then an idle machine
+    play_after_search(cfg, load=lambda: next(reads, 0.5), wait_s=60.0)
+    propose(cfg)
+    assert evidence(cfg)["timing"]["instant"]["taken"] is True and "waiting" in capsys.readouterr().out
+
+
+def test_a_proposal_under_another_engine_build_is_packaged_with_a_warning(tmp_path, monkeypatch):
+    cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0)})
+    ran_on = sweep_json(cfg)["engine_build"]
+    monkeypatch.setattr(proposal, "engine_build", lambda *a, **k: {"commit": None, "source_sha": "f" * 64})
+    result = propose(cfg)
+    assert result["m"]["chosen"] == "writer_rules=none" and "engine build" in " ".join(result["m"]["warnings"])
+    assert evidence(cfg)["sweep"]["engine_build"] == ran_on and evidence(cfg)["packaged_by"]["source_sha"] == "f" * 64
+
+
+def test_a_person_may_choose_the_assembled_arm_after_its_confirm_failed(tmp_path):
+    cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0)},
+                       held_out={"assembled": dict(more_wrong=1)})
+    propose(cfg, chosen="writer_rules=none")
+    assert evidence(cfg)["rule_pick"] == "start" and evidence(cfg)["confirmed"] is False
+    (source,) = evidence(cfg)["profile_from"]
+    assert source["round"] == "confirm" and source["arm"].startswith("assembled-")
+
+
+def test_the_evidence_says_when_the_assembled_arm_is_the_start(tmp_path):
+    cfg = graded_sweep(tmp_path, modes=["instant", "thinking"],
+                       picks={"instant": "writer_reasoning=before_sql", "thinking": "start"})
+    result = propose(cfg)
+    assert evidence(cfg)["confirm"]["same_as_start"] is True and "start's settings" in result["m"]["why"]
+
+
+def test_a_metrics_page_with_an_endless_count_counts_as_none(stub_model):
+    endless = stub_model()
+    endless.running = float("inf")
+    assert server_running(endless.url) is None
+
+
+def test_a_report_reads_no_repeats_from_another_configs_sweep(tmp_path):
+    cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0)})
+    cfg = load_config(rewrite(cfg, sweep={"repeats": "auto"}))   # its sweep.json holds the earlier config's record
+    with pytest.raises(SweepConfigError, match="another config"):
+        report(cfg, "screen", controls=False)

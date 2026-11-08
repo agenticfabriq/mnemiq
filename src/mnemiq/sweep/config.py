@@ -367,6 +367,10 @@ class SweepConfig(BaseModel):
         names = [control.name for control in self.control]
         if len(set(names)) != len(names):
             raise ValueError("[[control]] names one control twice")
+        if self.search.strategy != "check" and self.dataset.held_out == 0:
+            raise ValueError(f"[dataset] held_out is 0, and a search (strategy {self.search.strategy!r}) confirms its "
+                             "pick on held-out questions: set held_out above 0, or use check mode ([search] strategy "
+                             '= "check"), which holds none out')
         return self
 
 
@@ -399,7 +403,16 @@ def load_config(path: str | os.PathLike) -> SweepConfig:
     cfg._path = path
     for db_id in _deployment_ids(cfg):
         deployment_settings(cfg, db_id)
-    case_ids = {case.id for case in load_questions(cfg)}
+    cases = load_questions(cfg)
+    case_ids = {case.id for case in cases}
+    if cfg.search.strategy != "check":
+        from mnemiq.sweep.split import split  # the split reads this module
+
+        if not split(cfg, cases)["held_out"]:
+            raise SweepConfigError(f"{path}: [dataset] held_out {cfg.dataset.held_out:g} holds no question of the "
+                                   f"{len(cases)} the question file has (it takes held_out of each group, those with "
+                                   "an answer and those without, rounded down), and a search confirms its pick on "
+                                   "held-out questions: raise held_out or add questions")
     for model in cfg.models:
         _check_start(cfg, model)
     for control in cfg.control:

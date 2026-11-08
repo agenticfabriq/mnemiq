@@ -18,10 +18,20 @@ Check mode compares the start with the engine's defaults for harm alone. It prop
 start's wrong and made-up answers exceed the defaults' by no more than the bounds, the defaults otherwise, and nothing
 unless both arms are valid in every run.
 
-What is written is a profile that ran: the confirmed arm's own file, or the start's or the defaults', renamed to
-`[propose] profile` (the model's name by default). Its version is recomputed by the engine's own loader and version
-function on the file as written, and a proposal whose version is not the one its rows were stamped with is refused. The
-version hashes what a profile resolves to, never its name, so the renaming cannot move it.
+Each of these spans the modes whose start the engine runs: a mode it refuses the start in ran nothing, so the profile
+holds no section for it, and the evidence and its reason name that mode.
+
+What is written is the own file of an arm that ran, renamed to `[propose] profile` (the model's name by default): the
+confirmed arm's, or the start's or the defaults'. Its version is recomputed by the engine's own loader and version
+function, and a proposal whose version is not the one the arm's rows were stamped with is refused. The version hashes
+what a profile resolves to, never its name, so the renaming cannot move it. Where one arm ran in every mode (the
+confirmed arm, the confirm round's start, any arm of a sweep of one mode), that check is made on the file as written.
+Where each mode ran an arm of its own (the start or check mode's arms in a sweep of several modes), the file is put
+together from those arms' files, and each is checked against its own mode's rows; the whole file's version then cannot
+be one a run stamped, since it hashes every mode, and the evidence says the profile was measured mode by mode.
+
+A proposal's two files, the profile and its evidence, are written together or not at all, and a refusal removes an
+earlier proposal's files, so none is left looking current.
 """
 
 from __future__ import annotations
@@ -47,14 +57,14 @@ from mnemiq import redact
 from mnemiq.config import without_credentials
 from mnemiq.profiles import load_profiles, profile_version
 from mnemiq.runtime import source_adapter
-from mnemiq.sweep.arms import Arm, _endpoint, _toml, arm_of, assembled_arm, baselines, check_arms
+from mnemiq.sweep.arms import Arm, _endpoint, _toml, arm_of, assembled_arm, baselines, check_arms, refusal_under
 from mnemiq.sweep.config import (
     ENDPOINT_FACTS, PROPOSAL, SWEEP, SweepConfig, SweepConfigError, fingerprint, load_questions, scrub_credentials,
 )
 from mnemiq.sweep.plan import _ROUNDS_OF, TIMING_CASES, unpinned_sources
 from mnemiq.sweep.report import decided_repeats, report
 from mnemiq.sweep.run import (
-    PROFILE, ROWS, _first_round, _replace, _rows_so_far, _write_json, arm_folder, engine_build,
+    PROFILE, ROWS, _first_round, _replace, _rows_so_far, _say, _write_json, arm_folder, engine_build,
 )
 from mnemiq.sweep.split import PARTS, saved_split
 from mnemiq.sweep.stats import detectable_gain, holm
@@ -66,6 +76,9 @@ EVIDENCE = "evidence.json"
 CHECKS = "checks.jsonl"
 LOADS = "load.jsonl"
 LOAD_EVERY_S = 30.0
+# How long the timing round waits for the machine's load to fall first, and how often it reads it meanwhile.
+LOAD_WAIT_S = 300.0
+LOAD_WAIT_EVERY_S = 15.0
 _METRICS_TIMEOUT_S = 2.0
 _METRICS_BYTES = 4 * 1024 * 1024
 _RUNNING = re.compile(r"^vllm:num_requests_running(?:\{[^}]*\})?\s+(\S+)", re.MULTILINE)
@@ -97,13 +110,38 @@ def server_running(base_url: str) -> int | None:
     found = _RUNNING.findall(b"".join(chunks).decode("utf-8", errors="replace"))
     try:
         return round(sum(float(value) for value in found)) if found else None
-    except ValueError:
+    except (ValueError, OverflowError):  # a count that is not a number, or not a finite one
         return None
 
 
 def machine_load() -> tuple[float, int]:
     """The sweep machine's 1-minute load average, and its core count."""
     return os.getloadavg()[0], os.cpu_count() or 1
+
+
+def quiet_machine(*, load=None, clock=None, sleep=None) -> bool:
+    """Wait up to `LOAD_WAIT_S` for the sweep machine's 1-minute load (`machine_load`, or `load`) to fall under its
+    core count, reading it every `LOAD_WAIT_EVERY_S`, and say so. The load average lags the work that raised it, so
+    without the wait the parallel rounds just before would cost the first timed reading. True once the load is under
+    the cores; False when it never fell, and the timing round goes on, its checks deciding what is taken. `clock` and
+    `sleep` default to `time.monotonic` and `time.sleep`."""
+    read, clock, sleep = load or machine_load, clock or time.monotonic, sleep or time.sleep
+    limit, every = LOAD_WAIT_S, LOAD_WAIT_EVERY_S
+    current, cores = read()
+    if current < cores:
+        return True
+    _say(f"The machine's 1-minute load is {current:.1f} on {cores} cores: waiting up to {limit:g} s for it to fall "
+         "before the timing round.")
+    started = clock()
+    while clock() - started < limit:
+        sleep(every)
+        current, cores = read()
+        if current < cores:
+            _say(f"The load is {current:.1f} after {clock() - started:.0f} s of waiting; the timing round starts.")
+            return True
+    _say(f"The load is still {current:.1f} on {cores} cores after {limit:g} s: timing anyway, and a reading the load "
+         "fails is not taken.")
+    return False
 
 
 @dataclass(frozen=True)
@@ -334,65 +372,111 @@ def pick(cfg: SweepConfig, model: str, mode: str) -> Arm | None:
     return None if entry is None else _arm_of(model, mode, entry)
 
 
+# --- the modes the start runs in ---------------------------------------------------------------------------------------
+
+
+def _running(cfg: SweepConfig, model: str, deployments=None) -> tuple[list[str], dict[str, str]]:
+    """The modes whose start the engine runs for `model`, in the config's order, and why it refuses the start in each
+    other one. These are the modes the first round ran, and the ones the confirm round and the proposal span."""
+    deployments = baselines(cfg) if deployments is None else deployments
+    running, refused = [], {}
+    for mode in cfg.modes:
+        why = refusal_under(cfg, arm_of(model, mode, {}), deployments)
+        if why is None:
+            running.append(mode)
+        else:
+            refused[mode] = why
+    return running, refused
+
+
+def _refused_note(refused: dict[str, str]) -> str:
+    """What the reason says of the modes whose start the engine refuses, or nothing."""
+    if not refused:
+        return ""
+    named = "; ".join(f"{mode}: {why}" for mode, why in refused.items())
+    modes = " and ".join(refused)
+    return (f" The engine refuses the start in {modes} ({named}), so nothing ran there, and the profile holds no section "
+            f"for {modes}, which runs at the engine's own settings for that mode.")
+
+
+def _refused_everywhere(refused: dict[str, str]) -> str:
+    named = "; ".join(f"{mode}: {why}" for mode, why in refused.items())
+    return f"Nothing is proposed: the engine refuses the start in every mode ({named}), so nothing ran."
+
+
 # --- the confirm round -------------------------------------------------------------------------------------------------
 
 
-def _confirming(cfg: SweepConfig, model: str, judged: dict, timing: dict) -> tuple[Arm | None, Arm, dict, list[str]]:
+def _confirming(cfg: SweepConfig, model: str, judged: dict, timing: dict,
+                running: Sequence[str]) -> tuple[Arm | None, Arm | None, dict, list[str]]:
     """The assembled arm the confirm round measures for `model` (None when no mode has a candidate), the start it is
-    measured against, each in every mode, each mode's pick (None for the start) and what decided it, and the
-    profile-wide settings the picks disagreed on."""
-    picks = {mode: _pick(judged[(model, mode)], timing.get((model, mode))) for mode in cfg.modes}
-    start = replace(arm_of(model, cfg.modes[0], {}, round="confirm"), modes=tuple(cfg.modes))
+    measured against (None when the engine runs the start in no mode), each in every mode of `running`, each of those
+    modes' pick (None for the start) and what decided it, and the profile-wide settings the picks disagreed on."""
+    picks = {mode: _pick(judged[(model, mode)], timing.get((model, mode))) for mode in running}
+    if not running:
+        return None, None, picks, []
+    start = replace(arm_of(model, running[0], {}, round="confirm"), modes=tuple(running))
     if not any(entry for entry, _ in picks.values()):
         return None, start, picks, []
     arms = {mode: _arm_of(model, mode, entry) if entry else arm_of(model, mode, {}) for mode, (entry, _) in picks.items()}
-    assembled, conflicts = assembled_arm(cfg, model, arms)
+    assembled, conflicts = assembled_arm(cfg, model, arms, modes=running)
     return assembled, start, picks, conflicts
 
 
 def after_search(sweep, until: str | None) -> None:
     """The rounds that follow a search, driven through `run`'s rounds (`sweep`: its `cfg`, `state`, `parts`, `job`,
-    `drain`, `halted` and `save`), then the sweep's record says it has finished. Check mode has neither round.
+    `drain`, `halted` and `save`), then the sweep's record says it has finished. Check mode has neither round, and a
+    sweep whose start the engine refuses in every mode has nothing to time or confirm.
 
     The timing round runs, for each model and mode with a candidate, the start and each candidate tied on the most right
-    answers, once each, alone, on the first `TIMING_CASES` cases to tune on. Before each case the worker checks the
-    server and the machine (`TimingCheck`), and the machine's load is sampled while the run lasts. With `until` set to
-    "timing", nothing follows it.
+    answers, once each, alone, on the first `TIMING_CASES` cases to tune on. It first waits, a bounded while, for the
+    machine's load to fall (`quiet_machine`). Before each case the worker checks the server and the machine
+    (`TimingCheck`), and the machine's load is sampled while the run lasts. With `until` set to "timing", nothing
+    follows it.
 
     The confirm round then runs, for each model with a candidate in any mode, the one profile assembled from each mode's
-    pick and the start, each in every mode, on the held-out cases, once per repeat.
+    pick and the start, each in every mode whose start the engine runs, on the held-out cases, once per repeat.
     """
     cfg = sweep.cfg
     if cfg.search.strategy != "check":
-        repeats = decided_repeats(cfg, sweep.state)
-        judged = _judged(cfg, _tuning_records(cfg, repeats))
-        cases = sweep.parts["tuning"][:TIMING_CASES]
-        for arms in _timed(cfg, judged).values():
-            for arm in arms:
-                folder = arm_folder(cfg, arm, 1)
-                job = sweep.job(arm, 1, cases=cases,
-                                before=TimingCheck(cfg.models[arm.model].llm_base_url, str(folder / CHECKS)))
-                running = job.left() > 0
-                if running:
-                    folder.mkdir(parents=True, exist_ok=True)
-                with _sampling(folder / LOADS) if running else nullcontext():
-                    sweep.drain(deque([job]), parallel=1)
-                if sweep.halted:
-                    return
-        if until == "timing":
-            return
-        timing = _timing(cfg, judged)
-        jobs = []
-        for model in cfg.models:
-            assembled, start, _, _ = _confirming(cfg, model, judged, timing)
-            if assembled is not None:
-                jobs += [sweep.job(arm, repeat, cases=sweep.parts["held_out"])
-                         for repeat in range(1, repeats + 1) for arm in (start, assembled)]
-        sweep.drain(deque(jobs))
-        if sweep.halted:
+        deployments = baselines(cfg)
+        running = {model: _running(cfg, model, deployments)[0] for model in cfg.models}
+        if any(running.values()) and not _time_and_confirm(sweep, until, running):
             return
     sweep.state["finished"] = True
     sweep.save()
+
+
+def _time_and_confirm(sweep, until: str | None, running: dict[str, list[str]]) -> bool:
+    """The timing round, then (unless `until` is "timing") the confirm round; True when both ran to their end."""
+    cfg = sweep.cfg
+    repeats = decided_repeats(cfg, sweep.state)
+    judged = _judged(cfg, _tuning_records(cfg, repeats))
+    cases = sweep.parts["tuning"][:TIMING_CASES]
+    timed = [sweep.job(arm, 1, cases=cases, before=TimingCheck(cfg.models[arm.model].llm_base_url,
+                                                                str(arm_folder(cfg, arm, 1) / CHECKS)))
+             for arms in _timed(cfg, judged).values() for arm in arms]
+    if any(job.left() for job in timed):
+        quiet_machine()
+    for job in timed:
+        running_now = job.left() > 0
+        if running_now:
+            job.folder.mkdir(parents=True, exist_ok=True)
+        with _sampling(job.folder / LOADS) if running_now else nullcontext():
+            sweep.drain(deque([job]), parallel=1)
+        if sweep.halted:
+            return False
+    if until == "timing":
+        return False
+    timing = _timing(cfg, judged)
+    jobs = []
+    for model in cfg.models:
+        assembled, start, _, _ = _confirming(cfg, model, judged, timing, running[model])
+        if assembled is not None:
+            jobs += [sweep.job(arm, repeat, cases=sweep.parts["held_out"])
+                     for repeat in range(1, repeats + 1) for arm in (start, assembled)]
+    sweep.drain(deque(jobs))
+    return not sweep.halted
 
 
 def _confirm_failure(cfg: SweepConfig, start: dict | None, arm: dict | None, runs: int) -> str | None:
@@ -444,12 +528,13 @@ def _renamed(path: Path, name: str) -> str:
     return renamed
 
 
-def _merged(cfg: SweepConfig, texts: dict[str, str], name: str) -> str:
+def _merged(texts: dict[str, str], name: str, modes: Sequence[str]) -> str:
     """One profiles file from each mode's own, each renamed to `name`: the profile-wide lines they all hold, then each
-    mode's section from that mode's file. Refused when the files disagree on a profile-wide line."""
+    mode's section from that mode's file, in the order of `modes`. Refused when the files disagree on a profile-wide
+    line."""
     head = f"[profiles.{_toml(name)}."
     shared, sections = set(), []
-    for mode in cfg.modes:
+    for mode in modes:
         lines = texts[mode].splitlines(keepends=True)
         starts = [number for number, line in enumerate(lines) if line.startswith(head)]
         if len(starts) != 1 or lines[starts[0]].rstrip("\n") != f"{head}{mode}]":
@@ -461,9 +546,9 @@ def _merged(cfg: SweepConfig, texts: dict[str, str], name: str) -> str:
                                "holds what each mode measured")
     merged = shared.pop() + "\n".join(sections)
     whole = tomllib.loads(merged)["profiles"][name]
-    for mode in cfg.modes:
+    for mode in modes:
         own = tomllib.loads(texts[mode])["profiles"][name]
-        if {key: value for key, value in whole.items() if key not in cfg.modes} | {mode: whole[mode]} != own:
+        if {key: value for key, value in whole.items() if key not in modes} | {mode: whole[mode]} != own:
             raise SweepConfigError(f"the merged profile does not hold what {mode} measured")
     return merged
 
@@ -521,59 +606,88 @@ def _agrees(recomputed: dict, stamped: dict) -> bool:
     return all(recomputed.get(db_id) == version for db_id, version in stamped.items())
 
 
-def _write_profile(cfg: SweepConfig, model: str, arms: tuple[Arm, ...] | None, repeats: int) -> dict:
-    """Write `model`'s proposed profiles file from the own files of `arms`, which ran: one arm in every mode, or one
-    arm for each mode, merged. None removes any file an earlier proposal left, since nothing is proposed now.
+_REFUSAL = ("the version the engine gives the profile file {what} is not the one its rows were stamped with: the file "
+            "is not the profile that was measured, so it is not proposed")
 
-    Each arm's file is checked first: the version the engine recomputes on it must be the one its rows were stamped
-    with. For one arm measured in every mode, the version recomputed on the file written must be that same version.
-    Returns what the evidence says of the file."""
-    path = Path(cfg.sweep.out) / PROPOSAL / model / PROFILES
+
+@dataclass(frozen=True)
+class _Draft:
+    """A proposed profiles file, every check made on a draft of it before anything is written: its text, the version
+    each deployment's engine gives it, and what the evidence says of it. No text when nothing is proposed."""
+
+    text: str | None
+    versions: dict
+    shown: dict
+
+
+def _draft(cfg: SweepConfig, model: str, arms: tuple[Arm, ...] | None, repeats: int, modes: Sequence[str]) -> _Draft:
+    """`model`'s proposed profiles file, from the own files of `arms`, which ran: one arm in every mode of `modes`, or
+    one arm for each, merged. Each arm's file is checked: the version the engine recomputes on it must be the one its
+    rows were stamped with, and for one arm in every mode that is checked on the draft of the file to be written."""
     if arms is None:
-        path.unlink(missing_ok=True)
-        return {"profile": None, "measured": None, "version": None, "confirmed_arm_version": None}
+        return _Draft(None, {}, {"profile": None, "measured": None, "profile_from": [], "version": None,
+                                 "confirmed_arm_version": None})
     name = cfg.propose.profile or model
     texts = [(arm, _renamed(arm_folder(cfg, arm, 1) / PROFILE, name)) for arm in arms]
     whole = len(arms) == 1
-    if whole and arms[0].modes != tuple(cfg.modes):
-        raise SweepConfigError(f"{arms[0].label} ran in {', '.join(arms[0].modes)} alone, not in every mode")
-    text = texts[0][1] if whole else _merged(cfg, {arm.mode: own for arm, own in texts}, name)
+    if whole and arms[0].modes != tuple(modes):
+        raise SweepConfigError(f"{arms[0].label} ran in {', '.join(arms[0].modes)}, not in {', '.join(modes)}")
+    text = texts[0][1] if whole else _merged({arm.mode: own for arm, own in texts}, name, modes)
     dialects: dict = {}
-    refusal = ("the version the engine gives the profile file {what} is not the one its rows were stamped with: the "
-               "file is not the profile that was measured, so it is not proposed")
     measured: dict[str, dict] = {}
     with tempfile.TemporaryDirectory(prefix="mnemiq-sweep-proposal-") as scratch:
         draft = Path(scratch) / PROFILES
         draft.write_text(text, encoding="utf-8")
-        expected = _versions(cfg, draft, dialects)
+        versions = _versions(cfg, draft, dialects)
         if whole:
             measured[arms[0].mode] = _stamped(cfg, arms[0], repeats)
-            if not _agrees(expected, measured[arms[0].mode]):
-                raise SweepConfigError(refusal.format(what=f"of {arms[0].label} in the {arms[0].round} round"))
+            if not _agrees(versions, measured[arms[0].mode]):
+                raise SweepConfigError(_REFUSAL.format(what=f"of {arms[0].label} in the {arms[0].round} round"))
         for arm, own in texts if not whole else ():
             own_path = Path(scratch) / f"own-{arm.mode}.toml"
             own_path.write_text(own, encoding="utf-8")
             measured[arm.mode] = _stamped(cfg, arm, repeats, arm.mode)
             if not _agrees(_versions(cfg, own_path, dialects), measured[arm.mode]):
-                raise SweepConfigError(refusal.format(what=f"of {arm.label} in the {arm.round} round, in {arm.mode}"))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _replace(path, text)
-    written = _versions(cfg, path, dialects)  # on the file as written
-    if written != expected:
-        path.unlink()
-        raise SweepConfigError(refusal.format(what="as written"))
-    shown = {"profile": name, "measured": "whole" if whole else "mode by mode", "version": _shown(written),
-             "confirmed_arm_version": _shown(measured[arms[0].mode]) if whole else None}
+                raise SweepConfigError(_REFUSAL.format(what=f"of {arm.label} in the {arm.round} round, in {arm.mode}"))
+    shown = {"profile": name, "measured": "whole" if whole else "mode by mode",
+             "profile_from": [{"round": arm.round, "arm": arm.profile_id, "modes": list(arm.modes)} for arm in arms],
+             "version": _shown(versions), "confirmed_arm_version": _shown(measured[arms[0].mode]) if whole else None}
     if not whole:
-        shown["measured_versions"] = {mode: _shown(versions) for mode, versions in measured.items()}
-    return shown
+        shown["measured_versions"] = {mode: _shown(each) for mode, each in measured.items()}
+    return _Draft(text, versions, shown)
+
+
+def _folder(cfg: SweepConfig, model: str) -> Path:
+    return Path(cfg.sweep.out) / PROPOSAL / model
+
+
+def _withdraw(cfg: SweepConfig) -> None:
+    """Remove every proposal file an earlier `propose` left: after a refusal, none may look current."""
+    for model in cfg.models:
+        for name in (PROFILES, EVIDENCE):
+            (_folder(cfg, model) / name).unlink(missing_ok=True)
+
+
+def _write(cfg: SweepConfig, model: str, draft: _Draft, evidence: dict) -> None:
+    """Write `model`'s two proposal files: the profile (or none, removing an earlier one) and then its evidence. The
+    version is recomputed on the profile as written, and must be the draft's."""
+    folder = _folder(cfg, model)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / EVIDENCE).unlink(missing_ok=True)  # until the profile beside it is written and checked
+    if draft.text is None:
+        (folder / PROFILES).unlink(missing_ok=True)
+    else:
+        _replace(folder / PROFILES, draft.text)
+        if _versions(cfg, folder / PROFILES, {}) != draft.versions:
+            raise SweepConfigError(_REFUSAL.format(what="as written"))
+    _write_json(folder / EVIDENCE, evidence)
 
 
 # --- the proposal ------------------------------------------------------------------------------------------------------
 
 
 def _finished(cfg: SweepConfig) -> dict:
-    """The sweep's record, refused unless the sweep was run under this config and engine build and has finished."""
+    """The sweep's record, refused unless the sweep was run under this config and has finished."""
     record = Path(cfg.sweep.out) / SWEEP
     if not record.exists():
         raise SweepConfigError(f"{cfg.sweep.out} holds no sweep ({SWEEP}): run the sweep before proposing from it")
@@ -581,10 +695,6 @@ def _finished(cfg: SweepConfig) -> dict:
     if state.get("fingerprint") != fingerprint(cfg):
         raise SweepConfigError(f"{record}: this sweep was run under another config. The rule a proposal applies is part "
                                "of the config, so it is read under the config the sweep ran under, or not at all.")
-    started = str((state.get("engine_build") or {}).get("source_sha"))
-    if started != engine_build()["source_sha"]:
-        raise SweepConfigError(f"{record}: this sweep was run under another engine build (source {started[:12]}), and "
-                               "a profile's version is the engine's: propose under the build it ran under")
     if not state.get("finished"):
         stop = f" (it stopped: {state['stopped']})" if state.get("stopped") in ("budget", "endpoint", "worker") else ""
         raise SweepConfigError(f"{record}: the sweep has not finished its rounds{stop}. Run it again: it resumes where "
@@ -593,7 +703,19 @@ def _finished(cfg: SweepConfig) -> dict:
     return state
 
 
-def _head(cfg: SweepConfig, model: str, state: dict, repeats: int) -> dict:
+def _build_warning(state: dict, packaged: dict) -> list[str]:
+    """A warning when the engine packaging the proposal is not the one the arms ran on: the rows were measured on the
+    latter, and the version check still guards the file."""
+    ran = str((state.get("engine_build") or {}).get("source_sha"))
+    if ran == packaged["source_sha"]:
+        return []
+    return [f"The sweep's arms ran on engine build {ran[:12]} (by source), and this proposal is packaged by build "
+            f"{packaged['source_sha'][:12]}. The rows were measured on the first. The profile's version is recomputed by "
+            "this one and must still be the one the rows were stamped with, so a change to what the profile resolves "
+            "to is refused."]
+
+
+def _head(cfg: SweepConfig, model: str, state: dict, repeats: int, packaged: dict) -> dict:
     """What every proposal's evidence opens with: the sweep, who asked, where, on what, and by which rule."""
     parts = saved_split(cfg)
     endpoints = {name: without_credentials(value) if isinstance(value, str) and name.endswith("_url") else value
@@ -607,6 +729,7 @@ def _head(cfg: SweepConfig, model: str, state: dict, repeats: int) -> dict:
         "model": model,
         "sweep": {"name": cfg.sweep.name, "fingerprint": state["fingerprint"], "engine_build": state["engine_build"],
                   "split_seed": cfg.dataset.split_seed},
+        "packaged_by": packaged,
         "identity": cfg.dataset.identity.model_dump(),
         "endpoints": endpoints,
         "split": {part: {"cases": len(parts[part]), "answerable": sum(case.answerable for case in parts[part])}
@@ -638,12 +761,14 @@ def _unmeasured(run: dict, max_errors: int) -> str:
     return f"run {run['run']} is not valid"
 
 
-def _check(cfg: SweepConfig, model: str, records: Sequence[dict]) -> dict:
-    """Check mode's verdict for `model`: the start, the defaults, or nothing."""
+def _check(cfg: SweepConfig, model: str, records: Sequence[dict], running: Sequence[str],
+           refused: dict[str, str]) -> dict:
+    """Check mode's verdict for `model`, over the modes whose start the engine runs: the start, the defaults, or
+    nothing."""
     bounds = cfg.propose
     numbers, invalid, harm = {}, [], []
-    valid = {"start", "defaults"}
-    for mode in cfg.modes:
+    valid = {"start", "defaults"} if running else set()
+    for mode in running:
         found = {arm: next((record for record in records if (record["model"], record["mode"], record["arm"])
                             == (model, mode, arm)), None) for arm in ("start", "defaults")}
         for arm, record in found.items():
@@ -665,7 +790,9 @@ def _check(cfg: SweepConfig, model: str, records: Sequence[dict]) -> dict:
                  or each["more_made_up"] > bounds.max_more_made_up]
         numbers[mode] = {"start": found["start"]["runs"], "defaults": found["defaults"]["runs"],
                          "start_against_defaults": apart}
-    if invalid:
+    if not running:
+        rule, why = None, _refused_everywhere(refused)
+    elif invalid:
         rule, why = None, ("Nothing is proposed: " + "; ".join(invalid) + ". Check mode proposes only between two "
                            "arms valid in every run.")
     elif harm:
@@ -674,58 +801,66 @@ def _check(cfg: SweepConfig, model: str, records: Sequence[dict]) -> dict:
     else:
         rule, why = "start", ("The start is proposed: in every mode and run its wrong and made-up answers exceed the "
                               "defaults' by no more than [propose] allows. Both arms' right answers are in the evidence.")
+    if running:
+        why += _refused_note(refused)
     return {"rule": rule, "why": why, "check": numbers, "valid": valid}
 
 
-def _check_arms(cfg: SweepConfig, model: str, profile_id: str) -> tuple[Arm, ...]:
-    return tuple(arm for mode in cfg.modes for arm in check_arms(cfg)
+def _check_arms(cfg: SweepConfig, model: str, profile_id: str, modes: Sequence[str]) -> tuple[Arm, ...]:
+    return tuple(arm for mode in modes for arm in check_arms(cfg)
                  if (arm.model, arm.mode, arm.profile_id) == (model, mode, profile_id))
 
 
-def _first_starts(cfg: SweepConfig, model: str) -> tuple[Arm, ...]:
-    """The start of `model` in each mode, as the first round ran it."""
-    return tuple(arm_of(model, mode, {}, round=_first_round(cfg)) for mode in cfg.modes)
+def _first_starts(cfg: SweepConfig, model: str, modes: Sequence[str]) -> tuple[Arm, ...]:
+    """The start of `model` in each of `modes`, as the first round ran it."""
+    return tuple(arm_of(model, mode, {}, round=_first_round(cfg)) for mode in modes)
 
 
 def _search(cfg: SweepConfig, model: str, state: dict, judged: dict, timing: dict, confirm: Sequence[dict],
-            repeats: int) -> dict:
-    """The rule's verdict for `model` in a sweep that searched, with what its evidence shows."""
+            repeats: int, running: list[str], refused: dict[str, str]) -> dict:
+    """The rule's verdict for `model` in a sweep that searched, over the modes whose start the engine runs, with what
+    its evidence shows."""
     room = state.get("room", {}).get(model, {})
-    no_room = [mode for mode in cfg.modes if room.get(mode, {}).get("stopped") == "no room"]
-    assembled, start, picks, conflicts = _confirming(cfg, model, judged, timing)
+    no_room = [mode for mode in running if room.get(mode, {}).get("stopped") == "no room"]
+    assembled, start, picks, conflicts = _confirming(cfg, model, judged, timing, running)
+    note = _refused_note(refused)
     verdict = {
         "picks": {mode: entry["label"] if entry else "start" for mode, (entry, _) in picks.items()},
         "picked_by": {mode: how for mode, (entry, how) in picks.items() if entry},
         "conflicts": conflicts, "failed_mode": None, "confirm": None, "numbers": None, "room": room,
-        "holm": {mode: judged[(model, mode)]["compared"] for mode in cfg.modes},
+        "holm": {mode: judged[(model, mode)]["compared"] for mode in running},
         "candidates": {mode: {"compared": judged[(model, mode)]["compared"],
                               "start": (judged[(model, mode)]["start"] or {}).get("runs"),
-                              "arms": judged[(model, mode)]["arms"]} for mode in cfg.modes},
-        "timing": {mode: timing[(model, mode)] for mode in cfg.modes if (model, mode) in timing},
+                              "arms": judged[(model, mode)]["arms"]} for mode in running},
+        "timing": {mode: timing[(model, mode)] for mode in running if (model, mode) in timing},
         # The start's own file: the confirm round's, measured in every mode, when that round ran.
-        "start_arms": (start,) if assembled is not None else _first_starts(cfg, model),
-        "start_valid": all((judged[(model, mode)]["start"] or {}).get("valid") for mode in cfg.modes),
-        "assembled": None,
+        "start_arms": (start,) if assembled is not None else _first_starts(cfg, model, running),
+        "start_valid": bool(running) and all((judged[(model, mode)]["start"] or {}).get("valid") for mode in running),
+        "assembled": None, "assembled_valid": False,
     }
-    if len(no_room) == len(cfg.modes):
+    if not running:
+        return verdict | {"rule": None, "rule_arms": None, "confirmed": None, "why": _refused_everywhere(refused)}
+    if len(no_room) == len(running):
         return verdict | {"rule": "start", "rule_arms": verdict["start_arms"], "confirmed": None,
                           "why": "There was no room to search in any mode: the start missed fewer of the questions to "
                                  "tune on than an arm must gain to win, so no arm could beat it, and the start is "
-                                 "proposed. Check mode compares it with the engine's defaults for harm."}
+                                 "proposed. Check mode compares it with the engine's defaults for harm." + note}
     if assembled is None:
-        unmeasured = [mode for mode in cfg.modes if not (judged[(model, mode)]["start"] or {}).get("valid")]
+        unmeasured = [mode for mode in running if not (judged[(model, mode)]["start"] or {}).get("valid")]
         said = [f"{mode}: the start is not valid, so no arm could be compared with it" for mode in unmeasured]
-        said += [f"{mode}: {judged[(model, mode)]['compared']} arms compared with the start" for mode in cfg.modes
+        said += [f"{mode}: {judged[(model, mode)]['compared']} arms compared with the start" for mode in running
                  if mode not in no_room and mode not in unmeasured]
         said += [f"{mode}: no room to search" for mode in no_room]
+        said += [f"{mode}: the engine refuses the start" for mode in refused]
         return verdict | {"rule": "start", "rule_arms": verdict["start_arms"], "confirmed": None,
                           "why": f"No arm beat the start beyond noise ({'; '.join(said)}; exact McNemar test, Holm's "
-                                 f"correction at alpha {cfg.propose.alpha:g}), so the start is proposed."}
-    numbers, failures = {}, {}
-    for mode in cfg.modes:
+                                 f"correction at alpha {cfg.propose.alpha:g}), so the start is proposed." + note}
+    numbers, failures, valid = {}, {}, []
+    for mode in running:
         mine = {arm: next((record for record in confirm if (record["model"], record["mode"], record["arm"])
                            == (model, mode, arm)), None) for arm in ("start", assembled.profile_id)}
         held_start, held_arm = mine["start"], mine[assembled.profile_id]
+        valid.append(held_arm is not None and held_arm["valid"])
         entry = picks[mode][0]
         numbers[mode] = {
             "held_out": {"start": held_start and held_start["runs"], "arm": held_arm and held_arm["runs"],
@@ -736,39 +871,47 @@ def _search(cfg: SweepConfig, model: str, state: dict, judged: dict, timing: dic
         }
         if (failure := _confirm_failure(cfg, held_start, held_arm, repeats)) is not None:
             failures[mode] = failure
-    failed = next((mode for mode in cfg.modes if mode in failures), None)
-    verdict |= {"numbers": numbers, "failed_mode": failed, "assembled": assembled,
+    failed = next((mode for mode in running if mode in failures), None)
+    same = not assembled.changes
+    verdict |= {"numbers": numbers, "failed_mode": failed, "assembled": assembled, "assembled_valid": all(valid),
                 "confirm": {"label": assembled.label, "arm": assembled.profile_id, "changes": dict(assembled.changes),
-                            "modes": list(assembled.modes), "passed": failed is None}}
+                            "modes": list(assembled.modes), "same_as_start": same, "passed": failed is None}}
     shown = ", ".join(f"{mode}: {label}" for mode, label in verdict["picks"].items())
+    lost = (" Every pick's change was lost to a conflict between the modes, so the profile holds the start's settings."
+            if same else "")
     if failed is None:
         return verdict | {"rule": assembled.label, "rule_arms": (assembled,), "confirmed": True,
                           "why": f"{assembled.label} is the one profile assembled from each mode's pick ({shown}), and "
                                  "it was confirmed on the held-out part in every mode and run: valid, with at least "
                                  "the start's right answers and no more wrong or made-up answers than [propose] "
-                                 "allows."}
+                                 f"allows.{lost}{note}"}
     return verdict | {"rule": "start", "rule_arms": (start,), "confirmed": False,
                       "why": f"The one profile assembled from each mode's pick ({shown}) failed on the held-out part in "
                              f"{failed}: {failures[failed]}. No other candidate is tried, since that would make the "
-                             "held-out part part of the search, so the start is proposed."}
+                             f"held-out part part of the search, so the start is proposed.{lost}{note}"}
 
 
-def _chosen_arms(cfg: SweepConfig, model: str, verdict: dict, chosen: str) -> tuple[tuple[Arm, ...], bool]:
+def _chosen_arms(cfg: SweepConfig, model: str, verdict: dict, chosen: str,
+                 running: Sequence[str]) -> tuple[tuple[Arm, ...], bool]:
     """The arms whose own files make up a person's choice for `model`, and whether that choice is the confirmed arm.
     Refused unless it names an arm that ran and is valid in every run."""
+    if not running:
+        raise SweepConfigError(f"{chosen!r} cannot be chosen for {model}: the engine refuses its start in every mode, "
+                               "so nothing ran")
     if cfg.search.strategy == "check":
         if chosen not in ("start", "defaults") or chosen not in verdict["valid"]:
             raise SweepConfigError(f"{chosen!r} is not an arm of {model} valid in every run: check mode's are "
                                    f"{', '.join(sorted(verdict['valid'])) or 'none'}")
-        return _check_arms(cfg, model, chosen), False
+        return _check_arms(cfg, model, chosen, running), False
     if chosen == "start":
         if not verdict["start_valid"]:
             raise SweepConfigError(f"the start of {model} is not valid in every run, so a person cannot choose it")
         return verdict["start_arms"], False
-    if verdict["confirmed"] and chosen == verdict["rule"]:
-        return verdict["rule_arms"], True
+    assembled = verdict["assembled"]
+    if assembled is not None and chosen == assembled.label and verdict["assembled_valid"]:
+        return (assembled,), bool(verdict["confirmed"])   # it ran in every mode, whether or not it passed
     arms, valid = [], []
-    for mode in cfg.modes:
+    for mode in running:
         entries = verdict["candidates"][mode]["arms"]
         valid += [entry["label"] for entry in entries if entry["valid"]]
         entry = next((entry for entry in entries if entry["label"] == chosen), None)
@@ -790,34 +933,54 @@ def propose(cfg: SweepConfig, chosen: str | None = None) -> dict:
     valid in every run. Its file is written instead, and the evidence says so, whether it is the arm the confirm round
     confirmed, and what the rule picked.
 
-    Refused for a sweep run under another config or engine build, or one that has not finished its rounds. Returns, for
-    each model, what was chosen and by whom, the rule's pick, each mode's pick, the conflicts, the mode that failed the
-    confirm round, why, and the files written.
+    Refused for a sweep run under another config, or one that has not finished its rounds; a refusal removes any
+    proposal files an earlier call left. A proposal packaged by another engine build than the one the arms ran on is
+    written with a warning, its version still checked. Returns, for each model, what was chosen and by whom, the rule's
+    pick, each mode's pick, the conflicts, the mode that failed the confirm round, how the profile was measured, why,
+    any warnings, and the files written.
     """
+    try:
+        return _propose(cfg, chosen)
+    except Exception:
+        _withdraw(cfg)
+        raise
+
+
+def _propose(cfg: SweepConfig, chosen: str | None) -> dict:
     state = _finished(cfg)
-    repeats = decided_repeats(cfg, state)
+    packaged = engine_build()
+    warnings = _build_warning(state, packaged)
+    for warning in warnings:
+        _say(warning)
+    deployments = baselines(cfg)
+    modes = {model: _running(cfg, model, deployments) for model in cfg.models}
+    repeats = decided_repeats(cfg, state) if any(running for running, _ in modes.values()) else 1
     if cfg.search.strategy == "check":
         records = report(cfg, "check", repeats=repeats, controls=False)[1]
-        verdicts = {model: _check(cfg, model, records) for model in cfg.models}
+        verdicts = {model: _check(cfg, model, records, *modes[model]) for model in cfg.models}
         for model, verdict in verdicts.items():
-            arms = _check_arms(cfg, model, verdict["rule"]) if verdict["rule"] else None
+            arms = _check_arms(cfg, model, verdict["rule"], modes[model][0]) if verdict["rule"] else None
             verdict |= {"rule_arms": arms, "confirmed": None, "picks": {}, "conflicts": [], "failed_mode": None}
     else:
         judged = _judged(cfg, _tuning_records(cfg, repeats))
         timing = _timing(cfg, judged)
         confirm = report(cfg, "confirm", repeats=repeats, controls=False)[1]
-        verdicts = {model: _search(cfg, model, state, judged, timing, confirm, repeats) for model in cfg.models}
-    picked = {model: _chosen_arms(cfg, model, verdict, chosen) for model, verdict in verdicts.items()} if chosen else {}
-    results = {}
+        verdicts = {model: _search(cfg, model, state, judged, timing, confirm, repeats, *modes[model])
+                    for model in cfg.models}
+    written = {}
     for model, verdict in verdicts.items():
-        arms, confirmed = picked[model] if chosen else (verdict["rule_arms"], bool(verdict["confirmed"]))
-        name = chosen if chosen else verdict["rule"]
-        why = verdict["why"] if not chosen else (f"A person chose {chosen}{' (the arm confirmed)' if confirmed else ''}. "
-                                                 f"The rule's own pick is {verdict['rule']}: {verdict['why']}")
-        evidence = _head(cfg, model, state, repeats) | {
-            "chosen": name, "chosen_by": "person" if chosen else "rule", "rule_pick": verdict["rule"],
-            "confirmed": confirmed, "why": why, "picks": verdict["picks"], "conflicts": verdict["conflicts"],
-            "failed_mode": verdict["failed_mode"],
+        running, refused = modes[model]
+        if chosen:
+            arms, confirmed = _chosen_arms(cfg, model, verdict, chosen, running)
+            why = (f"A person chose {chosen}{' (the arm confirmed)' if confirmed else ''}. The rule's own pick is "
+                   f"{verdict['rule']}: {verdict['why']}")
+        else:
+            arms, confirmed, why = verdict["rule_arms"], bool(verdict["confirmed"]), verdict["why"]
+        evidence = _head(cfg, model, state, repeats, packaged) | {
+            "chosen": chosen if chosen else verdict["rule"], "chosen_by": "person" if chosen else "rule",
+            "rule_pick": verdict["rule"], "confirmed": confirmed, "why": why, "warnings": warnings,
+            "picks": verdict["picks"], "conflicts": verdict["conflicts"], "failed_mode": verdict["failed_mode"],
+            "refused_modes": refused,
         }
         if cfg.search.strategy == "check":
             evidence["check"] = verdict["check"]
@@ -825,12 +988,14 @@ def propose(cfg: SweepConfig, chosen: str | None = None) -> dict:
             evidence |= {key: verdict[key] for key in ("room", "holm", "candidates", "timing", "picked_by", "confirm",
                                                         "numbers")}
             evidence["held_out_note"] = _held_out_note(cfg)
-        evidence |= _write_profile(cfg, model, arms, repeats)
-        folder = Path(cfg.sweep.out) / PROPOSAL / model
-        folder.mkdir(parents=True, exist_ok=True)
-        _write_json(folder / EVIDENCE, evidence)
+        draft = _draft(cfg, model, arms, repeats, running)
+        written[model] = (draft, evidence | draft.shown)
+    results = {}
+    for model, (draft, evidence) in written.items():   # every check passed: write each model's two files
+        _write(cfg, model, draft, evidence)
+        folder = _folder(cfg, model)
         results[model] = {key: evidence[key] for key in ("chosen", "chosen_by", "rule_pick", "confirmed", "picks",
-                                                         "conflicts", "failed_mode", "why")}
-        results[model] |= {"profiles_file": str(folder / PROFILES) if arms is not None else None,
+                                                         "conflicts", "failed_mode", "measured", "why", "warnings")}
+        results[model] |= {"profiles_file": str(folder / PROFILES) if draft.text is not None else None,
                            "evidence_file": str(folder / EVIDENCE)}
     return results

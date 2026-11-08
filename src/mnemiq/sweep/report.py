@@ -35,7 +35,9 @@ from mnemiq.contract import IdentityContext, Trace
 from mnemiq.eval.harness import CaseResult, Outcome, run_case
 from mnemiq.runtime import source_adapter
 from mnemiq.sweep.arms import ROUNDS, arm_from_profile
-from mnemiq.sweep.config import SWEEP, Control, SweepConfig, control_answers, deployment_settings, load_questions
+from mnemiq.sweep.config import (
+    SWEEP, Control, SweepConfig, SweepConfigError, control_answers, deployment_settings, fingerprint, load_questions,
+)
 from mnemiq.sweep.plan import TIMING_CASES
 from mnemiq.sweep.run import INVALID, PROFILE, ROWS, _identity, _rows_so_far
 from mnemiq.sweep.split import saved_split, split
@@ -282,13 +284,17 @@ def decided_repeats(cfg: SweepConfig, state: dict | None = None) -> int:
     sweep's record (`state`, by default its `sweep.json`) holds it.
 
     A search that stopped for want of room everywhere ran each start once and never decided, and is read at one run.
-    Raises when nothing has decided yet.
+    Raises when nothing has decided yet, and refuses a `sweep.json` written under another config, whose decision is not
+    this config's to read.
     """
     if isinstance(cfg.sweep.repeats, int):
         return cfg.sweep.repeats
     if state is None:
         record = Path(cfg.sweep.out) / SWEEP
         state = json.loads(record.read_text(encoding="utf-8")) if record.exists() else {}
+        if state and state.get("fingerprint") != fingerprint(cfg):
+            raise SweepConfigError(f"{record}: this sweep was run under another config, so how many runs its arms owe "
+                                   "is not this config's to read. Put the config back, or pass repeats=.")
     if "repeats" in state:
         return state["repeats"]
     if state.get("stopped") == "no room":
