@@ -279,3 +279,13 @@ def test_serve_refuses_the_http_transport():
     with pytest.raises(SystemExit, match="mnemiq serve --http"):
         serve(Settings(mcp_transport="http", tenant="acme", oidc_issuer=ISSUER,
                        oidc_audience="https://mnemiq.example.com/mcp"))
+
+
+def test_the_resolver_refuses_without_a_verified_token():
+    """Outside a verified request the per-call resolver refuses; it has no identity of its own to fall back to. The
+    transport refuses such a request first, so only a direct call reaches this."""
+    from mnemiq.mcp.server import _mcp_classes, http_identity
+
+    _, tool_error = _mcp_classes()
+    with pytest.raises(tool_error, match="no verified token"):
+        http_identity(_config(8123))("db.read")

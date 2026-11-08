@@ -234,3 +234,25 @@ def test_every_refusal_is_logged_with_its_reason(tmp_path, caplog):
     with caplog.at_level(logging.INFO, logger="mnemiq.auth"), pytest.raises(Exception):
         doors.v1(_bearer(mint(claims(tenant="globex"))))
     assert "another tenant" in caplog.text and "user-1" in caplog.text
+
+
+def test_the_binding_key_is_compared_in_constant_time():
+    """`==` would pass every behavioural test here and leak the key's prefix through timing, so this reads the code:
+    the binding check calls hmac.compare_digest, and nothing in the door compares a value with `==` or `!=`."""
+    import ast
+    import inspect
+
+    from mnemiq.auth import doors
+
+    tree = ast.parse(inspect.getsource(doors.HttpDoors._identity).lstrip().replace("    def", "def", 1))
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and n.func.attr == "compare_digest" and isinstance(n.func.value, ast.Name) and n.func.value.id == "hmac"]
+    assert len(calls) == 1
+    compared = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare) and any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
+            for operand in (node.left, *node.comparators):
+                if isinstance(operand, ast.Call) and isinstance(operand.func, ast.Name) and operand.func.id == "len":
+                    continue  # a count, not a value
+                compared |= {name.id for name in ast.walk(operand) if isinstance(name, ast.Name)}
+    assert not compared & {"key", "sent"}, compared
