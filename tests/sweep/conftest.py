@@ -805,7 +805,8 @@ def graded_sweep(tmp_path: Path, *, arms: dict | None = None, grid: dict | None 
 
     cfg = load_config(write_config(tmp_path, deployment=deployment, model=real_profiles, dataset=dataset, space=space,
                                    modes=modes, sweep={"repeats": 1}, **sections))
-    state = _begin(cfg)
+    state = _begin(cfg) | {"starts": {"m": {mode: None for mode in modes}}}   # as the first round's plan records it
+    (out(cfg) / "sweep.json").write_text(json.dumps(state))
     if no_room:
         stopped = {"misses": 0, "needed": None, "compared": 1, "stopped": "no room"}
         state["room"] = {"m": {mode: stopped for mode in no_room}}
@@ -860,7 +861,8 @@ def checked_sweep(tmp_path: Path, *, start: dict, defaults: dict, modes=("instan
     cfg = load_config(write_config(tmp_path, deployment=_idle_deployment(tmp_path), modes=list(modes),
                                    dataset=tiny_dataset(tmp_path, cases=26, answerable=17),
                                    search={"strategy": "check"}, sweep={"repeats": 1}))
-    _begin(cfg)
+    state = _begin(cfg) | {"starts": {"m": {mode: None for mode in modes}}}   # as the first round's plan records it
+    (out(cfg) / "sweep.json").write_text(json.dumps(state))
     for arm in check_arms(cfg):
         spec = start if arm.profile_id == "start" else defaults
         write_run(cfg, arm, checked_rows(arm, _parts(cfg)["tuning"], spec, stamped_version(cfg, arm)))

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from mnemiq.sweep.config import load_config
-from mnemiq.sweep.plan import estimate, render
+from mnemiq.sweep.plan import LOAD_WAIT_S, estimate, render
 
 from .conftest import KEY_ENV, UNREACHABLE, live_postgres_env, tiny_dataset, write_config
 
@@ -36,8 +36,11 @@ def test_the_cost_counts_each_round(tmp_path):
     timing = 2 * 19  # the start and one finalist, once each, alone
     confirm_one = 2 * 7  # the assembled profile and the start, on the held-out part
     assert est.case_runs == {1: screen_one + timing + confirm_one, 2: screen_two + timing + 2 * confirm_one}
-    assert est.hours == {1: pytest.approx(((screen_one + confirm_one) / 2 + timing) * 36 / 3600),
-                         2: pytest.approx(((screen_two + 2 * confirm_one) / 2 + timing) * 36 / 3600)}
+    # The timing round first waits, at most LOAD_WAIT_S, for the machine's load to fall.
+    assert est.hours == {1: pytest.approx(((screen_one + confirm_one) / 2 + timing) * 36 / 3600 + LOAD_WAIT_S / 3600),
+                         2: pytest.approx(((screen_two + 2 * confirm_one) / 2 + timing) * 36 / 3600
+                                          + LOAD_WAIT_S / 3600)}
+    assert "waiting up to 5 minutes" in render(cfg)
 
 
 def test_dollars_wait_for_measured_tokens(tmp_path):

@@ -848,6 +848,7 @@ class _Rounds:
         self.meter = _Meter(cfg) if state is not None else None
         self.dollars_checked = state is not None and self._dollars_checkable()
         if state is not None:
+            self._record_starts(refused)
             self._settle()
 
     # --- what the record says -----------------------------------------------------------------------------------
@@ -855,6 +856,19 @@ class _Rounds:
     def _no_room(self, key: tuple[str, str]) -> bool:
         model, mode = key
         return (self.state or {}).get("room", {}).get(model, {}).get(mode, {}).get("stopped") == "no room"
+
+    def _record_starts(self, refused: Sequence[tuple[Arm, str]]) -> None:
+        """Record in `starts`, for each model and mode, None when the engine runs its start, else why it refuses it. A
+        mode recorded as running stays so: its rows are what the sweep ran, and a proposal reads this record rather
+        than ask the engine again under another environment or build."""
+        record = self.state.setdefault("starts", {})
+        for (model, mode), arms in self.arms.items():
+            known = record.setdefault(model, {})
+            if arms:
+                known[mode] = None
+            elif known.get(mode, "") is not None:
+                known[mode] = next((why for arm, why in refused if (arm.model, arm.mode, arm.profile_id)
+                                    == (model, mode, "start")), "the engine refuses the start")
 
     def _active(self, key: tuple[str, str]) -> bool:
         """Whether `key`'s model and mode still runs arms: the engine runs its start, and it has not run out of room."""
@@ -1169,9 +1183,10 @@ def run(cfg: SweepConfig, until: str | None = None, smoke: int | None = None) ->
     `sweep.json` holds `fingerprint`, `engine_build` and `split_seed`; `repeats`, the runs each arm owes, once the first
     round has decided it or from the start when the config fixes it; `room`, by model and mode, the start's `misses`,
     the gain an arm `needed` (None when none can win), the arms `compared`, and `stopped: "no room"` when the search
-    stopped there; `seconds`, the time the sweep's runs have taken; `stopped`, the sweep's own stop: `"budget"`,
-    `"endpoint"` or `"worker"` (a worker that died), each cleared by the next run, or `"no room"` once every model and
-    mode that searches has stopped for it; and `finished`, true once the strategy's last round has run, which a
+    stopped there; `starts`, by model and mode, None where the engine runs the start, else why it refuses it, as the
+    first round's plan found it (a mode once run stays so); `seconds`, the time the sweep's runs have taken; `stopped`,
+    the sweep's own stop: `"budget"`, `"endpoint"` or `"worker"` (a worker that died), each cleared by the next run, or
+    `"no room"` once every model and mode that searches has stopped for it; and `finished`, true once the strategy's last round has run, which a
     proposal waits for.
 
     A stop for the budget comes before an arm, never during one. When an endpoint stops answering, or a worker dies,

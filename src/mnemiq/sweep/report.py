@@ -299,6 +299,12 @@ def decided_repeats(cfg: SweepConfig, state: dict | None = None) -> int:
         return state["repeats"]
     if state.get("stopped") == "no room":
         return 1
+    starts = state.get("starts")
+    if isinstance(starts, dict) and starts and all(why is not None for known in starts.values()
+                                                   for why in known.values()):
+        reasons = "; ".join(f"{model}, {mode}: {why}" for model, known in starts.items() for mode, why in known.items())
+        raise SweepConfigError(f"no start ran in this sweep: the engine refused the start of every model in every mode "
+                               f"({reasons}), so there is nothing to read")
     raise ValueError('[sweep] repeats is "auto", and the first round has not decided yet how many runs each arm owes: '
                      "pass repeats=, or run the first round to its end")
 

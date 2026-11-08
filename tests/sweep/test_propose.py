@@ -255,9 +255,14 @@ def test_a_mode_whose_start_the_engine_refuses_is_left_out_of_the_profile_confir
     run(cfg)   # ends normally: the confirm round runs where the start runs
     result = propose(cfg)
     assert result["m"]["chosen"] == "writer_rules=none" and evidence(cfg)["confirm"]["modes"] == ["thinking"]
-    assert "min_agreement" in evidence(cfg)["refused_modes"]["instant"] and "instant" in result["m"]["why"]
+    # What the first round's plan recorded, which the proposal reads.
+    assert sweep_json(cfg)["starts"]["m"]["thinking"] is None and "min_agreement" in sweep_json(cfg)["starts"]["m"]["instant"]
+    refused = evidence(cfg)["refused_modes"]["instant"]
+    assert "min_agreement" in refused["why"] and refused["unmeasured_profile_wide"] == {"writer_rules": "none"}
+    # Instant keeps the engine's per-mode settings, yet runs under the profile's writer_rules, never measured there.
+    assert "writer_rules=none" in result["m"]["why"] and "never measured" in result["m"]["why"]
     written = read_profile_file(str(proposal_file(cfg))).profiles["m"]
-    assert written.instant is None and written.thinking is not None
+    assert written.instant is None and written.thinking is not None and written.writer_rules == "none"
 
 
 def test_with_no_candidate_the_start_is_proposed_where_the_engine_runs_it(tmp_path, stub_model):
@@ -278,6 +283,11 @@ def test_when_the_engine_refuses_every_start_the_run_ends_and_propose_says_why(t
     result = propose(cfg)
     assert result["m"]["chosen"] is None and "refuses the start in every mode" in result["m"]["why"]
     assert KEY_ENV in result["m"]["why"] and not proposal_file(cfg).exists()
+    # The report and the pick say that no start ran, not that the first round has yet to decide.
+    with pytest.raises(SweepConfigError, match="no start ran"):
+        report(cfg, "screen", controls=False)
+    with pytest.raises(SweepConfigError, match="no start ran"):
+        pick(cfg, "m", "instant")
 
 
 def test_a_real_sweep_with_no_room_proposes_its_start(tmp_path, stub_model):
@@ -348,3 +358,95 @@ def test_a_report_reads_no_repeats_from_another_configs_sweep(tmp_path):
     cfg = load_config(rewrite(cfg, sweep={"repeats": "auto"}))   # its sweep.json holds the earlier config's record
     with pytest.raises(SweepConfigError, match="another config"):
         report(cfg, "screen", controls=False)
+
+
+def _proposal_files(cfg, model: str = "m") -> dict[str, bytes]:
+    folder = out(cfg) / "proposal" / model
+    return {path.name: path.read_bytes() for path in sorted(folder.iterdir())}
+
+
+def test_the_note_on_refused_modes_reads_right_for_several(tmp_path):
+    note = proposal._refused_note({"instant": "one reason", "deep": "another"}, {"writer_rules": "none",
+                                                                                "assertive_sql": True})
+    assert "instant and deep" in note and "those modes" in note and "each keeps the engine's own per-mode" in note
+    assert "(assertive_sql=true, writer_rules=none) were never measured there" in note
+    one = proposal._refused_note({"instant": "a reason"}, {})
+    assert "that mode" in one and "it keeps" in one and "change nothing from the start" in one
+
+
+def test_a_typo_in_a_persons_choice_leaves_the_earlier_proposal_as_it_was(tmp_path):
+    cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0), "retrieval_k=36": dict(only=2, other=0)})
+    propose(cfg, chosen="retrieval_k=36")
+    before = _proposal_files(cfg)
+    with pytest.raises(SweepConfigError, match="nnoe"):
+        propose(cfg, chosen="writer_rules=nnoe")
+    assert _proposal_files(cfg) == before
+
+
+def test_an_edited_config_leaves_the_earlier_proposal_as_it_was(tmp_path):
+    cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0)})
+    propose(cfg)
+    before = _proposal_files(cfg)
+    with pytest.raises(SweepConfigError, match="another config"):
+        propose(load_config(rewrite(cfg, propose={"alpha": 0.1})))
+    assert _proposal_files(cfg) == before
+
+
+def test_an_unset_key_variable_at_propose_time_is_named_and_changes_nothing(tmp_path, monkeypatch):
+    cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0)})
+    propose(cfg)
+    before = _proposal_files(cfg)
+    monkeypatch.delenv(KEY_ENV)
+    with pytest.raises(SweepConfigError, match=KEY_ENV) as refused:
+        propose(cfg)
+    assert "refuses the start" not in str(refused.value) and _proposal_files(cfg) == before
+
+
+def test_what_ran_is_read_from_the_record_not_checked_again(tmp_path, monkeypatch):
+    cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0)})
+    first = propose(cfg)["m"]
+    # A build whose engine would refuse every start now: the sweep ran them, and the proposal reports what ran.
+    monkeypatch.setattr("mnemiq.sweep.arms.refusal_under", lambda *args, **kwargs: "refused by a later build")
+    monkeypatch.setattr("mnemiq.sweep.propose.refusal_under", lambda *args, **kwargs: "refused by a later build",
+                        raising=False)
+    again = propose(cfg)["m"]
+    assert (again["chosen"], again["picks"]) == (first["chosen"], first["picks"]) == ("writer_rules=none",
+                                                                                     {"instant": "writer_rules=none"})
+    assert evidence(cfg)["refused_modes"] == {}
+
+
+def test_a_model_that_ran_nothing_does_not_block_a_persons_choice_for_another(tmp_path, stub_model, monkeypatch):
+    stub = stub_model(gold_when=lambda request: False)   # wrong everywhere, so m's start leaves room to search
+    models = {"m": {"llm_model": "stub-model", "llm_base_url": stub.url, "api_key_env": KEY_ENV},
+              "n": {"llm_model": "stub-model", "llm_base_url": stub.url, "api_key_env": "SWEEP_TEST_OTHER_KEY"}}
+    monkeypatch.delenv("SWEEP_TEST_OTHER_KEY", raising=False)   # so the engine refuses every start of n
+    cfg = load_config(write_config(tmp_path, model=stub, models=models, space={"writer_rules": ["none"]},
+                                   dataset=tiny_dataset(tmp_path, cases=10, answerable=9, stub=stub),
+                                   sweep={"repeats": 1}))
+    run(cfg)
+    result = propose(cfg, chosen="writer_rules=none")
+    assert result["m"]["chosen"] == "writer_rules=none" and result["m"]["chosen_by"] == "person"
+    assert result["n"]["chosen"] is None and "refuses the start in every mode" in result["n"]["why"]
+    assert proposal_file(cfg, "m").exists() and not proposal_file(cfg, "n").exists()
+
+
+def test_a_write_interrupted_part_way_leaves_no_proposal_files(tmp_path, monkeypatch):
+    cfg = graded_sweep(tmp_path, arms={"writer_rules=none": dict(only=9, other=0)})
+    propose(cfg)
+
+    def interrupted(path, value):
+        raise KeyboardInterrupt   # as Ctrl-C lands after the profile is written and before its evidence
+
+    monkeypatch.setattr(proposal, "_write_json", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        propose(cfg)
+    assert not (out(cfg) / "proposal" / "m").exists() or not list((out(cfg) / "proposal" / "m").iterdir())
+
+
+def test_a_mode_once_run_stays_recorded_when_a_later_plan_refuses_it(tmp_path, stub_model, monkeypatch):
+    cfg = load_config(write_config(tmp_path, model=stub_model(gold=True), sweep={"repeats": 1}))
+    run(cfg)
+    assert sweep_json(cfg)["starts"] == {"m": {"instant": None}}
+    monkeypatch.delenv(KEY_ENV)   # the next run's plan finds the engine refusing the start
+    run(cfg)
+    assert sweep_json(cfg)["starts"] == {"m": {"instant": None}}

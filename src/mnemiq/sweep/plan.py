@@ -27,6 +27,10 @@ from mnemiq.sweep.stats import detectable_gain
 # there are is known only after the grid; `plan` counts the start and one finalist for each model and mode, and says so.
 TIMING_ARMS_PER_MODE = 2
 TIMING_CASES = 20
+# Before the timing round the sweep waits, at most this long, for the machine's load to fall under its core count,
+# reading it this often meanwhile.
+LOAD_WAIT_S = 300.0
+LOAD_WAIT_EVERY_S = 15.0
 _UNKNOWN = "unknown until the first questions run"
 _JUDGE_UNPRICED = "the judge's price is not known"
 # The rounds that compare arms on the tuning part, by strategy; timing and confirm follow a search.
@@ -179,8 +183,9 @@ def estimate(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None 
     hours = None
     if cfg.search.seconds_per_question is not None:
         seconds = cfg.search.seconds_per_question
+        timed = any(_searches(cfg, r) for r in rounds.values())
         hours = {runs: sum(by_model[m][runs][0] / cfg.machine.parallel + by_model[m][runs][1] for m in cfg.models)
-                 * seconds / 3600 for runs in runs_each}
+                 * seconds / 3600 + (LOAD_WAIT_S / 3600 if timed else 0.0) for runs in runs_each}
     judged_elsewhere = [m for m in cfg.models
                         if _judged_elsewhere(cfg, m, [rounds[(m, mode)] for mode in cfg.modes], deployments)]
     dollars = None
@@ -317,8 +322,9 @@ def render(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None = 
             else:
                 lines.append(f"    {name}: {len(arms)} arms: {labels}")
         if _searches(cfg, rounds):
-            lines.append(f"    timing: the start and each finalist, once each and alone, on the first {TIMING_CASES} "
-                         f"cases to tune on (the cost counts {TIMING_ARMS_PER_MODE}: the start and one finalist)")
+            lines.append(f"    timing: after waiting up to {LOAD_WAIT_S / 60:g} minutes for the machine's load to fall, "
+                         f"the start and each finalist, once each and alone, on the first {TIMING_CASES} cases to tune "
+                         f"on (the cost counts {TIMING_ARMS_PER_MODE}: the start and one finalist, and the wait)")
     for model in cfg.models:
         if any(_searches(cfg, est.rounds[(model, mode)]) for mode in cfg.modes):
             lines.append(f"  confirm, {model}: the assembled profile against the start on the held-out part, in each "
