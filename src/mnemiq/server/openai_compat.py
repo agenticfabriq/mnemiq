@@ -71,9 +71,12 @@ def _inert(text: str, *, cell: bool) -> str:
 
 
 def _prose(text: str) -> str:
-    # Each line's leading whitespace goes, so no line of the answer becomes an indented code block, where a
-    # character reference would show as written.
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    """The answer text, inert. Each line's leading whitespace goes, so no line becomes an indented code block, where
+    an escape would show as written. A backslash the answer holds becomes the full-width one: Open WebUI's KaTeX also
+    scans whole paragraphs for `\\[`, and Marked splits a paragraph there, which would cut a doubled backslash in
+    two and open math. So every ASCII backslash left is this layer's own escape, before a character that opens
+    nothing. A table cell keeps its doubled backslashes, since a cell is lexed inline only."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").replace("\\", "\uff3c").split("\n")
     return "\n".join(_inert(line.lstrip(), cell=False) for line in lines)
 
 

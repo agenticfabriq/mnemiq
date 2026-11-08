@@ -455,7 +455,7 @@ def test_every_escaped_character_is_inert_in_cells_headers_and_prose(tmp_path, c
     reference, which Open WebUI shows as written in a table cell (found in the live check)."""
     ref = "\\" + char
     lines = _content(tmp_path, _answer(answer=f"a{char}b", columns=(f"h{char}h",), rows=[[f"c{char}c"]])).splitlines()
-    assert lines[0] == f"a{ref}b"
+    assert lines[0] == (f"a{ref}b" if char != "\\" else "a\uff3cb")  # the answer's own backslash goes full-width
     table = [line for line in lines if line.startswith("|")]
     assert table == [f"| h{ref}h |", "| --- |", f"| c{ref}c |"], table
 
@@ -478,6 +478,19 @@ def test_data_and_prose_never_render_as_a_link_image_html_or_math(tmp_path):
         assert shown in _content(tmp_path, _answer(columns=("v",), rows=[[raw]])), (raw, shown)
     # `(` and `[` stay as written: escaping either would open math in Open WebUI. The `]` is escaped, and renders as `]`.
     assert "revenue (net) 1.5 [draft\\]" in _content(tmp_path, _answer(answer="revenue (net) 1.5 [draft]"))
+
+
+def test_an_answer_never_carries_a_backslash_that_can_open_math(tmp_path):
+    """Open WebUI's KaTeX also scans whole paragraphs for `\\[`, and Marked splits a paragraph there, so a doubled
+    backslash from the answer can be cut in two and open math (found in review, reproduced with Marked 9 and Open
+    WebUI's extension). In the answer text every ASCII backslash is this layer's own escape, before a character
+    that opens nothing: a backslash the answer itself holds becomes the full-width one."""
+    for raw in ("\\[x\\]", "see \\[x+1\\] here", "\\begin{equation}x\\end{equation}", "a\\(b\\)", "C:\\code\\path", "\\\\[x]"):
+        prose = _content(tmp_path, _answer(answer=raw)).split("\n\n**Status:**")[0]
+        assert not re.search(r"\\(?![`*\]!<>|$&~_])", prose), (raw, prose)
+    assert _content(tmp_path, _answer(answer="\\[x\\]")).startswith("\uff3c[x\uff3c\\]")
+    # A cell keeps the data's backslashes, doubled: Marked lexes a cell inline only, where a doubled one is safe.
+    assert "| a\\\\(b\\\\) |" in _content(tmp_path, _answer(columns=("v",), rows=[["a\\(b\\)"]]))
 
 
 def test_the_sql_fence_outlasts_backticks_in_the_sql(tmp_path):
