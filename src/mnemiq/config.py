@@ -35,7 +35,7 @@ DEFAULT_RETRIEVAL_K = 24
 # construction site passes no limit: a second copy of the number is a second thing to forget.
 DEFAULT_MAX_QUESTION_CHARS = 4_000
 
-_SECRET_HINTS = ("api_key", "dsn", "password", "secret")  # fields whose value is never printed in .env.example
+_SECRET_HINTS = ("api_key", "dsn", "password", "secret", "connection_key")  # fields whose value is never printed in .env.example
 # A URL query parameter named like one of these carries a credential: the secret fields' hints, and the words a query
 # uses besides (`token`, `auth`, `sig` for a signed URL's signature, and `pwd` and `passwd` for a password).
 _CREDENTIAL_HINTS = (*_SECRET_HINTS, "key", "token", "auth", "sig", "pwd", "passwd")
@@ -161,6 +161,8 @@ def _without_userinfo(text: str, url: str) -> str:
 _LOCAL_ONLY_CHECKED_URL_FIELDS = (
     "llm_base_url", "embed_base_url", "verify_base_url",
     "verity_records_url", "verity_token_url", "verity_traces_url",
+    # The signing-key fetch. The issuer itself is only compared with `iss`, never fetched.
+    "oidc_jwks_url",
 )
 
 
@@ -339,7 +341,25 @@ class Settings(BaseSettings):
         description="where enrich writes ontology binding-suggestions (defaults beside the store)")
     principal: str | None = Field(default=None, description="MCP standalone identity: principal id")
     roles: str | None = Field(default=None, description="MCP standalone identity: comma-separated roles")
-    tenant: str | None = Field(default=None, description="MCP standalone identity: tenant id")
+    tenant: str | None = Field(default=None, description="MCP standalone identity: tenant id. With a token verifier configured it is required, and every verified token must carry this tenant; `*` accepts any")
+    # --- verified identity: each request's identity from its own token, once an issuer is configured ---
+    oidc_issuer: str | None = Field(default=None, description="the identity provider whose tokens the HTTP API and MCP over HTTP verify, matched exactly against `iss`; unset serves the settings identity above")
+    oidc_audience: str | None = Field(default=None, description="the `aud` a token must carry on /v1 and MCP; under MNEMIQ_MCP_TRANSPORT=http it is the MCP door's own URL, https://<host>/mcp")
+    oidc_jwks_url: str | None = Field(default=None, description="where the provider's signing keys are fetched; unset means <issuer>/protocol/openid-connect/certs")
+    oidc_jwks_file: str | None = Field(default=None, description="a JWKS file read instead of fetching the keys, for a deployment that may not reach the provider")
+    oidc_tenant_claim: str = Field(default="tenant", description="the token claim holding the caller's tenant")
+    oidc_roles_claim: str = Field(default="realm_access.roles", description="the dotted path of the token's roles claim; a token without it takes its roles from the identity map")
+    oidc_groups_claim: str | None = Field(default=None, description="opt-in: pass this claim's groups through as the identity's groups, for a provider whose groups only administrators control; unset, a token's groups grant nothing except through the identity map")
+    oidc_leeway_s: float = Field(default=30.0, ge=0, description="clock leeway, in seconds, on a token's exp, nbf and iat")
+    openwebui_audience: str | None = Field(default=None, description="the `aud` an identity provider's token must carry on Open WebUI's endpoint, distinct from MNEMIQ_OIDC_AUDIENCE; unset, that endpoint accepts no Bearer token")
+    openwebui_jwt_secret: str | None = Field(default=None, description="turns on Open WebUI's signed user header: the HS256 secret it shares with Open WebUI, at least 32 bytes")
+    openwebui_jwt_header: str = Field(default="X-OpenWebUI-User-Jwt", description="the header carrying Open WebUI's signed user token")
+    openwebui_jwt_max_lifetime_s: int = Field(default=300, ge=1, description="the longest lifetime, exp minus iat, accepted on Open WebUI's signed user token")
+    openwebui_user_headers: str = Field(default="X-OpenWebUI-User-Id,X-OpenWebUI-User-Email,X-OpenWebUI-User-Name,X-OpenWebUI-User-Role", description="Open WebUI's unsigned user headers, comma-separated; a request carrying any of them is refused once an issuer is configured")
+    openwebui_connection_key_header: str | None = Field(default=None, description="the custom header on mnemiq's Open WebUI connection that carries the connection key")
+    openwebui_connection_key: str | None = Field(default=None, description="the connection key, at least 32 bytes, which tells mnemiq a request came through its own Open WebUI connection; required with the signed user header")
+    identity_map_path: str | None = Field(default=None, description="a JSON file mapping each issuer's subjects, groups and verified emails to roles, for tokens that carry no roles claim")
+    mcp_transport: Literal["stdio", "http"] = Field(default="stdio", description="stdio runs the MCP server for one local caller; http serves it at /mcp on the HTTP API, each request judged by its own token")
     # --- verifier ---
     answer_log_path: str | None = Field(default=None, description="where each answer's record goes: which profile, version, model and engine commit produced it, as one JSON line each, with no question text, SQL or rows; unset keeps it beside the store as <store_path>.answers.jsonl, `off` writes none. Not rotated")
     answer_log_text: bool = Field(default=False, description="opt-in: the answer log also holds the question and the SQL as asked, which carry literals from the question and values from the database; rows are never logged")
@@ -365,6 +385,9 @@ class Settings(BaseSettings):
             self.source_id = "acme"
         if not self.store_path:
             self.store_path = "mnemiq.duckdb"
+        # Filled here rather than where the keys are fetched, so MNEMIQ_LOCAL_ONLY checks the URL actually used.
+        if self.oidc_issuer and not self.oidc_jwks_url and not self.oidc_jwks_file:
+            self.oidc_jwks_url = self.oidc_issuer.rstrip("/") + "/protocol/openid-connect/certs"
         return self
 
     # NB: default_mode is validated at boot by build_runtime (raising UnknownMode with the valid
@@ -589,6 +612,7 @@ class Settings(BaseSettings):
 
 def identity_from_settings(settings: "Settings | None"):
     """Standalone (no-AF) identity from config. AF replaces this with a JWT-carried identity."""
+    from mnemiq.auth.roles import normalize_roles
     from mnemiq.contract import IdentityContext
 
     return IdentityContext(
@@ -596,8 +620,7 @@ def identity_from_settings(settings: "Settings | None"):
         principal_id=(settings.principal if settings else None) or "local",
         # STRIPPED, because `MNEMIQ_ROLES=analyst, viewer` is what a person writes and it yielded a
         # role named " viewer" -- which matches nothing in the policy, grants nothing, and produces
-        # the same accurate-sounding "no tables are available" that #4 was filed about. Every
-        # surface resolves roles here, so the CLI, MCP and `/v1` all had it.
-        roles=[r.strip() for r in ((settings.roles if settings else "") or "").split(",")
-               if r.strip()],
+        # the same accurate-sounding "no tables are available" that #4 was filed about. The same
+        # normalizer reads a token's roles claim and the identity map, so no surface strips differently.
+        roles=normalize_roles(((settings.roles if settings else "") or "").split(",")),
     )

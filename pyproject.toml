@@ -35,6 +35,10 @@ dependencies = [
   # from 2.1, hides an unexpected tool exception from the client; `mcp/server.py` reads either version and raises
   # setup failures as the installed ToolError so their instruction still arrives.
   "mcp>=1.28,<2.4",
+  # The token verifiers in `mnemiq.auth`. Declared rather than borrowed from `mcp`: a security check cannot rest on
+  # another package's choice of dependencies. The floor is mcp's own; capped at the newest release the suite passes
+  # on (M121), and `crypto` brings the RSA and EC support an identity provider's keys need.
+  "pyjwt[crypto]>=2.10.1,<2.16",
 ]
 
 [project.optional-dependencies]

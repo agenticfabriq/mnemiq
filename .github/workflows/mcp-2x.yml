@@ -19,4 +19,6 @@ jobs:
       - uses: astral-sh/setup-uv@v3
       - run: uv venv && uv pip install -e ".[dev]" && uv pip install --upgrade "mcp>=2,<2.4"
       - run: uv pip freeze | grep -i '^mcp=='
-      - run: .venv/bin/python -m pytest tests/test_mcp_startup.py -v
+      # The HTTP door's per-request identity too: 2.x moved its path and statelessness settings, which
+      # `mcp/server.py` bridges, so only a 2.x run checks the bridge.
+      - run: .venv/bin/python -m pytest tests/test_mcp_startup.py tests/test_mcp_http_identity.py -v

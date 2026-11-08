@@ -760,6 +760,7 @@ dependencies = [
     { name = "pyarrow" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "pyjwt", extra = ["crypto"] },
     { name = "pytz" },
     { name = "sqlglot" },
 ]
@@ -821,6 +822,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=17" },
     { name = "pydantic", specifier = ">=2" },
     { name = "pydantic-settings", specifier = ">=2" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.10.1,<2.16" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytz" },
     { name = "rdflib", marker = "extra == 'ontology'", specifier = ">=7" },
