@@ -29,6 +29,9 @@ SECRETS = HERE / ".secrets"
 STATE = SECRETS / "state.json"
 COMPOSE = ["docker", "compose", "-f", str(HERE / "compose.yaml")]
 KEYCLOAK = "http://keycloak.localhost:18089"
+# This script reaches Keycloak by its published address: browsers resolve *.localhost themselves, and a program
+# using the system resolver may not, as on a Linux host with no myhostname in its name-service switch.
+KEYCLOAK_PUBLISHED = "http://127.0.0.1:18089"
 REALM = "mnemiq"
 OPEN_WEBUI = {"a": "http://localhost:13000", "b": "http://localhost:13001"}
 PROFILES = {"frontier": ("analyst", "store1_manager"), "for-analysts": ("analyst",), "for-stores": ("store1_manager",)}
@@ -159,13 +162,13 @@ def wait_for(url: str, what: str, seconds: int = 120) -> bool:
 
 
 def keycloak(state: dict) -> None:
-    status, tok = request("POST", f"{KEYCLOAK}/realms/master/protocol/openid-connect/token",
+    status, tok = request("POST", f"{KEYCLOAK_PUBLISHED}/realms/master/protocol/openid-connect/token",
                           form={"grant_type": "password", "client_id": "admin-cli", "username": "admin",
                                 "password": state["kc_admin"]})
     if status != 200:
         raise SystemExit(f"Keycloak refused the admin sign-in ({status})")
     admin = tok["access_token"]
-    base = f"{KEYCLOAK}/admin/realms/{REALM}"
+    base = f"{KEYCLOAK_PUBLISHED}/admin/realms/{REALM}"
     for client_id, key in (("workbench-proxy", "proxy_client"), ("open-webui", "openwebui_client")):
         _, found = request("GET", f"{base}/clients?clientId={client_id}", token=admin)
         client = found[0]
@@ -234,7 +237,7 @@ def cmd_users() -> int:
         print("run `secrets` first")
         return 2
     state = json.loads(STATE.read_text())
-    if not wait_for(f"{KEYCLOAK}/realms/{REALM}/.well-known/openid-configuration", "Keycloak"):
+    if not wait_for(f"{KEYCLOAK_PUBLISHED}/realms/{REALM}/.well-known/openid-configuration", "Keycloak"):
         return 1
     keycloak(state)
     if not wait_for(f"{OPEN_WEBUI['a']}/health", "Open WebUI A"):
