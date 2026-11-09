@@ -31,7 +31,7 @@ IDENTITY_SETTINGS = (
     "oidc_roles_claim", "oidc_groups_claim", "oidc_leeway_s", "openwebui_audience", "openwebui_jwt_secret",
     "openwebui_jwt_header", "openwebui_jwt_max_lifetime_s", "openwebui_user_headers",
     "openwebui_connection_key_header", "openwebui_connection_key", "openwebui_task_header", "identity_map_path",
-    "mcp_transport")
+    "mcp_transport", "oidc_end_session_url")
 OIDC = {"oidc_issuer": ISSUER, "oidc_audience": "mnemiq-api", "tenant": "acme"}
 OWUI = {"openwebui_jwt_secret": SECRET, "openwebui_connection_key_header": "X-Mnemiq-Connection",
         "openwebui_connection_key": KEY, "tenant": "acme"}
@@ -276,3 +276,50 @@ def test_a_jwks_file_with_a_signing_key_starts(tmp_path):
 
 def test_an_issuer_named_like_open_webuis_refuses_to_start():
     _refused("MNEMIQ_OIDC_ISSUER", **{**OIDC, "oidc_issuer": "open-webui"})
+
+
+# --- Sign out through the identity provider: the end-session URL the workbench's Sign out ends at --------------
+
+END = "https://idp.example/realms/r/protocol/openid-connect/logout?client_id=workbench-proxy"
+
+
+@pytest.mark.parametrize("url, refused_because", [
+    (END, None),
+    ("http://127.0.0.1:8080/logout", None),
+    ("http://[::1]/logout", None),
+    ("http://localhost/logout", None),
+    ("http://keycloak.localhost:18089/realms/r/protocol/openid-connect/logout", None),
+    ("HTTPS://IDP.example/logout", None),
+    ("http://idp.example/logout", "http is allowed only"),
+    ("ftp://idp.example/", "scheme"),
+    ("/realms/r/logout", "scheme"),
+    ("javascript:alert(1)", "scheme"),
+    ("https://user@idp.example/logout", "user name"),
+    ("https://idp.example/logout#f", "fragment"),
+    ("https://idp.example/logout?post_logout_redirect_uri=x", "post_logout_redirect_uri"),
+    ("https://idp.example:0/", "valid port"),
+    ("https:///logout", "no host"),
+])
+def test_an_end_session_url_must_be_https_or_loopback_http(url, refused_because):
+    """The browser is sent there, so a typo must not become an open redirect: https, or http only where a browser
+    resolves the host to this machine."""
+    if refused_because is None:
+        assert _cfg(**OIDC, oidc_end_session_url=url).end_session_url == url
+    else:
+        assert "MNEMIQ_OIDC_END_SESSION_URL" in _refused(refused_because, **OIDC, oidc_end_session_url=url)
+
+
+@pytest.mark.parametrize("doors", [{}, OWUI], ids=["no verifier", "open webui alone"])
+def test_an_end_session_url_needs_an_issuer(doors):
+    """Both paths: with no verifier at all the configuration is decided before any door is built."""
+    assert "MNEMIQ_OIDC_ISSUER" in _refused("MNEMIQ_OIDC_END_SESSION_URL", **doors, oidc_end_session_url=END)
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+@pytest.mark.parametrize("doors", [{}, OIDC, OWUI], ids=["no verifier", "oidc", "open webui alone"])
+def test_a_blank_end_session_url_is_unset(blank, doors):
+    config = _cfg(**doors, oidc_end_session_url=blank)
+    if not doors:
+        assert config is None
+    else:
+        assert config.end_session_url is None

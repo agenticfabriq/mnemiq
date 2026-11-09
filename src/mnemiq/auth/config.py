@@ -7,7 +7,7 @@ repeats a secret's value, because this message reaches the console and whatever 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 OPENWEBUI_ISSUER = "open-webui"  # the fixed `iss` Open WebUI puts on its signed user header
 MIN_SECRET_BYTES = 32  # an HS256 token can be attacked offline, so a short secret can be guessed and any user minted
@@ -51,6 +51,7 @@ class AuthConfig:
     # The signed header's name (lowercase), known even with that verifier off, so /v1 can refuse it by name.
     jwt_header: str = "x-openwebui-user-jwt"
     task_header: str = "x-mnemiq-task"  # marks an Open WebUI background task on /openai/v1 (lowercase)
+    end_session_url: str | None = None  # where the workbench's Sign out ends, at the identity provider
 
     @property
     def issuers(self) -> set[str]:
@@ -97,6 +98,45 @@ def check_mcp_audience(audience: str) -> None:
             f"{problem} (got {audience!r})")
 
 
+def check_end_session_url(url: str) -> None:
+    """The identity provider's end-session URL, which the workbench sends the browser to on Sign out.
+
+    The browser is redirected there, so it is refused unless it is plainly the provider's: absolute, https, no user
+    name to dress another host as this one, no fragment, and no `post_logout_redirect_uri` of its own, which the
+    workbench adds. http is allowed only where a browser resolves the host to this machine: the loopback literals,
+    `localhost`, and names under `.localhost` (RFC 6761), for a provider run locally.
+    """
+    problem = None
+    try:
+        parts = urlsplit(url)
+        port_ok = parts.port is None or parts.port > 0
+    except ValueError:
+        parts, port_ok = None, False
+    host = (parts.hostname or "") if parts is not None else ""
+    if parts is None or not port_ok:
+        problem = "it is not a URL with a valid port"
+    elif parts.scheme not in ("https", "http"):
+        problem = "its scheme is not https"
+    elif not host:
+        problem = "it names no host"
+    elif "@" in parts.netloc:
+        problem = "it carries a user name"
+    elif parts.fragment or url.endswith("#"):
+        problem = "it has a fragment"
+    elif "post_logout_redirect_uri" in parse_qs(parts.query, keep_blank_values=True):
+        problem = "it carries post_logout_redirect_uri, which the workbench adds"
+    elif parts.scheme == "http" and not (host in _LOOPBACK_LITERALS or host == "localhost"
+                                         or host.endswith(".localhost")):
+        problem = "http is allowed only for 127.0.0.1, [::1], localhost or a name under .localhost"
+    if problem:
+        raise AuthConfigError(f"MNEMIQ_OIDC_END_SESSION_URL must be the identity provider's end-session URL, "
+                              f"absolute and https: {problem} (got {url!r})")
+
+
+_END_SESSION_NEEDS_ISSUER = ("MNEMIQ_OIDC_END_SESSION_URL needs MNEMIQ_OIDC_ISSUER: Sign out ends at the identity "
+                             "provider that signs users in to the workbench, and with no issuer there is none")
+
+
 def _check_jwks_file(path: str) -> None:
     import json
 
@@ -128,6 +168,7 @@ def auth_config_from_settings(settings, *, validate_map=None) -> AuthConfig | No
     openwebui_on = not _blank(settings.openwebui_jwt_secret)
     mcp_http = settings.mcp_transport == "http"
     binding_header, binding_key = settings.openwebui_connection_key_header, settings.openwebui_connection_key
+    end_session = None if _blank(settings.oidc_end_session_url) else settings.oidc_end_session_url.strip()
 
     if not oidc_on and not openwebui_on:
         if mcp_http:
@@ -142,6 +183,8 @@ def auth_config_from_settings(settings, *, validate_map=None) -> AuthConfig | No
         if binding_header or binding_key:
             raise AuthConfigError("MNEMIQ_OPENWEBUI_CONNECTION_KEY is set but no Open WebUI door is configured: set "
                                   "MNEMIQ_OPENWEBUI_JWT_SECRET or MNEMIQ_OPENWEBUI_AUDIENCE, or unset the key")
+        if end_session:
+            raise AuthConfigError(_END_SESSION_NEEDS_ISSUER)
         return None
 
     if _blank(settings.tenant):
@@ -166,6 +209,8 @@ def auth_config_from_settings(settings, *, validate_map=None) -> AuthConfig | No
                                   "refuses a token carrying the other's audience, so equal values refuse every token")
         if mcp_http:
             check_mcp_audience(settings.oidc_audience)
+        if end_session:
+            check_end_session_url(end_session)
         oidc = OidcSettings(
             issuer=settings.oidc_issuer, audience=settings.oidc_audience,
             openwebui_audience=settings.openwebui_audience or None,
@@ -179,6 +224,8 @@ def auth_config_from_settings(settings, *, validate_map=None) -> AuthConfig | No
         if settings.openwebui_audience:
             raise AuthConfigError("MNEMIQ_OPENWEBUI_AUDIENCE needs MNEMIQ_OIDC_ISSUER, whose tokens it is the "
                                   "audience of")
+        if end_session:
+            raise AuthConfigError(_END_SESSION_NEEDS_ISSUER)
 
     openwebui = None
     if openwebui_on:
@@ -227,7 +274,8 @@ def auth_config_from_settings(settings, *, validate_map=None) -> AuthConfig | No
     config = AuthConfig(
         tenant=tenant, oidc=oidc, openwebui=openwebui, binding=binding,
         user_headers=user_headers, map_path=settings.identity_map_path or None, mcp_http=mcp_http,
-        jwt_header=settings.openwebui_jwt_header.strip().lower(), task_header=task_header)
+        jwt_header=settings.openwebui_jwt_header.strip().lower(), task_header=task_header,
+        end_session_url=end_session)
     if config.map_path:
         if validate_map is None:
             from mnemiq.auth.identity_map import IdentityMap

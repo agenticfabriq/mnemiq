@@ -156,8 +156,9 @@ def _without_userinfo(text: str, url: str) -> str:
 # otherwise be silently exempt while the run still prints "verified". That is what
 # tests/test_local_only.py::test_every_url_field_is_checked_or_explicitly_exempted is for: it
 # fails on any `_url` field that is neither in this tuple nor in that test's own EXEMPTED set,
-# which is where a field would go instead of here if checking it were ever wrong (there are none
-# today; MNEMIQ_LOCAL_ONLY's whole premise is that every network-facing URL is accounted for).
+# which is where a field goes instead of here when checking it would be wrong (one today: the
+# end-session URL only the browser visits; MNEMIQ_LOCAL_ONLY's whole premise is that every URL the
+# engine itself calls is accounted for).
 _LOCAL_ONLY_CHECKED_URL_FIELDS = (
     "llm_base_url", "embed_base_url", "verify_base_url",
     "verity_records_url", "verity_token_url", "verity_traces_url",
@@ -351,6 +352,7 @@ class Settings(BaseSettings):
     oidc_roles_claim: str = Field(default="realm_access.roles", description="the dotted path of the token's roles claim; a token without it takes its roles from the identity map")
     oidc_groups_claim: str | None = Field(default=None, description="opt-in: pass this claim's groups through as the identity's groups, for a provider whose groups only administrators control; unset, a token's groups grant nothing except through the identity map")
     oidc_leeway_s: float = Field(default=30.0, ge=0, description="clock leeway, in seconds, on a token's exp, nbf and iat")
+    oidc_end_session_url: str | None = Field(default=None, description="the identity provider's end-session URL as the browser reaches it, with the sign-in proxy client's `client_id` where the provider needs it: the workbench's Sign out ends there, through the proxy's `rd`, so it ends the provider's session even when the proxy cannot. https, or http only for a loopback address, localhost or a name under .localhost")
     openwebui_audience: str | None = Field(default=None, description="the `aud` an identity provider's token must carry on Open WebUI's endpoint, distinct from MNEMIQ_OIDC_AUDIENCE; unset, that endpoint accepts no Bearer token")
     openwebui_jwt_secret: str | None = Field(default=None, description="turns on Open WebUI's signed user header: the HS256 secret it shares with Open WebUI, at least 32 bytes")
     openwebui_jwt_header: str = Field(default="X-OpenWebUI-User-Jwt", description="the header carrying Open WebUI's signed user token")

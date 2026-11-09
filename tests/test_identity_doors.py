@@ -289,3 +289,9 @@ def test_the_signed_header_needs_no_scope(tmp_path):
     that takes both. What its users may read comes from their roles in the identity map alone."""
     identity = _doors(tmp_path, MAP, **{**OPTION_A, **OPTION_B}).openai(_owui())
     assert identity.principal_id == "open-webui:owui-user-1"
+
+
+def test_the_doors_carry_the_end_session_url(tmp_path):
+    end = "https://idp.example/realms/r/protocol/openid-connect/logout?client_id=workbench-proxy"
+    assert _doors(tmp_path, **OPTION_A, oidc_end_session_url=end).end_session_url == end
+    assert _doors(tmp_path, **OPTION_A).end_session_url is None
