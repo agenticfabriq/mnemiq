@@ -94,7 +94,8 @@ services:
       ENABLE_OAUTH_SIGNUP: "true"
       OAUTH_CLIENT_ID: open-webui
       OAUTH_PROVIDER_NAME: Keycloak
-      OAUTH_SCOPES: openid email profile
+      # The realm's client maps email and name itself, and defines no separate scopes for them.
+      OAUTH_SCOPES: openid
       OPENID_PROVIDER_URL: http://keycloak.localhost:18089/realms/mnemiq/.well-known/openid-configuration
       ENABLE_OAUTH_ID_TOKEN_COOKIE: "false"
       ENABLE_FORWARD_USER_INFO_HEADERS: "false"
