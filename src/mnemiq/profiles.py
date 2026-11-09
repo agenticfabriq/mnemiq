@@ -5,16 +5,22 @@ only its defaults. A deployment is one dataset, so a profile is a model and what
 
 A profile changes only what `PROFILE_SETTINGS` names. Allow-listed rather than deny-listed: a setting nobody classified
 must not become reachable by accident, and `test_every_settings_field_is_classified` makes each new one a decision.
+
+A profile can have one parent: another profile in its file (`extends`) or a starter the engine ships (`starter`). Its
+layers resolve in order, the deployment first, each over the one before it by the rules a profile with no parent
+follows over the deployment.
 """
 
 from __future__ import annotations
 
 import hashlib
+import importlib.resources
 import json
 import os
 import re
 import tomllib
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from types import SimpleNamespace as _Sample
 
 from pydantic import BaseModel, ConfigDict, ValidationError, create_model
@@ -61,6 +67,20 @@ DEPLOYMENT_SETTINGS = frozenset({
     "openwebui_connection_key", "identity_map_path", "mcp_transport",
 })
 
+# The profile settings that belong to an endpoint, the deployment's own: a starter never sets them.
+ENDPOINT_SETTINGS: tuple[str, ...] = ("llm_model", "llm_base_url", "llm_context_window", "verify_model", "verify_base_url")
+
+# The starters this engine ships: one TOML file per model build, inside the package, so an installed engine reads them
+# offline.
+STARTER_PACKAGE = "mnemiq.starter_profiles"
+
+# What a starter is refused for setting: a deployment's endpoint and keys, the roles its file grants, and a parent.
+_NOT_IN_A_STARTER = frozenset({*ENDPOINT_SETTINGS, "api_key_env", "verify_api_key_env", "roles", "extends", "starter"})
+
+# What one layer passes to the layers above it, besides its mode sections. Roles, the description and the parent keys
+# stay with the profile that names them, as does being the file's default.
+_INHERITED = PROFILE_SETTINGS | {"api_key_env", "verify_api_key_env"}
+
 _NAME = re.compile(r"[a-z0-9][a-z0-9._-]*")
 
 
@@ -100,6 +120,9 @@ class _Entry(BaseModel):
 
     description: str | None = None
     roles: list[str] | None = None
+    # A profile's parent, at most one of the two: another profile in the file, or a starter the engine ships.
+    extends: str | None = None
+    starter: str | None = None
     api_key_env: str | None = None
     verify_api_key_env: str | None = None
     instant: ModeSettings | None = None
@@ -150,15 +173,94 @@ def _key_from(variable: str, name: str) -> str:
     return value
 
 
-def _resolved(name: str, entry: _Entry, base: Settings) -> Settings:
-    """`base` under this profile, with each key kept to the endpoint it was set for.
+def starters_folder() -> Path:
+    """The folder of the starters this engine ships, on disk. Every reader calls it through this module and never binds
+    it at import, so a test that points it at a folder of its own reaches them all."""
+    try:
+        folder = importlib.resources.files(STARTER_PACKAGE)
+    except ModuleNotFoundError as exc:
+        raise ProfileFileError(f"this engine has no {STARTER_PACKAGE} package, so it ships no starters") from exc
+    if not isinstance(folder, Path) or not folder.is_dir():
+        raise ProfileFileError(f"{STARTER_PACKAGE} is not a folder on disk, as in a zipped install, so its starters "
+                               "cannot be read")
+    return folder.resolve()
+
+
+def starter_names() -> list[str]:
+    """The starters this engine ships, by name: the stem of each TOML file in its starters folder."""
+    return sorted(path.stem for path in starters_folder().glob("*.toml") if path.is_file())
+
+
+def starter_path(name: str) -> str:
+    """The file of a starter this engine ships. Only a name the folder lists is taken, so a name shaped like a path
+    never reaches a file outside it, and one an upgrade removed is refused rather than read as no starter."""
+    names = starter_names()
+    if name not in names:
+        raise ProfileFileError(f"starter {name!r} is not one this engine ships; it ships: {', '.join(names) or 'none'}")
+    return str(starters_folder() / f"{name}.toml")
+
+
+def _starter_entry(name: str) -> _Entry:
+    """A starter's settings: its file's default profile. Answer-time settings and mode sections only, since the model,
+    its endpoints, the keys and who may pick a profile stay with the deployment, and a starter is always a chain's first
+    layer."""
+    read = _read(starter_path(name))
+    if read.default not in read.profiles:
+        raise ProfileFileError(f"starter {name!r}: default = {read.default!r} names no profile")
+    entry = read.profiles[read.default]
+    if owned := sorted(entry.model_fields_set & _NOT_IN_A_STARTER):
+        raise ProfileFileError(f"starter {name!r} sets {', '.join(owned)}, which a starter never sets: the model, its "
+                               "endpoints, the keys and the roles stay with the deployment, and a starter has no parent")
+    return entry
+
+
+def _lineage(read: _File, name: str) -> tuple[str | None, list[str]]:
+    """The starter `name`'s root names, if any, and the profiles from the root down to `name`, following `extends`."""
+    if name not in read.profiles:
+        raise ProfileFileError(f"profile {name!r} is not one this file holds; it holds {sorted(read.profiles)}")
+    chain = [name]
+    while True:
+        holder = chain[-1]
+        entry = read.profiles[holder]
+        if entry.extends is not None and entry.starter is not None:
+            raise ProfileFileError(f"profile {holder!r} names two parents, extends {entry.extends!r} and starter "
+                                   f"{entry.starter!r}: a profile has at most one")
+        if entry.extends is None:
+            return entry.starter, chain[::-1]
+        if entry.extends in chain:
+            raise ProfileFileError(f"profile {name!r} extends a chain that comes back to itself: "
+                                   + " -> ".join([*chain, entry.extends]))
+        if entry.extends not in read.profiles:
+            raise ProfileFileError(f"profile {holder!r} extends {entry.extends!r}, which this file does not hold")
+        chain.append(entry.extends)
+
+
+def _merged_sections(below: dict[str, ModeSettings], entry: _Entry) -> dict[str, ModeSettings]:
+    """`entry`'s mode sections over `below`, setting by setting. Only what was set is carried, so `modes_for` still
+    applies only that, and a section with nothing below it is taken as it is."""
+    merged = dict(below)
+    for mode in MODES:
+        if (section := getattr(entry, mode)) is None:
+            continue
+        merged[mode] = section if mode not in merged else ModeSettings(**{
+            field: getattr(layer, field) for layer in (merged[mode], section) for field in layer.model_fields_set})
+    return merged
+
+
+def _layered(name: str, entry: _Entry, base: Settings) -> Settings:
+    """`base` under one layer of a profile, with each key kept to the endpoint it was set for. `base` is the layer
+    below: the deployment, a starter or a parent. So a layer moves an endpoint when it differs from the one below it,
+    even when it points back at the deployment's own.
 
     Judged on the resolved endpoint and not on the fields: `verify_endpoint` falls back to the chat endpoint and the chat
-    key, so a cleared field can still send a key to a host it was never meant for.
+    key, so a cleared field can still send a key to a host it was never meant for. Whether the result has a chat key, and
+    a judge key where it needs one, is checked once every layer is applied (`_checked`), since a layer below the one that
+    names the endpoint need not have one.
     """
     update = {field: getattr(entry, field) for field in entry.model_fields_set & PROFILE_SETTINGS}
-    sections = {mode: getattr(entry, mode) for mode in MODES if getattr(entry, mode) is not None}
-    if sections:
+    # With no parent, `base` is the deployment, whose `mode_settings` is None beside a profiles file (`load_profiles`
+    # refuses both), so the profile's sections are taken as they are.
+    if sections := _merged_sections(base.mode_settings or {}, entry):
         update["mode_settings"] = sections
     chat_moved = update.get("llm_base_url", base.llm_base_url) != base.llm_base_url
     if entry.api_key_env:
@@ -168,10 +270,6 @@ def _resolved(name: str, entry: _Entry, base: Settings) -> Settings:
     if chat_moved and "llm_context_window" not in update:
         update["llm_context_window"] = None  # the old server's, and a wrong one trims silently
     resolved = base.model_copy(update=update)
-    if not resolved.llm_base_url or not resolved.llm_api_key:
-        # `LLMClient` refuses both, in words that point at the environment and not at this profile.
-        raise ProfileFileError(f"profile {name!r} has no chat endpoint and key: set llm_base_url and api_key_env (a "
-                               "server that takes no key still needs the variable to hold some value)")
 
     judge = resolved.verify_base_url or resolved.llm_base_url
     if entry.verify_api_key_env:
@@ -181,38 +279,69 @@ def _resolved(name: str, entry: _Entry, base: Settings) -> Settings:
     if judge != base.verify_endpoint()[0] and "verify_model" not in entry.model_fields_set:
         # The old server's. The new one does not serve it, and under fail-closed every judged answer would fail.
         resolved = resolved.model_copy(update={"verify_model": None})
-    if judge != resolved.llm_base_url and not resolved.verify_api_key:
-        raise ProfileFileError(f"profile {name!r} runs its judge on another endpoint with no key of its own, so it "
-                               "would send the chat key there: set verify_api_key_env")
     return resolved
 
 
-def _refuse_an_unapplied_temperature(name: str, settings: Settings) -> None:
+def _set_by(field: str, layers: list[tuple[str, _Entry]]) -> str:
+    """Where `field`'s value came from: the last of `layers` that set it, or the deployment when none did."""
+    return next((label for label, entry in reversed(layers) if field in entry.model_fields_set), "the deployment")
+
+
+def _refuse_an_unapplied_temperature(name: str, settings: Settings,
+                                     layers: list[tuple[str, _Entry]] | None = None) -> None:
     """`LLMClient` drops a temperature for a model that takes none. It would otherwise boot, get a version and log a value
-    the model never sampled at, which is the one thing a version exists to prevent."""
+    the model never sampled at, which is the one thing a version exists to prevent.
+
+    With a profiles file, `layers` names where the value came from, since a parent's or a starter's is not written in
+    the profile being refused."""
     if settings.writer_temperature is not None and not accepts_temperature(settings.llm_model or ""):
-        raise ProfileFileError(f"profile {name!r} sets writer_temperature on {settings.llm_model!r}, which takes none")
+        where = "" if layers is None else f" (the value comes from {_set_by('writer_temperature', layers)})"
+        raise ProfileFileError(f"profile {name!r} sets writer_temperature on {settings.llm_model!r}, which takes "
+                               f"none{where}")
 
 
-def _refuse_reasoning_under_guided_decoding(name: str, settings: Settings) -> None:
+def _refuse_reasoning_under_guided_decoding(name: str, settings: Settings,
+                                            layers: list[tuple[str, _Entry]] | None = None) -> None:
     """Guided decoding holds the writer's reply to the JSON from its first token, so the reasoning it asks for could
-    never be written: the profile would log a setting that changed nothing but the prompt."""
+    never be written: the profile would log a setting that changed nothing but the prompt.
+
+    With a profiles file, `layers` names where each of the two came from."""
     if settings.guided_sql and settings.writer_reasoning != "none":
+        where = "" if layers is None else (f" (writer_reasoning from {_set_by('writer_reasoning', layers)}, "
+                                           f"guided_sql from {_set_by('guided_sql', layers)})")
         raise ProfileFileError(f"profile {name!r} sets writer_reasoning with guided_sql, which allows no text before the "
-                               "JSON: turn one of them off")
+                               f"JSON: turn one of them off{where}")
 
 
-def _checked(name: str, entry: _Entry, default: str, base: Settings) -> Profile:
+def _checked(name: str, read: _File, base: Settings) -> Profile:
+    entry = read.profiles[name]
     if not _NAME.fullmatch(name):
         raise ProfileFileError(f"profile name {name!r} must match {_NAME.pattern}")
-    if name == default and entry.roles is not None:
+    if name == read.default and entry.roles is not None:
         raise ProfileFileError(f"profile {name!r} is the default, which serves whoever names no profile: "
                                "it takes no roles")
-    if name != default and (not entry.roles or not all(role.strip() for role in entry.roles)):
+    if name != read.default and (not entry.roles or not all(role.strip() for role in entry.roles)):
         raise ProfileFileError(f"profile {name!r} must list the roles that may pick it, [\"*\"] meaning anyone")
-    settings = _resolved(name, entry, base)
-    _refuse_an_unapplied_temperature(name, settings)
-    _refuse_reasoning_under_guided_decoding(name, settings)
+    starter, chain = _lineage(read, name)
+    # Each layer as it is applied, so a refusal can name the one a value came from.
+    layers: list[tuple[str, _Entry]] = []
+    settings = base
+    if starter is not None:
+        layers.append((f"starter {starter!r}", _starter_entry(starter)))
+        settings = _layered(starter, layers[-1][1], settings)
+    for link in chain:
+        layers.append((f"profile {link!r}", read.profiles[link]))
+        settings = _layered(link, read.profiles[link], settings)
+
+    if not settings.llm_base_url or not settings.llm_api_key:
+        # `LLMClient` refuses both, in words that point at the environment and not at this profile.
+        raise ProfileFileError(f"profile {name!r} has no chat endpoint and key: set llm_base_url and api_key_env (a "
+                               "server that takes no key still needs the variable to hold some value)")
+    if (settings.verify_base_url or settings.llm_base_url) != settings.llm_base_url and not settings.verify_api_key:
+        raise ProfileFileError(f"profile {name!r} runs its judge on another endpoint with no key of its own, so it "
+                               "would send the chat key there: set verify_api_key_env")
+    _refuse_an_unapplied_temperature(name, settings, layers)
+    _refuse_reasoning_under_guided_decoding(name, settings, layers)
     try:
         modes_for(settings)
     except ValueError as exc:
@@ -243,7 +372,36 @@ def load_profiles(settings: Settings) -> tuple[dict[str, Profile], str]:
     read = _read(settings.profiles_path)
     if read.default not in read.profiles:
         raise ProfileFileError(f"default = {read.default!r} names no profile; the file has {sorted(read.profiles)}")
-    return {name: _checked(name, entry, read.default, settings) for name, entry in read.profiles.items()}, read.default
+    return {name: _checked(name, read, settings) for name in read.profiles}, read.default
+
+
+def flattened_entry(path: str, name: str) -> _Entry:
+    """What each layer of `name`'s chain sets, merged: the starter first, then each profile from the root down to `name`,
+    mode sections setting by setting. For a reader that needs what a profile sets rather than what a deployment
+    resolves it to, such as the start of a sweep, so no endpoint rule is applied: those need a deployment.
+
+    Roles, the description and the parent keys are not carried, so what it reports as set is what the layers set that
+    is inherited."""
+    read = _read(path)
+    starter, chain = _lineage(read, name)
+    layers = ([_starter_entry(starter)] if starter is not None else []) + [read.profiles[link] for link in chain]
+    values: dict[str, object] = {}
+    sections: dict[str, ModeSettings] = {}
+    for entry in layers:
+        values.update({field: getattr(entry, field) for field in entry.model_fields_set & _INHERITED})
+        sections = _merged_sections(sections, entry)
+    return _ProfileEntry(**values, **sections)
+
+
+def profile_starter(path: str, name: str) -> str | None:
+    """The starter `name`'s chain starts from: the one its root names, or None."""
+    return _lineage(_read(path), name)[0]
+
+
+def profile_sources(path: str, name: str) -> list[str]:
+    """Every file `name` resolves from: its profiles file, then its starter's file when its root names one."""
+    starter = profile_starter(path, name)
+    return [path] if starter is None else [path, starter_path(starter)]
 
 
 def _sample_packet() -> ContextPacket:
