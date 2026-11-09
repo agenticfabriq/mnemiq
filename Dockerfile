@@ -20,8 +20,9 @@ RUN uv sync --frozen --no-dev --extra server --no-install-project
 COPY src/ src/
 COPY scripts/seed_demo.py scripts/seed_demo.py
 COPY --from=workbench /build/src/mnemiq/server/static src/mnemiq/server/static
+# The user needs a home: DuckDB installs its extensions under ~/.duckdb.
 RUN uv sync --frozen --no-dev --extra server \
- && useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin mnemiq \
+ && useradd --uid 10001 --create-home --shell /usr/sbin/nologin mnemiq \
  && mkdir -p /app/demo && chown mnemiq /app/demo
 USER mnemiq
 ENV PATH=/app/.venv/bin:$PATH
