@@ -299,6 +299,12 @@ END = "https://idp.example/realms/r/protocol/openid-connect/logout?client_id=wor
     ("https://idp.example/logout?post_logout_redirect_uri=x", "post_logout_redirect_uri"),
     ("https://idp.example:0/", "valid port"),
     ("https:///logout", "no host"),
+    # Read as a browser reads them, not as urlsplit does: a browser takes `\\` for `/` (so the first is the remote
+    # host example.com), drops a tab, and cannot parse the space.
+    ("http://example.com\\.localhost/logout", "printable ASCII"),
+    ("https://idp .example/logout", "printable ASCII"),
+    ("https://idp.example/log\tout", "printable ASCII"),
+    ("https://\u00eddp.example/logout", "printable ASCII"),
 ])
 def test_an_end_session_url_must_be_https_or_loopback_http(url, refused_because):
     """The browser is sent there, so a typo must not become an open redirect: https, or http only where a browser

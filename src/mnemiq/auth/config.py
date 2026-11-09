@@ -113,7 +113,12 @@ def check_end_session_url(url: str) -> None:
     except ValueError:
         parts, port_ok = None, False
     host = (parts.hostname or "") if parts is not None else ""
-    if parts is None or not port_ok:
+    # The browser, not urlsplit, decides where it goes: it reads `\` as `/` (so `http://example.com\.localhost/`
+    # is example.com), drops a tab or a newline, and rejects a space. Printable ASCII alone reads the same to both.
+    if any(not "!" <= ch <= "~" or ch == "\\" for ch in url):
+        problem = ("it must be printable ASCII with no backslash, since a browser reads those differently from this "
+                   "check")
+    elif parts is None or not port_ok:
         problem = "it is not a URL with a valid port"
     elif parts.scheme not in ("https", "http"):
         problem = "its scheme is not https"

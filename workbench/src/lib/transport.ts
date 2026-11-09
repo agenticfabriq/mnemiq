@@ -97,6 +97,8 @@ export async function fetchWhoami(): Promise<Whoami | null> {
  *  an engine before the field) reads as none, and Sign out stays the proxy's own. */
 function endSessionOf(value: unknown): string | null {
   if (typeof value !== "string") return null;
+  // As the engine's own startup check: printable ASCII and no backslash, which a browser reads as `/`.
+  if (/[^\x21-\x7e]|\\/.test(value)) return null;
   try {
     const { protocol } = new URL(value);
     return protocol === "https:" || protocol === "http:" ? value : null;

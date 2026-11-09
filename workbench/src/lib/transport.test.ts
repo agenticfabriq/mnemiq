@@ -153,6 +153,8 @@ describe("fetchWhoami", () => {
       [42, null],
       ["javascript:alert(1)", null],
       ["/relative", null],
+      // A browser reads this host as example.com: the engine refuses it at startup, and so does this.
+      ["http://example.com\\.localhost/logout", null],
     ];
     for (const [sent, kept] of cases) {
       stubFetch(json({ principal_id: "alice@example.com", tenant_id: "tenant-a", verified: true, end_session_url: sent }));
