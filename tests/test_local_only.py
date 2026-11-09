@@ -334,10 +334,14 @@ def test_every_url_field_is_checked_or_explicitly_exempted():
     # forcing function: adding a `_url` field without updating one of the two sets below fails it.
     from mnemiq.config import Settings, _LOCAL_ONLY_CHECKED_URL_FIELDS
 
-    # Fields deliberately NOT checked, with why -- there are none today. A field would go here,
+    # Fields deliberately NOT checked, with why -- one today. A field goes here,
     # commented, only if checking it were actively wrong (the way pg_dsn/control_dsn are wrong to
     # check as URLs at all, were either of them ever renamed to end in `_url`).
-    EXEMPTED: set[str] = set()
+    EXEMPTED: set[str] = {
+        # Only the browser visits it, on Sign out; the engine never fetches it and it carries no data, so
+        # checking it would refuse a public identity provider for no egress at all.
+        "oidc_end_session_url",
+    }
 
     all_url_fields = {name for name in Settings.model_fields if name.endswith("_url")}
     accounted_for = set(_LOCAL_ONLY_CHECKED_URL_FIELDS) | EXEMPTED

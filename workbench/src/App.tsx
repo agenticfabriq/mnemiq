@@ -6,10 +6,10 @@ import { Mark } from "./components/Mark";
 import { ModeSelector } from "./components/ModeSelector";
 import { ScopePanel, useScope } from "./components/ScopePanel";
 import { Thread } from "./components/Thread";
-import { enter, MARKER, mayReload, namespaceOf, signOut } from "./lib/identity";
+import { enter, MARKER, mayReload, namespaceOf, signOut, signOutHref } from "./lib/identity";
 import { useWorkbench } from "./lib/runtime";
 import { fetchWhoami, NOTICE, Refused, type Refusal } from "./lib/transport";
-import type { Whoami } from "./lib/types";
+import type { Identity, Whoami } from "./lib/types";
 
 type Theme = "system" | "light" | "dark";
 
@@ -43,16 +43,13 @@ type Notice = Exclude<Refusal, "signed-out">;
 type Session =
   | { state: "resolving" }
   // `ns` is the identity's namespace, `shelf` where its items are kept (`enter`).
-  | { state: "ready"; ns: string | null; shelf: string | null; verified: boolean }
+  | { state: "ready"; ns: string | null; shelf: string | null; verified: boolean; endSession: string | null }
   | { state: "signed-out"; prompt: boolean }
-  | { state: "leaving"; ns: string | null }
+  | { state: "leaving"; ns: string | null; endSession: string | null }
   | { state: "refused"; refusal: Notice };
 
 const RELOAD = () => globalThis.location.reload();
 const NAVIGATE = (url: string) => globalThis.location.assign(url);
-
-/** The sign-in proxy's own sign-out, which ends its session and sends the browser back. */
-const SIGN_OUT = "/oauth2/sign_out";
 
 /**
  * The identity this tab holds threads for, as of its last check. The proxy's session is the
@@ -65,7 +62,7 @@ type Checked = { who: string; ns: string | null; at: number; hidden: boolean };
 
 const IDLE_MS = 60_000;
 
-const whoKey = (who: Whoami | null): string =>
+const whoKey = (who: Identity | null): string =>
   who === null ? "" : JSON.stringify([who.tenant_id, who.principal_id, who.verified]);
 
 /** A verified user on a page that cannot hash their identity gets no saved threads. Said,
@@ -164,7 +161,13 @@ export default function App({
         if (!live) return;
         const shelf = enter(ns);
         checked.current = { who: whoKey(who), ns, at: Date.now(), hidden: false };
-        setSession({ state: "ready", ns, shelf, verified: who !== null && who.verified });
+        setSession({
+          state: "ready",
+          ns,
+          shelf,
+          verified: who !== null && who.verified,
+          endSession: who?.end_session_url ?? null,
+        });
       })
       .catch((error: unknown) => {
         if (!live) return;
@@ -223,7 +226,9 @@ export default function App({
 
   const signOutNow = useCallback(() => {
     checked.current = null;
-    setSession((current) => (current.state === "ready" ? { state: "leaving", ns: current.ns } : current));
+    setSession((current) =>
+      current.state === "ready" ? { state: "leaving", ns: current.ns, endSession: current.endSession } : current,
+    );
   }, []);
 
   useEffect(() => {
@@ -231,7 +236,7 @@ export default function App({
     // Run once the workbench is gone, so nothing is left to write the threads back.
     signOut(session.ns);
     const back = `${globalThis.location.pathname}${globalThis.location.search}`;
-    navigate(`${SIGN_OUT}?rd=${encodeURIComponent(back)}`);
+    navigate(signOutHref(session.endSession, globalThis.location.origin, back));
   }, [session, navigate]);
 
   if (session.state === "ready") {

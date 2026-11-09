@@ -60,6 +60,11 @@ class HttpDoors:
         return self._owui is not None or self._openai is not None
 
     @property
+    def end_session_url(self) -> str | None:
+        """Where the workbench's Sign out ends, at the identity provider; operator configuration, never the request's."""
+        return self._cfg.end_session_url
+
+    @property
     def task_header(self) -> str:
         """The header (lowercase) whose non-empty value marks an Open WebUI background task on /openai/v1."""
         return self._cfg.task_header

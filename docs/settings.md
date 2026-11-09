@@ -222,8 +222,28 @@ with a message naming the setting to change. A token needs the `db.read` scope o
 `/openai/v1`, and is refused with a 403 without it, so the client that signs users in to the workbench, and Open
 WebUI's own client when it forwards each user's token, must request that scope. Open WebUI's signed user header
 carries no scopes and is not asked for one: what its users may read comes from their roles in the identity map
-alone. On MCP, `db.read` gates `db_read` and `get_schema`, and `db.write` gates `db_write`. A scope only narrows: what
-a token may read is still its roles' grants.
+alone. An Open WebUI user with no rule in the map is not refused: they are offered only the profiles open to every
+role (with no profiles file, the default alone) and asked with no roles, so they read only what the grants give a
+caller with no roles, and each question still reaches the engine and its model. On MCP, `db.read` gates `db_read` and `get_schema`, and `db.write` gates `db_write`. A scope only
+narrows: what a token may read is still its roles' grants.
+
+**Sign out through the identity provider.** Behind oauth2-proxy, the workbench's Sign out goes to the proxy's own
+sign-out, which ends the proxy's session and asks the identity provider to end the user's. When the proxy cannot load
+the session at that moment, the provider's session survives, and the next visit signs the same user straight back in.
+With `oidc_end_session_url` set, `/v1/whoami` tells a verified caller where the provider's end-session page is, and
+Sign out sends the browser on to it, which returns it to the workbench's root. The provider's session then ends either
+way; the provider asks the user to confirm only when the proxy could not end it. Three things must be in place, and
+each fails quietly without it:
+
+- **The provider's host in oauth2-proxy's `--whitelist-domain`, as the browser sends it**: lowercase, with a port
+  only when the URL names one other than its scheme's default, since a browser drops `:443` from an https URL.
+  Without it the proxy drops the redirect, logging `Rejecting invalid redirect … domain / port not in whitelist`, and
+  Sign out behaves as it did without the setting.
+- **The workbench's root, exactly (for example `https://mnemiq.example/`), among the client's valid post-logout
+  redirect URIs**, not a wildcard. Without it, expect the provider to show an error page instead of returning to the
+  workbench.
+- **The proxy client's `client_id` in the URL.** Keycloak needs it, or an ID token, which the workbench never holds.
+  Without it, expect Keycloak to refuse the sign-out.
 
 **The OpenAI-compatible endpoint.** `GET /openai/v1/models` and `POST /openai/v1/chat/completions` serve Open WebUI,
 or any OpenAI client, each request as its own verified caller, with one model per profile that caller may pick. They
@@ -244,6 +264,7 @@ title, answered empty without asking the engine. The question is the last user m
 | `oidc_roles_claim` | `"realm_access.roles"` | The dotted path of the token's roles claim. A token without it takes its roles from the identity map. |
 | `oidc_groups_claim` | unset | Opt-in: passes this claim's groups through as the identity's groups, for a provider whose groups only administrators control. Unset, a token's groups grant nothing except through the identity map. |
 | `oidc_leeway_s` | `30.0` | Clock leeway, in seconds, on a token's `exp`, `nbf` and `iat`. |
+| `oidc_end_session_url` | unset | The identity provider's end-session URL, as the browser reaches it, with the sign-in proxy client's `client_id` where the provider needs it. Set, the workbench's Sign out ends there, through the proxy's `rd`, so the provider's session ends even when the proxy cannot end it. Unset, Sign out is the proxy's alone. https, or http only for `127.0.0.1`, `[::1]`, `localhost` or a name under `.localhost`; printable ASCII with no backslash and no percent-encoded host; it needs `oidc_issuer`, and it must not carry `post_logout_redirect_uri`, which the workbench adds. |
 | `openwebui_audience` | unset | The `aud` an identity provider's token must carry on Open WebUI's endpoint, distinct from `oidc_audience`. The token needs the `db.read` scope there too. Unset, that endpoint accepts no Bearer token. |
 | `openwebui_jwt_secret` | unset | Turns on Open WebUI's signed user header: the HS256 secret it shares with Open WebUI, at least 32 bytes. |
 | `openwebui_jwt_header` | `"X-OpenWebUI-User-Jwt"` | The header carrying Open WebUI's signed user token. |
