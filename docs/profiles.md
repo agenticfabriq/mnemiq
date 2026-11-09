@@ -84,7 +84,9 @@ card_style = "bare"
   key variable, and drops the parent's `llm_context_window`, judge model and judge key unless it sets them. So a
   child that points back at the deployment's own URL, under a parent that moved away, is moving too and must name its
   own key: the deployment's key is never picked back up. Whether the profile ends with a chat endpoint and key is
-  checked once, on the resolved result, so a parent or a starter need not name one.
+  checked on the resolved result, so a starter, which never names one, is not refused for it. A parent in the file
+  is itself a profile: it is loaded and checked on its own, so it passes every check at boot as any profile does,
+  a chat endpoint and key included, and `roles` unless it is the default.
 - **A child cannot unset what a parent sets.** TOML has no null, so leaving a setting out inherits it. To run without
   a parent's setting, extend from a profile that does not set it.
 - **Versions hash the resolved result**, not the file ([Versions](#versions)). A change to a parent or to a starter
