@@ -37,7 +37,7 @@ from mnemiq.execute.select import (
     majority_index,
     trust,
 )
-from mnemiq.generate.generator import Generator, StrategyGenerator
+from mnemiq.generate.generator import Generator, StrategyGenerator, temperature_floor
 from mnemiq.generate.plan_query import Deferred, Feedback, plan_query
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.verdict import Approved
@@ -54,6 +54,13 @@ PROBE_BUDGET_S = 10.0
 # Cycled across candidates in multi-candidate mode: engineered disagreement, so the
 # selector has something real to select over (uniform resampling measured 56% unanimous).
 STRATEGIES = ("direct", "decompose", "skeleton")
+
+# The least temperature sent to a deep candidate whose strategy's prompt an earlier candidate already
+# sent, the fourth and fifth of five: at a writer temperature of 0 it would return that candidate's
+# SQL again, and the agreement gate would count the copy. 0.7 is the server default that
+# `writer_temperature`'s description names for Qwen2.5. Engine code, not a setting or a mode field,
+# so no profile version hashes it, as none hashes `seed_offset`.
+REPEAT_TEMPERATURE_FLOOR: float = 0.7
 
 
 @dataclass(frozen=True)
@@ -522,9 +529,13 @@ class Agent:
         held: dict = {"spent_s": 0.0}  # what the source said about a filter value, asked once a turn
         undefined: Deferred | None = None
         for i in range(self.candidates):
-            # seed_offset: a candidate that repeats an earlier one's strategy -- the fourth and
-            # fifth of five -- must not also repeat its seeded sample (M124).
-            with step(emit, Stage.CANDIDATE, index=i + 1, of=self.candidates), seed_offset(i):
+            # A candidate that repeats an earlier one's strategy -- the fourth and fifth of five --
+            # must not also repeat its sample: seed_offset sends it its own seed (M124), and
+            # temperature_floor at least REPEAT_TEMPERATURE_FLOOR, since at temperature 0 a seed
+            # changes nothing. Every other candidate is sent the writer's temperature as set.
+            floor = REPEAT_TEMPERATURE_FLOOR if i >= len(STRATEGIES) else None
+            with (step(emit, Stage.CANDIDATE, index=i + 1, of=self.candidates), seed_offset(i),
+                  temperature_floor(floor)):
                 outcome = plan_query(
                     packet,
                     snapshot,

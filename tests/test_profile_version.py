@@ -8,6 +8,7 @@ the version and the engine commit together pin the engine.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -167,3 +168,17 @@ def test_a_setting_with_no_credential_is_logged_as_it_is(monkeypatch, url):
     view, version = resolved_view(settings, "duckdb"), profile_version(settings, "duckdb")
     monkeypatch.setattr("mnemiq.profiles._no_credentials", lambda value: value)
     assert view == resolved_view(settings, "duckdb") and version == profile_version(settings, "duckdb")
+
+
+# What `profile_version(_settings(writer_temperature=0.0), "duckdb")` gave on main before deep mode's temperature floor,
+# with every MNEMIQ_* variable cleared. A change that moves every version on purpose records it again on main, and says
+# so in its commit.
+VERSION_ON_MAIN = "cec13cfd4071"
+
+
+def test_the_floor_changes_no_profile_version(monkeypatch):
+    """A profile at writer temperature 0, whose version hashes deep's mode with the rest, resolves to the version it
+    had on main before the floor: the floor is engine code, not a setting or a mode field."""
+    for name in [n for n in os.environ if n.startswith("MNEMIQ_")]:
+        monkeypatch.delenv(name)                    # so a shell's setting cannot move the version
+    assert profile_version(_settings(writer_temperature=0.0), "duckdb") == VERSION_ON_MAIN

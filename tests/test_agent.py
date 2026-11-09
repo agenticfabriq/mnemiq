@@ -1,6 +1,7 @@
 import logging
 
 import pyarrow as pa
+import pytest
 
 from mnemiq.agent.budget import Budget
 from mnemiq.agent.loop import Agent
@@ -598,3 +599,83 @@ def test_no_seed_set_means_none_sent_whatever_the_candidate():
     with seed_offset(2):
         client.complete("s", "u")
     assert seen == [None]
+
+
+def _temperature_recording_client():
+    """As `_seed_recording_client`: a real LLMClient over a fake OpenAI that answers count(*), with
+    model "m", which takes a temperature, recording each call's temperature, None when none was
+    sent."""
+    from types import SimpleNamespace
+
+    import mnemiq.llm.client as module
+    from mnemiq.config import Settings
+
+    seen = []
+
+    class _Fake:
+        def __init__(self, *_, **__):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+        def _create(self, **kwargs):
+            seen.append(kwargs.get("temperature"))
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=_sql("count(*)")))],
+                usage=None)
+
+    original = module.OpenAI
+    module.OpenAI = _Fake
+    try:
+        client = module.LLMClient(Settings(llm_base_url="http://x", llm_api_key="k",
+                                           llm_model="m", pg_dsn=None, acme_data_dir=None))
+    finally:
+        module.OpenAI = original
+    return client, seen
+
+
+def test_a_candidate_that_repeats_a_strategy_samples_at_least_at_the_floor():
+    """Five candidates cycle three strategies. At temperature 0 the fourth and fifth sent the first
+    and second prompts again and got the same SQL back, counted twice by the agreement gate; a seed
+    changes nothing there."""
+    from mnemiq.generate.generator import LLMGenerator
+
+    client, seen = _temperature_recording_client()
+    agent = _vote_agent([], 5)
+    agent.generator = LLMGenerator(client, temperature=0.0)
+    _answer(agent)
+    # The floor's value, 0.7, typed here so a change to it is seen.
+    assert seen[:5] == [0.0, 0.0, 0.0, 0.7, 0.7]
+
+
+@pytest.mark.parametrize("temperature", [None, 0.9])
+def test_the_floor_never_sends_a_temperature_where_none_was_set_nor_lowers_one(temperature):
+    from mnemiq.generate.generator import LLMGenerator
+
+    client, seen = _temperature_recording_client()
+    agent = _vote_agent([], 5)
+    agent.generator = LLMGenerator(client, temperature=temperature)
+    _answer(agent)
+    assert seen[:5] == [temperature] * 5
+
+
+def test_one_candidate_sends_the_writers_temperature_unchanged():
+    """Instant and thinking, as measured: with one candidate, every call is sent the writer's
+    temperature as set."""
+    from mnemiq.generate.generator import LLMGenerator
+
+    client, seen = _temperature_recording_client()
+    agent = _vote_agent([], 1)
+    agent.generator = LLMGenerator(client, temperature=0.0)
+    _answer(agent)
+    assert seen and set(seen) == {0.0}
+
+
+def test_the_floor_holds_inside_its_block_only():
+    from mnemiq.generate.generator import LLMGenerator, temperature_floor
+
+    client, seen = _temperature_recording_client()
+    generator = LLMGenerator(client, temperature=0.0)
+    generator.propose(_packet())
+    with temperature_floor(0.7):
+        generator.propose(_packet())
+    generator.propose(_packet())
+    assert seen == [0.0, 0.7, 0.0]
