@@ -4,6 +4,7 @@ what changes an answer and with nothing else."""
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -103,6 +104,20 @@ def test_a_models_own_start_replaces_the_shared_one_as_far_as_it_says(tmp_path):
     assert {name: start_profile(cfg, name) for name in models} == {
         "m": (str(shared), None), "n": (str(shared), "b"), "o": (str(own), None)}
     assert {name: start_settings(cfg, name)["retrieval_k"] for name in models} == {"m": 12, "n": 16, "o": 20}
+
+
+@pytest.mark.parametrize("line, named", [('extends = "parent"', "extends 'parent'"),
+                                         ('starter = "fixture-2.5-build"', "starter 'fixture-2.5-build'")])
+def test_a_start_profile_with_a_parent_is_refused(tmp_path, line, named):
+    # The sweep reads a start profile's own settings, so its parent's would be dropped without a word: the start would
+    # be named for `child` and run as the engine's defaults.
+    profiles = tmp_path / "start-profiles.toml"
+    profiles.write_text(f'default = "parent"\n[profiles.parent]\nretrieval_k = 12\n'
+                        f'[profiles.child]\nroles = ["*"]\n{line}\n')
+    refusal = (rf"model 'm' starts from profile 'child', which has a parent \({re.escape(named)}\), and a sweep "
+               "cannot yet start from a profile with a parent")
+    with pytest.raises(SweepConfigError, match=refusal):
+        load_config(write_config(tmp_path, start={"profile_file": str(profiles), "profile": "child"}))
 
 
 def test_check_mode_with_a_start_no_different_from_the_defaults_is_refused(tmp_path):

@@ -47,6 +47,73 @@ card_style = "bare"
   `max_attempts`, `verify`, `plan_attempts` and `prose`. With a profiles file, state them there:
   `MNEMIQ_MODE_SETTINGS` alongside it is refused.
 
+## A profile's parent: `extends` and `starter`
+
+A profile can start from one parent instead of from the deployment's settings alone: another profile in the same
+file, named with `extends`, or a starter profile the engine ships, named with `starter`.
+
+```toml
+default = "local"
+
+[profiles.local]
+llm_base_url = "http://127.0.0.1:8000/v1"
+llm_model = "qwen2.5-coder-32b"
+api_key_env = "LOCAL_LLM_KEY"
+writer_temperature = 0.0
+
+[profiles.local-bare]
+description = "The local model, with instant reading the bare schema"
+roles = ["analyst"]
+extends = "local"
+
+[profiles.local-bare.instant]
+card_style = "bare"
+```
+
+- **The layers, in order:** the deployment's settings, then the starter if the chain's root names one, then each
+  profile from the root down, ending with the profile itself. Each overrides the one before. A chain can be as long
+  as you need (`a` extends `b`, which extends `c`), and the order of the profiles in the file does not matter.
+- **At most one parent.** A profile names `extends` or `starter`, never both, so only a chain's root can name a
+  starter. A profile with neither starts from the deployment alone, as it always has.
+- **Never inherited:** `roles`, `description`, and being the `default`. A profile that extends the default is not the
+  default, so it lists its own `roles`.
+- **Mode sections merge setting by setting.** A parent's `instant` section that sets `card_style` and a child's that
+  sets `prose` give the child both.
+- **The endpoint rules apply through a parent**, each layer compared with the one before it, as a profile with no
+  parent is compared with the deployment. A child that moves the chat endpoint off its parent's must name its own
+  key variable, and drops the parent's `llm_context_window`, judge model and judge key unless it sets them. So a
+  child that points back at the deployment's own URL, under a parent that moved away, is moving too and must name its
+  own key: the deployment's key is never picked back up. Whether the profile ends with a chat endpoint and key is
+  checked on the resolved result, so a starter, which never names one, is not refused for it. A parent in the file
+  is itself a profile: it is loaded and checked on its own, so it passes every check at boot as any profile does,
+  a chat endpoint and key included, and `roles` unless it is the default.
+- **A child cannot unset what a parent sets.** TOML has no null, so leaving a setting out inherits it. To run without
+  a parent's setting, extend from a profile that does not set it.
+- **Versions hash the resolved result**, not the file ([Versions](#versions)). A change to a parent or to a starter
+  gives every profile under it a new version, and so can an engine upgrade, since an upgrade can change a starter it
+  ships. A profile with no parent keeps the version it had before parents existed.
+
+### Starters
+
+A starter is a profile the engine ships inside its package, one file per model build, holding the answer-time
+settings measured for that build. A profile names one by its exact name, `starter = "<name>"`: the engine never
+matches one from the model's name. A name it does not ship, whether typed wrong, shaped like a path, or removed by
+an upgrade, is refused at boot, and the refusal lists the starters this engine ships.
+
+- **A starter wins over the deployment's environment.** It is layered over the deployment, so with
+  `MNEMIQ_RETRIEVAL_K=36` in the env file and a starter that sets `retrieval_k = 24`, the profile runs with 24. Set the
+  value in the profile itself to override the starter.
+- **What a starter cannot clear.** A setting the starter leaves unset, such as `writer_temperature`, `llm_seed` or
+  `guard_fanout`, keeps the deployment's value. TOML has no null, so a starter has no way to unset one.
+- **What a starter never reaches.** The deployment settings that still change an answer, `verify_fail_closed` and
+  `max_question_chars`, and every mode the starter holds no section for.
+- **What a starter never sets.** The model and its endpoint (`llm_model`, `llm_base_url`, `llm_context_window`,
+  `verify_model`, `verify_base_url`), either key variable, `roles`, or a parent of its own. Those belong to the
+  deployment and its file, so a starter that sets one is refused.
+- **A starter's mode sections** merge setting by setting with the sections of the profiles above it, and with nothing
+  below it: `MNEMIQ_MODE_SETTINGS` is refused beside a profiles file, so an env file's mode settings never meet a
+  starter.
+
 ## What a profile may change
 
 Only how a question is answered: the model and its endpoint, the writer's prompt and temperature, the schema form,
@@ -86,9 +153,17 @@ version.
 - `MNEMIQ_PROFILE`, a setting from before profile files: name the file in `MNEMIQ_PROFILES_PATH` instead.
 - Per-mode settings that do not fit together, such as a judge or a minimum agreement on a mode with one candidate.
 - `writer_temperature` on a model that takes no temperature, such as GPT-5, which would ignore it.
+- `writer_reasoning` with `guided_sql`, which allows no text before the JSON.
+- With a profiles file, both of these refusals name the layer each value came from: the profile, a parent, a
+  starter, or the deployment.
 - A profile whose chat endpoint has no key, or whose judge runs on another endpoint with no key of its own.
 - A profile that would leave the network under `MNEMIQ_LOCAL_ONLY`.
 - An unknown key, a profile name outside `[a-z0-9][a-z0-9._-]*`, or a `default` that names no profile.
+- A profile that names two parents (`extends` and `starter`), extends a profile the file does not hold, or extends a
+  chain that comes back to itself, which the refusal shows from the profile to the repeated name.
+- A profile other than the default that lists no `roles`, even one that extends a profile that does.
+- A `starter` this engine does not ship. The refusal lists the ones it does.
+- A starter that sets the model, an endpoint, the context window, a key variable, `roles`, or a parent.
 
 ## Finding the right settings
 

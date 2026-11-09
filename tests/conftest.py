@@ -4,6 +4,16 @@ import os
 
 import pytest
 
+from tests.starter_fixtures import shipped_starters_untouched
+
+
+@pytest.fixture(autouse=True)
+def _shipped_starters_untouched():
+    """No test writes to the starters folder the engine ships. A test that needs starters makes its own folder
+    (`starter_fixtures.starter_folder`), and one that writes to the shipped folder fails, naming the file."""
+    with shipped_starters_untouched():
+        yield
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _seed_acme(request):

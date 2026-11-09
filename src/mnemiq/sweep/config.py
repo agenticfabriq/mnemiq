@@ -601,6 +601,15 @@ def _check_start(cfg: SweepConfig, model: str) -> None:
     if name not in read.profiles:
         raise SweepConfigError(f"model {model!r} starts from profile {name!r}, which {path} does not hold "
                                f"(it holds {sorted(read.profiles)})")
+    entry = read.profiles[name]
+    if entry.extends is not None or entry.starter is not None:
+        # The sweep reads the start profile's own settings (`start_settings`, `_start_sections`) and pins its file
+        # alone, so a parent's settings would be left out without a word while the start still carried this name.
+        parent = f"extends {entry.extends!r}" if entry.extends is not None else f"starter {entry.starter!r}"
+        raise SweepConfigError(f"model {model!r} starts from profile {name!r}, which has a parent ({parent}), and a "
+                               "sweep cannot yet start from a profile with a parent: it would read this profile's own "
+                               "settings without its parent's. Start from a profile that names neither extends nor "
+                               "starter")
 
 
 def _sha256(path: str, what: str) -> str:
