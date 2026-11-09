@@ -16,7 +16,7 @@ from mnemiq.config import Settings
 from mnemiq.contract import IdentityContext
 from mnemiq.profiles import Profile
 from mnemiq.server.app import build_app
-from tests.auth_keys import hs256, owui_claims
+from tests.auth_keys import AUDIENCE, ISSUER, OWUI_AUDIENCE, claims, hs256, jwks_for, mint, owui_claims, rsa_key
 
 SECRET, KEY = "s" * 32, "k" * 32
 SETTINGS_IDENTITY = IdentityContext(tenant_id="local", principal_id="settings-user", roles=["analyst"])
@@ -160,6 +160,31 @@ def test_a_door_refusal_is_in_openai_shape(tmp_path):
     error = _error(r, 401)
     assert error["type"] == "authentication_error" and "unsigned identity header" in error["message"]
     assert r.headers["www-authenticate"].startswith("Bearer")
+
+
+def test_a_bearer_without_db_read_is_a_403_in_openai_shape(tmp_path):
+    """The owner's decision (2026-11-08), at the endpoint: refused with RFC 6750's challenge, in OpenAI's shape, on
+    both routes and before the engine is asked."""
+    from mnemiq.auth.config import auth_config_from_settings
+    from mnemiq.auth.doors import HttpDoors
+
+    cfg = auth_config_from_settings(Settings(tenant="acme", oidc_issuer=ISSUER, oidc_audience=AUDIENCE,
+                                             openwebui_audience=OWUI_AUDIENCE))
+    rt = _RT()
+    client = _client(tmp_path, rt, doors=HttpDoors(cfg, fetch=lambda: jwks_for((rsa_key(), "k1"))))
+
+    def bearer(scope):
+        return {"Authorization": f"Bearer {mint(claims(aud=OWUI_AUDIENCE, scope=scope))}", "X-Mnemiq-Task": ""}
+
+    ask = {"model": "default", "messages": [{"role": "user", "content": "how many?"}]}
+    r = client.post("/openai/v1/chat/completions", json=ask, headers=bearer("openid"))
+    error = _error(r, 403)
+    assert error["type"] == "permission_error" and "lacks db.read" in error["message"]
+    assert r.headers["www-authenticate"] == 'Bearer error="insufficient_scope", scope="db.read"'
+    _error(client.get("/openai/v1/models", headers=bearer("openid")), 403)
+    assert rt.calls == 0
+    assert client.post("/openai/v1/chat/completions", json=ask, headers=bearer("openid db.read")).status_code == 200
+    assert rt.calls == 1
 
 
 def test_no_credential_is_a_401(tmp_path):

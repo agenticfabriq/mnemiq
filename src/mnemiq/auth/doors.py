@@ -30,7 +30,7 @@ logger = logging.getLogger("mnemiq.auth")
 
 Headers = Mapping[str, list[str]]  # every value of each header, keyed by its lowercase name
 
-V1_SCOPE = "db.read"  # what /v1 requires of a token, as MCP's read tools do
+READ_SCOPE = "db.read"  # what a provider token needs on /v1 and /openai/v1, as on MCP's read tools
 
 
 class DoorRefusal(Exception):
@@ -107,10 +107,12 @@ class HttpDoors:
                 raise DoorRefusal(401, "no Bearer token is accepted here without MNEMIQ_OPENWEBUI_AUDIENCE")
             found = verifier.claims(bearer)
             identity = identity_from_oidc(found, cfg)
-            # A 403, not a 401: the caller is known and not permitted, which signing in again would not change.
-            if door == "/v1" and V1_SCOPE not in token_scopes(found):
-                raise DoorRefusal(403, f"insufficient scope: this token lacks {V1_SCOPE}",
-                                  challenge=f'Bearer error="insufficient_scope", scope="{V1_SCOPE}"')
+            # A 403, not a 401: the caller is known and not permitted, which signing in again would not change. On
+            # both doors (the owner's decision, 2026-11-08). Open WebUI's signed header carries no scopes and has
+            # returned above: what its users may read comes from their roles in the identity map alone.
+            if READ_SCOPE not in token_scopes(found):
+                raise DoorRefusal(403, f"insufficient scope: this token lacks {READ_SCOPE}",
+                                  challenge=f'Bearer error="insufficient_scope", scope="{READ_SCOPE}"')
             return identity
         raise DoorRefusal(401, "no credential")
 

@@ -212,10 +212,12 @@ verified token, and the `principal` and `roles` above are never used. A tenant i
 once any verifier is configured, and every token must carry it, or `*` accepts any. Roles come from the token's roles
 claim when it has one, and from the identity map when it has none. A token's groups grant nothing unless the map
 names them or `oidc_groups_claim` opts in. Every setting here that a door cannot enforce stops the server at startup,
-with a message naming the setting to change. A token needs the `db.read` scope on every `/v1` route, and is refused with a
-403 without it, so the client that signs users in to the workbench must request that scope. On MCP, `db.read` gates
-`db_read` and `get_schema`, and `db.write` gates `db_write`. A scope only narrows: what a token may read is still its
-roles' grants.
+with a message naming the setting to change. A token needs the `db.read` scope on every `/v1` route and on
+`/openai/v1`, and is refused with a 403 without it, so the client that signs users in to the workbench, and Open
+WebUI's own client when it forwards each user's token, must request that scope. Open WebUI's signed user header
+carries no scopes and is not asked for one: what its users may read comes from their roles in the identity map
+alone. On MCP, `db.read` gates `db_read` and `get_schema`, and `db.write` gates `db_write`. A scope only narrows: what
+a token may read is still its roles' grants.
 
 **The OpenAI-compatible endpoint.** `GET /openai/v1/models` and `POST /openai/v1/chat/completions` serve Open WebUI,
 or any OpenAI client, each request as its own verified caller, with one model per profile that caller may pick. They
@@ -236,7 +238,7 @@ title, answered empty without asking the engine. The question is the last user m
 | `oidc_roles_claim` | `"realm_access.roles"` | The dotted path of the token's roles claim. A token without it takes its roles from the identity map. |
 | `oidc_groups_claim` | unset | Opt-in: passes this claim's groups through as the identity's groups, for a provider whose groups only administrators control. Unset, a token's groups grant nothing except through the identity map. |
 | `oidc_leeway_s` | `30.0` | Clock leeway, in seconds, on a token's `exp`, `nbf` and `iat`. |
-| `openwebui_audience` | unset | The `aud` an identity provider's token must carry on Open WebUI's endpoint, distinct from `oidc_audience`. Unset, that endpoint accepts no Bearer token. |
+| `openwebui_audience` | unset | The `aud` an identity provider's token must carry on Open WebUI's endpoint, distinct from `oidc_audience`. The token needs the `db.read` scope there too. Unset, that endpoint accepts no Bearer token. |
 | `openwebui_jwt_secret` | unset | Turns on Open WebUI's signed user header: the HS256 secret it shares with Open WebUI, at least 32 bytes. |
 | `openwebui_jwt_header` | `"X-OpenWebUI-User-Jwt"` | The header carrying Open WebUI's signed user token. |
 | `openwebui_jwt_max_lifetime_s` | `300` | The longest lifetime, `exp` minus `iat`, accepted on Open WebUI's signed user token. |
