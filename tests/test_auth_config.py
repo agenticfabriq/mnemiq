@@ -218,6 +218,39 @@ def test_a_jwks_file_with_no_usable_key_refuses_to_start(tmp_path):
     _refused("MNEMIQ_OIDC_JWKS_FILE", **{**OIDC, "oidc_jwks_file": str(tmp_path / "missing.json")})
 
 
+def _keys_the_verifier_cannot_use() -> dict:
+    """Keys PyJWT reads but the verifier never checks a signature with, since it pins RS256 and ES256."""
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from jwt.algorithms import ECAlgorithm, RSAAlgorithm
+
+    from tests.auth_keys import jwk, rsa_key
+
+    p384 = ECAlgorithm.to_jwk(ec.generate_private_key(ec.SECP384R1()).public_key(), as_dict=True)
+    return {
+        "hs256": {"kty": "oct", "k": "c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0LXNlY3JldA", "kid": "hs", "alg": "HS256"},
+        "es384": {**p384, "kid": "p384", "use": "sig"},
+        "es256-on-p384": {**p384, "kid": "p384-as-es256", "use": "sig", "alg": "ES256"},  # PyJWT builds this one
+        "ps256": {**jwk(rsa_key(), "ps"), "alg": "PS256"},
+        "rsa-private": {**RSAAlgorithm.to_jwk(rsa_key(), as_dict=True), "kid": "private", "alg": "RS256"},
+        "int-kid": {**jwk(rsa_key(), "k1"), "kid": 7},  # a token's `kid` is a string, so it can never name this key
+    }
+
+
+@pytest.mark.parametrize("name", ["hs256", "es384", "es256-on-p384", "ps256", "rsa-private", "int-kid"])
+def test_a_jwks_file_of_keys_the_verifier_cannot_use_refuses_to_start(tmp_path, name):
+    path = tmp_path / "jwks.json"
+    path.write_text(json.dumps({"keys": [_keys_the_verifier_cannot_use()[name]]}))
+    _refused("MNEMIQ_OIDC_JWKS_FILE", **{**OIDC, "oidc_jwks_file": str(path)})
+
+
+def test_a_jwks_file_with_one_usable_key_among_others_starts(tmp_path):
+    from tests.auth_keys import jwks_for, rsa_key
+
+    path = tmp_path / "jwks.json"
+    path.write_text(json.dumps({"keys": [*_keys_the_verifier_cannot_use().values(), *jwks_for((rsa_key(), "k1"))["keys"]]}))
+    assert _cfg(**{**OIDC, "oidc_jwks_file": str(path)}).oidc.jwks_file == str(path)
+
+
 def test_a_jwks_file_with_a_signing_key_starts(tmp_path):
     from tests.auth_keys import jwks_for, rsa_key
 

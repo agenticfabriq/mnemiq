@@ -337,6 +337,17 @@ def test_a_fetch_is_cut_at_its_total_deadline():
     assert time.monotonic() - started < 1.5
 
 
+def test_a_key_declared_for_another_algorithm_never_verifies():
+    """A JWK's `alg` names what the key is for; an RSA key published for PS256 does not verify an RS256 token."""
+    from mnemiq.auth.token import JwtIdentityVerifier
+
+    key = rsa_key()
+    published = jwks_for((key, "k1"))
+    published["keys"][0]["alg"] = "PS256"
+    v = JwtIdentityVerifier(_oidc(), audience=AUDIENCE, refuse_audience=None, fetch=_Fetch(published), clock=_Clock())
+    _rejected(v, mint(claims(), key), "unknown signing key")
+
+
 def test_a_hung_fetch_is_not_started_twice():
     release = threading.Event()
 
@@ -356,6 +367,44 @@ def test_a_hung_fetch_is_not_started_twice():
     _rejected(v, mint(claims()), "signing keys unavailable")
     release.set()
     v._keys._executor.shutdown(wait=True)  # anything queued behind the hung fetch has now run
+    assert fetch.calls == 1
+
+
+def test_two_requests_past_the_interval_check_fetch_once():
+    """Both requests read the interval before either takes the fetch guard, and the second takes it only after the
+    first has fetched; it must see that attempt and not fetch again (found in review: it fetched twice in one
+    interval, so a burst of unknown `kid`s could exceed one fetch per interval)."""
+    from mnemiq.auth.token import JwtIdentityVerifier
+
+    fetch = _Fetch(jwks_for((rsa_key(), "k1")))
+    v = JwtIdentityVerifier(_oidc(), audience=AUDIENCE, refuse_audience=None, fetch=fetch, clock=_Clock())
+    keys, checked, first_done, order = v._keys, threading.Barrier(2, timeout=5), threading.Event(), []
+    guard, lock = keys._fetching, threading.Lock()
+
+    class Gate:
+        """The fetch guard, held back until both requests have passed the check, then taken in turn."""
+
+        def acquire(self, blocking=True):
+            checked.wait()
+            with lock:
+                second = bool(order)
+                order.append(1)
+            if second:
+                first_done.wait(5)
+            return guard.acquire(blocking)
+
+        def release(self):
+            guard.release()
+            first_done.set()
+
+    keys._fetching = Gate()
+    found = []
+    threads = [threading.Thread(target=lambda: found.append(keys.key("k1").key_id)) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert found == ["k1", "k1"]
     assert fetch.calls == 1
 
 

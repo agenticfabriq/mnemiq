@@ -17,11 +17,10 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import jwt
 
 from mnemiq.auth.config import OidcSettings
-from mnemiq.auth.jwks import INVALID_SUBJECT, usable_keys
+from mnemiq.auth.jwks import ALGORITHMS, INVALID_SUBJECT, usable_keys
 
 logger = logging.getLogger("mnemiq.auth")
 
-ALGORITHMS = ("RS256", "ES256")
 REFETCH_INTERVAL_S = 60.0  # at most one JWKS fetch per interval, so unknown `kid`s cannot make us hammer the issuer
 FETCH_TIMEOUT_S = 5.0  # the whole fetch, not each socket read: a server trickling bytes is cut here too
 # An issuer revokes a key by no longer publishing it, so a fetched set is refreshed once this old: a removed key stops
@@ -93,6 +92,9 @@ class _KeySet:
 
     def _refresh(self, now: float) -> None:
         with self._state:
+            # Checked again under the guard: another request may have passed the same check and fetched since.
+            if self._last_attempt is not None and now - self._last_attempt < REFETCH_INTERVAL_S:
+                return
             self._last_attempt = now
             if self._pending is not None and not self._pending.done():
                 return  # an earlier fetch is still hung: never start a second behind it

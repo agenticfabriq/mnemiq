@@ -281,20 +281,49 @@ def _auth_settings(oidc):
     return AuthSettings(**kwargs)
 
 
+METADATA_PREFIX = "/.well-known/oauth-protected-resource"
+
+
+def _unscreened(paths, door: str) -> frozenset[str]:
+    """The routes the header screen lets through: the protected-resource metadata, which a client reads before it
+    holds a credential, and nothing else. An allow-list, so a route a later SDK adds is never served unscreened by
+    default: any route that is neither the door nor that metadata stops the server at startup."""
+    from mnemiq.auth.config import AuthConfigError
+
+    paths = [p for p in paths if p]
+    unscreened = frozenset(p for p in paths if p.startswith(METADATA_PREFIX))
+    unknown = sorted(set(paths) - unscreened - {door})
+    if unknown or door not in paths:
+        raise AuthConfigError(f"MCP over HTTP: the installed mcp serves {sorted(set(paths))}, and this server screens "
+                              f"only its door {door} and the protected-resource metadata; the routes {unknown} "
+                              "would be served without the header rules. Pin an mcp release this server supports")
+    return unscreened
+
+
+def _route_path(scope) -> str:
+    """The path Starlette routes by: a root path is stripped only where a slash follows it (Starlette's own
+    `get_route_path`, private to it, so restated here). Used only to recognise a route the screen skips."""
+    path, root = scope.get("path", ""), scope.get("root_path", "")
+    if not root or not path.startswith(root):
+        return path
+    if path == root:
+        return ""
+    return path[len(root):] if path[len(root)] == "/" else path
+
+
 class _HeaderScreen:
     """ASGI middleware in front of the SDK's bearer check on /mcp, applying the header rules every door shares
     (`mnemiq.auth.doors.screen`): the SDK reads the first Authorization header and ignores everything else, so a
     valid token beside Open WebUI's headers, or beside a second Authorization, would otherwise be served."""
 
-    def __init__(self, app, cfg, path: str = "/mcp") -> None:
-        self.app, self.cfg, self.path = app, cfg, path
+    def __init__(self, app, cfg, unscreened: frozenset[str], path: str = "/mcp") -> None:
+        self.app, self.cfg, self.unscreened, self.path = app, cfg, unscreened, path
 
     async def __call__(self, scope, receive, send):
-        # The path routing sees: a proxy's root path is part of the ASGI path, and Starlette strips it to route.
-        path, root = scope.get("path", ""), scope.get("root_path", "")
-        if root and path.startswith(root):
-            path = path[len(root):]
-        if scope["type"] == "http" and path == self.path:
+        # Screens every request but the named routes, never only the door's own path: this app receives exactly the
+        # paths the outer router sent it, so a path read differently from the router can over-screen the metadata
+        # route but can never let a request reach the door unscreened.
+        if scope["type"] == "http" and _route_path(scope) not in self.unscreened:
             from mnemiq.auth.doors import DoorRefusal, screen
 
             headers: dict[str, list[str]] = {}
@@ -333,7 +362,9 @@ def mcp_http_app(runtime, cfg, *, fetch: Callable[[], dict] | None = None):
     else:
         app = build_mcp(runtime, http_identity(cfg), server_kwargs={**server_kwargs, **http}).streamable_http_app()
     # Added last, so it is the outermost layer and runs before the SDK's authentication middleware.
-    app.add_middleware(_HeaderScreen, cfg=cfg)
+    door = http["streamable_http_path"]
+    unscreened = _unscreened([getattr(route, "path", None) for route in app.routes], door)
+    app.add_middleware(_HeaderScreen, cfg=cfg, unscreened=unscreened, path=door)
     return app
 
 
