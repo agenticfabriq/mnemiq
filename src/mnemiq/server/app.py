@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -69,10 +69,22 @@ class _Workbench(StaticFiles):
         return response
 
 
+class _NotPermitted(HTTPException):
+    """A door's 403 on /v1: a caller it has verified but does not permit (another tenant, no `db.read`). Its body
+    carries where Sign out ends at the identity provider, beside the unchanged `detail`, so the workbench can offer a
+    Sign out that switches accounts. Not a leak: the caller is known, and the URL is the provider's public page. A
+    401 never carries it."""
+
+    def __init__(self, detail: str, headers: dict | None, end_session_url: str | None) -> None:
+        super().__init__(status_code=403, detail=detail, headers=headers)
+        self.end_session_url = end_session_url
+
+
 def caller_dependency(doors, door: str = "v1"):
     """The FastAPI dependency that turns a request into its verified caller at `door` ("v1" or "openai"), or into
     the door's refusal: 401 with `WWW-Authenticate: Bearer`, 403 for another tenant or a token without the
-    `db.read` scope (with RFC 6750's insufficient-scope challenge), 503 for an unreadable map.
+    `db.read` scope (with RFC 6750's insufficient-scope challenge), 503 for an unreadable map. On /v1 a 403's body
+    also carries `end_session_url`, the doors' own, null when unset.
 
     Every value of every header goes to the door, keyed by lowercase name, so a credential sent twice is seen as
     sent twice. A plain function, so FastAPI runs it in a worker thread: a key fetch may block."""
@@ -88,8 +100,10 @@ def caller_dependency(doors, door: str = "v1"):
             return judge(headers)
         except DoorRefusal as exc:
             challenge = exc.challenge or ("Bearer" if exc.status == 401 else None)
-            raise HTTPException(status_code=exc.status, detail=exc.reason,
-                                headers={"WWW-Authenticate": challenge} if challenge else None) from None
+            headers = {"WWW-Authenticate": challenge} if challenge else None
+            if exc.status == 403 and door == "v1":
+                raise _NotPermitted(exc.reason, headers, doors.end_session_url) from None
+            raise HTTPException(status_code=exc.status, detail=exc.reason, headers=headers) from None
 
     return caller
 
@@ -111,6 +125,12 @@ def build_app(
                 yield
 
     app = FastAPI(title="mnemiq", version="v1", lifespan=lifespan)
+
+    @app.exception_handler(_NotPermitted)
+    async def not_permitted(request: Request, exc: _NotPermitted) -> JSONResponse:
+        return JSONResponse({"detail": exc.detail, "end_session_url": exc.end_session_url},
+                            status_code=exc.status_code, headers=exc.headers)
+
     if doors is None:
         def caller() -> IdentityContext:
             return identity

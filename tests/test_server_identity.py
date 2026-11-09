@@ -119,6 +119,44 @@ def test_whoami_keeps_its_other_fields():
     assert (reply["principal_id"], reply["tenant_id"], reply["verified"]) == ("user-7", "acme", True)
 
 
+@pytest.mark.parametrize("cause, token, detail", [
+    ("no db.read", dict(scope="openid"), "insufficient scope: this token lacks db.read"),
+    ("another tenant", dict(tenant="other"), "token is for another tenant"),
+])
+def test_a_403_on_whoami_carries_the_end_session_url_beside_its_detail(cause, token, detail):
+    """A caller the door knows but does not permit can still Sign out through the provider, so the workbench can
+    offer one that switches accounts. `detail` is unchanged, and so is the challenge."""
+    r = _client(_RT(), _doors(oidc_end_session_url=END)).get("/v1/whoami", headers=_auth(**token))
+    assert r.status_code == 403
+    assert r.json() == {"detail": detail, "end_session_url": END}
+    unset = _client(_RT(), _doors()).get("/v1/whoami", headers=_auth(**token))
+    assert r.headers.get("www-authenticate") == unset.headers.get("www-authenticate")
+
+
+def test_a_403_names_a_null_end_session_url_when_unset():
+    r = _client(_RT(), _doors()).get("/v1/whoami", headers=_auth(scope="openid"))
+    assert r.status_code == 403
+    assert r.json() == {"detail": "insufficient scope: this token lacks db.read", "end_session_url": None}
+
+
+@pytest.mark.parametrize("method, path, body", ROUTES)
+def test_every_v1_route_s_403_carries_the_end_session_url(method, path, body):
+    """Not a leak: the caller is verified, and the URL is the provider's public end-session page."""
+    r = _call(_client(_RT(), _doors(oidc_end_session_url=END)), method, path, body, _auth(scope="openid"))
+    assert r.status_code == 403
+    assert r.json()["end_session_url"] == END
+
+
+@pytest.mark.parametrize("headers", [{}, {"Authorization": "Bearer not-a-token"}], ids=["no credential", "bad token"])
+def test_a_401_is_byte_for_byte_the_same_with_the_end_session_url_set(headers):
+    with_url = _client(_RT(), _doors(oidc_end_session_url=END)).get("/v1/whoami", headers=headers)
+    without = _client(_RT(), _doors()).get("/v1/whoami", headers=headers)
+    assert with_url.status_code == without.status_code == 401
+    assert with_url.content == without.content
+    assert with_url.headers.items() == without.headers.items()
+    assert "sso.example" not in with_url.text
+
+
 def test_a_signed_out_whoami_is_a_401_that_names_no_end_session_url():
     """Where Sign out ends is told only to a verified caller, and a refusal says nothing of it."""
     r = _client(_RT(), _doors(oidc_end_session_url=END)).get("/v1/whoami")

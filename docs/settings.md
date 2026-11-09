@@ -231,7 +231,10 @@ narrows: what a token may read is still its roles' grants.
 sign-out, which ends the proxy's session and asks the identity provider to end the user's. When the proxy cannot load
 the session at that moment, the provider's session survives, and the next visit signs the same user straight back in.
 With `oidc_end_session_url` set, `/v1/whoami` tells a verified caller where the provider's end-session page is, and
-Sign out sends the browser on to it, which returns it to the workbench's root. The provider's session then ends either
+Sign out sends the browser on to it, which returns it to the workbench's root. A caller the door verifies but refuses
+on `/v1` gets it too, so they can sign out and switch accounts. A 403 for another tenant or a token without `db.read`
+has the body `{"detail": "<reason>", "end_session_url": "<the URL>"}`, with `null` when the setting is unset. A 401,
+for a caller nobody has verified, is unchanged and names it nowhere. The provider's session then ends either
 way; the provider asks the user to confirm only when the proxy could not end it. Three things must be in place, and
 each fails quietly without it:
 
