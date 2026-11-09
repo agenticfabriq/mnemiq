@@ -1,8 +1,8 @@
 """A scripted model server: an OpenAI-compatible endpoint on 127.0.0.1 that answers the engine's real requests.
 
-`StubModel` serves the doors the engine calls -- chat completions, embeddings, vLLM's `/tokenize` and `/metrics`, and
-`/v1/models` -- from a script, so a test can drive the product path (`build_runtime`, `Runtime.ask`, `run_case`) with no
-model behind it. A chat request is answered as whoever sent it, read from its system prompt: the SQL writer, the result
+`StubModel` serves the doors the engine and the sweep call -- chat completions, embeddings, vLLM's `/tokenize`,
+`/metrics` and `/version`, and `/v1/models` -- from a script, so a test can drive the product path (`build_runtime`,
+`Runtime.ask`, `run_case`) with no model behind it. A chat request is answered as whoever sent it, read from its system prompt: the SQL writer, the result
 judge, deep mode's selector, the corrector, the sentence that follows the rows, and enrichment's column notes.
 
 The writer is answered from the cases the stub has learned (`learn`): the case whose question the request carries.
@@ -194,16 +194,21 @@ class StubModel:
       prompt_tokens the prompt tokens every chat reply reports, whatever was sent: a server that read only part of
                     the prompt reports what it read.
       embed_status  every embeddings request fails with this: an HTTP code or "connect".
+      version       what `/version` reports, as vLLM's does.
+      root          the weights `/v1/models` reports the served model was launched from, as vLLM's `root` does.
+      reports_build false: `/version` and `/v1/models` answer 404, as a hosted endpoint's do.
 
-    Calling a stub, `stub(**options)`, starts another that shares its cases and stops when it stops.
+    Calling a stub, `stub(**options)`, starts another that shares its cases and stops when it stops. `version`, `root`,
+    `window` and `reports_build` are read as each request arrives, so a test can change one while the stub runs.
     """
 
     def __init__(self, rule: Rule | None = None, *, gold: bool = False,
                  gold_when: Callable[[dict], bool] | None = None, sql: str | None = None, varies: bool = False,
                  seconds: float = 0.0, start_misses: int = 0, on_call: Callable[[int], None] | None = None,
                  fail_first: int = 0, fail_after: int | None = None, status: int | str = 500,
-                 confidence: float = 0.9, window: int = 32768, prompt_tokens: int | None = None,
-                 embed_status: int | str | None = None, model: str = "stub-model",
+                 confidence: float = 0.9, window: int = 4096, prompt_tokens: int | None = None,
+                 embed_status: int | str | None = None, model: str = "stub-model", version: str = "0.9.0.1",
+                 root: str = "fixture/model-2.5-awq", reports_build: bool = True,
                  script: _Script | None = None) -> None:
         if gold and gold_when is not None:
             raise ValueError("gold and gold_when say the same thing: pass one")
@@ -229,6 +234,9 @@ class StubModel:
         self.prompt_tokens = prompt_tokens
         self.embed_status = embed_status
         self.model = model
+        self.version = version
+        self.root = root
+        self.reports_build = reports_build
         # What a test reads.
         self.calls = 0  # chat requests, failed ones included
         self.requests: list[dict] = []  # each chat request's body, in arrival order
@@ -409,8 +417,13 @@ class StubModel:
                 f'vllm:num_requests_running{{model_name="{self.model}"}} {float(running)}\n')
 
     def _models(self) -> dict:
-        return {"object": "list",
-                "data": [{"id": self.model, "object": "model", "owned_by": "stub", "max_model_len": self.window}]}
+        """vLLM's listing, the served model second: a decoy with another id comes first, so a reading that takes an
+        entry other than the one whose `id` is the served model's reads the decoy's values."""
+        decoy = {"id": "other-model", "object": "model", "owned_by": "other", "root": "other/decoy-model",
+                 "max_model_len": 1024}
+        served = {"id": self.model, "object": "model", "owned_by": "vllm", "root": self.root,
+                  "max_model_len": self.window}
+        return {"object": "list", "data": [decoy, served]}
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -424,8 +437,12 @@ class _Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/metrics":
             self.send_body(200, stub._metrics().encode(), "text/plain; version=0.0.4")
+        elif path in ("/v1/models", "/models", "/version") and not stub.reports_build:
+            self.send_json(404, {"error": {"message": f"no route {path}", "type": "not_found", "code": "404"}})
         elif path in ("/v1/models", "/models"):
             self.send_json(200, stub._models())
+        elif path == "/version":
+            self.send_json(200, {"version": stub.version})
         else:
             self.send_json(404, {"error": {"message": f"no route {path}", "type": "not_found", "code": "404"}})
 

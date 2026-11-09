@@ -4,8 +4,9 @@ An arm is one model in one mode, changed from that model's start. A change is na
 profile-wide setting by its own name (`retrieval_k`), a mode's setting by the mode and its name (`instant.candidates`),
 since one profile holds a section for each mode.
 
-The start is the engine's field defaults (each mode's own values, for a mode's settings), overlaid by the start profile
-when the config names one. A model's endpoint is a fact about the model, stated once under `[models]` (the judge's under
+The start is the engine's field defaults (each mode's own values, for a mode's settings), overlaid by the start when the
+config names one: a starter the engine ships, or a start profile read through its chain, the starter its root names and
+each profile it extends included. A model's endpoint is a fact about the model, stated once under `[models]` (the judge's under
 `[judge]` when the config has one), so it replaces whatever the start file says. Nothing a deployment's env file sets is
 part of an arm: `baseline` resets the deployment's settings before the arm's profile applies, and the profile file
 writes out every setting that has a value.
@@ -29,7 +30,7 @@ from mnemiq.config import ModeSettings, Settings
 from mnemiq.profiles import PROFILE_SETTINGS, load_profiles
 from mnemiq.profiles import _read as _read_profile_file
 from mnemiq.sweep.config import (
-    ENDPOINT_FACTS, SweepConfig, _deployment_ids, deployment_settings, scrub_credentials, start_profile,
+    ENDPOINT_FACTS, SweepConfig, _deployment_ids, deployment_settings, scrub_credentials, start_entry,
 )
 
 ROUNDS = ("screen", "grid", "timing", "confirm", "check")
@@ -130,12 +131,11 @@ def _endpoint(cfg: SweepConfig, model: str) -> dict[str, object]:
 
 def start_settings(cfg: SweepConfig, model: str) -> dict[str, object]:
     """Every profile setting and every mode's setting `model` starts from, by change name: the engine's field default,
-    overlaid by the start profile's entry, with the model's endpoint from `[models]`."""
+    overlaid by what the start sets, read whole (`start_entry`: a starter, or a start profile with each layer of its
+    chain), with the model's endpoint from `[models]`."""
     values = _field_defaults()
-    path, name = start_profile(cfg, model)
-    if path is not None:
-        read = _read_profile_file(path)
-        entry = read.profiles[name or read.default]
+    entry = start_entry(cfg, model)
+    if entry is not None:
         values.update({setting: getattr(entry, setting) for setting in entry.model_fields_set & PROFILE_SETTINGS})
         for mode_name in MODES:
             section = getattr(entry, mode_name)

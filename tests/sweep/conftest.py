@@ -6,7 +6,10 @@
 
 from __future__ import annotations
 
+import copy
+import importlib.metadata
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -19,9 +22,13 @@ from pathlib import Path
 import duckdb
 import pytest
 
+import mnemiq
 from mnemiq.config import DEFAULT_RETRIEVAL_K, Settings
 from mnemiq.contract import EvaluationCase
 from mnemiq.profiles import PROFILE_SETTINGS
+from mnemiq.sweep.run import engine_build
+from tests.starter_fixtures import ROOT_AND_CHILD, STARTER, starter_folder, write
+from tests.starter_fixtures import edit as edit  # for the sweep tests, which import their helpers from here
 
 from .stub_model import StubModel
 
@@ -283,8 +290,7 @@ def write_config(tmp_path: Path, *, deployment: TinyDeployment | None = None, mo
         "sweep": {"name": "tiny", "out": str(tmp_path / "sweep-out")},
         "dataset": {"questions": str(questions or deployment.questions), "env": str(deployment.env), "split_seed": 7,
                     "identity": {"tenant": "local", "principal": "sweep", "roles": [ROLE]}},
-        "models": {"m": {"llm_model": "stub-model", "llm_base_url": model.url if model is not None else UNREACHABLE,
-                         "api_key_env": KEY_ENV}},
+        "models": one_model(model),
         "modes": ["instant"],
     }
     for name, value in sections.items():
@@ -314,6 +320,140 @@ def start_refused_in_instant(tmp_path: Path) -> dict:
     path = tmp_path / "start-refused-in-instant.toml"
     path.write_text('default = "tuned"\n[profiles.tuned]\n[profiles.tuned.instant]\nmin_agreement = 0.6\n')
     return {"profile_file": str(path)}
+
+
+# --- a starter, its evidence, and a model's build ---------------------------------------------------------------------
+
+STARTER_NAME = "fixture-2.5-build"
+# Model `m` as `write_config` writes it under `[models]`, at an address nothing answers.
+ONE_MODEL = {"llm_model": "stub-model", "llm_base_url": UNREACHABLE, "api_key_env": KEY_ENV}
+# What a config states of the build the fixture starter was swept on: what no server reports.
+CONFIG_BUILD = {"model": "fixture/model-2.5-awq", "gpu": "GeForce RTX 4090", "quantization": "awq"}
+# The engine this process runs, which `starter_with_evidence` records as the one its starter was swept on.
+_RUNNING = engine_build()
+SHA12 = _RUNNING["source_sha"][:12]
+COMMIT = _RUNNING["commit"] or "no commit"
+# A database key shaped like a machine path, which the evidence schema refuses. Spelled in two parts, as the repo
+# guard's own tests spell one, so the source never holds a home path.
+PATH_SHAPED_KEY = "/" + "Users/x"
+
+
+def one_model(stub: StubModel | None = None, **fields) -> dict:
+    """The `[models]` section `write_config` writes: model `m`, at `stub`'s URL when given, with `fields` changed.
+    `build=` is its build table, `[models.m.build]`."""
+    entry = ONE_MODEL | ({"llm_base_url": stub.url} if stub is not None else {})
+    return {"m": entry | fields}
+
+
+def _counts(right: int, wrong: int, made_up: int, declined: int) -> dict:
+    """One run of an arm in one mode, as starter evidence records it: 26 questions, every one measured."""
+    return {"valid": True, "cases": 26, "right": right, "strict": right, "wrong": wrong, "made_up": made_up,
+            "declined": declined, "failed": 0, "errors": 0, "ungraded": 0, "unjudged": 0, "median_ms": 1000.0,
+            "median_rows_ms": 800.0, "prompt_tokens": 900.0}
+
+
+def _evidence(name: str) -> dict:
+    """Evidence the schema accepts for the starter `name`: checked in instant mode against the engine's defaults, on
+    the build `CONFIG_BUILD` states, served by vLLM 0.9.0.1 with a 4096-token window, on the running engine."""
+    return {
+        "starter": name,
+        "published": "2026-11-07",
+        "dataset": {"name": "fixture-questions", "questions": 26, "answerable": 17},
+        "made_up_measured": True,
+        "model_build": {"model": "fixture/model-2.5-awq", "quantization": "awq", "server": "vllm",
+                        "server_version": "0.9.0.1", "gpu": "GeForce RTX 4090", "context_window": 4096},
+        "engine_build": {"version": importlib.metadata.version("mnemiq"), **_RUNNING},
+        "safe_by": "check",
+        "rule": {"strategy": "check", "alpha": 0.05, "max_more_wrong": 0, "max_more_made_up": 0, "max_errors": 0,
+                 "repeats": 2},
+        "modes_measured": ["instant"],
+        "unmeasured_modes": {"thinking": ["retrieval_k", "writer_temperature"],
+                             "deep": ["retrieval_k", "writer_temperature"]},
+        "held_unset": ["guard_fanout", "llm_seed"],
+        "check": {"instant": [{"run": run, "start": _counts(12, 2, 0, 12), "defaults": _counts(11, 3, 1, 11)}
+                              for run in (1, 2)]},
+        "search": None,
+        "versions": {"": "0123456789ab"},
+        "measured_versions": None,
+    }
+
+
+# Each worker a sweep starts is a spawned process that imports the engine afresh, so the starters folder a test patched
+# in its own process is lost there. Imported as each worker starts, from `PYTHONPATH`, this patches it there too.
+_STARTERS_IN_WORKERS = """
+import os
+
+if os.environ.get("SWEEP_TEST_STARTERS"):
+    from pathlib import Path
+
+    import mnemiq.profiles
+
+    _folder = Path(os.environ["SWEEP_TEST_STARTERS"])
+    mnemiq.profiles.starters_folder = lambda: _folder
+"""
+
+
+def starter_with_evidence(tmp_path: Path, monkeypatch, *, name: str = STARTER_NAME, settings: str = STARTER,
+                          **evidence) -> Path:
+    """A starters folder of the test's own (`starter_folder`), holding the starter `name` with `settings` and its
+    evidence, which the schema accepts. Each keyword in `evidence` replaces that field of it. Returns the folder.
+
+    The sweep's workers read the same folder, through a `sitecustomize` on `PYTHONPATH` that each spawned process
+    imports as it starts."""
+    folder = starter_folder(tmp_path, monkeypatch, {name: settings})
+    write(folder / f"{name}.evidence.json", json.dumps(_evidence(name) | evidence, indent=2))
+    hook = tmp_path / "starters-in-workers"
+    hook.mkdir(exist_ok=True)
+    write(hook / "sitecustomize.py", _STARTERS_IN_WORKERS)
+    paths = [str(hook), str(Path(mnemiq.__file__).parents[1]), *filter(None, [os.environ.get("PYTHONPATH")])]
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(paths))
+    monkeypatch.setenv("SWEEP_TEST_STARTERS", str(folder))
+    return folder
+
+
+def valid_evidence(tmp_path: Path, monkeypatch) -> dict:
+    """The evidence `starter_with_evidence` writes, as a dict."""
+    folder = starter_with_evidence(tmp_path, monkeypatch)
+    return json.loads((folder / f"{STARTER_NAME}.evidence.json").read_text())
+
+
+def start_via(tmp_path: Path, via: str) -> dict:
+    """A `[start]` section that reaches the fixture starter: by its name, or through a profile file whose default (the
+    root of `ROOT_AND_CHILD`) names it."""
+    if via == "starter":
+        return {"starter": STARTER_NAME}
+    if via == "profile_file":
+        return {"profile_file": str(write(tmp_path / "start-from-starter.toml", ROOT_AND_CHILD))}
+    raise ValueError(f"no such way to start: {via}")
+
+
+def altered(evidence: dict, path: tuple) -> dict:
+    """A copy of `evidence` with one change its schema must refuse, at `path`: the keys down to a table, then what is
+    planted in it. `"extra"` is a key the schema does not name, `"fast"` a mode that is not one, and `PATH_SHAPED_KEY` a
+    database key shaped like a path; a table on the way that is null is made. `("rule", "max_more_wrong")` sets that
+    bound to 1, and `("published", None)` writes the date in another form."""
+    changed = copy.deepcopy(evidence)
+    if path == ("published", None):
+        changed["published"] = "07/11/2026"
+        return changed
+    if path == ("rule", "max_more_wrong"):
+        changed["rule"]["max_more_wrong"] = 1
+        return changed
+    *where, planted = path
+    holder = changed
+    for key in where:
+        if isinstance(holder, dict) and holder.get(key) is None:
+            holder[key] = {}
+        holder = holder[key]
+    if planted == "extra":
+        holder["extra"] = 1
+    elif planted == "fast":
+        holder["fast"] = copy.deepcopy(next(iter(holder.values())))
+    elif planted == PATH_SHAPED_KEY:
+        holder[PATH_SHAPED_KEY] = "0123456789ab"
+    else:
+        raise ValueError(f"no such change: {path}")
+    return changed
 
 
 def broken_questions(tmp_path: Path, bad: str) -> Path:
@@ -812,7 +952,7 @@ def play_after_search(cfg, *, held_out: dict | None = None, hosted: bool = False
     return rounds
 
 
-def _idle_deployment(tmp_path: Path) -> TinyDeployment:
+def idle_deployment(tmp_path: Path) -> TinyDeployment:
     """The tiny deployment, its store built, on a stub that is stopped once it is: a sweep whose rows are written calls
     no model."""
     with StubModel() as idle:
@@ -849,7 +989,7 @@ def graded_sweep(tmp_path: Path, *, arms: dict | None = None, grid: dict | None 
             if value not in space.setdefault(name, []):
                 space[name].append(value)
     dataset = tiny_dataset(tmp_path, cases=cases[0], answerable=cases[1], stub=real_profiles)
-    deployment = tiny_deployment(tmp_path, real_profiles) if real_profiles is not None else _idle_deployment(tmp_path)
+    deployment = tiny_deployment(tmp_path, real_profiles) if real_profiles is not None else idle_deployment(tmp_path)
     from mnemiq.sweep.arms import arm_of
     from mnemiq.sweep.config import load_config
     from mnemiq.sweep.run import _begin, _parts, run
@@ -909,7 +1049,7 @@ def checked_sweep(tmp_path: Path, *, start: dict, defaults: dict, modes=("instan
     from mnemiq.sweep.run import _begin, _parts
 
     tmp_path.mkdir(parents=True, exist_ok=True)
-    cfg = load_config(write_config(tmp_path, deployment=_idle_deployment(tmp_path), modes=list(modes),
+    cfg = load_config(write_config(tmp_path, deployment=idle_deployment(tmp_path), modes=list(modes),
                                    dataset=tiny_dataset(tmp_path, cases=26, answerable=17),
                                    search={"strategy": "check"}, sweep={"repeats": 1},
                                    start=start_that_differs(tmp_path)))

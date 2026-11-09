@@ -8,6 +8,9 @@ measured, so before one there is no dollar figure rather than a guess.
 The smallest detectable gain is set beside the room's upper bound: the most an arm can gain is the questions the start
 gets wrong, and before the start has run the tuning part's answerable questions bound that from above. When the gain
 needs more than that, no arm can win, and check mode is the useful run.
+
+Each model's build is shown as its config states it, with the starter its start resolves through and where the stated
+build differs from the one that starter was swept on. What the server reports is read only when the sweep runs.
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ from statistics import fmean
 from mnemiq.config import Settings
 from mnemiq.runtime import _resolve_verify_level
 from mnemiq.sweep.arms import Arm, baselines, check_arms, grid_arms, refusal_under, screen_arms, start_settings
-from mnemiq.sweep.config import _FILE_SOURCES, SMOKE, SweepConfig, _source_specs, load_questions
+from mnemiq.sweep.config import _FILE_SOURCES, SMOKE, SweepConfig, _source_specs, load_questions, start_starter
 from mnemiq.sweep.split import split
 from mnemiq.sweep.stats import detectable_gain
 
@@ -330,6 +333,22 @@ def _refusals(refused: list[tuple[Arm, str]]) -> list[str]:
     return lines
 
 
+def _builds(cfg: SweepConfig) -> list[str]:
+    """Each model's build as `[models.<name>.build]` states it, the starter its start resolves through, and where the
+    stated build differs from the one that starter was swept on, as far as can be told before the server is read."""
+    from mnemiq.sweep.starters import build_mismatches  # the starters read the run, which reads this module
+
+    lines = []
+    for model, entry in cfg.models.items():
+        build = entry.build
+        stated = {name: getattr(build, name) if build is not None else None for name in ("gpu", "quantization", "model")}
+        lines.append(f"{model} build: " + ", ".join(f"{name} {value or 'not stated'}" for name, value in stated.items()))
+        if (starter := start_starter(cfg, model)) is not None:
+            lines += [f"{model} starts from starter {starter!r}", *build_mismatches(cfg, model, None)]
+    lines.append("the server's model, version and window are read when the sweep runs")
+    return lines
+
+
 def _nothing_compared(est: Estimate, key: tuple[str, str]) -> str:
     """Why no arm of one model and mode is compared with the start, for a sweep that searches."""
     if not any(est.rounds[key].values()):
@@ -378,6 +397,8 @@ def render(cfg: SweepConfig, *, tokens: dict[str, tuple[float, float]] | None = 
                          "mode")
     if est.refused:
         lines += ["", "Skipped, since the engine refuses them", *_refusals(est.refused)]
+
+    lines += ["", "Builds", *(f"  {line}" for line in _builds(cfg))]
 
     lines += ["", "Cost"]
     asked = ", ".join(f"{count} with {_runs(runs)}" for runs, count in est.case_runs.items())
