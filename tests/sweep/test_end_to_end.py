@@ -14,12 +14,14 @@ import pytest
 from mnemiq.cli import SWEEP_BUDGET_STOP, main
 from mnemiq.sweep import propose as proposal
 from mnemiq.sweep.config import Control, Search, SweepConfig, SweepConfigError, fingerprint, load_config
+from mnemiq.sweep.propose import _agrees, _versions
 from mnemiq.sweep.report import report
 from mnemiq.sweep.stats import detectable_gain
 
 from .conftest import (
-    KEY_ENV, STUB_KEY, UNREACHABLE, answers_file, evidence, graded_sweep, json_lines, out, proposal_file, rewrite,
-    start_refused_in_instant, start_that_differs, tiny_deployment, tiny_files, write_config,
+    CONFIG_BUILD, KEY_ENV, STUB_KEY, STUB_WINDOW, UNREACHABLE, answers_file, deployment_file_naming, drafted_versions,
+    evidence, graded_sweep, json_lines, one_model, out, proposal_file, rewrite, start_refused_in_instant,
+    start_that_differs, starter_folder, tiny_deployment, tiny_files, write, write_config,
 )
 
 REPO = Path(__file__).resolve().parents[2]
@@ -114,6 +116,20 @@ def test_a_sweep_from_config_to_proposal(tmp_path, stub_model, monkeypatch, caps
     # A person may choose another arm that ran, and it applies to every model.
     assert main(["sweep", "propose", "--config", str(cfg_path), "--choose", "start"]) == 0
     assert "guided_sql = false" in proposal_text(cfg_path) and evidence_of(cfg_path)["chosen_by"] == "person"
+
+
+def test_a_starter_from_config_to_package(tmp_path, monkeypatch, stub_model):
+    starter_folder(tmp_path, monkeypatch, {})
+    model = stub_model(gold=True)
+    cfg_path = write_config(tmp_path, deployment=tiny_deployment(tmp_path, model), search={"strategy": "check"},
+                            start=start_that_differs(tmp_path),
+                            models=one_model(model, build=CONFIG_BUILD, llm_context_window=STUB_WINDOW))
+    for action in ("run", "propose"):
+        assert main(["sweep", action, "--config", str(cfg_path)]) == 0
+    assert main(["sweep", "starter", "--config", str(cfg_path), "--model", "m", "--dataset", "the tiny set"]) == 0
+    cfg = load_config(cfg_path)
+    dep = write(tmp_path / "dep.toml", deployment_file_naming("model-2.5-awq", cfg))
+    assert _agrees(_versions(cfg, dep, {}), drafted_versions(cfg))
 
 
 def test_the_doc_table_matches_detectable_gain():

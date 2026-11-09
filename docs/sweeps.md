@@ -65,6 +65,7 @@ Each action takes `--config`, the sweep's config file.
 | `mnemiq sweep run` | Runs the rounds in order, resuming where an earlier run stopped. `--until ROUND` stops after that round. `--smoke N` runs each arm of the first round once on its first N questions to tune on, in `<out>/smoke/`, instead of the sweep. |
 | `mnemiq sweep report` | Prints a table for each model and mode of every round that has run, or of one with `--round ROUND`. |
 | `mnemiq sweep propose` | Applies the config's rule to the finished sweep and writes each model's proposed profile and its evidence. `--choose ARM` writes a person's pick instead: an arm's label as the report shows it, `start`, or in check mode `defaults`. One pick applies to every model, and must name an arm that ran and is valid in every run there; in a mode the arm did not run in, the profile holds the start, which must be valid there too. |
+| `mnemiq sweep starter` | Writes a starter profile and its evidence into the engine's starters folder from finished sweeps whose rule found it safe over the engine's defaults: `--model` and `--dataset`, with `--search` for the search a check started from. See [starters.md](starters.md). |
 
 A command exits 0 when it did what it was asked. It exits 1 with the reason, and no traceback, when the config or
 the sweep's files refuse it, and when `run` stopped because an endpoint stopped answering or a worker died. A `run`
@@ -222,7 +223,8 @@ A starter is picked by name, never matched from the model's name: a model whose 
 starts from the engine's defaults unless its start names that starter. Its name is refused unless the engine ships it,
 and so is a starter whose evidence (`<name>.evidence.json`, beside it) is missing or does not have the form the engine
 reads, since the sweep compares the build it runs on with the one that evidence records
-([the model server's build](#the-model-servers-build)).
+([the model server's build](#the-model-servers-build)). Which starters the engine ships, and how one is made from a
+search and check mode with `mnemiq sweep starter`, are in [starters.md](starters.md).
 
 A start profile file whose profile extends another (`extends`) or names a starter (`starter`) is read whole, as the
 engine resolves it ([a profile's parent](profiles.md#a-profiles-parent-extends-and-starter)): the starter first, then

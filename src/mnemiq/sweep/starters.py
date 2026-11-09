@@ -11,13 +11,24 @@ field the server does not report leaves that field None, "not read", which is ne
 later reading fills it in. The model itself is never read, only stated (`[models.<name>.build]`), since a server's
 launch argument may be a repository id, an absolute path, a relative path or a cache snapshot, and no form tells them
 apart. The last part of what the server was launched from is kept only to say when it is not the stated model's name.
+
+A starter is published (`publish_starter`, `mnemiq sweep starter`) from finished sweeps whose rule found it safe over the
+engine's defaults: check mode's verdict, or a search from those defaults whose pick was confirmed on the held-out part.
+Every refusal comes before anything is written. The starter and its evidence are written under a draft name beside the
+starters and moved into place only once a deployment starting from the draft resolves, on every deployment the sweep
+read, to the version the proposal recorded.
 """
 
 from __future__ import annotations
 
+import hashlib
+import importlib.metadata
 import json
+import os
 import re
+import tempfile
 import time
+import tomllib
 from datetime import date
 from pathlib import Path
 from typing import Annotated, Literal
@@ -27,8 +38,15 @@ import httpx
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
 
 from mnemiq import profiles
-from mnemiq.sweep.config import SweepConfig, SweepConfigError, _RepoId, start_starter
-from mnemiq.sweep.run import engine_build
+from mnemiq.agent.modes import MODES
+from mnemiq.config import Settings
+from mnemiq.observability.answer_log import engine_commit
+from mnemiq.profiles import _NAME, ENDPOINT_SETTINGS, PROFILE_SETTINGS
+from mnemiq.sweep.arms import _endpoint, _toml, arm_of
+from mnemiq.sweep.config import (
+    PROPOSAL, SweepConfig, SweepConfigError, _RepoId, load_questions, start_profile, start_starter,
+)
+from mnemiq.sweep.run import PINS, arm_folder, engine_build
 
 EVIDENCE_SUFFIX = ".evidence.json"
 # What `server_readings` reads of a model server's build, each None when it was not read.
@@ -340,3 +358,364 @@ def weights_folder_note(cfg: SweepConfig, model: str, readings: dict | None) -> 
         return None
     return (f"the server's weights folder for {model!r} is {root_name!r}, not {stated}'s name: check "
             f"[models.{model}.build] model")
+
+
+# --- publishing a starter ---------------------------------------------------------------------------------------------
+
+# A starter's description, the same for every one, so no person types what its evidence says.
+_DESCRIPTION = ("{name}: settings found safe over the engine's defaults on {dataset}; the evidence is in "
+                "{name}" + EVIDENCE_SUFFIX)
+# What a starter never takes from the proposal it is written from: where the model is served and judged, the key
+# variables, who may pick the profile, and its description, which `_DESCRIPTION` replaces.
+_NOT_CARRIED = frozenset({*ENDPOINT_SETTINGS, "api_key_env", "verify_api_key_env", "roles", "description"})
+# What a starter is first written as, beside the starters it joins, until it resolves to the version that was measured.
+_DRAFT = ".publishing"
+_UNRESOLVED = "the starter does not resolve to the profile that was measured"
+_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _runs(count: int) -> str:
+    return "1 run" if count == 1 else f"{count} runs"
+
+
+def fewer_right(start: dict[str, list[int]], defaults: dict[str, list[int]]) -> list[str]:
+    """One line for each mode, in the engine's order, where the starter's lowest right count over its runs (`start`, a
+    mode to each run's count) is below the defaults' lowest over theirs (`defaults`): with one run of the defaults,
+    any shortfall. Empty when no mode falls short. A shortfall in one run alone, whose lowest is not below the
+    defaults' lowest, is not one."""
+    return [f"in {mode} its lowest right count over {_runs(len(start[mode]))} is {min(start[mode])}, and the "
+            f"defaults' lowest over {_runs(len(defaults[mode]))} is {min(defaults[mode])}"
+            for mode in MODES if mode in start and min(start[mode]) < min(defaults[mode])]
+
+
+def _key(name: str) -> str:
+    """A setting's name as a TOML key: bare when TOML reads it bare, else quoted (`arms._toml`)."""
+    return name if _BARE_KEY.fullmatch(name) else _toml(name)
+
+
+def starter_text(proposal_text: str, name: str, dataset: str) -> str:
+    """The starter `name`, from the text of a proposal's profiles file: its one profile, less what a starter never holds
+    (`_NOT_CARRIED`), renamed `name`, its file's default, and described by `_DESCRIPTION`. Every name and string is
+    written by `arms._toml`, so a dotted build name is a quoted key. Refused unless it reads back as that one profile
+    and nothing else."""
+    try:
+        raw = tomllib.loads(proposal_text)
+        held = {key: value for key, value in raw["profiles"][raw["default"]].items() if key not in _NOT_CARRIED}
+    except (tomllib.TOMLDecodeError, KeyError, TypeError, AttributeError):
+        raise SweepConfigError("the proposal's profiles file does not hold one profile that is its default") from None
+    sections = {key: held.pop(key) for key in [key for key in held if key in MODES]}
+    description = _DESCRIPTION.format(name=name, dataset=dataset)
+    profile = _toml(name)
+    try:
+        lines = [f"default = {profile}", "", f"[profiles.{profile}]", f"description = {_toml(description)}"]
+        lines += [f"{_key(key)} = {_toml(value)}" for key, value in held.items()]
+        for mode, section in sections.items():
+            lines += ["", f"[profiles.{profile}.{mode}]"]
+            lines += [f"{_key(key)} = {_toml(value)}" for key, value in section.items()]
+    except (TypeError, AttributeError):   # a value no profile setting takes, such as a table outside a mode's section
+        raise SweepConfigError("the proposal's profile holds a value a starter cannot write") from None
+    text = "\n".join(lines) + "\n"
+    if tomllib.loads(text) != {"default": name, "profiles": {name: {"description": description, **held, **sections}}}:
+        raise SweepConfigError(f"the proposal could not be written as starter {name!r} without changing what it holds")
+    return text
+
+
+def _proposal(cfg: SweepConfig, model: str) -> tuple[Path, Path]:
+    """Where a sweep's proposal for `model` is: its profiles file and its evidence."""
+    from mnemiq.sweep.propose import EVIDENCE, PROFILES  # the proposal reads this module
+
+    folder = Path(cfg.sweep.out) / PROPOSAL / model
+    return folder / PROFILES, folder / EVIDENCE
+
+
+def _proposed(cfg: SweepConfig, model: str, state: dict) -> dict:
+    """The evidence of the sweep's proposal for `model`, refused unless it is this sweep's and the rule chose it with
+    both bounds at 0."""
+    _, path = _proposal(cfg, model)
+    try:
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise SweepConfigError(f"{path} cannot be read: propose from the sweep before publishing a starter from "
+                               "it") from None
+    if not isinstance(evidence, dict) or (evidence.get("sweep") or {}).get("fingerprint") != state["fingerprint"]:
+        raise SweepConfigError(f"{path} was not proposed from the sweep in {cfg.sweep.out}: propose from it again")
+    if evidence.get("chosen_by") != "rule":
+        raise SweepConfigError("the proposal was chosen by a person, and a starter is only what the rule proposes")
+    for bound in ("max_more_wrong", "max_more_made_up"):
+        if (value := evidence["rule"][bound]) != 0:
+            raise SweepConfigError(f"[propose] {bound} is {value}: a starter needs both bounds at 0")
+    return evidence
+
+
+def _basis(cfg: SweepConfig, model: str, evidence: dict) -> str:
+    """What the starter is safe by: check mode's verdict over the engine's defaults, or a search from those defaults
+    whose pick was confirmed on the held-out part."""
+    chosen = evidence["chosen"]
+    if evidence["rule"]["strategy"] == "check":
+        if chosen == "start":
+            return "check"
+        if chosen == "defaults":
+            raise SweepConfigError("the rule proposed the engine's defaults: there is no starter to publish")
+        raise SweepConfigError("the rule proposed no profile: there is no starter to publish")
+    if start_profile(cfg, model) != (None, None):
+        raise SweepConfigError("the search did not start from the engine's defaults: check its proposal against them "
+                               "in check mode")
+    if evidence["confirmed"] is not True:
+        raise SweepConfigError("the search's pick was not confirmed on the held-out part")
+    return "search_from_defaults"
+
+
+def _right_counts(numbers: dict, arm: str) -> dict[str, list[int]]:
+    """Each measured mode's right count in each run of `arm`, from check mode's evidence."""
+    return {mode: [run["right"] for run in found[arm]] for mode, found in numbers.items()}
+
+
+_STATED = ("model", "quantization", "gpu")
+_READ_FROM_SERVER = ("server", "server_version", "context_window")
+
+
+def _build_of(cfg: SweepConfig, model: str, state: dict) -> dict:
+    """`model`'s build as the config states it and as the sweep's record read it from the server, each field None where
+    it was not."""
+    stated = cfg.models[model].build
+    read = (state.get("servers") or {}).get(model) or {}
+    return ({field: getattr(stated, field) if stated is not None else None for field in _STATED}
+            | {field: read.get(field) for field in _READ_FROM_SERVER})
+
+
+def _whole_build(model: str, sweeps: list[tuple[SweepConfig, dict]]) -> None:
+    """Refuse, in this order: a build the check's config (the first of `sweeps`) does not state whole, or a server a
+    sweep did not read whole; two sweeps whose servers read otherwise, or whose configs state the build otherwise where
+    both state it; and a stated `llm_context_window` that is not the server's window. The weights folder's name is
+    never part of it."""
+    (cfg, state), *rest = sweeps
+    build = _build_of(cfg, model, state)
+    unread = {field for other, other_state in rest for field in _READ_FROM_SERVER
+              if _build_of(other, model, other_state)[field] is None}
+    if missing := [field for field in ModelBuildRecord.model_fields if build[field] is None or field in unread]:
+        raise SweepConfigError(f"the model build is incomplete: {', '.join(missing)} not read from the server or not "
+                               f"stated in [models.{model}.build]")
+    for other, other_state in rest:
+        found = _build_of(other, model, other_state)
+        for field in _READ_FROM_SERVER:
+            if found[field] != build[field]:
+                raise SweepConfigError(f"the two sweeps read different servers: {field} {build[field]!r} and "
+                                       f"{found[field]!r}")
+        for field in _STATED:
+            if found[field] is not None and found[field] != build[field]:
+                raise SweepConfigError(f"the two sweeps state different builds in [models.{model}.build]: {field} "
+                                       f"{build[field]!r} and {found[field]!r}")
+    for each, _ in sweeps:
+        window = each.models[model].llm_context_window
+        if window is not None and window != build["context_window"]:
+            raise SweepConfigError(f"[models.{model}] llm_context_window is {window}, and the server reports a "
+                                   f"context_window of {build['context_window']}: state the server's window, or leave "
+                                   "it out")
+
+
+def _sha256(path: Path) -> str | None:
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.file_digest(fh, "sha256").hexdigest()
+    except OSError:
+        return None
+
+
+def _started_from(cfg: SweepConfig, model: str, evidence: dict, search: SweepConfig) -> None:
+    """Refuse a search whose proposal is not the file the check's start arm pinned as its start profile, by sha256: what
+    the check's arms read, not the file as it is now."""
+    proposal = _proposal(search, model)[0]
+    start = start_profile(cfg, model)[0]
+    first = next(iter(evidence.get("check") or {}), cfg.modes[0])
+    pins = arm_folder(cfg, arm_of(model, first, {}, round="check"), 1) / PINS
+    try:
+        pinned = json.loads(pins.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pinned = {}
+    found = _sha256(proposal)
+    if start is None or found is None or not isinstance(pinned, dict) or pinned.get(start) != found:
+        raise SweepConfigError(f"the search's proposal {proposal} is not the file the check started from")
+
+
+def _engine(build: dict) -> str:
+    return f"{str(build.get('source_sha'))[:12]} ({build.get('commit') or 'no commit'})"
+
+
+def _counts(run: dict) -> Counts:
+    return Counts(**{field: run[field] for field in Counts.model_fields})
+
+
+def _by_deployment(version: str | dict) -> dict[str, str]:
+    """A version as the evidence holds it, for each deployment: "" for a sweep of one."""
+    return {"": version} if isinstance(version, str) else dict(version)
+
+
+def _search_record(evidence: dict) -> SearchRecord:
+    """What a search's proposal shows: its split, how many arms each mode compared with the start, each mode's pick,
+    whether the pick was confirmed, and the held-out runs of the start and of the pick."""
+    numbers = evidence.get("numbers")
+    held_out = None if numbers is None else {
+        mode: HeldOut(start=[_counts(run) for run in found["held_out"]["start"] or []],
+                      candidate=[_counts(run) for run in found["held_out"]["arm"] or []])
+        for mode, found in numbers.items()}
+    return SearchRecord(split={part: PartCounts(cases=counts["cases"], answerable=counts["answerable"])
+                               for part, counts in evidence["split"].items()},
+                        compared=dict(evidence["holm"]), picks=dict(evidence["picks"]),
+                        confirmed=evidence["confirmed"], held_out=held_out)
+
+
+def _field_default(name: str) -> object:
+    return Settings.model_fields[name].get_default(call_default_factory=True)
+
+
+def starter_evidence(cfg: SweepConfig, model: str, name: str, dataset: str,
+                     search: SweepConfig | None) -> StarterEvidence:
+    """The evidence the starter `name` ships with, from the sweep `cfg`'s record and proposal for `model` (and, for a
+    check that started from a search's proposal, `search`'s), field by field from what each source may give: builds,
+    the rule, counts and versions, never a question, a statement, a case id or a path."""
+    from mnemiq.sweep.propose import _record  # the proposal reads this module
+
+    state = _record(cfg)
+    evidence = json.loads(_proposal(cfg, model)[1].read_text(encoding="utf-8"))
+    checked = evidence["rule"]["strategy"] == "check"
+    searched = search if search is not None else None if checked else cfg
+    found = json.loads(_proposal(searched, model)[1].read_text(encoding="utf-8")) if searched is not None else None
+    held = tomllib.loads(starter_text(_proposal(cfg, model)[0].read_text(encoding="utf-8"), name, dataset))
+    held = held["profiles"][name]
+    wide = {key: value for key, value in held.items() if key in PROFILE_SETTINGS}
+    measured = list(evidence["check"]) if checked else list(evidence["confirm"]["modes"])
+    cases = load_questions(cfg)
+    entry, read = cfg.models[model], state["servers"][model]
+    stated = entry.build.model_dump()
+    measured_versions = evidence.get("measured_versions")
+    return StarterEvidence(
+        starter=name,
+        published=date.today().isoformat(),
+        dataset=DatasetRecord(name=dataset, questions=len(cases), answerable=sum(case.answerable for case in cases)),
+        made_up_measured=any(not case.answerable for case in cases),
+        model_build=ModelBuildRecord(model=stated["model"], quantization=stated["quantization"], server=read["server"],
+                                     server_version=read["server_version"], gpu=stated["gpu"],
+                                     context_window=read["context_window"]),
+        engine_build=EngineBuildRecord(version=importlib.metadata.version("mnemiq"),
+                                       commit=state["engine_build"].get("commit"),
+                                       source_sha=state["engine_build"]["source_sha"]),
+        safe_by="check" if checked else "search_from_defaults",
+        rule=RuleRecord(**{field: evidence["rule"][field] for field in RuleRecord.model_fields}),
+        modes_measured=measured,
+        unmeasured_modes={mode: sorted(key for key, value in wide.items() if value != _field_default(key))
+                          for mode in MODES if mode not in measured},
+        held_unset=sorted(PROFILE_SETTINGS - set(ENDPOINT_SETTINGS) - set(held)),
+        check=None if not checked else {
+            mode: [CheckRun(run=start["run"], start=_counts(start), defaults=_counts(defaults))
+                   for start, defaults in zip(found_mode["start"], found_mode["defaults"], strict=True)]
+            for mode, found_mode in evidence["check"].items()},
+        search=_search_record(found) if found is not None else None,
+        versions=_by_deployment(evidence["version"]),
+        measured_versions=None if measured_versions is None else {
+            mode: _by_deployment(version) for mode, version in measured_versions.items()},
+    )
+
+
+def _deployment_text(cfg: SweepConfig, model: str, starter: str) -> str:
+    """A deployment's profiles file whose default starts from the starter `starter`, with the model's endpoint and key
+    variables from `[models]`, as the sweep's arms were served."""
+    entry = cfg.models[model]
+    judge_key = (cfg.judge if cfg.judge is not None else entry).verify_api_key_env
+    lines = ['default = "publishing"', "", "[profiles.publishing]", f"starter = {_toml(starter)}",
+             f"api_key_env = {_toml(entry.api_key_env)}"]
+    lines += [f"verify_api_key_env = {_toml(judge_key)}"] if judge_key else []
+    lines += [f"{field} = {_toml(value)}" for field, value in _endpoint(cfg, model).items() if value is not None]
+    return "\n".join(lines) + "\n"
+
+
+def _resolves_as_measured(cfg: SweepConfig, model: str, starter: str, version: str | dict) -> None:
+    """Refuse unless a deployment whose profile starts from the starter `starter` resolves, on every deployment the
+    sweep read, to the version the proposal recorded: the engine's own loader and version function, as a run stamps
+    its rows."""
+    from mnemiq.sweep.propose import _agrees, _versions  # the proposal reads this module
+
+    drafted = {None: version} if isinstance(version, str) else dict(version)
+    with tempfile.TemporaryDirectory(prefix="mnemiq-starter-") as scratch:
+        path = Path(scratch) / "profiles.toml"
+        path.write_text(_deployment_text(cfg, model, starter), encoding="utf-8")
+        try:
+            resolved = _versions(cfg, path, {})
+        except SweepConfigError as exc:
+            raise SweepConfigError(f"{_UNRESOLVED}: {exc}") from None
+    if set(resolved) != set(drafted) or not _agrees(resolved, drafted):
+        differs = "; ".join(f"{'the deployment' if db_id is None else f'the deployment for {db_id!r}'} gives it "
+                            f"{resolved.get(db_id)}, and the proposal's version is {drafted.get(db_id)}"
+                            for db_id in sorted(set(resolved) | set(drafted), key=str)
+                            if resolved.get(db_id) != drafted.get(db_id))
+        raise SweepConfigError(f"{_UNRESOLVED}: {differs}")
+
+
+def publish_starter(cfg: SweepConfig, model: str, dataset: str, *, name: str | None = None,
+                    search: SweepConfig | None = None) -> tuple[Path, Path]:
+    """Write the starter for `model`'s build and its evidence into the starters folder (`profiles.starters_folder`),
+    from the finished sweep `cfg`, whose rule found it safe over the engine's defaults: check mode's verdict, or a
+    search from those defaults whose pick was confirmed. `search` is the search whose proposal the check started from,
+    when it did. `dataset` names the questions, for the description and the evidence. Returns the two paths.
+
+    Every refusal comes before anything is written, in this order: a key variable not set; a sweep that has not
+    finished, or ran under another config; an engine with no checkout to write into; an engine other than the one the
+    sweeps ran on, by source hash; a proposal a person chose, or one whose bounds are not both 0; a check that chose the
+    defaults, or a search that did not start from them or whose pick was not confirmed; a starter that gets fewer right
+    answers than the defaults (`fewer_right`); a build not read and stated whole; a name that is not the build's; and a
+    search that is not the one the check started from.
+
+    The two files are written as `<name>.publishing.*` beside the starters, and moved into place only once a deployment
+    starting from the draft resolves, on every deployment the sweep read, to the version the proposal recorded. Any
+    failure removes the draft and leaves a starter already shipped under that name as it was."""
+    from mnemiq.sweep.propose import _finished, _keys_set  # the proposal reads this module
+
+    sweeps = [cfg] if search is None else [cfg, search]
+    for each in sweeps:
+        if model not in each.models:
+            raise SweepConfigError(f"{each.path}: model {model!r} is not one this sweep ran; it ran "
+                                   f"{', '.join(each.models)}")
+    for each in sweeps:
+        _keys_set(each, [model])
+    states = [_finished(each) for each in sweeps]
+    if engine_commit() is None:
+        raise SweepConfigError("publishing writes into the engine's source: run it from a checkout")
+    running = engine_build()
+    for state in states:
+        ran = state.get("engine_build") or {}
+        if ran.get("source_sha") != running["source_sha"]:
+            raise SweepConfigError(f"the sweep ran on engine {_engine(ran)}, and this is {_engine(running)}: publish "
+                                   "from a checkout at the sweep's commit")
+    evidence, *_ = [_proposed(each, model, state) for each, state in zip(sweeps, states, strict=True)]
+    safe_by = _basis(cfg, model, evidence)
+    if safe_by == "check" and (lines := fewer_right(_right_counts(evidence["check"], "start"),
+                                                    _right_counts(evidence["check"], "defaults"))):
+        raise SweepConfigError(f"the starter gets fewer right answers than the engine's defaults: {'; '.join(lines)}")
+    _whole_build(model, list(zip(sweeps, states, strict=True)))
+    derived = build_name(cfg.models[model].build.model)
+    if name is not None and name != derived:
+        raise SweepConfigError(f"--name {name!r} is not the build's name {derived!r}")
+    name = derived
+    if not _NAME.fullmatch(name):
+        raise SweepConfigError(f"the build's name {name!r} must match {_NAME.pattern}, as a profile name must")
+    if search is not None:
+        _started_from(cfg, model, evidence, search)
+
+    text = starter_text(_proposal(cfg, model)[0].read_text(encoding="utf-8"), name, dataset)
+    record = starter_evidence(cfg, model, name, dataset, search)
+    try:
+        folder = profiles.starters_folder()
+    except profiles.ProfileFileError as exc:
+        raise SweepConfigError(str(exc)) from None
+    placed = folder / f"{name}.toml", folder / f"{name}{EVIDENCE_SUFFIX}"
+    drafts = folder / f"{name}{_DRAFT}.toml", folder / f"{name}{_DRAFT}{EVIDENCE_SUFFIX}"
+    try:
+        drafts[0].write_text(text, encoding="utf-8")
+        drafts[1].write_text(record.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        _resolves_as_measured(cfg, model, f"{name}{_DRAFT}", evidence["version"])
+        # The evidence first: a new starter is never listed without it.
+        os.replace(drafts[1], placed[1])
+        os.replace(drafts[0], placed[0])
+    finally:
+        for path in drafts:
+            path.unlink(missing_ok=True)
+    return placed

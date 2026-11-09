@@ -114,6 +114,9 @@ an upgrade, is refused at boot, and the refusal lists the starters this engine s
   below it: `MNEMIQ_MODE_SETTINGS` is refused beside a profiles file, so an env file's mode settings never meet a
   starter.
 
+How a starter is made from sweeps, what is meant by its being safe, what its evidence holds, and which starters this
+engine ships: [starters.md](starters.md).
+
 ## What a profile may change
 
 Only how a question is answered: the model and its endpoint, the writer's prompt and temperature, the schema form,

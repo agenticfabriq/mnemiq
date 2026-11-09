@@ -27,10 +27,11 @@ from mnemiq.config import DEFAULT_RETRIEVAL_K, Settings
 from mnemiq.contract import EvaluationCase
 from mnemiq.profiles import PROFILE_SETTINGS
 from mnemiq.sweep.run import engine_build
+from mnemiq.sweep.starters import starter_text as _starter_text
 from tests.starter_fixtures import ROOT_AND_CHILD, STARTER, starter_folder, write
 from tests.starter_fixtures import edit as edit  # for the sweep tests, which import their helpers from here
 
-from .stub_model import STUB_WINDOW, StubModel
+from .stub_model import _WRITER, STUB_WINDOW, StubModel, _messages, _proposal
 
 ROLE = "sweep-test"
 KEY_ENV = "SWEEP_TEST_KEY"
@@ -1095,3 +1096,196 @@ def confirm_modes(cfg, model: str = "m") -> list[str]:
 
 def json_lines(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
+
+
+# --- finished sweeps a starter is published from ----------------------------------------------------------------------
+
+# The start's own mode sections read the schema as `CREATE TABLE` (`card_style = "ddl"`), which the engine's defaults
+# never send the writer, so a scripted rule can tell the start's requests from the defaults'.
+_START_CARDS = "ddl"
+_START_MARK = "CREATE TABLE"
+
+
+def _start_rule(stub: StubModel, *, declines: int, wrong: bool):
+    """A rule for the scripted model: under the start's settings, as its cards show, it declines the first `declines`
+    answerable cases it knows, or with `wrong` answers every case wrong. Every other request is answered as scripted."""
+    def rule(request: dict) -> str | None:
+        system, user = _messages(request)
+        if _WRITER not in system or _START_MARK not in f"{system}\n{user}":
+            return None
+        case = stub._script.find(user)
+        if case is None:
+            return None
+        if wrong and case.wrong_sql:
+            return _proposal(case.wrong_sql)
+        if case.answerable and stub._script.answerable_rank(case) < declines:
+            return _proposal(None, "declined under the start's settings")
+        return None
+
+    return rule
+
+
+def _start_profile(tmp_path: Path, settings: dict, marked: list[str]) -> dict:
+    """A `[start]` section naming a profile that sets `settings` profile-wide and gives each mode of `marked` a section
+    whose cards the scripted model can tell from the defaults' (`_START_CARDS`)."""
+    lines = ['default = "start"', "[profiles.start]", *(f"{name} = {_toml_value(value)}" for name, value in settings.items())]
+    for mode in marked:
+        lines += [f"[profiles.start.{mode}]", f'card_style = "{_START_CARDS}"']
+    path = write(tmp_path / "start-for-a-starter.toml", "\n".join(lines) + "\n")
+    return {"profile_file": str(path)}
+
+
+def finished_check(tmp_path: Path, monkeypatch, stub: StubModel, *, build=CONFIG_BUILD, llm_context_window=STUB_WINDOW,
+                   root: str | None = None, reports_build: bool = True, dataset: dict | None = None, modes=("instant",),
+                   defaults_better: bool = False, person_chose: str | None = None, propose: dict | None = None,
+                   start_sets: dict | None = None, unfinished: bool = False, config_edited_after: bool = False,
+                   start_declines: int | dict[str, int] = 0, answerable_only: bool = False,
+                   start_file: Path | None = None):
+    """A check-mode sweep of model `m` over the tiny deployment, run on the product path and proposed, loaded, with the
+    starters folder patched to `tmp_path / "starters"`. The scripted model answers every case right, and `[models.m]`
+    states `build` and `llm_context_window` (each omitted when None). One run per arm.
+
+    The start sets `start_sets` profile-wide (by default retrieval_k = 12), and each mode it is told apart in has a
+    section whose cards the scripted model can read (`_start_rule`): every measured mode, or with `start_declines` a
+    dict, the modes it names.
+
+    - `root` and `reports_build` go to the scripted model; `dataset` replaces the `[dataset]` keys it names, as
+      `two_deployments` gives them; `modes` are the modes the sweep runs; `propose` is its `[propose]` section.
+    - `defaults_better`: under the start's settings every answer is wrong, so the rule proposes the defaults.
+    - `person_chose`: a person's pick (`propose --choose`) in place of the rule's.
+    - `start_declines`: under the start's settings the model declines that many answerable cases it answers right under
+      the defaults', so the start has fewer right and no more wrong, and the rule still proposes it. An int applies in
+      every measured mode; a dict names the modes, the start level elsewhere.
+    - `answerable_only`: the tiny question file without its cases that have no answer.
+    - `unfinished`: a budget no arm fits in, so the run stops before the first arm and nothing is proposed.
+    - `config_edited_after`: the config is edited once the proposal is written, and loaded again.
+    - `start_file`: the start is that profiles file's default instead, such as a search's proposal."""
+    from mnemiq.sweep.config import load_config
+    from mnemiq.sweep.propose import propose as proposing
+    from mnemiq.sweep.run import run
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    starter_folder(tmp_path, monkeypatch, {})
+    modes = list(modes)
+    named = start_declines if isinstance(start_declines, dict) else dict.fromkeys(modes, start_declines)
+    assert len(set(named.values())) <= 1, "the start declines as many cases in each mode it is told apart in"
+    marked = [mode for mode in modes if mode in named]
+    rule = _start_rule(stub, declines=next(iter(named.values()), 0), wrong=defaults_better)
+    model = stub(rule, gold=True, reports_build=reports_build, **({"root": root} if root is not None else {}))
+    deployment = tiny_deployment(tmp_path, model)
+    questions = None
+    if answerable_only:
+        questions = write(tmp_path / "questions-answerable.json",
+                          json.dumps([_graded(case) for case in CASES if case.get("answerable", True)], indent=2))
+    sections: dict = {
+        "search": {"strategy": "check"}, "sweep": {"repeats": 1}, "modes": modes,
+        "start": ({"profile_file": str(start_file)} if start_file is not None
+                  else _start_profile(tmp_path, {"retrieval_k": 12} if start_sets is None else start_sets, marked)),
+        "models": one_model(model, build=build, llm_context_window=llm_context_window),
+    }
+    if dataset is not None:
+        sections["dataset"] = dataset
+    if propose is not None:
+        sections["propose"] = propose
+    if unfinished:
+        sections["search"] |= {"budget_hours": 0.1, "seconds_per_question": 1000.0}
+    cfg = load_config(write_config(tmp_path, deployment=deployment, model=model, questions=questions, **sections))
+    run(cfg)
+    if unfinished:
+        return cfg
+    proposing(cfg, person_chose)
+    if config_edited_after:
+        cfg = load_config(rewrite(cfg, propose={"alpha": 0.1}))
+    return cfg
+
+
+def finished_search(tmp_path: Path, monkeypatch, stub: StubModel, *, start: bool = False, confirmed: bool = True):
+    """A screen-then-grid search of model `m` over 16 questions, run on the product path and proposed, loaded, with the
+    starters folder patched to `tmp_path / "starters"`. Its one arm is guided_sql = true, and the scripted model answers
+    right only when the writer's request carries `response_format`, as guided decoding sends, so that arm is picked and
+    confirmed on the held-out part. `[models.m]` states `CONFIG_BUILD` and the server's window. One run per arm.
+
+    - `start`: the search starts from a profile of its own (`start_that_differs`), not the engine's defaults.
+    - `confirmed` false: on the held-out questions the model answers right only without guided decoding, so the pick
+      fails the confirm round, and the rule falls back to the start."""
+    from mnemiq.sweep import propose as proposal
+    from mnemiq.sweep.config import load_config, load_questions
+    from mnemiq.sweep.run import run
+    from mnemiq.sweep.split import split
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    starter_folder(tmp_path, monkeypatch, {})
+    # The wait for a quiet machine before the timing round would only add minutes on a busy machine.
+    monkeypatch.setattr(proposal, "LOAD_WAIT_S", 0.0)
+    held_out: set[str] = set()   # the held-out questions once the split is drawn, when the pick is to fail there
+
+    def gold_when(request: dict) -> bool:
+        case = stub._script.find(_messages(request)[1])
+        return ("response_format" in request) != (case is not None and case.question in held_out)
+
+    model = stub(gold_when=gold_when)
+    sections: dict = {"space": {"guided_sql": [True]}, "sweep": {"repeats": 1},
+                      "models": one_model(model, build=CONFIG_BUILD, llm_context_window=STUB_WINDOW)}
+    if start:
+        sections["start"] = start_that_differs(tmp_path)
+    cfg = load_config(write_config(tmp_path, deployment=tiny_deployment(tmp_path, model, cases=16), model=model,
+                                   **sections))
+    if not confirmed:
+        held_out.update(case.question for case in split(cfg, load_questions(cfg))["held_out"])
+    run(cfg)
+    proposal.propose(cfg)
+    return cfg
+
+
+def evidence_file(cfg, model: str = "m") -> Path:
+    """The evidence file `propose` wrote for `model`."""
+    return out(cfg) / "proposal" / model / "evidence.json"
+
+
+def read_json(path: Path) -> dict:
+    return json.loads(Path(path).read_text())
+
+
+def plant(path: Path, /, **fields) -> None:
+    """Add `fields` to the JSON object at `path`, as a later field of the proposal's evidence might. Positional, so a
+    field may itself be named `path`."""
+    write(path, json.dumps(read_json(path) | fields, indent=2))
+
+
+def drafted_versions(cfg, model: str = "m") -> dict:
+    """The proposal evidence's `version` as a map from deployment to version: one version is `{None: version}`."""
+    version = evidence(cfg, model)["version"]
+    return {None: version} if isinstance(version, str) else dict(version)
+
+
+def deployment_file_naming(name: str, cfg, model: str = "m") -> str:
+    """A deployment's profiles file whose default names the starter `name`, with the model's endpoint and key variables
+    from `[models]`, as a deployment serving that build writes it."""
+    from mnemiq.sweep.arms import _endpoint
+
+    entry = cfg.models[model]
+    judge_key = (cfg.judge if cfg.judge is not None else entry).verify_api_key_env
+    lines = ['default = "deployed"', "[profiles.deployed]", f"starter = {_toml_value(name)}",
+             f"api_key_env = {_toml_value(entry.api_key_env)}"]
+    lines += [f"verify_api_key_env = {_toml_value(judge_key)}"] if judge_key else []
+    lines += [f"{field} = {_toml_value(value)}" for field, value in _endpoint(cfg, model).items() if value is not None]
+    return "\n".join(lines) + "\n"
+
+
+def drops_the_instant_section(text: str, name: str, dataset: str) -> str:
+    """`starter_text`, with its `.instant` table taken out: a starter that no longer resolves to what was measured."""
+    lines, kept, inside = _starter_text(text, name, dataset).splitlines(keepends=True), [], False
+    for line in lines:
+        if line.startswith("["):
+            inside = line.rstrip("\n").endswith(".instant]")
+        if not inside:
+            kept.append(line)
+    assert len(kept) < len(lines), "the starter holds no instant table to take out"
+    return "".join(kept)
+
+
+def missing_from(text: str, names) -> list[str]:
+    """Each of `names` the doc's "Shipped starters" section does not name, in code."""
+    match = re.search(r"^## Shipped starters\n(.*?)(?=^## |\Z)", text, re.S | re.M)
+    assert match, "the doc has no '## Shipped starters' section"
+    return [name for name in names if f"`{name}`" not in match.group(1)]
