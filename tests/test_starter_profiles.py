@@ -42,7 +42,7 @@ def _load(tmp_path, text: str, **fields):
     return load_profiles(_settings(profiles_path=str(write(tmp_path / "profiles.toml", text)), **fields))
 
 
-def test_the_starter_is_over_the_deployment_and_under_the_root(tmp_path, monkeypatch):      # Review Focus 1
+def test_the_starter_is_over_the_deployment_and_under_the_root(tmp_path, monkeypatch):
     # root: starter "fixture-2.5-build", writer_temperature 0.2; child: extends root, retrieval_k 12
     starter_folder(tmp_path, monkeypatch, {"fixture-2.5-build": STARTER})
     profiles, _ = _load(tmp_path, ROOT_AND_CHILD, retrieval_k=5, writer_temperature=0.7)
@@ -52,12 +52,12 @@ def test_the_starter_is_over_the_deployment_and_under_the_root(tmp_path, monkeyp
     assert modes_for(child)["instant"].card_style == "bare"
 
 
-def test_a_starter_cannot_clear_what_it_held_unset(tmp_path, monkeypatch):                    # Review Focus 1
+def test_a_starter_cannot_clear_what_it_held_unset(tmp_path, monkeypatch):
     starter_folder(tmp_path, monkeypatch, {"fixture-2.5-build": STARTER})
     assert _load(tmp_path, ONLY, llm_seed=7)[0]["only"].settings.llm_seed == 7
 
 
-def test_env_mode_settings_never_meet_a_starter(tmp_path, monkeypatch):                       # gate item 1
+def test_env_mode_settings_never_meet_a_starter(tmp_path, monkeypatch):
     starter_folder(tmp_path, monkeypatch, {"fixture-2.5-build": STARTER})
     with pytest.raises(ProfileFileError, match="MNEMIQ_PROFILES_PATH and MNEMIQ_MODE_SETTINGS are both set"):
         _load(tmp_path, ONLY, mode_settings={"instant": ModeSettings(prose=False)})
@@ -73,13 +73,13 @@ def test_a_starter_resolves_under_a_deployment_with_no_chat_endpoint(tmp_path, m
 
 
 @pytest.mark.parametrize("name", ["no-such-build", "../profiles", "Qwen2.5"])
-def test_an_unknown_starter_is_refused_listing_the_shipped_ones(tmp_path, monkeypatch, name):   # Review Focus 2
+def test_an_unknown_starter_is_refused_listing_the_shipped_ones(tmp_path, monkeypatch, name):
     starter_folder(tmp_path, monkeypatch, {"fixture-2.5-build": STARTER})
     with pytest.raises(ProfileFileError, match=r"is not one this engine ships; it ships: fixture-2.5-build"):
         _load(tmp_path, f'default = "only"\n[profiles.only]\nstarter = "{name}"\n')
 
 
-def test_a_link_in_the_starters_folder_is_not_a_starter(tmp_path, monkeypatch):                     # Review Focus 2
+def test_a_link_in_the_starters_folder_is_not_a_starter(tmp_path, monkeypatch):
     # a valid starter outside the folder, linked into it under its own name: its name must never reach that file
     folder = starter_folder(tmp_path, monkeypatch, {"fixture-2.5-build": STARTER})
     (folder / "linked.toml").symlink_to(write(tmp_path / "outside.toml", STARTER.replace("fixture-2.5-build", "linked")))
@@ -92,26 +92,26 @@ def test_a_link_in_the_starters_folder_is_not_a_starter(tmp_path, monkeypatch): 
                                   'verify_model = "j"', 'verify_base_url = "http://192.0.2.1/v1"', 'api_key_env = "K"',
                                   'verify_api_key_env = "K"', 'roles = ["*"]', 'extends = "x"', 'starter = "y"'])
 def test_a_starter_that_sets_what_the_deployment_owns_is_refused(tmp_path, monkeypatch, line):
-    # the line goes before the .instant header, so it lands in the profile's own table (I4a)
+    # the line goes before the .instant header, so it lands in the profile's own table
     starter_folder(tmp_path, monkeypatch, {"fixture-2.5-build": STARTER_HEAD + line + "\n" + STARTER_INSTANT})
     with pytest.raises(ProfileFileError, match=r"starter 'fixture-2.5-build' sets .*, which a starter never sets"):
         _load(tmp_path, ONLY)
 
 
-def test_a_value_the_model_cannot_take_is_refused_naming_where_it_was_set(tmp_path, monkeypatch):   # Review Focus 3
+def test_a_value_the_model_cannot_take_is_refused_naming_where_it_was_set(tmp_path, monkeypatch):
     starter_folder(tmp_path, monkeypatch, {"fixture-2.5-build": STARTER})
     with pytest.raises(ProfileFileError, match=r"'only' sets writer_temperature on 'gpt-5', which takes none "
                                                r"\(the value comes from starter 'fixture-2.5-build'\)"):
         _load(tmp_path, ONLY, llm_model="gpt-5")
 
 
-def test_the_reasoning_refusal_names_where_each_of_its_two_settings_came_from(tmp_path, monkeypatch):   # M9
+def test_the_reasoning_refusal_names_where_each_of_its_two_settings_came_from(tmp_path, monkeypatch):
     starter_folder(tmp_path, monkeypatch, {"fixture-2.5-build": STARTER_HEAD + 'writer_reasoning = "before_sql"\n' + STARTER_INSTANT})
     with pytest.raises(ProfileFileError, match=r"\(writer_reasoning from starter 'fixture-2.5-build', guided_sql from profile 'only'\)"):
         _load(tmp_path, GUIDED_ROOT)
 
 
-def test_with_no_profiles_file_the_refusals_read_as_before():                                         # M9
+def test_with_no_profiles_file_the_refusals_read_as_before():
     with pytest.raises(ProfileFileError, match=r"'default' sets writer_temperature on 'gpt-5', which takes none$"):
         load_profiles(_settings(llm_model="gpt-5", writer_temperature=0.0))
 
@@ -128,7 +128,7 @@ def test_flattened_entry_and_sources_follow_the_chain(tmp_path, monkeypatch):
     path = str(write(tmp_path / "chain.toml", ROOT_AND_CHILD))
     entry = flattened_entry(path, "child")
     assert (entry.retrieval_k, entry.writer_temperature, entry.instant.card_style) == (12, 0.2, "bare")
-    assert entry.model_fields_set == {"retrieval_k", "writer_temperature", "instant"}         # the layers' union (M8)
+    assert entry.model_fields_set == {"retrieval_k", "writer_temperature", "instant"}         # the layers' union
     assert profile_sources(path, "child") == [path, str(folder / "fixture-2.5-build.toml")]
     assert profile_starter(path, "child") == "fixture-2.5-build"
 
@@ -145,6 +145,26 @@ def test_a_starter_whose_evidence_is_missing_or_names_another_file_is_refused(tm
         _load(tmp_path, ONLY)
 
 
+def test_evidence_linked_from_outside_the_folder_is_refused_though_it_matches(tmp_path, monkeypatch):
+    folder = starter_folder(tmp_path, monkeypatch, {"fixture-2.5-build": STARTER})
+    path = folder / "fixture-2.5-build.evidence.json"
+    outside = write(tmp_path / "outside.evidence.json", path.read_text())     # it records the starter's own sha256
+    path.unlink()
+    path.symlink_to(outside)
+    with pytest.raises(ProfileFileError, match=r"do not match \(fixture-2\.5-build\.evidence\.json is a link\)"):
+        _load(tmp_path, ONLY)
+
+
+def test_a_folder_named_as_the_evidence_is_refused(tmp_path, monkeypatch):
+    folder = starter_folder(tmp_path, monkeypatch, {"fixture-2.5-build": STARTER})
+    path = folder / "fixture-2.5-build.evidence.json"
+    path.unlink()
+    path.mkdir()
+    with pytest.raises(ProfileFileError, match=r"do not match \(fixture-2\.5-build\.evidence\.json is not a regular "
+                                               r"file\)"):
+        _load(tmp_path, ONLY)
+
+
 def test_a_starter_bound_to_its_evidence_loads(tmp_path, monkeypatch):
     # positive control: the evidence names the file's sha256, which is all the loader reads of it
     starter_folder(tmp_path, monkeypatch, {"fixture-2.5-build": STARTER})
@@ -152,21 +172,21 @@ def test_a_starter_bound_to_its_evidence_loads(tmp_path, monkeypatch):
 
 
 def test_every_shipped_starter_is_one_profile_named_for_its_file():
-    # vacuous by design until PR C ships the first starter; Task 6 adds `assert starter_names()` here (gate item 10)
+    # vacuous by design until the engine ships its first starter
     for name in starter_names():                 # a loop, not a parametrization, which would skip without a word
         read = _read(starter_path(name))
         assert read.default == name and list(read.profiles) == [name]
         _starter_entry(name)
 
 
-def test_the_starters_folder_is_inside_the_installed_package():                     # Review Focus 5
+def test_the_starters_folder_is_inside_the_installed_package():
     import mnemiq
     assert starters_folder() == Path(mnemiq.__file__).resolve().parent / "starter_profiles"
     assert (starters_folder() / "__init__.py").is_file()
 
 
 def test_the_guard_on_the_shipped_folder_catches_a_write():
-    # positive control for I5's autouse fixture, through the context manager it wraps
+    # positive control for the autouse guard on the shipped starters folder, through the context manager it wraps
     probe = Path(mnemiq.__file__).resolve().parent / "starter_profiles" / "probe.toml"
     with pytest.raises(AssertionError, match="probe.toml"):
         with shipped_starters_untouched():

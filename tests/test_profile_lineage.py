@@ -117,7 +117,7 @@ def test_a_mode_section_merges_setting_by_setting(tmp_path):
 
 @pytest.mark.parametrize("text", [CHILD_WITHOUT_ROLES, CHILD_OF_DEFAULT])
 def test_roles_and_default_are_never_inherited(tmp_path, text):
-    # a child of the default is not the default, so it lists its own roles (M9)
+    # a child of the default is not the default, so it lists its own roles
     with pytest.raises(ProfileFileError, match="'child' must list the roles"):
         _load(tmp_path, text)
 
@@ -156,7 +156,7 @@ def test_a_child_that_moves_with_no_key_is_refused_naming_it(tmp_path, monkeypat
 
 
 def test_a_child_back_at_the_deployments_endpoint_needs_its_own_key(tmp_path, monkeypatch):
-    # layering compares the child with its parent, so going back is a move: refused, failing closed (M9)
+    # layering compares the child with its parent, so going back is a move: refused, failing closed
     monkeypatch.setenv("E_KEY", "e")
     with pytest.raises(ProfileFileError, match="'child' has no chat endpoint and key"):
         _load(tmp_path, BACK_HOME)
@@ -179,7 +179,7 @@ def test_a_child_and_its_flat_copy_share_a_version(tmp_path):
     assert profile_version(profiles["child"].settings, "duckdb") == profile_version(profiles["flat"].settings, "duckdb")
 
 
-def test_a_profile_with_no_parent_keeps_todays_version(tmp_path):                         # gate item 12
+def test_a_profile_with_no_parent_keeps_todays_version(tmp_path):
     # a fixed file of two profiles, one with mode sections; the versions were recorded on main before this change
     profiles = _load(tmp_path, NO_PARENT_FILE)[0]
     assert {name: profile_version(p.settings, "duckdb") for name, p in profiles.items()} == GOLDEN_NO_PARENT_VERSIONS

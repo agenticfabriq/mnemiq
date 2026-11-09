@@ -127,6 +127,7 @@ def test_publishing_needs_a_checkout(tmp_path, monkeypatch, stub_model):
     with pytest.raises(SweepConfigError, match="run it from a checkout"):
         publish_starter(cfg, "m", "the tiny set")
     assert not list(profiles.starters_folder().glob("model-2.5-awq*"))
+    assert _shipped(profiles.starters_folder()) == []      # not even the publisher's lock, in an installed package
 
 
 def test_an_unset_key_is_refused_first(tmp_path, monkeypatch, stub_model):
@@ -356,8 +357,8 @@ def test_evidence_the_schema_refuses_is_refused_before_anything_is_written(tmp_p
 
 
 def _shipped(folder: Path) -> list[str]:
-    """Every entry of the starters folder, hidden ones included, but publishing's own lock."""
-    return sorted(path.name for path in folder.iterdir() if path.name != ".publish.lock")
+    """Every entry of the starters folder, hidden ones included."""
+    return sorted(path.name for path in folder.iterdir())
 
 
 def _second_move_fails(monkeypatch) -> list[str]:
@@ -414,7 +415,7 @@ def test_a_failure_while_the_starter_is_checked_leaves_nothing_new_in_the_folder
     monkeypatch.setattr("mnemiq.sweep.starters.starter_text", drops_the_instant_section)
     with pytest.raises(SweepConfigError, match="does not resolve to the profile that was measured"):
         publish_starter(cfg, "m", "the tiny set")
-    assert _shipped(profiles.starters_folder()) == before == []
+    assert before == [] and _shipped(profiles.starters_folder()) == [".publish.lock"]     # its lock alone
 
 
 def test_no_draft_is_ever_listed_as_a_starter(tmp_path, monkeypatch, stub_model):
@@ -437,10 +438,19 @@ def test_no_draft_is_ever_listed_as_a_starter(tmp_path, monkeypatch, stub_model)
     assert starter_names() == ["model-2.5-awq"]
 
 
-def test_a_held_publish_lock_refuses_a_second_publisher(tmp_path, monkeypatch):
-    folder = starter_folder(tmp_path, monkeypatch, {})
-    cfg = _nothing_ran(tmp_path / "sweep")
+def test_a_held_publish_lock_refuses_a_second_publisher(tmp_path, monkeypatch, stub_model):
+    cfg = finished_check(tmp_path, monkeypatch, stub_model)
+    folder = profiles.starters_folder()
     with _sole(folder / ".publish.lock", RuntimeError("held by another publisher")):
         with pytest.raises(SweepConfigError, match=re.escape(f"{folder} is in use by another publisher")):
             publish_starter(cfg, "m", "the tiny set")
-    assert _shipped(folder) == []
+    assert _shipped(folder) == [".publish.lock"]           # the other publisher's lock alone
+
+
+def test_a_hidden_copy_a_killed_publish_left_is_cleared(tmp_path, monkeypatch, stub_model):
+    cfg = finished_check(tmp_path, monkeypatch, stub_model)
+    stale = write(profiles.starters_folder() / ".x.tmp", "left by a publish that was killed mid-move")
+    publish_starter(cfg, "m", "the tiny set")
+    assert not stale.exists()
+    assert _shipped(profiles.starters_folder()) == [".publish.lock", "model-2.5-awq.evidence.json",
+                                                    "model-2.5-awq.toml"]

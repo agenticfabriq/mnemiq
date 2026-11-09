@@ -63,7 +63,6 @@ Publishing refuses, before it writes anything:
 - a `--dataset` label that is not 1 to 80 printable ASCII characters, not all spaces, without a slash;
 - a sweep whose out folder a run or a proposal is using: publishing holds each sweep's lock until it ends, as
   `propose` does, and reads each sweep's record and proposal once;
-- the starters folder, while another publisher holds its lock;
 - a key variable the model names that is not set;
 - a sweep that has not finished its rounds, or that ran under another config than the one given;
 - an engine with no checkout to write into: the starters live in the package's source, `src/mnemiq/starter_profiles/`;
@@ -80,19 +79,24 @@ Publishing refuses, before it writes anything:
 - a `--name` other than the build's;
 - with `--search`, a search whose proposal is not the file the check's arms started from, by its hash as they pinned
   it;
-- evidence its schema refuses, such as a `db_id` outside the form the schema reads.
+- evidence its schema refuses, such as a `db_id` outside the form the schema reads;
+- the starters folder, while another publisher holds its lock. Publishing takes that lock only once every check above
+  has passed, so a refusal leaves the starters folder as it was, with no lock file in it.
 
 It then writes the starter and its evidence into a staging folder outside the package, and checks them there: the
 evidence as the sweep reads it, and that a deployment whose profile starts from the staged starter resolves, on every
 deployment the sweep read, to the version the proposal recorded, with the engine's own loader and version function.
 Only then are the two files moved into the starters folder as `<name>.evidence.json` and `<name>.toml`, each under a
-hidden name until its move, while publishing holds the folder's lock. A starter the folder lists is never a draft, and
+hidden name until its move, while publishing holds the folder's lock. Holding it, publishing first removes any hidden
+copy that a publish killed mid-move left in the folder. A starter the folder lists is never a draft, and
 when a check fails nothing reaches the folder: a starter already shipped under that name is left as it was.
 
 Publishing writes the evidence, then the starter, and each is bound to the other: the evidence records the sha256 of
 the starter's file (`starter_sha256`). If publishing is interrupted between the two, the pair fails closed: the engine
-refuses at boot a starter whose evidence is missing or records another file. Restore both files with git, from the
-checkout publishing requires (`git checkout -- src/mnemiq/starter_profiles/<name>.*`), or publish again.
+refuses at boot a starter whose evidence is missing, is a link, or records another file. Restore both files with git,
+from the checkout publishing requires (`git checkout -- src/mnemiq/starter_profiles/<name>.*`), or publish again. For
+a new starter, which git has never held, an interrupted publish leaves only a lone evidence file, which nothing loads:
+delete it, or publish again.
 
 ## What the evidence holds
 

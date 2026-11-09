@@ -714,21 +714,23 @@ def publish_starter(cfg: SweepConfig, model: str, dataset: str, *, name: str | N
 
     Every refusal comes before anything is written, in this order: a dataset label that is not 1 to 80 printable ASCII
     characters, not all spaces, without a slash; an out folder a run or a proposal holds, whose lock publishing then
-    holds to its end, as a proposal does; the starters folder, while another publisher holds its lock; a key variable
-    not set; a sweep that has not finished, or ran under another config; an engine with
-    no checkout to write into; an engine other than the one the sweeps ran on, by source hash; a proposal a person
-    chose, or one whose bounds are not both 0, a `search` in check mode, or a `search` beside a sweep that is not; a
-    check that chose the defaults, or a search that did not start from them, whose pick was not confirmed, or whose pick
-    is the defaults; a starter that gets fewer right answers than the defaults (`fewer_right`); a build not read and
-    stated whole; a name that is not the build's; a search that is not the one the check started from; and evidence the
-    schema refuses. Each sweep's record and proposal are read once, so the checks and the evidence see the same bytes.
+    holds to its end, as a proposal does; a key variable not set; a sweep that has not finished, or ran under another
+    config; an engine with no checkout to write into; an engine other than the one the sweeps ran on, by source hash;
+    a proposal a person chose, or one whose bounds are not both 0, a `search` in check mode, or a `search` beside a
+    sweep that is not; a check that chose the defaults, or a search that did not start from them, whose pick was not
+    confirmed, or whose pick is the defaults; a starter that gets fewer right answers than the defaults
+    (`fewer_right`); a build not read and stated whole; a name that is not the build's; a search that is not the one
+    the check started from; evidence the schema refuses; and the starters folder, while another publisher holds its
+    lock. Each sweep's record and proposal are read once, so the checks and the evidence see the same bytes. Until
+    every check before the folder's lock has passed, nothing is written in the starters folder, not even the lock file.
 
     The evidence records the sha256 of the starter's file (`starter_sha256`), and the engine loads a starter only
-    beside evidence that does. The two files are staged outside the starters folder and checked there: the evidence as
-    the sweep reads it, and a deployment starting from the staged starter must resolve, on every deployment the sweep
-    read, to the version the proposal recorded. Only then is each moved in, the evidence first, under a hidden name
-    until its move. A failure before the moves leaves the starters folder as it was. One between them leaves a pair the
-    engine refuses until both files are restored or published again."""
+    beside evidence that does. Holding the folder's lock, publishing removes any hidden copy a killed publish left
+    there, then stages the two files outside the folder and checks them: the evidence as the sweep reads it, and a
+    deployment starting from the staged starter must resolve, on every deployment the sweep read, to the version the
+    proposal recorded. Only then is each moved in, the evidence first, under a hidden name until its move. A failure
+    before the moves leaves the starters folder as it was. One between them leaves a pair the engine refuses until both
+    files are restored or published again."""
     from mnemiq.sweep.propose import _finished  # the proposal reads this module
 
     if len(dataset) > DATASET_LABEL_MAX or not re.fullmatch(DATASET_LABEL_PATTERN, dataset):
@@ -751,13 +753,15 @@ def publish_starter(cfg: SweepConfig, model: str, dataset: str, *, name: str | N
             held.enter_context(_sole(out / OUT_LOCK, SweepConfigError(
                 f"{out} is in use by a run or a proposal of this sweep; publish again once it has ended")))
             locked.append(out)
-        try:
-            folder = profiles.starters_folder()
-        except profiles.ProfileFileError as exc:
-            raise SweepConfigError(str(exc)) from None
-        held.enter_context(_sole(folder / PUBLISH_LOCK, SweepConfigError(
-            f"{folder} is in use by another publisher; publish again once it has ended")))
-        return _publish(cfg, model, dataset, name, search, folder)
+        return _publish(cfg, model, dataset, name, search)
+
+
+def _clear_stale_copies(folder: Path) -> None:
+    """Remove each hidden copy (`.*.tmp`) that a publish killed between its copy and its move left in the starters
+    folder. Called with the folder's lock held, when no other publish can be moving one."""
+    for path in folder.glob(".*.tmp"):
+        if path.is_symlink() or path.is_file():
+            path.unlink(missing_ok=True)
 
 
 def _move_in(source: Path, folder: Path) -> None:
@@ -772,9 +776,10 @@ def _move_in(source: Path, folder: Path) -> None:
         hidden.unlink(missing_ok=True)
 
 
-def _publish(cfg: SweepConfig, model: str, dataset: str, name: str | None, search: SweepConfig | None,
-             folder: Path) -> tuple[Path, Path]:
-    """`publish_starter` itself, with each sweep's out folder lock and the starters folder's lock (`folder`) held."""
+def _publish(cfg: SweepConfig, model: str, dataset: str, name: str | None,
+             search: SweepConfig | None) -> tuple[Path, Path]:
+    """`publish_starter` itself, with each sweep's out folder lock held. The starters folder's lock is taken once every
+    check has passed, and held through staging, its checks and both moves."""
     from mnemiq.sweep.propose import _finished, _keys_set  # the proposal reads this module
 
     sweeps = [cfg] if search is None else [cfg, search]
@@ -817,17 +822,25 @@ def _publish(cfg: SweepConfig, model: str, dataset: str, name: str | None, searc
     searched = found.evidence if found is not None else None if safe_by == "check" else evidence
     record = starter_evidence(cfg, model, name, dataset, state=checked.state, evidence=evidence, text=text,
                               searched=searched)
-    # Staged outside the starters folder, under the names they ship as, and checked there: the evidence as the sweep
-    # reads it, its binding to the starter's bytes included, and the starter through the engine's own loader.
-    with tempfile.TemporaryDirectory(prefix="mnemiq-starter-") as scratch:
-        staged = Path(scratch)
-        starter, shipped = staged / f"{name}.toml", staged / f"{name}{EVIDENCE_SUFFIX}"
-        starter.write_bytes(text.encode("utf-8"))
-        shipped.write_bytes((record.model_dump_json(indent=2) + "\n").encode("utf-8"))
-        read_evidence(name, staged)
-        _resolves_as_measured(cfg, model, name, evidence["version"], staged)
-        # The evidence first: a new starter is never listed without it, and a starter the second move never replaced
-        # sits beside evidence that records another file, which the engine refuses.
-        _move_in(shipped, folder)
-        _move_in(starter, folder)
+    try:
+        folder = profiles.starters_folder()
+    except profiles.ProfileFileError as exc:
+        raise SweepConfigError(str(exc)) from None
+    # Taken only now, so a refusal above leaves the starters folder as it was, its lock file included.
+    with _sole(folder / PUBLISH_LOCK, SweepConfigError(
+            f"{folder} is in use by another publisher; publish again once it has ended")):
+        _clear_stale_copies(folder)
+        # Staged outside the starters folder, under the names they ship as, and checked there: the evidence as the
+        # sweep reads it, its binding to the starter's bytes included, and the starter through the engine's own loader.
+        with tempfile.TemporaryDirectory(prefix="mnemiq-starter-") as scratch:
+            staged = Path(scratch)
+            starter, shipped = staged / f"{name}.toml", staged / f"{name}{EVIDENCE_SUFFIX}"
+            starter.write_bytes(text.encode("utf-8"))
+            shipped.write_bytes((record.model_dump_json(indent=2) + "\n").encode("utf-8"))
+            read_evidence(name, staged)
+            _resolves_as_measured(cfg, model, name, evidence["version"], staged)
+            # The evidence first: a new starter is never listed without it, and a starter the second move never
+            # replaced sits beside evidence that records another file, which the engine refuses.
+            _move_in(shipped, folder)
+            _move_in(starter, folder)
     return folder / f"{name}.toml", folder / f"{name}{EVIDENCE_SUFFIX}"

@@ -13,11 +13,13 @@ follows over the deployment.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib.resources
 import json
 import os
 import re
+import stat
 import tomllib
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -216,23 +218,50 @@ def starter_path(name: str, folder: Path | None = None) -> str:
     return str((starters_folder() if folder is None else Path(folder)) / f"{name}.toml")
 
 
-def _bound(name: str, path: str, data: bytes) -> None:
-    """Refuse the starter `name`, read from `path` as `data`, unless the evidence beside it records the sha256 of those
-    bytes (`starter_sha256`). Publishing moves the evidence in first and the starter after it, so a pair it left half
-    moved is refused here rather than loaded unchecked. Only that one field is read; the sweep reads the rest."""
-    evidence = Path(path).with_name(f"{name}{EVIDENCE_SUFFIX}")
+def _evidence_bytes(evidence: Path) -> tuple[bytes | None, str | None]:
+    """A starter's evidence file as read, never through a link: a link could put a file from outside the package
+    beside the starter. The bytes, or None and why not."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow and evidence.is_symlink():   # where the flag does not exist, checked before opening instead
+        return None, f"{evidence.name} is a link"
     try:
-        held = json.loads(evidence.read_bytes())
+        descriptor = os.open(evidence, os.O_RDONLY | nofollow)
     except FileNotFoundError:
-        reason = f"{evidence.name} is missing"
+        return None, f"{evidence.name} is missing"
     except OSError as exc:
-        reason = f"{evidence.name} cannot be read: {exc.strerror}"
-    except ValueError:
-        reason = f"{evidence.name} is not JSON"
-    else:
-        if isinstance(held, dict) and held.get("starter_sha256") == hashlib.sha256(data).hexdigest():
-            return
-        reason = f"{evidence.name} does not record the sha256 of {Path(path).name}"
+        # The flag refuses a link as ELOOP on Linux and macOS, and as another error on some systems.
+        if exc.errno == errno.ELOOP or evidence.is_symlink():
+            return None, f"{evidence.name} is a link"
+        return None, f"{evidence.name} cannot be read: {exc.strerror}"
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None, f"{evidence.name} is not a regular file"
+        chunks = []
+        while chunk := os.read(descriptor, 1 << 16):
+            chunks.append(chunk)
+        return b"".join(chunks), None
+    except OSError as exc:
+        return None, f"{evidence.name} cannot be read: {exc.strerror}"
+    finally:
+        os.close(descriptor)
+
+
+def _bound(name: str, path: str, data: bytes) -> None:
+    """Refuse the starter `name`, read from `path` as `data`, unless the evidence beside it, a regular file and not a
+    link, records the sha256 of those bytes (`starter_sha256`). Publishing moves the evidence in first and the starter
+    after it, so a pair it left half moved is refused here rather than loaded unchecked. Only that one field is read;
+    the sweep reads the rest."""
+    evidence = Path(path).with_name(f"{name}{EVIDENCE_SUFFIX}")
+    raw, reason = _evidence_bytes(evidence)
+    if raw is not None:
+        try:
+            held = json.loads(raw)
+        except ValueError:
+            reason = f"{evidence.name} is not JSON"
+        else:
+            if isinstance(held, dict) and held.get("starter_sha256") == hashlib.sha256(data).hexdigest():
+                return
+            reason = f"{evidence.name} does not record the sha256 of {Path(path).name}"
     raise ProfileFileError(f"starter {name!r} and its evidence do not match ({reason}): it may have been published "
                            "incompletely. Restore both files, or publish it again")
 
