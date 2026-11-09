@@ -103,8 +103,11 @@ function endSessionOf(value: unknown): string | null {
   const authority = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/?#]*)/.exec(value)?.[1] ?? "";
   if (authority.includes("%")) return null;
   try {
-    const { protocol } = new URL(value);
-    return protocol === "https:" || protocol === "http:" ? value : null;
+    const { protocol, host } = new URL(value);
+    if (protocol !== "https:" && protocol !== "http:") return null;
+    // The backstop: a host the browser rewrites (a default port dropped, a hex or bracketed IP made canonical)
+    // would not go where the engine checked, so keep the URL only when the browser reads its authority as written.
+    return host === authority ? value : null;
   } catch {
     return null;
   }

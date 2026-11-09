@@ -6,6 +6,8 @@ repeats a secret's value, because this message reaches the console and whatever 
 
 from __future__ import annotations
 
+import ipaddress
+import re
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlsplit
 
@@ -136,9 +138,63 @@ def check_end_session_url(url: str) -> None:
     elif parts.scheme == "http" and not (host in _LOOPBACK_LITERALS or host == "localhost"
                                          or host.endswith(".localhost")):
         problem = "http is allowed only for 127.0.0.1, [::1], localhost or a name under .localhost"
+    else:
+        problem = _end_session_authority_problem(parts.netloc, parts.scheme)
     if problem:
         raise AuthConfigError(f"MNEMIQ_OIDC_END_SESSION_URL must be the identity provider's end-session URL, "
                               f"absolute and https: {problem} (got {url!r})")
+
+
+# A hostname label as a browser keeps it unchanged: lowercase letters, digits, `_`, and `-` inside.
+_LABEL = re.compile(r"[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?")
+_DEFAULT_PORT = {"https": "443", "http": "80"}
+
+
+def _end_session_authority_problem(netloc: str, scheme: str) -> str | None:
+    """Why the authority is not one a browser reads exactly as written, or None.
+
+    An allow-list, not a list of the forms found so far: the two loopback literals, or a lowercase ASCII hostname
+    whose last label starts with a letter (so no numeric or hex form reads as IPv4) and has no `xn--` label, with a
+    port written canonically and never the scheme's default. WHATWG's URL parser leaves exactly these unchanged, which
+    the workbench's tests check against the same fixture.
+    """
+    if netloc.startswith("["):
+        end = netloc.find("]") + 1
+        host, rest = netloc[:end], netloc[end:]
+    else:
+        host, sep, rest = netloc.partition(":")
+        rest = f":{rest}" if sep else ""
+    port = rest[1:] if rest.startswith(":") else None
+    if port == "":
+        return "it has an empty port"
+    if port is not None and not re.fullmatch(r"[1-9][0-9]{0,4}", port):
+        return "its port must be written without a leading zero"
+    if port == _DEFAULT_PORT.get(scheme):
+        return "it names the scheme's default port, which a browser drops; leave the port out"
+    if host in ("127.0.0.1", "[::1]"):
+        return None
+    if host.startswith("[") or _is_ip(host):
+        return "it names an IP address other than 127.0.0.1 or [::1]; name the provider by a hostname"
+    if host != host.lower():
+        return "its host must be lowercase, as a browser sends it"
+    if len(host) > 253:
+        return "its host is longer than 253 characters"
+    labels = host.split(".")
+    if not all(_LABEL.fullmatch(label) for label in labels):
+        return "its host is not a hostname: each label is 1 to 63 lowercase letters, digits, _ and inner -"
+    if any(label.startswith("xn--") for label in labels):
+        return "it names an internationalised host (xn--); write an ASCII alias for it"
+    if not labels[-1][0].isalpha():
+        return "its last label must start with a letter, or a browser reads the host as an IP address"
+    return None
+
+
+def _is_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
 
 
 _END_SESSION_NEEDS_ISSUER = ("MNEMIQ_OIDC_END_SESSION_URL needs MNEMIQ_OIDC_ISSUER: Sign out ends at the identity "

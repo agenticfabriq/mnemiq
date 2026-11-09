@@ -248,6 +248,17 @@ each fails quietly without it:
 - **The proxy client's `client_id` in the URL.** Keycloak needs it, or an ID token, which the workbench never holds.
   Without it, expect Keycloak to refuse the sign-out.
 
+**Write the URL as the browser sends it.** A browser lowercases a host, drops a default port, removes a leading zero
+from a port and rewrites an IP address into its own form, so the check accepts only a URL it would leave unchanged.
+What a refusal costs, by case:
+
+- **An uppercase host** is the same host to the browser: lowercase this setting, and the whitelist entry if it was
+  written the same way.
+- **A default port (`:443`, `:80`) or a port with a leading zero:** drop or rewrite it in this setting, and in the
+  whitelist entry if it was written the same way.
+- **An IP address other than `127.0.0.1` or `[::1]`, or an internationalised host:** give the provider a hostname,
+  and move the issuer, the cookie host, the whitelist entry and this setting to it together.
+
 **The OpenAI-compatible endpoint.** `GET /openai/v1/models` and `POST /openai/v1/chat/completions` serve Open WebUI,
 or any OpenAI client, each request as its own verified caller, with one model per profile that caller may pick. They
 are served only where the endpoint can verify a caller of its own: `openwebui_jwt_secret` (Open WebUI's signed user
@@ -267,7 +278,7 @@ title, answered empty without asking the engine. The question is the last user m
 | `oidc_roles_claim` | `"realm_access.roles"` | The dotted path of the token's roles claim. A token without it takes its roles from the identity map. |
 | `oidc_groups_claim` | unset | Opt-in: passes this claim's groups through as the identity's groups, for a provider whose groups only administrators control. Unset, a token's groups grant nothing except through the identity map. |
 | `oidc_leeway_s` | `30.0` | Clock leeway, in seconds, on a token's `exp`, `nbf` and `iat`. |
-| `oidc_end_session_url` | unset | The identity provider's end-session URL, as the browser reaches it, with the sign-in proxy client's `client_id` where the provider needs it. Set, the workbench's Sign out ends there, through the proxy's `rd`, so the provider's session ends even when the proxy cannot end it. Unset, Sign out is the proxy's alone. https, or http only for `127.0.0.1`, `[::1]`, `localhost` or a name under `.localhost`; printable ASCII with no backslash and no percent-encoded host; it needs `oidc_issuer`, and it must not carry `post_logout_redirect_uri`, which the workbench adds. |
+| `oidc_end_session_url` | unset | The identity provider's end-session URL, as the browser reaches it, with the sign-in proxy client's `client_id` where the provider needs it. Set, the workbench's Sign out ends there, through the proxy's `rd`, so the provider's session ends even when the proxy cannot end it. Unset, Sign out is the proxy's alone. https, or http only for `127.0.0.1`, `[::1]`, `localhost` or a name under `.localhost`; its host a lowercase hostname whose last label starts with a letter (no `xn--` label), or `127.0.0.1` or `[::1]`; a port only when it is not the scheme's default, written without a leading zero; printable ASCII with no backslash; it needs `oidc_issuer`, and it must not carry `post_logout_redirect_uri`, which the workbench adds. |
 | `openwebui_audience` | unset | The `aud` an identity provider's token must carry on Open WebUI's endpoint, distinct from `oidc_audience`. The token needs the `db.read` scope there too. Unset, that endpoint accepts no Bearer token. |
 | `openwebui_jwt_secret` | unset | Turns on Open WebUI's signed user header: the HS256 secret it shares with Open WebUI, at least 32 bytes. |
 | `openwebui_jwt_header` | `"X-OpenWebUI-User-Jwt"` | The header carrying Open WebUI's signed user token. |

@@ -187,6 +187,22 @@ def test_a_bearer_without_db_read_is_a_403_in_openai_shape(tmp_path):
     assert rt.calls == 1
 
 
+def test_an_openai_403_carries_no_end_session_url(tmp_path):
+    """Only /v1's refusals carry where Sign out ends; /openai/v1 keeps OpenAI's error shape, with nothing added."""
+    from mnemiq.auth.config import auth_config_from_settings
+    from mnemiq.auth.doors import HttpDoors
+
+    cfg = auth_config_from_settings(Settings(
+        tenant="acme", oidc_issuer=ISSUER, oidc_audience=AUDIENCE, openwebui_audience=OWUI_AUDIENCE,
+        oidc_end_session_url="https://sso.example/realms/r/protocol/openid-connect/logout?client_id=c"))
+    client = _client(tmp_path, _RT(), doors=HttpDoors(cfg, fetch=lambda: jwks_for((rsa_key(), "k1"))))
+    token = mint(claims(aud=OWUI_AUDIENCE, scope="openid"))
+    r = client.get("/openai/v1/models", headers={"Authorization": f"Bearer {token}", "X-Mnemiq-Task": ""})
+    error = _error(r, 403)
+    assert error["type"] == "permission_error"
+    assert "end_session_url" not in r.json() and "sso.example" not in r.text
+
+
 def test_no_credential_is_a_401(tmp_path):
     _error(_client(tmp_path).get("/openai/v1/models", headers={"X-Mnemiq-Task": ""}), 401)
 
