@@ -241,7 +241,7 @@ each fails quietly without it:
 - **The provider's host in oauth2-proxy's `--whitelist-domain`, as the browser sends it**: lowercase, with a port
   only when the URL names one other than its scheme's default, since a browser drops `:443` from an https URL.
   Without it the proxy drops the redirect, logging `Rejecting invalid redirect … domain / port not in whitelist`, and
-  Sign out behaves as it did without the setting.
+  sends the browser to its own default page instead, so Sign out is the proxy's alone.
 - **The workbench's root, exactly (for example `https://mnemiq.example/`), among the client's valid post-logout
   redirect URIs**, not a wildcard. Without it, expect the provider to show an error page instead of returning to the
   workbench.
@@ -259,7 +259,7 @@ What a refusal costs, by case:
 - **An IP address other than `127.0.0.1` or `[::1]`, or an internationalised host:** give the provider a hostname,
   and move the issuer, the cookie host, the whitelist entry and this setting to it together.
 
-**The OpenAI-compatible endpoint.** `GET /openai/v1/models` and `POST /openai/v1/chat/completions` serve Open WebUI,
+**The OpenAI-compatible endpoint.** [Open WebUI](open-webui.md) sets it up end to end. `GET /openai/v1/models` and `POST /openai/v1/chat/completions` serve Open WebUI,
 or any OpenAI client, each request as its own verified caller, with one model per profile that caller may pick. They
 are served only where the endpoint can verify a caller of its own: `openwebui_jwt_secret` (Open WebUI's signed user
 header) or `openwebui_audience` (a provider token for this endpoint). Otherwise every path under `/openai/v1` answers
