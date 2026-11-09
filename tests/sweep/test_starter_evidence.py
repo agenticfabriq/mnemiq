@@ -3,6 +3,8 @@ the build the starter was swept on, and the schema that holds a starter's eviden
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import get_args
 
 import pytest
@@ -20,7 +22,7 @@ from mnemiq.sweep.starters import (
 
 from .conftest import (
     COMMIT, CONFIG_BUILD, PATH_SHAPED_KEY, SHA12, STUB_WINDOW, altered, evidence, one_model, started_sweep,
-    starter_with_evidence, sweep_json, valid_evidence, write_config,
+    starter_with_evidence, sweep_json, valid_evidence, write, write_config,
 )
 
 # A date in ASCII form but no calendar's, and a real date written in Arabic-Indic digits.
@@ -192,7 +194,10 @@ def test_a_given_engine_is_compared_in_place_of_the_running_one(tmp_path, monkey
 
 def test_a_starter_without_valid_evidence_is_refused_at_load(tmp_path, monkeypatch):
     folder = starter_with_evidence(tmp_path, monkeypatch)
-    (folder / "fixture-2.5-build.evidence.json").write_text('{"starter": "fixture-2.5-build"}')
+    # bound to the starter's file, so the engine's own loader takes it, and nothing else the schema needs
+    sha = hashlib.sha256((folder / "fixture-2.5-build.toml").read_bytes()).hexdigest()
+    write(folder / "fixture-2.5-build.evidence.json",
+          json.dumps({"starter": "fixture-2.5-build", "starter_sha256": sha}))
     with pytest.raises(SweepConfigError, match="ships without valid evidence"):
         load_config(write_config(tmp_path, start={"starter": "fixture-2.5-build"}))
 
@@ -212,6 +217,13 @@ def test_the_evidence_schema_refuses_what_it_does_not_name_at_any_depth(tmp_path
     # calendar has, or one in other digits; a path-shaped database key; a model given as a path
     where = plant_at[:plant_at.index(None)] if None in plant_at else plant_at
     assert refused.value.errors()[0]["loc"][:len(where)] == where    # refused where it was planted, not elsewhere
+
+
+def test_evidence_that_names_another_starter_file_is_refused(tmp_path, monkeypatch):
+    starter_with_evidence(tmp_path, monkeypatch, starter_sha256="0" * 64)
+    with pytest.raises(SweepConfigError, match=r"ships without valid evidence \(its starter_sha256 is not the sha256 "
+                                               r"of fixture-2\.5-build\.toml\)"):
+        read_evidence("fixture-2.5-build")
 
 
 def test_the_mode_alias_is_the_engines_modes():

@@ -133,6 +133,24 @@ def test_flattened_entry_and_sources_follow_the_chain(tmp_path, monkeypatch):
     assert profile_starter(path, "child") == "fixture-2.5-build"
 
 
+@pytest.mark.parametrize("evidence", [None, "not json", "[]", "{}", '{"starter_sha256": "' + "0" * 64 + '"}'])
+def test_a_starter_whose_evidence_is_missing_or_names_another_file_is_refused(tmp_path, monkeypatch, evidence):
+    # what an interrupted publish leaves: a starter beside no evidence, or beside the evidence of another file
+    folder = starter_folder(tmp_path, monkeypatch, {"fixture-2.5-build": STARTER})
+    path = folder / "fixture-2.5-build.evidence.json"
+    path.unlink() if evidence is None else path.write_text(evidence)
+    with pytest.raises(ProfileFileError, match=r"starter 'fixture-2\.5-build' and its evidence do not match .*: it may "
+                                               r"have been published incompletely\. Restore both files, or publish it "
+                                               r"again"):
+        _load(tmp_path, ONLY)
+
+
+def test_a_starter_bound_to_its_evidence_loads(tmp_path, monkeypatch):
+    # positive control: the evidence names the file's sha256, which is all the loader reads of it
+    starter_folder(tmp_path, monkeypatch, {"fixture-2.5-build": STARTER})
+    assert _load(tmp_path, ONLY)[0]["only"].settings.retrieval_k == 36
+
+
 def test_every_shipped_starter_is_one_profile_named_for_its_file():
     # vacuous by design until PR C ships the first starter; Task 6 adds `assert starter_names()` here (gate item 10)
     for name in starter_names():                 # a loop, not a parametrization, which would skip without a word

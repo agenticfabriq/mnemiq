@@ -14,9 +14,10 @@ apart. The last part of what the server was launched from is kept only to say wh
 
 A starter is published (`publish_starter`, `mnemiq sweep starter`) from finished sweeps whose rule found it safe over
 the engine's defaults: check mode's verdict, or a search from those defaults whose pick was confirmed on the held-out
-part. Every refusal comes before anything is written. The starter and its evidence are written under a draft name
-beside the starters and moved into place only once a deployment starting from the draft resolves, on every deployment
-the sweep read, to the version the proposal recorded.
+part. Every refusal comes before anything is written. The evidence records the sha256 of the starter's file
+(`starter_sha256`), and the engine loads a starter only beside evidence that does. The pair is staged outside the
+starters folder and checked there; only then is each moved in, the evidence first, under a hidden name until its
+move and under the folder's lock, so the folder never lists a draft.
 """
 
 from __future__ import annotations
@@ -28,7 +29,9 @@ import os
 import re
 import tempfile
 import time
+import shutil
 import tomllib
+import uuid
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import date
@@ -43,14 +46,13 @@ from mnemiq import profiles
 from mnemiq.agent.modes import MODES
 from mnemiq.config import Settings
 from mnemiq.observability.answer_log import engine_commit
-from mnemiq.profiles import _NAME, ENDPOINT_SETTINGS, PROFILE_SETTINGS
+from mnemiq.profiles import _NAME, ENDPOINT_SETTINGS, EVIDENCE_SUFFIX, PROFILE_SETTINGS
 from mnemiq.sweep.arms import _endpoint, _toml, arm_of
 from mnemiq.sweep.config import (
     PROPOSAL, SweepConfig, SweepConfigError, _RepoId, load_questions, start_profile, start_starter,
 )
 from mnemiq.sweep.run import OUT_LOCK, PINS, _sole, arm_folder, engine_build
 
-EVIDENCE_SUFFIX = ".evidence.json"
 # What `server_readings` reads of a model server's build, each None when it was not read.
 READINGS = ("server", "server_version", "context_window", "root_name")
 # What a resumed sweep refuses when the server now reports it otherwise. The weights folder's name is kept only to say,
@@ -73,10 +75,13 @@ def _calendar_day(value: str) -> str:
 Day = Annotated[str, Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"), AfterValidator(_calendar_day)]
 # A deployment's `db_id`, or "" for a sweep of one deployment: never a path.
 DbKey = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{0,64}$")]
-# The label a person gives the questions a starter was measured on (`--dataset`): 1 to 80 printable ASCII characters,
-# with no slash of either kind, so it is never a path.
-DATASET_LABEL_PATTERN = r"^[\x20-\x2e\x30-\x5b\x5d-\x7e]{1,80}$"
-DatasetLabel = Annotated[str, Field(pattern=DATASET_LABEL_PATTERN)]
+# The label a person gives the questions a starter was measured on (`--dataset`): printable ASCII with no slash of
+# either kind, so it is never a path, at least one character that is not a space, and at most `DATASET_LABEL_MAX`.
+DATASET_LABEL_PATTERN = r"^[\x20-\x2e\x30-\x5b\x5d-\x7e]*[\x21-\x2e\x30-\x5b\x5d-\x7e][\x20-\x2e\x30-\x5b\x5d-\x7e]*$"
+DATASET_LABEL_MAX = 80
+DatasetLabel = Annotated[str, Field(pattern=DATASET_LABEL_PATTERN, max_length=DATASET_LABEL_MAX)]
+# The sha256 of a starter's file, as its evidence records it.
+Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 
 class _Record(BaseModel):
@@ -167,6 +172,7 @@ class StarterEvidence(_Record):
     """What a starter ships with: what it was swept on, by which rule, and what the sweeps measured, in aggregate."""
 
     starter: str
+    starter_sha256: Sha256  # the starter's file, which the engine loads only beside evidence that records it
     published: Day  # the local date the starter was written
     dataset: DatasetRecord
     made_up_measured: bool  # whether the measured questions hold one with no answer, which a made-up answer needs
@@ -188,10 +194,10 @@ def build_name(repo_id: str) -> str:
     return repo_id.split("/", 1)[-1].lower()
 
 
-def evidence_path(name: str) -> Path:
-    """Where the starter `name`'s evidence ships: beside its file, in the starters folder. The engine's `starter_path`
-    refuses a name the folder does not list."""
-    return Path(profiles.starter_path(name)).with_name(f"{name}{EVIDENCE_SUFFIX}")
+def evidence_path(name: str, folder: Path | None = None) -> Path:
+    """Where the starter `name`'s evidence ships: beside its file, in the starters folder (or in `folder`). The engine's
+    `starter_path` refuses a name the folder does not list."""
+    return Path(profiles.starter_path(name, folder)).with_name(f"{name}{EVIDENCE_SUFFIX}")
 
 
 def _reasons(exc: ValidationError) -> str:
@@ -201,28 +207,35 @@ def _reasons(exc: ValidationError) -> str:
                      for e in errors)
 
 
-def read_evidence(name: str) -> StarterEvidence:
-    """The evidence the starter `name` ships with, refused unless it is a regular file in the starters folder, as the
-    starter's own file is, that the schema accepts and that names this starter."""
+def read_evidence(name: str, folder: Path | None = None) -> StarterEvidence:
+    """The evidence the starter `name` ships with (or that `folder` holds beside it), refused unless it is a regular
+    file in the starters folder, as the starter's own file is, that the schema accepts, that names this starter, and
+    that records the sha256 of the starter's file."""
     try:
-        path = evidence_path(name)
+        path = evidence_path(name, folder)
+        starter = Path(profiles.starter_path(name, folder))
     except profiles.ProfileFileError as exc:
         raise SweepConfigError(str(exc)) from None
+    home = (profiles.starters_folder() if folder is None else Path(folder)).resolve()
     if not path.exists() and not path.is_symlink():
         reason = f"{path.name} is missing"
-    elif path.is_symlink() or not path.is_file() or path.resolve().parent != profiles.starters_folder().resolve():
+    elif path.is_symlink() or not path.is_file() or path.resolve().parent != home:
         reason = f"{path.name} is not a regular file in the starters folder"
     else:
         try:
             evidence = StarterEvidence.model_validate_json(path.read_bytes())
+            held = hashlib.sha256(starter.read_bytes()).hexdigest()
         except OSError as exc:
-            reason = f"{path.name} cannot be read: {exc.strerror}"
+            reason = f"{path.name} or {starter.name} cannot be read: {exc.strerror}"
         except ValidationError as exc:
             reason = _reasons(exc)
         else:
-            if evidence.starter == name:
+            if evidence.starter != name:
+                reason = f"it names starter {evidence.starter!r}"
+            elif evidence.starter_sha256 != held:
+                reason = f"its starter_sha256 is not the sha256 of {starter.name}"
+            else:
                 return evidence
-            reason = f"it names starter {evidence.starter!r}"
     raise SweepConfigError(f"starter {name!r} ships without valid evidence ({reason})")
 
 
@@ -374,8 +387,9 @@ _DESCRIPTION = ("{name}: settings found safe over the engine's defaults on {data
 # What a starter never takes from the proposal it is written from: where the model is served and judged, the key
 # variables, who may pick the profile, and its description, which `_DESCRIPTION` replaces.
 _NOT_CARRIED = frozenset({*ENDPOINT_SETTINGS, "api_key_env", "verify_api_key_env", "roles", "description"})
-# What a starter is first written as, beside the starters it joins, until it resolves to the version that was measured.
-_DRAFT = ".publishing"
+# The lock a publisher holds on the starters folder, so a second one is refused at once rather than moving its files in
+# between the first one's.
+PUBLISH_LOCK = ".publish.lock"
 _UNRESOLVED = "the starter does not resolve to the profile that was measured"
 _BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
@@ -619,7 +633,7 @@ def starter_evidence(cfg: SweepConfig, model: str, name: str, dataset: str, *, s
 
 def _evidence(cfg: SweepConfig, model: str, name: str, dataset: str, state: dict, evidence: dict, text: str,
               found: dict | None) -> StarterEvidence:
-    """`starter_evidence` itself, which the schema may refuse."""
+    """`starter_evidence` itself, which the schema may refuse. `text` is the starter's file as written, in UTF-8."""
     checked = evidence["rule"]["strategy"] == "check"
     held = tomllib.loads(text)["profiles"][name]
     wide = {key: value for key, value in held.items() if key in PROFILE_SETTINGS}
@@ -630,6 +644,7 @@ def _evidence(cfg: SweepConfig, model: str, name: str, dataset: str, state: dict
     measured_versions = evidence.get("measured_versions")
     return StarterEvidence(
         starter=name,
+        starter_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
         published=date.today().isoformat(),
         dataset=DatasetRecord(name=dataset, questions=len(cases), answerable=sum(case.answerable for case in cases)),
         made_up_measured=any(not case.answerable for case in cases),
@@ -668,10 +683,10 @@ def _deployment_text(cfg: SweepConfig, model: str, starter: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _resolves_as_measured(cfg: SweepConfig, model: str, starter: str, version: str | dict) -> None:
-    """Refuse unless a deployment whose profile starts from the starter `starter` resolves, on every deployment the
-    sweep read, to the version the proposal recorded: the engine's own loader and version function, as a run stamps
-    its rows."""
+def _resolves_as_measured(cfg: SweepConfig, model: str, starter: str, version: str | dict, staged: Path) -> None:
+    """Refuse unless a deployment whose profile starts from the starter `starter`, read from the folder it is staged in
+    (`staged`), resolves, on every deployment the sweep read, to the version the proposal recorded: the engine's own
+    loader and version function, as a run stamps its rows."""
     from mnemiq.sweep.propose import _agrees, _versions  # the proposal reads this module
 
     drafted = {None: version} if isinstance(version, str) else dict(version)
@@ -679,7 +694,7 @@ def _resolves_as_measured(cfg: SweepConfig, model: str, starter: str, version: s
         path = Path(scratch) / "profiles.toml"
         path.write_text(_deployment_text(cfg, model, starter), encoding="utf-8")
         try:
-            resolved = _versions(cfg, path, {})
+            resolved = _versions(cfg, path, {}, starters=staged)
         except SweepConfigError as exc:
             raise SweepConfigError(f"{_UNRESOLVED}: {exc}") from None
     if set(resolved) != set(drafted) or not _agrees(resolved, drafted):
@@ -698,8 +713,9 @@ def publish_starter(cfg: SweepConfig, model: str, dataset: str, *, name: str | N
     when it did. `dataset` labels the questions, for the description and the evidence. Returns the two paths.
 
     Every refusal comes before anything is written, in this order: a dataset label that is not 1 to 80 printable ASCII
-    characters without a slash; an out folder a run or a proposal holds, whose lock publishing then holds to its end, as
-    a proposal does; a key variable not set; a sweep that has not finished, or ran under another config; an engine with
+    characters, not all spaces, without a slash; an out folder a run or a proposal holds, whose lock publishing then
+    holds to its end, as a proposal does; the starters folder, while another publisher holds its lock; a key variable
+    not set; a sweep that has not finished, or ran under another config; an engine with
     no checkout to write into; an engine other than the one the sweeps ran on, by source hash; a proposal a person
     chose, or one whose bounds are not both 0, a `search` in check mode, or a `search` beside a sweep that is not; a
     check that chose the defaults, or a search that did not start from them, whose pick was not confirmed, or whose pick
@@ -707,15 +723,18 @@ def publish_starter(cfg: SweepConfig, model: str, dataset: str, *, name: str | N
     stated whole; a name that is not the build's; a search that is not the one the check started from; and evidence the
     schema refuses. Each sweep's record and proposal are read once, so the checks and the evidence see the same bytes.
 
-    The two files are written as `<name>.publishing.*` beside the starters, and moved into place only once a deployment
-    starting from the draft resolves, on every deployment the sweep read, to the version the proposal recorded. Any
-    failure removes the draft and leaves a starter already shipped under that name as it was."""
+    The evidence records the sha256 of the starter's file (`starter_sha256`), and the engine loads a starter only
+    beside evidence that does. The two files are staged outside the starters folder and checked there: the evidence as
+    the sweep reads it, and a deployment starting from the staged starter must resolve, on every deployment the sweep
+    read, to the version the proposal recorded. Only then is each moved in, the evidence first, under a hidden name
+    until its move. A failure before the moves leaves the starters folder as it was. One between them leaves a pair the
+    engine refuses until both files are restored or published again."""
     from mnemiq.sweep.propose import _finished  # the proposal reads this module
 
-    if not re.fullmatch(DATASET_LABEL_PATTERN, dataset):
+    if len(dataset) > DATASET_LABEL_MAX or not re.fullmatch(DATASET_LABEL_PATTERN, dataset):
         raise SweepConfigError(f"--dataset {dataset!r} is not a label a starter can carry: it names the questions in "
-                               "the starter's description and evidence, so it is 1 to 80 printable ASCII characters "
-                               "with no / or \\")
+                               f"the starter's description and evidence, so it is 1 to {DATASET_LABEL_MAX} printable "
+                               "ASCII characters, not all spaces, with no / or \\")
     sweeps = [cfg] if search is None else [cfg, search]
     for each in sweeps:
         if model not in each.models:
@@ -732,12 +751,30 @@ def publish_starter(cfg: SweepConfig, model: str, dataset: str, *, name: str | N
             held.enter_context(_sole(out / OUT_LOCK, SweepConfigError(
                 f"{out} is in use by a run or a proposal of this sweep; publish again once it has ended")))
             locked.append(out)
-        return _publish(cfg, model, dataset, name, search)
+        try:
+            folder = profiles.starters_folder()
+        except profiles.ProfileFileError as exc:
+            raise SweepConfigError(str(exc)) from None
+        held.enter_context(_sole(folder / PUBLISH_LOCK, SweepConfigError(
+            f"{folder} is in use by another publisher; publish again once it has ended")))
+        return _publish(cfg, model, dataset, name, search, folder)
 
 
-def _publish(cfg: SweepConfig, model: str, dataset: str, name: str | None,
-             search: SweepConfig | None) -> tuple[Path, Path]:
-    """`publish_starter` itself, with each sweep's out folder lock held."""
+def _move_in(source: Path, folder: Path) -> None:
+    """Copy `source` into `folder` under a hidden name that ends in neither `.toml` nor the evidence's suffix, so no
+    reader lists it, then move it into place under its own name: the folder never holds part of the file under that
+    name. The hidden copy is removed on every path."""
+    hidden = folder / f".{source.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        shutil.copyfile(source, hidden)
+        os.replace(hidden, folder / source.name)
+    finally:
+        hidden.unlink(missing_ok=True)
+
+
+def _publish(cfg: SweepConfig, model: str, dataset: str, name: str | None, search: SweepConfig | None,
+             folder: Path) -> tuple[Path, Path]:
+    """`publish_starter` itself, with each sweep's out folder lock and the starters folder's lock (`folder`) held."""
     from mnemiq.sweep.propose import _finished, _keys_set  # the proposal reads this module
 
     sweeps = [cfg] if search is None else [cfg, search]
@@ -780,20 +817,17 @@ def _publish(cfg: SweepConfig, model: str, dataset: str, name: str | None,
     searched = found.evidence if found is not None else None if safe_by == "check" else evidence
     record = starter_evidence(cfg, model, name, dataset, state=checked.state, evidence=evidence, text=text,
                               searched=searched)
-    try:
-        folder = profiles.starters_folder()
-    except profiles.ProfileFileError as exc:
-        raise SweepConfigError(str(exc)) from None
-    placed = folder / f"{name}.toml", folder / f"{name}{EVIDENCE_SUFFIX}"
-    drafts = folder / f"{name}{_DRAFT}.toml", folder / f"{name}{_DRAFT}{EVIDENCE_SUFFIX}"
-    try:
-        drafts[0].write_text(text, encoding="utf-8")
-        drafts[1].write_text(record.model_dump_json(indent=2) + "\n", encoding="utf-8")
-        _resolves_as_measured(cfg, model, f"{name}{_DRAFT}", evidence["version"])
-        # The evidence first: a new starter is never listed without it.
-        os.replace(drafts[1], placed[1])
-        os.replace(drafts[0], placed[0])
-    finally:
-        for path in drafts:
-            path.unlink(missing_ok=True)
-    return placed
+    # Staged outside the starters folder, under the names they ship as, and checked there: the evidence as the sweep
+    # reads it, its binding to the starter's bytes included, and the starter through the engine's own loader.
+    with tempfile.TemporaryDirectory(prefix="mnemiq-starter-") as scratch:
+        staged = Path(scratch)
+        starter, shipped = staged / f"{name}.toml", staged / f"{name}{EVIDENCE_SUFFIX}"
+        starter.write_bytes(text.encode("utf-8"))
+        shipped.write_bytes((record.model_dump_json(indent=2) + "\n").encode("utf-8"))
+        read_evidence(name, staged)
+        _resolves_as_measured(cfg, model, name, evidence["version"], staged)
+        # The evidence first: a new starter is never listed without it, and a starter the second move never replaced
+        # sits beside evidence that records another file, which the engine refuses.
+        _move_in(shipped, folder)
+        _move_in(starter, folder)
+    return folder / f"{name}.toml", folder / f"{name}{EVIDENCE_SUFFIX}"

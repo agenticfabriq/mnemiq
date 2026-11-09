@@ -55,14 +55,15 @@ check mode: `mnemiq sweep starter --config search.toml --model <model> --dataset
 
 The starter is named for its build: the part of `[models.<model>.build] model` after the `/`, lowercased, so
 `Qwen/Qwen2.5-Coder-32B-Instruct-AWQ` gives `qwen2.5-coder-32b-instruct-awq`. `--name` may only repeat that name.
-`--dataset` labels the questions in the starter's description and its evidence: 1 to 80 printable ASCII characters
-with no `/` or `\`, so the label is never a path.
+`--dataset` labels the questions in the starter's description and its evidence: 1 to 80 printable ASCII characters,
+not all spaces, with no `/` or `\`, so the label is never a path.
 
 Publishing refuses, before it writes anything:
 
-- a `--dataset` label that is not 1 to 80 printable ASCII characters without a slash;
+- a `--dataset` label that is not 1 to 80 printable ASCII characters, not all spaces, without a slash;
 - a sweep whose out folder a run or a proposal is using: publishing holds each sweep's lock until it ends, as
   `propose` does, and reads each sweep's record and proposal once;
+- the starters folder, while another publisher holds its lock;
 - a key variable the model names that is not set;
 - a sweep that has not finished its rounds, or that ran under another config than the one given;
 - an engine with no checkout to write into: the starters live in the package's source, `src/mnemiq/starter_profiles/`;
@@ -81,19 +82,27 @@ Publishing refuses, before it writes anything:
   it;
 - evidence its schema refuses, such as a `db_id` outside the form the schema reads.
 
-It then writes the starter and its evidence as `<name>.publishing.toml` and `<name>.publishing.evidence.json` beside
-the starters, and checks that a deployment whose profile starts from that draft resolves, on every deployment the
-sweep read, to the version the proposal recorded, with the engine's own loader and version function. Only then are the
-two files moved into place as `<name>.toml` and `<name>.evidence.json`. When the check fails, the draft is removed, and
-a starter already shipped under that name is left as it was.
+It then writes the starter and its evidence into a staging folder outside the package, and checks them there: the
+evidence as the sweep reads it, and that a deployment whose profile starts from the staged starter resolves, on every
+deployment the sweep read, to the version the proposal recorded, with the engine's own loader and version function.
+Only then are the two files moved into the starters folder as `<name>.evidence.json` and `<name>.toml`, each under a
+hidden name until its move, while publishing holds the folder's lock. A starter the folder lists is never a draft, and
+when a check fails nothing reaches the folder: a starter already shipped under that name is left as it was.
+
+Publishing writes the evidence, then the starter, and each is bound to the other: the evidence records the sha256 of
+the starter's file (`starter_sha256`). If publishing is interrupted between the two, the pair fails closed: the engine
+refuses at boot a starter whose evidence is missing or records another file. Restore both files with git, from the
+checkout publishing requires (`git checkout -- src/mnemiq/starter_profiles/<name>.*`), or publish again.
 
 ## What the evidence holds
 
-Every starter ships with `<name>.evidence.json` beside it, which the engine reads before a sweep starts from the
-starter. It holds builds, the rule and aggregate counts, never a question, a statement, a case id or a path, and its
-schema refuses any field it does not name:
+Every starter ships with `<name>.evidence.json` beside it. The engine reads its `starter_sha256` whenever it loads the
+starter, and a sweep reads all of it before it starts from the starter. It holds builds, the rule and aggregate
+counts, never a question, a statement, a case id or a path, and its schema refuses any field it does not name:
 
 - `starter`: the starter's name.
+- `starter_sha256`: the sha256 of the starter's file. The engine loads the starter only beside evidence that records
+  it, so a pair published incompletely is refused rather than loaded.
 - `published`: the local date it was written.
 - `dataset`: the label `--dataset` gave the questions, how many there are, and how many have an answer.
 - `made_up_measured`: whether the questions hold one with no answer, which a made-up answer needs

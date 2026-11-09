@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -30,7 +31,8 @@ from mnemiq.profiles import PROFILE_SETTINGS
 from mnemiq.sweep.run import engine_build
 from mnemiq.sweep.starters import starter_text as _starter_text
 from tests.starter_fixtures import ROOT_AND_CHILD, STARTER, starter_folder, write
-from tests.starter_fixtures import edit as edit  # for the sweep tests, which import their helpers from here
+from tests.starter_fixtures import bind as bind  # for the sweep tests, which import their helpers from here
+from tests.starter_fixtures import edit as edit
 
 from .stub_model import _WRITER, STUB_WINDOW, StubModel, _messages, _proposal
 
@@ -403,7 +405,8 @@ def starter_with_evidence(tmp_path: Path, monkeypatch, *, name: str = STARTER_NA
     The sweep's workers read the same folder, through a `sitecustomize` on `PYTHONPATH` that each spawned process
     imports as it starts."""
     folder = starter_folder(tmp_path, monkeypatch, {name: settings})
-    write(folder / f"{name}.evidence.json", json.dumps(_evidence(name) | evidence, indent=2))
+    bound = {"starter_sha256": hashlib.sha256((folder / f"{name}.toml").read_bytes()).hexdigest()}
+    write(folder / f"{name}.evidence.json", json.dumps(_evidence(name) | bound | evidence, indent=2))
     hook = tmp_path / "starters-in-workers"
     hook.mkdir(exist_ok=True)
     write(hook / "sitecustomize.py", _STARTERS_IN_WORKERS)

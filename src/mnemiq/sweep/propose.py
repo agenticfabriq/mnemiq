@@ -658,14 +658,15 @@ def _merged(texts: dict[str, str], name: str, modes: Sequence[str]) -> str:
     return merged
 
 
-def _versions(cfg: SweepConfig, path: Path, dialects: dict) -> dict[str | None, str]:
+def _versions(cfg: SweepConfig, path: Path, dialects: dict, *, starters: Path | None = None) -> dict[str | None, str]:
     """The version the engine gives the default profile of the file at `path`, for each deployment, as a run's runtime
-    stamps it: the engine's own loader on the deployment's baseline, and its version function with the dialect of the
-    deployment's own adapter (read once into `dialects`)."""
+    stamps it: the engine's own loader on the deployment's baseline (reading a starter from `starters`, when given), and
+    its version function with the dialect of the deployment's own adapter (read once into `dialects`)."""
     found = {}
     for db_id, settings in baselines(cfg):
         try:
-            profiles, default = load_profiles(settings.model_copy(update={"profiles_path": str(path)}))
+            profiles, default = load_profiles(settings.model_copy(update={"profiles_path": str(path)}),
+                                              starters=starters)
         except ValueError as exc:  # the profile loader's refusals, with every key variable set (`_keys_set`)
             raise _Stale(f"the engine refuses the proposed profile, so its version cannot be recomputed: "
                          f"{scrub_credentials(str(exc), settings)}") from None

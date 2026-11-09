@@ -6,6 +6,8 @@ Each test runs with the starters folder patched to `tmp_path / "starters"`, neve
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 import tomllib
 from pathlib import Path
@@ -15,11 +17,14 @@ from pydantic import ValidationError
 
 from mnemiq import profiles
 from mnemiq.cli import main
-from mnemiq.profiles import ENDPOINT_SETTINGS, starter_names
+from mnemiq.profiles import ENDPOINT_SETTINGS, ProfileFileError, _starter_entry, starter_names
+from mnemiq.sweep import starters
 from mnemiq.sweep.config import SweepConfigError, load_config
 from mnemiq.sweep.propose import _agrees, _versions, propose
 from mnemiq.sweep.run import OUT_LOCK, _sole
-from mnemiq.sweep.starters import DatasetRecord, StarterEvidence, _whole_build, fewer_right, publish_starter
+from mnemiq.sweep.starters import (
+    DatasetRecord, StarterEvidence, _whole_build, fewer_right, publish_starter, read_evidence,
+)
 
 from .conftest import (
     CONFIG_BUILD, KEY_ENV, STUB_WINDOW, deployment_file_naming, drafted_versions, drops_the_instant_section, evidence,
@@ -226,7 +231,7 @@ def test_the_doc_names_every_evidence_field_and_every_shipped_starter():
 # --- what a person types, and what a second sweep brings -------------------------------------------------------------
 
 # A dataset label that could hold a path, that is not printable ASCII, that is empty, or that runs past the cap.
-UNFIT_LABELS = ["../questions", "C:\\sets\\mine", "the tiny set\n", "the tiny s\u00e9t", "x" * 81, ""]
+UNFIT_LABELS = ["../questions", "C:\\sets\\mine", "the tiny set\n", "the tiny s\u00e9t", "x" * 81, "", "   "]
 
 
 def _nothing_ran(tmp_path: Path):
@@ -242,7 +247,7 @@ def test_a_dataset_label_that_could_hold_a_path_or_is_unbounded_is_refused_first
     starter_folder(tmp_path, monkeypatch, {})
     with pytest.raises(SweepConfigError, match="--dataset"):
         publish_starter(_nothing_ran(tmp_path), "m", label)    # refused before any sweep is read
-    assert not list(profiles.starters_folder().iterdir())
+    assert _shipped(profiles.starters_folder()) == []
 
 
 @pytest.mark.parametrize("label", UNFIT_LABELS)
@@ -265,7 +270,7 @@ def test_a_search_whose_pick_lost_every_change_is_the_defaults_and_is_never_publ
     assert evidence(cfg)["confirm"]["same_as_start"] is True and evidence(cfg)["confirmed"] is True
     with pytest.raises(SweepConfigError, match="the search's pick is the engine's defaults: there is no starter"):
         publish_starter(cfg, "m", "the tiny set")
-    assert not list(profiles.starters_folder().iterdir())
+    assert _shipped(profiles.starters_folder()) == []
 
 
 @pytest.mark.parametrize("held", ["check", "search"])
@@ -275,7 +280,7 @@ def test_publishing_holds_each_sweeps_out_folder_lock_as_propose_does(tmp_path, 
     with _sole(out(sweeps[held]) / OUT_LOCK, RuntimeError("held by the test")):
         with pytest.raises(SweepConfigError, match=re.escape(f"{out(sweeps[held])} is in use by a run or a proposal")):
             publish_starter(sweeps["check"], "m", "the tiny set", search=sweeps["search"])
-    assert not list(profiles.starters_folder().iterdir())
+    assert _shipped(profiles.starters_folder()) == []
 
 
 def test_a_search_that_is_itself_a_check_is_refused(tmp_path, monkeypatch, stub_model):
@@ -345,3 +350,97 @@ def test_evidence_the_schema_refuses_is_refused_before_anything_is_written(tmp_p
     with pytest.raises(SweepConfigError, match="evidence does not have the form the engine reads: versions"):
         publish_starter(cfg, "m", "the tiny set")
     assert not list(profiles.starters_folder().glob("model-2.5-awq*"))
+
+
+# --- the starter bound to its evidence, staged outside the folder, and moved in under a lock ------------------------
+
+
+def _shipped(folder: Path) -> list[str]:
+    """Every entry of the starters folder, hidden ones included, but publishing's own lock."""
+    return sorted(path.name for path in folder.iterdir() if path.name != ".publish.lock")
+
+
+def _second_move_fails(monkeypatch) -> list[str]:
+    """The machine stops between publishing's two moves into the starters folder: the second raises. Returns the name
+    each move into the folder was for, in order."""
+    real, moves = os.replace, []
+
+    def replace(source, target, *args, **kwargs):
+        if Path(target).parent == profiles.starters_folder():
+            moves.append(Path(target).name)
+            if len(moves) == 2:
+                raise OSError("the machine stopped between the two moves")
+        return real(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace)
+    return moves
+
+
+def test_the_evidence_binds_the_starter_by_the_sha256_of_its_file(tmp_path, monkeypatch, stub_model):
+    toml_path, evidence_path = publish_starter(finished_check(tmp_path, monkeypatch, stub_model), "m", "the tiny set")
+    assert read_json(evidence_path)["starter_sha256"] == hashlib.sha256(toml_path.read_bytes()).hexdigest()
+    assert read_evidence("model-2.5-awq").starter == "model-2.5-awq"
+
+
+def test_a_republish_stopped_between_its_two_moves_leaves_a_pair_the_engine_refuses(tmp_path, monkeypatch, stub_model):
+    cfg = finished_check(tmp_path, monkeypatch, stub_model)
+    publish_starter(cfg, "m", "the tiny set")
+    moves = _second_move_fails(monkeypatch)
+    with pytest.raises(OSError, match="the machine stopped"):
+        publish_starter(cfg, "m", "the tiny set, again")     # another label: another starter file and evidence
+    assert moves == ["model-2.5-awq.evidence.json", "model-2.5-awq.toml"]      # the evidence first
+    with pytest.raises(ProfileFileError, match="starter 'model-2.5-awq' and its evidence do not match"):
+        _starter_entry("model-2.5-awq")
+    with pytest.raises(SweepConfigError, match="ships without valid evidence"):
+        read_evidence("model-2.5-awq")
+    assert not list(profiles.starters_folder().glob(".*.tmp"))
+
+
+def test_a_new_starter_stopped_between_its_two_moves_is_never_listed(tmp_path, monkeypatch, stub_model):
+    cfg = finished_check(tmp_path, monkeypatch, stub_model)
+    _second_move_fails(monkeypatch)
+    with pytest.raises(OSError, match="the machine stopped"):
+        publish_starter(cfg, "m", "the tiny set")
+    # only its evidence was moved in, which no reader takes for a starter
+    assert "model-2.5-awq" not in starter_names()
+    with pytest.raises(ProfileFileError, match="'model-2.5-awq' is not one this engine ships"):
+        _starter_entry("model-2.5-awq")
+    assert not list(profiles.starters_folder().glob(".*.tmp"))
+
+
+def test_a_failure_while_the_starter_is_checked_leaves_nothing_new_in_the_folder(tmp_path, monkeypatch, stub_model):
+    cfg = finished_check(tmp_path, monkeypatch, stub_model)
+    before = _shipped(profiles.starters_folder())
+    monkeypatch.setattr("mnemiq.sweep.starters.starter_text", drops_the_instant_section)
+    with pytest.raises(SweepConfigError, match="does not resolve to the profile that was measured"):
+        publish_starter(cfg, "m", "the tiny set")
+    assert _shipped(profiles.starters_folder()) == before == []
+
+
+def test_no_draft_is_ever_listed_as_a_starter(tmp_path, monkeypatch, stub_model):
+    cfg = finished_check(tmp_path, monkeypatch, stub_model)
+    listed, checking, moving = [], starters._resolves_as_measured, os.replace
+
+    def checked(*args, **kwargs):
+        listed.append(starter_names())                       # while the drafted starter is checked
+        return checking(*args, **kwargs)
+
+    def replace(source, target, *args, **kwargs):
+        if Path(target).parent == profiles.starters_folder():
+            listed.append(starter_names())                   # just before each move into the folder
+        return moving(source, target, *args, **kwargs)
+
+    monkeypatch.setattr("mnemiq.sweep.starters._resolves_as_measured", checked)
+    monkeypatch.setattr(os, "replace", replace)
+    publish_starter(cfg, "m", "the tiny set")
+    assert len(listed) == 3 and listed == [[], [], []]
+    assert starter_names() == ["model-2.5-awq"]
+
+
+def test_a_held_publish_lock_refuses_a_second_publisher(tmp_path, monkeypatch):
+    folder = starter_folder(tmp_path, monkeypatch, {})
+    cfg = _nothing_ran(tmp_path / "sweep")
+    with _sole(folder / ".publish.lock", RuntimeError("held by another publisher")):
+        with pytest.raises(SweepConfigError, match=re.escape(f"{folder} is in use by another publisher")):
+            publish_starter(cfg, "m", "the tiny set")
+    assert _shipped(folder) == []

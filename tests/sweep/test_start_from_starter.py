@@ -11,11 +11,11 @@ from pydantic import ValidationError
 from mnemiq.config import DEFAULT_RETRIEVAL_K
 from mnemiq.sweep.arms import start_settings
 from mnemiq.sweep.config import (
-    ModelBuild, SweepConfigError, fingerprint, fingerprint_body, load_config, start_starter,
+    ModelBuild, SweepConfigError, fingerprint, fingerprint_body, load_config, pinned_files, start_starter,
 )
 
 from .conftest import (
-    CONFIG_BUILD, ONE_MODEL, ROOT_AND_CHILD, edit, idle_deployment, one_model, start_that_differs, start_via,
+    CONFIG_BUILD, ONE_MODEL, ROOT_AND_CHILD, bind, edit, idle_deployment, one_model, start_that_differs, start_via,
     starter_with_evidence, write, write_config,
 )
 
@@ -83,9 +83,11 @@ def test_a_start_profile_that_extends_is_read_through_its_chain(tmp_path, monkey
 def test_the_starter_file_is_pinned(tmp_path, monkeypatch, via, changed, old, new):
     folder = starter_with_evidence(tmp_path, monkeypatch)
     cfg = load_config(write_config(tmp_path, deployment=idle_deployment(tmp_path), start=start_via(tmp_path, via)))
-    before = fingerprint(cfg)
+    before, pins = fingerprint(cfg), pinned_files(cfg)
     edit(folder / changed, old, new)
+    bind(folder, "fixture-2.5-build")   # the starter and its evidence stay a pair, as publishing writes them
     assert fingerprint(load_config(cfg.path)) != before
+    assert pinned_files(load_config(cfg.path))[str(folder / changed)] != pins[str(folder / changed)]
 
 
 def test_a_config_without_the_new_keys_fingerprints_as_before(tmp_path):
