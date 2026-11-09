@@ -276,6 +276,8 @@ answer shows the SQL that produced it and the tables it read; a question the dat
 comes back as a stated reason, not a guess — that is the interface pictured at the top of this
 file. See [`workbench/README.md`](workbench/README.md).
 
+Under an identity provider, `/openai/v1` answers Open WebUI or any OpenAI client, each request as its own verified user ([settings](docs/settings.md#identity-from-tokens)).
+
 ## Use it from an AI agent (MCP)
 
 `uv run mnemiq serve` exposes two read-only, access-scoped tools over stdio — `db_read(question)`

@@ -57,7 +57,7 @@ DEPLOYMENT_SETTINGS = frozenset({
     # Who is asking: each request's identity from a verified token.
     "oidc_issuer", "oidc_audience", "oidc_jwks_url", "oidc_jwks_file", "oidc_tenant_claim", "oidc_roles_claim",
     "oidc_groups_claim", "oidc_leeway_s", "openwebui_audience", "openwebui_jwt_secret", "openwebui_jwt_header",
-    "openwebui_jwt_max_lifetime_s", "openwebui_user_headers", "openwebui_connection_key_header",
+    "openwebui_jwt_max_lifetime_s", "openwebui_user_headers", "openwebui_connection_key_header", "openwebui_task_header",
     "openwebui_connection_key", "identity_map_path", "mcp_transport",
 })
 

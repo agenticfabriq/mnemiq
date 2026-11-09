@@ -35,6 +35,16 @@ OPTION_A = dict(tenant="acme", oidc_issuer=ISSUER, oidc_audience=AUDIENCE, openw
 MAP = {ISSUER: {}, "open-webui": {"sub": {"owui-user-1": ["store1_manager"]}}}
 
 
+def test_the_openai_door_is_enabled_by_its_own_verifier_only(tmp_path):
+    """/openai/v1 is served only where its door can verify a caller: Open WebUI's secret or its own audience."""
+    v1_only = dict(tenant="acme", oidc_issuer=ISSUER, oidc_audience=AUDIENCE)
+    assert not _doors(tmp_path, **v1_only).openai_enabled
+    assert _doors(tmp_path, **OPTION_A).openai_enabled
+    assert _doors(tmp_path, tenant="acme", openwebui_jwt_secret=SECRET, openwebui_connection_key_header="X-Mnemiq-Connection",
+                  openwebui_connection_key=KEY).openai_enabled
+    assert _doors(tmp_path, **OPTION_A).task_header == "x-mnemiq-task"
+
+
 def _bearer(token):
     return {"authorization": [f"Bearer {token}"]}
 
@@ -265,9 +275,17 @@ def test_v1_needs_the_db_read_scope(tmp_path):
     assert doors.v1(_bearer(mint(claims(scope="openid db.read")))).principal_id == "user-1"
 
 
-def test_openai_takes_a_bearer_without_db_read_until_its_rule_is_decided(tmp_path):
-    """Pinned on purpose: whether /openai/v1's Bearer tokens need db.read, as /v1's do, is decided with the endpoint
-    itself, and that decision should change this test rather than pass unnoticed. Open WebUI's signed header carries
-    no scopes at all."""
+def test_openai_needs_the_db_read_scope_on_a_bearer(tmp_path):
+    """The owner's decision (2026-11-08): a provider token needs db.read on /openai/v1 as on /v1, so taking the scope
+    away cuts a user off on every door that takes a token."""
     doors = _doors(tmp_path, **OPTION_A)
-    assert doors.openai(_bearer(mint(claims(aud=OWUI_AUDIENCE, scope="openid")))).principal_id == "user-1"
+    rejected = _refused(doors.openai, _bearer(mint(claims(aud=OWUI_AUDIENCE, scope="openid"))), 403, "lacks db.read")
+    assert rejected.challenge == 'Bearer error="insufficient_scope", scope="db.read"'
+    assert doors.openai(_bearer(mint(claims(aud=OWUI_AUDIENCE, scope="openid db.read")))).principal_id == "user-1"
+
+
+def test_the_signed_header_needs_no_scope(tmp_path):
+    """Open WebUI's signed header carries no scopes at all, so the rule is for Bearer tokens only, on a deployment
+    that takes both. What its users may read comes from their roles in the identity map alone."""
+    identity = _doors(tmp_path, MAP, **{**OPTION_A, **OPTION_B}).openai(_owui())
+    assert identity.principal_id == "open-webui:owui-user-1"

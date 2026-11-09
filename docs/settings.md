@@ -212,10 +212,21 @@ verified token, and the `principal` and `roles` above are never used. A tenant i
 once any verifier is configured, and every token must carry it, or `*` accepts any. Roles come from the token's roles
 claim when it has one, and from the identity map when it has none. A token's groups grant nothing unless the map
 names them or `oidc_groups_claim` opts in. Every setting here that a door cannot enforce stops the server at startup,
-with a message naming the setting to change. A token needs the `db.read` scope on every `/v1` route, and is refused with a
-403 without it, so the client that signs users in to the workbench must request that scope. On MCP, `db.read` gates
-`db_read` and `get_schema`, and `db.write` gates `db_write`. A scope only narrows: what a token may read is still its
-roles' grants.
+with a message naming the setting to change. A token needs the `db.read` scope on every `/v1` route and on
+`/openai/v1`, and is refused with a 403 without it, so the client that signs users in to the workbench, and Open
+WebUI's own client when it forwards each user's token, must request that scope. Open WebUI's signed user header
+carries no scopes and is not asked for one: what its users may read comes from their roles in the identity map
+alone. On MCP, `db.read` gates `db_read` and `get_schema`, and `db.write` gates `db_write`. A scope only narrows: what
+a token may read is still its roles' grants.
+
+**The OpenAI-compatible endpoint.** `GET /openai/v1/models` and `POST /openai/v1/chat/completions` serve Open WebUI,
+or any OpenAI client, each request as its own verified caller, with one model per profile that caller may pick. They
+are served only where the endpoint can verify a caller of its own: `openwebui_jwt_secret` (Open WebUI's signed user
+header) or `openwebui_audience` (a provider token for this endpoint). Otherwise every path under `/openai/v1` answers
+404, and a startup line says why. Every request must carry the header `openwebui_task_header` names: Open WebUI fills
+it from `{{TASK}}`, empty for a question, and a request whose value is not empty is a background task, such as a
+title, answered empty without asking the engine. The question is the last user message's text, and
+`reasoning_effort` picks the mode: `low` instant, `medium` thinking, `high` deep.
 
 | Setting | Default | What it does |
 |---|---|---|
@@ -227,13 +238,14 @@ roles' grants.
 | `oidc_roles_claim` | `"realm_access.roles"` | The dotted path of the token's roles claim. A token without it takes its roles from the identity map. |
 | `oidc_groups_claim` | unset | Opt-in: passes this claim's groups through as the identity's groups, for a provider whose groups only administrators control. Unset, a token's groups grant nothing except through the identity map. |
 | `oidc_leeway_s` | `30.0` | Clock leeway, in seconds, on a token's `exp`, `nbf` and `iat`. |
-| `openwebui_audience` | unset | The `aud` an identity provider's token must carry on Open WebUI's endpoint, distinct from `oidc_audience`. Unset, that endpoint accepts no Bearer token. |
+| `openwebui_audience` | unset | The `aud` an identity provider's token must carry on Open WebUI's endpoint, distinct from `oidc_audience`. The token needs the `db.read` scope there too. Unset, that endpoint accepts no Bearer token. |
 | `openwebui_jwt_secret` | unset | Turns on Open WebUI's signed user header: the HS256 secret it shares with Open WebUI, at least 32 bytes. |
 | `openwebui_jwt_header` | `"X-OpenWebUI-User-Jwt"` | The header carrying Open WebUI's signed user token. |
 | `openwebui_jwt_max_lifetime_s` | `300` | The longest lifetime, `exp` minus `iat`, accepted on Open WebUI's signed user token. |
 | `openwebui_user_headers` | `"X-OpenWebUI-User-Id,X-OpenWebUI-User-Email,X-OpenWebUI-User-Name,X-OpenWebUI-User-Role"` | Open WebUI's unsigned user headers. A request carrying any of them is refused once an issuer is configured. |
 | `openwebui_connection_key_header` | unset | The custom header on mnemiq's Open WebUI connection that carries the connection key. |
 | `openwebui_connection_key` | unset | The connection key, at least 32 bytes, which tells mnemiq a request came through its own Open WebUI connection. Required with the signed user header. |
+| `openwebui_task_header` | `"X-Mnemiq-Task"` | The custom header on mnemiq's Open WebUI connection that carries `{{TASK}}`. Every `/openai/v1` request must carry it, empty for a chat turn; a request whose value is not empty is a background task, such as title generation, and gets an empty completion without reaching the engine. It must be a header of its own. |
 | `identity_map_path` | unset | A JSON file mapping each issuer's subjects, groups and verified emails to roles, for tokens that carry no roles claim. |
 | `mcp_transport` | `"stdio"` | `stdio` runs the MCP server for one local caller. `http` serves it at `/mcp` on the HTTP API, each request judged by its own token. |
 

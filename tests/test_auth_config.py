@@ -30,10 +30,25 @@ IDENTITY_SETTINGS = (
     "tenant", "oidc_issuer", "oidc_audience", "oidc_jwks_url", "oidc_jwks_file", "oidc_tenant_claim",
     "oidc_roles_claim", "oidc_groups_claim", "oidc_leeway_s", "openwebui_audience", "openwebui_jwt_secret",
     "openwebui_jwt_header", "openwebui_jwt_max_lifetime_s", "openwebui_user_headers",
-    "openwebui_connection_key_header", "openwebui_connection_key", "identity_map_path", "mcp_transport")
+    "openwebui_connection_key_header", "openwebui_connection_key", "openwebui_task_header", "identity_map_path",
+    "mcp_transport")
 OIDC = {"oidc_issuer": ISSUER, "oidc_audience": "mnemiq-api", "tenant": "acme"}
 OWUI = {"openwebui_jwt_secret": SECRET, "openwebui_connection_key_header": "X-Mnemiq-Connection",
         "openwebui_connection_key": KEY, "tenant": "acme"}
+
+
+def test_the_task_header_defaults_to_x_mnemiq_task():
+    assert Settings().openwebui_task_header == "X-Mnemiq-Task"
+    assert _cfg(**OIDC).task_header == "x-mnemiq-task"
+    assert _cfg(**OIDC, openwebui_task_header=" X-Open-Task ").task_header == "x-open-task"
+    assert _cfg(**OIDC, openwebui_task_header="  ").task_header == "x-mnemiq-task"  # blank reads as unset
+
+
+@pytest.mark.parametrize("name", ["AUTHORIZATION", "x-openwebui-user-JWT", "X-OPENWEBUI-USER-ID", "x-mnemiq-CONNECTION"])
+def test_a_task_header_sharing_a_name_refuses_to_start(name):
+    """The task header only says which request is a background task; sharing a name with a credential, a user
+    header or the connection key would make one header mean two things."""
+    _refused("MNEMIQ_OPENWEBUI_TASK_HEADER", **OWUI, openwebui_task_header=name)
 
 
 def test_no_issuer_means_no_auth_config():

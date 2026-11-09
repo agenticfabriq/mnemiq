@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = ROOT / "src" / "mnemiq"
 # A module that only an extra's install loads, and the extra that must declare what it imports at load time.
-EXTRA_MODULES = {"server/app.py": "server"}
+EXTRA_MODULES = {"server/app.py": "server", "server/openai_compat.py": "server"}
 
 
 def _name(requirement: str) -> str:
