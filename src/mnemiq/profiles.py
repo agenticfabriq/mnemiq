@@ -187,8 +187,12 @@ def starters_folder() -> Path:
 
 
 def starter_names() -> list[str]:
-    """The starters this engine ships, by name: the stem of each TOML file in its starters folder."""
-    return sorted(path.stem for path in starters_folder().glob("*.toml") if path.is_file())
+    """The starters this engine ships, by name: the stem of each TOML file in its starters folder. A starter is a
+    regular file in the folder itself, so a link is never one: `is_file` follows it, and its name would read whatever
+    file it points at, outside the package."""
+    folder = starters_folder().resolve()
+    return sorted(path.stem for path in folder.glob("*.toml")
+                  if not path.is_symlink() and path.is_file() and path.resolve().parent == folder)
 
 
 def starter_path(name: str) -> str:

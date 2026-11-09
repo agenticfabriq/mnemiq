@@ -79,6 +79,15 @@ def test_an_unknown_starter_is_refused_listing_the_shipped_ones(tmp_path, monkey
         _load(tmp_path, f'default = "only"\n[profiles.only]\nstarter = "{name}"\n')
 
 
+def test_a_link_in_the_starters_folder_is_not_a_starter(tmp_path, monkeypatch):                     # Review Focus 2
+    # a valid starter outside the folder, linked into it under its own name: its name must never reach that file
+    folder = starter_folder(tmp_path, monkeypatch, {"fixture-2.5-build": STARTER})
+    (folder / "linked.toml").symlink_to(write(tmp_path / "outside.toml", STARTER.replace("fixture-2.5-build", "linked")))
+    assert starter_names() == ["fixture-2.5-build"]
+    with pytest.raises(ProfileFileError, match=r"starter 'linked' is not one this engine ships; it ships: fixture-2\.5-build$"):
+        _load(tmp_path, 'default = "only"\n[profiles.only]\nstarter = "linked"\n')
+
+
 @pytest.mark.parametrize("line", ['llm_base_url = "http://192.0.2.1/v1"', 'llm_model = "m"', "llm_context_window = 8192",
                                   'verify_model = "j"', 'verify_base_url = "http://192.0.2.1/v1"', 'api_key_env = "K"',
                                   'verify_api_key_env = "K"', 'roles = ["*"]', 'extends = "x"', 'starter = "y"'])
