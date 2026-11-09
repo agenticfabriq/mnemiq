@@ -55,11 +55,13 @@ PROBE_BUDGET_S = 10.0
 # selector has something real to select over (uniform resampling measured 56% unanimous).
 STRATEGIES = ("direct", "decompose", "skeleton")
 
-# The least temperature sent to a deep candidate whose strategy's prompt an earlier candidate already
-# sent, the fourth and fifth of five: at a writer temperature of 0 it would return that candidate's
-# SQL again, and the agreement gate would count the copy. 0.7 is the server default that
-# `writer_temperature`'s description names for Qwen2.5. Engine code, not a setting or a mode field,
-# so no profile version hashes it, as none hashes `seed_offset`.
+# The least temperature sent to a candidate whose strategy's prompt an earlier candidate already
+# sent, which only a mode set to more than len(STRATEGIES) candidates has (deep's fourth and fifth
+# of five): at a writer temperature of 0 it would return that candidate's SQL again, and the
+# agreement gate would count the copy. Every other candidate, every mode with one candidate, and
+# the fallback to the single path are sent the writer's temperature as set. 0.7 is the server
+# default that `writer_temperature`'s description names for Qwen2.5. Engine code, not a setting or
+# a mode field, so no profile version hashes it, as none hashes `seed_offset`.
 REPEAT_TEMPERATURE_FLOOR: float = 0.7
 
 
@@ -529,8 +531,9 @@ class Agent:
         held: dict = {"spent_s": 0.0}  # what the source said about a filter value, asked once a turn
         undefined: Deferred | None = None
         for i in range(self.candidates):
-            # A candidate that repeats an earlier one's strategy -- the fourth and fifth of five --
-            # must not also repeat its sample: seed_offset sends it its own seed (M124), and
+            # A candidate that repeats an earlier one's strategy -- from the fourth on, in any mode
+            # set to more candidates than STRATEGIES holds, as deep's five are -- must not also
+            # repeat its sample: seed_offset sends it its own seed (M124), and
             # temperature_floor at least REPEAT_TEMPERATURE_FLOOR, since at temperature 0 a seed
             # changes nothing. Every other candidate is sent the writer's temperature as set.
             floor = REPEAT_TEMPERATURE_FLOOR if i >= len(STRATEGIES) else None

@@ -168,8 +168,10 @@ _TEMPERATURE_FLOOR: ContextVar[float | None] = ContextVar("mnemiq_temperature_fl
 @contextmanager
 def temperature_floor(floor: float | None) -> Iterator[None]:
     """The writer's calls made inside send at least `floor` when its temperature is set, and what
-    they send today otherwise: deep mode wraps a candidate that repeats an earlier one's strategy,
-    since at temperature 0 it would return that candidate's SQL again. None sets no floor."""
+    they would send without it otherwise: the agent wraps a candidate that repeats an earlier one's
+    strategy, in any mode set to more candidates than there are strategies, since at temperature 0
+    it would return that candidate's SQL again. None sets no floor. Reset on exit, a raise included,
+    so no call made after the block on the same thread is sent the floor."""
     token = _TEMPERATURE_FLOOR.set(floor)
     try:
         yield

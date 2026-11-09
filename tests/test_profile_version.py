@@ -170,9 +170,9 @@ def test_a_setting_with_no_credential_is_logged_as_it_is(monkeypatch, url):
     assert view == resolved_view(settings, "duckdb") and version == profile_version(settings, "duckdb")
 
 
-# What `profile_version(_settings(writer_temperature=0.0), "duckdb")` gave on main before deep mode's temperature floor,
-# with every MNEMIQ_* variable cleared. A change that moves every version on purpose records it again on main, and says
-# so in its commit.
+# What `profile_version(_settings(writer_temperature=0.0), "duckdb")` gave on main before the temperature floor for a
+# candidate that repeats a strategy, with every MNEMIQ_* variable cleared. A change that moves every version on purpose
+# records it again on main, and says so in its commit.
 VERSION_ON_MAIN = "cec13cfd4071"
 
 

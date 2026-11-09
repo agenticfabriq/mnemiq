@@ -601,16 +601,17 @@ def test_no_seed_set_means_none_sent_whatever_the_candidate():
     assert seen == [None]
 
 
-def _temperature_recording_client():
+def _temperature_recording_client(replies=()):
     """As `_seed_recording_client`: a real LLMClient over a fake OpenAI that answers count(*), with
     model "m", which takes a temperature, recording each call's temperature, None when none was
-    sent."""
+    sent. `replies` are given first, in order, then count(*)."""
     from types import SimpleNamespace
 
     import mnemiq.llm.client as module
     from mnemiq.config import Settings
 
     seen = []
+    queued = list(replies)
 
     class _Fake:
         def __init__(self, *_, **__):
@@ -618,8 +619,9 @@ def _temperature_recording_client():
 
         def _create(self, **kwargs):
             seen.append(kwargs.get("temperature"))
+            content = queued.pop(0) if queued else _sql("count(*)")
             return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content=_sql("count(*)")))],
+                choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
                 usage=None)
 
     original = module.OpenAI
@@ -679,3 +681,31 @@ def test_the_floor_holds_inside_its_block_only():
         generator.propose(_packet())
     generator.propose(_packet())
     assert seen == [0.0, 0.7, 0.0]
+
+
+def test_the_fallback_to_the_single_path_is_sent_the_writers_temperature():
+    """When no candidate runs, the single path answers instead, after every candidate's block has
+    closed: it is sent the writer's temperature as set, not the floor the last candidate had."""
+    from mnemiq.generate.generator import LLMGenerator
+
+    defer = '{"sql": null, "reason": "unsure"}'
+    client, seen = _temperature_recording_client(replies=[defer] * 5)
+    agent = _vote_agent([], 5)
+    agent.generator = LLMGenerator(client, temperature=0.0)
+    result = _answer(agent)
+    assert not result.deferred, "the single path answered after five deferring candidates"
+    assert seen[:5] == [0.0, 0.0, 0.0, 0.7, 0.7]  # the five candidates
+    assert seen[5:] and set(seen[5:]) == {0.0}  # the single path's calls
+
+
+def test_the_floor_is_reset_when_its_block_raises():
+    from mnemiq.generate.generator import LLMGenerator, temperature_floor
+
+    client, seen = _temperature_recording_client()
+    generator = LLMGenerator(client, temperature=0.0)
+    with pytest.raises(RuntimeError):
+        with temperature_floor(0.7):
+            generator.propose(_packet())
+            raise RuntimeError("a candidate's call failed")
+    generator.propose(_packet())
+    assert seen == [0.7, 0.0]
