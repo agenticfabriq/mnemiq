@@ -88,8 +88,8 @@ evidence as the sweep reads it, and that a deployment whose profile starts from 
 deployment the sweep read, to the version the proposal recorded, with the engine's own loader and version function.
 Only then are the two files moved into the starters folder as `<name>.evidence.json` and `<name>.toml`, each under a
 hidden name until its move, while publishing holds the folder's lock. Holding it, publishing first removes any hidden
-copy that a publish killed mid-move left in the folder. A starter the folder lists is never a draft, and
-when a check fails nothing reaches the folder: a starter already shipped under that name is left as it was.
+copy that a publish killed mid-move left in the folder, and no other file. A starter the folder lists is never a
+draft, and when a check fails nothing reaches the folder: a starter already shipped under that name is left as it was.
 
 Publishing writes the evidence, then the starter, and each is bound to the other: the evidence records the sha256 of
 the starter's file (`starter_sha256`). If publishing is interrupted between the two, the pair fails closed: the engine

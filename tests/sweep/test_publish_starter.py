@@ -449,8 +449,33 @@ def test_a_held_publish_lock_refuses_a_second_publisher(tmp_path, monkeypatch, s
 
 def test_a_hidden_copy_a_killed_publish_left_is_cleared(tmp_path, monkeypatch, stub_model):
     cfg = finished_check(tmp_path, monkeypatch, stub_model)
-    stale = write(profiles.starters_folder() / ".x.tmp", "left by a publish that was killed mid-move")
+    folder = profiles.starters_folder()
+    # what a publish killed between its copy and its move leaves: `.<file>.<32 hex>.tmp`, for either file
+    stale = [write(folder / f".model-2.5-awq.toml.{'a' * 32}.tmp", "left by a publish killed mid-move"),
+             write(folder / f".model-2.5-awq.evidence.json.{'b' * 32}.tmp", "left by a publish killed mid-move")]
     publish_starter(cfg, "m", "the tiny set")
-    assert not stale.exists()
-    assert _shipped(profiles.starters_folder()) == [".publish.lock", "model-2.5-awq.evidence.json",
-                                                    "model-2.5-awq.toml"]
+    assert not any(path.exists() for path in stale)
+    assert _shipped(folder) == [".publish.lock", "model-2.5-awq.evidence.json", "model-2.5-awq.toml"]
+
+
+def test_the_hidden_copies_publishing_makes_are_the_ones_it_clears(tmp_path, monkeypatch, stub_model):
+    cfg = finished_check(tmp_path, monkeypatch, stub_model)
+    moved, moving = [], os.replace
+
+    def replace(source, target, *args, **kwargs):
+        if Path(target).parent == profiles.starters_folder():
+            moved.append(Path(source).name)
+        return moving(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace)
+    publish_starter(cfg, "m", "the tiny set")
+    assert len(moved) == 2 and all(starters._HIDDEN_COPY.fullmatch(name) for name in moved)
+
+
+def test_a_hidden_file_publishing_never_makes_survives_a_publish(tmp_path, monkeypatch, stub_model):
+    cfg = finished_check(tmp_path, monkeypatch, stub_model)
+    folder = profiles.starters_folder()
+    kept = [write(folder / ".notes.tmp", "a person's own"), write(folder / ".x.tmp", "another tool's"),
+            write(folder / f".model-2.5-awq.toml.{'A' * 32}.tmp", "not a copy publishing names: its hex is upper case")]
+    publish_starter(cfg, "m", "the tiny set")
+    assert all(path.exists() for path in kept)

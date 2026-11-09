@@ -390,6 +390,10 @@ _NOT_CARRIED = frozenset({*ENDPOINT_SETTINGS, "api_key_env", "verify_api_key_env
 # The lock a publisher holds on the starters folder, so a second one is refused at once rather than moving its files in
 # between the first one's.
 PUBLISH_LOCK = ".publish.lock"
+# The hidden copy `_move_in` makes of a starter's file or its evidence on its way into the starters folder, and nothing
+# else: `.<name>.toml.<uuid>.tmp` or `.<name>.evidence.json.<uuid>.tmp`, the name as a profile name is written and the
+# uuid as 32 lowercase hex digits. Only these are ever cleared, so another hidden file in the folder is left alone.
+_HIDDEN_COPY = re.compile(rf"\.(?:{_NAME.pattern})(?:\.toml|{re.escape(EVIDENCE_SUFFIX)})\.[0-9a-f]{{32}}\.tmp")
 _UNRESOLVED = "the starter does not resolve to the profile that was measured"
 _BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
@@ -757,10 +761,10 @@ def publish_starter(cfg: SweepConfig, model: str, dataset: str, *, name: str | N
 
 
 def _clear_stale_copies(folder: Path) -> None:
-    """Remove each hidden copy (`.*.tmp`) that a publish killed between its copy and its move left in the starters
-    folder. Called with the folder's lock held, when no other publish can be moving one."""
+    """Remove each hidden copy (`_HIDDEN_COPY`) that a publish killed between its copy and its move left in the starters
+    folder, and no other file. Called with the folder's lock held, when no other publish can be moving one."""
     for path in folder.glob(".*.tmp"):
-        if path.is_symlink() or path.is_file():
+        if _HIDDEN_COPY.fullmatch(path.name) and (path.is_symlink() or path.is_file()):
             path.unlink(missing_ok=True)
 
 

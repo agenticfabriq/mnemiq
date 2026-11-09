@@ -220,12 +220,13 @@ def starter_path(name: str, folder: Path | None = None) -> str:
 
 def _evidence_bytes(evidence: Path) -> tuple[bytes | None, str | None]:
     """A starter's evidence file as read, never through a link: a link could put a file from outside the package
-    beside the starter. The bytes, or None and why not."""
+    beside the starter. Opened without blocking, so a named pipe with no writer is refused as not a regular file
+    rather than holding the engine's boot; that changes nothing for a regular file. The bytes, or None and why not."""
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if not nofollow and evidence.is_symlink():   # where the flag does not exist, checked before opening instead
         return None, f"{evidence.name} is a link"
     try:
-        descriptor = os.open(evidence, os.O_RDONLY | nofollow)
+        descriptor = os.open(evidence, os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0))
     except FileNotFoundError:
         return None, f"{evidence.name} is missing"
     except OSError as exc:

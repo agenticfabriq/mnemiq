@@ -7,6 +7,9 @@ so a starter that sets one is refused, as is a name the engine does not ship.
 
 from __future__ import annotations
 
+import os
+import re
+import threading
 from pathlib import Path
 
 import pytest
@@ -163,6 +166,36 @@ def test_a_folder_named_as_the_evidence_is_refused(tmp_path, monkeypatch):
     with pytest.raises(ProfileFileError, match=r"do not match \(fixture-2\.5-build\.evidence\.json is not a regular "
                                                r"file\)"):
         _load(tmp_path, ONLY)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no named pipes on this system")
+def test_a_fifo_named_as_the_evidence_is_refused_without_waiting_for_a_writer(tmp_path, monkeypatch):
+    folder = starter_folder(tmp_path, monkeypatch, {"fixture-2.5-build": STARTER})
+    path = folder / "fixture-2.5-build.evidence.json"
+    path.unlink()
+    os.mkfifo(path)
+    outcome: list = []
+
+    def load() -> None:
+        try:
+            _load(tmp_path, ONLY)
+        except ProfileFileError as exc:
+            outcome.append(str(exc))
+        except BaseException as exc:  # noqa: BLE001 -- reported below, not lost in the thread
+            outcome.append(exc)
+        else:
+            outcome.append("loaded")
+
+    # In a thread joined with a deadline, so a load that waits for a writer fails the test instead of hanging the suite
+    worker = threading.Thread(target=load, daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+    if worker.is_alive():
+        os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))     # a writer comes and goes, so the thread can end
+        worker.join(timeout=5)
+        pytest.fail("loading the starter waited for a writer on its evidence, a named pipe, instead of refusing it")
+    assert len(outcome) == 1 and isinstance(outcome[0], str)
+    assert re.search(r"do not match \(fixture-2\.5-build\.evidence\.json is not a regular file\)", outcome[0])
 
 
 def test_a_starter_bound_to_its_evidence_loads(tmp_path, monkeypatch):
