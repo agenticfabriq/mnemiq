@@ -1,0 +1,171 @@
+# mnemiq behind Open WebUI and the workbench, with Keycloak as the one identity provider. See docs/open-webui.md.
+#
+# From the repository root, in this order:
+#   python examples/open-webui/make-secrets.py secrets
+#   docker compose -f examples/open-webui/compose.yaml up -d --build      (add --profile option-b for option B)
+#   python examples/open-webui/make-secrets.py users
+#
+# Every secret reaches its service through env_file, from examples/open-webui/.secrets/ (mode 600, git-ignored),
+# which Compose reads on the host. Nothing below is interpolated, and no file a container reads holds a secret.
+#
+# One Keycloak address for browsers and containers: Keycloak listens on 18089 under the network alias
+# keycloak.localhost, and is published on 127.0.0.1:18089, which a browser reaches by that name (*.localhost is
+# loopback). So the issuer, its keys and its end-session page are the same host for everyone.
+
+name: mnemiq-open-webui
+
+x-mnemiq-env: &mnemiq-env
+  MNEMIQ_SOURCES_PATH: demo/sources.json
+  MNEMIQ_STORE_PATH: demo/store.duckdb
+  MNEMIQ_AUTHZ_PATH: /config/authz.json
+  MNEMIQ_PROFILES_PATH: /config/profiles.toml
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm", "--http-port=18089", "--health-enabled=true",
+              "--hostname=http://keycloak.localhost:18089"]
+    env_file: [.secrets/keycloak.env]
+    volumes: ["./realm.json:/opt/keycloak/data/import/mnemiq-realm.json:ro"]
+    ports: ["127.0.0.1:18089:18089"]
+    networks:
+      edge: {aliases: [keycloak.localhost]}
+      internal: {aliases: [keycloak.localhost]}
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q UP <&3"]
+      interval: 5s
+      retries: 60
+
+  # Seeds the demo data once, then enriches and indexes it: one pass of the operator's model over the schema.
+  init:
+    build: {context: ../.., dockerfile: Dockerfile}
+    image: mnemiq:example
+    command: ["sh", "-c", "[ -f demo/store.duckdb ] || (python scripts/seed_demo.py && mnemiq enrich && mnemiq build)"]
+    environment: *mnemiq-env
+    env_file: [.secrets/llm.env]
+    volumes: ["demo:/app/demo", "./authz.json:/config/authz.json:ro", "./profiles.toml:/config/profiles.toml:ro"]
+    networks: [egress]
+
+  mnemiq:
+    image: mnemiq:example
+    environment:
+      <<: *mnemiq-env
+      MNEMIQ_TENANT: acme
+      MNEMIQ_OIDC_ISSUER: http://keycloak.localhost:18089/realms/mnemiq
+      MNEMIQ_OIDC_AUDIENCE: mnemiq-api
+      MNEMIQ_OPENWEBUI_AUDIENCE: mnemiq-openwebui
+      MNEMIQ_OPENWEBUI_CONNECTION_KEY_HEADER: X-Mnemiq-Connection
+      MNEMIQ_OIDC_END_SESSION_URL: http://keycloak.localhost:18089/realms/mnemiq/protocol/openid-connect/logout?client_id=workbench-proxy
+      MNEMIQ_IDENTITY_MAP_PATH: /config/identity-map.json
+    # The Open WebUI signed-header secret, the connection key, and the operator's model.
+    env_file: [.secrets/mnemiq.env, .secrets/llm.env]
+    volumes:
+      - "demo:/app/demo"
+      - "./authz.json:/config/authz.json:ro"
+      - "./profiles.toml:/config/profiles.toml:ro"
+      # Open WebUI user ids for option B (not secrets), written by make-secrets.py and re-read on each request.
+      - "./.secrets/identity-map.json:/config/identity-map.json:ro"
+    # No published port: reachable only from the containers it shares a network with.
+    networks: [internal, egress]
+    depends_on:
+      init: {condition: service_completed_successfully}
+      keycloak: {condition: service_healthy}
+
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.6
+    command: ["--alpha-config=/etc/oauth2-proxy.yaml", "--cookie-secure=false", "--cookie-refresh=240s",
+              "--email-domain=*", "--redirect-url=http://localhost:14180/oauth2/callback",
+              "--skip-provider-button=true", "--reverse-proxy=false",
+              "--whitelist-domain=keycloak.localhost:18089"]
+    env_file: [.secrets/oauth2-proxy.env]
+    volumes: ["./oauth2-proxy.yaml:/etc/oauth2-proxy.yaml:ro"]
+    ports: ["127.0.0.1:14180:4180"]
+    networks: [edge, internal]
+    restart: on-failure
+    depends_on:
+      keycloak: {condition: service_healthy}
+      mnemiq: {condition: service_healthy}
+
+  # Option A: users sign in to Open WebUI through Keycloak, which forwards each user's own token to mnemiq.
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:v0.13.0
+    environment:
+      WEBUI_URL: http://localhost:13000
+      ENABLE_OAUTH_SIGNUP: "true"
+      OAUTH_CLIENT_ID: open-webui
+      OAUTH_PROVIDER_NAME: Keycloak
+      OAUTH_SCOPES: openid email profile
+      OPENID_PROVIDER_URL: http://keycloak.localhost:18089/realms/mnemiq/.well-known/openid-configuration
+      ENABLE_OAUTH_ID_TOKEN_COOKIE: "false"
+      ENABLE_FORWARD_USER_INFO_HEADERS: "false"
+      ENABLE_OAUTH_GROUP_MANAGEMENT: "true"
+      OAUTH_GROUPS_CLAIM: groups
+      DEFAULT_USER_ROLE: user
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_OPENAI_API: "true"
+      OPENAI_API_BASE_URLS: http://mnemiq:8080/openai/v1
+      OPENAI_API_KEYS: ""
+      # Background generations would send chats holding governed rows to a task model. This example has no model
+      # trusted with results to give it, so it turns them off. See docs/open-webui.md.
+      ENABLE_TITLE_GENERATION: "false"
+      ENABLE_TAGS_GENERATION: "false"
+      ENABLE_FOLLOW_UP_GENERATION: "false"
+      ENABLE_SEARCH_QUERY_GENERATION: "false"
+      ENABLE_RETRIEVAL_QUERY_GENERATION: "false"
+      ENABLE_AUTOCOMPLETE_GENERATION: "false"
+      ANONYMIZED_TELEMETRY: "false"
+      DO_NOT_TRACK: "true"
+      SCARF_NO_ANALYTICS: "true"
+    # WEBUI_SECRET_KEY, OAUTH_CLIENT_SECRET, and OPENAI_API_CONFIGS (the connection: system_oauth, the {{TASK}}
+    # header, the connection key, and model_ids set to every profile).
+    env_file: [.secrets/open-webui.env]
+    volumes: ["open-webui:/app/backend/data"]
+    ports: ["127.0.0.1:13000:8080"]
+    networks: [edge, internal]
+    depends_on:
+      keycloak: {condition: service_healthy}
+      mnemiq: {condition: service_healthy}
+
+  # Option B: Open WebUI keeps its own accounts and signs each user into a header. Use it only where every backend
+  # Open WebUI calls may see each user's id, email and name (docs/open-webui.md).
+  open-webui-b:
+    profiles: [option-b]
+    image: ghcr.io/open-webui/open-webui:v0.13.0
+    environment:
+      WEBUI_URL: http://localhost:13001
+      ENABLE_FORWARD_USER_INFO_HEADERS: "true"
+      DEFAULT_USER_ROLE: user
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_OPENAI_API: "true"
+      OPENAI_API_BASE_URLS: http://mnemiq:8080/openai/v1
+      OPENAI_API_KEYS: ""
+      ENABLE_TITLE_GENERATION: "false"
+      ENABLE_TAGS_GENERATION: "false"
+      ENABLE_FOLLOW_UP_GENERATION: "false"
+      ENABLE_SEARCH_QUERY_GENERATION: "false"
+      ENABLE_RETRIEVAL_QUERY_GENERATION: "false"
+      ENABLE_AUTOCOMPLETE_GENERATION: "false"
+      ANONYMIZED_TELEMETRY: "false"
+      DO_NOT_TRACK: "true"
+      SCARF_NO_ANALYTICS: "true"
+    # WEBUI_SECRET_KEY, FORWARD_USER_INFO_HEADER_JWT_SECRET, and OPENAI_API_CONFIGS (auth none, no key, the
+    # {{TASK}} header, the connection key, model_ids).
+    env_file: [.secrets/open-webui-b.env]
+    volumes: ["open-webui-b:/app/backend/data"]
+    ports: ["127.0.0.1:13001:8080"]
+    networks: [edge, internal]
+    depends_on:
+      mnemiq: {condition: service_healthy}
+
+networks:
+  # Published ports live here.
+  edge: {}
+  # mnemiq, the proxy, Open WebUI and Keycloak; no route out.
+  internal: {internal: true}
+  # mnemiq and init reach the operator's model through this one; nothing on it publishes a port.
+  egress: {}
+
+volumes:
+  demo: {}
+  open-webui: {}
+  open-webui-b: {}

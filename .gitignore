@@ -76,3 +76,6 @@ ojdbc.properties
 
 # Answer logs: which profile produced each answer, beside the store.
 *.answers.jsonl
+
+# The Open WebUI example's generated secrets (make-secrets.py)
+examples/open-webui/.secrets/

@@ -1,0 +1,21 @@
+# An allowlist: nothing reaches the build but the inputs named here, whatever a COPY says.
+*
+!pyproject.toml
+!uv.lock
+!LICENSE
+!src/
+!scripts/seed_demo.py
+!workbench/
+workbench/node_modules
+workbench/dist
+src/mnemiq/server/static
+**/__pycache__
+# Re-excluded at any depth, after the lines above: credentials and local data never enter a build stage.
+**/.env*
+**/.demo-env
+**/demo-data
+**/demo-sources.json
+**/demo-grants.json
+**/Wallet_*.zip
+**/cwallet.sso
+**/ewallet.p12
