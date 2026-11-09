@@ -90,12 +90,42 @@ def test_every_v1_route_serves_the_tokens_identity_never_the_settings_one(method
 
 def test_whoami_returns_the_verified_caller():
     r = _client(_RT(), _doors()).get("/v1/whoami", headers=_auth(sub="user-7"))
-    assert r.json() == {"principal_id": "user-7", "tenant_id": "acme", "verified": True}
+    assert r.json() == {"principal_id": "user-7", "tenant_id": "acme", "verified": True, "end_session_url": None}
 
 
 def test_whoami_returns_the_settings_identity_with_no_issuer():
     assert _client(_RT()).get("/v1/whoami").json() == {"principal_id": "settings-user", "tenant_id": "local",
-                                                        "verified": False}
+                                                        "verified": False, "end_session_url": None}
+
+
+# --- Sign out through the identity provider: whoami carries where it ends ---------------------------------------
+
+END = "https://sso.example/realms/r/protocol/openid-connect/logout?client_id=workbench-proxy"
+
+
+def test_whoami_returns_the_configured_end_session_url():
+    r = _client(_RT(), _doors(oidc_end_session_url=END)).get("/v1/whoami", headers=_auth(sub="user-7"))
+    assert r.json()["end_session_url"] == END
+
+
+def test_whoami_returns_no_end_session_url_when_unset():
+    assert _client(_RT(), _doors()).get("/v1/whoami", headers=_auth()).json()["end_session_url"] is None
+    assert _client(_RT()).get("/v1/whoami").json()["end_session_url"] is None
+
+
+def test_whoami_keeps_its_other_fields():
+    reply = _client(_RT(), _doors(oidc_end_session_url=END)).get("/v1/whoami", headers=_auth(sub="user-7")).json()
+    assert set(reply) == {"principal_id", "tenant_id", "verified", "end_session_url"}
+    assert (reply["principal_id"], reply["tenant_id"], reply["verified"]) == ("user-7", "acme", True)
+
+
+def test_a_signed_out_whoami_is_a_401_that_names_no_end_session_url():
+    """Where Sign out ends is told only to a verified caller, and a refusal says nothing of it."""
+    r = _client(_RT(), _doors(oidc_end_session_url=END)).get("/v1/whoami")
+    assert r.status_code == 401
+    assert "sso.example" not in r.text
+    assert not any("sso.example" in value for value in r.headers.values())
+
 
 
 def test_with_no_issuer_chat_and_schema_serve_the_settings_identity():

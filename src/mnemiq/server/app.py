@@ -125,7 +125,10 @@ def build_app(
     def whoami(who: IdentityContext = Depends(caller)) -> dict:
         # What the workbench keys its stored threads by, so one browser never shows a user another's. `verified`
         # tells a token's identity from the one settings identity, whose threads the browser may keep.
-        return {"principal_id": who.principal_id, "tenant_id": who.tenant_id, "verified": doors is not None}
+        # `end_session_url` is where its Sign out ends, at the identity provider: operator configuration, never
+        # anything the request carries, and told only to a caller the door has verified.
+        return {"principal_id": who.principal_id, "tenant_id": who.tenant_id, "verified": doors is not None,
+                "end_session_url": doors.end_session_url if doors is not None else None}
 
     @app.post("/v1/ask")
     def ask(body: AskBody, who: IdentityContext = Depends(caller)) -> dict:
