@@ -645,7 +645,7 @@ def _begin(cfg: SweepConfig, servers: dict[str, dict] | None = None) -> dict:
 
     `servers` is what this run read of each model server's build (`server_readings`). A new sweep records it; a later
     run records it merged into what was recorded (`merged_readings`), which refuses a server whose build changed,
-    before anything is written."""
+    before anything is written, and says a weights folder that moved, which it never refuses."""
     out = Path(cfg.sweep.out)
     record, parts = out / SWEEP, out / SPLIT
     found, build = fingerprint(cfg), engine_build()
@@ -666,11 +666,14 @@ def _begin(cfg: SweepConfig, servers: dict[str, dict] | None = None) -> dict:
         if parts.exists():
             saved_split(cfg)  # refuses a split that is not the one the sweep drew
         if servers is not None:
-            from mnemiq.sweep.starters import merged_readings  # the starters read this module
+            from mnemiq.sweep.starters import merged_readings, moved_weights_note  # the starters read this module
 
             recorded = state.get("servers") or {}
             state["servers"] = {model: merged_readings(recorded.get(model) or {}, now, model)
                                 for model, now in servers.items()}
+            for model, now in servers.items():
+                if (note := moved_weights_note(recorded.get(model) or {}, now, model)) is not None:
+                    _say(note)
     elif _rows_exist(out):
         raise SweepConfigError(f"{out} holds rows but no {SWEEP}, so the config they were written under cannot be "
                                "checked. Start a new sweep in another out folder.")
@@ -1330,7 +1333,8 @@ def run(cfg: SweepConfig, until: str | None = None, smoke: int | None = None) ->
     where it was not read).
 
     Each run reads every model's server first. A new sweep records what it read; a resumed one fills in what the record
-    had not read and refuses a field read both times that differs (`merged_readings`), before any arm. Then, before the
+    had not read and refuses a server, version or window read both times that differs (`merged_readings`), before any
+    arm, while a weights folder that moved is recorded and said, never refused. Then, before the
     first round, it says where a model's build differs from the one its start's starter was swept on
     (`build_mismatches`), and a weights folder whose name is not the stated model's. A smoke reads and says the same,
     and records nothing outside its own folder.

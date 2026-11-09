@@ -30,7 +30,7 @@ from mnemiq.sweep.run import engine_build
 from tests.starter_fixtures import ROOT_AND_CHILD, STARTER, starter_folder, write
 from tests.starter_fixtures import edit as edit  # for the sweep tests, which import their helpers from here
 
-from .stub_model import StubModel
+from .stub_model import STUB_WINDOW, StubModel
 
 ROLE = "sweep-test"
 KEY_ENV = "SWEEP_TEST_KEY"
@@ -330,9 +330,8 @@ ONE_MODEL = {"llm_model": "stub-model", "llm_base_url": UNREACHABLE, "api_key_en
 # What a config states of the build the fixture starter was swept on: what no server reports.
 CONFIG_BUILD = {"model": "fixture/model-2.5-awq", "gpu": "GeForce RTX 4090", "quantization": "awq"}
 # The engine this process runs, which `starter_with_evidence` records as the one its starter was swept on.
-_RUNNING = engine_build()
-SHA12 = _RUNNING["source_sha"][:12]
-COMMIT = _RUNNING["commit"] or "no commit"
+SHA12 = engine_build()["source_sha"][:12]
+COMMIT = engine_build()["commit"] or "no commit"
 # A database key shaped like a machine path, which the evidence schema refuses. Spelled in two parts, as the repo
 # guard's own tests spell one, so the source never holds a home path.
 PATH_SHAPED_KEY = "/" + "Users/x"
@@ -354,15 +353,16 @@ def _counts(right: int, wrong: int, made_up: int, declined: int) -> dict:
 
 def _evidence(name: str) -> dict:
     """Evidence the schema accepts for the starter `name`: checked in instant mode against the engine's defaults, on
-    the build `CONFIG_BUILD` states, served by vLLM 0.9.0.1 with a 4096-token window, on the running engine."""
+    the build `CONFIG_BUILD` states, served as a stub serves by default (vLLM 0.9.0.1, a window of `STUB_WINDOW`), on
+    the engine running now."""
     return {
         "starter": name,
         "published": "2026-11-07",
         "dataset": {"name": "fixture-questions", "questions": 26, "answerable": 17},
         "made_up_measured": True,
         "model_build": {"model": "fixture/model-2.5-awq", "quantization": "awq", "server": "vllm",
-                        "server_version": "0.9.0.1", "gpu": "GeForce RTX 4090", "context_window": 4096},
-        "engine_build": {"version": importlib.metadata.version("mnemiq"), **_RUNNING},
+                        "server_version": "0.9.0.1", "gpu": "GeForce RTX 4090", "context_window": STUB_WINDOW},
+        "engine_build": {"version": importlib.metadata.version("mnemiq"), **engine_build()},
         "safe_by": "check",
         "rule": {"strategy": "check", "alpha": 0.05, "max_more_wrong": 0, "max_more_made_up": 0, "max_errors": 0,
                  "repeats": 2},
@@ -430,11 +430,18 @@ def start_via(tmp_path: Path, via: str) -> dict:
 def altered(evidence: dict, path: tuple) -> dict:
     """A copy of `evidence` with one change its schema must refuse, at `path`: the keys down to a table, then what is
     planted in it. `"extra"` is a key the schema does not name, `"fast"` a mode that is not one, and `PATH_SHAPED_KEY` a
-    database key shaped like a path; a table on the way that is null is made. `("rule", "max_more_wrong")` sets that
-    bound to 1, and `("published", None)` writes the date in another form."""
+    database key shaped like a path; a table on the way that is null is made. A `None` in `path` sets the field named
+    by the keys before it to the value after it: `("model_build", "model", None, "/srv/qwen")`, and
+    `("published", None)`, with no value, writes the date in another form. `("rule", "max_more_wrong")` sets that bound
+    to 1."""
     changed = copy.deepcopy(evidence)
-    if path == ("published", None):
-        changed["published"] = "07/11/2026"
+    if None in path:
+        cut = path.index(None)
+        *where, field = path[:cut]
+        holder = changed
+        for key in where:
+            holder = holder[key]
+        holder[field] = path[cut + 1] if len(path) > cut + 1 else "07/11/2026"
         return changed
     if path == ("rule", "max_more_wrong"):
         changed["rule"]["max_more_wrong"] = 1

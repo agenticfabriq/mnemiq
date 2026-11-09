@@ -345,7 +345,8 @@ def _builds(cfg: SweepConfig) -> list[str]:
         lines.append(f"{model} build: " + ", ".join(f"{name} {value or 'not stated'}" for name, value in stated.items()))
         if (starter := start_starter(cfg, model)) is not None:
             lines += [f"{model} starts from starter {starter!r}", *build_mismatches(cfg, model, None)]
-    lines.append("the server's model, version and window are read when the sweep runs")
+    lines.append("the server, its version and its window are read when the sweep runs; the model is stated in "
+                 "[models.<name>.build], never read")
     return lines
 
 

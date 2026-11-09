@@ -835,10 +835,11 @@ def _build_warning(state: dict, packaged: dict) -> list[str]:
 def _head(cfg: SweepConfig, model: str, state: dict, repeats: int, packaged: dict) -> dict:
     """What every proposal's evidence opens with: the sweep, who asked, where, on what, by which rule, and the starter
     the start resolves through, with where the sweep's build differs from the one it was swept on (`build_mismatches`,
-    against the server readings the sweep recorded)."""
+    against the server readings and the engine build the sweep recorded: its arms', not the one packaging this)."""
     parts = saved_split(cfg)
     starter = start_starter(cfg, model)
     readings = (state.get("servers") or {}).get(model)
+    ran_on = state.get("engine_build")
     endpoints = {name: without_credentials(value) if isinstance(value, str) and name.endswith("_url") else value
                  for name, value in _endpoint(cfg, model).items() if name in ENDPOINT_FACTS}
     rule = {"strategy": cfg.search.strategy, "alpha": cfg.propose.alpha, "max_more_wrong": cfg.propose.max_more_wrong,
@@ -858,7 +859,7 @@ def _head(cfg: SweepConfig, model: str, state: dict, repeats: int, packaged: dic
         "rule": rule,
         "unpinned_sources": unpinned_sources(baselines(cfg)),
         "start_starter": None if starter is None else {"name": starter,
-                                                       "mismatches": build_mismatches(cfg, model, readings)},
+                                                       "mismatches": build_mismatches(cfg, model, readings, ran_on)},
     }
 
 

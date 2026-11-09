@@ -2,8 +2,9 @@
 
 `StubModel` serves the doors the engine and the sweep call -- chat completions, embeddings, vLLM's `/tokenize`,
 `/metrics` and `/version`, and `/v1/models` -- from a script, so a test can drive the product path (`build_runtime`,
-`Runtime.ask`, `run_case`) with no model behind it. A chat request is answered as whoever sent it, read from its system prompt: the SQL writer, the result
-judge, deep mode's selector, the corrector, the sentence that follows the rows, and enrichment's column notes.
+`Runtime.ask`, `run_case`) with no model behind it. A chat request is answered as whoever sent it, read from its system
+prompt: the SQL writer, the result judge, deep mode's selector, the corrector, the sentence that follows the rows, and
+enrichment's column notes.
 
 The writer is answered from the cases the stub has learned (`learn`): the case whose question the request carries.
 Answering right means that case's gold SQL, or a decline when the case has no answer. Answering wrong means the case's
@@ -46,6 +47,9 @@ CONTEXT_TOO_LONG = (
 _WRITER = '{"sql": "<the SELECT, or null>"'
 _DECLINE = "the tables on the cards hold no data for that"
 _WINDOW_STEP = 1024
+# The context window a stub reports by default, at `/tokenize` and in `/v1/models` alike, as one vLLM server reports one
+# `max_model_len`. Wide enough that the tiny deployment's prompts fit beside the writer's reply budget.
+STUB_WINDOW = 32768
 
 Rule = Callable[[dict], "str | int | None"]
 
@@ -206,7 +210,7 @@ class StubModel:
                  gold_when: Callable[[dict], bool] | None = None, sql: str | None = None, varies: bool = False,
                  seconds: float = 0.0, start_misses: int = 0, on_call: Callable[[int], None] | None = None,
                  fail_first: int = 0, fail_after: int | None = None, status: int | str = 500,
-                 confidence: float = 0.9, window: int = 4096, prompt_tokens: int | None = None,
+                 confidence: float = 0.9, window: int = STUB_WINDOW, prompt_tokens: int | None = None,
                  embed_status: int | str | None = None, model: str = "stub-model", version: str = "0.9.0.1",
                  root: str = "fixture/model-2.5-awq", reports_build: bool = True,
                  script: _Script | None = None) -> None:

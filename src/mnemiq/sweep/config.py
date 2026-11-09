@@ -46,7 +46,8 @@ ENDPOINT_FACTS = ENDPOINT_SETTINGS
 _START_KEYS = ("profile_file", "profile", "starter")
 # A model as the Hugging Face hub names it, `<owner>/<name>`: one slash, and no leading `/`, `.` or `~`, so no absolute,
 # relative or home path has this form.
-_REPO_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+REPO_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
+_REPO_ID = re.compile(REPO_ID_PATTERN)
 # What a sweep keeps in its out folder beside each model's own folder, `<out>/<model>`, so no model may take one of these
 # names: the folder a smoke replaces whole, the proposal's folder, the sweep's record, its split and the cases its
 # endpoints left to ask again.
@@ -130,9 +131,10 @@ def _path(value: str | None, info: ValidationInfo) -> str | None:
 
 
 _Text = Annotated[str, Field(min_length=1)]
-# A model's repository id. Its form (`_REPO_ID`), and that it is not a path from the config's folder, are checked where
-# the model's name is known (`SweepConfig._models_name_repositories`), so that a refusal names the table.
-_RepoId = Annotated[str, Field(min_length=1)]
+# A model's repository id, in the hub's form, so a build read on its own refuses anything else. A sweep config refuses
+# one first where the model's name is known, so the refusal names its table, and also one that exists as a path from
+# the config's folder (`SweepConfig._models_state_repositories`, `_models_name_repositories`).
+_RepoId = Annotated[str, Field(pattern=REPO_ID_PATTERN)]
 _ProfileName = Annotated[str, AfterValidator(_profile_name)]
 _EnvName = Annotated[str, AfterValidator(_env_name)]
 _Count = Annotated[int, Field(ge=0)]
@@ -374,21 +376,29 @@ class SweepConfig(BaseModel):
         """The file this config was loaded from."""
         return self._path
 
+    @field_validator("models", mode="before")
+    @classmethod
+    def _models_state_repositories(cls, models: Any) -> Any:
+        """Each build's `model` is a repository id, never a local path: a server's launch argument may be either, and a
+        path names nothing on another machine. Refused here, before `ModelBuild` refuses it in pydantic's words, so the
+        refusal names the model's table. Anything but text is left to the fields' own types."""
+        for name, entry in (models.items() if isinstance(models, dict) else ()):
+            build = entry.get("build") if isinstance(entry, dict) else None
+            stated = build.get("model") if isinstance(build, dict) else None
+            if isinstance(stated, str) and not _REPO_ID.fullmatch(stated):
+                raise ValueError(f"[models.{name}.build] model {stated!r} is not a repository id, <owner>/<name>: "
+                                 "state the id the weights were downloaded as")
+        return models
+
     @field_validator("models")
     @classmethod
     def _models_name_repositories(cls, models: dict[str, ModelEntry], info: ValidationInfo) -> dict[str, ModelEntry]:
-        """Each build's `model` is a repository id, never a local path: a server's launch argument may be either, and a
-        path names nothing on another machine. A relative one such as `models/qwen-awq` has the id's form, so it is also
-        refused when it exists from the config's folder."""
+        """A relative path such as `models/qwen-awq` has a repository id's form, so a build's `model` is also refused
+        when it exists as a path from the config's folder."""
         base = (info.context or {}).get("base") or os.getcwd()
         for name, entry in models.items():
             stated = entry.build.model if entry.build is not None else None
-            if stated is None:
-                continue
-            if not _REPO_ID.fullmatch(stated):
-                raise ValueError(f"[models.{name}.build] model {stated!r} is not a repository id, <owner>/<name>: "
-                                 "state the id the weights were downloaded as")
-            if os.path.lexists(os.path.join(base, stated)):
+            if stated is not None and os.path.lexists(os.path.join(base, stated)):
                 raise ValueError(f"[models.{name}.build] model {stated!r} is a path here, not a repository id: state "
                                  "the id the weights were downloaded as")
         return models

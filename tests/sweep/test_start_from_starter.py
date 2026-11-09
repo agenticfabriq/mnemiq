@@ -6,10 +6,13 @@ from __future__ import annotations
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from mnemiq.config import DEFAULT_RETRIEVAL_K
 from mnemiq.sweep.arms import start_settings
-from mnemiq.sweep.config import SweepConfigError, fingerprint, fingerprint_body, load_config, start_starter
+from mnemiq.sweep.config import (
+    ModelBuild, SweepConfigError, fingerprint, fingerprint_body, load_config, start_starter,
+)
 
 from .conftest import (
     CONFIG_BUILD, ONE_MODEL, ROOT_AND_CHILD, edit, idle_deployment, one_model, start_that_differs, start_via,
@@ -28,6 +31,10 @@ GOLDEN_CONFIG_DUMP = (
     '"max_more_made_up": 0, "max_more_wrong": 0, "profile": null}, "search": {"screen_alpha": 0.25, "strategy": '
     '"screen-then-grid"}, "space": {}, "start": {"per_model": {}, "profile": null, "profile_file": null}, "sweep": '
     '{"max_errors": 0, "name": "tiny", "out": "<tmp>/sweep-out", "repeats": "auto"}}'
+)
+# The `[start]` part of the same dump for a config whose model has a start table of its own, naming a profile.
+GOLDEN_START_DUMP = (
+    '{"per_model": {"m": {"profile": "b", "profile_file": null}}, "profile": null, "profile_file": "<tmp>/shared.toml"}'
 )
 
 
@@ -87,6 +94,14 @@ def test_a_config_without_the_new_keys_fingerprints_as_before(tmp_path):
     assert dumped == GOLDEN_CONFIG_DUMP     # recorded by running the same function on main before this change
 
 
+def test_a_models_own_start_table_without_a_starter_fingerprints_as_before(tmp_path):
+    shared = write(tmp_path / "shared.toml", 'default = "a"\n[profiles.a]\nretrieval_k = 12\n[profiles.b]\nretrieval_k = 16\n')
+    cfg = load_config(write_config(tmp_path, deployment=idle_deployment(tmp_path),
+                                   start={"profile_file": str(shared), "m": {"profile": "b"}}))
+    dumped = json.dumps(fingerprint_body(cfg)["config"]["start"], sort_keys=True).replace(str(tmp_path), "<tmp>")
+    assert dumped == GOLDEN_START_DUMP      # recorded by running the same dump on main before this change
+
+
 def test_the_build_table_is_fingerprinted(tmp_path):
     d = idle_deployment(tmp_path)     # a fingerprint pins the store, so it needs one built
     a = fingerprint(load_config(write_config(tmp_path, deployment=d, models=one_model(build=CONFIG_BUILD))))
@@ -95,8 +110,16 @@ def test_the_build_table_is_fingerprinted(tmp_path):
 
 
 def test_no_model_may_be_named_starter(tmp_path):
-    with pytest.raises(SweepConfigError, match="starter"):
+    with pytest.raises(SweepConfigError,
+                       match=r"models\.starter: \[start\] reads starter as its own key, so no model can take the name"):
         load_config(write_config(tmp_path, models={"starter": ONE_MODEL}))
+
+
+@pytest.mark.parametrize("model", ["/srv/models/qwen-awq", "qwen-awq", "~/qwen-awq", "./qwen-awq", "a/b/c"])
+def test_a_build_read_on_its_own_refuses_what_is_not_a_repository_id(model):
+    ModelBuild.model_validate({"model": "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ"})    # positive control
+    with pytest.raises(ValidationError):
+        ModelBuild.model_validate({"model": model})
 
 
 @pytest.mark.parametrize("model", ["/srv/models/qwen-awq", "models/qwen-awq", "~/qwen-awq", "./qwen-awq"])

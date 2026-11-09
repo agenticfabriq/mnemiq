@@ -18,27 +18,39 @@ from __future__ import annotations
 import json
 import re
 import time
+from datetime import date
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
 
 from mnemiq import profiles
-from mnemiq.sweep.config import SweepConfig, SweepConfigError, start_starter
+from mnemiq.sweep.config import SweepConfig, SweepConfigError, _RepoId, start_starter
 from mnemiq.sweep.run import engine_build
 
 EVIDENCE_SUFFIX = ".evidence.json"
 # What `server_readings` reads of a model server's build, each None when it was not read.
 READINGS = ("server", "server_version", "context_window", "root_name")
+# What a resumed sweep refuses when the server now reports it otherwise. The weights folder's name is kept only to say,
+# never to refuse: a cache snapshot's folder is a hash, and can move with the same weights in it.
+_REFUSED_WHEN_CHANGED = ("server", "server_version", "context_window")
 # Each build request is read against a deadline and a size cap, so a proxy dripping a catch-all page cannot hold a run.
 _READ_TIMEOUT_S = 5.0
 _READ_BYTES = 1024 * 1024
 
 Mode = Literal["instant", "thinking", "deep"]
 Part = Literal["tuning", "held_out"]
-Day = Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}$")]
+
+
+def _calendar_day(value: str) -> str:
+    date.fromisoformat(value)  # refuses a month or a day no calendar has, such as 2026-99-99
+    return value
+
+
+# A day as `YYYY-MM-DD`, in ASCII digits (`\d` would take any script's), and one a calendar has.
+Day = Annotated[str, Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"), AfterValidator(_calendar_day)]
 # A deployment's `db_id`, or "" for a sweep of one deployment: never a path.
 DbKey = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{0,64}$")]
 
@@ -51,7 +63,7 @@ class ModelBuildRecord(_Record):
     """The build a starter was swept on: the model, its quantization and the GPU as the config stated them, and the
     server, its version and its window as the server reported them."""
 
-    model: str
+    model: _RepoId
     quantization: str
     server: str
     server_version: str
@@ -245,14 +257,16 @@ def server_readings(base_url: str, served: str, key: str | None) -> dict:
 
 def merged_readings(recorded: dict, now: dict, model: str | None = None) -> dict:
     """What a resumed sweep records of a model server's build: `recorded`, with each field it did not read and `now`
-    read filled in. A field read both times that differs is refused, since the sweep's rounds would compare answers
-    from two builds; a field either reading missed is never a difference. `model` names the server in the refusal."""
+    read filled in. The server, its version or its window read both times and different is refused, since the sweep's
+    rounds would compare answers from two builds; a field either reading missed is never a difference. The weights
+    folder's name takes the latest reading and is never refused (`moved_weights_note` says it). `model` names the
+    server in the refusal."""
     merged = {field: recorded.get(field) for field in READINGS}
     for field in READINGS:
         before, value = recorded.get(field), now.get(field)
         if value is None:
             continue
-        if before is None:
+        if before is None or field not in _REFUSED_WHEN_CHANGED:
             merged[field] = value
         elif before != value:
             whose = f" for {model!r}" if model is not None else ""
@@ -262,19 +276,29 @@ def merged_readings(recorded: dict, now: dict, model: str | None = None) -> dict
     return merged
 
 
+def moved_weights_note(recorded: dict, now: dict, model: str) -> str | None:
+    """A line when the server's weights folder, read both times, is not the one the sweep recorded, else None."""
+    before, value = recorded.get("root_name"), now.get("root_name")
+    if before is None or value is None or before == value:
+        return None
+    return (f"the server's weights folder for {model!r} changed since the sweep started: was {before!r}, now "
+            f"{value!r}. Said, never refused: check [models.{model}.build] model")
+
+
 def _folded(value: object) -> str:
     """A value as builds are compared: casefolded, its spacing collapsed."""
     return " ".join(str(value).split()).casefold()
 
 
-def build_mismatches(cfg: SweepConfig, model: str, readings: dict | None) -> list[str]:
+def build_mismatches(cfg: SweepConfig, model: str, readings: dict | None, engine: dict | None = None) -> list[str]:
     """Where the build `model` runs on differs from the one its start's starter was swept on, one line each, and one
     line naming what could not be compared: empty when the start reaches no starter, or when everything matches.
 
     `readings` is what `server_readings` read, or None before a run. The model, its quantization and the GPU are
     compared as `[models.<name>.build]` states them; the server, its version and its window as the server reports
-    them; the config's `llm_context_window` against the window the starter was swept with; and the running engine
-    against the one the starter was swept on, by source hash."""
+    them; the config's `llm_context_window` against the window the starter was swept with; and `engine` (an
+    `engine_build`: the one the sweep's arms ran on, for a proposal; by default the one running now) against the one the
+    starter was swept on, by source hash."""
     name = start_starter(cfg, model)
     if name is None:
         return []
@@ -298,7 +322,7 @@ def build_mismatches(cfg: SweepConfig, model: str, readings: dict | None) -> lis
     if unchecked:
         lines.append(f"starter {name!r}, model {model!r}: not checked, since the config does not state them or the "
                      f"server does not report them: {', '.join(unchecked)}")
-    ran, running = shipped.engine_build, engine_build()
+    ran, running = shipped.engine_build, engine if engine is not None else engine_build()
     if running["source_sha"] != ran.source_sha:
         lines.append(f"starter {name!r}: the engine differs: swept on {ran.source_sha[:12]} "
                      f"({ran.commit or 'no commit'}), running {running['source_sha'][:12]} "

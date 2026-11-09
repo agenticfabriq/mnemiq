@@ -225,9 +225,9 @@ reads, since the sweep compares the build it runs on with the one that evidence 
 ([the model server's build](#the-model-servers-build)).
 
 A start profile file whose profile extends another (`extends`) or names a starter (`starter`) is read whole, as the
-engine resolves it ([a profile's parent](profiles.md#a-profiles-parent-extends-and-starter)): the starter first, then each profile from the root down, then the
-profile's own settings. A chain the engine refuses is refused before anything runs, and the starter's file and its
-evidence are pinned beside the profile file.
+engine resolves it ([a profile's parent](profiles.md#a-profiles-parent-extends-and-starter)): the starter first, then
+each profile from the root down, then the profile's own settings. A chain the engine refuses is refused before anything
+runs, and the starter's file and its evidence are pinned beside the profile file.
 
 No profile setting the deployment's env file sets is part of an arm: each arm starts from the engine's field
 defaults, overlaid by the start profile, and its profile file writes out every setting it holds a value for. What a
@@ -506,9 +506,10 @@ source error, a question not measured.
 ## Sweeping a live source: only from a snapshot
 
 The sweep pins every file an answer depends on (the question file, the start profiles, the starter a start reaches and
-its evidence, each deployment's access policy and store, and each source read from a file) and refuses to go on, or marks an arm invalid for good, when one
-moves. A live database cannot be hashed, so a change to it during the sweep goes unseen, and arms run hours apart
-would be graded against different data. `plan` lists such a source as not pinned.
+its evidence, each deployment's access policy and store, and each source read from a file) and refuses to go on, or
+marks an arm invalid for good, when one moves. A live database cannot be hashed, so a change to it during the sweep
+goes unseen, and arms run hours apart would be graded against different data. `plan` lists such a source as not
+pinned.
 
 So sweep a snapshot: a copy that nothing writes while the sweep runs. A SQLite or DuckDB file is pinned, so a change
 to it is caught. A frozen copy in the database's own engine keeps the SQL dialect the profile will run against, which
@@ -529,9 +530,10 @@ its start's starter was swept on.
   weights were launched from (`root`). A field that cannot be read (a failed request, a 404 as a hosted endpoint
   answers, no entry for the model) is not read, never a value. The whole launch path is never kept.
 - **Recorded.** The first run records what it read in `sweep.json`, under `servers`. A resumed run reads again: a field
-  read for the first time is filled in, and a field read both times that differs is refused before any arm, since the
-  rounds would compare answers from two builds. A field either run could not read is never a difference. A smoke reads
-  and says what a run says, and records nothing outside its own folder.
+  read for the first time is filled in, and a server, version or window read both times that differs is refused before
+  any arm, since the rounds would compare answers from two builds. A field either run could not read is never a
+  difference. A weights folder that moved is recorded and said, never refused. A smoke reads and says what a run says,
+  and records nothing outside its own folder.
 - **Stated in the config.** The model, the GPU and the quantization come from `[models.<name>.build]`, since no server
   reports them reliably.
 
@@ -551,8 +553,11 @@ proposal's evidence carries them under `start_starter`, the starter's name and t
 `sweep.json` recorded, and in its `warnings`.
 
 When the server's weights folder, the last part of `root`, is not the stated model's name (the part of its id after
-the `/`, casefolded), `run` says so, and the proposal's warnings carry the same line. It never refuses on this: a cache
-snapshot's folder is a hash.
+the `/`, casefolded), `run` says so, and the proposal's warnings carry the same line; a resumed run also says when the
+folder is not the one the sweep recorded. Neither is refused: a cache snapshot's folder is a hash.
+
+The proposal compares the starter with the engine the sweep's arms ran on, as `sweep.json` records it, not the one that
+writes the proposal; that one is compared with the arms' engine by its own warning.
 
 ## Running, resuming and smoke
 
@@ -562,10 +567,9 @@ snapshot's folder is a hash.
   stopped: each arm from the answers it wrote, and what the first round decided (the runs each arm owes, each start's
   room) read back. A resumed config may change only `budget_hours`, `budget_dollars`, `seconds_per_question` and its
   `[[control]]` tables. Anything else (the config, a deployment's settings, a pinned file), another engine build, or a
-  model server that now reports another build is refused before any arm: put it back, or start a new sweep in another
-  out folder. Each worker checks the build again
-  as it starts an arm, so an edit or a pull while the sweep runs stops it with nothing of that arm asked, rather than
-  writing rows under another build.
+  model server that now reports another server, version or window is refused before any arm: put it back, or start a
+  new sweep in another out folder. Each worker checks the build again as it starts an arm, so an edit or a pull while
+  the sweep runs stops it with nothing of that arm asked, rather than writing rows under another build.
 - **Smoke.** `--smoke N` runs each arm of the first round once on its first N questions to tune on, in
   `<out>/smoke/`, which nothing else reads, with no budget, room or repeats. Each smoke replaces that folder whole, and
   only a folder a smoke made.

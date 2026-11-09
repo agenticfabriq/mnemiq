@@ -19,14 +19,18 @@ from mnemiq.sweep.starters import (
 )
 
 from .conftest import (
-    COMMIT, CONFIG_BUILD, PATH_SHAPED_KEY, SHA12, altered, evidence, one_model, started_sweep, starter_with_evidence,
-    sweep_json, valid_evidence, write_config,
+    COMMIT, CONFIG_BUILD, PATH_SHAPED_KEY, SHA12, STUB_WINDOW, altered, evidence, one_model, started_sweep,
+    starter_with_evidence, sweep_json, valid_evidence, write_config,
 )
+
+# A date in ASCII form but no calendar's, and a real date written in Arabic-Indic digits.
+NO_SUCH_DAY = "2026-99-99"
+DAY_IN_OTHER_DIGITS = "٢٠٢٦-١١-٠٧"
 
 
 def test_the_server_reports_the_served_entry_and_never_a_path(stub_model):
     assert server_readings(stub_model().url, "stub-model", None) == {
-        "server": "vllm", "server_version": "0.9.0.1", "context_window": 4096, "root_name": "model-2.5-awq"}
+        "server": "vllm", "server_version": "0.9.0.1", "context_window": STUB_WINDOW, "root_name": "model-2.5-awq"}
     assert server_readings(stub_model(root="/srv/models/qwen-awq").url, "stub-model", None)["root_name"] == "qwen-awq"
     assert server_readings(stub_model().url, "not-served", None)["context_window"] is None     # no entry: not read
     assert set(server_readings(stub_model(reports_build=False).url, "stub-model", None).values()) == {None}
@@ -40,11 +44,16 @@ def test_an_unread_field_is_never_a_difference_and_a_later_read_fills_it(stub_mo
         merged_readings(recorded, now | {"context_window": 8192})
 
 
+def test_a_weights_folder_that_moved_is_recorded_never_refused():
+    recorded = {"server": "vllm", "server_version": "0.9.0.1", "context_window": 4096, "root_name": "model-2.5-awq"}
+    assert merged_readings(recorded, recorded | {"root_name": "3f2a9c"}) == recorded | {"root_name": "3f2a9c"}
+
+
 def test_matching_builds_warn_nothing(tmp_path, monkeypatch, stub_model):
     starter_with_evidence(tmp_path, monkeypatch)
     model = stub_model()
     cfg = load_config(write_config(tmp_path, start={"starter": "fixture-2.5-build"},
-                                   models=one_model(model, build=CONFIG_BUILD, llm_context_window=4096)))
+                                   models=one_model(model, build=CONFIG_BUILD, llm_context_window=STUB_WINDOW)))
     assert build_mismatches(cfg, "m", server_readings(model.url, "stub-model", None)) == []
 
 
@@ -52,7 +61,7 @@ def test_a_differing_server_version_is_named_with_both_values(tmp_path, monkeypa
     starter_with_evidence(tmp_path, monkeypatch)
     model = stub_model(version="0.10.0")
     cfg = load_config(write_config(tmp_path, start={"starter": "fixture-2.5-build"},
-                                   models=one_model(model, build=CONFIG_BUILD, llm_context_window=4096)))
+                                   models=one_model(model, build=CONFIG_BUILD, llm_context_window=STUB_WINDOW)))
     assert build_mismatches(cfg, "m", server_readings(model.url, "stub-model", None)) == [
         "starter 'fixture-2.5-build', model 'm': server_version differs: swept on '0.9.0.1', this sweep has '0.10.0'"]
 
@@ -61,7 +70,7 @@ def test_case_and_spacing_are_not_a_difference(tmp_path, monkeypatch, stub_model
     starter_with_evidence(tmp_path, monkeypatch)
     model = stub_model()
     cfg = load_config(write_config(tmp_path, start={"starter": "fixture-2.5-build"},
-                                   models=one_model(model, build=CONFIG_BUILD | {"gpu": "geforce  rtx 4090"}, llm_context_window=4096)))
+                                   models=one_model(model, build=CONFIG_BUILD | {"gpu": "geforce  rtx 4090"}, llm_context_window=STUB_WINDOW)))
     assert build_mismatches(cfg, "m", server_readings(model.url, "stub-model", None)) == []
 
 
@@ -77,7 +86,7 @@ def test_another_engine_build_is_named(tmp_path, monkeypatch, stub_model):
     monkeypatch.setattr("mnemiq.sweep.starters.engine_build", lambda *a, **k: {"commit": "abc1234", "source_sha": "e" * 64})
     model = stub_model()
     cfg = load_config(write_config(tmp_path, start={"starter": "fixture-2.5-build"},
-                                   models=one_model(model, build=CONFIG_BUILD, llm_context_window=4096)))
+                                   models=one_model(model, build=CONFIG_BUILD, llm_context_window=STUB_WINDOW)))
     assert build_mismatches(cfg, "m", server_readings(model.url, "stub-model", None)) == [
         f"starter 'fixture-2.5-build': the engine differs: swept on {SHA12} ({COMMIT}), running eeeeeeeeeeee (abc1234)"]
 
@@ -105,6 +114,16 @@ def test_a_resume_on_another_server_is_refused(tmp_path, monkeypatch, stub_model
         run(cfg)
 
 
+def test_a_resume_whose_weights_folder_moved_is_said_never_refused(tmp_path, monkeypatch, stub_model, capsys):
+    model = stub_model(gold=True)
+    cfg = started_sweep(tmp_path, model)
+    model.root = "/srv/snapshots/3f2a9c"                          # a cache snapshot's folder is a hash
+    run(cfg, until="screen")
+    assert sweep_json(cfg)["servers"]["m"]["root_name"] == "3f2a9c"
+    assert ("the server's weights folder for 'm' changed since the sweep started: was 'model-2.5-awq', now '3f2a9c'"
+            in capsys.readouterr().out)
+
+
 def test_a_resume_that_cannot_read_the_server_is_not_refused(tmp_path, monkeypatch, stub_model):
     model = stub_model(gold=True)
     cfg = started_sweep(tmp_path, model)
@@ -130,6 +149,47 @@ def test_the_proposal_records_the_starter_and_its_mismatches(tmp_path, monkeypat
                                               "mismatches": build_mismatches(cfg, "m", sweep_json(cfg)["servers"]["m"])}
 
 
+def test_the_proposal_warns_of_each_mismatch_and_a_weights_folder_of_another_name(tmp_path, monkeypatch, stub_model):
+    starter_with_evidence(tmp_path, monkeypatch)
+    model = stub_model(gold=True, version="0.10.0", root="/srv/snapshots/3f2a9c")
+    cfg = load_config(write_config(tmp_path, model=model, models=one_model(model, build=CONFIG_BUILD),
+                                   start={"starter": "fixture-2.5-build"}, search={"strategy": "check"}))
+    run(cfg)
+    propose(cfg)
+    warnings = evidence(cfg)["warnings"]
+    mismatches = build_mismatches(cfg, "m", sweep_json(cfg)["servers"]["m"])
+    assert any("server_version differs" in line for line in mismatches) and set(mismatches) <= set(warnings)
+    assert ("the server's weights folder for 'm' is '3f2a9c', not fixture/model-2.5-awq's name: check "
+            "[models.m.build] model") in warnings
+
+
+def test_the_proposal_compares_the_starter_with_the_engine_the_arms_ran_on(tmp_path, monkeypatch, stub_model):
+    starter_with_evidence(tmp_path, monkeypatch)
+    model = stub_model(gold=True)
+    cfg = load_config(write_config(tmp_path, model=model, start={"starter": "fixture-2.5-build"},
+                                   search={"strategy": "check"}))
+    run(cfg)
+    # The engine packaging the proposal is another than the one the arms ran on, and the starter was swept on.
+    monkeypatch.setattr("mnemiq.sweep.starters.engine_build", lambda *a, **k: {"commit": "abc1234",
+                                                                               "source_sha": "e" * 64})
+    propose(cfg)
+    record = sweep_json(cfg)
+    shown = evidence(cfg)["start_starter"]["mismatches"]
+    assert shown == build_mismatches(cfg, "m", record["servers"]["m"], engine=record["engine_build"])
+    assert not any("the engine differs" in line for line in shown)
+    assert build_mismatches(cfg, "m", record["servers"]["m"])[-1].endswith("running eeeeeeeeeeee (abc1234)")
+
+
+def test_a_given_engine_is_compared_in_place_of_the_running_one(tmp_path, monkeypatch, stub_model):
+    starter_with_evidence(tmp_path, monkeypatch)
+    model = stub_model()
+    cfg = load_config(write_config(tmp_path, start={"starter": "fixture-2.5-build"},
+                                   models=one_model(model, build=CONFIG_BUILD, llm_context_window=STUB_WINDOW)))
+    readings = server_readings(model.url, "stub-model", None)
+    assert build_mismatches(cfg, "m", readings, engine={"commit": None, "source_sha": "d" * 64}) == [
+        f"starter 'fixture-2.5-build': the engine differs: swept on {SHA12} ({COMMIT}), running dddddddddddd (no commit)"]
+
+
 def test_a_starter_without_valid_evidence_is_refused_at_load(tmp_path, monkeypatch):
     folder = starter_with_evidence(tmp_path, monkeypatch)
     (folder / "fixture-2.5-build.evidence.json").write_text('{"starter": "fixture-2.5-build"}')
@@ -140,14 +200,18 @@ def test_a_starter_without_valid_evidence_is_refused_at_load(tmp_path, monkeypat
 @pytest.mark.parametrize("plant_at", [("dataset", "extra"), ("rule", "extra"), ("model_build", "extra"),
                                       ("check", "instant", 0, "start", "extra"), ("unmeasured_modes", "fast"),
                                       ("rule", "max_more_wrong"), ("published", None),
-                                      ("versions", PATH_SHAPED_KEY), ("measured_versions", "instant", PATH_SHAPED_KEY)])
+                                      ("versions", PATH_SHAPED_KEY), ("measured_versions", "instant", PATH_SHAPED_KEY),
+                                      ("model_build", "model", None, "/srv/models/qwen-awq"),
+                                      ("published", None, NO_SUCH_DAY), ("published", None, DAY_IN_OTHER_DIGITS)])
 def test_the_evidence_schema_refuses_what_it_does_not_name_at_any_depth(tmp_path, monkeypatch, plant_at):
     good = valid_evidence(tmp_path, monkeypatch)                     # starter_with_evidence's evidence, as a dict
     StarterEvidence.model_validate(good)                             # positive control: the unaltered one passes
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError) as refused:
         StarterEvidence.model_validate(altered(good, plant_at))
-    # altered: an unknown key at that path; "fast" as a mode key; max_more_wrong 1; published "07/11/2026";
-    # a path-shaped database key
+    # altered: an unknown key at that path; "fast" as a mode key; max_more_wrong 1; published "07/11/2026", a day no
+    # calendar has, or one in other digits; a path-shaped database key; a model given as a path
+    where = plant_at[:plant_at.index(None)] if None in plant_at else plant_at
+    assert refused.value.errors()[0]["loc"][:len(where)] == where    # refused where it was planted, not elsewhere
 
 
 def test_the_mode_alias_is_the_engines_modes():
