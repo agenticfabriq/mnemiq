@@ -54,7 +54,10 @@ tab load as someone else, and it checks who is asking before sending a question
 after being hidden or idle for a minute.
 
 Behind a sign-in proxy, a verified user gets a **Sign out** control: it clears
-their threads and mode, then sends the browser to the proxy's own sign-out. A
+their threads and mode, then sends the browser to the proxy's own sign-out, and
+on to the identity provider's when the engine names one (`oidc_end_session_url`
+in [the settings](../docs/settings.md#identity-from-tokens)), so that session
+ends too. A
 `401` or a redirect to sign in means only that the session expired: the
 workbench clears the screen, keeps the saved threads, and reloads so the proxy
 signs the user in again (the same user gets their threads back; anyone else

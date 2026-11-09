@@ -222,8 +222,27 @@ with a message naming the setting to change. A token needs the `db.read` scope o
 `/openai/v1`, and is refused with a 403 without it, so the client that signs users in to the workbench, and Open
 WebUI's own client when it forwards each user's token, must request that scope. Open WebUI's signed user header
 carries no scopes and is not asked for one: what its users may read comes from their roles in the identity map
-alone. On MCP, `db.read` gates `db_read` and `get_schema`, and `db.write` gates `db_write`. A scope only narrows: what
-a token may read is still its roles' grants.
+alone. An Open WebUI user with no rule in the map is not refused: they are offered the `default` profile only and asked
+with no roles, so they read only what the grants give a caller with no roles, and each question still reaches the
+engine and its model. On MCP, `db.read` gates `db_read` and `get_schema`, and `db.write` gates `db_write`. A scope only
+narrows: what a token may read is still its roles' grants.
+
+**Sign out through the identity provider.** Behind oauth2-proxy, the workbench's Sign out goes to the proxy's own
+sign-out, which ends the proxy's session and asks the identity provider to end the user's. When the proxy cannot load
+the session at that moment, the provider's session survives, and the next visit signs the same user straight back in.
+With `oidc_end_session_url` set, `/v1/whoami` tells a verified caller where the provider's end-session page is, and
+Sign out sends the browser on to it, which returns it to the workbench's root. The provider's session then ends either
+way; the provider asks the user to confirm only when the proxy could not end it. Three things must be in place, and
+each fails quietly without it:
+
+- **The provider's `host:port` in oauth2-proxy's `--whitelist-domain`**, exactly. Without it the proxy drops the
+  redirect, logging `Rejecting invalid redirect … domain / port not in whitelist`, and Sign out behaves as it did
+  without the setting.
+- **The workbench's root, exactly (for example `https://mnemiq.example/`), among the client's valid post-logout
+  redirect URIs**, not a wildcard. Without it, expect the provider to show an error page instead of returning to the
+  workbench.
+- **The proxy client's `client_id` in the URL.** Keycloak needs it, or an ID token, which the workbench never holds.
+  Without it, expect Keycloak to refuse the sign-out.
 
 **The OpenAI-compatible endpoint.** `GET /openai/v1/models` and `POST /openai/v1/chat/completions` serve Open WebUI,
 or any OpenAI client, each request as its own verified caller, with one model per profile that caller may pick. They
