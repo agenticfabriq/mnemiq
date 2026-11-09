@@ -55,24 +55,31 @@ check mode: `mnemiq sweep starter --config search.toml --model <model> --dataset
 
 The starter is named for its build: the part of `[models.<model>.build] model` after the `/`, lowercased, so
 `Qwen/Qwen2.5-Coder-32B-Instruct-AWQ` gives `qwen2.5-coder-32b-instruct-awq`. `--name` may only repeat that name.
-`--dataset` names the questions in the starter's description and its evidence.
+`--dataset` labels the questions in the starter's description and its evidence: 1 to 80 printable ASCII characters
+with no `/` or `\`, so the label is never a path.
 
 Publishing refuses, before it writes anything:
 
+- a `--dataset` label that is not 1 to 80 printable ASCII characters without a slash;
+- a sweep whose out folder a run or a proposal is using: publishing holds each sweep's lock until it ends, as
+  `propose` does, and reads each sweep's record and proposal once;
 - a key variable the model names that is not set;
 - a sweep that has not finished its rounds, or that ran under another config than the one given;
 - an engine with no checkout to write into: the starters live in the package's source, `src/mnemiq/starter_profiles/`;
 - an engine other than the one the sweeps ran on, by source hash: publish from a checkout at the sweeps' commit;
 - a proposal a person chose (`propose --choose`), or one made with either `[propose]` bound above 0;
-- check mode that proposed the engine's defaults, a search that did not start from them, or a search whose pick was
-  not confirmed on the held-out part;
+- a `--search` that names a sweep in check mode, and a `--search` beside a sweep that is not check mode;
+- check mode that proposed the engine's defaults, a search that did not start from them, a search whose pick was not
+  confirmed on the held-out part, and a search whose pick is the defaults themselves, every change it picked lost to a
+  disagreement between the modes;
 - a starter that gets fewer right answers than the defaults, as [right answers](#right-answers) says;
 - a build that is not whole: the server, its version and its window not read from the server by each sweep, the
   model, the GPU or the quantization not stated in `[models.<model>.build]`, two sweeps that read different servers or
   state different builds, or an `llm_context_window` other than the window the server reports;
 - a `--name` other than the build's;
 - with `--search`, a search whose proposal is not the file the check's arms started from, by its hash as they pinned
-  it.
+  it;
+- evidence its schema refuses, such as a `db_id` outside the form the schema reads.
 
 It then writes the starter and its evidence as `<name>.publishing.toml` and `<name>.publishing.evidence.json` beside
 the starters, and checks that a deployment whose profile starts from that draft resolves, on every deployment the
@@ -88,7 +95,7 @@ schema refuses any field it does not name:
 
 - `starter`: the starter's name.
 - `published`: the local date it was written.
-- `dataset`: the name `--dataset` gave the questions, how many there are, and how many have an answer.
+- `dataset`: the label `--dataset` gave the questions, how many there are, and how many have an answer.
 - `made_up_measured`: whether the questions hold one with no answer, which a made-up answer needs
   ([made-up answers](#made-up-answers)).
 - `model_build`: the model's repository id, its quantization and the GPU, as the config states them, and the server,

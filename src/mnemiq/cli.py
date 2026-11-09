@@ -130,7 +130,8 @@ def _add_sweep(sub) -> None:
     parsers["starter"].add_argument("--model", required=True,
                                     help="the model in [models] whose build the starter is for")
     parsers["starter"].add_argument("--dataset", required=True, metavar="NAME",
-                                    help="the question set's name, as the starter's description and evidence give it")
+                                    help="the question set's label, as the starter's description and evidence give "
+                                         "it: 1 to 80 printable ASCII characters, with no / or \\")
     parsers["starter"].add_argument("--name",
                                     help="the starter's name, which must be the build's: the part of "
                                          "[models.<model>.build] model after the /, lowercased (the default)")

@@ -12,11 +12,11 @@ later reading fills it in. The model itself is never read, only stated (`[models
 launch argument may be a repository id, an absolute path, a relative path or a cache snapshot, and no form tells them
 apart. The last part of what the server was launched from is kept only to say when it is not the stated model's name.
 
-A starter is published (`publish_starter`, `mnemiq sweep starter`) from finished sweeps whose rule found it safe over the
-engine's defaults: check mode's verdict, or a search from those defaults whose pick was confirmed on the held-out part.
-Every refusal comes before anything is written. The starter and its evidence are written under a draft name beside the
-starters and moved into place only once a deployment starting from the draft resolves, on every deployment the sweep
-read, to the version the proposal recorded.
+A starter is published (`publish_starter`, `mnemiq sweep starter`) from finished sweeps whose rule found it safe over
+the engine's defaults: check mode's verdict, or a search from those defaults whose pick was confirmed on the held-out
+part. Every refusal comes before anything is written. The starter and its evidence are written under a draft name
+beside the starters and moved into place only once a deployment starting from the draft resolves, on every deployment
+the sweep read, to the version the proposal recorded.
 """
 
 from __future__ import annotations
@@ -29,6 +29,8 @@ import re
 import tempfile
 import time
 import tomllib
+from contextlib import ExitStack
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Annotated, Literal
@@ -46,7 +48,7 @@ from mnemiq.sweep.arms import _endpoint, _toml, arm_of
 from mnemiq.sweep.config import (
     PROPOSAL, SweepConfig, SweepConfigError, _RepoId, load_questions, start_profile, start_starter,
 )
-from mnemiq.sweep.run import PINS, arm_folder, engine_build
+from mnemiq.sweep.run import OUT_LOCK, PINS, _sole, arm_folder, engine_build
 
 EVIDENCE_SUFFIX = ".evidence.json"
 # What `server_readings` reads of a model server's build, each None when it was not read.
@@ -71,6 +73,10 @@ def _calendar_day(value: str) -> str:
 Day = Annotated[str, Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"), AfterValidator(_calendar_day)]
 # A deployment's `db_id`, or "" for a sweep of one deployment: never a path.
 DbKey = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{0,64}$")]
+# The label a person gives the questions a starter was measured on (`--dataset`): 1 to 80 printable ASCII characters,
+# with no slash of either kind, so it is never a path.
+DATASET_LABEL_PATTERN = r"^[\x20-\x2e\x30-\x5b\x5d-\x7e]{1,80}$"
+DatasetLabel = Annotated[str, Field(pattern=DATASET_LABEL_PATTERN)]
 
 
 class _Record(BaseModel):
@@ -98,7 +104,7 @@ class EngineBuildRecord(_Record):
 
 
 class DatasetRecord(_Record):
-    name: str
+    name: DatasetLabel
     questions: int
     answerable: int
 
@@ -428,12 +434,24 @@ def _proposal(cfg: SweepConfig, model: str) -> tuple[Path, Path]:
     return folder / PROFILES, folder / EVIDENCE
 
 
-def _proposed(cfg: SweepConfig, model: str, state: dict) -> dict:
-    """The evidence of the sweep's proposal for `model`, refused unless it is this sweep's and the rule chose it with
-    both bounds at 0."""
-    _, path = _proposal(cfg, model)
+@dataclass(frozen=True)
+class _Swept:
+    """A finished sweep as publishing reads it, each file once, so every check and the evidence written read the same
+    bytes: its config, its record (`sweep.json`), and its proposal for the model, the evidence parsed and the profiles
+    file as it was read (None when nothing was proposed)."""
+
+    cfg: SweepConfig
+    state: dict
+    evidence: dict
+    profile: bytes | None
+
+
+def _proposed(cfg: SweepConfig, model: str, state: dict) -> _Swept:
+    """The sweep's proposal for `model`, read once, refused unless it is this sweep's and the rule chose it with both
+    bounds at 0."""
+    profiles_path, path = _proposal(cfg, model)
     try:
-        evidence = json.loads(path.read_text(encoding="utf-8"))
+        evidence = json.loads(path.read_bytes())
     except (OSError, ValueError):
         raise SweepConfigError(f"{path} cannot be read: propose from the sweep before publishing a starter from "
                                "it") from None
@@ -444,7 +462,27 @@ def _proposed(cfg: SweepConfig, model: str, state: dict) -> dict:
     for bound in ("max_more_wrong", "max_more_made_up"):
         if (value := evidence["rule"][bound]) != 0:
             raise SweepConfigError(f"[propose] {bound} is {value}: a starter needs both bounds at 0")
-    return evidence
+    try:
+        profile = profiles_path.read_bytes()
+    except FileNotFoundError:
+        profile = None
+    except OSError as exc:
+        raise SweepConfigError(f"{profiles_path} cannot be read: {exc.strerror}") from None
+    return _Swept(cfg, state, evidence, profile)
+
+
+def _paired(check: _Swept, search: _Swept | None) -> None:
+    """Refuse a `--search` that is not a search, and a sweep published beside one that is not check mode: with
+    `--search`, the sweep published is the check that started from the search's proposal."""
+    if search is None:
+        return
+    if search.evidence["rule"]["strategy"] == "check":
+        raise SweepConfigError(f"--search names a sweep in check mode ({search.cfg.path}), and it names the search "
+                               "whose proposal the check started from")
+    if (strategy := check.evidence["rule"]["strategy"]) != "check":
+        raise SweepConfigError(f"--search is given, so the sweep published must be a check started from the search's "
+                               f"proposal, and {check.cfg.path} ran strategy {strategy!r}: publish a search from the "
+                               "engine's defaults without --search")
 
 
 def _basis(cfg: SweepConfig, model: str, evidence: dict) -> str:
@@ -462,6 +500,10 @@ def _basis(cfg: SweepConfig, model: str, evidence: dict) -> str:
                                "in check mode")
     if evidence["confirmed"] is not True:
         raise SweepConfigError("the search's pick was not confirmed on the held-out part")
+    if (evidence.get("confirm") or {}).get("same_as_start"):
+        # Every pick's change was lost to a conflict between the modes, so what was confirmed is the start, which is
+        # the engine's defaults.
+        raise SweepConfigError("the search's pick is the engine's defaults: there is no starter to publish")
     return "search_from_defaults"
 
 
@@ -513,18 +555,10 @@ def _whole_build(model: str, sweeps: list[tuple[SweepConfig, dict]]) -> None:
                                    "it out")
 
 
-def _sha256(path: Path) -> str | None:
-    try:
-        with open(path, "rb") as fh:
-            return hashlib.file_digest(fh, "sha256").hexdigest()
-    except OSError:
-        return None
-
-
-def _started_from(cfg: SweepConfig, model: str, evidence: dict, search: SweepConfig) -> None:
-    """Refuse a search whose proposal is not the file the check's start arm pinned as its start profile, by sha256: what
-    the check's arms read, not the file as it is now."""
-    proposal = _proposal(search, model)[0]
+def _started_from(cfg: SweepConfig, model: str, evidence: dict, search: _Swept) -> None:
+    """Refuse a search whose proposal, as read, is not the file the check's start arm pinned as its start profile, by
+    sha256: what the check's arms read, not the file as it is now."""
+    proposal = _proposal(search.cfg, model)[0]
     start = start_profile(cfg, model)[0]
     first = next(iter(evidence.get("check") or {}), cfg.modes[0])
     pins = arm_folder(cfg, arm_of(model, first, {}, round="check"), 1) / PINS
@@ -532,7 +566,7 @@ def _started_from(cfg: SweepConfig, model: str, evidence: dict, search: SweepCon
         pinned = json.loads(pins.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         pinned = {}
-    found = _sha256(proposal)
+    found = hashlib.sha256(search.profile).hexdigest() if search.profile is not None else None
     if start is None or found is None or not isinstance(pinned, dict) or pinned.get(start) != found:
         raise SweepConfigError(f"the search's proposal {proposal} is not the file the check started from")
 
@@ -568,20 +602,26 @@ def _field_default(name: str) -> object:
     return Settings.model_fields[name].get_default(call_default_factory=True)
 
 
-def starter_evidence(cfg: SweepConfig, model: str, name: str, dataset: str,
-                     search: SweepConfig | None) -> StarterEvidence:
-    """The evidence the starter `name` ships with, from the sweep `cfg`'s record and proposal for `model` (and, for a
-    check that started from a search's proposal, `search`'s), field by field from what each source may give: builds,
-    the rule, counts and versions, never a question, a statement, a case id or a path."""
-    from mnemiq.sweep.propose import _record  # the proposal reads this module
+def starter_evidence(cfg: SweepConfig, model: str, name: str, dataset: str, *, state: dict, evidence: dict,
+                     text: str, searched: dict | None) -> StarterEvidence:
+    """The evidence the starter `name` ships with, field by field from what each source may give: builds, the rule,
+    counts and versions, never a question, a statement, a case id or a path. Each source is passed as publishing read it
+    once: the sweep `cfg`'s record (`state`) and its proposal's evidence for `model`, the starter's own `text`, and the
+    evidence of the search behind it (`searched`: a check's `--search`, or the sweep itself when it is that search;
+    None for check mode alone). Refused, never raised as the schema's own error, when it does not have the schema's
+    form."""
+    try:
+        return _evidence(cfg, model, name, dataset, state, evidence, text, searched)
+    except ValidationError as exc:
+        raise SweepConfigError(f"the starter's evidence does not have the form the engine reads: "
+                               f"{_reasons(exc)}") from None
 
-    state = _record(cfg)
-    evidence = json.loads(_proposal(cfg, model)[1].read_text(encoding="utf-8"))
+
+def _evidence(cfg: SweepConfig, model: str, name: str, dataset: str, state: dict, evidence: dict, text: str,
+              found: dict | None) -> StarterEvidence:
+    """`starter_evidence` itself, which the schema may refuse."""
     checked = evidence["rule"]["strategy"] == "check"
-    searched = search if search is not None else None if checked else cfg
-    found = json.loads(_proposal(searched, model)[1].read_text(encoding="utf-8")) if searched is not None else None
-    held = tomllib.loads(starter_text(_proposal(cfg, model)[0].read_text(encoding="utf-8"), name, dataset))
-    held = held["profiles"][name]
+    held = tomllib.loads(text)["profiles"][name]
     wide = {key: value for key, value in held.items() if key in PROFILE_SETTINGS}
     measured = list(evidence["check"]) if checked else list(evidence["confirm"]["modes"])
     cases = load_questions(cfg)
@@ -655,25 +695,52 @@ def publish_starter(cfg: SweepConfig, model: str, dataset: str, *, name: str | N
     """Write the starter for `model`'s build and its evidence into the starters folder (`profiles.starters_folder`),
     from the finished sweep `cfg`, whose rule found it safe over the engine's defaults: check mode's verdict, or a
     search from those defaults whose pick was confirmed. `search` is the search whose proposal the check started from,
-    when it did. `dataset` names the questions, for the description and the evidence. Returns the two paths.
+    when it did. `dataset` labels the questions, for the description and the evidence. Returns the two paths.
 
-    Every refusal comes before anything is written, in this order: a key variable not set; a sweep that has not
-    finished, or ran under another config; an engine with no checkout to write into; an engine other than the one the
-    sweeps ran on, by source hash; a proposal a person chose, or one whose bounds are not both 0; a check that chose the
-    defaults, or a search that did not start from them or whose pick was not confirmed; a starter that gets fewer right
-    answers than the defaults (`fewer_right`); a build not read and stated whole; a name that is not the build's; and a
-    search that is not the one the check started from.
+    Every refusal comes before anything is written, in this order: a dataset label that is not 1 to 80 printable ASCII
+    characters without a slash; an out folder a run or a proposal holds, whose lock publishing then holds to its end, as
+    a proposal does; a key variable not set; a sweep that has not finished, or ran under another config; an engine with
+    no checkout to write into; an engine other than the one the sweeps ran on, by source hash; a proposal a person
+    chose, or one whose bounds are not both 0, a `search` in check mode, or a `search` beside a sweep that is not; a
+    check that chose the defaults, or a search that did not start from them, whose pick was not confirmed, or whose pick
+    is the defaults; a starter that gets fewer right answers than the defaults (`fewer_right`); a build not read and
+    stated whole; a name that is not the build's; a search that is not the one the check started from; and evidence the
+    schema refuses. Each sweep's record and proposal are read once, so the checks and the evidence see the same bytes.
 
     The two files are written as `<name>.publishing.*` beside the starters, and moved into place only once a deployment
     starting from the draft resolves, on every deployment the sweep read, to the version the proposal recorded. Any
     failure removes the draft and leaves a starter already shipped under that name as it was."""
-    from mnemiq.sweep.propose import _finished, _keys_set  # the proposal reads this module
+    from mnemiq.sweep.propose import _finished  # the proposal reads this module
 
+    if not re.fullmatch(DATASET_LABEL_PATTERN, dataset):
+        raise SweepConfigError(f"--dataset {dataset!r} is not a label a starter can carry: it names the questions in "
+                               "the starter's description and evidence, so it is 1 to 80 printable ASCII characters "
+                               "with no / or \\")
     sweeps = [cfg] if search is None else [cfg, search]
     for each in sweeps:
         if model not in each.models:
             raise SweepConfigError(f"{each.path}: model {model!r} is not one this sweep ran; it ran "
                                    f"{', '.join(each.models)}")
+    with ExitStack() as held:
+        locked: list[Path] = []
+        for each in sweeps:
+            out = Path(each.sweep.out).resolve()
+            if out in locked:
+                continue
+            if not out.is_dir():
+                _finished(each)  # refuses: no sweep has run in that folder
+            held.enter_context(_sole(out / OUT_LOCK, SweepConfigError(
+                f"{out} is in use by a run or a proposal of this sweep; publish again once it has ended")))
+            locked.append(out)
+        return _publish(cfg, model, dataset, name, search)
+
+
+def _publish(cfg: SweepConfig, model: str, dataset: str, name: str | None,
+             search: SweepConfig | None) -> tuple[Path, Path]:
+    """`publish_starter` itself, with each sweep's out folder lock held."""
+    from mnemiq.sweep.propose import _finished, _keys_set  # the proposal reads this module
+
+    sweeps = [cfg] if search is None else [cfg, search]
     for each in sweeps:
         _keys_set(each, [model])
     states = [_finished(each) for each in sweeps]
@@ -685,23 +752,34 @@ def publish_starter(cfg: SweepConfig, model: str, dataset: str, *, name: str | N
         if ran.get("source_sha") != running["source_sha"]:
             raise SweepConfigError(f"the sweep ran on engine {_engine(ran)}, and this is {_engine(running)}: publish "
                                    "from a checkout at the sweep's commit")
-    evidence, *_ = [_proposed(each, model, state) for each, state in zip(sweeps, states, strict=True)]
+    swept = [_proposed(each, model, state) for each, state in zip(sweeps, states, strict=True)]
+    checked, found = swept[0], swept[1] if search is not None else None
+    _paired(checked, found)
+    evidence = checked.evidence
     safe_by = _basis(cfg, model, evidence)
     if safe_by == "check" and (lines := fewer_right(_right_counts(evidence["check"], "start"),
                                                     _right_counts(evidence["check"], "defaults"))):
         raise SweepConfigError(f"the starter gets fewer right answers than the engine's defaults: {'; '.join(lines)}")
-    _whole_build(model, list(zip(sweeps, states, strict=True)))
+    _whole_build(model, [(each.cfg, each.state) for each in swept])
     derived = build_name(cfg.models[model].build.model)
     if name is not None and name != derived:
         raise SweepConfigError(f"--name {name!r} is not the build's name {derived!r}")
     name = derived
     if not _NAME.fullmatch(name):
         raise SweepConfigError(f"the build's name {name!r} must match {_NAME.pattern}, as a profile name must")
-    if search is not None:
-        _started_from(cfg, model, evidence, search)
+    if found is not None:
+        _started_from(cfg, model, evidence, found)
 
-    text = starter_text(_proposal(cfg, model)[0].read_text(encoding="utf-8"), name, dataset)
-    record = starter_evidence(cfg, model, name, dataset, search)
+    try:
+        proposal_text = checked.profile.decode("utf-8") if checked.profile is not None else None
+    except UnicodeDecodeError:
+        proposal_text = None
+    if proposal_text is None:
+        raise SweepConfigError(f"{_proposal(cfg, model)[0]} cannot be read as the profile the rule proposed")
+    text = starter_text(proposal_text, name, dataset)
+    searched = found.evidence if found is not None else None if safe_by == "check" else evidence
+    record = starter_evidence(cfg, model, name, dataset, state=checked.state, evidence=evidence, text=text,
+                              searched=searched)
     try:
         folder = profiles.starters_folder()
     except profiles.ProfileFileError as exc:

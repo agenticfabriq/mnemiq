@@ -11,17 +11,20 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from mnemiq import profiles
 from mnemiq.cli import main
 from mnemiq.profiles import ENDPOINT_SETTINGS, starter_names
-from mnemiq.sweep.config import SweepConfigError
-from mnemiq.sweep.propose import _agrees, _versions
-from mnemiq.sweep.starters import StarterEvidence, fewer_right, publish_starter
+from mnemiq.sweep.config import SweepConfigError, load_config
+from mnemiq.sweep.propose import _agrees, _versions, propose
+from mnemiq.sweep.run import OUT_LOCK, _sole
+from mnemiq.sweep.starters import DatasetRecord, StarterEvidence, _whole_build, fewer_right, publish_starter
 
 from .conftest import (
-    KEY_ENV, deployment_file_naming, drafted_versions, drops_the_instant_section, evidence_file, finished_check,
-    finished_search, missing_from, plant, proposal_file, read_json, two_deployments, write,
+    CONFIG_BUILD, KEY_ENV, STUB_WINDOW, deployment_file_naming, drafted_versions, drops_the_instant_section, evidence,
+    evidence_file, finished_check, finished_search, graded_sweep, missing_from, one_model, out, plant, proposal_file,
+    read_json, starter_folder, two_deployments, write, write_config,
 )
 
 REPO = Path(__file__).resolve().parents[2]
@@ -99,7 +102,7 @@ def test_a_shortfall_in_thinking_alone_is_refused_naming_thinking(tmp_path, monk
 
 def test_a_set_where_every_question_has_an_answer_publishes_saying_made_up_was_not_measured(
         tmp_path, monkeypatch, stub_model):
-    # as on BIRD: no case without an answer, so made-up answers cannot show, and that alone refuses nothing
+    # as on a set where every question has an answer: made-up answers cannot show, and that alone refuses nothing
     cfg = finished_check(tmp_path, monkeypatch, stub_model, answerable_only=True)
     held = read_json(publish_starter(cfg, "m", "the tiny set")[1])
     assert held["made_up_measured"] is False and held["safe_by"] == "check"
@@ -110,6 +113,7 @@ def test_publishing_on_another_engine_build_is_refused(tmp_path, monkeypatch, st
     monkeypatch.setattr("mnemiq.sweep.starters.engine_build", lambda *a, **k: {"commit": "abc1234", "source_sha": "e" * 64})
     with pytest.raises(SweepConfigError, match="publish from a checkout at the sweep's commit"):
         publish_starter(cfg, "m", "the tiny set")
+    assert not list(profiles.starters_folder().glob("model-2.5-awq*"))
 
 
 def test_publishing_needs_a_checkout(tmp_path, monkeypatch, stub_model):
@@ -117,6 +121,7 @@ def test_publishing_needs_a_checkout(tmp_path, monkeypatch, stub_model):
     monkeypatch.setattr("mnemiq.sweep.starters.engine_commit", lambda *a, **k: None)
     with pytest.raises(SweepConfigError, match="run it from a checkout"):
         publish_starter(cfg, "m", "the tiny set")
+    assert not list(profiles.starters_folder().glob("model-2.5-awq*"))
 
 
 def test_an_unset_key_is_refused_first(tmp_path, monkeypatch, stub_model):
@@ -125,12 +130,15 @@ def test_an_unset_key_is_refused_first(tmp_path, monkeypatch, stub_model):
     monkeypatch.setattr("mnemiq.sweep.starters.engine_commit", lambda *a, **k: None)   # a later check would also fail
     with pytest.raises(SweepConfigError, match=KEY_ENV):
         publish_starter(cfg, "m", "the tiny set")
+    assert not list(profiles.starters_folder().glob("model-2.5-awq*"))
 
 
 def test_a_name_that_is_not_the_builds_is_refused(tmp_path, monkeypatch, stub_model):
     cfg = finished_check(tmp_path, monkeypatch, stub_model)
     with pytest.raises(SweepConfigError, match="is not the build's name 'model-2.5-awq'"):
         publish_starter(cfg, "m", "the tiny set", name="something-else")
+    assert not list(profiles.starters_folder().glob("model-2.5-awq*"))
+    assert not list(profiles.starters_folder().glob("something-else*"))
 
 
 def test_a_servers_local_weights_path_is_never_recorded(tmp_path, monkeypatch, stub_model):
@@ -155,6 +163,7 @@ def test_the_search_must_be_the_one_the_check_started_from(tmp_path, monkeypatch
     other = finished_search(tmp_path / "x", monkeypatch, stub_model)           # its proposal is another file
     with pytest.raises(SweepConfigError, match="is not the file the check started from"):
         publish_starter(check, "m", "the tiny set", search=other)
+    assert not list(profiles.starters_folder().glob("model-2.5-awq*"))
 
 
 def test_a_check_started_from_the_searchs_proposal_publishes_with_both_in_its_evidence(tmp_path, monkeypatch,
@@ -174,9 +183,10 @@ def test_a_check_started_from_the_searchs_proposal_publishes_with_both_in_its_ev
 
 def test_the_evidence_holds_aggregate_counts_only(tmp_path, monkeypatch, stub_model):
     cfg = finished_check(tmp_path, monkeypatch, stub_model)
-    plant(evidence_file(cfg), case_id="bird-1471", question="How many schools", path=str(tmp_path), url="http://192.0.2.9/v1")
+    plant(evidence_file(cfg), case_id="case-0001", question="How many widgets", path=str(tmp_path),
+          url="http://192.0.2.9/v1")
     text = publish_starter(cfg, "m", "the tiny set")[1].read_text()
-    assert not any(s in text for s in ("bird-1471", "How many schools", str(tmp_path), "192.0.2.9"))
+    assert not any(s in text for s in ("case-0001", "How many widgets", str(tmp_path), "192.0.2.9"))
 
 
 def test_a_mode_left_unmeasured_and_what_is_held_unset_are_named(tmp_path, monkeypatch, stub_model):
@@ -184,7 +194,8 @@ def test_a_mode_left_unmeasured_and_what_is_held_unset_are_named(tmp_path, monke
     held = read_json(publish_starter(cfg, "m", "the tiny set")[1])
     assert held["modes_measured"] == ["instant"]
     assert held["unmeasured_modes"] == {"thinking": ["writer_temperature"], "deep": ["writer_temperature"]}
-    assert "llm_seed" in held["held_unset"] and held["made_up_measured"] is True   # the tiny cases hold some with no answer
+    # the tiny cases hold some with no answer
+    assert "llm_seed" in held["held_unset"] and held["made_up_measured"] is True
 
 
 def test_a_starter_that_resolves_otherwise_is_never_moved_into_place(tmp_path, monkeypatch, stub_model):
@@ -210,3 +221,127 @@ def test_the_doc_names_every_evidence_field_and_every_shipped_starter():
     text = (REPO / "docs/starters.md").read_text()
     assert all(f"`{field}`" in text for field in StarterEvidence.model_fields)
     assert missing_from(text, starter_names()) == [] and missing_from(text, ["not-a-starter"]) == ["not-a-starter"]
+
+
+# --- what a person types, and what a second sweep brings -------------------------------------------------------------
+
+# A dataset label that could hold a path, that is not printable ASCII, that is empty, or that runs past the cap.
+UNFIT_LABELS = ["../questions", "C:\\sets\\mine", "the tiny set\n", "the tiny s\u00e9t", "x" * 81, ""]
+
+
+def _nothing_ran(tmp_path: Path):
+    """A config whose sweep never ran: its out folder made, nothing in it."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    cfg = load_config(write_config(tmp_path))
+    out(cfg).mkdir(parents=True)
+    return cfg
+
+
+@pytest.mark.parametrize("label", UNFIT_LABELS)
+def test_a_dataset_label_that_could_hold_a_path_or_is_unbounded_is_refused_first(tmp_path, monkeypatch, label):
+    starter_folder(tmp_path, monkeypatch, {})
+    with pytest.raises(SweepConfigError, match="--dataset"):
+        publish_starter(_nothing_ran(tmp_path), "m", label)    # refused before any sweep is read
+    assert not list(profiles.starters_folder().iterdir())
+
+
+@pytest.mark.parametrize("label", UNFIT_LABELS)
+def test_the_evidence_schema_refuses_such_a_dataset_label(label):
+    with pytest.raises(ValidationError):
+        DatasetRecord(name=label, questions=8, answerable=6)
+
+
+def test_a_printable_dataset_label_is_one_the_schema_takes():
+    assert DatasetRecord(name="the tiny set (v2): 8 questions", questions=8, answerable=6).name.startswith("the tiny")
+
+
+def test_a_search_whose_pick_lost_every_change_is_the_defaults_and_is_never_published(tmp_path, monkeypatch):
+    starter_folder(tmp_path, monkeypatch, {})
+    # Each mode's pick sets one profile-wide setting its own way, so the profile assembled from them keeps the start's
+    # value: the confirm round confirms the engine's defaults.
+    cfg = graded_sweep(tmp_path, modes=("instant", "thinking"),
+                       picks={"instant": "retrieval_k=36", "thinking": "retrieval_k=12"})
+    propose(cfg)
+    assert evidence(cfg)["confirm"]["same_as_start"] is True and evidence(cfg)["confirmed"] is True
+    with pytest.raises(SweepConfigError, match="the search's pick is the engine's defaults: there is no starter"):
+        publish_starter(cfg, "m", "the tiny set")
+    assert not list(profiles.starters_folder().iterdir())
+
+
+@pytest.mark.parametrize("held", ["check", "search"])
+def test_publishing_holds_each_sweeps_out_folder_lock_as_propose_does(tmp_path, monkeypatch, held):
+    starter_folder(tmp_path, monkeypatch, {})
+    sweeps = {"check": _nothing_ran(tmp_path / "check"), "search": _nothing_ran(tmp_path / "search")}
+    with _sole(out(sweeps[held]) / OUT_LOCK, RuntimeError("held by the test")):
+        with pytest.raises(SweepConfigError, match=re.escape(f"{out(sweeps[held])} is in use by a run or a proposal")):
+            publish_starter(sweeps["check"], "m", "the tiny set", search=sweeps["search"])
+    assert not list(profiles.starters_folder().iterdir())
+
+
+def test_a_search_that_is_itself_a_check_is_refused(tmp_path, monkeypatch, stub_model):
+    first = finished_check(tmp_path / "first", monkeypatch, stub_model)
+    second = finished_check(tmp_path / "second", monkeypatch, stub_model, start_file=proposal_file(first))
+    with pytest.raises(SweepConfigError, match="--search names a sweep in check mode"):
+        publish_starter(second, "m", "the tiny set", search=first)
+    assert not list(profiles.starters_folder().glob("model-2.5-awq*"))
+
+
+def test_a_search_given_beside_a_sweep_that_is_not_a_check_is_refused(tmp_path, monkeypatch, stub_model):
+    cfg = finished_search(tmp_path, monkeypatch, stub_model)
+    with pytest.raises(SweepConfigError, match="--search is given, so the sweep published must be a check"):
+        publish_starter(cfg, "m", "the tiny set", search=cfg)
+    assert not list(profiles.starters_folder().glob("model-2.5-awq*"))
+
+
+def test_a_shortfall_in_the_second_run_alone_is_refused(tmp_path, monkeypatch, stub_model):
+    # level with the defaults in its first run and one short in its second: a right-answers check that read only the
+    # first run would publish this
+    cfg = finished_check(tmp_path, monkeypatch, stub_model, repeats=2, start_declines=1, declining_from_run=2)
+    runs = evidence(cfg)["check"]["instant"]
+    start, defaults = ([run["right"] for run in runs[arm]] for arm in ("start", "defaults"))
+    assert start[0] == defaults[0] and start[1] == defaults[1] - 1
+    with pytest.raises(SweepConfigError, match="in instant its lowest right count over 2 runs is"):
+        publish_starter(cfg, "m", "the tiny set")
+    assert not list(profiles.starters_folder().glob("model-2.5-awq*"))
+
+
+def _servers(**read) -> dict:
+    """A sweep's record holding what it read of model `m`'s server: the stub's build, with `read` changed."""
+    return {"servers": {"m": {"server": "vllm", "server_version": "0.9.0.1", "context_window": STUB_WINDOW,
+                              "root_name": "model-2.5-awq"} | read}}
+
+
+def _stating(tmp_path: Path, build: dict | None, **fields):
+    """A config whose model states `build` (none when None), loaded; nothing runs."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    return load_config(write_config(tmp_path, models=one_model(build=build, **fields)))
+
+
+@pytest.mark.parametrize("search_build, search_read, match", [
+    (CONFIG_BUILD, {"server_version": None}, "the model build is incomplete: server_version not read"),
+    (CONFIG_BUILD, {"server_version": "0.10.0"}, "the two sweeps read different servers: server_version '0.9.0.1' and "
+                                                 "'0.10.0'"),
+    (CONFIG_BUILD | {"quantization": "gptq"}, {}, r"the two sweeps state different builds in \[models.m.build\]: "
+                                                  "quantization 'awq' and 'gptq'"),
+])
+def test_two_sweeps_that_read_or_state_the_build_otherwise_are_refused(tmp_path, search_build, search_read, match):
+    check = _stating(tmp_path / "check", CONFIG_BUILD, llm_context_window=STUB_WINDOW)
+    search = _stating(tmp_path / "search", search_build)
+    with pytest.raises(SweepConfigError, match=match):
+        _whole_build("m", [(check, _servers()), (search, _servers(**search_read))])
+
+
+def test_two_sweeps_on_one_build_pass_and_a_build_the_search_does_not_state_is_not_compared(tmp_path):
+    check = _stating(tmp_path / "check", CONFIG_BUILD, llm_context_window=STUB_WINDOW)
+    for number, build in enumerate((CONFIG_BUILD, None)):
+        search = _stating(tmp_path / f"search-{number}", build)
+        # the weights folder is never compared
+        _whole_build("m", [(check, _servers()), (search, _servers(root_name="3f2a9c"))])
+
+
+def test_evidence_the_schema_refuses_is_refused_before_anything_is_written(tmp_path, monkeypatch, stub_model):
+    cfg = finished_check(tmp_path, monkeypatch, stub_model)
+    plant(evidence_file(cfg), version={"lib.a": "0123456789ab"})    # as a deployment named lib.a would give it
+    with pytest.raises(SweepConfigError, match="evidence does not have the form the engine reads: versions"):
+        publish_starter(cfg, "m", "the tiny set")
+    assert not list(profiles.starters_folder().glob("model-2.5-awq*"))

@@ -14,6 +14,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import threading
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -1106,9 +1107,13 @@ _START_CARDS = "ddl"
 _START_MARK = "CREATE TABLE"
 
 
-def _start_rule(stub: StubModel, *, declines: int, wrong: bool):
+def _start_rule(stub: StubModel, *, declines: int, wrong: bool, from_ask: int = 1):
     """A rule for the scripted model: under the start's settings, as its cards show, it declines the first `declines`
-    answerable cases it knows, or with `wrong` answers every case wrong. Every other request is answered as scripted."""
+    answerable cases it knows from its `from_ask`-th ask of each on (in instant mode, one ask a run), or with `wrong`
+    answers every case wrong. Every other request is answered as scripted."""
+    asked: dict[str, int] = {}
+    lock = threading.Lock()
+
     def rule(request: dict) -> str | None:
         system, user = _messages(request)
         if _WRITER not in system or _START_MARK not in f"{system}\n{user}":
@@ -1116,9 +1121,11 @@ def _start_rule(stub: StubModel, *, declines: int, wrong: bool):
         case = stub._script.find(user)
         if case is None:
             return None
+        with lock:
+            asked[case.id] = count = asked.get(case.id, 0) + 1
         if wrong and case.wrong_sql:
             return _proposal(case.wrong_sql)
-        if case.answerable and stub._script.answerable_rank(case) < declines:
+        if count >= from_ask and case.answerable and stub._script.answerable_rank(case) < declines:
             return _proposal(None, "declined under the start's settings")
         return None
 
@@ -1128,7 +1135,8 @@ def _start_rule(stub: StubModel, *, declines: int, wrong: bool):
 def _start_profile(tmp_path: Path, settings: dict, marked: list[str]) -> dict:
     """A `[start]` section naming a profile that sets `settings` profile-wide and gives each mode of `marked` a section
     whose cards the scripted model can tell from the defaults' (`_START_CARDS`)."""
-    lines = ['default = "start"', "[profiles.start]", *(f"{name} = {_toml_value(value)}" for name, value in settings.items())]
+    lines = ['default = "start"', "[profiles.start]",
+             *(f"{name} = {_toml_value(value)}" for name, value in settings.items())]
     for mode in marked:
         lines += [f"[profiles.start.{mode}]", f'card_style = "{_START_CARDS}"']
     path = write(tmp_path / "start-for-a-starter.toml", "\n".join(lines) + "\n")
@@ -1140,10 +1148,10 @@ def finished_check(tmp_path: Path, monkeypatch, stub: StubModel, *, build=CONFIG
                    defaults_better: bool = False, person_chose: str | None = None, propose: dict | None = None,
                    start_sets: dict | None = None, unfinished: bool = False, config_edited_after: bool = False,
                    start_declines: int | dict[str, int] = 0, answerable_only: bool = False,
-                   start_file: Path | None = None):
+                   start_file: Path | None = None, repeats: int = 1, declining_from_run: int = 1):
     """A check-mode sweep of model `m` over the tiny deployment, run on the product path and proposed, loaded, with the
     starters folder patched to `tmp_path / "starters"`. The scripted model answers every case right, and `[models.m]`
-    states `build` and `llm_context_window` (each omitted when None). One run per arm.
+    states `build` and `llm_context_window` (each omitted when None). `repeats` runs per arm, one by default.
 
     The start sets `start_sets` profile-wide (by default retrieval_k = 12), and each mode it is told apart in has a
     section whose cards the scripted model can read (`_start_rule`): every measured mode, or with `start_declines` a
@@ -1155,7 +1163,8 @@ def finished_check(tmp_path: Path, monkeypatch, stub: StubModel, *, build=CONFIG
     - `person_chose`: a person's pick (`propose --choose`) in place of the rule's.
     - `start_declines`: under the start's settings the model declines that many answerable cases it answers right under
       the defaults', so the start has fewer right and no more wrong, and the rule still proposes it. An int applies in
-      every measured mode; a dict names the modes, the start level elsewhere.
+      every measured mode; a dict names the modes, the start level elsewhere. With `declining_from_run`, the declines
+      begin at that run of the start, which is level with the defaults before it (instant mode asks a case once a run).
     - `answerable_only`: the tiny question file without its cases that have no answer.
     - `unfinished`: a budget no arm fits in, so the run stops before the first arm and nothing is proposed.
     - `config_edited_after`: the config is edited once the proposal is written, and loaded again.
@@ -1170,7 +1179,7 @@ def finished_check(tmp_path: Path, monkeypatch, stub: StubModel, *, build=CONFIG
     named = start_declines if isinstance(start_declines, dict) else dict.fromkeys(modes, start_declines)
     assert len(set(named.values())) <= 1, "the start declines as many cases in each mode it is told apart in"
     marked = [mode for mode in modes if mode in named]
-    rule = _start_rule(stub, declines=next(iter(named.values()), 0), wrong=defaults_better)
+    rule = _start_rule(stub, declines=next(iter(named.values()), 0), wrong=defaults_better, from_ask=declining_from_run)
     model = stub(rule, gold=True, reports_build=reports_build, **({"root": root} if root is not None else {}))
     deployment = tiny_deployment(tmp_path, model)
     questions = None
@@ -1178,7 +1187,7 @@ def finished_check(tmp_path: Path, monkeypatch, stub: StubModel, *, build=CONFIG
         questions = write(tmp_path / "questions-answerable.json",
                           json.dumps([_graded(case) for case in CASES if case.get("answerable", True)], indent=2))
     sections: dict = {
-        "search": {"strategy": "check"}, "sweep": {"repeats": 1}, "modes": modes,
+        "search": {"strategy": "check"}, "sweep": {"repeats": repeats}, "modes": modes,
         "start": ({"profile_file": str(start_file)} if start_file is not None
                   else _start_profile(tmp_path, {"retrieval_k": 12} if start_sets is None else start_sets, marked)),
         "models": one_model(model, build=build, llm_context_window=llm_context_window),
