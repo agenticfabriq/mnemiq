@@ -155,6 +155,15 @@ describe("fetchWhoami", () => {
       ["/relative", null],
       // A browser reads this host as example.com: the engine refuses it at startup, and so does this.
       ["http://example.com\\.localhost/logout", null],
+      // A browser decodes this host to kc.example.com, where the engine's check read it as written.
+      ["https://kc%2eexample.com/x", null],
+      ["", null],
+      ["https://", null],
+      // Outside the host, percent-encoding is the provider's.
+      [
+        "https://idp.example/realms/my%20realm/protocol/openid-connect/logout?client_id=a%2Fb",
+        "https://idp.example/realms/my%20realm/protocol/openid-connect/logout?client_id=a%2Fb",
+      ],
     ];
     for (const [sent, kept] of cases) {
       stubFetch(json({ principal_id: "alice@example.com", tenant_id: "tenant-a", verified: true, end_session_url: sent }));

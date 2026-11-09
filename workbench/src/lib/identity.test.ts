@@ -287,6 +287,11 @@ describe("signOutHref", () => {
     expect(signOutHref(null, "https://mnemiq.example", "/x?y=1")).toBe("/oauth2/sign_out?rd=%2Fx%3Fy%3D1");
   });
 
+  it("falls back to the proxy's own sign-out when the end-session URL cannot be read", () => {
+    // fetchWhoami never passes one on, but a throw here would land after the threads were purged.
+    expect(signOutHref("not a url", "https://mnemiq.example", "/")).toBe("/oauth2/sign_out?rd=%2F");
+  });
+
   it("ends at the identity provider, which sends the browser back to the workbench's root", () => {
     expect(signOutHref(END, "https://mnemiq.example", "/x?y=1")).toBe(
       "/oauth2/sign_out?rd=" +

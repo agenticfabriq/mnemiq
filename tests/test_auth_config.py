@@ -290,6 +290,8 @@ END = "https://idp.example/realms/r/protocol/openid-connect/logout?client_id=wor
     ("http://localhost/logout", None),
     ("http://keycloak.localhost:18089/realms/r/protocol/openid-connect/logout", None),
     ("HTTPS://IDP.example/logout", None),
+    # Percent-encoding outside the host is the provider's business: a realm or a client id may need it.
+    ("https://idp.example/realms/my%20realm/protocol/openid-connect/logout?client_id=a%2Fb", None),
     ("http://idp.example/logout", "http is allowed only"),
     ("ftp://idp.example/", "scheme"),
     ("/realms/r/logout", "scheme"),
@@ -305,6 +307,14 @@ END = "https://idp.example/realms/r/protocol/openid-connect/logout?client_id=wor
     ("https://idp .example/logout", "printable ASCII"),
     ("https://idp.example/log\tout", "printable ASCII"),
     ("https://\u00eddp.example/logout", "printable ASCII"),
+    # A browser percent-decodes a host before it reads it; urlsplit does not.
+    ("https://kc%2eexample.com/x", "percent-encoded"),
+    ("https://kc%2Fexample.com/x", "percent-encoded"),
+    ("https://kc.example.com%3A443/x", "percent-encoded"),
+    ("http://evil.com%2F.localhost/logout", "percent-encoded"),
+    # A single label is not under .localhost, and resolves through the DNS search domain.
+    ("http://notlocalhost/logout", "http is allowed only"),
+    ("https://idp.example/logout#", "fragment"),
 ])
 def test_an_end_session_url_must_be_https_or_loopback_http(url, refused_because):
     """The browser is sent there, so a typo must not become an open redirect: https, or http only where a browser

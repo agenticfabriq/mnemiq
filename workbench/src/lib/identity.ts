@@ -168,8 +168,15 @@ export const SIGN_OUT = "/oauth2/sign_out";
  * signed straight back in.
  */
 export function signOutHref(endSession: string | null, origin: string, back: string): string {
-  if (endSession === null) return `${SIGN_OUT}?rd=${encodeURIComponent(back)}`;
-  const end = new URL(endSession);
+  const proxyOnly = `${SIGN_OUT}?rd=${encodeURIComponent(back)}`;
+  if (endSession === null) return proxyOnly;
+  let end: URL;
+  try {
+    end = new URL(endSession);
+  } catch {
+    // The threads are already purged by now, so a URL that cannot be read must not stop the sign-out.
+    return proxyOnly;
+  }
   end.searchParams.set("post_logout_redirect_uri", `${origin}/`);
   return `${SIGN_OUT}?rd=${encodeURIComponent(end.toString())}`;
 }
