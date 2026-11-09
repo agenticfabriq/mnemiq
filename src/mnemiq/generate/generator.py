@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -155,6 +158,27 @@ class Generator(Protocol):
 GENERATOR_MAX_TOKENS = 4000
 
 
+# The least temperature the writer sends for calls made inside `temperature_floor(floor)`. A context
+# variable, as `seed_offset`'s is, so it reaches `LLMGenerator.propose` through `StrategyGenerator`
+# and `plan_query` with no signature changed, and holds per thread under the HTTP server. Read here
+# and not in the client, so it reaches only the writer's calls, never the judge's or the selector's.
+_TEMPERATURE_FLOOR: ContextVar[float | None] = ContextVar("mnemiq_temperature_floor", default=None)
+
+
+@contextmanager
+def temperature_floor(floor: float | None) -> Iterator[None]:
+    """The writer's calls made inside send at least `floor` when its temperature is set, and what
+    they would send without it otherwise: the agent wraps a candidate that repeats an earlier one's
+    strategy, in any mode set to more candidates than there are strategies, since at temperature 0
+    it would return that candidate's SQL again. None sets no floor. Reset on exit, a raise included,
+    so no call made after the block on the same thread is sent the floor."""
+    token = _TEMPERATURE_FLOOR.set(floor)
+    try:
+        yield
+    finally:
+        _TEMPERATURE_FLOOR.reset(token)
+
+
 class LLMGenerator:
     def __init__(self, client, max_tokens: int = GENERATOR_MAX_TOKENS, dialect: str = "duckdb",
                  guided_sql: bool = False, assertive: bool = False,
@@ -182,12 +206,15 @@ class LLMGenerator:
             system, user = question_last_prompt(system, packet, feedback)
         else:
             user = user_prompt(packet, feedback)
+        temperature, floor = self._temperature, _TEMPERATURE_FLOOR.get()
+        if temperature is not None and floor is not None:
+            temperature = max(temperature, floor)  # raises a temperature that is set, never sends one
         raw = self._client.complete(
             system,
             user,
             max_tokens=self._max_tokens,
             **({"extra_body": extra} if extra else {}),
-            **({"temperature": self._temperature} if self._temperature is not None else {}),
+            **({"temperature": temperature} if temperature is not None else {}),
         )
         return _parse_after_reasoning(raw) if self._reasoning == "before_sql" else _parse(raw)
 

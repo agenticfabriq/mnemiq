@@ -97,7 +97,9 @@ declined. It leaves no room for reasoning before the answer.
 `writer_temperature` sets the writer's sampling temperature. At 0 the writer takes its most likely words, so the same
 question gets the same SQL run after run on a server that honours it. Unset, none is sent and the server's default
 applies (0.7 for Qwen2.5). It is refused for a model that takes no temperature, such as GPT-5. `llm_seed` sends a
-sampling seed on every call; vLLM honours it, and the hosted endpoint accepts it and ignores it.
+sampling seed on every call; vLLM honours it, and the hosted endpoint accepts it and ignores it. A mode set to more
+than three candidates, as deep is, raises the writer's temperature to 0.7 for a candidate that repeats a strategy
+("Several candidates"), so its answers at 0 repeat run after run only when `llm_seed` is set.
 
 ### Repair from feedback
 
@@ -113,7 +115,11 @@ corrector.
 
 Deep mode writes several candidate statements with different strategies (`candidates`), runs them all and groups
 them by their result. `min_agreement` is the share of candidates that must return the same result: below it, or when
-some candidates fail to run, the question is declined as disagreement rather than answered with a pick. When no
+some candidates fail to run, the question is declined as disagreement rather than answered with a pick. When
+`writer_temperature` is set below 0.7, a candidate whose strategy an earlier candidate already used, which only a mode
+set to more than three candidates has (deep's fourth and fifth of five), is sent 0.7, so it samples instead of
+repeating that candidate's answer, and the agreement gate counts no copies. Every other candidate, every mode with one
+candidate, and the fallback to the single path are sent the temperature as set. When no
 candidate runs at all, deep mode falls back to the single path with its repairs, and that answer has no agreement
 behind it. When the candidates do not already agree, the `judge`, a model call, picks among their distinct results;
 without it, the most common result is taken. Both need more than one candidate.
