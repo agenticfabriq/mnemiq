@@ -123,10 +123,16 @@ The URL must be written as a browser sends it, and the three things it needs are
 [settings](settings.md#identity-from-tokens). A user the door refuses with a 403 (no `db.read`, another tenant) is
 told the same URL in the refusal's body, so the workbench can let them sign out and switch accounts.
 
+**Open WebUI's own Sign out (option A) ends the provider's session too.** It goes to the provider's end-session
+endpoint with the user's ID token, then back to its sign-in page, so the next sign-in asks for the password. Checked
+with Open WebUI v0.13.0 and Keycloak 26.0.
+
 ## Local development
 
-The example names Keycloak `keycloak.localhost`, which browsers resolve to this machine, so one address serves the
-browser and the containers alike, over plain http. That is for local development only. A deployment serves its
+The example names Keycloak `keycloak.localhost`, which browsers resolve to this machine (checked with Chrome 157 and
+Safari 27.2 on macOS), so one address serves the browser and the containers alike, over plain http. A program using
+the system's resolver may not resolve it, as on a Linux host with no `myhostname` in its name-service switch, so
+`make-secrets.py` reaches Keycloak by its published address. That is for local development only. A deployment serves its
 provider over https under its own name, and mnemiq's check allows http only for loopback and `.localhost` names.
 
 ## What an answer looks like
