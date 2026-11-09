@@ -21,7 +21,7 @@ from mnemiq.sweep.starters import (
 )
 
 from .conftest import (
-    COMMIT, CONFIG_BUILD, PATH_SHAPED_KEY, SHA12, STUB_WINDOW, altered, evidence, one_model, started_sweep,
+    COMMIT, CONFIG_BUILD, NAMED_KEY, PATH_SHAPED_KEY, SHA12, STUB_WINDOW, altered, evidence, one_model, started_sweep,
     starter_with_evidence, sweep_json, valid_evidence, write, write_config,
 )
 
@@ -206,6 +206,7 @@ def test_a_starter_without_valid_evidence_is_refused_at_load(tmp_path, monkeypat
                                       ("check", "instant", 0, "start", "extra"), ("unmeasured_modes", "fast"),
                                       ("rule", "max_more_wrong"), ("published", None),
                                       ("versions", PATH_SHAPED_KEY), ("measured_versions", "instant", PATH_SHAPED_KEY),
+                                      ("versions", NAMED_KEY), ("measured_versions", "instant", NAMED_KEY),
                                       ("model_build", "model", None, "/srv/models/qwen-awq"),
                                       ("published", None, NO_SUCH_DAY), ("published", None, DAY_IN_OTHER_DIGITS)])
 def test_the_evidence_schema_refuses_what_it_does_not_name_at_any_depth(tmp_path, monkeypatch, plant_at):

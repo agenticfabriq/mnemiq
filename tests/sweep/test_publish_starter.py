@@ -50,10 +50,12 @@ def test_two_deployments_and_two_modes_each_resolve_to_their_measured_version(tm
     cfg = finished_check(tmp_path, monkeypatch, stub_model, dataset=two_deployments(tmp_path, stub_model()),
                          modes=["instant", "thinking"])
     held = read_json(publish_starter(cfg, "m", "the tiny set")[1])
-    assert set(held["versions"]) == {"lib-a", "lib-b"} and len(set(held["versions"].values())) == 2
+    # numbered in the order of the sorted names, which are never published
+    assert set(held["versions"]) == {"deployment-1", "deployment-2"} and len(set(held["versions"].values())) == 2
     assert set(held["measured_versions"]) == {"instant", "thinking"}
     dep = write(tmp_path / "dep.toml", deployment_file_naming("model-2.5-awq", cfg))
-    assert _versions(cfg, dep, {}) == {"lib-a": held["versions"]["lib-a"], "lib-b": held["versions"]["lib-b"]}
+    assert _versions(cfg, dep, {}) == {"lib-a": held["versions"]["deployment-1"],
+                                       "lib-b": held["versions"]["deployment-2"]}
 
 
 @pytest.mark.parametrize("make, match", [
@@ -347,8 +349,9 @@ def test_two_sweeps_on_one_build_pass_and_a_build_the_search_does_not_state_is_n
 
 def test_evidence_the_schema_refuses_is_refused_before_anything_is_written(tmp_path, monkeypatch, stub_model):
     cfg = finished_check(tmp_path, monkeypatch, stub_model)
-    plant(evidence_file(cfg), version={"lib.a": "0123456789ab"})    # as a deployment named lib.a would give it
-    with pytest.raises(SweepConfigError, match="evidence does not have the form the engine reads: versions"):
+    # a value of another type than the schema's, as a later proposal might write
+    plant(evidence_file(cfg), rule=read_json(evidence_file(cfg))["rule"] | {"alpha": "0.05"})
+    with pytest.raises(SweepConfigError, match="evidence does not have the form the engine reads: alpha"):
         publish_starter(cfg, "m", "the tiny set")
     assert not list(profiles.starters_folder().glob("model-2.5-awq*"))
 
@@ -479,3 +482,18 @@ def test_a_hidden_file_publishing_never_makes_survives_a_publish(tmp_path, monke
             write(folder / f".model-2.5-awq.toml.{'A' * 32}.tmp", "not a copy publishing names: its hex is upper case")]
     publish_starter(cfg, "m", "the tiny set")
     assert all(path.exists() for path in kept)
+
+
+def test_deployments_are_numbered_in_the_evidence_and_never_named(tmp_path, monkeypatch, stub_model):
+    names = ("customer_acme_prod", "warehouse_eu")
+    cfg = finished_check(tmp_path, monkeypatch, stub_model, dataset=two_deployments(tmp_path, stub_model(), names),
+                         modes=["instant", "thinking"])
+    shipped = [path.read_bytes() for path in publish_starter(cfg, "m", "the tiny set")]
+    assert not any(name.encode() in data for name in names for data in shipped)
+    held = read_json(profiles.starters_folder() / "model-2.5-awq.evidence.json")
+    numbered = {"customer_acme_prod": "deployment-1", "warehouse_eu": "deployment-2"}      # one mapping, sorted
+    proposed = evidence(cfg)                                                       # the sweep's own, by name
+    assert held["versions"] == {numbered[name]: version for name, version in proposed["version"].items()}
+    assert held["measured_versions"] == {
+        mode: {numbered[name]: version for name, version in each.items()}
+        for mode, each in proposed["measured_versions"].items()}

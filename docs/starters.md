@@ -79,7 +79,7 @@ Publishing refuses, before it writes anything:
 - a `--name` other than the build's;
 - with `--search`, a search whose proposal is not the file the check's arms started from, by its hash as they pinned
   it;
-- evidence its schema refuses, such as a `db_id` outside the form the schema reads;
+- evidence its schema refuses, such as a value of another type than the schema's;
 - the starters folder, while another publisher holds its lock. Publishing takes that lock only once every check above
   has passed, so a refusal leaves the starters folder as it was, with no lock file in it.
 
@@ -102,7 +102,8 @@ delete it, or publish again.
 
 Every starter ships with `<name>.evidence.json` beside it. The engine reads its `starter_sha256` whenever it loads the
 starter, and a sweep reads all of it before it starts from the starter. It holds builds, the rule and aggregate
-counts, never a question, a statement, a case id or a path, and its schema refuses any field it does not name:
+counts, never a question, a statement, a case id or a path, and its schema refuses any field it does not name.
+Deployments are numbered in it, never named. The dataset label is the publisher's own words, and is public:
 
 - `starter`: the starter's name.
 - `starter_sha256`: the sha256 of the starter's file. The engine loads the starter only beside evidence that records
@@ -126,10 +127,11 @@ counts, never a question, a statement, a case id or a path, and its schema refus
   medians and prompt tokens. Null for a starter made by a search alone.
 - `search`: from the search, its split, how many arms each mode compared with the start, each mode's pick, whether the
   pick was confirmed, and the held-out runs of the start and the pick. Null when no search is part of the evidence.
-- `versions`: the version the measured profile resolves to on each deployment the sweep read, by its `db_id`, or under
-  `""` for a sweep of one.
+- `versions`: the version the measured profile resolves to on each deployment the sweep read, under
+  `deployment-1`, `deployment-2` and on, numbered in the order of the deployments' sorted names, or under `""` for a
+  sweep of one.
 - `measured_versions`: when each mode was measured with a profile of its own, the version each mode's rows were stamped
-  with, by deployment. Null when one profile was measured in every mode.
+  with, by deployment, numbered as in `versions`. Null when one profile was measured in every mode.
 
 ## What a starter overrides, cannot clear, and never reaches
 

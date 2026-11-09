@@ -339,6 +339,8 @@ COMMIT = engine_build()["commit"] or "no commit"
 # A database key shaped like a machine path, which the evidence schema refuses. Spelled in two parts, as the repo
 # guard's own tests spell one, so the source never holds a home path.
 PATH_SHAPED_KEY = "/" + "Users/x"
+# A deployment named as a customer might name one, which published evidence numbers instead.
+NAMED_KEY = "customer_acme_prod"
 
 
 def one_model(stub: StubModel | None = None, **fields) -> dict:
@@ -461,8 +463,8 @@ def altered(evidence: dict, path: tuple) -> dict:
         holder["extra"] = 1
     elif planted == "fast":
         holder["fast"] = copy.deepcopy(next(iter(holder.values())))
-    elif planted == PATH_SHAPED_KEY:
-        holder[PATH_SHAPED_KEY] = "0123456789ab"
+    elif planted in (PATH_SHAPED_KEY, NAMED_KEY):
+        holder[planted] = "0123456789ab"
     else:
         raise ValueError(f"no such change: {path}")
     return changed
@@ -657,16 +659,16 @@ def start_of(cfg, mode: str, *, model: str = "m"):
     return next(a for a in screen_arms(cfg) if a.model == model and a.mode == mode and not a.changes)
 
 
-def two_deployments(tmp_path: Path, stub: StubModel) -> dict:
-    """The tiny deployment read as two, `lib-a` and `lib-b`, with the tiny cases split between them by db_id: two env
-    files naming the same store and source, `lib-b`'s with a longer question limit, which its profile's version holds.
-    Returned as the `[dataset]` keys that name them, for `write_config(dataset=...)`."""
+def two_deployments(tmp_path: Path, stub: StubModel, names: tuple[str, str] = ("lib-a", "lib-b")) -> dict:
+    """The tiny deployment read as two, `lib-a` and `lib-b` (or `names`), with the tiny cases split between them by
+    db_id: two env files naming the same store and source, the second's with a longer question limit, which its
+    profile's version holds. Returned as the `[dataset]` keys that name them, for `write_config(dataset=...)`."""
     d = tiny_deployment(tmp_path, stub)
-    envs = {name: d.root / f"{name}.env" for name in ("lib-a", "lib-b")}
-    envs["lib-a"].write_text(d.env.read_text())
-    envs["lib-b"].write_text(d.env.read_text() + "MNEMIQ_MAX_QUESTION_CHARS='2000'\n")
+    envs = {name: d.root / f"{name}.env" for name in names}
+    envs[names[0]].write_text(d.env.read_text())
+    envs[names[1]].write_text(d.env.read_text() + "MNEMIQ_MAX_QUESTION_CHARS='2000'\n")
     questions = d.root / "questions-two-deployments.json"
-    questions.write_text(json.dumps([_graded(case) | {"db_id": ("lib-a", "lib-b")[number % 2]}
+    questions.write_text(json.dumps([_graded(case) | {"db_id": names[number % 2]}
                                      for number, case in enumerate(CASES)]))
     return {"questions": str(questions), "deployments": {name: str(env) for name, env in envs.items()}}
 

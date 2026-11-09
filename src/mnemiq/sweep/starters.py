@@ -73,8 +73,9 @@ def _calendar_day(value: str) -> str:
 
 # A day as `YYYY-MM-DD`, in ASCII digits (`\d` would take any script's), and one a calendar has.
 Day = Annotated[str, Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"), AfterValidator(_calendar_day)]
-# A deployment's `db_id`, or "" for a sweep of one deployment: never a path.
-DbKey = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{0,64}$")]
+# A deployment as published evidence holds it: numbered `deployment-<n>`, never named, since a deployment's own name
+# (its `db_id`) can name a customer; or "" for a sweep of one deployment.
+DeploymentKey = Annotated[str, Field(pattern=r"^(?:deployment-[1-9][0-9]*)?$")]
 # The label a person gives the questions a starter was measured on (`--dataset`): printable ASCII with no slash of
 # either kind, so it is never a path, at least one character that is not a space, and at most `DATASET_LABEL_MAX`.
 DATASET_LABEL_PATTERN = r"^[\x20-\x2e\x30-\x5b\x5d-\x7e]*[\x21-\x2e\x30-\x5b\x5d-\x7e][\x20-\x2e\x30-\x5b\x5d-\x7e]*$"
@@ -185,8 +186,8 @@ class StarterEvidence(_Record):
     held_unset: list[str]
     check: dict[Mode, list[CheckRun]] | None
     search: SearchRecord | None
-    versions: dict[DbKey, str]
-    measured_versions: dict[Mode, dict[DbKey, str]] | None  # when the profile was measured mode by mode
+    versions: dict[DeploymentKey, str]
+    measured_versions: dict[Mode, dict[DeploymentKey, str]] | None  # when the profile was measured mode by mode
 
 
 def build_name(repo_id: str) -> str:
@@ -597,9 +598,23 @@ def _counts(run: dict) -> Counts:
     return Counts(**{field: run[field] for field in Counts.model_fields})
 
 
-def _by_deployment(version: str | dict) -> dict[str, str]:
-    """A version as the evidence holds it, for each deployment: "" for a sweep of one."""
-    return {"": version} if isinstance(version, str) else dict(version)
+def _numbered(cfg: SweepConfig) -> dict[str, str]:
+    """Each deployment the sweep read, by its `db_id`, to the key published evidence gives it: `deployment-<n>`, in the
+    order of the sorted ids. One mapping serves every version the evidence holds. Empty for a sweep of one."""
+    return {db_id: f"deployment-{number}"
+            for number, db_id in enumerate(sorted(cfg.dataset.deployments or {}), start=1)}
+
+
+def _by_deployment(version: str | dict, numbered: dict[str, str]) -> dict[str, str]:
+    """A version as published evidence holds it, for each deployment: under "" for a sweep of one, else under each
+    deployment's number (`numbered`), never its name. Refused when it names a deployment the sweep did not read, which
+    no number could stand for."""
+    if isinstance(version, str):
+        return {"": version}
+    if not set(version) <= set(numbered):
+        raise SweepConfigError("the proposal's versions name a deployment the sweep did not read, so they cannot be "
+                               "numbered: propose from the sweep again")
+    return {numbered[db_id]: each for db_id, each in sorted(version.items())}
 
 
 def _search_record(evidence: dict) -> SearchRecord:
@@ -646,6 +661,7 @@ def _evidence(cfg: SweepConfig, model: str, name: str, dataset: str, state: dict
     entry, read = cfg.models[model], state["servers"][model]
     stated = entry.build.model_dump()
     measured_versions = evidence.get("measured_versions")
+    numbered = _numbered(cfg)
     return StarterEvidence(
         starter=name,
         starter_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
@@ -669,9 +685,9 @@ def _evidence(cfg: SweepConfig, model: str, name: str, dataset: str, state: dict
                    for start, defaults in zip(found_mode["start"], found_mode["defaults"], strict=True)]
             for mode, found_mode in evidence["check"].items()},
         search=_search_record(found) if found is not None else None,
-        versions=_by_deployment(evidence["version"]),
+        versions=_by_deployment(evidence["version"], numbered),
         measured_versions=None if measured_versions is None else {
-            mode: _by_deployment(version) for mode, version in measured_versions.items()},
+            mode: _by_deployment(version, numbered) for mode, version in measured_versions.items()},
     )
 
 
