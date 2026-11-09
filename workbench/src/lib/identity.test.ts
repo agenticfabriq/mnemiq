@@ -10,6 +10,7 @@ import {
   mayReload,
   namespaceOf,
   signOut,
+  signOutHref,
 } from "./identity";
 
 const ALICE = { principal_id: "alice@example.com", tenant_id: "tenant-a", verified: true };
@@ -275,6 +276,25 @@ describe("signOut", () => {
     signOut(alice);
 
     expect(localStorage.getItem(keyFor(bob, "threads"))).toBe("[bob's]");
+  });
+});
+
+describe("signOutHref", () => {
+  const END = "https://kc.example/realms/r/protocol/openid-connect/logout?client_id=workbench-proxy";
+
+  it("is the proxy's own sign-out, back to the page, with no end-session URL", () => {
+    expect(signOutHref(null, "https://mnemiq.example", "/")).toBe("/oauth2/sign_out?rd=%2F");
+    expect(signOutHref(null, "https://mnemiq.example", "/x?y=1")).toBe("/oauth2/sign_out?rd=%2Fx%3Fy%3D1");
+  });
+
+  it("ends at the identity provider, which sends the browser back to the workbench's root", () => {
+    expect(signOutHref(END, "https://mnemiq.example", "/x?y=1")).toBe(
+      "/oauth2/sign_out?rd=" +
+        encodeURIComponent(
+          "https://kc.example/realms/r/protocol/openid-connect/logout?client_id=workbench-proxy" +
+            "&post_logout_redirect_uri=https%3A%2F%2Fmnemiq.example%2F",
+        ),
+    );
   });
 });
 

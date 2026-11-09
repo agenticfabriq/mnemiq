@@ -491,6 +491,28 @@ describe("signing out", () => {
     expect(reload).not.toHaveBeenCalled();
   });
 
+  it("ends the sign-out at the identity provider when the engine names its end-session URL", async () => {
+    const END = "https://kc.example/realms/r/protocol/openid-connect/logout?client_id=workbench-proxy";
+    const alice = await signedInBefore(ALICE, "alice's question");
+    serve({ "/v1/whoami": () => json({ ...ALICE, end_session_url: END }), "/v1/schema": SCOPE });
+    const navigate = vi.fn();
+    render(<App reload={vi.fn()} navigate={navigate} />);
+    expect(await screen.findAllByText("alice's question")).not.toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+
+    // The proxy's sign-out first, then the provider's, which returns the browser to the workbench's root.
+    const root = encodeURIComponent(`${globalThis.location.origin}/`);
+    await waitFor(() =>
+      expect(navigate).toHaveBeenCalledWith(
+        `/oauth2/sign_out?rd=${encodeURIComponent(`${END}&post_logout_redirect_uri=${root}`)}`,
+      ),
+    );
+    await settle();
+    expect(localStorage.getItem(keyFor(alice, "threads"))).toBeNull();
+    expect(localStorage.getItem(keyFor(alice, "mode"))).toBeNull();
+  });
+
   for (const [what, whoami] of [
     ["an engine without the whoami route", () => new Response("", { status: 404 })],
     ["the settings identity", () => json({ principal_id: "analyst", tenant_id: "local", verified: false })],

@@ -71,7 +71,7 @@ export async function fetchWhoami(): Promise<Whoami | null> {
   const response = await v1("/v1/whoami");
   if (response.status === 404) return null;
   if (!response.ok) throw new Refused("unavailable");
-  let body: { principal_id?: unknown; tenant_id?: unknown; verified?: unknown };
+  let body: { principal_id?: unknown; tenant_id?: unknown; verified?: unknown; end_session_url?: unknown };
   try {
     body = (await response.json()) as typeof body;
   } catch {
@@ -88,7 +88,21 @@ export async function fetchWhoami(): Promise<Whoami | null> {
     // Only an explicit false is unverified. Read the other way, an engine that left the field
     // out would hand a verified user the history of whoever used this browser before.
     verified: body.verified !== false,
+    end_session_url: endSessionOf(body.end_session_url),
   };
+}
+
+/** The end-session URL the engine names, kept only as an absolute http(s) URL. The browser is sent
+ *  there on Sign out, so anything else (a script URL, a relative path, a non-string, or nothing, from
+ *  an engine before the field) reads as none, and Sign out stays the proxy's own. */
+function endSessionOf(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  try {
+    const { protocol } = new URL(value);
+    return protocol === "https:" || protocol === "http:" ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 /** A run that failed before the engine started one. `code` "unavailable" marks a service

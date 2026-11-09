@@ -10,7 +10,7 @@
  * email address, and every key sits in plain view in the browser's storage panel.
  */
 
-import type { Whoami } from "./types";
+import type { Identity } from "./types";
 
 const PREFIX = "mnemiq.ns.";
 
@@ -49,7 +49,7 @@ export const keyFor = (ns: string, item: Item): string =>
  * it. `crypto.subtle` exists only in a secure context; a verified user on a page without it
  * gets no namespace, so nothing of theirs is read or written.
  */
-export async function namespaceOf(who: Whoami | null): Promise<string | null> {
+export async function namespaceOf(who: Identity | null): Promise<string | null> {
   if (who === null || !who.verified) return SINGLE;
   const subtle = globalThis.crypto?.subtle;
   if (!subtle) return null;
@@ -155,6 +155,23 @@ export function enter(ns: string | null): string | null {
     // Full: the next load compares against the older marker and purges again, which is safe.
   }
   return shelf;
+}
+
+/** The sign-in proxy's own sign-out, which ends its session and then sends the browser to `rd`. */
+export const SIGN_OUT = "/oauth2/sign_out";
+
+/**
+ * Where Sign out sends the browser. Without an end-session URL, the proxy's sign-out, back to the
+ * page signed out from, exactly as before. With one, `rd` is the identity provider's end-session URL,
+ * carrying the workbench's root as `post_logout_redirect_uri` (one exact address the provider can
+ * register), so the provider's session ends even when the proxy could not end it, and nobody is
+ * signed straight back in.
+ */
+export function signOutHref(endSession: string | null, origin: string, back: string): string {
+  if (endSession === null) return `${SIGN_OUT}?rd=${encodeURIComponent(back)}`;
+  const end = new URL(endSession);
+  end.searchParams.set("post_logout_redirect_uri", `${origin}/`);
+  return `${SIGN_OUT}?rd=${encodeURIComponent(end.toString())}`;
 }
 
 /**
