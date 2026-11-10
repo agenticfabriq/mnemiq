@@ -4,6 +4,7 @@ the guard that keeps every test away from the folder the engine ships."""
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -36,13 +37,26 @@ def edit(path: Path, old: str, new: str) -> None:
     path.write_text(text.replace(old, new))
 
 
+def bind(folder: Path, name: str) -> None:
+    """Make the starter `name`'s evidence in `folder` name its file's sha256 (`starter_sha256`), as publishing writes
+    the pair, keeping every other field the evidence holds; a starter with no evidence gets one of that field alone,
+    which is all the engine's loader reads."""
+    evidence = folder / f"{name}.evidence.json"
+    held = json.loads(evidence.read_text()) if evidence.exists() else {}
+    sha = hashlib.sha256((folder / f"{name}.toml").read_bytes()).hexdigest()
+    if held.get("starter_sha256") != sha:
+        write(evidence, json.dumps(held | {"starter_sha256": sha}, indent=2))
+
+
 def starter_folder(tmp_path: Path, monkeypatch, starters: dict[str, str]) -> Path:
-    """A starters folder of the test's own, holding `<name>.toml` for each starter, which every reader in the engine
-    then lists in place of the shipped one. A subfolder, so a test's own `profiles.toml` is never listed as a starter."""
+    """A starters folder of the test's own, holding `<name>.toml` for each starter, bound to its evidence (`bind`),
+    which every reader in the engine then lists in place of the shipped one. A subfolder, so a test's own
+    `profiles.toml` is never listed as a starter."""
     folder = tmp_path / "starters"
     folder.mkdir(exist_ok=True)
     for name, text in starters.items():
         write(folder / f"{name}.toml", text)
+        bind(folder, name)
     monkeypatch.setattr("mnemiq.profiles.starters_folder", lambda: folder)
     return folder
 

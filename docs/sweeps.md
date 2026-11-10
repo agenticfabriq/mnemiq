@@ -65,6 +65,7 @@ Each action takes `--config`, the sweep's config file.
 | `mnemiq sweep run` | Runs the rounds in order, resuming where an earlier run stopped. `--until ROUND` stops after that round. `--smoke N` runs each arm of the first round once on its first N questions to tune on, in `<out>/smoke/`, instead of the sweep. |
 | `mnemiq sweep report` | Prints a table for each model and mode of every round that has run, or of one with `--round ROUND`. |
 | `mnemiq sweep propose` | Applies the config's rule to the finished sweep and writes each model's proposed profile and its evidence. `--choose ARM` writes a person's pick instead: an arm's label as the report shows it, `start`, or in check mode `defaults`. One pick applies to every model, and must name an arm that ran and is valid in every run there; in a mode the arm did not run in, the profile holds the start, which must be valid there too. |
+| `mnemiq sweep starter` | Writes a starter profile and its evidence into the engine's starters folder from finished sweeps whose rule found it safe over the engine's defaults: `--model` and `--dataset`, with `--search` for the search a check started from. See [starters.md](starters.md). |
 
 A command exits 0 when it did what it was asked. It exits 1 with the reason, and no traceback, when the config or
 the sweep's files refuse it, and when `run` stopped because an endpoint stopped answering or a worker died. A `run`
@@ -120,6 +121,11 @@ roles = ["analyst"]
 llm_model = "qwen2.5-coder-32b"
 llm_base_url = "http://127.0.0.1:8000/v1"
 api_key_env = "LOCAL_LLM_KEY"
+
+[models.local.build]
+model = "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ"
+gpu = "GeForce RTX 4090"
+quantization = "awq"
 
 [models.hosted]
 llm_model = "your-hosted-model"
@@ -188,6 +194,12 @@ another, so it follows the profile name rule, `[a-z0-9][a-z0-9._-]*`.
 - `llm_context_window`, `verify_model`, `verify_base_url`, `verify_api_key_env`: as in a profile, optional.
 - `price_in_per_mtok`, `price_out_per_mtok`: dollars per million prompt and completion tokens. Without both, the
   sweep cannot price the model or check a dollar budget.
+- `[models.<name>.build]`: what the model is served from that no server reports reliably, each optional: `model`, the
+  repository id the weights were downloaded as (`<owner>/<name>`, such as `Qwen/Qwen2.5-Coder-32B-Instruct-AWQ`),
+  `gpu` and `quantization`. A server's launch argument may be an id, an absolute path, a relative path or a cache
+  snapshot, and no form tells them apart, so `model` is stated, never read. It must have the id's form, and is refused
+  when it exists as a path from the config's folder, as a relative launch path such as `models/qwen-awq` would: a path
+  names nothing on another machine. The table is part of the config, so it is fingerprinted, and `plan` prints it.
 
 A model's endpoint is a fact about the model, stated here once. It is never a value to try, and it replaces whatever
 the start profile says.
@@ -201,8 +213,23 @@ row's tokens cannot be split between the writer and the judge.
 ### `[start]`
 
 Where each model starts: `profile_file` and `profile` name a profiles file and one profile in it (its `default` when
-`profile` is left out). A model's own `[start.<model>]` replaces it for that model: naming a file it replaces both,
-naming only a profile it keeps `[start]`'s file. With neither, a model starts from the engine's defaults.
+`profile` is left out), or `starter` names a starter the engine ships, by its name. A start is one or the other: a table
+naming `starter` beside `profile_file` or `profile` is refused. A model's own `[start.<model>]` replaces `[start]` for
+that model: naming a starter or a file it replaces it whole; naming only a profile it keeps `[start]`'s file, which is
+refused when `[start]` names a starter, since a starter's file holds its one profile. With neither, a model starts from
+the engine's defaults.
+
+A starter is picked by name, never matched from the model's name: a model whose `llm_model` reads like a starter's name
+starts from the engine's defaults unless its start names that starter. Its name is refused unless the engine ships it,
+and so is a starter whose evidence (`<name>.evidence.json`, beside it) is missing or does not have the form the engine
+reads, since the sweep compares the build it runs on with the one that evidence records
+([the model server's build](#the-model-servers-build)). Which starters the engine ships, and how one is made from a
+search and check mode with `mnemiq sweep starter`, are in [starters.md](starters.md).
+
+A start profile file whose profile extends another (`extends`) or names a starter (`starter`) is read whole, as the
+engine resolves it ([a profile's parent](profiles.md#a-profiles-parent-extends-and-starter)): the starter first, then
+each profile from the root down, then the profile's own settings. A chain the engine refuses is refused before anything
+runs, and the starter's file and its evidence are pinned beside the profile file.
 
 No profile setting the deployment's env file sets is part of an arm: each arm starts from the engine's field
 defaults, overlaid by the start profile, and its profile file writes out every setting it holds a value for. What a
@@ -409,9 +436,12 @@ each run's `only/other` and p. The screen's p is the one-sided p it keeps by; ev
 - **the sweep**: its name, its fingerprint (what its answers depend on), the engine build its arms ran on and the one
   that wrote the proposal, the split seed and each part's size, the identity, each model's endpoints without
   credentials, the rule (strategy, `alpha`, `screen_alpha`, the bounds, `max_errors`, the runs each arm owed and
-  whether the first round decided them), and the sources it could not pin;
+  whether the first round decided them), the sources it could not pin, and the starter the start resolves through with
+  where the sweep's build differs from the one it was swept on (`start_starter`, null when it reaches none;
+  [the model server's build](#the-model-servers-build));
 - **the verdict**: whether the start is valid in every run (`start_valid`), what was chosen and by whom (the rule or a
-  person), the rule's own pick, whether it was confirmed, why in words, and any warnings;
+  person), the rule's own pick, whether it was confirmed, why in words, and any warnings: another engine packaging the
+  proposal, where the build differs from the starter's, and a weights folder that is not the stated model's;
 - **each mode**: its pick and what decided it, its room (the start's misses, the gain needed, the arms compared), and
   every arm compared with the start, with its runs, its pairs, whether it passed Holm in each run and why it is not a
   candidate when it is not;
@@ -477,10 +507,11 @@ source error, a question not measured.
 
 ## Sweeping a live source: only from a snapshot
 
-The sweep pins every file an answer depends on (the question file, the start profiles, each deployment's access
-policy and store, and each source read from a file) and refuses to go on, or marks an arm invalid for good, when one
-moves. A live database cannot be hashed, so a change to it during the sweep goes unseen, and arms run hours apart
-would be graded against different data. `plan` lists such a source as not pinned.
+The sweep pins every file an answer depends on (the question file, the start profiles, the starter a start reaches and
+its evidence, each deployment's access policy and store, and each source read from a file) and refuses to go on, or
+marks an arm invalid for good, when one moves. A live database cannot be hashed, so a change to it during the sweep
+goes unseen, and arms run hours apart would be graded against different data. `plan` lists such a source as not
+pinned.
 
 So sweep a snapshot: a copy that nothing writes while the sweep runs. A SQLite or DuckDB file is pinned, so a change
 to it is caught. A frozen copy in the database's own engine keeps the SQL dialect the profile will run against, which
@@ -489,6 +520,47 @@ until the sweep ends. Build the snapshot deployment's store from the snapshot, a
 Every arm running at once queries it, so `parallel` raises how often a statement is cancelled at the engine's 30-second
 bound ([sizing `parallel`](#sizing-parallel-to-memory)).
 
+## The model server's build
+
+A profile is measured on one build: one model, quantization and GPU, one server and its version, one window, one
+engine. A sweep reads what it can of that build from the server, records it, and says where it differs from the build
+its start's starter was swept on.
+
+- **Read from the server.** Each run reads every model's server before anything else, with the model's key and a
+  5-second timeout: the server and the window from the `/v1/models` entry whose `id` is the model's `llm_model`
+  (`owned_by` and `max_model_len`), the version from `/version` at the URL's origin, and the last part of the path the
+  weights were launched from (`root`). A field that cannot be read (a failed request, a 404 as a hosted endpoint
+  answers, no entry for the model) is not read, never a value. The whole launch path is never kept.
+- **Recorded.** The first run records what it read in `sweep.json`, under `servers`. A resumed run reads again: a field
+  read for the first time is filled in, and a server, version or window read both times that differs is refused before
+  any arm, since the rounds would compare answers from two builds. A field either run could not read is never a
+  difference. A weights folder that moved is recorded and said, never refused. A smoke reads and says what a run says,
+  and records nothing outside its own folder.
+- **Stated in the config.** The model, the GPU and the quantization come from `[models.<name>.build]`, since no server
+  reports them reliably.
+
+When a model's start resolves through a starter, named in `[start]` or by the root of its start profile's chain, the
+build is compared with the one the starter's evidence records, case and spacing aside:
+
+- the model, the quantization and the GPU as the config states them, and the server, its version and its window as the
+  server reports them, each that differs named with both values;
+- the config's `llm_context_window` against the window the starter was swept with;
+- in one line, what could not be compared, since the config does not state it or the server does not report it;
+- and the engine, by its source hash, named with both commits. A starter swept on an earlier engine says so on every
+  later one, until it is swept again.
+
+Each is a warning, and none stops the sweep. `plan` prints each model's build as stated, the starter each model starts
+from, and what can be compared before the server is read. `run` says each line once, before the first round. The
+proposal's evidence carries them under `start_starter`, the starter's name and the lines, read against the servers
+`sweep.json` recorded, and in its `warnings`.
+
+When the server's weights folder, the last part of `root`, is not the stated model's name (the part of its id after
+the `/`, casefolded), `run` says so, and the proposal's warnings carry the same line; a resumed run also says when the
+folder is not the one the sweep recorded. Neither is refused: a cache snapshot's folder is a hash.
+
+The proposal compares the starter with the engine the sweep's arms ran on, as `sweep.json` records it, not the one that
+writes the proposal; that one is compared with the arms' engine by its own warning.
+
 ## Running, resuming and smoke
 
 - **One run at a time per out folder.** A second `run` on the same folder is refused at once, and so is a `propose`
@@ -496,15 +568,16 @@ bound ([sizing `parallel`](#sizing-parallel-to-memory)).
 - **Resume.** A stopped run, whether by the budget, an endpoint, a worker, Ctrl-C or the machine, resumes where it
   stopped: each arm from the answers it wrote, and what the first round decided (the runs each arm owes, each start's
   room) read back. A resumed config may change only `budget_hours`, `budget_dollars`, `seconds_per_question` and its
-  `[[control]]` tables. Anything else (the config, a deployment's settings, a pinned file) or another engine build is
-  refused before any arm: put it back, or start a new sweep in another out folder. Each worker checks the build again
-  as it starts an arm, so an edit or a pull while the sweep runs stops it with nothing of that arm asked, rather than
-  writing rows under another build.
+  `[[control]]` tables. Anything else (the config, a deployment's settings, a pinned file), another engine build, or a
+  model server that now reports another server, version or window is refused before any arm: put it back, or start a
+  new sweep in another out folder. Each worker checks the build again as it starts an arm, so an edit or a pull while
+  the sweep runs stops it with nothing of that arm asked, rather than writing rows under another build.
 - **Smoke.** `--smoke N` runs each arm of the first round once on its first N questions to tune on, in
   `<out>/smoke/`, which nothing else reads, with no budget, room or repeats. Each smoke replaces that folder whole, and
   only a folder a smoke made.
 
-The out folder holds the sweep's record, `sweep.json` (what it was started under and what its rounds decided); its
+The out folder holds the sweep's record, `sweep.json` (what it was started under, what each model's server reported of
+its build, and what its rounds decided); its
 split, `split.json`; `retries.json`, the questions an endpoint left to ask again; one folder per run of each arm,
 `<model>/<round>/<modes>/<arm>/run-<n>/`, with the arm's `profile.toml`, its answers in `rows.jsonl` (one graded row
 per question and mode) and its store copies; `proposal/<model>/`; and `smoke/`.

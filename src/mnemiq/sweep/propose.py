@@ -65,13 +65,12 @@ import httpx
 from mnemiq import redact
 from mnemiq.agent.modes import MODES
 from mnemiq.config import without_credentials
-from mnemiq.profiles import _read as _read_profile_file
 from mnemiq.profiles import load_profiles, profile_version
 from mnemiq.runtime import source_adapter
 from mnemiq.sweep.arms import Arm, _endpoint, _mode_of, _show, _toml, arm_of, assembled_arm, baselines, check_arms
 from mnemiq.sweep.config import (
     ENDPOINT_FACTS, PROPOSAL, SWEEP, SweepConfig, SweepConfigError, fingerprint, load_questions, scrub_credentials,
-    start_profile, unset_keys,
+    start_entry, start_starter, unset_keys,
 )
 from mnemiq.sweep.plan import _ROUNDS_OF, LOAD_WAIT_EVERY_S, LOAD_WAIT_S, TIMING_CASES, unpinned_sources
 from mnemiq.sweep.report import ArmFileError, decided_repeats, report
@@ -79,6 +78,7 @@ from mnemiq.sweep.run import (
     OUT_LOCK, PROFILE, ROWS, _first_round, _replace, _rows_so_far, _say, _sole, _write_json, arm_folder, engine_build,
 )
 from mnemiq.sweep.split import PARTS, saved_split
+from mnemiq.sweep.starters import build_mismatches, weights_folder_note
 from mnemiq.sweep.stats import detectable_gain, holm
 
 PROFILES = "profiles.toml"
@@ -480,13 +480,9 @@ def _refused_note(refused: dict[str, str], wide: dict | None, dropped: dict[str,
 
 
 def _start_sections(cfg: SweepConfig, model: str, modes: Sequence[str]) -> dict[str, dict]:
-    """For each of `modes`, what the start profile's own section for it sets: empty with no start profile or no such
-    section."""
-    path, name = start_profile(cfg, model)
-    entry = None
-    if path is not None:
-        read = _read_profile_file(path)
-        entry = read.profiles[name or read.default]
+    """For each of `modes`, what the start's section for it sets, read whole (`start_entry`: a starter's, or each layer
+    of the start profile's chain merged): empty with no start or no such section."""
+    entry = start_entry(cfg, model)
     found = {}
     for mode in modes:
         section = getattr(entry, mode) if entry is not None else None
@@ -662,14 +658,15 @@ def _merged(texts: dict[str, str], name: str, modes: Sequence[str]) -> str:
     return merged
 
 
-def _versions(cfg: SweepConfig, path: Path, dialects: dict) -> dict[str | None, str]:
+def _versions(cfg: SweepConfig, path: Path, dialects: dict, *, starters: Path | None = None) -> dict[str | None, str]:
     """The version the engine gives the default profile of the file at `path`, for each deployment, as a run's runtime
-    stamps it: the engine's own loader on the deployment's baseline, and its version function with the dialect of the
-    deployment's own adapter (read once into `dialects`)."""
+    stamps it: the engine's own loader on the deployment's baseline (reading a starter from `starters`, when given), and
+    its version function with the dialect of the deployment's own adapter (read once into `dialects`)."""
     found = {}
     for db_id, settings in baselines(cfg):
         try:
-            profiles, default = load_profiles(settings.model_copy(update={"profiles_path": str(path)}))
+            profiles, default = load_profiles(settings.model_copy(update={"profiles_path": str(path)}),
+                                              starters=starters)
         except ValueError as exc:  # the profile loader's refusals, with every key variable set (`_keys_set`)
             raise _Stale(f"the engine refuses the proposed profile, so its version cannot be recomputed: "
                          f"{scrub_credentials(str(exc), settings)}") from None
@@ -837,8 +834,13 @@ def _build_warning(state: dict, packaged: dict) -> list[str]:
 
 
 def _head(cfg: SweepConfig, model: str, state: dict, repeats: int, packaged: dict) -> dict:
-    """What every proposal's evidence opens with: the sweep, who asked, where, on what, and by which rule."""
+    """What every proposal's evidence opens with: the sweep, who asked, where, on what, by which rule, and the starter
+    the start resolves through, with where the sweep's build differs from the one it was swept on (`build_mismatches`,
+    against the server readings and the engine build the sweep recorded: its arms', not the one packaging this)."""
     parts = saved_split(cfg)
+    starter = start_starter(cfg, model)
+    readings = (state.get("servers") or {}).get(model)
+    ran_on = state.get("engine_build")
     endpoints = {name: without_credentials(value) if isinstance(value, str) and name.endswith("_url") else value
                  for name, value in _endpoint(cfg, model).items() if name in ENDPOINT_FACTS}
     rule = {"strategy": cfg.search.strategy, "alpha": cfg.propose.alpha, "max_more_wrong": cfg.propose.max_more_wrong,
@@ -857,6 +859,8 @@ def _head(cfg: SweepConfig, model: str, state: dict, repeats: int, packaged: dic
                   for part in PARTS},
         "rule": rule,
         "unpinned_sources": unpinned_sources(baselines(cfg)),
+        "start_starter": None if starter is None else {"name": starter,
+                                                       "mismatches": build_mismatches(cfg, model, readings, ran_on)},
     }
 
 
@@ -1163,14 +1167,20 @@ def _drafts(cfg: SweepConfig, chosen: str | None) -> dict[str, tuple[_Draft, dic
         wide = _profile_wide(arms)
         outside = [*refused, *unsearched]   # the modes the profile holds no section for
         dropped = _start_sections(cfg, model, outside) if arms is not None else {mode: {} for mode in outside}
-        evidence = _head(cfg, model, state, repeats, packaged) | {
+        head = _head(cfg, model, state, repeats, packaged)
+        # The engine build's warning, then where this model's build differs from its starter's, then a weights folder
+        # whose name is not the stated model's, each as the run said it.
+        readings = (state.get("servers") or {}).get(model)
+        mine = [*warnings, *(head["start_starter"] or {}).get("mismatches", []),
+                *filter(None, [weights_folder_note(cfg, model, readings)])]
+        evidence = head | {
             "start_valid": verdict["start_valid"],
             "chosen": chosen if picked[model] is not None else verdict["rule"],
             "chosen_by": "person" if picked[model] is not None else "rule",
             "rule_pick": verdict["rule"], "confirmed": confirmed,
             "why": why + (_refused_note(refused, wide, dropped) + _unsearched_note(unsearched, wide, dropped)
                           if running else ""),
-            "warnings": warnings, "picks": verdict["picks"], "conflicts": verdict["conflicts"],
+            "warnings": mine, "picks": verdict["picks"], "conflicts": verdict["conflicts"],
             "failed_mode": verdict["failed_mode"],
             "refused_modes": {mode: {"why": reason, "unmeasured_profile_wide": wide or {},
                                      "dropped_start_section": dropped[mode]} for mode, reason in refused.items()},

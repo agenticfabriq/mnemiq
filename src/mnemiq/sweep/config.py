@@ -32,14 +32,22 @@ from mnemiq.config import (
     _SECRET_HINTS, ModeSettings, Settings, SourceSpec, userinfo_unplaced, without_credentials,
 )
 from mnemiq.contract import EvaluationCase
-from mnemiq.profiles import _NAME, DEPLOYMENT_SETTINGS, PROFILE_SETTINGS, ProfileFileError
+from mnemiq.profiles import (
+    _NAME, DEPLOYMENT_SETTINGS, ENDPOINT_SETTINGS, PROFILE_SETTINGS, ProfileFileError, _Entry, _starter_entry,
+    flattened_entry, profile_sources, profile_starter, starter_path,
+)
 from mnemiq.profiles import _read as _read_profile_file
 
-# Profile settings that describe where a model is served, not how it is asked. They belong to `[models]`, and are refused
-# from `[space]` before the profile-setting check, which would otherwise let them through.
-ENDPOINT_FACTS = ("llm_model", "llm_base_url", "llm_context_window", "verify_model", "verify_base_url")
+# Profile settings that describe where a model is served, not how it is asked: the engine's own list, which a starter
+# never sets. They belong to `[models]`, and are refused from `[space]` before the profile-setting check, which would
+# otherwise let them through.
+ENDPOINT_FACTS = ENDPOINT_SETTINGS
 # The names `[start]` reads as its own, so no model may take one.
-_START_KEYS = ("profile_file", "profile")
+_START_KEYS = ("profile_file", "profile", "starter")
+# A model as the Hugging Face hub names it, `<owner>/<name>`: one slash, and no leading `/`, `.` or `~`, so no absolute,
+# relative or home path has this form.
+REPO_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
+_REPO_ID = re.compile(REPO_ID_PATTERN)
 # What a sweep keeps in its out folder beside each model's own folder, `<out>/<model>`, so no model may take one of these
 # names: the folder a smoke replaces whole, the proposal's folder, the sweep's record, its split and the cases its
 # endpoints left to ask again.
@@ -123,6 +131,10 @@ def _path(value: str | None, info: ValidationInfo) -> str | None:
 
 
 _Text = Annotated[str, Field(min_length=1)]
+# A model's repository id, in the hub's form, so a build read on its own refuses anything else. A sweep config refuses
+# one first where the model's name is known, so the refusal names its table, and also one that exists as a path from
+# the config's folder (`SweepConfig._models_state_repositories`, `_models_name_repositories`).
+_RepoId = Annotated[str, Field(pattern=REPO_ID_PATTERN)]
 _ProfileName = Annotated[str, AfterValidator(_profile_name)]
 _EnvName = Annotated[str, AfterValidator(_env_name)]
 _Count = Annotated[int, Field(ge=0)]
@@ -193,8 +205,18 @@ class Dataset(_Section):
         return self
 
 
+class ModelBuild(_Section):
+    """What a model is served from that no server reports reliably, as `[models.<name>.build]` states it: the weights'
+    repository id, the GPU and the quantization. Each is optional to a sweep. The server's own account of its build is
+    read from it when the sweep runs (`mnemiq.sweep.starters.server_readings`)."""
+
+    model: _RepoId | None = None
+    gpu: _Text | None = None
+    quantization: _Text | None = None
+
+
 class ModelEntry(_NoKeys):
-    """One model under test: where it is served and the variable holding its key."""
+    """One model under test: where it is served, the variable holding its key, and the build it is served from."""
 
     llm_model: _Text
     llm_base_url: _Text
@@ -205,6 +227,7 @@ class ModelEntry(_NoKeys):
     verify_api_key_env: _EnvName | None = None
     price_in_per_mtok: _Price | None = None
     price_out_per_mtok: _Price | None = None
+    build: ModelBuild | None = None
 
     _endpoints = field_validator("llm_base_url", "verify_base_url")(_endpoint_url)
 
@@ -226,10 +249,19 @@ class Judge(_NoKeys):
 
 
 class StartEntry(_Section):
+    """A start: a profile in a profiles file, or a starter the engine ships, picked by its name."""
+
     profile_file: str | None = None
     profile: _ProfileName | None = None
+    starter: _ProfileName | None = None
 
     _profile_file = field_validator("profile_file")(_path)
+
+    @model_validator(mode="after")
+    def _one_kind(self) -> StartEntry:
+        if self.starter is not None and (self.profile_file is not None or self.profile is not None):
+            raise ValueError("a start is a starter or a profile file, not both")
+        return self
 
 
 class Start(StartEntry):
@@ -244,6 +276,14 @@ class Start(StartEntry):
             return data
         own = {key: value for key, value in data.items() if key in _START_KEYS}
         return {**own, "per_model": {key: value for key, value in data.items() if key not in _START_KEYS}}
+
+    @model_validator(mode="after")
+    def _no_profile_beside_a_starter(self) -> Start:
+        # A model's own table naming only a profile keeps `[start]`'s file, and a starter's file holds its one profile.
+        for model, own in self.per_model.items():
+            if self.starter is not None and own.profile is not None and own.profile_file is None:
+                raise ValueError(f"[start.{model}] names a profile, and [start] names a starter, which holds no other")
+        return self
 
 
 class Search(_Section):
@@ -335,6 +375,33 @@ class SweepConfig(BaseModel):
     def path(self) -> Path | None:
         """The file this config was loaded from."""
         return self._path
+
+    @field_validator("models", mode="before")
+    @classmethod
+    def _models_state_repositories(cls, models: Any) -> Any:
+        """Each build's `model` is a repository id, never a local path: a server's launch argument may be either, and a
+        path names nothing on another machine. Refused here, before `ModelBuild` refuses it in pydantic's words, so the
+        refusal names the model's table. Anything but text is left to the fields' own types."""
+        for name, entry in (models.items() if isinstance(models, dict) else ()):
+            build = entry.get("build") if isinstance(entry, dict) else None
+            stated = build.get("model") if isinstance(build, dict) else None
+            if isinstance(stated, str) and not _REPO_ID.fullmatch(stated):
+                raise ValueError(f"[models.{name}.build] model {stated!r} is not a repository id, <owner>/<name>: "
+                                 "state the id the weights were downloaded as")
+        return models
+
+    @field_validator("models")
+    @classmethod
+    def _models_name_repositories(cls, models: dict[str, ModelEntry], info: ValidationInfo) -> dict[str, ModelEntry]:
+        """A relative path such as `models/qwen-awq` has a repository id's form, so a build's `model` is also refused
+        when it exists as a path from the config's folder."""
+        base = (info.context or {}).get("base") or os.getcwd()
+        for name, entry in models.items():
+            stated = entry.build.model if entry.build is not None else None
+            if stated is not None and os.path.lexists(os.path.join(base, stated)):
+                raise ValueError(f"[models.{name}.build] model {stated!r} is a path here, not a repository id: state "
+                                 "the id the weights were downloaded as")
+        return models
 
     @field_validator("modes")
     @classmethod
@@ -548,14 +615,54 @@ def load_questions(cfg: SweepConfig) -> list[EvaluationCase]:
     return cases
 
 
+def _named_starter(cfg: SweepConfig, model: str) -> str | None:
+    """The starter `model`'s start names, by name: its own table's when that names a starter or a file, and so replaces
+    `[start]` whole, else `[start]`'s. Never matched from the model's name."""
+    own = cfg.start.per_model.get(model)
+    if own is not None and (own.starter is not None or own.profile_file is not None):
+        return own.starter
+    return cfg.start.starter
+
+
 def start_profile(cfg: SweepConfig, model: str) -> tuple[str | None, str | None]:
-    """The profile file and profile `model` starts from; (None, None) is the engine's defaults. A model's own table
-    replaces `[start]`: naming a file, it replaces both; naming only a profile, it keeps `[start]`'s file."""
+    """The profile file and profile `model` starts from; (None, None) is the engine's defaults. A starter is its file
+    and the one profile it holds, named as the starter is. A model's own table replaces `[start]`: naming a starter or
+    a file, it replaces it whole; naming only a profile, it keeps `[start]`'s file."""
+    if (starter := _named_starter(cfg, model)) is not None:
+        try:
+            return starter_path(starter), starter
+        except ProfileFileError as exc:
+            raise SweepConfigError(f"model {model!r} starts from a starter the engine refuses: {exc}") from None
     own = cfg.start.per_model.get(model)
     if own is not None and own.profile_file is not None:
         return own.profile_file, own.profile
     profile = own.profile if own is not None and own.profile is not None else cfg.start.profile
     return cfg.start.profile_file, profile
+
+
+def _start_named(cfg: SweepConfig, model: str) -> tuple[str, str] | None:
+    """The file `model` starts from and the profile in it, the file's default when the start names none; None for the
+    engine's defaults."""
+    path, profile = start_profile(cfg, model)
+    if path is None:
+        return None
+    return path, profile or _read_profile_file(path).default
+
+
+def start_entry(cfg: SweepConfig, model: str) -> _Entry | None:
+    """What `model`'s start sets, read whole: each layer of its profile's chain merged (`flattened_entry`), the starter
+    its root names first, then each profile it extends, then its own settings. None for the engine's defaults."""
+    named = _start_named(cfg, model)
+    return None if named is None else flattened_entry(*named)
+
+
+def start_starter(cfg: SweepConfig, model: str) -> str | None:
+    """The starter `model`'s start resolves through: one its start names, or the one its start profile's root names
+    (`profile_starter`). None when it reaches none."""
+    if (starter := _named_starter(cfg, model)) is not None:
+        return starter
+    named = _start_named(cfg, model)
+    return None if named is None else profile_starter(*named)
 
 
 def unset_keys(cfg: SweepConfig, models: Collection[str]) -> list[str]:
@@ -586,6 +693,12 @@ def _check_differs(cfg: SweepConfig) -> None:
 
 
 def _check_start(cfg: SweepConfig, model: str) -> None:
+    """Refuse a start the sweep cannot read whole: a file that cannot be read, a profile it does not hold, a chain the
+    engine refuses (a cycle, a missing parent, a starter that sets what a starter never sets), or a starter whose
+    evidence `read_evidence` refuses, since the sweep compares builds against it."""
+    from mnemiq.sweep.starters import read_evidence  # the starters read this module
+
+    named = _named_starter(cfg, model)
     path, profile = start_profile(cfg, model)
     if path is None:
         if profile is not None:
@@ -601,15 +714,19 @@ def _check_start(cfg: SweepConfig, model: str) -> None:
     if name not in read.profiles:
         raise SweepConfigError(f"model {model!r} starts from profile {name!r}, which {path} does not hold "
                                f"(it holds {sorted(read.profiles)})")
-    entry = read.profiles[name]
-    if entry.extends is not None or entry.starter is not None:
-        # The sweep reads the start profile's own settings (`start_settings`, `_start_sections`) and pins its file
-        # alone, so a parent's settings would be left out without a word while the start still carried this name.
-        parent = f"extends {entry.extends!r}" if entry.extends is not None else f"starter {entry.starter!r}"
-        raise SweepConfigError(f"model {model!r} starts from profile {name!r}, which has a parent ({parent}), and a "
-                               "sweep cannot yet start from a profile with a parent: it would read this profile's own "
-                               "settings without its parent's. Start from a profile that names neither extends nor "
-                               "starter")
+    what = f"starter {named!r}" if named is not None else f"profile {name!r}"
+    try:
+        if named is not None:
+            _starter_entry(named)  # the engine's own reading of a starter, which refuses what a starter never sets
+        flattened_entry(path, name)
+        starter = start_starter(cfg, model)
+    except ProfileFileError as exc:
+        raise SweepConfigError(f"model {model!r} starts from {what}, which the engine refuses: {exc}") from None
+    if starter is not None:
+        try:
+            read_evidence(starter)
+        except SweepConfigError as exc:
+            raise SweepConfigError(f"model {model!r} starts from {what}: {exc}") from None
 
 
 def _sha256(path: str, what: str) -> str:
@@ -620,14 +737,34 @@ def _sha256(path: str, what: str) -> str:
         raise SweepConfigError(f"{what} {path} cannot be read: {exc.strerror}") from None
 
 
+def _start_files(cfg: SweepConfig, model: str) -> dict[str, str]:
+    """Each file `model`'s start is read from, by path, to what it is: its profile file and the starter its chain
+    reaches (`profile_sources`), and that starter's evidence, which the sweep reads to compare builds."""
+    from mnemiq.sweep.starters import evidence_path  # the starters read this module
+
+    try:
+        named = _start_named(cfg, model)
+        if named is None:
+            return {}
+        starter = start_starter(cfg, model)
+        shipped = starter_path(starter) if starter is not None else None
+        files = {path: "the start's starter" if path == shipped else "the start profile file"
+                 for path in profile_sources(*named)}
+        if starter is not None:
+            files[str(evidence_path(starter))] = "the start's starter evidence"
+    except ProfileFileError as exc:
+        # Read again as each arm runs: a refusal here marks the arm invalid, where the engine's error would end it.
+        raise SweepConfigError(f"the start of model {model!r} cannot be read: {exc}") from None
+    return files
+
+
 def pinned_files(cfg: SweepConfig) -> dict[str, str]:
-    """Each file an answer depends on, by absolute path, to its sha256: each model's start profile, the question file,
-    and for each deployment its access policy, its store and each source read from a file. A live database is not here:
-    it cannot be hashed."""
+    """Each file an answer depends on, by absolute path, to its sha256: each model's start profile, the starter its
+    start reaches and that starter's evidence, the question file, and for each deployment its access policy, its store
+    and each source read from a file. A live database is not here: it cannot be hashed."""
     files = {cfg.dataset.questions: "the question file"}
     for model in cfg.models:
-        if (path := start_profile(cfg, model)[0]) is not None:
-            files[path] = "the start profile file"
+        files.update(_start_files(cfg, model))
     for db_id in _deployment_ids(cfg):
         settings = deployment_settings(cfg, db_id)
         if settings.authz_path:
@@ -667,22 +804,36 @@ def _answering_settings(settings: Settings) -> dict:
     return view
 
 
-def fingerprint(cfg: SweepConfig) -> str:
-    """What a sweep's answers depend on, as one sha256, so that a sweep resumed under anything else is refused.
-
-    It covers the config, less `[search]`'s budgets and `seconds_per_question` and less `[[control]]` (a sweep may be
-    resumed with a larger budget or a new estimate, or given a control afterwards), each deployment's settings without
-    its keys or the credentials in its DSNs and URLs, the pinned files, and the split seed. The config's own endpoints
-    carry none: `load_config` refuses one that does.
-    """
+def fingerprint_body(cfg: SweepConfig) -> dict:
+    """What `fingerprint` hashes. A key a config gained with starters and build tables (`[start] starter`, a model's
+    own `starter`, `[models.<name>.build]`) enters only when set, so a config that names none fingerprints as it did
+    before them."""
     config = cfg.model_dump(mode="json")
     config["search"] = {key: value for key, value in config["search"].items() if key not in _PLANNING}
     del config["control"]
-    body = {
+    for table in (config["start"], *config["start"]["per_model"].values()):
+        if table.get("starter") is None:
+            table.pop("starter", None)
+    for entry in config["models"].values():
+        if entry.get("build") is None:
+            entry.pop("build", None)
+    return {
         "config": config,
         "deployments": {db_id or "": _answering_settings(deployment_settings(cfg, db_id))
                         for db_id in _deployment_ids(cfg)},
         "files": pinned_files(cfg),
         "split_seed": cfg.dataset.split_seed,
     }
+
+
+def fingerprint(cfg: SweepConfig) -> str:
+    """What a sweep's answers depend on, as one sha256, so that a sweep resumed under anything else is refused.
+
+    It covers the config, less `[search]`'s budgets and `seconds_per_question` and less `[[control]]` (a sweep may be
+    resumed with a larger budget or a new estimate, or given a control afterwards), each model's build table among it;
+    each deployment's settings without its keys or the credentials in its DSNs and URLs; the pinned files, a start's
+    starter and its evidence among them; and the split seed. The config's own endpoints carry no credential:
+    `load_config` refuses one that does.
+    """
+    body = fingerprint_body(cfg)
     return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()

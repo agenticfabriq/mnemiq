@@ -101,10 +101,14 @@ def _add_sweep(sub) -> None:
         "run": "run the sweep's rounds, resuming where an earlier run stopped",
         "report": "print each round's table: every arm against the start, question by question",
         "propose": "apply the config's rule to the finished sweep and write each model's profile and evidence",
+        "starter": "write a starter profile and its evidence from finished sweeps that found it safe over the engine's "
+                   "defaults",
     }
     epilogs = {"run": "Exit status: 0 once the rounds asked for have run; 3 when the budget stopped the sweep before "
                       "an arm it could not cover (raise the budget in [search] and run again: it resumes); 1 for a "
-                      "refusal, an endpoint that stopped answering or a worker that died."}
+                      "refusal, an endpoint that stopped answering or a worker that died.",
+               "starter": "The starter is written into the engine's own starters folder, so run it from a checkout at "
+                          "the sweeps' commit. See docs/starters.md."}
     parsers = {}
     for name, text in helps.items():
         parsers[name] = actions.add_parser(name, help=text, description=text[:1].upper() + text[1:] + ".",
@@ -123,6 +127,17 @@ def _add_sweep(sub) -> None:
         help="a person's pick in place of the rule's: an arm's label as the report shows it, or start (or "
              "defaults, in check mode). It applies to every model, and must name an arm that ran and is valid in "
              "every run")
+    parsers["starter"].add_argument("--model", required=True,
+                                    help="the model in [models] whose build the starter is for")
+    parsers["starter"].add_argument("--dataset", required=True, metavar="NAME",
+                                    help="the question set's label, as the starter's description and evidence give "
+                                         "it: 1 to 80 printable ASCII characters, with no / or \\")
+    parsers["starter"].add_argument("--name",
+                                    help="the starter's name, which must be the build's: the part of "
+                                         "[models.<model>.build] model after the /, lowercased (the default)")
+    parsers["starter"].add_argument("--search", metavar="CONFIG",
+                                    help="the config file of the search whose proposal the check started from, whose "
+                                         "evidence joins the starter's")
 
 
 # `mnemiq sweep run`'s exit status when the budget stopped the sweep: neither finished (0) nor failed (1).
@@ -147,6 +162,8 @@ def _cmd_sweep(args) -> int:
             _sweep_report(cfg, args)
         elif args.sweep_command == "propose":
             _sweep_propose(cfg, args)
+        elif args.sweep_command == "starter":
+            _sweep_starter(cfg, args)
     except SweepConfigError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -245,6 +262,16 @@ def _sweep_propose(cfg, args) -> None:
         print(f"  {result['why']}")
         print(f"  profile: {result['profiles_file'] or 'none written'}")
         print(f"  evidence: {result['evidence_file']}")
+
+
+def _sweep_starter(cfg, args) -> None:
+    from mnemiq.sweep.config import load_config
+    from mnemiq.sweep.starters import publish_starter
+
+    search = load_config(args.search) if args.search else None
+    written = publish_starter(cfg, args.model, args.dataset, name=args.name, search=search)
+    for label, path in zip(("starter", "evidence"), written, strict=True):
+        print(f"{label}: {path}")
 
 
 def _identity(args, settings: Settings | None = None) -> IdentityContext:

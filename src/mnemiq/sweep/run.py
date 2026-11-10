@@ -635,13 +635,17 @@ def _rows_exist(out: Path) -> bool:
 _CLEARED = ("budget", "endpoint", "worker")
 
 
-def _begin(cfg: SweepConfig) -> dict:
+def _begin(cfg: SweepConfig, servers: dict[str, dict] | None = None) -> dict:
     """The sweep's record, `sweep.json`, beside its split, `split.json`. A first run writes both. A later run refuses a
     sweep started under another config (the fingerprint) or another engine build (its source hash), and rows with no
     record or no split to read them by, all before any arm runs. A stop for the budget, a dead endpoint or a dead worker
     is cleared, as this run resumes it. A new sweep draws its split, over any that another left, and records its
     digest; a sweep whose split is gone may draw it again only before any row, and a saved split that is not the one
-    drawn is refused."""
+    drawn is refused.
+
+    `servers` is what this run read of each model server's build (`server_readings`). A new sweep records it; a later
+    run records it merged into what was recorded (`merged_readings`), which refuses a server whose build changed,
+    before anything is written, and says a weights folder that moved, which it never refuses."""
     out = Path(cfg.sweep.out)
     record, parts = out / SWEEP, out / SPLIT
     found, build = fingerprint(cfg), engine_build()
@@ -651,8 +655,8 @@ def _begin(cfg: SweepConfig) -> dict:
         if state.get("fingerprint") != found:
             raise SweepConfigError(
                 f"{record}: this sweep was started under another config. The config, a deployment's settings, or a "
-                "file they pin (the question file, a start profile, an access policy, a store, a file source) has "
-                "changed since. Put it back, or start a new sweep in another out folder.")
+                "file they pin (the question file, a start profile or its starter, an access policy, a store, a file "
+                "source) has changed since. Put it back, or start a new sweep in another out folder.")
         started = str((state.get("engine_build") or {}).get("source_sha"))
         if started != build["source_sha"]:
             raise SweepConfigError(
@@ -661,6 +665,15 @@ def _begin(cfg: SweepConfig) -> dict:
                 "started with, or start a new sweep in another out folder.")
         if parts.exists():
             saved_split(cfg)  # refuses a split that is not the one the sweep drew
+        if servers is not None:
+            from mnemiq.sweep.starters import merged_readings, moved_weights_note  # the starters read this module
+
+            recorded = state.get("servers") or {}
+            state["servers"] = {model: merged_readings(recorded.get(model) or {}, now, model)
+                                for model, now in servers.items()}
+            for model, now in servers.items():
+                if (note := moved_weights_note(recorded.get(model) or {}, now, model)) is not None:
+                    _say(note)
     elif _rows_exist(out):
         raise SweepConfigError(f"{out} holds rows but no {SWEEP}, so the config they were written under cannot be "
                                "checked. Start a new sweep in another out folder.")
@@ -668,6 +681,8 @@ def _begin(cfg: SweepConfig) -> dict:
         state = {"fingerprint": found, "engine_build": build, "split_seed": cfg.dataset.split_seed}
         if isinstance(cfg.sweep.repeats, int):
             state["repeats"] = cfg.sweep.repeats
+        if servers is not None:
+            state["servers"] = servers
     if new or not parts.exists():
         if not new and _rows_exist(out):
             raise SweepConfigError(f"{out} holds rows but no {SPLIT}, so the cases they answered cannot be read back. "
@@ -1265,6 +1280,25 @@ def _smoke(cfg: SweepConfig, count: int) -> None:
     sweep.finish()
 
 
+def _server_readings(cfg: SweepConfig) -> dict[str, dict]:
+    """What each model's server reports of its build, by model (`server_readings`), asked with the model's own key."""
+    from mnemiq.sweep.starters import server_readings  # the starters read this module
+
+    return {model: server_readings(entry.llm_base_url, entry.llm_model, os.environ.get(entry.api_key_env))
+            for model, entry in cfg.models.items()}
+
+
+def _say_builds(cfg: SweepConfig, servers: dict[str, dict]) -> None:
+    """Say, once before the first round, where each model's build differs from the one its starter was swept on
+    (`build_mismatches`), and a weights folder whose name is not the stated model's. Neither stops the sweep."""
+    from mnemiq.sweep.starters import build_mismatches, weights_folder_note  # the starters read this module
+
+    for model in cfg.models:
+        _say(*build_mismatches(cfg, model, servers.get(model)))
+        if (note := weights_folder_note(cfg, model, servers.get(model))) is not None:
+            _say(note)
+
+
 def run(cfg: SweepConfig, until: str | None = None, smoke: int | None = None) -> None:
     """Run the sweep's rounds in order: through `until` when it names one, or, with `smoke`, each arm of the first round
     on that many cases.
@@ -1294,7 +1328,16 @@ def run(cfg: SweepConfig, until: str | None = None, smoke: int | None = None) ->
     first round's plan found it (a mode once run stays so); `seconds`, the time the sweep's runs have taken; `stopped`,
     the sweep's own stop: `"budget"`, `"endpoint"` or `"worker"` (a worker that died), each cleared by the next run, or
     `"no room"` once every model and mode that searches has stopped for it; and `finished`, true once the strategy's
-    last round has run, which a proposal waits for.
+    last round has run, which a proposal waits for; and `servers`, by model, what its server reported of its build
+    (`server_readings`: the server, its version, its window and the last part of what it was launched from, each None
+    where it was not read).
+
+    Each run reads every model's server first. A new sweep records what it read; a resumed one fills in what the record
+    had not read and refuses a server, version or window read both times that differs (`merged_readings`), before any
+    arm, while a weights folder that moved is recorded and said, never refused. Then, before the
+    first round, it says where a model's build differs from the one its start's starter was swept on
+    (`build_mismatches`), and a weights folder whose name is not the stated model's. A smoke reads and says the same,
+    and records nothing outside its own folder.
 
     A stop for the budget comes before an arm, never during one. When an endpoint stops answering, or a worker dies,
     the runs going on finish, none starts, and `run` exits non-zero naming the endpoint, or the run and what its worker
@@ -1316,10 +1359,13 @@ def run(cfg: SweepConfig, until: str | None = None, smoke: int | None = None) ->
                                                 "again once it has ended")):
         if (why := identity_refusal(cfg)) is not None:
             raise SweepConfigError(f"the sweep's identity cannot be graded: {why}")
+        servers = _server_readings(cfg)
         if smoke is not None:
+            _say_builds(cfg, servers)
             _smoke(cfg, smoke)
             return
-        state = _begin(cfg)
+        state = _begin(cfg, servers)
+        _say_builds(cfg, state["servers"])
         sweep = _Rounds(cfg, state, _parts(cfg))
         sweep.first_round()
         if not sweep.halted and until != sweep.first and strategy == "screen-then-grid":

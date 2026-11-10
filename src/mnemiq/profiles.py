@@ -13,11 +13,13 @@ follows over the deployment.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib.resources
 import json
 import os
 import re
+import stat
 import tomllib
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -73,6 +75,10 @@ ENDPOINT_SETTINGS: tuple[str, ...] = ("llm_model", "llm_base_url", "llm_context_
 # The starters this engine ships: one TOML file per model build, inside the package, so an installed engine reads them
 # offline.
 STARTER_PACKAGE = "mnemiq.starter_profiles"
+
+# Beside each starter, its evidence, which records the sha256 of the starter's file (`starter_sha256`): the engine
+# loads a starter only beside evidence that names its bytes.
+EVIDENCE_SUFFIX = ".evidence.json"
 
 # What a starter is refused for setting: a deployment's endpoint and keys, the roles its file grants, and a parent.
 _NOT_IN_A_STARTER = frozenset({*ENDPOINT_SETTINGS, "api_key_env", "verify_api_key_env", "roles", "extends", "starter"})
@@ -154,9 +160,16 @@ def _unreadable(path: str, exc: ValidationError) -> ProfileFileError:
 def _read(path: str) -> _File:
     try:
         with open(path, "rb") as fh:
-            raw = tomllib.load(fh)
+            data = fh.read()
     except OSError as exc:
         raise ProfileFileError(f"MNEMIQ_PROFILES_PATH={path!r} cannot be read: {exc.strerror}") from exc
+    return _parsed(path, data)
+
+
+def _parsed(path: str, data: bytes) -> _File:
+    """The profiles file read from `path` as `data`."""
+    try:
+        raw = tomllib.loads(data.decode())
     except tomllib.TOMLDecodeError as exc:
         # Position only: the decoder's message can quote the line.
         raise ProfileFileError(f"{path} is not valid TOML") from exc
@@ -186,29 +199,87 @@ def starters_folder() -> Path:
     return folder.resolve()
 
 
-def starter_names() -> list[str]:
-    """The starters this engine ships, by name: the stem of each TOML file in its starters folder. A starter is a
-    regular file in the folder itself, so a link is never one: `is_file` follows it, and its name would read whatever
-    file it points at, outside the package."""
-    folder = starters_folder().resolve()
+def starter_names(folder: Path | None = None) -> list[str]:
+    """The starters this engine ships, by name: the stem of each TOML file in its starters folder (or in `folder`, such
+    as one a starter is staged in before it is published). A starter is a regular file in the folder itself, so a link
+    is never one: `is_file` follows it, and its name would read whatever file it points at, outside the package."""
+    folder = (starters_folder() if folder is None else Path(folder)).resolve()
     return sorted(path.stem for path in folder.glob("*.toml")
                   if not path.is_symlink() and path.is_file() and path.resolve().parent == folder)
 
 
-def starter_path(name: str) -> str:
-    """The file of a starter this engine ships. Only a name the folder lists is taken, so a name shaped like a path
-    never reaches a file outside it, and one an upgrade removed is refused rather than read as no starter."""
-    names = starter_names()
+def starter_path(name: str, folder: Path | None = None) -> str:
+    """The file of a starter this engine ships (or that `folder` holds). Only a name the folder lists is taken, so a
+    name shaped like a path never reaches a file outside it, and one an upgrade removed is refused rather than read as
+    no starter."""
+    names = starter_names(folder)
     if name not in names:
         raise ProfileFileError(f"starter {name!r} is not one this engine ships; it ships: {', '.join(names) or 'none'}")
-    return str(starters_folder() / f"{name}.toml")
+    return str((starters_folder() if folder is None else Path(folder)) / f"{name}.toml")
 
 
-def _starter_entry(name: str) -> _Entry:
-    """A starter's settings: its file's default profile. Answer-time settings and mode sections only, since the model,
-    its endpoints, the keys and who may pick a profile stay with the deployment, and a starter is always a chain's first
-    layer."""
-    read = _read(starter_path(name))
+def _evidence_bytes(evidence: Path) -> tuple[bytes | None, str | None]:
+    """A starter's evidence file as read, never through a link: a link could put a file from outside the package
+    beside the starter. Opened without blocking, so a named pipe with no writer is refused as not a regular file
+    rather than holding the engine's boot; that changes nothing for a regular file. The bytes, or None and why not."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow and evidence.is_symlink():   # where the flag does not exist, checked before opening instead
+        return None, f"{evidence.name} is a link"
+    try:
+        descriptor = os.open(evidence, os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        return None, f"{evidence.name} is missing"
+    except OSError as exc:
+        # The flag refuses a link as ELOOP on Linux and macOS, and as another error on some systems.
+        if exc.errno == errno.ELOOP or evidence.is_symlink():
+            return None, f"{evidence.name} is a link"
+        return None, f"{evidence.name} cannot be read: {exc.strerror}"
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None, f"{evidence.name} is not a regular file"
+        chunks = []
+        while chunk := os.read(descriptor, 1 << 16):
+            chunks.append(chunk)
+        return b"".join(chunks), None
+    except OSError as exc:
+        return None, f"{evidence.name} cannot be read: {exc.strerror}"
+    finally:
+        os.close(descriptor)
+
+
+def _bound(name: str, path: str, data: bytes) -> None:
+    """Refuse the starter `name`, read from `path` as `data`, unless the evidence beside it, a regular file and not a
+    link, records the sha256 of those bytes (`starter_sha256`). Publishing moves the evidence in first and the starter
+    after it, so a pair it left half moved is refused here rather than loaded unchecked. Only that one field is read;
+    the sweep reads the rest."""
+    evidence = Path(path).with_name(f"{name}{EVIDENCE_SUFFIX}")
+    raw, reason = _evidence_bytes(evidence)
+    if raw is not None:
+        try:
+            held = json.loads(raw)
+        except ValueError:
+            reason = f"{evidence.name} is not JSON"
+        else:
+            if isinstance(held, dict) and held.get("starter_sha256") == hashlib.sha256(data).hexdigest():
+                return
+            reason = f"{evidence.name} does not record the sha256 of {Path(path).name}"
+    raise ProfileFileError(f"starter {name!r} and its evidence do not match ({reason}): it may have been published "
+                           "incompletely. Restore both files, or publish it again")
+
+
+def _starter_entry(name: str, folder: Path | None = None) -> _Entry:
+    """A starter's settings: its file's default profile, read once and only beside evidence that records its bytes
+    (`_bound`). Answer-time settings and mode sections only, since the model, its endpoints, the keys and who may pick a
+    profile stay with the deployment, and a starter is always a chain's first layer. `folder` reads the starter from
+    another folder than the one the engine ships, as publishing checks a staged one."""
+    path = starter_path(name, folder)
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError as exc:
+        raise ProfileFileError(f"starter {name!r} cannot be read: {exc.strerror}") from exc
+    _bound(name, path, data)
+    read = _parsed(path, data)
     if read.default not in read.profiles:
         raise ProfileFileError(f"starter {name!r}: default = {read.default!r} names no profile")
     entry = read.profiles[read.default]
@@ -317,7 +388,7 @@ def _refuse_reasoning_under_guided_decoding(name: str, settings: Settings,
                                f"JSON: turn one of them off{where}")
 
 
-def _checked(name: str, read: _File, base: Settings) -> Profile:
+def _checked(name: str, read: _File, base: Settings, starters: Path | None = None) -> Profile:
     entry = read.profiles[name]
     if not _NAME.fullmatch(name):
         raise ProfileFileError(f"profile name {name!r} must match {_NAME.pattern}")
@@ -331,7 +402,7 @@ def _checked(name: str, read: _File, base: Settings) -> Profile:
     layers: list[tuple[str, _Entry]] = []
     settings = base
     if starter is not None:
-        layers.append((f"starter {starter!r}", _starter_entry(starter)))
+        layers.append((f"starter {starter!r}", _starter_entry(starter, starters)))
         settings = _layered(starter, layers[-1][1], settings)
     for link in chain:
         layers.append((f"profile {link!r}", read.profiles[link]))
@@ -356,8 +427,9 @@ def _checked(name: str, read: _File, base: Settings) -> Profile:
     return Profile(name, None if entry.roles is None else frozenset(entry.roles), settings)
 
 
-def load_profiles(settings: Settings) -> tuple[dict[str, Profile], str]:
-    """The profiles this deployment runs, and the default's name. With no file: one profile, these settings as they are."""
+def load_profiles(settings: Settings, *, starters: Path | None = None) -> tuple[dict[str, Profile], str]:
+    """The profiles this deployment runs, and the default's name. With no file: one profile, these settings as they are.
+    A starter a profile names is read from `starters`, when given, in place of the folder the engine ships."""
     if "MNEMIQ_PROFILE" in os.environ:
         # `Settings` ignores what it does not know, so this would silently stop meaning what it says.
         raise ProfileFileError("MNEMIQ_PROFILE is gone: name a file of profiles in MNEMIQ_PROFILES_PATH, or unset it")
@@ -376,7 +448,7 @@ def load_profiles(settings: Settings) -> tuple[dict[str, Profile], str]:
     read = _read(settings.profiles_path)
     if read.default not in read.profiles:
         raise ProfileFileError(f"default = {read.default!r} names no profile; the file has {sorted(read.profiles)}")
-    return {name: _checked(name, read, settings) for name in read.profiles}, read.default
+    return {name: _checked(name, read, settings, starters) for name in read.profiles}, read.default
 
 
 def flattened_entry(path: str, name: str) -> _Entry:

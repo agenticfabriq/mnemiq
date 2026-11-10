@@ -113,6 +113,12 @@ an upgrade, is refused at boot, and the refusal lists the starters this engine s
 - **A starter's mode sections** merge setting by setting with the sections of the profiles above it, and with nothing
   below it: `MNEMIQ_MODE_SETTINGS` is refused beside a profiles file, so an env file's mode settings never meet a
   starter.
+- **A starter ships bound to its evidence.** `<name>.evidence.json` beside it records the sha256 of the starter's file
+  (`starter_sha256`), and a starter whose evidence is missing, is a link or not a regular file, is not JSON, or
+  records another file is refused at boot, as one published incompletely.
+
+How a starter is made from sweeps, what is meant by its being safe, what its evidence holds, and which starters this
+engine ships: [starters.md](starters.md).
 
 ## What a profile may change
 
@@ -164,6 +170,8 @@ version.
 - A profile other than the default that lists no `roles`, even one that extends a profile that does.
 - A `starter` this engine does not ship. The refusal lists the ones it does.
 - A starter that sets the model, an endpoint, the context window, a key variable, `roles`, or a parent.
+- A starter whose evidence is missing, is a link or not a regular file, is not JSON, or does not record the sha256
+  of the starter's file.
 
 ## Finding the right settings
 

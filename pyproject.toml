@@ -94,6 +94,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mnemiq"]
+# What publishing a starter leaves in the starters folder while it runs: the folder's lock, and a file copied in under a
+# hidden name until it is moved into place. `packages` ships what .gitignore ignores, so they are excluded here too.
+exclude = ["src/mnemiq/starter_profiles/.publish.lock", "src/mnemiq/starter_profiles/.*.tmp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

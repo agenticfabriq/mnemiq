@@ -31,6 +31,11 @@ src/mnemiq/server/static/
 workbench/node_modules/
 workbench/dist/
 
+# What publishing a starter leaves in the starters folder while it runs: the folder's lock, and a file copied in under
+# a hidden name until it is moved into place. Neither belongs in the repository or in a wheel.
+src/mnemiq/starter_profiles/.publish.lock
+src/mnemiq/starter_profiles/.*.tmp
+
 # Python
 __pycache__/
 *.pyc
