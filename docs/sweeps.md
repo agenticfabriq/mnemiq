@@ -459,10 +459,10 @@ each run's `only/other` and p. The screen's p is the one-sided p it keeps by; ev
 
 - **the sweep**: its name, its fingerprint (what its answers depend on), the engine build its arms ran on and the one
   that wrote the proposal, the split seed and each part's size, the identity, each model's endpoints without
-  credentials, the rule (strategy, `alpha`, `screen_alpha`, the bounds, `max_errors`, the runs each arm owed and
-  whether the first round decided them), the sources it could not pin, and the starter the start resolves through with
-  where the sweep's build differs from the one it was swept on (`start_starter`, null when it reaches none;
-  [the model server's build](#the-model-servers-build));
+  credentials, the rule (strategy, `alpha`, `screen_alpha`, the bounds, `harm` when it is `"worst"`, `max_errors`,
+  the runs each arm owed and whether the first round decided them), the sources it could not pin, and the starter the
+  start resolves through with where the sweep's build differs from the one it was swept on (`start_starter`, null
+  when it reaches none; [the model server's build](#the-model-servers-build));
 - **the verdict**: whether the start is valid in every run (`start_valid`), what was chosen and by whom (the rule or a
   person), the rule's own pick, whether it was confirmed, why in words, and any warnings: another engine packaging the
   proposal, where the build differs from the starter's, and a weights folder that is not the stated model's;
@@ -477,7 +477,9 @@ each run's `only/other` and p. The screen's p is the one-sided p it keeps by; ev
   arm of its own), and its `version`, recomputed by the engine and checked against the version the measured arm's
   answers were stamped with;
 - **modes the engine refused and modes the sweep did not search** (below), and in check mode the start and the
-  defaults side by side.
+  defaults side by side, run by run, with what the start gave beyond the defaults in each run
+  (`start_against_defaults`) and, under `harm = "worst"`, each arm's highest wrong and made-up counts in each mode
+  (`highest`).
 
 `propose` writes both files only once every check has passed. It opens each deployment's source to read its
 dialect, which a profile's version holds, so it needs the same access to the source as the run, and each key variable

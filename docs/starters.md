@@ -11,9 +11,10 @@ a search from it, before you rely on it.
 
 ## What "safe" means
 
-A starter adds no wrong answers and no made-up answers over the engine's defaults for that model, in each measured
-mode, by the sweep's own rule, with both `[propose]` bounds at 0 (`max_more_wrong` and `max_more_made_up`). It is not
-a claim that it is the best profile for the build, only that its sweeps found it no worse on those two counts.
+A starter gave no more wrong answers and no more made-up answers than the engine's defaults for that model, in each
+measured mode, by the sweep's own rule and under the reading its evidence records (below), with both `[propose]`
+bounds at 0 (`max_more_wrong` and `max_more_made_up`). It is not a claim that it is the best profile for the build,
+only that its sweeps found it no worse on those two counts.
 
 How the starter's counts were compared with the defaults' is the reading the rule ran under, which the evidence
 records under `rule` (`harm`, [sweeps.md](sweeps.md#check-mode)). Publishing accepts either:
@@ -21,11 +22,11 @@ records under `rule` (`harm`, [sweeps.md](sweeps.md#check-mode)). Publishing acc
 - **Run by run** (no `harm` in the evidence). In each run, the starter gave no more wrong and no more made-up answers
   than the defaults gave in the run of the same number. A search's confirm round, on the held-out part, reads them
   this way, and so does check mode by default.
-- **Worst against worst** (`harm: worst`, check mode only). The starter's highest wrong count over its runs is not
-  above the defaults' highest over theirs, and the same for made-up answers. That is not "no more wrong answers in
-  every run": a starter can give more than the defaults in one run and still be published, when its highest count is
-  not above theirs. Like the right-answers reading below, it grows more lenient as the defaults get more runs, and
-  with one run of each it is the run-by-run reading.
+- **Worst against worst** (`harm: worst`, check mode only, with two or more runs of each arm). The starter's highest
+  wrong count over its runs is not above the defaults' highest over theirs, and the same for made-up answers. That is
+  not "no more wrong answers in every run": a starter can give more than the defaults in one run and still be
+  published, when its highest count is not above theirs. Like the right-answers reading below, it grows more lenient
+  as the defaults get more runs, and with one run of each it would be the run-by-run reading.
 
 ### Right answers
 
@@ -76,7 +77,9 @@ hand:
    mnemiq sweep starter --config check.toml --model <model> --dataset "<the question set's name>"
    ```
 
-Its evidence says `safe_by: check` and holds no search (`search` is null): the check is all that found it safe.
+Its evidence says `safe_by: check` and holds no search (`search` is null): the check is all that found it safe. Check
+mode holds no question out, so a profile tuned on the same questions is measured on the questions it was tuned on;
+check it on questions its tuning never saw when you can.
 
 The starter is named for its build: the part of `[models.<model>.build] model` after the `/`, lowercased, so
 `Qwen/Qwen2.5-Coder-32B-Instruct-AWQ` gives `qwen2.5-coder-32b-instruct-awq`. `--name` may only repeat that name.
@@ -150,8 +153,9 @@ Deployments are numbered in it, never named. The dataset label is the publisher'
 - `engine_build`: the engine's package version, the commit the sweeps ran on, and its source hash.
 - `safe_by`: `check` or `search_from_defaults` ([right answers](#right-answers)).
 - `rule`: the strategy, `alpha`, both bounds, `max_errors` and the runs each arm owed, and `harm: worst` when check
-  mode read the bounds worst against worst; with no `harm`, they were read run by run
-  ([what "safe" means](#what-safe-means)).
+  mode read the bounds worst against worst ([what "safe" means](#what-safe-means)). A missing `harm` and
+  `harm: per_run` both mean the run-by-run reading, and publishing writes neither: it leaves `harm` out, as evidence
+  written before the reading existed does. `harm: worst` is refused with a strategy other than `check`.
 - `modes_measured`: the modes the starter was measured in, each of which it holds a section for.
 - `unmeasured_modes`: each other mode, with the starter's profile-wide settings that differ from the engine's
   defaults, which apply there unmeasured.
