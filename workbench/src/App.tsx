@@ -46,10 +46,15 @@ type Session =
   | { state: "ready"; ns: string | null; shelf: string | null; verified: boolean; endSession: string | null }
   | { state: "signed-out"; prompt: boolean }
   | { state: "leaving"; ns: string | null; endSession: string | null }
-  | { state: "refused"; refusal: Notice };
+  // `endSession`: where a Sign out from the notice ends, as the refusing 403 named it.
+  | { state: "refused"; refusal: Notice; endSession: string | null };
 
 const RELOAD = () => globalThis.location.reload();
 const NAVIGATE = (url: string) => globalThis.location.assign(url);
+
+/** Where a Sign out sends the browser (`signOutHref`), returning to the page signed out from. */
+const signOutTo = (endSession: string | null): string =>
+  signOutHref(endSession, globalThis.location.origin, `${globalThis.location.pathname}${globalThis.location.search}`);
 
 /**
  * The identity this tab holds threads for, as of its last check. The proxy's session is the
@@ -171,9 +176,9 @@ export default function App({
       })
       .catch((error: unknown) => {
         if (!live) return;
-        const refusal = error instanceof Refused ? error.refusal : "unavailable";
-        if (refusal === "signed-out") refused(refusal);
-        else setSession({ state: "refused", refusal });
+        const why = error instanceof Refused ? error : new Refused("unavailable");
+        if (why.refusal === "signed-out") refused(why.refusal);
+        else setSession({ state: "refused", refusal: why.refusal, endSession: why.endSession });
       });
     return () => {
       live = false;
@@ -235,8 +240,7 @@ export default function App({
     if (session.state !== "leaving") return;
     // Run once the workbench is gone, so nothing is left to write the threads back.
     signOut(session.ns);
-    const back = `${globalThis.location.pathname}${globalThis.location.search}`;
-    navigate(signOutHref(session.endSession, globalThis.location.origin, back));
+    navigate(signOutTo(session.endSession));
   }, [session, navigate]);
 
   if (session.state === "ready") {
@@ -251,7 +255,15 @@ export default function App({
       />
     );
   }
-  if (session.state === "refused") return <SessionNotice message={NOTICE[session.refusal]} />;
+  if (session.state === "refused") {
+    const { refusal, endSession } = session;
+    // Refused as this sign-in, signing in again as the same user changes nothing: the way on is
+    // another account. Nothing is purged, since a 403 does not say who is asking, so nothing this
+    // browser holds is known to be theirs. An outage is not about the sign-in, and offers nothing.
+    const action =
+      refusal === "unavailable" ? undefined : { label: "Sign out", onClick: () => navigate(signOutTo(endSession)) };
+    return <SessionNotice message={NOTICE[refusal]} action={action} />;
+  }
   if (session.state === "signed-out" && session.prompt) {
     return (
       <SessionNotice

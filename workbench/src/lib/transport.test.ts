@@ -230,6 +230,93 @@ describe("fetchWhoami", () => {
   });
 });
 
+describe("fetchWhoami's 403", () => {
+  const END = "https://kc.example/realms/r/protocol/openid-connect/logout?client_id=workbench-proxy";
+  const SCOPE_CHALLENGE = { "www-authenticate": 'Bearer error="insufficient_scope", scope="db.read"' };
+  // Both 403s the engine sends: a sign-in it does not permit, and one without the scope it needs.
+  const KINDS: [Refusal, Record<string, string>][] = [
+    ["not-permitted", {}],
+    ["insufficient-scope", SCOPE_CHALLENGE],
+  ];
+
+  const forbidden = (body: BodyInit | null, headers: Record<string, string>) =>
+    new Response(body, { status: 403, headers });
+
+  /** The `Refused` a request ends with. */
+  const refusedBy = async (promise: Promise<unknown>): Promise<Refused> => {
+    try {
+      await promise;
+    } catch (error) {
+      if (error instanceof Refused) return error;
+      throw error;
+    }
+    throw new Error("the request was not refused");
+  };
+
+  for (const [refusal, headers] of KINDS) {
+    it(`carries the end-session URL named beside the detail of a 403 read as ${refusal}`, async () => {
+      stubFetch(forbidden(JSON.stringify({ detail: "Forbidden", end_session_url: END }), headers));
+
+      const refused = await refusedBy(fetchWhoami());
+
+      expect(refused.refusal).toBe(refusal);
+      expect(refused.endSession).toBe(END);
+    });
+
+    it(`reads a 403 naming no usable end-session URL as naming none, and still as ${refusal}`, async () => {
+      const naming = (end_session_url: unknown) => JSON.stringify({ detail: "Forbidden", end_session_url });
+      const bodies: [string, () => BodyInit | null][] = [
+        ["a null URL", () => naming(null)],
+        ["no URL", () => JSON.stringify({ detail: "Forbidden" })],
+        ["a numeric URL", () => naming(42)],
+        // Each refused by the same reader as whoami's 200.
+        ["a script URL", () => naming("javascript:alert(1)")],
+        ["a relative path", () => naming("/relative")],
+        ["a host the browser rewrites", () => naming("https://0x7f/x")],
+        ["an empty body", () => ""],
+        ["no body", () => null],
+        ["a body that is not JSON", () => "Forbidden"],
+        ["JSON that is not an object", () => JSON.stringify(END)],
+        ["a JSON array", () => JSON.stringify([END])],
+        ["JSON null", () => "null"],
+        [
+          "a body that fails part way",
+          () =>
+            new ReadableStream({
+              start(controller) {
+                controller.error(new TypeError("the connection was reset"));
+              },
+            }),
+        ],
+      ];
+      for (const [what, body] of bodies) {
+        stubFetch(forbidden(body(), headers));
+
+        const refused = await refusedBy(fetchWhoami());
+
+        expect([what, refused.refusal]).toEqual([what, refusal]);
+        expect([what, refused.endSession]).toEqual([what, null]);
+      }
+    });
+  }
+
+  it("names no end-session URL on any refusal but a 403, even one whose body names it", async () => {
+    const naming = JSON.stringify({ detail: "x", end_session_url: END });
+    const answers: [string, () => Response][] = [
+      ["a 401", () => new Response(naming, { status: 401 })],
+      ["a redirect to the identity provider", () => OPAQUE_REDIRECT],
+      ["a 503", () => new Response(naming, { status: 503 })],
+      ["a 500", () => new Response(naming, { status: 500 })],
+    ];
+    for (const [what, response] of answers) {
+      stubFetch(response());
+      expect([what, (await refusedBy(fetchWhoami())).endSession]).toEqual([what, null]);
+    }
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed to fetch")));
+    expect((await refusedBy(fetchWhoami())).endSession).toBeNull();
+  });
+});
+
 describe("fetchScope", () => {
   for (const [what, response, refusal] of SESSION_ANSWERS) {
     it(`reads ${what} as ${refusal}`, async () => {

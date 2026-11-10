@@ -16,6 +16,7 @@ import type { Thread } from "./lib/threads";
 const ALICE = { principal_id: "alice@example.com", tenant_id: "tenant-a", verified: true };
 const BOB = { principal_id: "bob@example.com", tenant_id: "tenant-a", verified: true };
 const STARTER = "how many claims are there?";
+const END = "https://kc.example/realms/r/protocol/openid-connect/logout?client_id=workbench-proxy";
 
 const thread = (question: string): Thread => ({
   id: `t-${question}`,
@@ -492,7 +493,6 @@ describe("signing out", () => {
   });
 
   it("ends the sign-out at the identity provider when the engine names its end-session URL", async () => {
-    const END = "https://kc.example/realms/r/protocol/openid-connect/logout?client_id=workbench-proxy";
     const alice = await signedInBefore(ALICE, "alice's question");
     serve({ "/v1/whoami": () => json({ ...ALICE, end_session_url: END }), "/v1/schema": SCOPE });
     const navigate = vi.fn();
@@ -628,6 +628,153 @@ describe("refusals that are not a sign-out", () => {
     expect(reload).not.toHaveBeenCalled();
     expect(screen.getAllByText("alice's question")).not.toHaveLength(0);
     expect(namespaced().length).toBeGreaterThan(0);
+  });
+});
+
+describe("signing out of a sign-in the engine refuses", () => {
+  // A 403 says signing in again as the same user changes nothing: the way on is another account.
+  const SCOPE_CHALLENGE = { "www-authenticate": 'Bearer error="insufficient_scope", scope="db.read"' };
+  const forbidden = (body: BodyInit | null, headers: Record<string, string> = {}) =>
+    new Response(body, { status: 403, headers });
+  const naming = (end_session_url: unknown) => JSON.stringify({ detail: "Forbidden", end_session_url });
+
+  /** The proxy's sign-out, then the provider's, which returns the browser to the workbench's root. */
+  const viaProvider = () => {
+    const root = encodeURIComponent(`${globalThis.location.origin}/`);
+    return `/oauth2/sign_out?rd=${encodeURIComponent(`${END}&post_logout_redirect_uri=${root}`)}`;
+  };
+  /** The proxy's sign-out alone, back to the page signed out from. */
+  const PROXY_ONLY = "/oauth2/sign_out?rd=%2F";
+
+  it("offers a Sign out that ends at the identity provider the 403 names, purging nothing", async () => {
+    await signedInBefore(ALICE, "alice's question");
+    const before = snapshot();
+    serve({ "/v1/whoami": () => forbidden(naming(END), { "content-type": "application/json" }) });
+    const navigate = vi.fn();
+    const reload = vi.fn();
+    render(<App reload={reload} navigate={navigate} />);
+    expect(await screen.findByText(NOTICE["not-permitted"])).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+
+    expect(navigate).toHaveBeenCalledTimes(1);
+    expect(navigate).toHaveBeenCalledWith(viaProvider());
+    await settle();
+    // The refused user never loaded a namespace, so there is nothing of theirs to purge, and
+    // whatever the browser holds is someone else's.
+    expect(snapshot()).toEqual(before);
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  for (const [what, body] of [
+    ["a null end_session_url", naming(null)],
+    ["no end_session_url", JSON.stringify({ detail: "Forbidden" })],
+    ["an empty body", ""],
+    ["a body that is not JSON", "Forbidden"],
+    ["a script URL for end_session_url", naming("javascript:alert(1)")],
+    ["a relative path for end_session_url", naming("/relative")],
+  ] as const) {
+    it(`offers a Sign out at the proxy alone when the 403 has ${what}`, async () => {
+      await signedInBefore(ALICE, "alice's question");
+      const before = snapshot();
+      serve({ "/v1/whoami": () => forbidden(body) });
+      const navigate = vi.fn();
+      const reload = vi.fn();
+      render(<App reload={reload} navigate={navigate} />);
+      expect(await screen.findByText(NOTICE["not-permitted"])).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+
+      expect(navigate).toHaveBeenCalledTimes(1);
+      expect(navigate).toHaveBeenCalledWith(PROXY_ONLY);
+      await settle();
+      expect(snapshot()).toEqual(before);
+      expect(reload).not.toHaveBeenCalled();
+    });
+  }
+
+  it("sends the browser back to the page it signed out from, as the workbench's Sign out does", async () => {
+    globalThis.history.replaceState(null, "", "/workbench/?thread=1");
+    try {
+      serve({ "/v1/whoami": () => forbidden("") });
+      const navigate = vi.fn();
+      render(<App reload={vi.fn()} navigate={navigate} />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Sign out" }));
+
+      expect(navigate).toHaveBeenCalledWith(`/oauth2/sign_out?rd=${encodeURIComponent("/workbench/?thread=1")}`);
+    } finally {
+      globalThis.history.replaceState(null, "", "/");
+    }
+  });
+
+  it("offers it to a sign-in that lacks a scope, saying what it said before", async () => {
+    await signedInBefore(ALICE, "alice's question");
+    const before = snapshot();
+    serve({ "/v1/whoami": () => forbidden(naming(END), SCOPE_CHALLENGE) });
+    const navigate = vi.fn();
+    render(<App reload={vi.fn()} navigate={navigate} />);
+
+    const notice = await screen.findByText("Not permitted: this sign-in lacks the access the workbench needs.");
+    expect(notice).toHaveTextContent(/^Not permitted: this sign-in lacks the access the workbench needs\.$/);
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+
+    expect(navigate).toHaveBeenCalledWith(viaProvider());
+    await settle();
+    expect(snapshot()).toEqual(before);
+  });
+
+  for (const [what, failure, says] of [
+    [
+      "a 401",
+      () => serve({ "/v1/whoami": () => new Response(naming(END), { status: 401 }) }),
+      null, // the page reloads to sign in again, showing nothing
+    ],
+    [
+      "a 401 soon after a reload",
+      () => {
+        mayReload(Date.now() - 5_000);
+        serve({ "/v1/whoami": () => new Response(naming(END), { status: 401 }) });
+      },
+      /session has ended/i,
+    ],
+    ["a 503", () => serve({ "/v1/whoami": () => new Response(naming(END), { status: 503 }) }), NOTICE.unavailable],
+    [
+      "a network failure",
+      () => vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed to fetch"))),
+      NOTICE.unavailable,
+    ],
+  ] as const) {
+    it(`offers no Sign out on ${what}, which is not a refusal of this sign-in`, async () => {
+      failure();
+      const reload = vi.fn();
+
+      render(<App reload={reload} navigate={vi.fn()} />);
+
+      if (says === null) await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
+      else expect(await screen.findByText(says)).toBeInTheDocument();
+      await settle();
+      expect(screen.queryByRole("button", { name: "Sign out" })).not.toBeInTheDocument();
+    });
+  }
+
+  it("adds no Sign out of its own to a 403 on the schema, above the workbench", async () => {
+    const alice = await signedInBefore(ALICE, "alice's question");
+    serve({
+      "/v1/whoami": () => json(ALICE),
+      "/v1/schema": () => forbidden(naming(END), { "content-type": "application/json" }),
+    });
+    const navigate = vi.fn();
+    render(<App reload={vi.fn()} navigate={navigate} />);
+    expect(await screen.findByText(NOTICE["not-permitted"])).toBeInTheDocument();
+
+    // The workbench's own Sign out, and only that: it purges, and ends where whoami said.
+    expect(screen.getAllByRole("button", { name: "Sign out" })).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith(PROXY_ONLY));
+    await settle();
+    expect(localStorage.getItem(keyFor(alice, "threads"))).toBeNull();
   });
 });
 

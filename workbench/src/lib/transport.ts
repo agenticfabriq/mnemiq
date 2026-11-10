@@ -15,8 +15,12 @@ import type { AguiEvent, HistoryTurn, Mode, SchemaTable, Whoami } from "./types"
  */
 export type Refusal = "signed-out" | "not-permitted" | "insufficient-scope" | "unavailable";
 
+/** `endSession`: where a refused sign-in's Sign out ends, as a 403 on whoami names it; null otherwise. */
 export class Refused extends Error {
-  constructor(readonly refusal: Refusal) {
+  constructor(
+    readonly refusal: Refusal,
+    readonly endSession: string | null = null,
+  ) {
     super(refusal);
     this.name = "Refused";
   }
@@ -42,24 +46,42 @@ function refusalOf(response: Response): Refusal | null {
 }
 
 /**
- * fetch for /v1, throwing `Refused` for an answer about the session. A redirect is never
- * followed: followed to the identity provider, it is a cross-origin request the browser
- * refuses, and that refusal is indistinguishable from the network failing -- a signed-out
- * user would be told the service is down.
+ * fetch for /v1. A redirect is never followed: followed to the identity provider, it is a
+ * cross-origin request the browser refuses, and that refusal is indistinguishable from the
+ * network failing -- a signed-out user would be told the service is down.
  */
-async function v1(path: string, init: RequestInit = {}): Promise<Response> {
-  let response: Response;
+async function request(path: string, init: RequestInit = {}): Promise<Response> {
   try {
-    response = await fetch(path, { ...init, redirect: "manual" });
+    return await fetch(path, { ...init, redirect: "manual" });
   } catch (error) {
     // fetch rejects with a TypeError when the request never got an answer. A cancelled
     // request rejects with an AbortError instead, and stays the caller's business.
     if (error instanceof TypeError) throw new Refused("unavailable");
     throw error;
   }
+}
+
+/** `request`, throwing `Refused` for an answer about the session. */
+async function v1(path: string, init: RequestInit = {}): Promise<Response> {
+  const response = await request(path, init);
   const refusal = refusalOf(response);
   if (refusal) throw new Refused(refusal);
   return response;
+}
+
+/**
+ * The end-session URL a 403's body names beside its detail, `{"detail": ..., "end_session_url": ...}`,
+ * read as whoami's 200 reads it. A body that cannot be read, or names none, reads as none: the 403 is
+ * the answer either way, and reading its body never turns it into another refusal.
+ */
+async function endSessionOfRefusal(response: Response): Promise<string | null> {
+  let body: { end_session_url?: unknown } | null;
+  try {
+    body = (await response.json()) as typeof body;
+  } catch {
+    return null;
+  }
+  return endSessionOf(body?.end_session_url);
 }
 
 /**
@@ -68,7 +90,13 @@ async function v1(path: string, init: RequestInit = {}): Promise<Response> {
  * identity there is no telling whose threads to show.
  */
 export async function fetchWhoami(): Promise<Whoami | null> {
-  const response = await v1("/v1/whoami");
+  const response = await request("/v1/whoami");
+  const refusal = refusalOf(response);
+  if (refusal) {
+    // A 403 refuses this sign-in, so the user's way on is another account: the page offers a Sign
+    // out, and needs to know where it ends. No other refusal names one.
+    throw new Refused(refusal, response.status === 403 ? await endSessionOfRefusal(response) : null);
+  }
   if (response.status === 404) return null;
   if (!response.ok) throw new Refused("unavailable");
   let body: { principal_id?: unknown; tenant_id?: unknown; verified?: unknown; end_session_url?: unknown };
