@@ -20,7 +20,7 @@ from mnemiq.sweep.arms import check_arms
 from mnemiq.sweep.config import SweepConfig, SweepConfigError, fingerprint, fingerprint_body, load_config
 from mnemiq.sweep.propose import _check, propose
 from mnemiq.sweep.run import _begin, _parts, engine_build
-from mnemiq.sweep.starters import StarterEvidence, publish_starter, read_evidence
+from mnemiq.sweep.starters import RuleRecord, StarterEvidence, publish_starter, read_evidence
 
 from .conftest import (
     _START_MARK, CONFIG_BUILD, KEY_ENV, STUB_WINDOW, UNREACHABLE, _start_profile, checked_rows, evidence,
@@ -449,3 +449,21 @@ def test_a_per_run_proposal_whose_evidence_claims_worst_is_never_published(tmp_p
     with pytest.raises(SweepConfigError, match=r"records harm 'worst'.*'per_run'"):
         publish_starter(cfg, "m", "the tiny set")
     assert not list(profiles.starters_folder().glob("model-2.5-awq*"))
+
+
+# --- the starter's rule record ------------------------------------------------------------------------------------
+
+_RULE = {"strategy": "check", "alpha": 0.05, "max_more_wrong": 0, "max_more_made_up": 0, "max_errors": 0, "repeats": 2}
+
+
+@pytest.mark.parametrize("strategy", ["screen-then-grid", "grid"])
+def test_the_starter_schema_refuses_worst_outside_check_mode(tmp_path, monkeypatch, strategy):
+    shipped = valid_evidence(tmp_path, monkeypatch)
+    with pytest.raises(ValidationError, match="check mode's reading alone"):
+        StarterEvidence.model_validate(shipped | {"rule": shipped["rule"] | {"strategy": strategy, "harm": "worst"}})
+
+
+def test_a_rule_dump_that_already_leaves_harm_out_is_written():
+    for harm in ("per_run", "worst"):
+        assert RuleRecord(**_RULE, harm=harm).model_dump(exclude={"harm"}) == _RULE
+    assert RuleRecord(**_RULE).model_dump(exclude_defaults=True) == _RULE

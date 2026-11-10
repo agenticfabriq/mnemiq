@@ -43,6 +43,7 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import (
     AfterValidator, BaseModel, ConfigDict, Field, SerializerFunctionWrapHandler, ValidationError, model_serializer,
+    model_validator,
 )
 
 from mnemiq import profiles
@@ -139,8 +140,9 @@ class DatasetRecord(_Record):
 class RuleRecord(_Record):
     """The rule the sweeps ran under. Both bounds are 0, so the schema itself refuses a starter with looser ones.
 
-    `harm` is how check mode read the bounds (`[propose] harm`). It is written only when it is "worst", and read as
-    "per_run" when absent, so evidence published before the reading existed reads, and is written, as it was."""
+    `harm` is how check mode read the bounds (`[propose] harm`), and "worst" is refused with any other strategy, as
+    the sweep's config refuses it. It is written only when it is "worst", and read as "per_run" when absent, so
+    evidence published before the reading existed reads, and is written, as it was."""
 
     strategy: Literal["check", "screen-then-grid", "grid"]
     alpha: float
@@ -150,11 +152,17 @@ class RuleRecord(_Record):
     max_errors: int
     repeats: int
 
+    @model_validator(mode="after")
+    def _worst_in_check_mode_alone(self) -> RuleRecord:
+        if self.harm == "worst" and self.strategy != "check":
+            raise ValueError(f'harm "worst" is check mode\'s reading alone, and the strategy is {self.strategy!r}')
+        return self
+
     @model_serializer(mode="wrap")
     def _per_run_unwritten(self, handler: SerializerFunctionWrapHandler) -> dict:
         written = handler(self)
         if self.harm == "per_run":
-            del written["harm"]
+            written.pop("harm", None)   # a dump told to leave harm out, or its default, has already left it out
         return written
 
 
