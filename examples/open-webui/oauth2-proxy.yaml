@@ -1,0 +1,35 @@
+# oauth2-proxy v7.15.6 in front of mnemiq's workbench and /v1. It holds no secret: ${PROXY_CLIENT_SECRET} is filled
+# from the container's environment (.secrets/oauth2-proxy.env), which the proxy's alpha config expands at load.
+injectRequestHeaders:
+  # The access token, not the ID token: the access token carries mnemiq's audience and the db.read scope.
+  - name: Authorization
+    values:
+      - claimSource:
+          claim: access_token
+          prefix: "Bearer "
+upstreamConfig:
+  upstreams:
+    - id: mnemiq
+      path: /
+      uri: http://mnemiq:8080
+      # Flush the workbench's event stream as it arrives, so progress renders while the engine works.
+      flushInterval: 1s
+server:
+  BindAddress: 0.0.0.0:4180
+providers:
+  - id: keycloak
+    provider: oidc
+    clientID: workbench-proxy
+    clientSecret: ${PROXY_CLIENT_SECRET}
+    scope: openid
+    # PKCE at both ends: the realm's client requires S256 too.
+    code_challenge_method: S256
+    # Ends the user's Keycloak session on Sign out, while the proxy can load it. mnemiq's end-session setting covers
+    # the case where it cannot.
+    backendLogoutURL: "http://keycloak.localhost:18089/realms/mnemiq/protocol/openid-connect/logout?id_token_hint={id_token}"
+    oidcConfig:
+      issuerURL: http://keycloak.localhost:18089/realms/mnemiq
+      emailClaim: email
+      audienceClaims: [aud]
+      # Kept on: v7.15.6 skips the nonce only for a session it has just refreshed, so sign-in keeps it.
+      insecureSkipNonce: false

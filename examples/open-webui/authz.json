@@ -1,0 +1,6 @@
+{
+  "roles": {
+    "analyst": ["customer", "segment_lookup"],
+    "store1_manager": ["product", "order_line"]
+  }
+}

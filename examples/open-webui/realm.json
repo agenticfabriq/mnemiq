@@ -1,0 +1,258 @@
+{
+ "realm": "mnemiq",
+ "enabled": true,
+ "accessTokenLifespan": 300,
+ "ssoSessionIdleTimeout": 1800,
+ "roles": {
+  "realm": [
+   {
+    "name": "analyst"
+   },
+   {
+    "name": "store1_manager"
+   }
+  ]
+ },
+ "groups": [
+  {
+   "name": "analyst"
+  },
+  {
+   "name": "store1_manager"
+  }
+ ],
+ "clientScopes": [
+  {
+   "name": "basic",
+   "protocol": "openid-connect",
+   "attributes": {
+    "include.in.token.scope": "false",
+    "display.on.consent.screen": "false"
+   },
+   "protocolMappers": [
+    {
+     "name": "sub",
+     "protocol": "openid-connect",
+     "protocolMapper": "oidc-sub-mapper",
+     "config": {
+      "access.token.claim": "true",
+      "introspection.token.claim": "true"
+     }
+    }
+   ]
+  },
+  {
+   "name": "roles",
+   "protocol": "openid-connect",
+   "attributes": {
+    "include.in.token.scope": "false",
+    "display.on.consent.screen": "false"
+   },
+   "protocolMappers": [
+    {
+     "name": "realm roles",
+     "protocol": "openid-connect",
+     "protocolMapper": "oidc-usermodel-realm-role-mapper",
+     "config": {
+      "claim.name": "realm_access.roles",
+      "jsonType.label": "String",
+      "multivalued": "true",
+      "access.token.claim": "true",
+      "id.token.claim": "false",
+      "introspection.token.claim": "true"
+     }
+    }
+   ]
+  },
+  {
+   "name": "db.read",
+   "protocol": "openid-connect",
+   "attributes": {
+    "include.in.token.scope": "true",
+    "display.on.consent.screen": "false"
+   }
+  }
+ ],
+ "defaultDefaultClientScopes": [
+  "basic",
+  "roles"
+ ],
+ "clients": [
+  {
+   "clientId": "workbench-proxy",
+   "name": "mnemiq workbench, through oauth2-proxy",
+   "publicClient": false,
+   "standardFlowEnabled": true,
+   "directAccessGrantsEnabled": false,
+   "redirectUris": [
+    "http://localhost:14180/oauth2/callback"
+   ],
+   "webOrigins": [
+    "http://localhost:14180"
+   ],
+   "attributes": {
+    "post.logout.redirect.uris": "http://localhost:14180/",
+    "pkce.code.challenge.method": "S256"
+   },
+   "protocolMappers": [
+    {
+     "name": "mnemiq-api audience",
+     "protocol": "openid-connect",
+     "protocolMapper": "oidc-audience-mapper",
+     "config": {
+      "included.custom.audience": "mnemiq-api",
+      "access.token.claim": "true",
+      "id.token.claim": "false"
+     }
+    },
+    {
+     "name": "tenant",
+     "protocol": "openid-connect",
+     "protocolMapper": "oidc-hardcoded-claim-mapper",
+     "config": {
+      "claim.name": "tenant",
+      "claim.value": "acme",
+      "jsonType.label": "String",
+      "access.token.claim": "true",
+      "id.token.claim": "false"
+     }
+    },
+    {
+     "name": "email",
+     "protocol": "openid-connect",
+     "protocolMapper": "oidc-usermodel-property-mapper",
+     "config": {
+      "user.attribute": "email",
+      "claim.name": "email",
+      "jsonType.label": "String",
+      "id.token.claim": "true",
+      "access.token.claim": "true",
+      "userinfo.token.claim": "true"
+     }
+    },
+    {
+     "name": "email verified",
+     "protocol": "openid-connect",
+     "protocolMapper": "oidc-usermodel-property-mapper",
+     "config": {
+      "user.attribute": "emailVerified",
+      "claim.name": "email_verified",
+      "jsonType.label": "boolean",
+      "id.token.claim": "true",
+      "access.token.claim": "true",
+      "userinfo.token.claim": "true"
+     }
+    },
+    {
+     "name": "name",
+     "protocol": "openid-connect",
+     "protocolMapper": "oidc-full-name-mapper",
+     "config": {
+      "id.token.claim": "true",
+      "access.token.claim": "true",
+      "userinfo.token.claim": "true"
+     }
+    }
+   ],
+   "defaultClientScopes": [
+    "basic",
+    "roles",
+    "db.read"
+   ]
+  },
+  {
+   "clientId": "open-webui",
+   "name": "Open WebUI (option A)",
+   "publicClient": false,
+   "standardFlowEnabled": true,
+   "directAccessGrantsEnabled": false,
+   "redirectUris": [
+    "http://localhost:13000/oauth/oidc/login/callback"
+   ],
+   "webOrigins": [
+    "http://localhost:13000"
+   ],
+   "attributes": {
+    "post.logout.redirect.uris": "http://localhost:13000/auth",
+    "pkce.code.challenge.method": "S256"
+   },
+   "protocolMappers": [
+    {
+     "name": "mnemiq-openwebui audience",
+     "protocol": "openid-connect",
+     "protocolMapper": "oidc-audience-mapper",
+     "config": {
+      "included.custom.audience": "mnemiq-openwebui",
+      "access.token.claim": "true",
+      "id.token.claim": "false"
+     }
+    },
+    {
+     "name": "tenant",
+     "protocol": "openid-connect",
+     "protocolMapper": "oidc-hardcoded-claim-mapper",
+     "config": {
+      "claim.name": "tenant",
+      "claim.value": "acme",
+      "jsonType.label": "String",
+      "access.token.claim": "true",
+      "id.token.claim": "false"
+     }
+    },
+    {
+     "name": "email",
+     "protocol": "openid-connect",
+     "protocolMapper": "oidc-usermodel-property-mapper",
+     "config": {
+      "user.attribute": "email",
+      "claim.name": "email",
+      "jsonType.label": "String",
+      "id.token.claim": "true",
+      "access.token.claim": "true",
+      "userinfo.token.claim": "true"
+     }
+    },
+    {
+     "name": "email verified",
+     "protocol": "openid-connect",
+     "protocolMapper": "oidc-usermodel-property-mapper",
+     "config": {
+      "user.attribute": "emailVerified",
+      "claim.name": "email_verified",
+      "jsonType.label": "boolean",
+      "id.token.claim": "true",
+      "access.token.claim": "true",
+      "userinfo.token.claim": "true"
+     }
+    },
+    {
+     "name": "name",
+     "protocol": "openid-connect",
+     "protocolMapper": "oidc-full-name-mapper",
+     "config": {
+      "id.token.claim": "true",
+      "access.token.claim": "true",
+      "userinfo.token.claim": "true"
+     }
+    },
+    {
+     "name": "groups",
+     "protocol": "openid-connect",
+     "protocolMapper": "oidc-group-membership-mapper",
+     "config": {
+      "claim.name": "groups",
+      "full.path": "false",
+      "id.token.claim": "true",
+      "access.token.claim": "false",
+      "userinfo.token.claim": "true"
+     }
+    }
+   ],
+   "defaultClientScopes": [
+    "basic",
+    "roles",
+    "db.read"
+   ]
+  }
+ ]
+}

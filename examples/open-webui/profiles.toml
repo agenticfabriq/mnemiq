@@ -1,0 +1,13 @@
+# Each profile is one model in Open WebUI. A profile with roles is offered only to callers holding one of them.
+default = "frontier"
+
+[profiles.frontier]
+description = "The deployment's model, with the engine's defaults"
+
+[profiles.for-analysts]
+description = "The same model, offered to analysts only"
+roles = ["analyst"]
+
+[profiles.for-stores]
+description = "The same model, offered to store managers only"
+roles = ["store1_manager"]

@@ -146,10 +146,10 @@ export type AguiEvent =
 export type SchemaTable = { object_id: string; card: string };
 
 /**
- * Who the engine says is asking (`GET /v1/whoami`). `verified` is true when the identity came
- * from a verified token, false for the deployment's one configured identity.
+ * Who the engine says is asking (`GET /v1/whoami`): all a namespace or an identity check is keyed by.
+ * `verified` is true when the identity came from a verified token, false for the deployment's one
+ * configured identity.
  */
-/** Who the engine says is asking: all a namespace or an identity check is keyed by. */
 export type Identity = { principal_id: string; tenant_id: string | null; verified: boolean };
 /** The engine's whoami: the identity, and where Sign out ends at the identity provider, if anywhere. */
 export type Whoami = Identity & { end_session_url: string | null };

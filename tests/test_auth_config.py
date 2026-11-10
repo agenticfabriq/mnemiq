@@ -1,6 +1,7 @@
 """Every identity configuration the doors cannot enforce refuses to start, each with a message naming what to change."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -289,7 +290,7 @@ END = "https://idp.example/realms/r/protocol/openid-connect/logout?client_id=wor
     ("http://[::1]/logout", None),
     ("http://localhost/logout", None),
     ("http://keycloak.localhost:18089/realms/r/protocol/openid-connect/logout", None),
-    ("HTTPS://IDP.example/logout", None),
+    ("HTTPS://IDP.example/logout", "must be lowercase"),  # the host as the browser sends it
     # Percent-encoding outside the host is the provider's business: a realm or a client id may need it.
     ("https://idp.example/realms/my%20realm/protocol/openid-connect/logout?client_id=a%2Fb", None),
     ("http://idp.example/logout", "http is allowed only"),
@@ -339,3 +340,22 @@ def test_a_blank_end_session_url_is_unset(blank, doors):
         assert config is None
     else:
         assert config.end_session_url is None
+
+
+# The shared fixture: the same rows the workbench runs through the WHATWG URL parser, so a host the check accepts is
+# one a browser reads as written.
+_HOSTS = json.loads((Path(__file__).resolve().parents[1] / "workbench/src/test/end_session_hosts.json").read_text())
+
+
+@pytest.mark.parametrize("url", _HOSTS["accepted"])
+def test_the_shared_fixture_s_accepted_urls_pass_the_startup_check(url):
+    assert _cfg(**OIDC, oidc_end_session_url=url).end_session_url == url
+
+
+@pytest.mark.parametrize("url, reason", _HOSTS["refused"])
+def test_the_shared_fixture_s_refused_urls_are_refused_at_startup(url, reason):
+    assert "MNEMIQ_OIDC_END_SESSION_URL" in _refused(reason, **OIDC, oidc_end_session_url=url)
+
+
+def test_a_padded_end_session_url_is_stored_stripped():
+    assert _cfg(**OIDC, oidc_end_session_url=f"  {END} \t").end_session_url == END

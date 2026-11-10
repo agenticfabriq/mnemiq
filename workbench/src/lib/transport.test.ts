@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { fetchScope, fetchWhoami, NOTICE, Refused, streamChat, type Refusal } from "./transport";
 import type { HistoryTurn } from "./types";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 function sseResponse(...frames: string[]): Response {
   const body = new ReadableStream<Uint8Array>({
@@ -159,6 +161,10 @@ describe("fetchWhoami", () => {
       ["https://kc%2eexample.com/x", null],
       ["", null],
       ["https://", null],
+      // The browser rewrites each of these hosts, so the URL would not go where the engine checked.
+      ["https://idp.example:443/x", null],
+      ["https://0x7f/x", null],
+      ["https://[0:0:0:0:0:0:0:1]/x", null],
       // Outside the host, percent-encoding is the provider's.
       [
         "https://idp.example/realms/my%20realm/protocol/openid-connect/logout?client_id=a%2Fb",
@@ -305,5 +311,19 @@ describe("every /v1 request", () => {
       ["/v1/schema", "manual"],
       ["/v1/chat", "manual"],
     ]);
+  });
+});
+
+// The engine's startup check and this parser must agree on every host it accepts: the shared fixture, read by the
+// engine's tests too. Vitest's jsdom environment puts node:url's WHATWG URL on the global, so this is that parser.
+// Read from the workbench root, where Vitest runs: under jsdom, import.meta.url is not a file URL.
+const HOSTS = JSON.parse(readFileSync(join(process.cwd(), "src/test/end_session_hosts.json"), "utf8")) as {
+  accepted: string[];
+};
+
+describe("the end-session hosts the engine accepts", () => {
+  it.each(HOSTS.accepted)("%s keeps its authority under the WHATWG URL parser", (url) => {
+    const written = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(url)?.[1];
+    expect(new URL(url).host).toBe(written);
   });
 });

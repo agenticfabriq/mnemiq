@@ -1,0 +1,126 @@
+{
+ "description": "End-session URLs the engine's startup check (check_end_session_url) accepts and refuses. Read by tests/test_auth_config.py, which checks each against the server, and by src/lib/transport.test.ts, which checks that every accepted URL keeps its authority under the WHATWG URL parser. A refused row names a fragment of its refusal message.",
+ "accepted": [
+  "https://idp.example/realms/r/protocol/openid-connect/logout?client_id=workbench-proxy",
+  "https://idp.example/logout",
+  "http://127.0.0.1:8080/logout",
+  "http://[::1]/logout",
+  "http://localhost/logout",
+  "http://keycloak.localhost:18089/realms/r/protocol/openid-connect/logout",
+  "https://idp.example/realms/my%20realm/protocol/openid-connect/logout?client_id=a%2Fb",
+  "https://kc_1.example/x",
+  "https://idp.example:8443/x",
+  "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example/x",
+  "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/x"
+ ],
+ "refused": [
+  [
+   "HTTPS://IDP.example/logout",
+   "must be lowercase"
+  ],
+  [
+   "https://kc.0X/x",
+   "must be lowercase"
+  ],
+  [
+   "https://XN--a.example/x",
+   "must be lowercase"
+  ],
+  [
+   "https://kc;example.com/x",
+   "not a hostname"
+  ],
+  [
+   "https://;kc.example/x",
+   "not a hostname"
+  ],
+  [
+   "https://kc;.example/x",
+   "not a hostname"
+  ],
+  [
+   "https://-kc.example/x",
+   "not a hostname"
+  ],
+  [
+   "https://kc-.example/x",
+   "not a hostname"
+  ],
+  [
+   "https://idp.example./x",
+   "not a hostname"
+  ],
+  [
+   "https://kc..example/x",
+   "not a hostname"
+  ],
+  [
+   "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example/x",
+   "not a hostname"
+  ],
+  [
+   "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/x",
+   "longer than 253"
+  ],
+  [
+   "https://xn--a.example/x",
+   "internationalised"
+  ],
+  [
+   "https://kc.example.123/x",
+   "last label"
+  ],
+  [
+   "https://kc.example.0x1/x",
+   "last label"
+  ],
+  [
+   "https://9/x",
+   "last label"
+  ],
+  [
+   "https://1.2.3/x",
+   "last label"
+  ],
+  [
+   "https://0x7f/x",
+   "last label"
+  ],
+  [
+   "https://0x/x",
+   "last label"
+  ],
+  [
+   "https://10.0.0.5/x",
+   "other than 127.0.0.1"
+  ],
+  [
+   "https://[::ffff:1.2.3.4]/x",
+   "other than 127.0.0.1"
+  ],
+  [
+   "https://[0:0:0:0:0:0:0:1]/x",
+   "other than 127.0.0.1"
+  ],
+  [
+   "https://[fe80::1%25en0]/x",
+   "percent-encoded"
+  ],
+  [
+   "https://idp.example:/x",
+   "empty port"
+  ],
+  [
+   "https://idp.example:08443/x",
+   "leading zero"
+  ],
+  [
+   "https://idp.example:443/x",
+   "default port"
+  ],
+  [
+   "http://localhost:80/x",
+   "default port"
+  ]
+ ]
+}
