@@ -174,7 +174,8 @@ export function signOutHref(endSession: string | null, origin: string, back: str
   try {
     end = new URL(endSession);
   } catch {
-    // The threads are already purged by now, so a URL that cannot be read must not stop the sign-out.
+    // The user asked to leave, and the workbench's Sign out has purged their threads by now, so a URL
+    // that cannot be read must not stop the sign-out.
     return proxyOnly;
   }
   end.searchParams.set("post_logout_redirect_uri", `${origin}/`);
@@ -183,8 +184,8 @@ export function signOutHref(endSession: string | null, origin: string, back: str
 
 /**
  * An explicit sign-out: the signing-out user's threads and mode go, and nothing else. Nothing
- * but the Sign out control purges on signing out; an expired session keeps the threads (the
- * page's handling of a refusal says why).
+ * but the workbench's Sign out purges on signing out; the refused page's Sign out does not, and an
+ * expired session keeps the threads (the page's handling of a refusal says why).
  */
 export function signOut(ns: string | null): void {
   if (ns === null) return;
