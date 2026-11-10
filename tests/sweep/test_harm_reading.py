@@ -24,9 +24,9 @@ from mnemiq.sweep.starters import StarterEvidence, publish_starter, read_evidenc
 
 from .conftest import (
     _START_MARK, CONFIG_BUILD, KEY_ENV, STUB_WINDOW, UNREACHABLE, _start_profile, checked_rows, evidence,
-    finished_check, idle_deployment, one_model, out, play_after_search, read_json, rewrite, stamped_version,
-    start_that_differs, starter_folder, tiny_dataset, tiny_deployment, tiny_files, valid_evidence, write_config,
-    write_run,
+    evidence_file, finished_check, idle_deployment, one_model, out, play_after_search, read_json, rewrite,
+    stamped_version, start_that_differs, starter_folder, tiny_dataset, tiny_deployment, tiny_files, valid_evidence,
+    write, write_config, write_run,
 )
 from .stub_model import _WRITER, _messages, _proposal
 
@@ -412,3 +412,31 @@ def test_a_worst_check_from_config_to_starter(tmp_path, monkeypatch, stub_model)
     assert main(["sweep", "starter", "--config", str(cfg_path), "--model", "m", "--dataset", "the tiny set"]) == 0
     published = read_evidence("model-2.5-awq")
     assert published.rule.harm == "worst" and published.safe_by == "check" and published.search is None
+
+
+# --- publishing reads the reading the config fixed, not one the evidence was edited to ------------------------------
+
+
+def _reading_edited(cfg, harm: str | None) -> None:
+    """The proposal's evidence for model `m` with its rule's `harm` set to `harm`, or taken out when None, and nothing
+    else changed: as a hand edit of `evidence.json` leaves it."""
+    held = read_json(evidence_file(cfg))
+    held["rule"].pop("harm", None)
+    held["rule"] |= {"harm": harm} if harm is not None else {}
+    write(evidence_file(cfg), json.dumps(held, indent=2))
+
+
+def test_a_worst_proposal_whose_evidence_lost_its_reading_is_never_published(tmp_path, monkeypatch, stub_model):
+    cfg = finished_check(tmp_path, monkeypatch, stub_model, propose={"harm": "worst"}, repeats=2)
+    _reading_edited(cfg, None)
+    with pytest.raises(SweepConfigError, match=r"records harm 'per_run'.*'worst'"):
+        publish_starter(cfg, "m", "the tiny set")
+    assert not list(profiles.starters_folder().glob("model-2.5-awq*"))
+
+
+def test_a_per_run_proposal_whose_evidence_claims_worst_is_never_published(tmp_path, monkeypatch, stub_model):
+    cfg = finished_check(tmp_path, monkeypatch, stub_model)
+    _reading_edited(cfg, "worst")
+    with pytest.raises(SweepConfigError, match=r"records harm 'worst'.*'per_run'"):
+        publish_starter(cfg, "m", "the tiny set")
+    assert not list(profiles.starters_folder().glob("model-2.5-awq*"))

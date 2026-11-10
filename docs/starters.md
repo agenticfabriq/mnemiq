@@ -92,7 +92,9 @@ Publishing refuses, before it writes anything:
 - a sweep that has not finished its rounds, or that ran under another config than the one given;
 - an engine with no checkout to write into: the starters live in the package's source, `src/mnemiq/starter_profiles/`;
 - an engine other than the one the sweeps ran on, by source hash: publish from a checkout at the sweeps' commit;
-- a proposal a person chose (`propose --choose`), or one made with either `[propose]` bound above 0;
+- a proposal a person chose (`propose --choose`), one made with either `[propose]` bound above 0, or one whose
+  evidence records another reading of the harm rule (`harm` under `rule`) than the config the sweep ran under, as an
+  edit of `evidence.json` would leave it;
 - a `--search` that names a sweep in check mode, and a `--search` beside a sweep that is not check mode;
 - check mode that proposed the engine's defaults, a search that did not start from them, a search whose pick was not
   confirmed on the held-out part, and a search whose pick is the defaults themselves, every change it picked lost to a

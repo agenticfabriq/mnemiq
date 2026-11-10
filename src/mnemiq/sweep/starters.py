@@ -499,7 +499,7 @@ class _Swept:
 
 def _proposed(cfg: SweepConfig, model: str, state: dict) -> _Swept:
     """The sweep's proposal for `model`, read once, refused unless it is this sweep's and the rule chose it with both
-    bounds at 0."""
+    bounds at 0, under the reading of the harm rule (`[propose] harm`) the config fixed."""
     profiles_path, path = _proposal(cfg, model)
     try:
         evidence = json.loads(path.read_bytes())
@@ -513,6 +513,10 @@ def _proposed(cfg: SweepConfig, model: str, state: dict) -> _Swept:
     for bound in ("max_more_wrong", "max_more_made_up"):
         if (value := evidence["rule"][bound]) != 0:
             raise SweepConfigError(f"[propose] {bound} is {value}: a starter needs both bounds at 0")
+    # The starter records the reading the evidence holds, so it must be the one the config fixed: absent, "per_run".
+    if (said := evidence["rule"].get("harm", "per_run")) != cfg.propose.harm:
+        raise SweepConfigError(f"{path} records harm {said!r}, and the config the sweep ran under has [propose] harm "
+                               f"{cfg.propose.harm!r}: propose from the sweep again")
     try:
         profile = profiles_path.read_bytes()
     except FileNotFoundError:
@@ -794,16 +798,16 @@ def publish_starter(cfg: SweepConfig, model: str, dataset: str, *, name: str | N
     Every refusal comes before anything is written, in this order: a dataset label that is not 1 to 80 printable ASCII
     characters, not all spaces, without a slash; an out folder a run or a proposal holds, whose lock publishing then
     holds to its end, as a proposal does; a key variable not set; a sweep that has not finished, or ran under another
-    config; an engine with no checkout to write into; an engine other than the one the sweeps ran on, by source hash;
-    a proposal a person chose, or one whose bounds are not both 0, a `search` in check mode, or a `search` beside a
-    sweep that is not; a check that chose the defaults, or a search that did not start from them, whose pick was not
-    confirmed, or whose pick is the defaults; a starter that gets fewer right answers than the defaults
-    (`fewer_right`); a build not read and stated whole; a build whose server, server version, GPU or quantization is
-    not what may be published (`_publishable_build`); a name that is not the build's; a search that is not the one the
-    check started from; evidence the schema refuses; the staged pair's own checks, below; and the starters folder,
-    while another publisher holds its lock. Each sweep's record and proposal are read once, so the checks and the
-    evidence see the same bytes. Until every check has passed, nothing is written in the starters folder, not even the
-    lock file.
+    config; an engine with no checkout to write into; an engine other than the one the sweeps ran on, by source hash; a
+    proposal a person chose, one whose bounds are not both 0, or one whose evidence records another reading of the harm
+    rule than its config, a `search` in check mode, or a `search` beside a sweep that is not; a check that chose the
+    defaults, or a search that did not start from them, whose pick was not confirmed, or whose pick is the defaults; a
+    starter that gets fewer right answers than the defaults (`fewer_right`); a build not read and stated whole; a build
+    whose server, server version, GPU or quantization is not what may be published (`_publishable_build`); a name that
+    is not the build's; a search that is not the one the check started from; evidence the schema refuses; the staged
+    pair's own checks, below; and the starters folder, while another publisher holds its lock. Each sweep's record and
+    proposal are read once, so the checks and the evidence see the same bytes. Until every check has passed, nothing is
+    written in the starters folder, not even the lock file.
 
     The evidence records the sha256 of the starter's file (`starter_sha256`), and the engine loads a starter only
     beside evidence that does. The two files are staged outside the starters folder and checked there: the evidence as
