@@ -109,11 +109,13 @@ The [proxy's config](../examples/open-webui/oauth2-proxy.yaml) holds the setting
 - **The flush interval** lets the workbench's answer stream render as it arrives.
 - **`backendLogoutURL`** ends the provider's session on Sign out, while the proxy can load the session.
 
-**A refresh that fails because the provider is unreachable** does not end the session at once: the proxy keeps it and
-tries again on the next request. Once the token it holds expires, the proxy stops serving the session and sends the
-browser to the provider, so nobody is let in past the token's lifetime. When the provider is back, the user signs in
-there, without a password if the provider's own session is still alive. A refresh the provider refuses with
-`invalid_grant` or `invalid_client`, a revoked session for example, ends the proxy's session at once.
+**A refresh that fails because the provider is unreachable** ends the proxy's session at once if the session was
+refreshed before: when a refresh fails the proxy checks the stored ID token's nonce, which Keycloak 26 leaves out of a
+refreshed one. On a session's first refresh the stored token is the sign-in's, so the proxy keeps the session and tries
+again on each request until that token expires. Either way nobody is let in past the token's lifetime: the browser is
+sent to the provider, and once it is back the user signs in there, without a password if the provider's own session
+is still alive. A refresh the provider refuses with `invalid_grant` or `invalid_client`, a revoked session for
+example, ends the proxy's session at once.
 
 ## Sign out
 
