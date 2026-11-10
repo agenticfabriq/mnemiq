@@ -26,7 +26,9 @@ services:
     command: ["start-dev", "--import-realm", "--http-port=18089", "--health-enabled=true",
               "--hostname=http://keycloak.localhost:18089"]
     env_file: [.secrets/keycloak.env]
-    volumes: ["./realm.json:/opt/keycloak/data/import/mnemiq-realm.json:ro"]
+    # Keycloak's own database lives in a volume, like Open WebUI's accounts, so a plain `down` and `up` keeps both.
+    # Otherwise `users` recreates each person under a new id, and Open WebUI refuses them as an email already taken.
+    volumes: ["keycloak:/opt/keycloak/data", "./realm.json:/opt/keycloak/data/import/mnemiq-realm.json:ro"]
     ports: ["127.0.0.1:18089:18089"]
     networks:
       edge: {aliases: [keycloak.localhost]}
@@ -171,6 +173,7 @@ networks:
   egress: {}
 
 volumes:
+  keycloak: {}
   demo: {}
   open-webui: {}
   open-webui-b: {}

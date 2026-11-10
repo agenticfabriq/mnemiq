@@ -16,6 +16,9 @@ python examples/open-webui/make-secrets.py check
 Run `users` straight after `up`. The first account to sign up to an Open WebUI instance becomes its admin, and `users`
 creates that account. Until it runs, anything that reaches the port could take it, which here means this machine only.
 
+`docker compose -f examples/open-webui/compose.yaml down` keeps every account, Keycloak's and Open WebUI's alike.
+`down -v` removes them all together, with the demo data, and the steps above start over.
+
 Then open Open WebUI at <http://localhost:13000> and the workbench at <http://localhost:14180>, and sign in with a
 user from `examples/open-webui/.secrets/users.txt`. Everything listens on 127.0.0.1 only. This is a local demo: a
 deployment serves Keycloak over https, keeps its secrets in its own store, and fronts mnemiq with its own network
