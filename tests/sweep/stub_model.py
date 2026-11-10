@@ -199,11 +199,13 @@ class StubModel:
                     the prompt reports what it read.
       embed_status  every embeddings request fails with this: an HTTP code or "connect".
       version       what `/version` reports, as vLLM's does.
+      owned_by      what `/v1/models` reports the server is, as vLLM's `owned_by` does: "vllm" by default.
       root          the weights `/v1/models` reports the served model was launched from, as vLLM's `root` does.
       reports_build false: `/version` and `/v1/models` answer 404, as a hosted endpoint's do.
 
-    Calling a stub, `stub(**options)`, starts another that shares its cases and stops when it stops. `version`, `root`,
-    `window` and `reports_build` are read as each request arrives, so a test can change one while the stub runs.
+    Calling a stub, `stub(**options)`, starts another that shares its cases and stops when it stops. `version`,
+    `owned_by`, `root`, `window` and `reports_build` are read as each request arrives, so a test can change one while
+    the stub runs.
     """
 
     def __init__(self, rule: Rule | None = None, *, gold: bool = False,
@@ -212,7 +214,7 @@ class StubModel:
                  fail_first: int = 0, fail_after: int | None = None, status: int | str = 500,
                  confidence: float = 0.9, window: int = STUB_WINDOW, prompt_tokens: int | None = None,
                  embed_status: int | str | None = None, model: str = "stub-model", version: str = "0.9.0.1",
-                 root: str = "fixture/model-2.5-awq", reports_build: bool = True,
+                 root: str = "fixture/model-2.5-awq", reports_build: bool = True, owned_by: str = "vllm",
                  script: _Script | None = None) -> None:
         if gold and gold_when is not None:
             raise ValueError("gold and gold_when say the same thing: pass one")
@@ -239,6 +241,7 @@ class StubModel:
         self.embed_status = embed_status
         self.model = model
         self.version = version
+        self.owned_by = owned_by
         self.root = root
         self.reports_build = reports_build
         # What a test reads.
@@ -425,7 +428,7 @@ class StubModel:
         entry other than the one whose `id` is the served model's reads the decoy's values."""
         decoy = {"id": "other-model", "object": "model", "owned_by": "other", "root": "other/decoy-model",
                  "max_model_len": 1024}
-        served = {"id": self.model, "object": "model", "owned_by": "vllm", "root": self.root,
+        served = {"id": self.model, "object": "model", "owned_by": self.owned_by, "root": self.root,
                   "max_model_len": self.window}
         return {"object": "list", "data": [decoy, served]}
 

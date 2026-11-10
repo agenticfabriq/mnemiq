@@ -76,12 +76,16 @@ Publishing refuses, before it writes anything:
 - a build that is not whole: the server, its version and its window not read from the server by each sweep, the
   model, the GPU or the quantization not stated in `[models.<model>.build]`, two sweeps that read different servers or
   state different builds, or an `llm_context_window` other than the window the server reports;
+- a build that could publish more than a build's facts: a server other than one on the engine's list of servers a
+  starter may be published from (`vllm`), a server version not shaped as a release (digits and dots, then at most one
+  segment of letters, digits, `.`, `+`, `-` or `_`), or a stated GPU or quantization that is not printable ASCII
+  without a slash. A sweep on another server still runs; only what may be published is held to this;
 - a `--name` other than the build's;
 - with `--search`, a search whose proposal is not the file the check's arms started from, by its hash as they pinned
   it;
 - evidence its schema refuses, such as a value of another type than the schema's;
 - the starters folder, while another publisher holds its lock. Publishing takes that lock only once every check above
-  has passed, so a refusal leaves the starters folder as it was, with no lock file in it.
+  has passed, and the staged checks below, so a refusal leaves the starters folder as it was, with no lock file in it.
 
 It then writes the starter and its evidence into a staging folder outside the package, and checks them there: the
 evidence as the sweep reads it, and that a deployment whose profile starts from the staged starter resolves, on every
@@ -113,8 +117,8 @@ Deployments are numbered in it, never named. The dataset label is the publisher'
 - `made_up_measured`: whether the questions hold one with no answer, which a made-up answer needs
   ([made-up answers](#made-up-answers)).
 - `model_build`: the model's repository id, its quantization and the GPU, as the config states them, and the server,
-  its version and its window, as the server reported them. The folder the server loaded the weights from is never
-  recorded.
+  its version and its window, as the server reported them: a server on the engine's list, and a version shaped as a
+  release. The folder the server loaded the weights from is never recorded.
 - `engine_build`: the engine's package version, the commit the sweeps ran on, and its source hash.
 - `safe_by`: `check` or `search_from_defaults` ([right answers](#right-answers)).
 - `rule`: the strategy, `alpha`, both bounds, `max_errors` and the runs each arm owed.

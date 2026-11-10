@@ -76,11 +76,24 @@ Day = Annotated[str, Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"), AfterValida
 # A deployment as published evidence holds it: numbered `deployment-<n>`, never named, since a deployment's own name
 # (its `db_id`) can name a customer; or "" for a sweep of one deployment.
 DeploymentKey = Annotated[str, Field(pattern=r"^(?:deployment-[1-9][0-9]*)?$")]
-# The label a person gives the questions a starter was measured on (`--dataset`): printable ASCII with no slash of
-# either kind, so it is never a path, at least one character that is not a space, and at most `DATASET_LABEL_MAX`.
+# Text a person states that a starter publishes: printable ASCII with no slash of either kind, so it is never a path,
+# and at least one character that is not a space. The label of the questions (`--dataset`) takes at most
+# `DATASET_LABEL_MAX` characters, and the GPU and the quantization `[models.<name>.build]` states at most `STATED_MAX`.
 DATASET_LABEL_PATTERN = r"^[\x20-\x2e\x30-\x5b\x5d-\x7e]*[\x21-\x2e\x30-\x5b\x5d-\x7e][\x20-\x2e\x30-\x5b\x5d-\x7e]*$"
 DATASET_LABEL_MAX = 80
 DatasetLabel = Annotated[str, Field(pattern=DATASET_LABEL_PATTERN, max_length=DATASET_LABEL_MAX)]
+STATED_MAX = 64
+StatedText = Annotated[str, Field(pattern=DATASET_LABEL_PATTERN, max_length=STATED_MAX)]
+# The model servers a starter may be published from, by the name each reports for itself (`owned_by`), which the
+# evidence publishes. A closed list: a server joins it, one line here, once a starter is to be swept on it. A sweep on
+# any other server still runs, and says where its build differs; only what may be published is held to this.
+PUBLISHABLE_SERVERS: tuple[str, ...] = ("vllm",)
+PublishableServer = Literal[PUBLISHABLE_SERVERS]
+# A server's version as the evidence publishes it: a release's digits and dots, then at most one segment of letters,
+# digits, `.`, `+`, `-` or `_` (a pre-, post-, dev- or local part), so never a slash, a backslash, a colon or a space.
+SERVER_VERSION_PATTERN = r"^[0-9]+(?:\.[0-9]+)*[A-Za-z0-9.+_-]*$"
+SERVER_VERSION_MAX = 40
+ServerVersion = Annotated[str, Field(pattern=SERVER_VERSION_PATTERN, max_length=SERVER_VERSION_MAX)]
 # The sha256 of a starter's file, as its evidence records it.
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
@@ -94,10 +107,10 @@ class ModelBuildRecord(_Record):
     server, its version and its window as the server reported them."""
 
     model: _RepoId
-    quantization: str
-    server: str
-    server_version: str
-    gpu: str
+    quantization: StatedText
+    server: PublishableServer
+    server_version: ServerVersion
+    gpu: StatedText
     context_window: int
 
 
@@ -574,6 +587,28 @@ def _whole_build(model: str, sweeps: list[tuple[SweepConfig, dict]]) -> None:
                                    "it out")
 
 
+def _fits(pattern: str, longest: int, value: object) -> bool:
+    return isinstance(value, str) and len(value) <= longest and re.fullmatch(pattern, value) is not None
+
+
+def _publishable_build(model: str, build: dict) -> None:
+    """Refuse a build whose published fields could carry anything but a build's facts: a server not on the closed list
+    (`PUBLISHABLE_SERVERS`), a server version not shaped as a release (`SERVER_VERSION_PATTERN`), and a stated GPU or
+    quantization that could carry a path (`StatedText`). The evidence publishes each as read or stated."""
+    if build["server"] not in PUBLISHABLE_SERVERS:
+        raise SweepConfigError(f"server {build['server']!r} is not a model server a starter may be published from "
+                               f"({', '.join(PUBLISHABLE_SERVERS)}): what the server reports of itself is published")
+    if not _fits(SERVER_VERSION_PATTERN, SERVER_VERSION_MAX, build["server_version"]):
+        raise SweepConfigError(f"server_version {build['server_version']!r} is not a release version (digits and dots, "
+                               "then at most one segment of letters, digits, '.', '+', '-' or '_', in at most "
+                               f"{SERVER_VERSION_MAX} characters): what the server reports of itself is published")
+    for field in ("gpu", "quantization"):
+        if not _fits(DATASET_LABEL_PATTERN, STATED_MAX, build[field]):
+            raise SweepConfigError(f"[models.{model}.build] {field} {build[field]!r} is not text a starter can "
+                                   f"publish: 1 to {STATED_MAX} printable ASCII characters, not all spaces, with no / "
+                                   "or \\")
+
+
 def _started_from(cfg: SweepConfig, model: str, evidence: dict, search: _Swept) -> None:
     """Refuse a search whose proposal, as read, is not the file the check's start arm pinned as its start profile, by
     sha256: what the check's arms read, not the file as it is now."""
@@ -739,18 +774,20 @@ def publish_starter(cfg: SweepConfig, model: str, dataset: str, *, name: str | N
     a proposal a person chose, or one whose bounds are not both 0, a `search` in check mode, or a `search` beside a
     sweep that is not; a check that chose the defaults, or a search that did not start from them, whose pick was not
     confirmed, or whose pick is the defaults; a starter that gets fewer right answers than the defaults
-    (`fewer_right`); a build not read and stated whole; a name that is not the build's; a search that is not the one
-    the check started from; evidence the schema refuses; and the starters folder, while another publisher holds its
-    lock. Each sweep's record and proposal are read once, so the checks and the evidence see the same bytes. Until
-    every check before the folder's lock has passed, nothing is written in the starters folder, not even the lock file.
+    (`fewer_right`); a build not read and stated whole; a build whose server, server version, GPU or quantization is
+    not what may be published (`_publishable_build`); a name that is not the build's; a search that is not the one the
+    check started from; evidence the schema refuses; the staged pair's own checks, below; and the starters folder,
+    while another publisher holds its lock. Each sweep's record and proposal are read once, so the checks and the
+    evidence see the same bytes. Until every check has passed, nothing is written in the starters folder, not even the
+    lock file.
 
     The evidence records the sha256 of the starter's file (`starter_sha256`), and the engine loads a starter only
-    beside evidence that does. Holding the folder's lock, publishing removes any hidden copy a killed publish left
-    there, then stages the two files outside the folder and checks them: the evidence as the sweep reads it, and a
-    deployment starting from the staged starter must resolve, on every deployment the sweep read, to the version the
-    proposal recorded. Only then is each moved in, the evidence first, under a hidden name until its move. A failure
-    before the moves leaves the starters folder as it was. One between them leaves a pair the engine refuses until both
-    files are restored or published again."""
+    beside evidence that does. The two files are staged outside the starters folder and checked there: the evidence as
+    the sweep reads it, and a deployment starting from the staged starter must resolve, on every deployment the sweep
+    read, to the version the proposal recorded. Only then does publishing take the folder's lock, remove any hidden copy
+    a killed publish left there, and move each file in, the evidence first, under a hidden name until its move. A
+    failure before the moves leaves the starters folder as it was. One between them leaves a pair the engine refuses
+    until both files are restored or published again."""
     from mnemiq.sweep.propose import _finished  # the proposal reads this module
 
     if len(dataset) > DATASET_LABEL_MAX or not re.fullmatch(DATASET_LABEL_PATTERN, dataset):
@@ -823,6 +860,7 @@ def _publish(cfg: SweepConfig, model: str, dataset: str, name: str | None,
                                                     _right_counts(evidence["check"], "defaults"))):
         raise SweepConfigError(f"the starter gets fewer right answers than the engine's defaults: {'; '.join(lines)}")
     _whole_build(model, [(each.cfg, each.state) for each in swept])
+    _publishable_build(model, _build_of(cfg, model, checked.state))
     derived = build_name(cfg.models[model].build.model)
     if name is not None and name != derived:
         raise SweepConfigError(f"--name {name!r} is not the build's name {derived!r}")
@@ -842,23 +880,24 @@ def _publish(cfg: SweepConfig, model: str, dataset: str, name: str | None,
     searched = found.evidence if found is not None else None if safe_by == "check" else evidence
     record = starter_evidence(cfg, model, name, dataset, state=checked.state, evidence=evidence, text=text,
                               searched=searched)
-    try:
-        folder = profiles.starters_folder()
-    except profiles.ProfileFileError as exc:
-        raise SweepConfigError(str(exc)) from None
-    # Taken only now, so a refusal above leaves the starters folder as it was, its lock file included.
-    with _sole(folder / PUBLISH_LOCK, SweepConfigError(
-            f"{folder} is in use by another publisher; publish again once it has ended")):
-        _clear_stale_copies(folder)
-        # Staged outside the starters folder, under the names they ship as, and checked there: the evidence as the
-        # sweep reads it, its binding to the starter's bytes included, and the starter through the engine's own loader.
-        with tempfile.TemporaryDirectory(prefix="mnemiq-starter-") as scratch:
-            staged = Path(scratch)
-            starter, shipped = staged / f"{name}.toml", staged / f"{name}{EVIDENCE_SUFFIX}"
-            starter.write_bytes(text.encode("utf-8"))
-            shipped.write_bytes((record.model_dump_json(indent=2) + "\n").encode("utf-8"))
-            read_evidence(name, staged)
-            _resolves_as_measured(cfg, model, name, evidence["version"], staged)
+    # Staged outside the starters folder, under the names they ship as, and checked there: the evidence as the sweep
+    # reads it, its binding to the starter's bytes included, and the starter through the engine's own loader. Both
+    # checks read the staging folder alone, so the starters folder is not touched until they pass.
+    with tempfile.TemporaryDirectory(prefix="mnemiq-starter-") as scratch:
+        staged = Path(scratch)
+        starter, shipped = staged / f"{name}.toml", staged / f"{name}{EVIDENCE_SUFFIX}"
+        starter.write_bytes(text.encode("utf-8"))
+        shipped.write_bytes((record.model_dump_json(indent=2) + "\n").encode("utf-8"))
+        read_evidence(name, staged)
+        _resolves_as_measured(cfg, model, name, evidence["version"], staged)
+        try:
+            folder = profiles.starters_folder()
+        except profiles.ProfileFileError as exc:
+            raise SweepConfigError(str(exc)) from None
+        # Taken only now, so every refusal leaves the starters folder as it was, its lock file included.
+        with _sole(folder / PUBLISH_LOCK, SweepConfigError(
+                f"{folder} is in use by another publisher; publish again once it has ended")):
+            _clear_stale_copies(folder)
             # The evidence first: a new starter is never listed without it, and a starter the second move never
             # replaced sits beside evidence that records another file, which the engine refuses.
             _move_in(shipped, folder)

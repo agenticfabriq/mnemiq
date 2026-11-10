@@ -414,11 +414,13 @@ def test_a_new_starter_stopped_between_its_two_moves_is_never_listed(tmp_path, m
 
 def test_a_failure_while_the_starter_is_checked_leaves_nothing_new_in_the_folder(tmp_path, monkeypatch, stub_model):
     cfg = finished_check(tmp_path, monkeypatch, stub_model)
-    before = _shipped(profiles.starters_folder())
+    folder = profiles.starters_folder()
+    stale = write(folder / f".model-2.5-awq.toml.{'c' * 32}.tmp", "left by a publish killed mid-move")
+    before = _shipped(folder)
     monkeypatch.setattr("mnemiq.sweep.starters.starter_text", drops_the_instant_section)
     with pytest.raises(SweepConfigError, match="does not resolve to the profile that was measured"):
         publish_starter(cfg, "m", "the tiny set")
-    assert before == [] and _shipped(profiles.starters_folder()) == [".publish.lock"]     # its lock alone
+    assert _shipped(folder) == before == [stale.name]      # no lock taken, and nothing cleared, for a staged refusal
 
 
 def test_no_draft_is_ever_listed_as_a_starter(tmp_path, monkeypatch, stub_model):
@@ -497,3 +499,31 @@ def test_deployments_are_numbered_in_the_evidence_and_never_named(tmp_path, monk
     assert held["measured_versions"] == {
         mode: {numbered[name]: version for name, version in each.items()}
         for mode, each in proposed["measured_versions"].items()}
+
+
+# --- what a server reports of itself, and what a person states of the build, as published ---------------------------
+
+
+@pytest.mark.parametrize("reports, field", [
+    ({"owned_by": "customer_acme_prod", "version": "/srv/customer_acme/private/build"}, "server"),
+    ({"owned_by": "customer_acme_prod"}, "server"),
+    ({"version": "/srv/customer_acme/private/build"}, "server_version"),
+])
+def test_a_server_that_reports_itself_as_no_known_release_is_never_published(tmp_path, monkeypatch, stub_model,
+                                                                             reports, field):
+    # the sweep ran and proposed on it: only what may be published is restricted
+    cfg = finished_check(tmp_path, monkeypatch, stub_model, server=reports)
+    folder = profiles.starters_folder()
+    with pytest.raises(SweepConfigError, match=rf"^{field} "):
+        publish_starter(cfg, "m", "the tiny set")
+    assert _shipped(folder) == []
+    assert not any(b"customer_acme" in path.read_bytes() for path in folder.rglob("*") if path.is_file())
+
+
+@pytest.mark.parametrize("field, value", [("gpu", "lab/rtx-4090"), ("quantization", "awq\\int4"),
+                                          ("quantization", "awq\u0001"), ("gpu", "x" * 65)])
+def test_a_stated_build_that_could_carry_a_path_is_never_published(tmp_path, monkeypatch, stub_model, field, value):
+    cfg = finished_check(tmp_path, monkeypatch, stub_model, build=CONFIG_BUILD | {field: value})
+    with pytest.raises(SweepConfigError, match=rf"^\[models\.m\.build\] {field} "):
+        publish_starter(cfg, "m", "the tiny set")
+    assert _shipped(profiles.starters_folder()) == []

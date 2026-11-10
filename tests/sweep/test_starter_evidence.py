@@ -207,6 +207,10 @@ def test_a_starter_without_valid_evidence_is_refused_at_load(tmp_path, monkeypat
                                       ("rule", "max_more_wrong"), ("published", None),
                                       ("versions", PATH_SHAPED_KEY), ("measured_versions", "instant", PATH_SHAPED_KEY),
                                       ("versions", NAMED_KEY), ("measured_versions", "instant", NAMED_KEY),
+                                      ("model_build", "server", None, "customer_acme_prod"),
+                                      ("model_build", "server_version", None, "/srv/customer_acme/private/build"),
+                                      ("model_build", "gpu", None, "lab/rtx-4090"),
+                                      ("model_build", "quantization", None, "awq\u0001"),
                                       ("model_build", "model", None, "/srv/models/qwen-awq"),
                                       ("published", None, NO_SUCH_DAY), ("published", None, DAY_IN_OTHER_DIGITS)])
 def test_the_evidence_schema_refuses_what_it_does_not_name_at_any_depth(tmp_path, monkeypatch, plant_at):
@@ -225,6 +229,13 @@ def test_evidence_that_names_another_starter_file_is_refused(tmp_path, monkeypat
     with pytest.raises(SweepConfigError, match=r"ships without valid evidence \(its starter_sha256 is not the sha256 "
                                                r"of fixture-2\.5-build\.toml\)"):
         read_evidence("fixture-2.5-build")
+
+
+@pytest.mark.parametrize("version", ["0.9.0.1", "0.10.1rc1", "0.6.3.post1", "0.9.0+cu124", "0.10.2.dev123+g5abc"])
+def test_a_release_of_a_known_server_is_one_the_schema_takes(tmp_path, monkeypatch, version):
+    good = valid_evidence(tmp_path, monkeypatch)
+    good["model_build"] |= {"server": "vllm", "server_version": version}
+    assert StarterEvidence.model_validate(good).model_build.server_version == version
 
 
 def test_the_mode_alias_is_the_engines_modes():

@@ -1153,7 +1153,8 @@ def finished_check(tmp_path: Path, monkeypatch, stub: StubModel, *, build=CONFIG
                    defaults_better: bool = False, person_chose: str | None = None, propose: dict | None = None,
                    start_sets: dict | None = None, unfinished: bool = False, config_edited_after: bool = False,
                    start_declines: int | dict[str, int] = 0, answerable_only: bool = False,
-                   start_file: Path | None = None, repeats: int = 1, declining_from_run: int = 1):
+                   start_file: Path | None = None, repeats: int = 1, declining_from_run: int = 1,
+                   server: dict | None = None):
     """A check-mode sweep of model `m` over the tiny deployment, run on the product path and proposed, loaded, with the
     starters folder patched to `tmp_path / "starters"`. The scripted model answers every case right, and `[models.m]`
     states `build` and `llm_context_window` (each omitted when None). `repeats` runs per arm, one by default.
@@ -1173,7 +1174,8 @@ def finished_check(tmp_path: Path, monkeypatch, stub: StubModel, *, build=CONFIG
     - `answerable_only`: the tiny question file without its cases that have no answer.
     - `unfinished`: a budget no arm fits in, so the run stops before the first arm and nothing is proposed.
     - `config_edited_after`: the config is edited once the proposal is written, and loaded again.
-    - `start_file`: the start is that profiles file's default instead, such as a search's proposal."""
+    - `start_file`: the start is that profiles file's default instead, such as a search's proposal.
+    - `server`: what the scripted model's server reports of itself, as `owned_by` and `version` options."""
     from mnemiq.sweep.config import load_config
     from mnemiq.sweep.propose import propose as proposing
     from mnemiq.sweep.run import run
@@ -1185,7 +1187,8 @@ def finished_check(tmp_path: Path, monkeypatch, stub: StubModel, *, build=CONFIG
     assert len(set(named.values())) <= 1, "the start declines as many cases in each mode it is told apart in"
     marked = [mode for mode in modes if mode in named]
     rule = _start_rule(stub, declines=next(iter(named.values()), 0), wrong=defaults_better, from_ask=declining_from_run)
-    model = stub(rule, gold=True, reports_build=reports_build, **({"root": root} if root is not None else {}))
+    model = stub(rule, gold=True, reports_build=reports_build, **({"root": root} if root is not None else {}),
+                 **(server or {}))
     deployment = tiny_deployment(tmp_path, model)
     questions = None
     if answerable_only:
