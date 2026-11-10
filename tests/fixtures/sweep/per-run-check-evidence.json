@@ -1,0 +1,292 @@
+{
+  "check": {
+    "instant": {
+      "defaults": [
+        {
+          "cases": 26,
+          "declined": 10,
+          "errors": 0,
+          "failed": 0,
+          "made_up": 1,
+          "median_ms": 1000.0,
+          "median_rows_ms": 800.0,
+          "prompt_tokens": 900.0,
+          "right": 10,
+          "run": 1,
+          "strict": 10,
+          "ungraded": 0,
+          "unjudged": 0,
+          "valid": true,
+          "versions": [
+            "045596a78073"
+          ],
+          "wrong": 5
+        },
+        {
+          "cases": 26,
+          "declined": 13,
+          "errors": 0,
+          "failed": 0,
+          "made_up": 0,
+          "median_ms": 1000.0,
+          "median_rows_ms": 800.0,
+          "prompt_tokens": 900.0,
+          "right": 10,
+          "run": 2,
+          "strict": 10,
+          "ungraded": 0,
+          "unjudged": 0,
+          "valid": true,
+          "versions": [
+            "045596a78073"
+          ],
+          "wrong": 3
+        }
+      ],
+      "start": [
+        {
+          "cases": 26,
+          "declined": 11,
+          "errors": 0,
+          "failed": 0,
+          "made_up": 1,
+          "median_ms": 1000.0,
+          "median_rows_ms": 800.0,
+          "prompt_tokens": 900.0,
+          "right": 11,
+          "run": 1,
+          "strict": 11,
+          "ungraded": 0,
+          "unjudged": 0,
+          "valid": true,
+          "versions": [
+            "61d0b8aa465c"
+          ],
+          "wrong": 3
+        },
+        {
+          "cases": 26,
+          "declined": 10,
+          "errors": 0,
+          "failed": 0,
+          "made_up": 1,
+          "median_ms": 1000.0,
+          "median_rows_ms": 800.0,
+          "prompt_tokens": 900.0,
+          "right": 11,
+          "run": 2,
+          "strict": 11,
+          "ungraded": 0,
+          "unjudged": 0,
+          "valid": true,
+          "versions": [
+            "61d0b8aa465c"
+          ],
+          "wrong": 4
+        }
+      ],
+      "start_against_defaults": [
+        {
+          "more_made_up": 0,
+          "more_wrong": -2,
+          "run": 1
+        },
+        {
+          "more_made_up": 1,
+          "more_wrong": 1,
+          "run": 2
+        }
+      ]
+    },
+    "thinking": {
+      "defaults": [
+        {
+          "cases": 26,
+          "declined": 10,
+          "errors": 0,
+          "failed": 0,
+          "made_up": 1,
+          "median_ms": 1000.0,
+          "median_rows_ms": 800.0,
+          "prompt_tokens": 900.0,
+          "right": 10,
+          "run": 1,
+          "strict": 10,
+          "ungraded": 0,
+          "unjudged": 0,
+          "valid": true,
+          "versions": [
+            "045596a78073"
+          ],
+          "wrong": 5
+        },
+        {
+          "cases": 26,
+          "declined": 13,
+          "errors": 0,
+          "failed": 0,
+          "made_up": 0,
+          "median_ms": 1000.0,
+          "median_rows_ms": 800.0,
+          "prompt_tokens": 900.0,
+          "right": 10,
+          "run": 2,
+          "strict": 10,
+          "ungraded": 0,
+          "unjudged": 0,
+          "valid": true,
+          "versions": [
+            "045596a78073"
+          ],
+          "wrong": 3
+        }
+      ],
+      "start": [
+        {
+          "cases": 26,
+          "declined": 11,
+          "errors": 0,
+          "failed": 0,
+          "made_up": 1,
+          "median_ms": 1000.0,
+          "median_rows_ms": 800.0,
+          "prompt_tokens": 900.0,
+          "right": 11,
+          "run": 1,
+          "strict": 11,
+          "ungraded": 0,
+          "unjudged": 0,
+          "valid": true,
+          "versions": [
+            "61d0b8aa465c"
+          ],
+          "wrong": 3
+        },
+        {
+          "cases": 26,
+          "declined": 10,
+          "errors": 0,
+          "failed": 0,
+          "made_up": 1,
+          "median_ms": 1000.0,
+          "median_rows_ms": 800.0,
+          "prompt_tokens": 900.0,
+          "right": 11,
+          "run": 2,
+          "strict": 11,
+          "ungraded": 0,
+          "unjudged": 0,
+          "valid": true,
+          "versions": [
+            "61d0b8aa465c"
+          ],
+          "wrong": 4
+        }
+      ],
+      "start_against_defaults": [
+        {
+          "more_made_up": 0,
+          "more_wrong": -2,
+          "run": 1
+        },
+        {
+          "more_made_up": 1,
+          "more_wrong": 1,
+          "run": 2
+        }
+      ]
+    }
+  },
+  "chosen": "defaults",
+  "chosen_by": "rule",
+  "confirmed": false,
+  "confirmed_arm_version": null,
+  "conflicts": [],
+  "endpoints": {
+    "llm_base_url": "http://127.0.0.1:9/v1",
+    "llm_context_window": null,
+    "llm_model": "stub-model",
+    "verify_base_url": null,
+    "verify_model": null
+  },
+  "failed_mode": null,
+  "identity": {
+    "principal": "sweep",
+    "roles": [
+      "sweep-test"
+    ],
+    "tenant": "local"
+  },
+  "measured": "mode by mode",
+  "measured_versions": {
+    "instant": "045596a78073",
+    "thinking": "045596a78073"
+  },
+  "model": "m",
+  "packaged_by": {
+    "commit": "<commit>",
+    "source_sha": "<source_sha>"
+  },
+  "picks": {},
+  "profile": "m",
+  "profile_from": [
+    {
+      "arm": "defaults",
+      "modes": [
+        "instant"
+      ],
+      "round": "check"
+    },
+    {
+      "arm": "defaults",
+      "modes": [
+        "thinking"
+      ],
+      "round": "check"
+    }
+  ],
+  "refused_modes": {},
+  "rule": {
+    "alpha": 0.05,
+    "max_errors": 0,
+    "max_more_made_up": 0,
+    "max_more_wrong": 0,
+    "repeats": 2,
+    "repeats_decided": true,
+    "strategy": "check"
+  },
+  "rule_pick": "defaults",
+  "split": {
+    "held_out": {
+      "answerable": 0,
+      "cases": 0
+    },
+    "tuning": {
+      "answerable": 17,
+      "cases": 26
+    }
+  },
+  "start_starter": null,
+  "start_valid": true,
+  "sweep": {
+    "engine_build": {
+      "commit": "<commit>",
+      "source_sha": "<source_sha>"
+    },
+    "fingerprint": "<fingerprint>",
+    "name": "tiny",
+    "split_seed": 7
+  },
+  "unpinned_sources": [],
+  "unsearched_modes": {
+    "deep": {
+      "dropped_start_section": {},
+      "unmeasured_profile_wide": {
+        "retrieval_k": 24
+      }
+    }
+  },
+  "version": "045596a78073",
+  "warnings": [],
+  "why": "The defaults are proposed: in run 2 of instant the start gives 1 more wrong and 1 more made-up answers than the defaults; in run 2 of thinking the start gives 1 more wrong and 1 more made-up answers than the defaults, beyond what [propose] allows (max_more_wrong 0, max_more_made_up 0). The sweep did not search deep. The profile holds no section for that mode, so it keeps the engine's own per-mode settings, and runs under the profile's whole-profile settings, whose change from the start (retrieval_k=24) was never measured there."
+}
