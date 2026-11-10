@@ -235,18 +235,23 @@ Sign out sends the browser on to it, which returns it to the workbench's root. A
 on `/v1` gets it too, so they can sign out and switch accounts. A 403 for another tenant or a token without `db.read`
 has the body `{"detail": "<reason>", "end_session_url": "<the URL>"}`, with `null` when the setting is unset. A 401,
 for a caller nobody has verified, is unchanged and names it nowhere. The provider's session then ends either
-way; the provider asks the user to confirm only when the proxy could not end it. Three things must be in place, and
-each fails quietly without it:
+way; the provider asks the user to confirm only when the proxy could not end it. Three things must be in place.
+Without the first, Sign out quietly stops short of the provider. Without either of the others, the user is left on the
+provider's error page:
 
 - **The provider's host in oauth2-proxy's `--whitelist-domain`, as the browser sends it**: lowercase, with a port
   only when the URL names one other than its scheme's default, since a browser drops `:443` from an https URL.
   Without it the proxy drops the redirect, logging `Rejecting invalid redirect … domain / port not in whitelist`, and
   sends the browser to its own default page instead, so Sign out is the proxy's alone.
 - **The workbench's root, exactly (for example `https://mnemiq.example/`), among the client's valid post-logout
-  redirect URIs**, not a wildcard. Without it, expect the provider to show an error page instead of returning to the
+  redirect URIs**, not a wildcard. Without it, Keycloak shows `Invalid redirect uri` instead of returning to the
   workbench.
 - **The proxy client's `client_id` in the URL.** Keycloak needs it, or an ID token, which the workbench never holds.
-  Without it, expect Keycloak to refuse the sign-out.
+  Without it, Keycloak shows `Missing parameters: id_token_hint`.
+
+In the last two cases, the provider's session has still ended if the proxy has a `backendLogoutURL`, as the
+[example](../examples/open-webui/oauth2-proxy.yaml) does, so the next visit asks for a password: the error page is a
+dead end, not a session left open.
 
 **Write the URL as the browser sends it.** A browser lowercases a host, drops a default port, removes a leading zero
 from a port and rewrites an IP address into its own form, so the check accepts only a URL it would leave unchanged.
