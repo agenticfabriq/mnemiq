@@ -637,6 +637,11 @@ describe("signing out of a sign-in the engine refuses", () => {
   const forbidden = (body: BodyInit | null, headers: Record<string, string> = {}) =>
     new Response(body, { status: 403, headers });
   const naming = (end_session_url: unknown) => JSON.stringify({ detail: "Forbidden", end_session_url });
+  // Both 403s the engine sends: a sign-in it does not permit, and one without the scope it needs.
+  const KINDS = [
+    ["not-permitted", {}],
+    ["insufficient-scope", SCOPE_CHALLENGE],
+  ] as const;
 
   /** The proxy's sign-out, then the provider's, which returns the browser to the workbench's root. */
   const viaProvider = () => {
@@ -693,10 +698,7 @@ describe("signing out of a sign-in the engine refuses", () => {
     });
   }
 
-  for (const [refusal, headers] of [
-    ["not-permitted", {}],
-    ["insufficient-scope", SCOPE_CHALLENGE],
-  ] as const) {
+  for (const [refusal, headers] of KINDS) {
     it(`offers a Sign out at the proxy alone when the body of a 403 read as ${refusal} never arrives`, async () => {
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
       const navigate = vi.fn();
@@ -781,38 +783,42 @@ describe("signing out of a sign-in the engine refuses", () => {
     });
   }
 
-  it("offers it when the check before a question is refused, ending where that 403 says", async () => {
-    const alice = await signedInBefore(ALICE, "alice's question");
-    let whoami = () => json(ALICE); // a 200 naming no end-session URL
-    const chat = vi.fn(() => new Response("", { status: 500 }));
-    serve({ "/v1/whoami": () => whoami(), "/v1/schema": SCOPE, "/v1/chat": chat });
-    const navigate = vi.fn();
-    const reload = vi.fn();
-    render(<App reload={reload} navigate={navigate} />);
-    expect(await screen.findAllByText("alice's question")).not.toHaveLength(0);
+  for (const [refusal, headers] of KINDS) {
+    it(`offers it when the check before a question is refused as ${refusal}, ending where that 403 says`, async () => {
+      const alice = await signedInBefore(ALICE, "alice's question");
+      let whoami = () => json(ALICE); // a 200 naming no end-session URL
+      const chat = vi.fn(() => new Response("", { status: 500 }));
+      serve({ "/v1/whoami": () => whoami(), "/v1/schema": SCOPE, "/v1/chat": chat });
+      const navigate = vi.fn();
+      const reload = vi.fn();
+      render(<App reload={reload} navigate={navigate} />);
+      expect(await screen.findAllByText("alice's question")).not.toHaveLength(0);
 
-    // Hidden while the browser's sign-in becomes one the engine refuses, then shown again.
-    setVisibility("hidden");
-    whoami = () => forbidden(naming(END), { "content-type": "application/json" });
-    setVisibility("visible");
-    fireEvent.click(await workbench());
-    fireEvent.click(await screen.findByRole("button", { name: STARTER }));
+      // Hidden while the browser's sign-in becomes one the engine refuses, then shown again.
+      setVisibility("hidden");
+      whoami = () => forbidden(naming(END), { ...headers, "content-type": "application/json" });
+      setVisibility("visible");
+      fireEvent.click(await workbench());
+      fireEvent.click(await screen.findByRole("button", { name: STARTER }));
 
-    expect(await screen.findByText(NOTICE["not-permitted"])).toBeInTheDocument();
-    expect(screen.getAllByRole("button", { name: "Sign out" })).toHaveLength(1);
-    const before = snapshot();
-    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+      expect(await screen.findByText(NOTICE[refusal])).toBeInTheDocument();
+      expect(screen.getAllByRole("button", { name: "Sign out" })).toHaveLength(1);
+      // Going to the refused page kept the user's saved threads and mode.
+      expect(localStorage.getItem(keyFor(alice, "threads"))).toContain("alice's question");
+      expect(localStorage.getItem(keyFor(alice, "mode"))).toBe("deep");
+      const before = snapshot();
+      fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
 
-    expect(navigate).toHaveBeenCalledTimes(1);
-    expect(navigate).toHaveBeenCalledWith(viaProvider());
-    await settle();
-    expect(snapshot()).toEqual(before);
-    expect(localStorage.getItem(keyFor(alice, "threads"))).toContain("alice's question");
-    // The page a reload would show: the tab no longer answers for whoever it held threads for.
-    expect(screen.queryAllByText("alice's question")).toHaveLength(0);
-    expect(chat).not.toHaveBeenCalled();
-    expect(reload).not.toHaveBeenCalled();
-  });
+      expect(navigate).toHaveBeenCalledTimes(1);
+      expect(navigate).toHaveBeenCalledWith(viaProvider());
+      await settle();
+      expect(snapshot()).toEqual(before);
+      // The page a reload would show: the tab no longer answers for whoever it held threads for.
+      expect(screen.queryAllByText("alice's question")).toHaveLength(0);
+      expect(chat).not.toHaveBeenCalled();
+      expect(reload).not.toHaveBeenCalled();
+    });
+  }
 
   it("keeps the workbench, adding no Sign out, when the check before a question finds an outage", async () => {
     await signedInBefore(ALICE, "alice's question");
