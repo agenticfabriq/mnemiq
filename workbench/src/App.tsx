@@ -143,7 +143,7 @@ export default function App({
       // threads. The same user usually signs straight back in, and a refusal can arrive late,
       // from a tab opened before someone else signed in, where a purge would erase the new
       // user's history. A different user's threads are purged when that user loads (`enter`);
-      // the Sign out control clears the user's own.
+      // the workbench's Sign out clears the user's own (the refused page's purges nothing).
       //
       // Reloading goes back through the sign-in proxy, which signs the user in again. A proxy
       // that cannot would send every load straight back here, so a second reload within the
