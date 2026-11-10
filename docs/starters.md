@@ -11,10 +11,21 @@ a search from it, before you rely on it.
 
 ## What "safe" means
 
-A starter adds no wrong answers and no made-up answers over the engine's defaults for that model, in each run and each
-measured mode, by the sweep's own rule, with both `[propose]` bounds at 0 (`max_more_wrong` and `max_more_made_up`).
-It is not a claim that it is the best profile for the build, only that its sweeps found it no worse on those two
-counts.
+A starter adds no wrong answers and no made-up answers over the engine's defaults for that model, in each measured
+mode, by the sweep's own rule, with both `[propose]` bounds at 0 (`max_more_wrong` and `max_more_made_up`). It is not
+a claim that it is the best profile for the build, only that its sweeps found it no worse on those two counts.
+
+How the starter's counts were compared with the defaults' is the reading the rule ran under, which the evidence
+records under `rule` (`harm`, [sweeps.md](sweeps.md#check-mode)). Publishing accepts either:
+
+- **Run by run** (no `harm` in the evidence). In each run, the starter gave no more wrong and no more made-up answers
+  than the defaults gave in the run of the same number. A search's confirm round, on the held-out part, reads them
+  this way, and so does check mode by default.
+- **Worst against worst** (`harm: worst`, check mode only). The starter's highest wrong count over its runs is not
+  above the defaults' highest over theirs, and the same for made-up answers. That is not "no more wrong answers in
+  every run": a starter can give more than the defaults in one run and still be published, when its highest count is
+  not above theirs. Like the right-answers reading below, it grows more lenient as the defaults get more runs, and
+  with one run of each it is the run-by-run reading.
 
 ### Right answers
 
@@ -52,6 +63,20 @@ A starter is written by a command, never by hand, so no number in its evidence i
 
 A search from the engine's defaults whose pick was confirmed on the held-out part can be published on its own, without
 check mode: `mnemiq sweep starter --config search.toml --model <model> --dataset "<the question set's name>"`.
+
+A check on its own can be published too, when the profile to ship already exists, from an earlier search or written by
+hand:
+
+1. Run check mode on the build's server, started from that profile (`[start] profile_file`, with `[start] profile`
+   when the file's default is not the one), against the engine's defaults, with both `[propose]` bounds at 0, and
+   propose.
+2. Publish from the check alone, without `--search`:
+
+   ```bash
+   mnemiq sweep starter --config check.toml --model <model> --dataset "<the question set's name>"
+   ```
+
+Its evidence says `safe_by: check` and holds no search (`search` is null): the check is all that found it safe.
 
 The starter is named for its build: the part of `[models.<model>.build] model` after the `/`, lowercased, so
 `Qwen/Qwen2.5-Coder-32B-Instruct-AWQ` gives `qwen2.5-coder-32b-instruct-awq`. `--name` may only repeat that name.
@@ -122,7 +147,9 @@ Deployments are numbered in it, never named. The dataset label is the publisher'
   release. The folder the server loaded the weights from is never recorded.
 - `engine_build`: the engine's package version, the commit the sweeps ran on, and its source hash.
 - `safe_by`: `check` or `search_from_defaults` ([right answers](#right-answers)).
-- `rule`: the strategy, `alpha`, both bounds, `max_errors` and the runs each arm owed.
+- `rule`: the strategy, `alpha`, both bounds, `max_errors` and the runs each arm owed, and `harm: worst` when check
+  mode read the bounds worst against worst; with no `harm`, they were read run by run
+  ([what "safe" means](#what-safe-means)).
 - `modes_measured`: the modes the starter was measured in, each of which it holds a section for.
 - `unmeasured_modes`: each other mode, with the starter's profile-wide settings that differ from the engine's
   defaults, which apply there unmeasured.
@@ -168,9 +195,9 @@ and re-sweeping every shipped starter on the engine being tagged is a step of ta
 
 1. Set the release's version.
 2. On that commit, run check mode of each shipped starter against the engine's defaults, started from the starter by
-   name (`[start] starter`), with `[sweep] repeats = 2`, both `[propose]` bounds at 0, and the modes the starter's
-   evidence measured (`modes_measured`). A re-sweep is check mode alone: a new or replacement starter takes the whole
-   protocol, a search and then check mode.
+   name (`[start] starter`), with `[sweep] repeats = 2`, both `[propose]` bounds at 0, the reading its evidence
+   records (`harm` under `rule`), and the modes the starter's evidence measured (`modes_measured`). A re-sweep is check
+   mode alone; a new or replacement starter is made as [how one is made](#how-one-is-made) says.
 3. Publish with `mnemiq sweep starter` from a checkout at that commit.
 4. Tag the commit that adds the republished files, with no `.py` file of the package changed since the sweep, so the
    tagged engine has the source hash the evidence names (`engine_build` hashes only `.py` files).

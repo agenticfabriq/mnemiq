@@ -276,6 +276,9 @@ The rule, fixed before any answer is written:
 - `alpha` (default `0.05`): the bar an arm must pass, after Holm's correction.
 - `max_more_wrong`, `max_more_made_up` (default `0` each): how many more wrong answers, and made-up answers to
   questions the data cannot answer, an arm may give than the start.
+- `harm` (default `"per_run"`): how check mode reads those two bounds ([check mode](#check-mode)): `"per_run"`
+  compares the start with the defaults run against run, and `"worst"` compares each arm's highest count over its
+  runs. Check mode only: a config that sets `"worst"` with another strategy is refused.
 - `profile`: the name of the proposed profile (default: the model's name).
 
 ### `[machine]`
@@ -367,11 +370,30 @@ evidence says how many it holds and what gain it could show.
 
 `strategy = "check"` does not search. It runs the start and the engine's defaults (an arm named `defaults` that
 undoes whatever the start profile sets) on every question, with none held out, and compares them for harm. It proposes
-the start when, in every run, the start's wrong and made-up answers exceed the defaults' by no more than `[propose]`
-allows; the defaults otherwise; and nothing unless both arms are valid in every run. Use it when the question set is
-too small to search, as `plan` says, or to check a profile you already run. `[space]` plays no part in it. Its start
-must differ from the engine's defaults in each mode it runs: with no start profile, or one that sets nothing in a mode,
-the two arms would be the same profile, and the config is refused.
+the start when the start's wrong and made-up answers exceed the defaults' by no more than `[propose]` allows; the
+defaults otherwise; and nothing unless both arms are valid in every run. Use it when the question set is too small to
+search, as `plan` says, or to check a profile you already run. `[space]` plays no part in it. Its start must differ
+from the engine's defaults in each mode it runs: with no start profile, or one that sets nothing in a mode, the two
+arms would be the same profile, and the config is refused.
+
+`[propose] harm` says how the two arms' counts are compared, in each mode the sweep runs:
+
+- `"per_run"` (the default): run 1 of the start against run 1 of the defaults, run 2 against run 2, and so on. The
+  bounds must hold in every run. A start that answers the same each run, at temperature 0 say, is then held to
+  whichever of the defaults' runs went best: with the bounds at 0, one run of the defaults with fewer wrong answers
+  than the start refuses it, however the defaults' other runs went.
+- `"worst"`: each arm at its worst. The start's highest wrong count over its runs, less the defaults' highest wrong
+  count over theirs, must be at most `max_more_wrong`, and the same for made-up answers and `max_more_made_up`. A start
+  can give more wrong answers than the defaults in one run and still be proposed, when its highest count is not above
+  theirs. Like the right-answers reading a starter is published by, which compares the lowest right counts
+  ([starters.md](starters.md#right-answers)), it grows more lenient as the defaults get more runs: each run of the
+  defaults is one more chance for their highest count to rise. With one run of each arm, the two readings are the
+  same.
+
+The reading is part of the rule, fixed before any answer is written: `propose` refuses a config edited since the sweep
+ran, so a finished sweep is never read under another reading. The evidence records it under `rule` only when it is
+`"worst"`, and then adds, for each mode, each arm's highest wrong and made-up counts (`highest`) beside the run-by-run
+comparison; the reason names the reading and those counts.
 
 ## Controls: another system's answers
 
