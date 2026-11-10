@@ -55,7 +55,11 @@ The example's [realm](../examples/open-webui/realm.json) is Keycloak's, but the 
   - `db.read` among its default scopes;
   - the roles claim mnemiq reads (`realm_access.roles` by default), and a `groups` claim if Open WebUI should place
     users in groups (below);
-  - for Microsoft Entra, `offline_access` in its scopes, or the token stops after about an hour.
+  - for Microsoft Entra, `offline_access` in its scopes, or the token stops after about an hour;
+  - **PKCE (S256) required**, with `OAUTH_CODE_CHALLENGE_METHOD=S256` on Open WebUI;
+  - its callback registered **exactly**, `https://<open-webui>/oauth/oidc/login/callback`, and set as Open WebUI's
+    `OPENID_REDIRECT_URI` (unset, v0.13.0 sends its legacy `/oauth/oidc/callback`), and `https://<open-webui>/auth`
+    registered exactly as its post-logout redirect URI, where its Sign out returns. Not wildcards.
 
   mnemiq never accepts Open WebUI's client id as an audience: that would accept any token minted for Open WebUI.
 - **The workbench's client (the proxy's):** an audience mapper adding `MNEMIQ_OIDC_AUDIENCE`, `db.read`, **PKCE

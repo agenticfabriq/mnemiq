@@ -167,13 +167,14 @@
    "standardFlowEnabled": true,
    "directAccessGrantsEnabled": false,
    "redirectUris": [
-    "http://localhost:13000/*"
+    "http://localhost:13000/oauth/oidc/login/callback"
    ],
    "webOrigins": [
     "http://localhost:13000"
    ],
    "attributes": {
-    "post.logout.redirect.uris": "http://localhost:13000/*"
+    "post.logout.redirect.uris": "http://localhost:13000/auth",
+    "pkce.code.challenge.method": "S256"
    },
    "protocolMappers": [
     {

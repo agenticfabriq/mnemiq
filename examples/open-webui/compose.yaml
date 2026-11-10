@@ -98,6 +98,9 @@ services:
       # The realm's client maps email and name itself, and defines no separate scopes for them.
       OAUTH_SCOPES: openid
       OPENID_PROVIDER_URL: http://keycloak.localhost:18089/realms/mnemiq/.well-known/openid-configuration
+      # PKCE, and the callback the realm registers exactly. Unset, v0.13.0 sends its legacy /oauth/oidc/callback.
+      OAUTH_CODE_CHALLENGE_METHOD: S256
+      OPENID_REDIRECT_URI: http://localhost:13000/oauth/oidc/login/callback
       ENABLE_OAUTH_ID_TOKEN_COOKIE: "false"
       ENABLE_FORWARD_USER_INFO_HEADERS: "false"
       ENABLE_OAUTH_GROUP_MANAGEMENT: "true"
