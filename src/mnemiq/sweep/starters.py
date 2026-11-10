@@ -13,11 +13,12 @@ launch argument may be a repository id, an absolute path, a relative path or a c
 apart. The last part of what the server was launched from is kept only to say when it is not the stated model's name.
 
 A starter is published (`publish_starter`, `mnemiq sweep starter`) from finished sweeps whose rule found it safe over
-the engine's defaults: check mode's verdict, or a search from those defaults whose pick was confirmed on the held-out
-part. Every refusal comes before anything is written. The evidence records the sha256 of the starter's file
-(`starter_sha256`), and the engine loads a starter only beside evidence that does. The pair is staged outside the
-starters folder and checked there; only then is each moved in, the evidence first, under a hidden name until its
-move and under the folder's lock, so the folder never lists a draft.
+the engine's defaults: check mode's verdict, under either reading of its harm rule (`[propose] harm`, which the
+evidence records), or a search from those defaults whose pick was confirmed on the held-out part. Every refusal comes
+before anything is written. The evidence records the sha256 of the starter's file (`starter_sha256`), and the engine
+loads a starter only beside evidence that does. The pair is staged outside the starters folder and checked there; only
+then is each moved in, the evidence first, under a hidden name until its move and under the folder's lock, so the
+folder never lists a draft.
 """
 
 from __future__ import annotations
@@ -40,7 +41,10 @@ from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    AfterValidator, BaseModel, ConfigDict, Field, SerializerFunctionWrapHandler, ValidationError, model_serializer,
+    model_validator,
+)
 
 from mnemiq import profiles
 from mnemiq.agent.modes import MODES
@@ -49,7 +53,7 @@ from mnemiq.observability.answer_log import engine_commit
 from mnemiq.profiles import _NAME, ENDPOINT_SETTINGS, EVIDENCE_SUFFIX, PROFILE_SETTINGS
 from mnemiq.sweep.arms import _endpoint, _toml, arm_of
 from mnemiq.sweep.config import (
-    PROPOSAL, SweepConfig, SweepConfigError, _RepoId, load_questions, start_profile, start_starter,
+    PROPOSAL, Harm, SweepConfig, SweepConfigError, _RepoId, load_questions, start_profile, start_starter,
 )
 from mnemiq.sweep.run import OUT_LOCK, PINS, _sole, arm_folder, engine_build
 
@@ -134,14 +138,32 @@ class DatasetRecord(_Record):
 
 
 class RuleRecord(_Record):
-    """The rule the sweeps ran under. Both bounds are 0, so the schema itself refuses a starter with looser ones."""
+    """The rule the sweeps ran under. Both bounds are 0, so the schema itself refuses a starter with looser ones.
+
+    `harm` is how check mode read the bounds (`[propose] harm`), and "worst" is refused with any other strategy, as
+    the sweep's config refuses it. It is written only when it is "worst", and read as "per_run" when absent, so
+    evidence published before the reading existed reads, and is written, as it was."""
 
     strategy: Literal["check", "screen-then-grid", "grid"]
     alpha: float
     max_more_wrong: Literal[0]
     max_more_made_up: Literal[0]
+    harm: Harm = "per_run"
     max_errors: int
     repeats: int
+
+    @model_validator(mode="after")
+    def _worst_in_check_mode_alone(self) -> RuleRecord:
+        if self.harm == "worst" and self.strategy != "check":
+            raise ValueError(f'harm "worst" is check mode\'s reading alone, and the strategy is {self.strategy!r}')
+        return self
+
+    @model_serializer(mode="wrap")
+    def _per_run_unwritten(self, handler: SerializerFunctionWrapHandler) -> dict:
+        written = handler(self)
+        if self.harm == "per_run":
+            written.pop("harm", None)   # a dump told to leave harm out, or its default, has already left it out
+        return written
 
 
 class Counts(_Record):
@@ -485,7 +507,7 @@ class _Swept:
 
 def _proposed(cfg: SweepConfig, model: str, state: dict) -> _Swept:
     """The sweep's proposal for `model`, read once, refused unless it is this sweep's and the rule chose it with both
-    bounds at 0."""
+    bounds at 0, under the reading of the harm rule (`[propose] harm`) the config fixed."""
     profiles_path, path = _proposal(cfg, model)
     try:
         evidence = json.loads(path.read_bytes())
@@ -499,6 +521,10 @@ def _proposed(cfg: SweepConfig, model: str, state: dict) -> _Swept:
     for bound in ("max_more_wrong", "max_more_made_up"):
         if (value := evidence["rule"][bound]) != 0:
             raise SweepConfigError(f"[propose] {bound} is {value}: a starter needs both bounds at 0")
+    # The starter records the reading the evidence holds, so it must be the one the config fixed: absent, "per_run".
+    if (said := evidence["rule"].get("harm", "per_run")) != cfg.propose.harm:
+        raise SweepConfigError(f"{path} records harm {said!r}, and the config the sweep ran under has [propose] harm "
+                               f"{cfg.propose.harm!r}: propose from the sweep again")
     try:
         profile = profiles_path.read_bytes()
     except FileNotFoundError:
@@ -716,7 +742,9 @@ def _evidence(cfg: SweepConfig, model: str, name: str, dataset: str, state: dict
                                        commit=state["engine_build"].get("commit"),
                                        source_sha=state["engine_build"]["source_sha"]),
         safe_by="check" if checked else "search_from_defaults",
-        rule=RuleRecord(**{field: evidence["rule"][field] for field in RuleRecord.model_fields}),
+        # The reading check mode passed under: a proposal's evidence records it only when it is "worst".
+        rule=RuleRecord(**{field: evidence["rule"][field] for field in RuleRecord.model_fields if field != "harm"},
+                        harm=evidence["rule"].get("harm", "per_run")),
         modes_measured=measured,
         unmeasured_modes={mode: sorted(key for key, value in wide.items() if value != _field_default(key))
                           for mode in MODES if mode not in measured},
@@ -769,23 +797,25 @@ def _resolves_as_measured(cfg: SweepConfig, model: str, starter: str, version: s
 def publish_starter(cfg: SweepConfig, model: str, dataset: str, *, name: str | None = None,
                     search: SweepConfig | None = None) -> tuple[Path, Path]:
     """Write the starter for `model`'s build and its evidence into the starters folder (`profiles.starters_folder`),
-    from the finished sweep `cfg`, whose rule found it safe over the engine's defaults: check mode's verdict, or a
-    search from those defaults whose pick was confirmed. `search` is the search whose proposal the check started from,
-    when it did. `dataset` labels the questions, for the description and the evidence. Returns the two paths.
+    from the finished sweep `cfg`, whose rule found it safe over the engine's defaults: check mode's verdict, under
+    either reading of its harm rule, which the evidence records, or a search from those defaults whose pick was
+    confirmed. `search` is the search whose proposal the check started from, when it did; a check started from a
+    profile of its own is published without one. `dataset` labels the questions, for the description and the
+    evidence. Returns the two paths.
 
     Every refusal comes before anything is written, in this order: a dataset label that is not 1 to 80 printable ASCII
     characters, not all spaces, without a slash; an out folder a run or a proposal holds, whose lock publishing then
     holds to its end, as a proposal does; a key variable not set; a sweep that has not finished, or ran under another
-    config; an engine with no checkout to write into; an engine other than the one the sweeps ran on, by source hash;
-    a proposal a person chose, or one whose bounds are not both 0, a `search` in check mode, or a `search` beside a
-    sweep that is not; a check that chose the defaults, or a search that did not start from them, whose pick was not
-    confirmed, or whose pick is the defaults; a starter that gets fewer right answers than the defaults
-    (`fewer_right`); a build not read and stated whole; a build whose server, server version, GPU or quantization is
-    not what may be published (`_publishable_build`); a name that is not the build's; a search that is not the one the
-    check started from; evidence the schema refuses; the staged pair's own checks, below; and the starters folder,
-    while another publisher holds its lock. Each sweep's record and proposal are read once, so the checks and the
-    evidence see the same bytes. Until every check has passed, nothing is written in the starters folder, not even the
-    lock file.
+    config; an engine with no checkout to write into; an engine other than the one the sweeps ran on, by source hash; a
+    proposal a person chose, one whose bounds are not both 0, or one whose evidence records another reading of the harm
+    rule than its config, a `search` in check mode, or a `search` beside a sweep that is not; a check that chose the
+    defaults, or a search that did not start from them, whose pick was not confirmed, or whose pick is the defaults; a
+    starter that gets fewer right answers than the defaults (`fewer_right`); a build not read and stated whole; a build
+    whose server, server version, GPU or quantization is not what may be published (`_publishable_build`); a name that
+    is not the build's; a search that is not the one the check started from; evidence the schema refuses; the staged
+    pair's own checks, below; and the starters folder, while another publisher holds its lock. Each sweep's record and
+    proposal are read once, so the checks and the evidence see the same bytes. Until every check has passed, nothing is
+    written in the starters folder, not even the lock file.
 
     The evidence records the sha256 of the starter's file (`starter_sha256`), and the engine loads a starter only
     beside evidence that does. The two files are staged outside the starters folder and checked there: the evidence as

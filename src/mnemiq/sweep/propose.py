@@ -16,9 +16,10 @@ every mode the sweep runs and once per repeat, run k beside run k. It passes whe
 gets at least the start's right answers, and adds no more wrong or made-up answers than the bounds. When it fails, the
 start is proposed: no second candidate is tried, since that would make the held-out cases part of the search.
 
-Check mode compares the start with the engine's defaults for harm alone. It proposes the start when, in every run, the
-start's wrong and made-up answers exceed the defaults' by no more than the bounds, the defaults otherwise, and nothing
-unless both arms are valid in every run.
+Check mode compares the start with the engine's defaults for harm alone. It proposes the start when its wrong and
+made-up answers exceed the defaults' by no more than the bounds, the defaults otherwise, and nothing unless both arms
+are valid in every run. `[propose] harm` says how the counts are read: run against run, in every run ("per_run", the
+default), or each arm's highest count over its runs against the other's, in every mode ("worst").
 
 Each of these spans the modes whose start the sweep ran, as the first round's plan recorded them (`starts` in
 `sweep.json`), never asked of the engine again. A mode the engine refused the start in ran nothing, so the profile holds
@@ -848,6 +849,9 @@ def _head(cfg: SweepConfig, model: str, state: dict, repeats: int, packaged: dic
             "repeats_decided": isinstance(cfg.sweep.repeats, int) or "repeats" in state}
     if cfg.search.strategy != "check":
         rule["screen_alpha"] = cfg.search.screen_alpha
+    # Absent, the reading is "per_run": evidence from before the key reads, and is written, as it was.
+    if cfg.propose.harm != "per_run":
+        rule["harm"] = cfg.propose.harm
     return {
         "model": model,
         "sweep": {"name": cfg.sweep.name, "fingerprint": state["fingerprint"], "engine_build": state["engine_build"],
@@ -886,11 +890,32 @@ def _unmeasured(run: dict, max_errors: int) -> str:
     return f"run {run['run']} is not valid"
 
 
+def _highest(record: dict) -> dict[str, int]:
+    """An arm's highest wrong count and its highest made-up count over its runs, each read on its own."""
+    return {"wrong": max(run["wrong"] for run in record["runs"]),
+            "made_up": max(run["made_up"] for run in record["runs"])}
+
+
+def _highest_said(numbers: dict) -> str:
+    """Each mode's highest counts, the start's against the defaults', for the reason."""
+    said = []
+    for mode, found in numbers.items():
+        start, defaults = found["highest"]["start"], found["highest"]["defaults"]
+        said.append(f"in {mode}, {start['wrong']} wrong against {defaults['wrong']} and {start['made_up']} made-up "
+                    f"against {defaults['made_up']}")
+    return "The highest counts, the start's against the defaults': " + "; ".join(said) + "."
+
+
 def _check(cfg: SweepConfig, model: str, records: Sequence[dict], running: Sequence[str],
            refused: dict[str, str]) -> dict:
     """Check mode's verdict for `model`, over the modes recorded as having run its start: the start, the defaults, or
-    nothing."""
+    nothing.
+
+    Under `[propose] harm = "per_run"` the bounds hold run against run, in every run. Under "worst" they hold between
+    each arm's highest count over its runs, in every mode: the numbers then add both arms' highest wrong and made-up
+    counts beside the per-run comparison, and the reason says which reading decided."""
     bounds = cfg.propose
+    worst = bounds.harm == "worst"
     numbers, invalid, harm = {}, [], []
     valid = {"start", "defaults"} if running else set()
     for mode in running:
@@ -909,17 +934,35 @@ def _check(cfg: SweepConfig, model: str, records: Sequence[dict], running: Seque
         apart = [{"run": start["run"], "more_wrong": start["wrong"] - defaults["wrong"],
                   "more_made_up": start["made_up"] - defaults["made_up"]}
                  for start, defaults in zip(found["start"]["runs"], found["defaults"]["runs"], strict=True)]
+        numbers[mode] = {"start": found["start"]["runs"], "defaults": found["defaults"]["runs"],
+                         "start_against_defaults": apart}
+        if worst:
+            highest = {arm: _highest(found[arm]) for arm in ("start", "defaults")}
+            numbers[mode]["highest"] = highest
+            if (highest["start"]["wrong"] - highest["defaults"]["wrong"] > bounds.max_more_wrong
+                    or highest["start"]["made_up"] - highest["defaults"]["made_up"] > bounds.max_more_made_up):
+                harm.append(mode)
+            continue
         harm += [f"in run {each['run']} of {mode} the start gives {each['more_wrong']} more wrong and "
                  f"{each['more_made_up']} more made-up answers than the defaults"
                  for each in apart if each["more_wrong"] > bounds.max_more_wrong
                  or each["more_made_up"] > bounds.max_more_made_up]
-        numbers[mode] = {"start": found["start"]["runs"], "defaults": found["defaults"]["runs"],
-                         "start_against_defaults": apart}
     if not running:
         rule, why = None, _refused_everywhere(refused)
     elif invalid:
         rule, why = None, ("Nothing is proposed: " + "; ".join(invalid) + ". Check mode proposes only between two "
                            "arms valid in every run.")
+    elif worst and harm:
+        rule, why = "defaults", ('The defaults are proposed: read worst against worst ([propose] harm = "worst"), the '
+                                 "start's highest wrong or made-up count over its runs exceeds the defaults' highest "
+                                 f"by more than [propose] allows in {_joined(harm)} (max_more_wrong "
+                                 f"{bounds.max_more_wrong}, max_more_made_up {bounds.max_more_made_up}). "
+                                 + _highest_said(numbers))
+    elif worst:
+        rule, why = "start", ('The start is proposed: read worst against worst ([propose] harm = "worst"), in every '
+                              "mode the start's highest wrong and made-up counts over its runs exceed the defaults' "
+                              f"highest by no more than [propose] allows. {_highest_said(numbers)} Both arms' right "
+                              "answers are in the evidence.")
     elif harm:
         rule, why = "defaults", ("The defaults are proposed: " + "; ".join(harm) + ", beyond what [propose] allows "
                                  f"(max_more_wrong {bounds.max_more_wrong}, "

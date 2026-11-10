@@ -276,6 +276,10 @@ The rule, fixed before any answer is written:
 - `alpha` (default `0.05`): the bar an arm must pass, after Holm's correction.
 - `max_more_wrong`, `max_more_made_up` (default `0` each): how many more wrong answers, and made-up answers to
   questions the data cannot answer, an arm may give than the start.
+- `harm` (default `"per_run"`): how check mode reads those two bounds ([check mode](#check-mode)): `"per_run"`
+  compares the start with the defaults run against run, and `"worst"` compares each arm's highest count over its
+  runs. Check mode only, with `[sweep] repeats` fixed at 2 or more: a config that sets `"worst"` with another
+  strategy, or with `repeats` of `"auto"` or 1, is refused.
 - `profile`: the name of the proposed profile (default: the model's name).
 
 ### `[machine]`
@@ -367,11 +371,31 @@ evidence says how many it holds and what gain it could show.
 
 `strategy = "check"` does not search. It runs the start and the engine's defaults (an arm named `defaults` that
 undoes whatever the start profile sets) on every question, with none held out, and compares them for harm. It proposes
-the start when, in every run, the start's wrong and made-up answers exceed the defaults' by no more than `[propose]`
-allows; the defaults otherwise; and nothing unless both arms are valid in every run. Use it when the question set is
-too small to search, as `plan` says, or to check a profile you already run. `[space]` plays no part in it. Its start
-must differ from the engine's defaults in each mode it runs: with no start profile, or one that sets nothing in a mode,
-the two arms would be the same profile, and the config is refused.
+the start when the start's wrong and made-up answers exceed the defaults' by no more than `[propose]` allows; the
+defaults otherwise; and nothing unless both arms are valid in every run. Use it when the question set is too small to
+search, as `plan` says, or to check a profile you already run. `[space]` plays no part in it. Its start must differ
+from the engine's defaults in each mode it runs: with no start profile, or one that sets nothing in a mode, the two
+arms would be the same profile, and the config is refused.
+
+`[propose] harm` says how the two arms' counts are compared, in each mode the sweep runs:
+
+- `"per_run"` (the default): run 1 of the start against run 1 of the defaults, run 2 against run 2, and so on. The
+  bounds must hold in every run. A start that answers the same each run, at temperature 0 say, is then held to
+  whichever of the defaults' runs went best: with the bounds at 0, one run of the defaults with fewer wrong answers
+  than the start refuses it, however the defaults' other runs went.
+- `"worst"`: each arm at its worst. The start's highest wrong count over its runs, less the defaults' highest wrong
+  count over theirs, must be at most `max_more_wrong`, and the same for made-up answers and `max_more_made_up`. A start
+  can give more wrong answers than the defaults in one run and still be proposed, when its highest count is not above
+  theirs. Like the right-answers reading a starter is published by, which compares the lowest right counts
+  ([starters.md](starters.md#right-answers)), it grows more lenient as the defaults get more runs: each run of the
+  defaults is one more chance for their highest count to rise. With one run of each arm the two readings are the
+  same, so `"worst"` needs `[sweep] repeats` set to 2 or more: under `"auto"`, a start that writes the same SQL in
+  its first two runs, as one at temperature 0 does, makes every arm run once.
+
+The reading is part of the rule, fixed before any answer is written: `propose` refuses a config edited since the sweep
+ran, so a finished sweep is never read under another reading. The evidence records it under `rule` only when it is
+`"worst"`, and then adds, for each mode, each arm's highest wrong and made-up counts (`highest`) beside the run-by-run
+comparison; the reason names the reading and those counts.
 
 ## Controls: another system's answers
 
@@ -435,10 +459,10 @@ each run's `only/other` and p. The screen's p is the one-sided p it keeps by; ev
 
 - **the sweep**: its name, its fingerprint (what its answers depend on), the engine build its arms ran on and the one
   that wrote the proposal, the split seed and each part's size, the identity, each model's endpoints without
-  credentials, the rule (strategy, `alpha`, `screen_alpha`, the bounds, `max_errors`, the runs each arm owed and
-  whether the first round decided them), the sources it could not pin, and the starter the start resolves through with
-  where the sweep's build differs from the one it was swept on (`start_starter`, null when it reaches none;
-  [the model server's build](#the-model-servers-build));
+  credentials, the rule (strategy, `alpha`, `screen_alpha`, the bounds, `harm` when it is `"worst"`, `max_errors`,
+  the runs each arm owed and whether the first round decided them), the sources it could not pin, and the starter the
+  start resolves through with where the sweep's build differs from the one it was swept on (`start_starter`, null
+  when it reaches none; [the model server's build](#the-model-servers-build));
 - **the verdict**: whether the start is valid in every run (`start_valid`), what was chosen and by whom (the rule or a
   person), the rule's own pick, whether it was confirmed, why in words, and any warnings: another engine packaging the
   proposal, where the build differs from the starter's, and a weights folder that is not the stated model's;
@@ -453,7 +477,9 @@ each run's `only/other` and p. The screen's p is the one-sided p it keeps by; ev
   arm of its own), and its `version`, recomputed by the engine and checked against the version the measured arm's
   answers were stamped with;
 - **modes the engine refused and modes the sweep did not search** (below), and in check mode the start and the
-  defaults side by side.
+  defaults side by side, run by run, with what the start gave beyond the defaults in each run
+  (`start_against_defaults`) and, under `harm = "worst"`, each arm's highest wrong and made-up counts in each mode
+  (`highest`).
 
 `propose` writes both files only once every check has passed. It opens each deployment's source to read its
 dialect, which a profile's version holds, so it needs the same access to the source as the run, and each key variable

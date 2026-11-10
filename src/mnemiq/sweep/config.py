@@ -294,10 +294,16 @@ class Search(_Section):
     seconds_per_question: _Positive | None = None
 
 
+# How check mode reads its two arms' wrong and made-up answers against the bounds: run k of the start against run k of
+# the defaults, in every run, or each arm's highest count over its runs against the other's.
+Harm = Literal["per_run", "worst"]
+
+
 class Propose(_Section):
     alpha: _Alpha = 0.05
     max_more_wrong: _Count = 0
     max_more_made_up: _Count = 0
+    harm: Harm = "per_run"
     profile: _ProfileName | None = None
 
 
@@ -438,6 +444,15 @@ class SweepConfig(BaseModel):
         names = [control.name for control in self.control]
         if len(set(names)) != len(names):
             raise ValueError("[[control]] names one control twice")
+        if self.propose.harm == "worst" and self.search.strategy != "check":
+            raise ValueError('[propose] harm = "worst" reads check mode\'s start and defaults, each at its highest '
+                             f"count over its runs, and strategy {self.search.strategy!r} compares no such pair: use "
+                             'it with [search] strategy = "check", or leave it out')
+        if self.propose.harm == "worst" and not (isinstance(self.sweep.repeats, int) and self.sweep.repeats >= 2):
+            raise ValueError(f'[propose] harm = "worst" reads each arm at its highest count over its runs, and [sweep] '
+                             f"repeats is {self.sweep.repeats!r}: with one run of each arm it is run against run, and "
+                             '"auto" runs every arm once when the start writes the same SQL twice, as a start at '
+                             "temperature 0 does. Set [sweep] repeats to 2 or more")
         if self.search.strategy != "check" and self.dataset.held_out == 0:
             raise ValueError(f"[dataset] held_out is 0, and a search (strategy {self.search.strategy!r}) confirms its "
                              "pick on held-out questions: set held_out above 0, or use check mode ([search] strategy "
@@ -806,11 +821,13 @@ def _answering_settings(settings: Settings) -> dict:
 
 def fingerprint_body(cfg: SweepConfig) -> dict:
     """What `fingerprint` hashes. A key a config gained with starters and build tables (`[start] starter`, a model's
-    own `starter`, `[models.<name>.build]`) enters only when set, so a config that names none fingerprints as it did
-    before them."""
+    own `starter`, `[models.<name>.build]`) enters only when set, and `[propose] harm` only when it is "worst", so a
+    config that names none of them fingerprints as it did before them."""
     config = cfg.model_dump(mode="json")
     config["search"] = {key: value for key, value in config["search"].items() if key not in _PLANNING}
     del config["control"]
+    if config["propose"]["harm"] == "per_run":
+        del config["propose"]["harm"]
     for table in (config["start"], *config["start"]["per_model"].values()):
         if table.get("starter") is None:
             table.pop("starter", None)
