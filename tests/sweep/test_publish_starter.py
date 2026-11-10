@@ -520,6 +520,17 @@ def test_a_server_that_reports_itself_as_no_known_release_is_never_published(tmp
     assert not any(b"customer_acme" in path.read_bytes() for path in folder.rglob("*") if path.is_file())
 
 
+@pytest.mark.parametrize("version, published", [("0.9.0+rocm6.2", True), ("0.9.0+acme", False)])
+def test_a_server_version_publishes_only_as_a_release(tmp_path, monkeypatch, stub_model, version, published):
+    cfg = finished_check(tmp_path, monkeypatch, stub_model, server={"version": version})
+    if published:
+        assert read_json(publish_starter(cfg, "m", "the tiny set")[1])["model_build"]["server_version"] == version
+    else:
+        with pytest.raises(SweepConfigError, match="^server_version '0.9.0\\+acme' is not a release version"):
+            publish_starter(cfg, "m", "the tiny set")
+        assert _shipped(profiles.starters_folder()) == []
+
+
 @pytest.mark.parametrize("field, value", [("gpu", "lab/rtx-4090"), ("quantization", "awq\\int4"),
                                           ("quantization", "awq\u0001"), ("gpu", "x" * 65)])
 def test_a_stated_build_that_could_carry_a_path_is_never_published(tmp_path, monkeypatch, stub_model, field, value):

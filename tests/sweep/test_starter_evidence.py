@@ -17,7 +17,7 @@ from mnemiq.sweep.plan import render
 from mnemiq.sweep.propose import propose
 from mnemiq.sweep.run import run
 from mnemiq.sweep.starters import (
-    Mode, StarterEvidence, build_mismatches, merged_readings, read_evidence, server_readings,
+    Mode, StarterEvidence, _publishable_build, build_mismatches, merged_readings, read_evidence, server_readings,
 )
 
 from .conftest import (
@@ -231,11 +231,33 @@ def test_evidence_that_names_another_starter_file_is_refused(tmp_path, monkeypat
         read_evidence("fixture-2.5-build")
 
 
-@pytest.mark.parametrize("version", ["0.9.0.1", "0.10.1rc1", "0.6.3.post1", "0.9.0+cu124", "0.10.2.dev123+g5abc"])
+# Releases as PEP 440 names their parts, with a local part only for the accelerator a build is for, and what is not.
+RELEASES = ["0.9.0.1", "0.6.3.post1", "0.9.0rc2", "0.9.0+cu124", "0.9.0+rocm6.2"]
+NOT_RELEASES = ["0.9.0+acme", "0.9.0+customer_acme_prod", "/srv/customer_acme/private/build", "0.9.0 rc2", ""]
+
+
+@pytest.mark.parametrize("version", RELEASES)
 def test_a_release_of_a_known_server_is_one_the_schema_takes(tmp_path, monkeypatch, version):
     good = valid_evidence(tmp_path, monkeypatch)
     good["model_build"] |= {"server": "vllm", "server_version": version}
     assert StarterEvidence.model_validate(good).model_build.server_version == version
+
+
+@pytest.mark.parametrize("version", NOT_RELEASES)
+def test_a_version_that_is_not_a_release_is_refused_by_the_schema(tmp_path, monkeypatch, version):
+    good = valid_evidence(tmp_path, monkeypatch)
+    with pytest.raises(ValidationError):
+        StarterEvidence.model_validate(good | {"model_build": good["model_build"] | {"server_version": version}})
+
+
+@pytest.mark.parametrize("version, published", [*((v, True) for v in RELEASES), *((v, False) for v in NOT_RELEASES)])
+def test_publishing_takes_a_release_and_refuses_anything_else(version, published):
+    build = {"server": "vllm", "server_version": version, "gpu": "GeForce RTX 4090", "quantization": "awq"}
+    if published:
+        _publishable_build("m", build)
+    else:
+        with pytest.raises(SweepConfigError, match="^server_version "):
+            _publishable_build("m", build)
 
 
 def test_the_mode_alias_is_the_engines_modes():

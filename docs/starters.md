@@ -77,9 +77,10 @@ Publishing refuses, before it writes anything:
   model, the GPU or the quantization not stated in `[models.<model>.build]`, two sweeps that read different servers or
   state different builds, or an `llm_context_window` other than the window the server reports;
 - a build that could publish more than a build's facts: a server other than one on the engine's list of servers a
-  starter may be published from (`vllm`), a server version not shaped as a release (digits and dots, then at most one
-  segment of letters, digits, `.`, `+`, `-` or `_`), or a stated GPU or quantization that is not printable ASCII
-  without a slash. A sweep on another server still runs; only what may be published is held to this;
+  starter may be published from (`vllm`), a server version not shaped as a release (digits and dots, then optionally
+  a pre-release such as `rc2`, `.postN`, `.devN`, and an accelerator tag such as `+cu124` or `+rocm6.2`, never a word
+  of the server's own), or a stated GPU or quantization that is not printable ASCII without a slash. A sweep on another
+  server still runs; only what may be published is held to this;
 - a `--name` other than the build's;
 - with `--search`, a search whose proposal is not the file the check's arms started from, by its hash as they pinned
   it;

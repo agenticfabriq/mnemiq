@@ -89,9 +89,14 @@ StatedText = Annotated[str, Field(pattern=DATASET_LABEL_PATTERN, max_length=STAT
 # any other server still runs, and says where its build differs; only what may be published is held to this.
 PUBLISHABLE_SERVERS: tuple[str, ...] = ("vllm",)
 PublishableServer = Literal[PUBLISHABLE_SERVERS]
-# A server's version as the evidence publishes it: a release's digits and dots, then at most one segment of letters,
-# digits, `.`, `+`, `-` or `_` (a pre-, post-, dev- or local part), so never a slash, a backslash, a colon or a space.
-SERVER_VERSION_PATTERN = r"^[0-9]+(?:\.[0-9]+)*[A-Za-z0-9.+_-]*$"
+# A server's version as the evidence publishes it: a release as PEP 440 names its parts, digits and dots, then
+# optionally a pre-release (`a`, `b` or `rc` and a number), a `.post` and a `.dev` number, and a local part only of the
+# accelerator tags a build is for (`cu124`, `rocm6.2`, `cpu`, `tpu`, `xpu`, in any case, dot-separated). A word the
+# server adds, such as an organisation's name in a local part, is never published, and neither is a slash, a backslash,
+# a colon or a space.
+_ACCELERATOR = r"(?:cu[0-9]+|rocm[0-9]+(?:\.[0-9]+)*|cpu|tpu|xpu)"
+SERVER_VERSION_PATTERN = (r"^[0-9]+(?:\.[0-9]+)*(?:(?:a|b|rc)[0-9]+)?(?:\.post[0-9]+)?(?:\.dev[0-9]+)?"
+                          rf"(?:\+(?i:{_ACCELERATOR}(?:\.{_ACCELERATOR})*))?$")
 SERVER_VERSION_MAX = 40
 ServerVersion = Annotated[str, Field(pattern=SERVER_VERSION_PATTERN, max_length=SERVER_VERSION_MAX)]
 # The sha256 of a starter's file, as its evidence records it.
@@ -599,9 +604,10 @@ def _publishable_build(model: str, build: dict) -> None:
         raise SweepConfigError(f"server {build['server']!r} is not a model server a starter may be published from "
                                f"({', '.join(PUBLISHABLE_SERVERS)}): what the server reports of itself is published")
     if not _fits(SERVER_VERSION_PATTERN, SERVER_VERSION_MAX, build["server_version"]):
-        raise SweepConfigError(f"server_version {build['server_version']!r} is not a release version (digits and dots, "
-                               "then at most one segment of letters, digits, '.', '+', '-' or '_', in at most "
-                               f"{SERVER_VERSION_MAX} characters): what the server reports of itself is published")
+        raise SweepConfigError(f"server_version {build['server_version']!r} is not a release version (digits and "
+                               "dots, then optionally a pre-release such as rc2, .postN, .devN and an accelerator tag "
+                               f"such as +cu124, in at most {SERVER_VERSION_MAX} characters): what the server reports "
+                               "of itself is published")
     for field in ("gpu", "quantization"):
         if not _fits(DATASET_LABEL_PATTERN, STATED_MAX, build[field]):
             raise SweepConfigError(f"[models.{model}.build] {field} {build[field]!r} is not text a starter can "
