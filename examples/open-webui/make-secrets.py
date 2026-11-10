@@ -110,9 +110,9 @@ def cmd_secrets() -> int:
     elif not llm.exists():
         write_private(llm, env_file({key: "" for key in LLM_SETTINGS}))
     missing = [k for k in ("MNEMIQ_LLM_BASE_URL", "MNEMIQ_LLM_MODEL") if not _env_value(llm, k)]
-    print(f"wrote the secrets to {SECRETS} (mode 600); demo passwords are in {SECRETS / 'users.txt'}")
+    print("wrote the secrets to examples/open-webui/.secrets/ (mode 600); the demo passwords are in users.txt there")
     if missing:
-        print(f"set {', '.join(missing)} (and the key) in {llm}, or export them and run this again: mnemiq needs "
+        print(f"set {', '.join(missing)} (and the key) in .secrets/llm.env, or export them and run this again: mnemiq needs "
               "its model to enrich the demo data and to answer")
         return 2
     return 0
