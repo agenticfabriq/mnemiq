@@ -142,7 +142,7 @@ def test_the_harm_reading_defaults_to_per_run():
 
 def test_worst_loads_in_check_mode(tmp_path):
     cfg = load_config(write_config(tmp_path, search={"strategy": "check"}, start=start_that_differs(tmp_path),
-                                   propose={"harm": "worst"}))
+                                   sweep={"repeats": 2}, propose={"harm": "worst"}))
     assert cfg.propose.harm == "worst"
 
 
@@ -150,6 +150,14 @@ def test_worst_loads_in_check_mode(tmp_path):
 def test_worst_outside_check_mode_is_refused_naming_the_key(tmp_path, strategy):
     with pytest.raises(SweepConfigError, match=r'\[propose\] harm = "worst"'):
         load_config(write_config(tmp_path, search={"strategy": strategy}, propose={"harm": "worst"}))
+
+
+@pytest.mark.parametrize("repeats", [None, "auto", 1])
+def test_worst_with_fewer_than_two_fixed_runs_is_refused_naming_both_keys(tmp_path, repeats):
+    # "auto" runs every arm once when the start writes the same SQL twice, as a start at temperature 0 does
+    with pytest.raises(SweepConfigError, match=r'\[propose\] harm = "worst".*\[sweep\] repeats'):
+        load_config(write_config(tmp_path, search={"strategy": "check"}, start=start_that_differs(tmp_path),
+                                 sweep={} if repeats is None else {"repeats": repeats}, propose={"harm": "worst"}))
 
 
 def test_an_unknown_harm_reading_is_refused(tmp_path):
@@ -177,7 +185,7 @@ def test_the_worst_reading_is_part_of_the_fingerprint(tmp_path):
 
 
 def test_a_finished_per_run_check_is_never_read_under_worst(tmp_path):
-    cfg = checked_runs(tmp_path, start=[dict(right=11, wrong=3)], defaults=[dict(right=10, wrong=3)],
+    cfg = checked_runs(tmp_path, start=[dict(right=11, wrong=3)] * 2, defaults=[dict(right=10, wrong=3)] * 2,
                        modes=("instant",))
     with pytest.raises(SweepConfigError, match="this sweep was run under another config"):
         propose(load_config(rewrite(cfg, propose={"harm": "worst"})))
@@ -356,14 +364,15 @@ def test_a_per_run_check_publishes_a_starter_whose_rule_is_written_as_before(tmp
 
 
 def test_a_worst_check_publishes_a_starter_that_records_worst(tmp_path, monkeypatch, stub_model):
-    cfg = finished_check(tmp_path, monkeypatch, stub_model, propose={"harm": "worst"})
+    cfg = finished_check(tmp_path, monkeypatch, stub_model, propose={"harm": "worst"}, repeats=2)
     _, evidence_path = publish_starter(cfg, "m", "the tiny set")
     assert read_json(evidence_path)["rule"]["harm"] == "worst" and read_json(evidence_path)["safe_by"] == "check"
     assert read_evidence("model-2.5-awq").rule.harm == "worst"
 
 
 def test_a_worst_check_that_proposed_the_defaults_is_never_published(tmp_path, monkeypatch, stub_model):
-    cfg = finished_check(tmp_path, monkeypatch, stub_model, propose={"harm": "worst"}, defaults_better=True)
+    cfg = finished_check(tmp_path, monkeypatch, stub_model, propose={"harm": "worst"}, repeats=2,
+                         defaults_better=True)
     assert evidence(cfg)["chosen"] == "defaults" and evidence(cfg)["rule"]["harm"] == "worst"
     with pytest.raises(SweepConfigError, match="the engine's defaults: there is no starter"):
         publish_starter(cfg, "m", "the tiny set")

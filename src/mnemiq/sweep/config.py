@@ -448,6 +448,11 @@ class SweepConfig(BaseModel):
             raise ValueError('[propose] harm = "worst" reads check mode\'s start and defaults, each at its highest '
                              f"count over its runs, and strategy {self.search.strategy!r} compares no such pair: use "
                              'it with [search] strategy = "check", or leave it out')
+        if self.propose.harm == "worst" and not (isinstance(self.sweep.repeats, int) and self.sweep.repeats >= 2):
+            raise ValueError(f'[propose] harm = "worst" reads each arm at its highest count over its runs, and [sweep] '
+                             f"repeats is {self.sweep.repeats!r}: with one run of each arm it is run against run, and "
+                             '"auto" runs every arm once when the start writes the same SQL twice, as a start at '
+                             "temperature 0 does. Set [sweep] repeats to 2 or more")
         if self.search.strategy != "check" and self.dataset.held_out == 0:
             raise ValueError(f"[dataset] held_out is 0, and a search (strategy {self.search.strategy!r}) confirms its "
                              "pick on held-out questions: set held_out above 0, or use check mode ([search] strategy "

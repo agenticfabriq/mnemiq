@@ -278,7 +278,8 @@ The rule, fixed before any answer is written:
   questions the data cannot answer, an arm may give than the start.
 - `harm` (default `"per_run"`): how check mode reads those two bounds ([check mode](#check-mode)): `"per_run"`
   compares the start with the defaults run against run, and `"worst"` compares each arm's highest count over its
-  runs. Check mode only: a config that sets `"worst"` with another strategy is refused.
+  runs. Check mode only, with `[sweep] repeats` fixed at 2 or more: a config that sets `"worst"` with another
+  strategy, or with `repeats` of `"auto"` or 1, is refused.
 - `profile`: the name of the proposed profile (default: the model's name).
 
 ### `[machine]`
@@ -387,8 +388,9 @@ arms would be the same profile, and the config is refused.
   can give more wrong answers than the defaults in one run and still be proposed, when its highest count is not above
   theirs. Like the right-answers reading a starter is published by, which compares the lowest right counts
   ([starters.md](starters.md#right-answers)), it grows more lenient as the defaults get more runs: each run of the
-  defaults is one more chance for their highest count to rise. With one run of each arm, the two readings are the
-  same.
+  defaults is one more chance for their highest count to rise. With one run of each arm the two readings are the
+  same, so `"worst"` needs `[sweep] repeats` set to 2 or more: under `"auto"`, a start that writes the same SQL in
+  its first two runs, as one at temperature 0 does, makes every arm run once.
 
 The reading is part of the rule, fixed before any answer is written: `propose` refuses a config edited since the sweep
 ran, so a finished sweep is never read under another reading. The evidence records it under `rule` only when it is
