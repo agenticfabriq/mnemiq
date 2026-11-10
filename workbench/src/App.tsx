@@ -216,7 +216,16 @@ export default function App({
       who = await fetchWhoami();
     } catch (error) {
       // Nothing is sent without a confirmed identity, so a failed check sends nothing.
-      if (checked.current === mine) refused(error instanceof Refused ? error.refusal : "unavailable");
+      if (checked.current !== mine) return false;
+      const why = error instanceof Refused ? error : new Refused("unavailable");
+      if (why.refusal === "not-permitted" || why.refusal === "insufficient-scope") {
+        // The browser now holds a sign-in the engine refuses: the page a reload would show, with
+        // its Sign out. The threads stay saved, as for an expired session, since a 403 does not say
+        // whether it is still the same user.
+        checked.current = null;
+        setNotice(null);
+        setSession({ state: "refused", refusal: why.refusal, endSession: why.endSession });
+      } else refused(why.refusal);
       return false;
     }
     if (checked.current !== mine) return false; // the page moved on while asking
