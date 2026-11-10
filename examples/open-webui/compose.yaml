@@ -36,11 +36,12 @@ services:
       interval: 5s
       retries: 60
 
-  # Seeds the demo data once, then enriches and indexes it: one pass of the operator's model over the schema.
+  # Seeds the demo data, then enriches and indexes it: one pass of the operator's model over the schema. The marker is
+  # written last, because enrich creates the store before build runs, so a run that stops partway starts over next time.
   init:
     build: {context: ../.., dockerfile: Dockerfile}
     image: mnemiq:example
-    command: ["sh", "-c", "[ -f demo/store.duckdb ] || (python scripts/seed_demo.py && mnemiq enrich && mnemiq build)"]
+    command: ["sh", "-c", "[ -f demo/.initialized ] || (python scripts/seed_demo.py && mnemiq enrich && mnemiq build && touch demo/.initialized)"]
     environment: *mnemiq-env
     env_file: [.secrets/llm.env]
     volumes: ["demo:/app/demo", "./authz.json:/config/authz.json:ro", "./profiles.toml:/config/profiles.toml:ro"]
