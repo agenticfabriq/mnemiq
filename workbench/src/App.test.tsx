@@ -1,10 +1,10 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
 import { SCALAR_ANSWER } from "./test/fixtures";
 import { enter, keyFor, LEGACY, MARKER, mayReload, namespaceOf, SINGLE } from "./lib/identity";
-import { NOTICE } from "./lib/transport";
+import { NOTICE, REFUSAL_BODY_MS } from "./lib/transport";
 import type { Thread } from "./lib/threads";
 
 /**
@@ -690,6 +690,29 @@ describe("signing out of a sign-in the engine refuses", () => {
       await settle();
       expect(snapshot()).toEqual(before);
       expect(reload).not.toHaveBeenCalled();
+    });
+  }
+
+  for (const [refusal, headers] of [
+    ["not-permitted", {}],
+    ["insufficient-scope", SCOPE_CHALLENGE],
+  ] as const) {
+    it(`offers a Sign out at the proxy alone when the body of a 403 read as ${refusal} never arrives`, async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const navigate = vi.fn();
+      try {
+        // The headers, then nothing.
+        serve({ "/v1/whoami": () => forbidden(new ReadableStream<Uint8Array>(), headers) });
+        render(<App reload={vi.fn()} navigate={navigate} />);
+        await act(() => vi.advanceTimersByTimeAsync(REFUSAL_BODY_MS));
+      } finally {
+        vi.useRealTimers();
+      }
+
+      expect(await screen.findByText(NOTICE[refusal])).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+
+      expect(navigate).toHaveBeenCalledWith(PROXY_ONLY);
     });
   }
 

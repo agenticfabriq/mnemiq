@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { fetchScope, fetchWhoami, NOTICE, Refused, streamChat, type Refusal } from "./transport";
+import { fetchScope, fetchWhoami, NOTICE, REFUSAL_BODY_MS, Refused, streamChat, type Refusal } from "./transport";
 import type { HistoryTurn } from "./types";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -298,7 +298,67 @@ describe("fetchWhoami's 403", () => {
         expect([what, refused.endSession]).toEqual([what, null]);
       }
     });
+
+    it(`stops waiting for a 403 body that never arrives, cancelling it, and still reads it as ${refusal}`, async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        let cancelled = false;
+        // The headers, then nothing: a body that stalls, from a source that never finishes cancelling.
+        const stalled = new ReadableStream<Uint8Array>({
+          cancel() {
+            cancelled = true;
+            return new Promise<void>(() => {});
+          },
+        });
+        stubFetch(forbidden(stalled, headers));
+        let refused: Refused | undefined;
+        const settling = refusedBy(fetchWhoami()).then((r) => {
+          refused = r;
+        });
+
+        await vi.advanceTimersByTimeAsync(REFUSAL_BODY_MS);
+
+        expect(refused?.refusal).toBe(refusal);
+        expect(refused?.endSession).toBeNull();
+        expect(cancelled).toBe(true);
+        await settling;
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   }
+
+  it("still reads the URL from a 403 body that arrives in parts inside the deadline", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const text = JSON.stringify({ detail: "Forbidden", end_session_url: END });
+      const half = Math.floor(text.length / 2);
+      const encode = new TextEncoder();
+      const slow = new ReadableStream<Uint8Array>({
+        start(controller) {
+          setTimeout(() => controller.enqueue(encode.encode(text.slice(0, half))), 100);
+          setTimeout(() => {
+            controller.enqueue(encode.encode(text.slice(half)));
+            controller.close();
+          }, REFUSAL_BODY_MS - 100);
+        },
+      });
+      stubFetch(forbidden(slow, {}));
+      let refused: Refused | undefined;
+      const settling = refusedBy(fetchWhoami()).then((r) => {
+        refused = r;
+      });
+
+      await vi.advanceTimersByTimeAsync(REFUSAL_BODY_MS - 100);
+
+      expect(refused?.endSession).toBe(END);
+      await settling;
+      // The deadline is cleared once the body is in, so nothing is left to fire.
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it("names no end-session URL on any refusal but a 403, even one whose body names it", async () => {
     const naming = JSON.stringify({ detail: "x", end_session_url: END });

@@ -70,14 +70,53 @@ async function v1(path: string, init: RequestInit = {}): Promise<Response> {
 }
 
 /**
+ * How long a 403's body may take to arrive. The refusal is known from the status alone and the page shows
+ * nothing until it is reported, while the body, a few dozen bytes the engine sends with the headers, only
+ * says where Sign out ends: one still missing after this has stalled, and Sign out is left to the proxy.
+ */
+export const REFUSAL_BODY_MS = 2_000;
+
+/** A response's body as text, or null when it fails or is not all in within `ms`, its read then cancelled. */
+async function textWithin(response: Response, ms: number): Promise<string | null> {
+  if (response.body === null) return null;
+  const reader = response.body.getReader();
+  const read = (async () => {
+    const decoder = new TextDecoder();
+    let text = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return text + decoder.decode();
+      text += decoder.decode(value, { stream: true });
+    }
+  })();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+  });
+  try {
+    const text = await Promise.race([read, late]);
+    // Cancelling ends the pending read, which then settles. Not awaited: a source that is slow to
+    // cancel must not hold the refusal either.
+    if (text === null) reader.cancel().catch(() => {});
+    return text;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * The end-session URL a 403's body names beside its detail, `{"detail": ..., "end_session_url": ...}`,
- * read as whoami's 200 reads it. A body that cannot be read, or names none, reads as none: the 403 is
- * the answer either way, and reading its body never turns it into another refusal.
+ * read as whoami's 200 reads it. A body that cannot be read in time, or names none, reads as none: the
+ * 403 is the answer either way, and reading its body never turns it into another refusal.
  */
 async function endSessionOfRefusal(response: Response): Promise<string | null> {
+  const text = await textWithin(response, REFUSAL_BODY_MS);
+  if (text === null) return null;
   let body: { end_session_url?: unknown } | null;
   try {
-    body = (await response.json()) as typeof body;
+    body = JSON.parse(text) as typeof body;
   } catch {
     return null;
   }
