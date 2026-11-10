@@ -109,8 +109,11 @@ The [proxy's config](../examples/open-webui/oauth2-proxy.yaml) holds the setting
 - **The flush interval** lets the workbench's answer stream render as it arrives.
 - **`backendLogoutURL`** ends the provider's session on Sign out, while the proxy can load the session.
 
-**A refresh that fails** (the provider briefly unreachable at the moment a session is due one) ends that session, and
-the user signs in again. It fails closed: nobody is let in, at the cost of a sign-in.
+**A refresh that fails because the provider is unreachable** does not end the session at once: the proxy keeps it and
+tries again on the next request. Once the token it holds expires, the proxy stops serving the session and sends the
+browser to the provider, so nobody is let in past the token's lifetime. When the provider is back, the user signs in
+there, without a password if the provider's own session is still alive. A refresh the provider refuses with
+`invalid_grant` or `invalid_client`, a revoked session for example, ends the proxy's session at once.
 
 ## Sign out
 
