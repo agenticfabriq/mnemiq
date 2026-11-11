@@ -160,15 +160,18 @@ To answer from your own database instead:
    as the example passes its other secrets: `MNEMIQ_ORACLE_USER` and `MNEMIQ_ORACLE_PASSWORD` for Oracle, whose
    driver the image includes. [Deploying mnemiq against Oracle](oracle-deployment.md) says what the engine enforces on
    its own and what only the database can.
-3. **Point mnemiq at it** in the compose file's `x-mnemiq-env`: `MNEMIQ_SOURCES_PATH` to the manifest, and
+3. **Grant your tables to the roles.** The example's `authz.json` grants each realm role a few of the demo's tables,
+   so until it names yours, no one can read them. List each role's tables as the source stores the names (an Oracle
+   table created unquoted is upper case), as [Access policy](access-policy.md) describes.
+4. **Point mnemiq at it** in the compose file's `x-mnemiq-env`: `MNEMIQ_SOURCES_PATH` to the manifest, and
    `MNEMIQ_STORE_PATH` to a file under `/app/demo`, the `demo` volume, which the image's own user can write. If you
    have business definitions, set `MNEMIQ_ONTOLOGY_RECORDS_PATH` to them here as well: `mnemiq enrich` reads them.
-4. **Enrich and index once,** with the model mnemiq will answer with: delete `python scripts/seed_demo.py && ` from
-   the `init` service's command, and the first start runs `mnemiq enrich` and `mnemiq build` on your database.
-   Enrichment asks the model about every table it describes, so a wide schema takes a while. To build again after
-   you change the definitions or the tables, stop `mnemiq` so that only one process has the store open, then run
-   `docker compose -f examples/open-webui/compose.yaml run --rm --no-deps mnemiq sh -c "mnemiq enrich && mnemiq build"`
-   and start `mnemiq` again.
+5. **Enrich and index,** with the model mnemiq will answer with. On a new `demo` volume, the `init` service does it
+   on the first start; delete `python scripts/seed_demo.py && ` from its command so that it does not seed the demo
+   too. It skips a volume it has already initialized, so after the demo has run, and after any change to the
+   definitions or the tables, stop `mnemiq` (only one process should have the store open), run
+   `docker compose -f examples/open-webui/compose.yaml run --rm --no-deps mnemiq sh -c "mnemiq enrich && mnemiq build"`,
+   and start `mnemiq` again. Enrichment asks the model about every table it describes, so a wide schema takes a while.
 
 At start-up mnemiq says whether the largest prompt your tables can produce fits the model's window. Read that line
 before inviting anyone: "fits only by withholding column descriptions" means a question that brings in the widest
