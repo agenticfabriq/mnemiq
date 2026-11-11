@@ -147,6 +147,33 @@ All of that is for local development only, and so are the proxy's `--cookie-secu
 A deployment serves its provider over https under its own name, drops `--cookie-secure=false` so the proxy's cookie is
 `Secure`, and runs Keycloak with `start`. mnemiq's check allows http only for loopback and `.localhost` names.
 
+## Your own database
+
+The example answers from a small demo database, which its `init` service seeds, enriches and indexes on first start.
+To answer from your own database instead:
+
+1. **Describe the source.** Write a source manifest naming the database, the schema and the tables mnemiq may read,
+   as in [Sources](../README.md#sources), and mount it into the `init` and `mnemiq` services. From inside a container,
+   a database on the machine that runs Docker is `host.docker.internal`; on Linux, also give both services
+   `extra_hosts: ["host.docker.internal:host-gateway"]`.
+2. **Give mnemiq a user that can only read,** and pass its name and password to both services through an `env_file`,
+   as the example passes its other secrets: `MNEMIQ_ORACLE_USER` and `MNEMIQ_ORACLE_PASSWORD` for Oracle, whose
+   driver the image includes. [Deploying mnemiq against Oracle](oracle-deployment.md) says what the engine enforces on
+   its own and what only the database can.
+3. **Point mnemiq at it** in the compose file's `x-mnemiq-env`: `MNEMIQ_SOURCES_PATH` to the manifest, and
+   `MNEMIQ_STORE_PATH` to a file under `/app/demo`, the `demo` volume, which the image's own user can write. If you
+   have business definitions, set `MNEMIQ_ONTOLOGY_RECORDS_PATH` to them here as well: `mnemiq enrich` reads them.
+4. **Enrich and index once,** with the model mnemiq will answer with: delete `python scripts/seed_demo.py && ` from
+   the `init` service's command, and the first start runs `mnemiq enrich` and `mnemiq build` on your database.
+   Enrichment asks the model about every table it describes, so a wide schema takes a while. To build again after
+   you change the definitions or the tables, stop `mnemiq` so that only one process has the store open, then run
+   `docker compose -f examples/open-webui/compose.yaml run --rm --no-deps mnemiq sh -c "mnemiq enrich && mnemiq build"`
+   and start `mnemiq` again.
+
+At start-up mnemiq says whether the largest prompt your tables can produce fits the model's window. Read that line
+before inviting anyone: "fits only by withholding column descriptions" means a question that brings in the widest
+tables is sent with fewer descriptions than enrichment wrote, and "TOO SMALL" means such a question can fail.
+
 ## What an answer looks like
 
 mnemiq replies in Markdown: the answer and a status line, the SQL in a fenced block, up to 20 rows as a table

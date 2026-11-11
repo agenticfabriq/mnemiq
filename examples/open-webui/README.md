@@ -17,7 +17,8 @@ Run `users` straight after `up`. The first account to sign up to an Open WebUI i
 creates that account. Until it runs, anything that reaches the port could take it, which here means this machine only.
 
 Then open Open WebUI at <http://localhost:13000> and the workbench at <http://localhost:14180>, and sign in with a
-user from `examples/open-webui/.secrets/users.txt`. Everything listens on 127.0.0.1 only. This is a local demo: a
+user from `examples/open-webui/.secrets/users.txt`. To answer from your own database instead of the demo's, see
+[Your own database](../../docs/open-webui.md#your-own-database). Everything listens on 127.0.0.1 only. This is a local demo: a
 deployment serves Keycloak over https, keeps its secrets in its own store, and fronts mnemiq with its own network
 policy.
 

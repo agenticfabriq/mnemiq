@@ -16,12 +16,14 @@ COPY --from=ghcr.io/astral-sh/uv:0.13.7 /uv /usr/local/bin/uv
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
 COPY pyproject.toml uv.lock LICENSE ./
-RUN uv sync --frozen --no-dev --extra server --no-install-project
+# `oracle` too, so the image can read an Oracle source: without it a deployment pointed at Oracle has no driver.
+# It is python-oracledb in thin mode, a wheel that needs no Oracle client libraries.
+RUN uv sync --frozen --no-dev --extra server --extra oracle --no-install-project
 COPY src/ src/
 COPY scripts/seed_demo.py scripts/seed_demo.py
 COPY --from=workbench /build/src/mnemiq/server/static src/mnemiq/server/static
 # The user needs a home: DuckDB installs its extensions under ~/.duckdb.
-RUN uv sync --frozen --no-dev --extra server \
+RUN uv sync --frozen --no-dev --extra server --extra oracle \
  && useradd --uid 10001 --create-home --shell /usr/sbin/nologin mnemiq \
  && mkdir -p /app/demo && chown mnemiq /app/demo
 USER mnemiq
