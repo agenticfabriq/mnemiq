@@ -1,0 +1,40 @@
+default = "qwen2.5-coder-32b-instruct-awq"
+
+[profiles."qwen2.5-coder-32b-instruct-awq"]
+description = "qwen2.5-coder-32b-instruct-awq: settings found safe over the engine's defaults on BIRD mini-dev (SQLite), 444 of its 500 questions; the evidence is in qwen2.5-coder-32b-instruct-awq.evidence.json"
+answer_markdown = false
+assertive_sql = false
+card_style = "cards"
+guard_undefined_terms = false
+guided_sql = false
+llm_prompt_cut_check = true
+llm_window_check = true
+prompt_layout = "question_first"
+retrieval_k = 24
+verify_grounding = false
+verify_sanity = true
+verify_threshold = 0.5
+writer_reasoning = "none"
+writer_rules = "full"
+writer_temperature = 0.0
+
+[profiles."qwen2.5-coder-32b-instruct-awq".instant]
+card_style = "bare"
+candidates = 1
+corrector = false
+judge = false
+budget_s = 30.0
+max_attempts = 1
+verify = "sanity"
+plan_attempts = 3
+prose = true
+
+[profiles."qwen2.5-coder-32b-instruct-awq".thinking]
+candidates = 1
+corrector = true
+judge = false
+budget_s = 120.0
+max_attempts = 3
+verify = "full"
+plan_attempts = 3
+prose = true

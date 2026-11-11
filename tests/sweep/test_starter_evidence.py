@@ -265,6 +265,6 @@ def test_the_mode_alias_is_the_engines_modes():
 
 
 def test_every_shipped_starter_has_valid_evidence():
-    # vacuous until the engine ships its first starter
+    assert starter_names(), "the engine ships at least one starter"
     for name in starter_names():
         assert read_evidence(name).starter == name
