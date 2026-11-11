@@ -19,6 +19,7 @@ from mnemiq.agent.modes import modes_for
 from mnemiq.config import ModeSettings, Settings
 from mnemiq.profiles import (ProfileFileError, _read, _starter_entry, flattened_entry, load_profiles, profile_sources,
                              profile_starter, profile_version, starter_names, starter_path, starters_folder)
+from mnemiq.sweep.starters import fewer_right, read_evidence
 from tests.starter_fixtures import (ROOT_AND_CHILD, STARTER, STARTER_HEAD, STARTER_INSTANT, shipped_starters_untouched,
                                     starter_folder, write)
 
@@ -205,7 +206,7 @@ def test_a_starter_bound_to_its_evidence_loads(tmp_path, monkeypatch):
 
 
 def test_every_shipped_starter_is_one_profile_named_for_its_file():
-    # vacuous by design until the engine ships its first starter
+    assert starter_names(), "the engine ships at least one starter"
     for name in starter_names():                 # a loop, not a parametrization, which would skip without a word
         read = _read(starter_path(name))
         assert read.default == name and list(read.profiles) == [name]
@@ -225,3 +226,20 @@ def test_the_guard_on_the_shipped_folder_catches_a_write():
         with shipped_starters_untouched():
             probe.write_text("default = 'x'\n")
     assert not probe.exists()
+
+
+def test_the_qwen_starter_ships():
+    # published from a check alone, read worst against worst, on a question set where every question has an answer
+    assert "qwen2.5-coder-32b-instruct-awq" in starter_names()
+    evidence = read_evidence("qwen2.5-coder-32b-instruct-awq")
+    assert evidence.safe_by == "check" and evidence.search is None
+    assert (evidence.rule.strategy, evidence.rule.harm) == ("check", "worst")
+    assert (evidence.rule.max_more_wrong, evidence.rule.max_more_made_up) == (0, 0)
+    assert evidence.made_up_measured is False
+    assert sorted(evidence.check) == ["instant", "thinking"] and "deep" in evidence.unmeasured_modes
+    assert evidence.rule.repeats == 2 and all(len(runs) == 2 for runs in evidence.check.values())
+    for runs in evidence.check.values():         # the reading the evidence records, on the counts it holds
+        assert max(r.start.wrong for r in runs) <= max(r.defaults.wrong for r in runs)
+        assert max(r.start.made_up for r in runs) <= max(r.defaults.made_up for r in runs)
+    assert fewer_right({m: [r.start.right for r in runs] for m, runs in evidence.check.items()},
+                       {m: [r.defaults.right for r in runs] for m, runs in evidence.check.items()}) == []

@@ -217,4 +217,12 @@ engine".
 
 ## Shipped starters
 
-None yet.
+| Starter | Build | Modes measured | Evidence |
+|---|---|---|---|
+| `qwen2.5-coder-32b-instruct-awq` | Qwen2.5-Coder-32B-Instruct, AWQ, served by vLLM 0.9.0.1 with a 28,672-token window on one GeForce RTX 4090 | instant, thinking | [evidence](../src/mnemiq/starter_profiles/qwen2.5-coder-32b-instruct-awq.evidence.json) |
+
+`qwen2.5-coder-32b-instruct-awq` was found safe by check mode alone (`safe_by: check`, no search in its evidence), read
+worst against worst (`harm: worst`), with two runs of each arm, on BIRD mini-dev (SQLite), 444 of its 500 questions.
+Its settings came from an earlier search on part of those questions, so the check measured it partly on questions it
+was tuned on. Made-up answers were not measured, since every question in that set has an answer. Deep was not
+measured: there the engine's own deep settings apply, under the starter's `writer_temperature` of 0.

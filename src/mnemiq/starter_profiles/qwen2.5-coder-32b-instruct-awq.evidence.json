@@ -1,0 +1,235 @@
+{
+  "starter": "qwen2.5-coder-32b-instruct-awq",
+  "starter_sha256": "b26dd2ba7e07b717e491443a0fd539316f6986d0767f3f0d5dbb0a8174fa9ba2",
+  "published": "2026-11-11",
+  "dataset": {
+    "name": "BIRD mini-dev (SQLite), 444 of its 500 questions",
+    "questions": 444,
+    "answerable": 444
+  },
+  "made_up_measured": false,
+  "model_build": {
+    "model": "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ",
+    "quantization": "awq",
+    "server": "vllm",
+    "server_version": "0.9.0.1",
+    "gpu": "GeForce RTX 4090",
+    "context_window": 28672
+  },
+  "engine_build": {
+    "version": "0.1.0.dev0",
+    "commit": "c4c71deeb35c356e296af2c64f46addf0101e0e9",
+    "source_sha": "5f86bc46600c8d51e39f841d2d04201fabad12068c122194787f43f4979d7188"
+  },
+  "safe_by": "check",
+  "rule": {
+    "strategy": "check",
+    "alpha": 0.05,
+    "max_more_wrong": 0,
+    "max_more_made_up": 0,
+    "harm": "worst",
+    "max_errors": 5,
+    "repeats": 2
+  },
+  "modes_measured": [
+    "instant",
+    "thinking"
+  ],
+  "unmeasured_modes": {
+    "deep": [
+      "writer_temperature"
+    ]
+  },
+  "held_unset": [
+    "guard_fanout",
+    "llm_seed"
+  ],
+  "check": {
+    "instant": [
+      {
+        "run": 1,
+        "start": {
+          "valid": true,
+          "cases": 444,
+          "right": 212,
+          "strict": 200,
+          "wrong": 121,
+          "made_up": 0,
+          "declined": 110,
+          "failed": 1,
+          "errors": 0,
+          "ungraded": 0,
+          "unjudged": 0,
+          "median_ms": 4172.315721982159,
+          "median_rows_ms": 2956.8306869999788,
+          "prompt_tokens": 1399.5135135135135
+        },
+        "defaults": {
+          "valid": true,
+          "cases": 444,
+          "right": 208,
+          "strict": 195,
+          "wrong": 112,
+          "made_up": 0,
+          "declined": 121,
+          "failed": 3,
+          "errors": 0,
+          "ungraded": 0,
+          "unjudged": 0,
+          "median_ms": 4409.626451500117,
+          "median_rows_ms": 3288.559558000088,
+          "prompt_tokens": 3278.7004504504503
+        }
+      },
+      {
+        "run": 2,
+        "start": {
+          "valid": true,
+          "cases": 444,
+          "right": 212,
+          "strict": 200,
+          "wrong": 124,
+          "made_up": 0,
+          "declined": 107,
+          "failed": 1,
+          "errors": 0,
+          "ungraded": 0,
+          "unjudged": 0,
+          "median_ms": 3737.984179499108,
+          "median_rows_ms": 2666.840443000183,
+          "prompt_tokens": 1399.0608108108108
+        },
+        "defaults": {
+          "valid": true,
+          "cases": 444,
+          "right": 201,
+          "strict": 191,
+          "wrong": 129,
+          "made_up": 0,
+          "declined": 112,
+          "failed": 2,
+          "errors": 0,
+          "ungraded": 0,
+          "unjudged": 0,
+          "median_ms": 4429.005313000744,
+          "median_rows_ms": 3253.9495070004705,
+          "prompt_tokens": 3286.2027027027025
+        }
+      }
+    ],
+    "thinking": [
+      {
+        "run": 1,
+        "start": {
+          "valid": true,
+          "cases": 444,
+          "right": 189,
+          "strict": 178,
+          "wrong": 97,
+          "made_up": 0,
+          "declined": 156,
+          "failed": 2,
+          "errors": 0,
+          "ungraded": 0,
+          "unjudged": 0,
+          "median_ms": 5701.687630500146,
+          "median_rows_ms": 4680.244238499995,
+          "prompt_tokens": 5058.948198198198
+        },
+        "defaults": {
+          "valid": true,
+          "cases": 444,
+          "right": 188,
+          "strict": 177,
+          "wrong": 106,
+          "made_up": 0,
+          "declined": 149,
+          "failed": 1,
+          "errors": 0,
+          "ungraded": 0,
+          "unjudged": 0,
+          "median_ms": 5510.832154000582,
+          "median_rows_ms": 4591.612735999661,
+          "prompt_tokens": 4940.108108108108
+        }
+      },
+      {
+        "run": 2,
+        "start": {
+          "valid": true,
+          "cases": 444,
+          "right": 189,
+          "strict": 178,
+          "wrong": 98,
+          "made_up": 0,
+          "declined": 155,
+          "failed": 2,
+          "errors": 0,
+          "ungraded": 0,
+          "unjudged": 0,
+          "median_ms": 5543.2817165001325,
+          "median_rows_ms": 4577.514202999737,
+          "prompt_tokens": 5064.344594594595
+        },
+        "defaults": {
+          "valid": true,
+          "cases": 444,
+          "right": 196,
+          "strict": 185,
+          "wrong": 95,
+          "made_up": 0,
+          "declined": 152,
+          "failed": 1,
+          "errors": 0,
+          "ungraded": 0,
+          "unjudged": 0,
+          "median_ms": 5561.429834000592,
+          "median_rows_ms": 4607.903903000988,
+          "prompt_tokens": 5065.792792792793
+        }
+      }
+    ]
+  },
+  "search": null,
+  "versions": {
+    "deployment-1": "8ce92811685b",
+    "deployment-2": "8ce92811685b",
+    "deployment-3": "8ce92811685b",
+    "deployment-4": "8ce92811685b",
+    "deployment-5": "8ce92811685b",
+    "deployment-6": "8ce92811685b",
+    "deployment-7": "8ce92811685b",
+    "deployment-8": "8ce92811685b",
+    "deployment-9": "8ce92811685b",
+    "deployment-10": "8ce92811685b",
+    "deployment-11": "8ce92811685b"
+  },
+  "measured_versions": {
+    "instant": {
+      "deployment-1": "8ce92811685b",
+      "deployment-2": "8ce92811685b",
+      "deployment-3": "8ce92811685b",
+      "deployment-4": "8ce92811685b",
+      "deployment-5": "8ce92811685b",
+      "deployment-6": "8ce92811685b",
+      "deployment-7": "8ce92811685b",
+      "deployment-8": "8ce92811685b",
+      "deployment-9": "8ce92811685b",
+      "deployment-10": "8ce92811685b",
+      "deployment-11": "8ce92811685b"
+    },
+    "thinking": {
+      "deployment-1": "6e18e36edbe0",
+      "deployment-2": "6e18e36edbe0",
+      "deployment-3": "6e18e36edbe0",
+      "deployment-4": "6e18e36edbe0",
+      "deployment-5": "6e18e36edbe0",
+      "deployment-6": "6e18e36edbe0",
+      "deployment-7": "6e18e36edbe0",
+      "deployment-8": "6e18e36edbe0",
+      "deployment-9": "6e18e36edbe0",
+      "deployment-10": "6e18e36edbe0",
+      "deployment-11": "6e18e36edbe0"
+    }
+  }
+}
