@@ -36,6 +36,8 @@ _UNKNOWN_USER = "not found in Superset database"
 # Superset's tool search (`MCP_TOOL_SEARCH_CONFIG` in `superset/mcp_service/mcp_config.py`, on by default), which
 # replaces the tool catalogue a client lists with a search tool and a call proxy.
 _UNKNOWN_TOOL = re.compile(r"unknown tool", re.IGNORECASE)
+# How long a call waits for Superset when neither the client nor the call says otherwise.
+_DEFAULT_TIMEOUT_S = 45.0
 
 
 @dataclass(frozen=True, repr=False)
@@ -94,9 +96,10 @@ class SupersetToolError(_SupersetFailure):
 
 
 class SupersetMcp:
-    """Calls Superset's MCP tools at `url`, carrying `credential` and nothing else, each call within `timeout_s`."""
+    """Calls Superset's MCP tools at `url`, carrying `credential` and nothing else, each call within `timeout_s`
+    unless the call names a deadline of its own."""
 
-    def __init__(self, url: str, credential: Bearer, *, timeout_s: float = 45.0) -> None:
+    def __init__(self, url: str, credential: Bearer, *, timeout_s: float = _DEFAULT_TIMEOUT_S) -> None:
         if not isinstance(credential, Bearer):
             raise TypeError("SupersetMcp carries a Bearer, never a bare string")
         self._url = url
@@ -108,12 +111,16 @@ class SupersetMcp:
     def credential(self) -> Bearer:
         return self._credential
 
-    def call(self, tool: str, request: dict) -> dict:
+    def call(self, tool: str, request: dict, *, timeout_s: float | None = None) -> dict:
         """Call `tool` with the arguments `{"request": request}`, as Superset's tools take them, and return its
-        payload: the structured content when Superset sends it, else the first text content read as a JSON object."""
+        payload: the structured content when Superset sends it, else the first text content read as a JSON object.
+
+        `timeout_s` is this call's own deadline, in place of the client's: a caller that gives Superset a time limit
+        of its own waits longer than that limit, so Superset's answer that the statement ran out of time arrives
+        before the transport gives up on it."""
         import anyio
 
-        exchange = _Exchange()
+        exchange = _Exchange(deadline_s=self._timeout_s if timeout_s is None else timeout_s)
         result = anyio.run(self._exchange, tool, request, exchange)
         if exchange.error is not None:
             raise self._failure(tool, exchange) from exchange.error
@@ -128,8 +135,8 @@ class SupersetMcp:
 
         http_client = self._http_client(exchange)
         # One deadline over the whole call (connecting, the handshake and the tool call), so a slow Superset costs
-        # at most `timeout_s` whichever step it is slow in.
-        deadline = anyio.move_on_after(self._timeout_s)
+        # at most the call's deadline whichever step it is slow in.
+        deadline = anyio.move_on_after(exchange.deadline_s)
         # Cancelled when the transport reports an answer it could not read (a proxy's page, say): mcp 1.x hands that
         # to the session's message handler and leaves the call waiting for a result that will never come.
         abandon = anyio.CancelScope()
@@ -152,7 +159,7 @@ class SupersetMcp:
         finally:
             exchange.timed_out = deadline.cancel_called
         if exchange.error is None:
-            exchange.error = TimeoutError(f"no answer within {self._timeout_s:g} seconds")
+            exchange.error = TimeoutError(f"no answer within {exchange.deadline_s:g} seconds")
         return None
 
     def _http_client(self, exchange: _Exchange):
@@ -188,7 +195,7 @@ class SupersetMcp:
         if status is not None and not 200 <= status < 300:
             return SupersetUnavailable(f"Superset's MCP service answered HTTP {status}", detail=detail)
         if exchange.timed_out:
-            return SupersetUnavailable(f"Superset's MCP service did not answer {tool} within {self._timeout_s:g} "
+            return SupersetUnavailable(f"Superset's MCP service did not answer {tool} within {exchange.deadline_s:g} "
                                        "seconds", detail=detail)
         if exchange.statuses:  # it answered something: an unreadable answer, or a connection lost mid-call
             return SupersetUnavailable(f"Superset's MCP service gave no usable answer to {tool}", detail=detail)
@@ -197,9 +204,10 @@ class SupersetMcp:
 
 @dataclass
 class _Exchange:
-    """What one call observed beside its result: each HTTP response's status in order, whether time ran out, and
-    the exception that ended it, if one did."""
+    """One call's deadline, and what the call observed beside its result: each HTTP response's status in order,
+    whether time ran out, and the exception that ended it, if one did."""
 
+    deadline_s: float = _DEFAULT_TIMEOUT_S
     statuses: list[int] = field(default_factory=list)
     timed_out: bool = False
     error: Exception | None = None

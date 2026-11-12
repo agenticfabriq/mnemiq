@@ -257,6 +257,30 @@ def test_slow_server_is_unavailable_within_the_timeout(fake):
     _holds_no_credential(caught.value)
 
 
+def test_a_call_can_wait_longer_than_the_client_deadline(fake):
+    """A call's own deadline replaces the client's, so a statement given more time than the client's default (an
+    enrichment query, say) is not cut off by it."""
+    def slow(request, authorization):
+        time.sleep(2)
+        return PAYLOAD
+
+    fake.reply("execute_sql", slow)
+    assert _client(fake.url, timeout_s=1).call("execute_sql", REQUEST, timeout_s=30) == PAYLOAD
+
+
+def test_a_call_can_set_a_shorter_deadline(fake):
+    def slow(request, authorization):
+        time.sleep(3)
+        return PAYLOAD
+
+    fake.reply("execute_sql", slow)
+    started = time.monotonic()
+    with pytest.raises(SupersetUnavailable) as caught:
+        _client(fake.url, timeout_s=30).call("execute_sql", REQUEST, timeout_s=1)
+    assert time.monotonic() - started < 2.5
+    assert str(caught.value) == "Superset's MCP service did not answer execute_sql within 1 seconds"
+
+
 def test_a_call_from_inside_an_event_loop_is_not_read_as_an_outage(fake):
     """The client blocks, so it is called from a thread with no event loop; one called from a coroutine is a mistake
     in mnemiq, and raises as itself rather than as Superset being unavailable."""
