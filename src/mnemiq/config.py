@@ -210,6 +210,8 @@ class ModeSettings(BaseModel):
     verify: Literal["off", "sanity", "full"] | None = None
     plan_attempts: int | None = Field(default=None, ge=1)
     prose: bool | None = None
+    empty_retries: int | None = Field(default=None, ge=0)
+    retry_answered_empties: bool | None = None
 
     @model_validator(mode="after")
     def _null_only_where_it_means_something(self):

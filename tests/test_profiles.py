@@ -270,3 +270,27 @@ def test_local_only_passes_a_file_that_stays_local(tmp_path, monkeypatch):
     body = 'llm_base_url = "http://10.0.0.5:8000/v1"\napi_key_env = "TEST_CHAT_KEY"'
     profiles, _ = _load(tmp_path, _other(body), local_only=True)
     assert "other" in profiles
+
+
+def test_a_profile_tries_an_empty_result_again_in_the_mode_it_names(tmp_path, monkeypatch):
+    profiles, _ = _load(tmp_path, _one('[profiles.only.instant]\nempty_retries = 1\nretry_answered_empties = true'))
+    modes = modes_for(profiles["only"].settings)
+    assert (modes["instant"].empty_retries, modes["instant"].retry_answered_empties) == (1, True)
+    assert modes["thinking"] == MODES["thinking"]
+
+
+@pytest.mark.parametrize("sections, refused", [
+    ({"deep": {"empty_retries": 1}}, "empty_retries"),
+    ({"instant": {"retry_answered_empties": True}}, "retry_answered_empties"),
+    ({"thinking": {"empty_retries": 0, "retry_answered_empties": True}}, "retry_answered_empties"),
+])
+def test_an_empty_retry_setting_no_answer_would_read_is_refused(sections, refused):
+    """Deep's candidates never read a retry, and the answered empties have none to spend without
+    `empty_retries`: an arm setting either would score as "no effect"."""
+    with pytest.raises(ValueError, match=refused):
+        modes_for(Settings(mode_settings=sections))
+
+
+def test_a_negative_empty_retry_count_is_refused():
+    with pytest.raises(ValueError):
+        Settings(mode_settings={"instant": {"empty_retries": -1}})

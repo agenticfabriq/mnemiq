@@ -583,3 +583,123 @@ def test_runtime_ask_declines_a_row_filtered_empty_result_naming_the_value(sourc
     assert payload["deferred"] is True and payload["reason_code"] == "verification"
     assert payload["answer"].startswith("No rows matched, and 'south' could not be checked")
     assert "north" not in payload["answer"]
+
+
+# --- an empty result tried again: `empty_retries` and `retry_answered_empties` ----------------------
+#
+# A per-mode setting, 0 in every mode: an empty result buys up to that many more writer calls, the
+# writer told the result was empty and why the sanity layer would decline it. Only the empty
+# results the layer would decline are tried again, unless `retry_answered_empties` asks for every
+# one. A retry that produces nothing to answer with leaves the result before it standing.
+
+# A value the column holds, so this returns rows: the misspelled query's repair.
+FOUND_SQL = "SELECT id, amount FROM claim WHERE adjuster = 'agent_0042'"
+# Another misspelling, a different statement, so the cache does not answer it.
+MISSPELLED_AGAIN_SQL = "SELECT id, amount FROM claim WHERE adjuster = 'agnt_0042'"
+
+
+def _retrying(adapter, values, replies, mode="instant", judge=None, **settings):
+    from dataclasses import replace
+
+    verifiers, _ = _build_mode_verifiers(Settings(), client=judge or _CountingJudgeClient())
+    generator = FakeGenerator([json.dumps({"sql": sql}) for sql in replies])
+    agent = build_agent(replace(MODES[mode], **settings), generator=generator,
+                        synthesizer=FakeSynthesizer("SYNTHESIZED"), adapter=adapter,
+                        cache=TwoTierCache(L1Cache()), corrector=None, values=values, selector=None,
+                        verifier=verifiers[mode])
+    return agent, generator
+
+
+def _ask(agent, snap, question="List the claims handled by adjuster agent_0042."):
+    return agent.answer(_packet(question), snap, _GRANTS, _IDENTITY)
+
+
+def test_no_mode_tries_an_empty_result_again_unless_a_profile_says_so(source):
+    adapter, snap, values = source
+    assert {(m.empty_retries, m.retry_answered_empties) for m in MODES.values()} == {(0, False)}
+    agent, generator = _retrying(adapter, values, [MISSPELLED_SQL, FOUND_SQL])
+    ans = _ask(agent, snap)
+    assert ans.deferred is True and ans.answer.startswith(MISSPELLED_DECLINE), ans.answer
+    assert generator.calls == [None]
+
+
+def test_a_declined_empty_result_is_tried_again_told_why_and_the_rows_answer(source):
+    adapter, snap, values = source
+    agent, generator = _retrying(adapter, values, [MISSPELLED_SQL, FOUND_SQL], empty_retries=1)
+    ans = _ask(agent, snap)
+    assert ans.deferred is False and ans.failed is False, ans.answer
+    assert ans.preview is not None and ans.preview.row_count > 0
+    assert ans.attempts == 2
+    first, retry = generator.calls
+    assert first is None
+    assert "returned no rows" in retry and MISSPELLED_DECLINE in retry, retry
+
+
+def test_an_answered_empty_result_is_tried_again_only_when_asked(source):
+    adapter, snap, values = source
+    question = "Which open claims are over 1,000,000?"
+    agent, generator = _retrying(adapter, values, [NONE_SQL, NONE_SQL], empty_retries=1)
+    ans = _ask(agent, snap, question)
+    assert ans.deferred is False and NONE_NOTE in ans.answer, ans.answer
+    assert generator.calls == [None]
+    # Asked, the writer is told every value was found; writing the same query again keeps the
+    # answer it had, from the cache, with no second run.
+    agent, generator = _retrying(adapter, values, [NONE_SQL, NONE_SQL], empty_retries=1,
+                                 retry_answered_empties=True)
+    ans = _ask(agent, snap, question)
+    assert ans.deferred is False and NONE_NOTE in ans.answer, ans.answer
+    assert len(generator.calls) == 2 and "every value it filters on was found" in generator.calls[1]
+
+
+def test_a_retry_that_produces_nothing_leaves_the_result_before_it_standing(source):
+    adapter, snap, values = source
+    # The writer has nothing more to say: the decline stands, naming the value.
+    agent, generator = _retrying(adapter, values, [MISSPELLED_SQL], empty_retries=1)
+    ans = _ask(agent, snap)
+    assert ans.deferred is True and ans.verify_layer == "sanity", ans.answer
+    assert ans.answer.startswith(MISSPELLED_DECLINE) and len(generator.calls) == 2
+    # The database rejects the retry: the answered "none" stands.
+    agent, generator = _retrying(adapter, values, [NONE_SQL, "SELECT CAST(region AS INTEGER) AS r FROM claim"],
+                                 empty_retries=1, retry_answered_empties=True)
+    ans = _ask(agent, snap, "Which open claims are over 1,000,000?")
+    assert ans.deferred is False and ans.failed is False and NONE_NOTE in ans.answer, ans.answer
+    assert len(generator.calls) == 2
+
+
+def test_empty_retries_cap_the_writer_calls_an_empty_result_buys(source):
+    adapter, snap, values = source
+    agent, generator = _retrying(adapter, values, [MISSPELLED_SQL, MISSPELLED_AGAIN_SQL, FOUND_SQL],
+                                 empty_retries=1)
+    ans = _ask(agent, snap)
+    assert ans.deferred is True and "'agnt_0042' does not appear in claim.adjuster" in ans.answer, ans.answer
+    assert len(generator.calls) == 2
+    agent, generator = _retrying(adapter, values, [MISSPELLED_SQL, MISSPELLED_AGAIN_SQL, FOUND_SQL],
+                                 empty_retries=2)
+    ans = _ask(agent, snap)
+    assert ans.deferred is False and len(generator.calls) == 3 and ans.attempts == 3, ans.answer
+
+
+def test_in_thinking_an_empty_result_is_tried_again_before_the_judge_reads_it(source):
+    adapter, snap, values = source
+    judge = _CountingJudgeClient()
+    agent, generator = _retrying(adapter, values, [MISSPELLED_SQL, FOUND_SQL], mode="thinking",
+                                 judge=judge, empty_retries=1)
+    ans = _ask(agent, snap)
+    assert ans.deferred is False and ans.verify_layer == "judge", ans.answer
+    assert len(judge.calls) == 1 and "(0 rows)" not in judge.calls[0]
+    judge = _CountingJudgeClient()
+    agent, generator = _retrying(adapter, values, [NONE_SQL, FOUND_SQL], mode="thinking", judge=judge,
+                                 empty_retries=1, retry_answered_empties=True)
+    ans = _ask(agent, snap)
+    assert ans.deferred is False and len(judge.calls) == 1 and "(0 rows)" not in judge.calls[0]
+
+
+def test_a_database_error_before_any_empty_result_is_repaired_as_before(source):
+    """The two budgets are apart: `max_attempts` repairs what the database rejects, and an empty
+    retry is spent only on an empty result."""
+    adapter, snap, values = source
+    agent, generator = _retrying(adapter, values, ["SELECT CAST(region AS INTEGER) AS r FROM claim",
+                                                   MISSPELLED_SQL, FOUND_SQL],
+                                 mode="thinking", empty_retries=1)
+    ans = _ask(agent, snap)
+    assert ans.deferred is False and len(generator.calls) == 3 and ans.attempts == 3, ans.answer
