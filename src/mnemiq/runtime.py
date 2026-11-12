@@ -38,6 +38,7 @@ from mnemiq.store.control import resolve_version
 from mnemiq.store.snapshot_store import load_snapshot
 from mnemiq.superset.executor import NoSourceConnection, SupersetCredentialMissing, superset_executor
 from mnemiq.superset.grants import FixedGrants, resolve_grants
+from mnemiq.superset.history import superset_history
 from mnemiq.superset.settings import SUPERSET_DIALECT, SUPERSET_SOURCE_JOB
 from mnemiq.verify.judge import SemanticJudge
 from mnemiq.verify.verifier import Verifier
@@ -332,7 +333,12 @@ class Runtime:
                 grants=grants,
             )
         if superset:
-            packet.history = _superset_history(history, grants)
+            # No row the client sent back is kept. The newest turn with SQL is decided again under these grants, with
+            # the answering agent's own value index and fan-out setting, and run again through this request's adapter
+            # within the answer statement's time limit, so "it" in a follow-up names rows this person may read now.
+            packet.history = superset_history(history, grants=grants, snapshot=self.snapshot, adapter=adapter,
+                                              timeout_s=agent.timeout_s, values=agent.values,
+                                              guard_fanout=agent.guard_fanout)
         else:
             # Scoped against THIS identity's boundary, never the one that produced the turn.
             packet.history = scope_history(history, grants.fingerprint)
@@ -494,13 +500,6 @@ class Runtime:
 
 def _authz(settings: Settings) -> AuthzProvider:
     return FileAuthzProvider(settings.authz_path) if settings.authz_path else DenyAll()
-
-
-def _superset_history(history: list[HistoryTurn] | None, grants: GrantSet) -> list[HistoryTurn]:
-    """The earlier turns a Superset-mode request is reminded of: scoped as direct mode scopes them, with no rows. The
-    rows a client sends back with a turn may be another person's, or older than what this person may now read, so none
-    of them reach the prompt; a turn's question and SQL still do."""
-    return [turn.model_copy(update={"rows": []}) for turn in scope_history(history, grants.fingerprint)]
 
 
 def _superset_source_refusal(snapshot: Snapshot, settings: Settings) -> str | None:
