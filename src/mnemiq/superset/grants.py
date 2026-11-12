@@ -7,8 +7,11 @@ adapter carries, in two steps:
    prepares it, dry run or not (`security_manager.raise_for_access` with `force_dataset_match=True`, in
    `superset/mcp_service/sql_lab/tool/execute_sql.py`). A dry run Superset accepts therefore means the person may read
    every table it names, through access to the whole database or because each table is a dataset granted to them.
-2. When Superset refuses that, the tables of the physical datasets Superset lists for the person on the configured
-   database and schema, and nothing else.
+2. When Superset refuses that, the physical datasets Superset lists for the person on the configured database and
+   schema name candidate tables, and Superset confirms them the same way: a dry run naming the candidates, and, when
+   that is refused, one naming each alone. Only a table Superset confirms is granted: the listing only narrows what is
+   asked, and the dry run is the access check execution itself makes, so the grant is what a query on the table is
+   allowed.
 
 Superset has no column rules for SQL, so whatever the person may read they read raw: every level the snapshot
 classifies anything at is cleared. Superset's refusal text can name a table the person cannot see, so it is logged and
@@ -104,6 +107,11 @@ class _Dataset:
     sql: str | None
 
 
+class _Unreadable(Exception):
+    """The grants cannot be read: Superset did not answer, or answered with something mnemiq cannot read. Already
+    logged where it was found."""
+
+
 def resolve_grants(adapter: SupersetSqlAdapter, snapshot: Snapshot) -> GrantSet:
     """The snapshot tables the person whose token `adapter` carries may read, as Superset decides.
 
@@ -111,40 +119,65 @@ def resolve_grants(adapter: SupersetSqlAdapter, snapshot: Snapshot) -> GrantSet:
     its object id. Raises `NotABuilder` when the person's roles do not permit `execute_sql` or `list_datasets`, and
     `SupersetMisconfigured` when Superset's MCP service answers either with any other tool error; a credential Superset
     refuses (`SupersetRefusedCaller`) and a denial it does not explain (`SupersetDenied`) propagate. Returns
-    `UNAVAILABLE` when Superset does not answer, when the probe reaches its time limit or is cancelled, and when the
+    `UNAVAILABLE` when Superset does not answer, when any dry run reaches its time limit or is cancelled, and when the
     datasets cannot be read whole."""
     tables = _tables(snapshot)
     if not tables:
         return GrantSet(frozenset())
     clearance = classified_levels(snapshot)
     try:
-        adapter.dry_run(_probe(tables))
-    except SupersetAccessRefused:
-        # Superset's text, which can name a table, was logged where the payload was read.
-        logger.info("Superset refused the probe of %d tables; granting the datasets it lists for this user",
-                    len(tables))
-    except SupersetQueryFailed as exc:
-        # Says nothing about access to the whole database either way.
-        logger.warning("Superset could not check the probe of %d tables (%s); granting the datasets it lists for this "
-                       "user", len(tables), exc)
-    except (SupersetUnavailable, QueryTimedOut, QueryCancelled) as exc:
-        logger.warning("the probe of %d tables got no answer from Superset (%s: %s); granting nothing", len(tables),
-                       exc, getattr(exc, "detail", ""))
+        if _accepted(adapter, list(tables)):
+            return GrantSet(frozenset(object_id for ids in tables.values() for object_id in ids),
+                            pii_clearance=clearance)
+        datasets = _read_datasets(adapter)
+        candidates = _candidates(datasets, tables, adapter.database_id, adapter.schema)
+        confirmed = _confirmed(adapter, candidates)
+    except _Unreadable:
         return UNAVAILABLE
+    logger.info("granted %d of %d tables: those Superset confirmed of the %d its %d datasets for this user name",
+                len(confirmed), len(tables), len(candidates), len(datasets))
+    return GrantSet(frozenset(object_id for name in confirmed for object_id in tables[name]), pii_clearance=clearance)
+
+
+def _accepted(adapter: SupersetSqlAdapter, names: list[str]) -> bool:
+    """Whether Superset, asked as the person, accepts a dry run naming every table in `names`. A refusal, and a
+    statement Superset cannot check (which says nothing about access either way), are both a no, logged.
+
+    Raises `NotABuilder` for a role that does not permit `execute_sql`, `SupersetMisconfigured` for any other tool
+    error, and `_Unreadable` when Superset does not answer or the dry run reaches its time limit or is cancelled; a
+    refused credential and an unexplained denial propagate."""
+    try:
+        adapter.dry_run(_probe(names))
+    except SupersetAccessRefused as exc:
+        # Superset's text, which can name a table, was logged where the payload was read.
+        logger.info("Superset refused a dry run naming %d tables for this user: %s", len(names), exc)
+        return False
+    except SupersetQueryFailed as exc:
+        logger.warning("Superset could not check a dry run naming %d tables for this user: %s", len(names), exc)
+        return False
+    except (SupersetUnavailable, QueryTimedOut, QueryCancelled) as exc:
+        logger.warning("a dry run naming %d tables got no answer from Superset (%s %s); granting nothing", len(names),
+                       exc, getattr(exc, "detail", ""))
+        raise _Unreadable from exc
     except SupersetPermissionDenied as exc:
         raise _not_a_builder(exc) from exc
     except SupersetToolError as exc:
         raise _misconfigured(exc) from exc
-    else:
-        return GrantSet(frozenset(object_id for ids in tables.values() for object_id in ids),
-                        pii_clearance=clearance)
-    datasets = _read_datasets(adapter)
-    if datasets is None:
-        return UNAVAILABLE
-    granted = _granted(datasets, tables, adapter.database_id, adapter.schema)
-    logger.info("granted %d of %d tables through the %d datasets Superset lists for this user", len(granted),
-                len(tables), len(datasets))
-    return GrantSet(frozenset(granted), pii_clearance=clearance)
+    return True
+
+
+def _confirmed(adapter: SupersetSqlAdapter, candidates: list[str]) -> list[str]:
+    """The candidates Superset confirms the person may read: all of them when it accepts a dry run naming them all,
+    else each it accepts a dry run of alone. A single candidate refused is not asked about again."""
+    if not candidates or _accepted(adapter, candidates):
+        return candidates
+    confirmed = []
+    if len(candidates) > 1:  # a single candidate was just asked about alone
+        confirmed = [name for name in candidates if _accepted(adapter, [name])]
+    for name in candidates:
+        if name not in confirmed:
+            logger.info("Superset did not confirm %r for this user, so it is not granted", name)
+    return confirmed
 
 
 def _tables(snapshot: Snapshot) -> dict[str, set[str]]:
@@ -163,10 +196,10 @@ def _probe(names) -> str:
     return f"SELECT 1 FROM {tables} WHERE 1 = 0"
 
 
-def _read_datasets(adapter: SupersetSqlAdapter) -> list[_Dataset] | None:
-    """Every dataset Superset lists for the person in the configured schema, in id order; None when the list cannot be
-    read whole: Superset does not answer, one dataset alone is too large for its response size, or a page does not
-    read as one.
+def _read_datasets(adapter: SupersetSqlAdapter) -> list[_Dataset]:
+    """Every dataset Superset lists for the person in the configured schema, in id order. Raises `_Unreadable` when
+    the list cannot be read whole: Superset does not answer, one dataset alone is too large for its response size, or a
+    page does not read as one.
 
     Superset reads page `p` of size `s` as the `s` datasets after the first `(p - 1) * s`: `list_datasets` passes
     `page - 1` on, and `BaseDAO.list` (`superset/daos/base.py`) offsets by `page * page_size`. A page too large is
@@ -187,21 +220,21 @@ def _read_datasets(adapter: SupersetSqlAdapter) -> list[_Dataset] | None:
             cut = True
         except SupersetUnavailable as exc:
             logger.warning("list_datasets got no answer from Superset (%s: %s); granting nothing", exc, exc.detail)
-            return None
+            raise _Unreadable from exc
         else:
             cut = bool(payload.get("_response_truncated"))
         if cut:
             if size == 1:
                 logger.warning("list_datasets: dataset %d alone is too large for Superset's response size; granting "
                                "nothing", len(datasets) + 1)
-                return None
+                raise _Unreadable
             size = _smaller(size)
             continue
         found = _page_datasets(payload, size, datasets[-1].id if datasets else None)
         if found is None:
             logger.warning("list_datasets answered page %d of %d with no page of datasets mnemiq can read (keys %s, "
                            "error_type %s); granting nothing", page, size, sorted(payload), payload.get("error_type"))
-            return None
+            raise _Unreadable
         datasets.extend(found)
         if len(found) < size:
             return datasets
@@ -258,25 +291,25 @@ def _dataset(item) -> _Dataset | None:
     return _Dataset(dataset_id, table_name, schema, database_id, sql)
 
 
-def _granted(datasets: list[_Dataset], tables: dict[str, set[str]], database_id: int, schema: str) -> set[str]:
-    """The object ids of the tables that the physical datasets on the configured database and schema reach. The schema
-    is compared as stored, as Superset compares it. Superset reads a dataset as virtual when its SQL is not empty
-    (`SqlaTable.kind` in `superset/connectors/sqla/models.py`); a virtual dataset grants its own query's rows, never
-    the tables that query reads."""
-    granted: set[str] = set()
+def _candidates(datasets: list[_Dataset], tables: dict[str, set[str]], database_id: int, schema: str) -> list[str]:
+    """The stored names of the snapshot tables that the physical datasets on the configured database and schema name,
+    in the snapshot's order: the tables to ask Superset to confirm, never a grant by themselves. The schema is compared
+    as stored, as Superset compares it. Superset reads a dataset as virtual when its SQL is not empty (`SqlaTable.kind`
+    in `superset/connectors/sqla/models.py`); a virtual dataset names its own query's rows, never the tables that query
+    reads."""
+    named: set[str] = set()
     for dataset in datasets:
-        if dataset.database_id != database_id or dataset.schema != schema or dataset.sql:
-            continue
-        for name in _names_reached(dataset.table_name):
-            granted |= tables.get(name, set())
-    return granted
+        if dataset.database_id == database_id and dataset.schema == schema and not dataset.sql:
+            named |= _candidate_names(dataset.table_name)
+    return [name for name in tables if name in named]
 
 
-def _names_reached(table_name: str) -> set[str]:
-    """The stored names a dataset named `table_name` stands for, read as Postgres reads a name
+def _candidate_names(table_name: str) -> set[str]:
+    """The stored names a dataset named `table_name` may stand for, read as Postgres reads a name
     (`mnemiq.sql.identifiers`): the table stored under exactly that name, as a quoted reference reads it, and, where
-    the name is a plain word Postgres reads unquoted, the table it folds to, so a dataset `Party` stands for a stored
-    `party`. Any other name stands only for itself."""
+    the name is a plain word Postgres reads unquoted, the table it folds to, so a dataset `Party` names a stored
+    `party`. Any other name names only itself. These are candidates only: the fallback asks Superset about every one
+    of them, and grants none on its name alone."""
     names = {table_name}
     if _PLAIN_WORD.fullmatch(table_name) and not _reserved(table_name):
         names.add(resolve_stored(table_name, SUPERSET_DIALECT))
@@ -285,8 +318,8 @@ def _names_reached(table_name: str) -> set[str]:
 
 def _reserved(word: str) -> bool:
     """Whether any engine mnemiq lists reserves `word` or refuses it as a bare table name. Every engine's list, not
-    Postgres's alone, which holds only part of what Postgres refuses there: a word taken for one Postgres reads
-    unquoted grants the table it folds to, so a list too short would grant a table the name cannot reach."""
+    Postgres's alone, which holds only part of what Postgres refuses there; a word missed only adds a candidate for
+    Superset to confirm or refuse."""
     folded = word.casefold()
     return any(folded in words for words in (*RESERVED.values(), *BARE_TABLE_UNSAFE.values()))
 

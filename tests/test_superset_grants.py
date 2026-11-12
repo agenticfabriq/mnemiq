@@ -1,9 +1,11 @@
 """Which snapshot tables a person may read, as Superset decides when asked as them: a dry run naming every table, and
-when Superset refuses it, the physical datasets it lists for them.
+when Superset refuses it, the tables the physical datasets it lists for them name, each kept only when a dry run of it
+is accepted too.
 
 Most tests drive `resolve_grants` over an adapter whose client is a recording stand-in that answers `execute_sql` and
-`list_datasets` the way Superset does, paging included. A few run it over the real client against the fake Superset,
-so the refusals reach the grant as the client reads them off the wire.
+`list_datasets` the way Superset does: a dry run accepted only when the person may read every table it names, and the
+datasets paged. A few run it over the real client against the fake Superset, so the refusals reach the grant as the
+client reads them off the wire.
 """
 
 from __future__ import annotations
@@ -62,6 +64,39 @@ def _refused(text: str = PARTY_REFUSAL, error_type: str = "TABLE_SECURITY_ACCESS
     return {"success": False, "rows": None, "columns": None, "error": text, "error_type": error_type}
 
 
+def _access(readable, *, unparsable=()):
+    """Answers a dry run as Superset's access check does for a person who may read the tables in `readable`: accepted
+    when every table it names is readable, refused naming those that are not, and failed when it names one in
+    `unparsable`, a table Superset cannot parse for access."""
+    readable, unparsable = set(readable), set(unparsable)
+
+    def answer(request: dict) -> dict:
+        names = _names(request["sql"])
+        if unparsable & set(names):
+            return _refused("Unable to parse SQL", error_type="INVALID_SQL_ERROR")
+        missing = [name for name in names if name not in readable]
+        if missing:
+            return _refused("You need access to the following tables: " + ", ".join(f"`sales.{n}`" for n in missing))
+        return DRY_RUN_OK
+
+    return answer
+
+
+def _in_turn(*answers):
+    """Answers each dry run with the next of `answers`, the last one for every dry run after it."""
+    queue = list(answers)
+
+    def answer(request: dict):
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    return answer
+
+
+def _names(sql: str) -> list[str]:
+    """The tables a dry run names, in order."""
+    return [table.name for table in sqlglot.parse_one(sql, read="postgres").find_all(exp.Table)]
+
+
 def _snapshot(*tables: str, columns: list[Column] = (), dimensions: list[Dimension] = ()) -> Snapshot:
     return Snapshot(version="v1", source_id="superset", created_at="t", columns=list(columns),
                     dimensions=list(dimensions),
@@ -82,7 +117,8 @@ class _Superset:
     `cut_above` maps a dataset id to the largest page size at which a page holding it still fits Superset's response
     size; a larger page holding it is answered as `cut` says: "error", the error the size guard raises for a tool it
     does not cut, or "flag", a page marked `_response_truncated`. `asked` records every `list_datasets` request, cut or
-    not, and `pages` each page answered whole: its request and the ids it carried."""
+    not, `pages` each page answered whole: its request and the ids it carried, and `probes` the tables each dry run
+    named."""
 
     def __init__(self, probe, datasets: list[dict] = (), *, cut_above: dict[int, int] | None = None,
                  cut: str = "error", list_answer=None) -> None:
@@ -93,9 +129,11 @@ class _Superset:
         self.list_answer = list_answer
         self.asked: list[dict] = []
         self.pages: list[tuple[dict, list[int]]] = []
+        self.probes: list[list[str]] = []
 
     def __call__(self, request: dict):
         if "sql" in request:
+            self.probes.append(_names(request["sql"]))
             return self.probe(request) if callable(self.probe) else self.probe
         self.asked.append(request)
         assert len(self.asked) <= _MOST_PAGES, "the listing never stopped asking for pages"
@@ -194,7 +232,7 @@ def test_every_classified_level_is_cleared(path):
                Column(id="policy.region", object_id="policy", name="region", pii_level="none")]
     dimensions = [Dimension(id="party.dob", label="dob", source="party", pii_level="dob")]
     snapshot = _snapshot("policy", "claim", "party", columns=columns, dimensions=dimensions)
-    probe = DRY_RUN_OK if path == "probe" else _refused()
+    probe = DRY_RUN_OK if path == "probe" else _access({"policy"})
     grants = resolve_grants(_adapter(_Superset(probe, [_dataset(1, "policy")])), snapshot)
     assert grants.pii_clearance == classified_levels(snapshot) == {"pii", "phi", "pci", "dob"}
     assert grants.objects == ({"policy", "claim", "party"} if path == "probe" else {"policy"})
@@ -205,49 +243,130 @@ def test_every_classified_level_is_cleared(path):
 
 @pytest.mark.parametrize("stored", [("policy", "claim", "party"), ("policy", "claim")])
 def test_dataset_access_grants_exactly_those_tables(stored):
+    """The datasets name the candidates, and Superset, asked as the person, confirms them."""
     datasets = [
         _dataset(1, "policy"),                                         # granted
         _dataset(2, "claim", database_id=8),                           # another database
-        # Virtual, though named for a stored table: grants neither that table nor the one its SQL reads.
+        # Virtual, though named for a stored table: names neither that table nor the one its SQL reads.
         _dataset(3, "claim", sql="SELECT * FROM party WHERE region = 'west'"),
-        _dataset(4, "Party"),                                          # reaches stored `party` when unquoted
+        _dataset(4, "Party"),                                          # names stored `party`, read unquoted
     ]
-    adapter = _adapter(_Superset(_refused(), datasets))
+    superset = _Superset(_access({"policy", "party"}), datasets)
+    adapter = _adapter(superset)
     grants = resolve_grants(adapter, _snapshot(*stored))
-    assert grants.objects == ({"policy", "party"} if "party" in stored else {"policy"})
+    candidates = ["policy", "party"] if "party" in stored else ["policy"]
+    assert grants.objects == set(candidates)
     assert grants.available is True
-    assert _tools(adapter) == ["execute_sql", "list_datasets"]
+    assert _tools(adapter) == ["execute_sql", "list_datasets", "execute_sql"]
+    assert superset.probes == [list(stored), candidates]
 
 
-def test_a_dataset_reaches_the_table_stored_under_its_own_name():
-    """A dataset stands for the table stored under exactly its name, which a quoted reference reads: a mixed-case name,
-    or one holding a space, is granted under that stored name."""
+def test_a_dataset_names_the_table_stored_under_its_own_name():
+    """A dataset names the table stored under exactly its name as a candidate, probed quoted, so a mixed-case name or
+    one holding a space is confirmed and granted under that stored name."""
     datasets = [_dataset(1, "Policy Lines"), _dataset(2, "Party")]
-    grants = resolve_grants(_adapter(_Superset(_refused(), datasets)), _snapshot("Policy Lines", "Party", "claim"))
+    superset = _Superset(_access({"Policy Lines", "Party"}), datasets)
+    grants = resolve_grants(_adapter(superset), _snapshot("Policy Lines", "Party", "claim"))
     assert grants.objects == {"Policy Lines", "Party"}
+    assert superset.probes[1] == ["Policy Lines", "Party"]
 
 
-def test_a_name_postgres_cannot_read_unquoted_reaches_only_itself():
-    """Only a plain word read unquoted folds: a dataset whose name holds a space, or is a word Postgres reserves,
-    reaches the table stored under its own name and never the table its lower case names."""
+def test_a_name_postgres_cannot_read_unquoted_names_only_itself():
+    """Only a plain word read unquoted folds: a dataset whose name holds a space, or is a word Postgres reserves, names
+    the table stored under its own name and never the table its lower case names, so nothing is asked about those."""
     datasets = [_dataset(1, "Policy Lines"), _dataset(2, "Order"), _dataset(3, "Select")]
-    snapshot = _snapshot("policy lines", "order", "select")
-    assert resolve_grants(_adapter(_Superset(_refused(), datasets)), snapshot).objects == frozenset()
+    superset = _Superset(_access(set()), datasets)
+    assert resolve_grants(_adapter(superset), _snapshot("policy lines", "order", "select")).objects == frozenset()
+    assert len(superset.probes) == 1
 
 
 def test_a_dataset_in_another_schema_is_never_granted():
     """The schema is compared as stored, whatever the listing's own filter let through."""
     page = {"datasets": [_dataset(1, "policy", schema="Sales"), _dataset(2, "claim", schema=None),
                          _dataset(3, "party", schema="sales ")]}
-    adapter = _adapter(_Superset(_refused(), list_answer=page))
-    assert resolve_grants(adapter, _snapshot("policy", "claim", "party")).objects == frozenset()
+    superset = _Superset(_access({"policy", "party"}), list_answer=page)
+    assert resolve_grants(_adapter(superset), _snapshot("policy", "claim", "party")).objects == frozenset()
+    assert len(superset.probes) == 1
 
 
 def test_an_empty_sql_is_a_physical_dataset():
     """Superset reads a dataset as virtual when its SQL is not empty (`SqlaTable.kind`), and only then."""
     datasets = [_dataset(1, "policy", sql=""), _dataset(2, "claim", sql=" ")]
-    grants = resolve_grants(_adapter(_Superset(_refused(), datasets)), _snapshot("policy", "claim"))
+    superset = _Superset(_access({"policy", "claim"}), datasets)
+    grants = resolve_grants(_adapter(superset), _snapshot("policy", "claim", "secret"))
     assert grants.objects == {"policy"}
+    assert superset.probes[1:] == [["policy"]]
+
+
+def test_a_dataset_in_another_catalog_is_not_granted():
+    """The listing carries no catalog, so a physical dataset in another catalog looks like one for the snapshot's table.
+    Superset, asked as the person, refuses that table, so it is not granted, and the other candidates still are."""
+    datasets = [_dataset(1, "policy"), _dataset(2, "claim"), _dataset(3, "party")]
+    superset = _Superset(_access({"policy", "party"}), datasets)  # `claim`'s dataset is another catalog's
+    grants = resolve_grants(_adapter(superset), _snapshot("policy", "claim", "party", "secret"))
+    assert grants.objects == {"policy", "party"}
+    assert superset.probes == [["policy", "claim", "party", "secret"], ["policy", "claim", "party"],
+                               ["policy"], ["claim"], ["party"]]
+
+
+def test_a_case_folded_name_superset_refuses_is_not_granted():
+    """A dataset `Party` makes a stored `party` a candidate, which the fallback asks Superset about like any other:
+    refused, it is not granted, and a single refused candidate is not asked about again."""
+    superset = _Superset(_access(set()), [_dataset(1, "Party")])
+    grants = resolve_grants(_adapter(superset), _snapshot("party", "claim"))
+    assert grants.objects == frozenset() and grants.available is True
+    assert superset.probes == [["party", "claim"], ["party"]]
+
+
+def test_confirmed_candidates_are_granted_with_one_probe():
+    superset = _Superset(_access({"policy", "claim"}), [_dataset(1, "policy"), _dataset(2, "claim")])
+    adapter = _adapter(superset)
+    grants = resolve_grants(adapter, _snapshot("policy", "claim", "secret"))
+    assert grants.objects == {"policy", "claim"}
+    assert _tools(adapter) == ["execute_sql", "list_datasets", "execute_sql"]
+    confirmation = adapter.client.calls[2].request
+    assert confirmation["dry_run"] is True
+    assert confirmation["sql"] == 'SELECT 1 FROM "policy", "claim" WHERE 1 = 0'
+
+
+def test_one_refused_candidate_does_not_deny_the_rest(caplog):
+    """A candidate Superset refuses, or cannot check, is left out alone, the reason logged; the others are granted.
+    Superset's text naming the refused table stays in the log."""
+    datasets = [_dataset(i, f"t{i}") for i in range(1, 6)]
+    superset = _Superset(_access({"t1", "t2", "t4", "t5"}, unparsable={"t5"}), datasets)
+    with caplog.at_level(logging.INFO, logger="mnemiq.superset"):
+        grants = resolve_grants(_adapter(superset), _snapshot(*(f"t{i}" for i in range(1, 6)), "secret"))
+    assert grants.objects == {"t1", "t2", "t4"}
+    assert superset.probes[2:] == [["t1"], ["t2"], ["t3"], ["t4"], ["t5"]]
+    assert "`sales.t3`" in caplog.text and "Unable to parse SQL" in caplog.text
+    assert "t3" not in repr(grants) and "t5" not in repr(grants)
+
+
+@pytest.mark.parametrize("stage", ["all candidates", "a candidate alone"])
+def test_permission_denied_on_a_confirmation_probe_is_not_a_builder(stage, caplog):
+    denial = SupersetPermissionDenied("Superset's roles for this user do not permit execute_sql", detail=ROLE_DENIAL)
+    answers = [_refused(), denial] if stage == "all candidates" else [_refused(), _refused(), denial]
+    superset = _Superset(_in_turn(*answers), [_dataset(1, "policy"), _dataset(2, "claim")])
+    with caplog.at_level(logging.WARNING, logger="mnemiq.superset"), pytest.raises(NotABuilder) as caught:
+        resolve_grants(_adapter(superset), _snapshot("policy", "claim", "party"))
+    assert caught.value.message == NOT_A_BUILDER
+    assert "sales.party" in caplog.text
+
+
+CONFIRMATION_FAILURES = {
+    "tool error": (SupersetToolError("Superset's execute_sql tool failed", detail="boom"), SupersetMisconfigured),
+    "refused caller": (SupersetRefusedCaller("Superset did not accept the credential", detail="401"),
+                       SupersetRefusedCaller),
+    "generic denial": (SupersetDenied("Superset refused execute_sql and did not say why", detail=GENERIC_DENIAL),
+                       SupersetDenied),
+}
+
+
+@pytest.mark.parametrize(("failure", "raised"), CONFIRMATION_FAILURES.values(), ids=CONFIRMATION_FAILURES.keys())
+def test_a_confirmation_probe_fails_as_the_first_probe_does(failure, raised):
+    superset = _Superset(_in_turn(_refused(), failure), [_dataset(1, "policy")])
+    with pytest.raises(raised):
+        resolve_grants(_adapter(superset), _snapshot("policy", "claim"))
 
 
 def test_list_datasets_request_is_pinned():
@@ -268,7 +387,7 @@ def test_list_datasets_request_is_pinned():
 
 def test_datasets_are_read_page_by_page_until_a_short_page():
     datasets = [_dataset(i, f"t{i}") for i in range(1, 251)]
-    superset = _Superset(_refused(), datasets)
+    superset = _Superset(_access({f"t{i}" for i in range(1, 251)}), datasets)
     adapter = _adapter(superset)
     grants = resolve_grants(adapter, _snapshot(*(f"t{i}" for i in range(1, 251)), "other"))
     assert grants.objects == {f"t{i}" for i in range(1, 251)}
@@ -288,7 +407,7 @@ def test_a_cut_dataset_page_is_asked_again_smaller(cut):
     to one dataset, and the read goes on at that size: every dataset is read once, in order, none skipped."""
     big = _dataset(120, "big_view", sql="SELECT " + "x, " * 20_000 + "1")
     datasets = [_dataset(i, f"t{i}") for i in range(1, 231) if i != 120] + [big]
-    superset = _Superset(_refused(), datasets, cut_above={120: 5}, cut=cut)
+    superset = _Superset(_access({f"t{i}" for i in range(1, 231)} - {"t120"}), datasets, cut_above={120: 5}, cut=cut)
     grants = resolve_grants(_adapter(superset), _snapshot(*(f"t{i}" for i in range(1, 231))))
     assert grants.available is True
     assert grants.objects == {f"t{i}" for i in range(1, 231)} - {"t120"}
@@ -306,8 +425,8 @@ def test_paging_never_skips_or_repeats_a_dataset(position, fits):
     Superset reads page `p` of size `s` as the `s` datasets after the first `(p - 1) * s` (`max(request.page - 1, 0)` in
     `list_datasets`, `offset(page * page_size)` in `BaseDAO.list`)."""
     datasets = [_dataset(i, f"t{i}") for i in range(1, 231)]
-    superset = _Superset(_refused(), datasets, cut_above={position: fits})
-    grants = resolve_grants(_adapter(superset), _snapshot(*(f"t{i}" for i in range(1, 231))))
+    superset = _Superset(_access({f"t{i}" for i in range(1, 231)}), datasets, cut_above={position: fits})
+    grants = resolve_grants(_adapter(superset), _snapshot(*(f"t{i}" for i in range(1, 231)), "secret"))
     if fits == 0:
         assert grants is UNAVAILABLE
         return
@@ -376,19 +495,19 @@ def test_a_page_repeating_one_already_read_denies():
 def test_query_failed_probe_takes_the_dataset_fallback(caplog):
     """A probe Superset could not parse for access establishes nothing about database-wide access; the person gets the
     datasets Superset lists for them, and the failure is logged."""
-    probe = _refused("Unable to parse SQL", error_type="INVALID_SQL_ERROR")
-    adapter = _adapter(_Superset(probe, [_dataset(1, "policy")]))
+    adapter = _adapter(_Superset(_access({"policy"}, unparsable={"claim"}), [_dataset(1, "policy")]))
     with caplog.at_level(logging.WARNING, logger="mnemiq.superset"):
         grants = resolve_grants(adapter, _snapshot("policy", "claim"))
     assert grants.objects == {"policy"}
-    assert _tools(adapter) == ["execute_sql", "list_datasets"]
+    assert _tools(adapter) == ["execute_sql", "list_datasets", "execute_sql"]
     assert "Unable to parse SQL" in caplog.text
 
 
-def test_a_probe_mnemiq_would_not_send_takes_the_dataset_fallback():
-    """A stored name holding a template marker keeps the probe from being sent at all, which establishes nothing."""
+def test_a_name_mnemiq_would_not_send_is_never_granted():
+    """A stored name holding a template marker keeps every dry run naming it from being sent, which establishes
+    nothing: the datasets are read, and Superset never confirms that table, so it is not granted."""
     adapter = _adapter(_Superset(DRY_RUN_OK, [_dataset(1, "a{{b")]))
-    assert resolve_grants(adapter, _snapshot("a{{b", "claim")).objects == {"a{{b"}
+    assert resolve_grants(adapter, _snapshot("a{{b", "claim")).objects == frozenset()
     assert _tools(adapter) == ["list_datasets"]
 
 
@@ -466,23 +585,30 @@ def test_any_other_tool_error_is_misconfigured(caplog):
     assert "boom" in caplog.text
 
 
+_STATEMENT_FAILURES = {
+    "unavailable": SupersetUnavailable("Superset's MCP service could not be reached"),
+    "timed out": QueryTimedOut("Superset ended the statement at its time limit"),
+    "cancelled": QueryCancelled("Superset reports the statement was stopped"),
+}
 UNANSWERED = {
-    "probe unavailable": ("probe", SupersetUnavailable("Superset's MCP service could not be reached")),
-    "probe timed out": ("probe", QueryTimedOut("Superset ended the statement at its time limit")),
-    "probe cancelled": ("probe", QueryCancelled("Superset reports the statement was stopped")),
+    **{f"probe {name}": ("probe", failure) for name, failure in _STATEMENT_FAILURES.items()},
     "listing unavailable": ("list_datasets", SupersetUnavailable("Superset's MCP service answered HTTP 502")),
+    **{f"confirmation {name}": ("confirmation", failure) for name, failure in _STATEMENT_FAILURES.items()},
+    **{f"candidate alone {name}": ("candidate alone", failure) for name, failure in _STATEMENT_FAILURES.items()},
 }
 
 
 @pytest.mark.parametrize(("on", "failure"), UNANSWERED.values(), ids=UNANSWERED.keys())
 def test_unavailable_denies_and_says_so(on, failure):
-    """Superset not answering grants nothing, and the grants say they could not be read rather than that the person
-    may read nothing."""
-    if on == "probe":
-        superset = _Superset(failure, [_dataset(1, "policy")])
-    else:
-        superset = _Superset(_refused(), list_answer=failure)
-    grants = resolve_grants(_adapter(superset), _snapshot("policy"))
+    """Superset not answering, the first dry run, the listing or any dry run confirming a candidate, grants nothing,
+    and the grants say they could not be read rather than that the person may read nothing."""
+    datasets = [_dataset(1, "policy"), _dataset(2, "party")]
+    probes = {"probe": _in_turn(failure),
+              "list_datasets": _in_turn(_refused()),
+              "confirmation": _in_turn(_refused(), failure),
+              "candidate alone": _in_turn(_refused(), _refused(), failure)}
+    superset = _Superset(probes[on], datasets, list_answer=failure if on == "list_datasets" else None)
+    grants = resolve_grants(_adapter(superset), _snapshot("policy", "party", "claim"))
     assert grants.available is False
     assert grants.objects == frozenset()
 
@@ -499,12 +625,12 @@ def test_probe_refusal_names_no_table(caplog):
     """Superset's refusal text names a table the person cannot see. It reaches the log, and neither the grants nor any
     exception's message."""
     # (a) A refused probe: the fallback runs, and the text is in the log only.
-    adapter = _adapter(_Superset(_refused(PARTY_REFUSAL), [_dataset(1, "policy")]))
+    adapter = _adapter(_Superset(_access({"policy"}), [_dataset(1, "policy")]))
     with caplog.at_level(logging.WARNING, logger="mnemiq.superset"):
         grants = resolve_grants(adapter, _snapshot("policy", "party"))
     assert grants.objects == {"policy"}
-    assert _tools(adapter) == ["execute_sql", "list_datasets"]
-    assert "party_admin" in caplog.text
+    assert _tools(adapter) == ["execute_sql", "list_datasets", "execute_sql"]
+    assert "`sales.party`" in caplog.text
     assert "party" not in repr(grants)
     caplog.clear()
     # (b) A role denial: not a builder, and the denial's own text is in the log only.
@@ -517,11 +643,11 @@ def test_probe_refusal_names_no_table(caplog):
 
 
 def test_grants_through_the_real_client():
-    """Over the real client against the fake Superset: the probe and every page run as the person, a page too large for
-    Superset's response size reaches the grant as a page to ask again smaller, and the datasets read become the
-    grant."""
+    """Over the real client against the fake Superset: the probe, every page and the confirmation run as the person, a
+    page too large for Superset's response size reaches the grant as a page to ask again smaller, and the tables the
+    datasets name, once Superset confirms them, become the grant."""
     datasets = [_dataset(i, f"t{i}") for i in range(1, 121)]
-    superset = _Superset(_refused(), datasets, cut_above={60: 50})
+    superset = _Superset(_access({f"t{i}" for i in range(1, 121)}), datasets, cut_above={60: 50})
 
     def list_datasets(request, authorization):
         answer = superset(request)
@@ -534,12 +660,14 @@ def test_grants_through_the_real_client():
         fake.reply("list_datasets", list_datasets)
         adapter = SupersetSqlAdapter(SupersetMcp(fake.url, DelegatedToken("person-token")), database_id=DATABASE_ID,
                                      schema=SCHEMA)
-        grants = resolve_grants(adapter, _snapshot(*(f"t{i}" for i in range(1, 121))))
+        grants = resolve_grants(adapter, _snapshot(*(f"t{i}" for i in range(1, 121)), "secret"))
     assert grants.objects == {f"t{i}" for i in range(1, 121)}
     assert {call.authorization for call in fake.calls} == {"Bearer person-token"}
     assert [(c.tool, c.request.get("page"), c.request.get("page_size")) for c in fake.calls] == [
         ("execute_sql", None, None), ("list_datasets", 1, 100), ("list_datasets", 1, 50), ("list_datasets", 2, 50),
-        ("list_datasets", 3, 50)]
+        ("list_datasets", 3, 50), ("execute_sql", None, None)]
+    confirmation = fake.calls[-1].request
+    assert confirmation["dry_run"] is True and _names(confirmation["sql"]) == [f"t{i}" for i in range(1, 121)]
 
 
 # --- the provider ------------------------------------------------------------------------------------------------
