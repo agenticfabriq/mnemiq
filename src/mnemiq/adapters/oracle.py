@@ -52,8 +52,10 @@ class OracleAdapter:
 
     dialect = "oracle"
     # Whether every session this adapter runs a statement in reads a date parse in the Gregorian
-    # calendar: True once `_configure_session` pins it, on the pool this adapter builds. An adapter
-    # `over()` someone else's connection leaves their session as it is, so it does not say so.
+    # calendar: `_configure_session` pins it on each session the pool builds, and only a read-only
+    # adapter keeps it pinned, since its gate refuses the ALTER SESSION that would change it and a
+    # pooled session outlives the lease that changed it (Codex's review). An adapter `over()`
+    # someone else's connection leaves their session as it is, so it does not say so.
     gregorian_calendar = False
 
     def __init__(self, dsn: str, user: str, password: str, schema: str | None = None,
@@ -160,7 +162,7 @@ class OracleAdapter:
             ping_interval=60,
             session_callback=self._configure_session, **extra)
         self._con = None  # `over()` sets this; a pooled adapter has no one connection
-        self.gregorian_calendar = True  # every pooled session runs `_configure_session` first
+        self.gregorian_calendar = read_only  # see the class attribute
         self._closed = False
         # `constrained` expires: see `_recheck_read_only`.
         self._ro_ttl_s = read_only_ttl_s

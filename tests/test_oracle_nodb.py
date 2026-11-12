@@ -663,8 +663,9 @@ class _SessionConnection:
 def test_every_pooled_session_reads_dates_in_the_gregorian_calendar(monkeypatch):
     """Oracle reads TO_DATE's year, month and day in the session's NLS_CALENDAR (1481-03-03 for
     '2024-03-03' under Thai Buddha, measured), so every session the pool makes is pinned to
-    Gregorian before any statement runs, whether or not it also needs a schema, and the adapter
-    says so for the value grounding. One built over someone else's connection does not."""
+    Gregorian before any statement runs, whether or not it also needs a schema. A read-only adapter
+    says so for the value grounding, since its gate refuses the ALTER SESSION that would undo the
+    pin on a pooled session; a writable one, or one over someone else's connection, does not."""
     import oracledb
     monkeypatch.setattr(oracledb, "create_pool", lambda **kw: mock.Mock())
     for schema, expected in ((None, ["ALTER SESSION SET NLS_CALENDAR = 'GREGORIAN'"]),
@@ -676,3 +677,6 @@ def test_every_pooled_session_reads_dates_in_the_gregorian_calendar(monkeypatch)
         a._configure_session(session, None)
         assert session.ran == expected, schema
     assert OracleAdapter.over(mock.Mock(), oracledb, "owner").gregorian_calendar is False
+    assert OracleAdapter("h:1521/X", "owner", "p", read_only=False).gregorian_calendar is False
+    with pytest.raises(mod.ReadOnlyViolation):
+        OracleAdapter("h:1521/X", "reader", "p").execute("ALTER SESSION SET NLS_CALENDAR = 'Thai Buddha'")
