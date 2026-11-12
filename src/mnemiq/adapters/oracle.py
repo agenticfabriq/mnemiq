@@ -51,6 +51,10 @@ class OracleAdapter:
     """
 
     dialect = "oracle"
+    # Whether every session this adapter runs a statement in reads a date parse in the Gregorian
+    # calendar: True once `_configure_session` pins it, on the pool this adapter builds. An adapter
+    # `over()` someone else's connection leaves their session as it is, so it does not say so.
+    gregorian_calendar = False
 
     def __init__(self, dsn: str, user: str, password: str, schema: str | None = None,
                  read_only: bool = True, config_dir: str | None = None,
@@ -156,6 +160,7 @@ class OracleAdapter:
             ping_interval=60,
             session_callback=self._configure_session, **extra)
         self._con = None  # `over()` sets this; a pooled adapter has no one connection
+        self.gregorian_calendar = True  # every pooled session runs `_configure_session` first
         self._closed = False
         # `constrained` expires: see `_recheck_read_only`.
         self._ro_ttl_s = read_only_ttl_s
@@ -200,12 +205,20 @@ class OracleAdapter:
 
         Never routed through `execute`: the read-only gate refuses ALTER, correctly, and this is
         the adapter configuring itself rather than running a caller's statement.
+
+        **The calendar is pinned to Gregorian on every session.** Oracle reads a TO_DATE's year,
+        month and day in the session's NLS_CALENDAR, which a logon trigger or the database's own
+        default can set: measured on Oracle 23 Free, `TO_DATE('2024-03-03', 'YYYY-MM-DD')` is
+        1481-03-03 under Thai Buddha and 2645-05-24 under Persian. The model writes the dates a
+        question names, the day-bound rewrite writes the next day from Python's calendar, and
+        the value grounding trusts a parse only on this promise (`gregorian_calendar`), so the
+        session must read them as written.
         """
-        if self._session_schema is None:
-            return
         cur = connection.cursor()
         try:
-            cur.execute(f'ALTER SESSION SET CURRENT_SCHEMA = "{self._session_schema}"')
+            cur.execute("ALTER SESSION SET NLS_CALENDAR = 'GREGORIAN'")
+            if self._session_schema is not None:
+                cur.execute(f'ALTER SESSION SET CURRENT_SCHEMA = "{self._session_schema}"')
         finally:
             cur.close()
 

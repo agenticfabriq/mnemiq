@@ -821,10 +821,12 @@ _ORACLE_TYPES = {"CLAIM": {"ID": "NUMBER", "TS": "TIMESTAMP(6)", "FILED": "DATE"
                            "STATUS": "VARCHAR2(20)", "NOTE": "VARCHAR2(200)"}}
 
 
-def _oracle(sql: str, values=None, **kw):
+def _oracle(sql: str, values=None, gregorian: bool = True, **kw):
+    # `gregorian`: the adapter pins its sessions to the Gregorian calendar (`OracleAdapter`), as
+    # the engine's own Oracle adapter does.
     return ground_values(sqlglot.parse_one(sql, read="oracle"), _ORACLE_VISIBLE,
                          _Values({("CLAIM", "STATUS"): {"open", "closed"}}) if values is None else values,
-                         dialect="oracle", types=_ORACLE_TYPES, **kw)
+                         dialect="oracle", types=_ORACLE_TYPES, gregorian=gregorian, **kw)
 
 
 def _read_oracle(sql: str, **kw) -> list[tuple]:
@@ -926,8 +928,21 @@ def test_the_decider_grounds_an_oracle_day_bound_after_moving_it():
 
     verdict = decide("SELECT ID FROM CLAIM WHERE TS >= TO_DATE('2024-03-03', 'YYYY-MM-DD') "
                      "AND TS <= TO_DATE('2024-03-09', 'YYYY-MM-DD')", _ORACLE_VISIBLE,
-                     dialect="oracle", target="oracle", types=_ORACLE_TYPES)
+                     dialect="oracle", target="oracle", types=_ORACLE_TYPES, gregorian_calendar=True)
     assert isinstance(verdict, Approved), verdict
     assert verdict.day_bounds == 1
     read = [(v.text, v.outcome) for v in verdict.value_grounding.values]
     assert read == [("2024-03-03", TYPED), ("2024-03-10", TYPED)], read
+
+
+def test_an_oracle_parse_reads_the_sessions_calendar_so_it_needs_a_gregorian_session():
+    """Oracle reads TO_DATE's year, month and day in the session's NLS_CALENDAR: measured on Oracle
+    23 Free, `TO_DATE('2024-03-03', 'YYYY-MM-DD')` is 1481-03-03 under Thai Buddha and 2645-05-24
+    under Persian, while `DATE '2024-03-03'` is 2024-03-03 under every calendar. So a parse is a
+    bound only where the adapter pins its sessions to Gregorian; the DATE literal needs nothing."""
+    parse = ("SELECT ID FROM CLAIM WHERE TS >= TO_DATE('2024-03-03', 'YYYY-MM-DD') "
+             "AND TS < TO_TIMESTAMP('2024-03-04', 'YYYY-MM-DD')")
+    assert {o for _, o, _, _ in _read_oracle(parse, gregorian=False)} == {UNCHECKED}
+    assert {o for _, o, _, _ in _read_oracle(parse, gregorian=True)} == {TYPED}
+    literal = "SELECT ID FROM CLAIM WHERE TS >= DATE '2024-03-03' AND TS < DATE '2024-03-04'"
+    assert {o for _, o, _, _ in _read_oracle(literal, gregorian=False)} == {TYPED}

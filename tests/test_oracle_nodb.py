@@ -639,3 +639,40 @@ def test_the_first_reprobe_runs_on_a_freshly_booted_host(monkeypatch):
     con = _ProbeFails()
     a._recheck_read_only(con)
     assert con.closed == 1, "the first lease on a freshly-booted host did not probe"
+
+
+class _SessionCursor:
+    def __init__(self, ran):
+        self.ran = ran
+
+    def execute(self, sql):
+        self.ran.append(sql)
+
+    def close(self):
+        pass
+
+
+class _SessionConnection:
+    def __init__(self):
+        self.ran = []
+
+    def cursor(self):
+        return _SessionCursor(self.ran)
+
+
+def test_every_pooled_session_reads_dates_in_the_gregorian_calendar(monkeypatch):
+    """Oracle reads TO_DATE's year, month and day in the session's NLS_CALENDAR (1481-03-03 for
+    '2024-03-03' under Thai Buddha, measured), so every session the pool makes is pinned to
+    Gregorian before any statement runs, whether or not it also needs a schema, and the adapter
+    says so for the value grounding. One built over someone else's connection does not."""
+    import oracledb
+    monkeypatch.setattr(oracledb, "create_pool", lambda **kw: mock.Mock())
+    for schema, expected in ((None, ["ALTER SESSION SET NLS_CALENDAR = 'GREGORIAN'"]),
+                             ("owner", ["ALTER SESSION SET NLS_CALENDAR = 'GREGORIAN'",
+                                        'ALTER SESSION SET CURRENT_SCHEMA = "OWNER"'])):
+        a = OracleAdapter("h:1521/X", "reader", "p", schema=schema)
+        assert a.gregorian_calendar is True
+        session = _SessionConnection()
+        a._configure_session(session, None)
+        assert session.ran == expected, schema
+    assert OracleAdapter.over(mock.Mock(), oracledb, "owner").gregorian_calendar is False

@@ -131,7 +131,9 @@ unless every value it filters on is found in the data (`verify_sanity` turns tha
 where the engine reads it one way. On DuckDB and Postgres that is an ISO date compared with a `DATE` column, or
 starting a range or ending it exclusively on a timestamp column. On Oracle it is a `TO_DATE` with the format
 `'YYYY-MM-DD'` or a `DATE` literal, starting a range or ending it exclusively on a `DATE` or `TIMESTAMP` column, since
-an Oracle `DATE` holds a time of day; a bare date string there follows the session's date format, so it still declines. At `full`, the sanity
+an Oracle `DATE` holds a time of day; a bare date string there follows the session's date format, so it still declines.
+mnemiq's Oracle adapter sets each session's calendar to Gregorian, since Oracle reads a `TO_DATE` in the session's
+calendar. At `full`, the sanity
 check runs first and then a model judges whether the result answers the question, declining below `verify_threshold`
 confidence. In the technical report's replay of 437 BIRD mini-dev answers, the judge at 0.5 cut the wrong-answer rate
 from 39.0% to 19.7% and cost 4.5 points of exact match. `verify_grounding` adds a check that every quoted phrase and

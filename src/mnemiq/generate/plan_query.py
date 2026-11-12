@@ -169,6 +169,9 @@ def plan_query(
     # pattern to match and so no false-positive rate to measure, and it stays correct when a
     # source starts phrasing its errors differently or a DSN turns up in a shape nobody listed.
     carries_source_words = feedback.from_source if feedback else False
+    # Whether the source reads a date parse (Oracle's TO_DATE) in the Gregorian calendar: only an
+    # adapter that pins its sessions to it says so, and anything else reads as no.
+    gregorian_calendar = getattr(adapter, "gregorian_calendar", False) is True
 
     for _attempt in range(max_attempts):
         proposal = generator.propose(packet, feedback.text if feedback else None)
@@ -245,7 +248,8 @@ def plan_query(
 
         verdict = decide(
             proposal.sql, visible, adapter=adapter, dialect=dialect, target=target,
-            values=values, policy=policy, registry=registry, views=views, keys=keys, types=types
+            values=values, policy=policy, registry=registry, views=views, keys=keys, types=types,
+            gregorian_calendar=gregorian_calendar,
         )
 
         corrected = False
@@ -268,6 +272,7 @@ def plan_query(
                 views=views,
                 keys=keys,
                 types=types,
+                gregorian_calendar=gregorian_calendar,
             )
             # Only when the repair is what carried it: a correction that still refuses is not
             # a corrected plan, it is a failed one, and reporting it would overstate the work.
