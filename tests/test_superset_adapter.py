@@ -38,9 +38,10 @@ REGION_COUNTS = {"success": True, "rows": [{"region": "west", "policy_count": 16
 DRY_RUN = {"success": True, "rows": None, "columns": None, "row_count": None, "affected_rows": None,
            "error": None, "error_type": None,
            "statements": [{"original_sql": SQL, "executed_sql": SQL, "row_count": 0, "data": None}]}
-SECRET_REFUSAL = {"success": False, "rows": None, "columns": None,
-                  "error": "You need access to the following tables: `sales.secret_table`",
-                  "error_type": "TABLE_SECURITY_ACCESS_ERROR"}
+# What Superset answers a statement that reads a table the person asking cannot see.
+HIDDEN_TABLE_REFUSAL = {"success": False, "rows": None, "columns": None,
+                        "error": "You need access to the following tables: `sales.secret_table`",
+                        "error_type": "TABLE_SECURITY_ACCESS_ERROR"}
 
 
 def _failed(error_type: str, error: str = "Superset's own words") -> dict:
@@ -166,7 +167,7 @@ def test_dry_run_reads_a_failure_as_a_run_does():
     """A dry run that Superset refuses raises what the same refusal raises from a run; whatever a successful dry run
     carries, it returns nothing."""
     with pytest.raises(SupersetAccessRefused):
-        _adapter(SECRET_REFUSAL).dry_run(SQL)
+        _adapter(HIDDEN_TABLE_REFUSAL).dry_run(SQL)
     with pytest.raises(QueryTimedOut):
         _adapter(_failed("timed_out")).dry_run(SQL)
     doubled = {**REGION_COUNTS, "columns": [{"name": "id", "type": "int64"}] * 2, "_response_truncated": True}
@@ -264,7 +265,7 @@ def test_refused_caller_ends_the_turn(refusal):
 def test_access_refusal_text_never_leaves_the_log(caplog):
     """Superset's text can name a table the person asking cannot see; it goes to the log and nowhere else."""
     with caplog.at_level(logging.WARNING, logger="mnemiq.superset"), pytest.raises(ExecutionError) as caught:
-        run(_adapter(SECRET_REFUSAL), SQL)
+        run(_adapter(HIDDEN_TABLE_REFUSAL), SQL)
     assert "secret_table" in caplog.text
     exc = caught.value
     assert not isinstance(exc, SourceUnavailableError)
