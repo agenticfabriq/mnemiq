@@ -61,6 +61,8 @@ _PLAIN_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 NOT_A_BUILDER = ("Superset refused this user's queries. Building with mnemiq needs Superset's Alpha and sql_lab "
                  "roles.")
+GRANTS_UNREADABLE = ("Superset's answer about what this user may read could not be read, so nothing was answered; "
+                     "mnemiq's log records why.")
 
 
 class _Stated(Exception):
@@ -84,6 +86,16 @@ class NotABuilder(_Stated):
 class SupersetMisconfigured(_Stated):
     """Superset's MCP service answered a call with an error that is not a refusal, so it is not set up as mnemiq needs.
     The message carries mnemiq's sentence for the error, which names the setting to change where it knows one."""
+
+
+class GrantsUnreadable(_Stated):
+    """What the person may read could not be read from Superset (`resolve_grants` returned grants that are not
+    available), so the request is refused rather than answered under no grants: an empty schema would read as access
+    to nothing, and a deferral would blame an access policy Superset mode does not hold. Why was logged where it was
+    found; the message is mnemiq's own sentence."""
+
+    def __init__(self) -> None:
+        super().__init__(GRANTS_UNREADABLE)
 
 
 @dataclass(frozen=True)

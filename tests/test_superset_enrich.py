@@ -110,9 +110,10 @@ def _no_mnemiq_environment(monkeypatch):
 
 
 class SourceBehindSuperset:
-    """`execute_sql` over the schema above, as Superset answers it: the first page of each `PostgresCatalogue`
-    statement from the schema's catalogue rows, and any other statement run by DuckDB over its tables. A catalogue
-    method named in `refused` is answered `success: false`, as Superset answers a statement the database refused."""
+    """`execute_sql` over the schema `TABLES` and `ROWS` hold, as Superset answers it: the first page of each
+    `PostgresCatalogue` statement from the schema's catalogue rows, and any other statement run by DuckDB over its
+    tables. A catalogue method named in `refused` is answered `success: false`, as Superset answers a statement the
+    database refused."""
 
     def __init__(self) -> None:
         self.tables = {name: list(columns) for name, columns in TABLES.items()}
@@ -328,8 +329,8 @@ def test_enrich_harvests_no_values(tmp_path, model, fake, key_file, capsys):
 
 
 def test_the_harvest_checks_see_a_harvest(tmp_path, model, fake, key_file):
-    """The positive control for the test above: the same source read with harvesting on, through the same adapter,
-    does send `_top_k`'s statement and the lookup's DISTINCT, and its values do reach the snapshot."""
+    """The positive control for `test_enrich_harvests_no_values`: the same source read with harvesting on, through the
+    same adapter, does send `_top_k`'s statement and the lookup's DISTINCT, and its values do reach the snapshot."""
     adapter = enrichment_adapter(_settings(tmp_path, model, fake), service_credential_from_env())
     snapshot = ground_codes(adapter, enrich_structural(adapter, SOURCE_ID))
     coded = {column.id: {value.code for value in column.coded_values} for column in snapshot.columns
@@ -448,6 +449,22 @@ def test_a_value_index_left_by_a_direct_enrichment_is_cleared(tmp_path, model, f
     con.execute("INSERT INTO value_index VALUES (?, 'claim', 'region', 'Northgate')", [SOURCE_ID])
     assert _cmd_enrich(settings) == 0
     assert con.execute("SELECT count(*) FROM value_index WHERE source_id = ?", [SOURCE_ID]).fetchone() == (0,)
+
+
+def test_examples_left_by_a_direct_build_are_cleared(tmp_path, model, fake, key_file):
+    """A store built over a direct connection before keeps that source's few-shot examples, whose SQL can carry
+    literals read with mnemiq's own credential; enriching the same source through Superset leaves none of them. Another
+    source's examples are its own build's to clear, and the ask path serves none of them in Superset mode either
+    (`test_superset_mode_serves_no_examples`)."""
+    settings = _settings(tmp_path, model, fake)
+    con = init_store(settings.store_path)
+    con.execute("CREATE TABLE IF NOT EXISTS example (question TEXT, sql TEXT, tables TEXT, object_id TEXT, "
+                "source_id TEXT, embedding FLOAT[3])")
+    for source_id in (SOURCE_ID, "acme"):
+        con.execute("INSERT INTO example VALUES ('claims in the south', ?, '[\"claim\"]', 'claim', ?, [1.0, 0.0, 0.0])",
+                    ["SELECT count(*) FROM claim WHERE region = 'Southmere'", source_id])
+    assert _cmd_enrich(settings) == 0
+    assert con.execute("SELECT source_id, count(*) FROM example GROUP BY source_id").fetchall() == [("acme", 1)]
 
 
 def test_superset_mode_serves_no_value_index(tmp_path, model, fake, no_direct_source):

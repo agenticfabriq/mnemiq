@@ -43,9 +43,9 @@ from mnemiq.superset.executor import (
     SupersetReadOnly,
     superset_executor,
 )
-from mnemiq.superset.grants import FixedGrants, resolve_grants
+from mnemiq.superset.grants import FixedGrants, GrantsUnreadable, resolve_grants
 from mnemiq.superset.history import superset_history
-from mnemiq.superset.settings import SUPERSET_DIALECT, SUPERSET_SOURCE_JOB
+from mnemiq.superset.settings import SUPERSET_DIALECT, SUPERSET_SOURCE_JOB, SupersetSnapshotRefused
 from mnemiq.verify.judge import SemanticJudge
 from mnemiq.verify.verifier import Verifier
 
@@ -176,15 +176,22 @@ class Runtime:
 
     def reload_if_stale(self) -> None:
         """Hot-swap the in-memory snapshot when the shared version pointer has advanced to a
-        version this replica already has locally. No-op without a control DSN."""
+        version this replica already has locally. No-op without a control DSN.
+
+        In Superset mode a newer snapshot Superset mode will not serve raises `SupersetSnapshotRefused`, on every
+        request until a snapshot it will serve is published: `ask`, `schema` and `scope` all call this there first."""
         if not self.settings or not self.settings.control_dsn:
             return
         snapshot, versions = load_current_snapshot(self.settings, self.con)
         if versions != self.loaded_versions:
             if self._superset_mode and (refusal := superset_source_refusal(snapshot, self.settings)) is not None:
-                # Held to the rule boot holds the first snapshot to. The snapshot already serving stays, and this
-                # request is refused rather than answered from one that may hold sample values.
-                raise SnapshotMissing(refusal)
+                # Held to the rule boot holds the first snapshot to. The snapshot already serving is kept in memory
+                # but answers nothing: this request is refused, on every door, rather than answered from a snapshot
+                # that may hold sample values, or from the one it was published to replace. Why goes to the log once
+                # here, and the person is told mnemiq's sentence.
+                logger.warning("Superset mode will not serve the snapshot published for source %r, so this request "
+                               "is refused: %s", snapshot.source_id, refusal)
+                raise SupersetSnapshotRefused(refusal)
             self.snapshot = snapshot
             self.loaded_versions = versions
             # Re-run every advisory whose SUBJECT is the snapshot, because the snapshot is
@@ -214,7 +221,8 @@ class Runtime:
             #
             # NOT once per swap on the threaded server, and this is measured from the code
             # rather than assumed: `build_app` closes over ONE runtime and serves it through
-            # two doors, `/v1/ask` as a sync `def` and `/v1/chat` through `run_in_executor`.
+            # two doors, `/v1/ask` as a sync `def` and `/v1/chat` through `run_in_executor`
+            # (three in Superset mode, where `/v1/schema` reloads first too, as a sync `def`).
             # Neither locks, and neither does this method -- so N workers can each pass the
             # version test above before any of them reaches the assignment, and each pays the
             # full walk and emits its own advisory line. The race predates
@@ -299,7 +307,7 @@ class Runtime:
             started = time.perf_counter()
             # What this person may read, as Superset decides when asked with their token: resolved once and handed to
             # everything that follows, as direct mode resolves the access policy's grants.
-            grants = resolve_grants(adapter, self.snapshot)
+            grants = self._superset_grants(adapter)
             authz = FixedGrants(grants)
             agent = agent.with_adapter(adapter)
         else:
@@ -341,6 +349,10 @@ class Runtime:
                 grants=grants,
             )
         if superset:
+            # No few-shot example is served, whatever the store holds, as no value index is (`NoValueIndex`): an
+            # example's SQL can carry a literal read with another credential, outside Superset's row rules, and the
+            # store keeps examples under any source id. Enrichment through Superset writes none of its own.
+            packet.examples = []
             # No row the client sent back is kept. The newest turn with SQL is decided again under these grants, with
             # the answering agent's own value index and fan-out setting, and run again through this request's adapter
             # within the answer statement's time limit, so "it" in a follow-up names rows this person may read now.
@@ -435,12 +447,23 @@ class Runtime:
     def _grants_for(self, identity: IdentityContext, delegation: DelegatedToken | None) -> GrantSet:
         """`identity`'s grants under the access policy, or in Superset mode what Superset says the person whose token
         `delegation` is may read, asked through an adapter built for this request. Superset mode refuses a request with
-        no token before asking anything."""
+        no token before asking anything, and reloads the snapshot first, as `ask` does there, so that the schema and
+        the answers are read from one snapshot, and a newer one it will not serve refuses both."""
         if not self._superset_mode:
             return self.authz.grants_for(identity)
         if delegation is None:
             raise SupersetCredentialMissing(_NO_DELEGATION)
-        return resolve_grants(superset_executor(self.settings, delegation), self.snapshot)
+        self.reload_if_stale()
+        return self._superset_grants(superset_executor(self.settings, delegation))
+
+    def _superset_grants(self, adapter) -> GrantSet:
+        """What Superset says the person whose token `adapter` carries may read. Raises `GrantsUnreadable` when that
+        could not be read from Superset: every door refuses then, rather than show an empty schema or defer with the
+        access policy's wording, since Superset mode holds no policy."""
+        grants = resolve_grants(adapter, self.snapshot)
+        if not grants.available:
+            raise GrantsUnreadable()
+        return grants
 
     def _cards(self, grants) -> list[dict]:
         """M4: this filtered on `oid in grants.objects` alone -- table level -- while promising

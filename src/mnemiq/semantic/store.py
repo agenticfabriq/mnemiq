@@ -93,6 +93,16 @@ def build_index(con: duckdb.DuckDBPyConnection, snapshot: Snapshot, embedder: Em
     return len(cards)
 
 
+def clear_example_index(con: duckdb.DuckDBPyConnection, source_id: str) -> None:
+    """Remove every example the index holds for `source_id`. Each build of the index clears its
+    source's first, and enrichment through Superset clears them in place of any build, since it
+    keeps no examples: none read over a direct connection before survive it."""
+    try:
+        con.execute("DELETE FROM example WHERE source_id = ?", [source_id])
+    except duckdb.CatalogException:
+        pass  # nothing built yet for any source -- nothing to clear
+
+
 def build_example_index(
     con: duckdb.DuckDBPyConnection, snapshot: Snapshot, embedder: Embedder
 ) -> int:
@@ -103,19 +113,13 @@ def build_example_index(
     empty-check-first, and width-mismatch-refused-before-clearing contract as build_index, above
     -- see its docstring for the reasoning.
     """
-    def _clear_stale() -> None:
-        try:
-            con.execute("DELETE FROM example WHERE source_id = ?", [snapshot.source_id])
-        except duckdb.CatalogException:
-            pass  # nothing built yet for any source -- nothing to clear
-
     if not snapshot.examples:
-        _clear_stale()
+        clear_example_index(con, snapshot.source_id)
         return 0
 
     dim = embedder.dim
     refuse_if_mismatched(con, "example", dim)
-    _clear_stale()
+    clear_example_index(con, snapshot.source_id)
     con.execute(_example_ddl(dim))
 
     vectors = embedder.embed([e.question for e in snapshot.examples])

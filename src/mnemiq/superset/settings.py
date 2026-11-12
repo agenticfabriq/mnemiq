@@ -33,6 +33,21 @@ SUPERSET_DIALECT = "postgres"
 # values that Superset's row rules would have kept from the person asking.
 SUPERSET_SOURCE_JOB = "superset:source"
 
+SNAPSHOT_REFUSED = ("This deployment's knowledge is not the one enriched for the Superset database it answers from, so "
+                    "nothing is answered until an operator enriches it through Superset; mnemiq's log records why.")
+
+
+class SupersetSnapshotRefused(Exception):
+    """A request refused because the snapshot published for it is one Superset mode will not serve (one the
+    `superset:source` job does not show was enriched through Superset from the configured database and schema). The
+    message is mnemiq's sentence for the person; `detail` says which rule the snapshot failed, which names the
+    deployment's own settings, and goes to the log only."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(SNAPSHOT_REFUSED)
+        self.detail = detail
+
+
 # The environment variable that turns on Superset mode, `Settings.superset_mcp_url` under its `MNEMIQ_` prefix.
 _SUPERSET_URL_VARIABLE = "MNEMIQ_SUPERSET_MCP_URL"
 

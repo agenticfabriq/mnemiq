@@ -395,6 +395,7 @@ def _cmd_enrich(settings: Settings) -> int:
     from mnemiq.enrichment.pipeline import enrich_structural
     from mnemiq.enrichment.semantic import enrich_semantic
     from mnemiq.llm.client import LLMClient
+    from mnemiq.semantic.store import clear_example_index
     from mnemiq.semantic.values import build_value_index, clear_value_index
     from mnemiq.store.bootstrap import init_store
     from mnemiq.store.snapshot_store import save_snapshot
@@ -511,6 +512,8 @@ def _cmd_enrich(settings: Settings) -> int:
     save_snapshot(con, snap)
     if superset:
         clear_value_index(con, snap.source_id)  # none harvested, and none left from a direct run
+        # Nor any few-shot example a direct build left, whose SQL can carry the literals it read.
+        clear_example_index(con, snap.source_id)
         n_values = 0
     else:
         n_values = build_value_index(adapter, snap, con)

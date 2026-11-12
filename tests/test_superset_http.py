@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -37,19 +39,23 @@ from mnemiq.superset.client import (
     SupersetUnavailable,
 )
 from mnemiq.superset.executor import SupersetCredentialMissing
-from mnemiq.superset.grants import NOT_A_BUILDER, NotABuilder, SupersetMisconfigured
+from mnemiq.superset.grants import NOT_A_BUILDER, GrantsUnreadable, NotABuilder, SupersetMisconfigured
 from mnemiq.superset.payload import SupersetAccessRefused
 from mnemiq.superset.service import SERVICE_KEY_ENV, service_credential_from_env
-from mnemiq.superset.settings import SupersetConfigError
+from mnemiq.superset.settings import SupersetConfigError, SupersetSnapshotRefused
 from tests.auth_keys import AUDIENCE, ISSUER, claims, jwks_for, mint, owui_claims, hs256, public_pem, raw_token, rsa_key
 from tests.scripted_deployment import SQL, retrieve_the_one_table
 from tests.superset_fake import FakeSuperset
 from tests.sweep.stub_model import StubModel
-from tests.test_superset_runtime import DATABASE_ID, _PROBE, _answer_rows, superset_deployment
+from tests.test_superset_runtime import DATABASE_ID, SOURCE_ID, _PROBE, _answer_rows, _snapshot, superset_deployment
 
 SIGN_IN = "Superset did not accept this sign-in; sign in to Superset again."
 DENIED = "Superset refused this request and did not say why; its log records the reason."
 ACCESS_REFUSED = "Superset refused access to something this request reads."
+GRANTS_UNREADABLE = ("Superset's answer about what this user may read could not be read, so nothing was answered; "
+                     "mnemiq's log records why.")
+SNAPSHOT_REFUSED = ("This deployment's knowledge is not the one enriched for the Superset database it answers from, so "
+                    "nothing is answered until an operator enriches it through Superset; mnemiq's log records why.")
 # Superset's own texts, as its MCP service renders them (`superset/mcp_service/auth.py` and
 # `superset/mcp_service/middleware.py`, `GlobalErrorHandlerMiddleware`).
 ROLE_DENIAL = "Permission denied: can_execute_sql_query on SQLLab for user west (tool: execute_sql)"
@@ -398,6 +404,10 @@ RAISED = {
                            "Superset mode answers each request as the person whose verified token it carries, and "
                            "this request carries none"),
     "read-only": (_read_only, 403, "read-only"),
+    "grants-unreadable": (GrantsUnreadable, 503, GRANTS_UNREADABLE),
+    # The detail names the deployment's settings, and must reach no one either.
+    "snapshot-refused": (lambda: SupersetSnapshotRefused(f"the snapshot was enriched elsewhere {SAID}"), 503,
+                         SNAPSHOT_REFUSED),
 }
 
 
@@ -484,6 +494,97 @@ def test_superset_mode_without_doors_refuses_every_ask_as_unsigned(tmp_path, mod
     r = client.post("/v1/chat", json={"question": "q"})
     assert _frames(r.text)[-1]["type"] == "RUN_ERROR"
     assert fake.calls == [] and model.calls == 0
+
+
+# --- what Superset mode cannot answer from ------------------------------------------------------------------------
+
+
+def _every_door(client) -> list:
+    """`/v1/ask` and `/v1/schema`, each asked once with a fresh token, and `/v1/chat`'s failure frame: what each door
+    answered."""
+    told = [_call(client, method, path, body, _bearer(_token()))
+            for method, path, body in [("post", "/v1/ask", {"question": "q"}), ("get", "/v1/schema", None)]]
+    return [*told, _refusal_in_band(client, _token())]
+
+
+def test_a_refused_snapshot_swap_is_503_on_every_door(server, fake, model, monkeypatch, caplog):
+    """A newer snapshot Superset mode will not serve refuses each request on every door with mnemiq's own sentence: a
+    503 on `/v1/ask` and `/v1/schema`, and on `/v1/chat` a failure in the stream. No door goes on serving the snapshot
+    that was serving while another refuses; Superset and the model are asked nothing; and why the snapshot was refused
+    goes to the log once per request, as a warning, and never to the person."""
+    client, runtime = server
+    serving = runtime.snapshot
+    runtime.settings = runtime.settings.model_copy(update={"control_dsn": "postgresql://control"})
+    monkeypatch.setattr(runtime_module, "load_current_snapshot",
+                        lambda settings, con: (_snapshot([], version="v2"), {SOURCE_ID: "v2"}))
+    why = "was not enriched through Superset"
+    with caplog.at_level(logging.INFO):
+        ask, schema, chat = _every_door(client)
+    for r in (ask, schema):
+        assert r.status_code == 503, r.text
+        assert r.json()["detail"] == SNAPSHOT_REFUSED and why not in r.text
+    assert chat["message"] == SNAPSHOT_REFUSED and why not in json.dumps(chat)
+    logged = [record for record in caplog.records if why in record.getMessage()]
+    assert len(logged) == 3 and {record.levelno for record in logged} == {logging.WARNING}
+    assert runtime.snapshot is serving
+    assert fake.calls == [] and model.calls == 0
+
+
+def _datasets_restricted(fake: FakeSuperset) -> None:
+    """A role Superset gives no access to the datasets' details: it refuses the grants' dry run, and answers
+    `list_datasets` with an error in place of a page."""
+    fake.reply("execute_sql", lambda request, authorization: {
+        "success": False, "rows": None, "columns": None, "error": f"You need access to the following tables: `wide` {SAID}",
+        "error_type": "TABLE_SECURITY_ACCESS_ERROR"})
+    fake.reply("list_datasets", lambda request, authorization: {
+        "error": f"You don't have permission to access dataset details for your role. {SAID}",
+        "error_type": "DataModelMetadataRestricted"})
+
+
+UNREADABLE_GRANTS = {
+    "datasets-restricted": _datasets_restricted,
+    "no-answer": lambda fake: fake.fail_http(502),
+}
+
+
+@pytest.mark.parametrize("unreadable", UNREADABLE_GRANTS.values(), ids=UNREADABLE_GRANTS.keys())
+def test_grants_superset_cannot_answer_are_503_on_every_door(server, fake, model, unreadable):
+    """When Superset's answer about what the person may read cannot be read, every door says so in mnemiq's words: a
+    503 on `/v1/ask` and `/v1/schema`, and on `/v1/chat` a failure in the stream. Never an empty schema, never the
+    access policy's wording (Superset mode holds no policy), and never Superset's own text."""
+    client, runtime = server
+    runtime.con.execute("CREATE TABLE IF NOT EXISTS semantic_object (object_id TEXT, card TEXT)")
+    runtime.con.execute("INSERT INTO semantic_object (object_id, card) VALUES ('wide', 'wide (col_0 TEXT)')")
+    unreadable(fake)
+    ask, schema, chat = _every_door(client)
+    for r in (ask, schema):
+        assert r.status_code == 503, r.text
+        assert r.json()["detail"] == GRANTS_UNREADABLE
+        assert SAID not in r.text and "policy" not in r.text.lower()
+    assert chat["message"] == GRANTS_UNREADABLE and SAID not in json.dumps(chat)
+    assert model.calls == 0
+
+
+def test_direct_mode_still_defers_an_unreadable_policy_in_its_own_words(tmp_path, model, monkeypatch):
+    """The control: in direct mode a policy file that cannot be read is still a deferral, a 200 whose sentence names
+    the policy as a configuration fault, and the schema still lists nothing."""
+    from tests.scripted_deployment import IDENTITY, deployment
+
+    retrieve_the_one_table(monkeypatch)
+    settings = deployment(tmp_path, model.url)
+    runtime = runtime_module.build_runtime(settings)
+    Path(settings.authz_path).write_text("not json")
+    runtime.con.execute("CREATE TABLE IF NOT EXISTS semantic_object (object_id TEXT, card TEXT)")
+    runtime.con.execute("INSERT INTO semantic_object (object_id, card) VALUES ('wide', 'wide (col_0 TEXT)')")
+    client = TestClient(app_module.build_app(runtime, IDENTITY))
+    r = client.post("/v1/ask", json={"question": "q"})
+    assert r.status_code == 200, r.text
+    assert r.json()["deferred"] is True and r.json()["reason_code"] == "policy_unavailable"
+    assert r.json()["answer"] == ("The authorization policy could not be read, so no access could be resolved. This is "
+                                  "a configuration fault, not a limit on your account.")
+    r = client.get("/v1/schema")
+    assert r.status_code == 200 and r.json()["tables"] == []
+    assert model.calls == 0
 
 
 # --- a token Superset stops accepting mid-ask -----------------------------------------------------------------------

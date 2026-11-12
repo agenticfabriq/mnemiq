@@ -26,16 +26,19 @@ from mnemiq.authz.grants import DenyAll
 from mnemiq.cache.store import NullCache, TwoTierCache
 from mnemiq.config import Settings
 from mnemiq.contract import Column, Snapshot
-from mnemiq.contract.semantic import Job, SourceBinding
+from mnemiq.contract.semantic import Example, Job, SourceBinding
+from mnemiq.llm.embeddings import LLMEmbedder
 from mnemiq.runtime import SnapshotMissing, build_runtime
+from mnemiq.semantic.retrieval import _retrieve_examples
+from mnemiq.semantic.store import build_example_index, build_index
 from mnemiq.store.bootstrap import init_store
-from mnemiq.store.snapshot_store import save_snapshot
+from mnemiq.store.snapshot_store import current_version, load_snapshot, save_snapshot
 from mnemiq.superset.client import Bearer, DelegatedToken, SupersetMcp
 from mnemiq.superset.executor import NoSourceConnection, SupersetCredentialMissing, superset_executor
-from mnemiq.superset.settings import SUPERSET_DIALECT, SUPERSET_SOURCE_JOB
+from mnemiq.superset.settings import SNAPSHOT_REFUSED, SUPERSET_DIALECT, SUPERSET_SOURCE_JOB, SupersetSnapshotRefused
 from tests.scripted_deployment import IDENTITY, SQL, deployment, retrieve_the_one_table
 from tests.superset_fake import FakeSuperset
-from tests.sweep.stub_model import ScriptedCase, StubModel
+from tests.sweep.stub_model import ScriptedCase, StubModel, embedding
 
 DATABASE_ID = 7
 SCHEMA = "public"
@@ -243,16 +246,26 @@ def test_boot_without_a_snapshot_refuses_before_any_source(tmp_path, model, fake
         build_runtime(superset_deployment(tmp_path, model.url, fake.url, snapshot=False))
 
 
-def test_a_swap_to_a_snapshot_enriched_elsewhere_is_refused(runtime, monkeypatch):
+def test_a_swap_to_a_snapshot_enriched_elsewhere_is_refused(runtime, fake, model, monkeypatch):
     """A newer published version is held to the rule boot holds the first one to: one enriched elsewhere is never
-    served, and the snapshot that was serving stays."""
+    served. The snapshot that was serving stays in memory, and answers nothing either: the ask, the schema and the
+    opening screen are each refused, before Superset is asked anything. Why is the refusal's detail; its message is
+    mnemiq's sentence."""
     serving = runtime.snapshot
     runtime.settings = runtime.settings.model_copy(update={"control_dsn": "postgresql://control"})
     monkeypatch.setattr(runtime_module, "load_current_snapshot",
                         lambda settings, con: (_snapshot([], version="v2"), {SOURCE_ID: "v2"}))
-    with pytest.raises(SnapshotMissing, match="was not enriched through Superset"):
+    with pytest.raises(SupersetSnapshotRefused) as refused:
         runtime.reload_if_stale()
+    assert str(refused.value) == SNAPSHOT_REFUSED and "was not enriched through Superset" in refused.value.detail
     assert runtime.snapshot is serving
+    for door in (lambda: runtime.ask("q", IDENTITY, delegation=DelegatedToken(TOKEN)),
+                 lambda: runtime.schema(IDENTITY, delegation=DelegatedToken(TOKEN)),
+                 lambda: runtime.scope(IDENTITY, delegation=DelegatedToken(TOKEN))):
+        with pytest.raises(SupersetSnapshotRefused):
+            door()
+    assert runtime.snapshot is serving
+    assert fake.calls == [] and model.calls == 0
 
 
 def test_a_swap_to_a_snapshot_enriched_through_superset_is_served(runtime, monkeypatch):
@@ -451,6 +464,70 @@ def test_history_reaches_the_prompt_without_the_rows_the_client_sent(runtime, mo
     prompts = [json.dumps(request) for request in model.requests]
     assert any("which region sold most" in prompt for prompt in prompts)  # the turn reached the prompt
     assert not any("east-secret-row" in prompt for prompt in prompts)
+
+
+# --- few-shot examples ------------------------------------------------------------------------------------------------
+
+# The question each stored example answers, and the literal its SQL carries, by the source id it is stored under: this
+# deployment's own, and another's, as a build over another source would leave it.
+EXAMPLE_QUESTION = "how many wide rows are there"
+EXAMPLE_LITERALS = {SOURCE_ID: "own-example-literal", "acme": "other-example-literal"}
+
+
+def _store_examples(settings: Settings) -> None:
+    """Index the store's snapshot as `mnemiq build` does, and store one example under each source id in
+    `EXAMPLE_LITERALS`, each reading `wide` and carrying its own literal."""
+    con = init_store(settings.store_path)
+    snapshot = load_snapshot(con, current_version(con, SOURCE_ID))
+    embedder = LLMEmbedder(settings)
+    build_index(con, snapshot, embedder)
+    for source_id, literal in EXAMPLE_LITERALS.items():
+        example = Example(question=EXAMPLE_QUESTION, sql=f"SELECT COUNT(*) AS n FROM wide WHERE col_0 = '{literal}'",
+                          tables=["wide"], object_id="wide")
+        build_example_index(con, snapshot.model_copy(update={"source_id": source_id, "examples": [example]}),
+                            embedder)
+    con.close()
+
+
+def test_superset_mode_serves_no_examples(tmp_path, model, fake, monkeypatch, no_direct_source):
+    """Superset mode serves no few-shot examples, whatever the store holds: an example's SQL can carry a literal read
+    with another credential, outside the asking person's row rules. One is stored under this deployment's source id
+    and one under another's, and the store's reading of examples serves both; yet no packet an agent of any profile
+    answers from carries either, and no prompt does."""
+    settings = superset_deployment(tmp_path, model.url, fake.url, profiles=PROFILES)
+    _store_examples(settings)
+    runtime = build_runtime(settings)
+    stored = _retrieve_examples(runtime.con, embedding(EXAMPLE_QUESTION), {"wide"}, k=5, not_raw=frozenset())
+    assert sorted(example.sql.split("'")[1] for example in stored) == sorted(EXAMPLE_LITERALS.values())
+    answered: list[list] = []
+    real_answer = Agent.answer
+
+    def recording_answer(self, packet, *args, **kwargs):
+        answered.append(list(packet.examples))
+        return real_answer(self, packet, *args, **kwargs)
+
+    monkeypatch.setattr(Agent, "answer", recording_answer)
+    asked = [(name, mode) for name, loaded in runtime.profiles.items() for mode in loaded.agents]
+    assert len(asked) == 4  # two profiles, two modes each
+    for name, mode in asked:
+        answer = runtime.ask(EXAMPLE_QUESTION, IDENTITY, mode=mode, profile=name, delegation=DelegatedToken(TOKEN))
+        assert not answer.deferred and not answer.failed, answer.answer
+    assert answered == [[]] * len(asked)
+    prompts = [json.dumps(request) for request in model.requests]
+    assert prompts and not any("WORKED EXAMPLES" in prompt for prompt in prompts)
+    assert not any(literal in prompt for prompt in prompts for literal in EXAMPLE_LITERALS.values())
+
+
+def test_direct_mode_serves_the_stores_examples(tmp_path, model):
+    """The control for `test_superset_mode_serves_no_examples`: examples stored the same way reach a direct-mode
+    prompt, so a prompt without them is one they were kept from."""
+    settings = deployment(tmp_path, model.url)
+    _store_examples(settings)
+    runtime = build_runtime(settings)
+    answer = runtime.ask(EXAMPLE_QUESTION, IDENTITY)
+    assert not answer.deferred and not answer.failed, answer.answer
+    prompts = [json.dumps(request) for request in model.requests]
+    assert any("WORKED EXAMPLES" in prompt and EXAMPLE_LITERALS[SOURCE_ID] in prompt for prompt in prompts)
 
 
 # --- the agent's copy -------------------------------------------------------------------------------------------------
