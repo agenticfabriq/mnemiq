@@ -90,7 +90,8 @@ VIEW_DIALECT = "postgres"
 
 class PostgresCatalogue:
     """The catalogue of `schema` in the Postgres database `rows` reads, in the shapes and order `SourceAdapter` gives
-    them. `rows` runs one statement and returns its rows, raising `ResultCut` when the answer was cut to size."""
+    them. `rows` runs one statement and returns its rows as the database has them now, never from a cache, raising
+    `ResultCut` when the answer was cut to size."""
 
     def __init__(self, rows: Callable[[str], list[tuple]], schema: str) -> None:
         self._rows = rows

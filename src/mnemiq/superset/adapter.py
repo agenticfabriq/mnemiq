@@ -2,12 +2,14 @@
 use as they use any other.
 
 Every statement runs as the person whose token the client carries, so Superset's permissions and row rules decide what
-it reads. The adapter sends the database, the schema, the statement and a time limit, and nothing else: no `limit`,
-which Superset would put in place of the statement's own LIMIT; no `template_params`; and nothing that asks Superset to
-skip its result cache.
+it reads. For a data statement the adapter sends the database, the schema, the statement and a time limit, and nothing
+else: no `limit`, which Superset would put in place of the statement's own LIMIT; no `template_params`; and nothing
+that asks Superset to skip its result cache, which keys a result on the statement after its row rules are applied and
+is consulted only once access is checked.
 
-The source's catalogue is read the same way, from Postgres's `pg_catalog` (`mnemiq.superset.pg_catalog`), and each part
-of it once per adapter.
+The source's catalogue is read the same way, from Postgres's `pg_catalog` (`mnemiq.superset.pg_catalog`), each part of
+it once per adapter, and each statement with `force_refresh`, so Superset runs it afresh rather than answer from its
+result cache.
 """
 
 from __future__ import annotations
@@ -41,9 +43,10 @@ class SupersetSqlAdapter:
     """Runs statements on one Superset database and schema through `client`, each within `timeout_s` unless the
     caller gives its own limit.
 
-    Each catalogue method reads its part of the catalogue on the first call and answers every later call with a copy of
-    what it read: `decide` reads the function inventory on every decision, and one adapter serves one request, so the
-    inventory is read live once per request. A read that raises is not remembered, and the next call asks again."""
+    Each catalogue method reads its part of the catalogue from the database on the first call, never from Superset's
+    result cache, and answers every later call with a copy of what it read: `decide` reads the function inventory on
+    every decision, and one adapter serves one request, so the inventory is read live once per request. A read that
+    raises is not remembered, and the next call asks again."""
 
     # The Postgres types with no equality operator, which `count(DISTINCT ...)` and `GROUP BY` refuse, as
     # `format_type` names them, upper-cased as profiling compares them. Profiling reads this in place of its table by
@@ -62,7 +65,7 @@ class SupersetSqlAdapter:
         return read_execute_response(self._execute_sql(sql, timeout_s))
 
     def execute(self, sql: str) -> list[tuple]:
-        return [tuple(row.values()) for row in self.execute_arrow(sql).to_pylist()]
+        return _tuples(self.execute_arrow(sql))
 
     def validate(self, sql: str) -> None:
         """The proof the proof seam asks for in place of `EXPLAIN`: the statement as a subquery that returns no rows.
@@ -112,7 +115,15 @@ class SupersetSqlAdapter:
 
     @cached_property
     def _catalogue(self) -> PostgresCatalogue:
-        return PostgresCatalogue(self.execute, self._schema)
+        return PostgresCatalogue(self._catalogue_rows, self._schema)
+
+    def _catalogue_rows(self, sql: str) -> list[tuple]:
+        """A catalogue statement's rows as the database has them now. Superset answers a statement it has run before
+        from its result cache unless the request says `force_refresh` (`_try_get_cached_result` in
+        `superset/sql/execution/executor.py`), for as long as a day by default, and a catalogue statement is the same
+        text every time. From the cache, a function created since would read as a builtin and pass the decider unseen,
+        and the pages of one read could come from different moments, skipping a row or repeating one."""
+        return _tuples(read_execute_response(self._execute_sql(sql, None, force_refresh=True)))
 
     @cached_property
     def _tables(self) -> tuple[str, ...]:
@@ -146,7 +157,8 @@ class SupersetSqlAdapter:
     def _virtual_columns(self) -> tuple[tuple[str, str, str], ...]:
         return tuple(self._catalogue.virtual_columns())
 
-    def _execute_sql(self, sql: str, timeout_s: float | None, *, dry_run: bool = False) -> dict:
+    def _execute_sql(self, sql: str, timeout_s: float | None, *, dry_run: bool = False,
+                     force_refresh: bool = False) -> dict:
         for delimiter in JINJA_DELIMITERS:
             if delimiter in sql:
                 raise SupersetQueryFailed(f"the statement holds {delimiter}, which Superset reads as a template "
@@ -155,7 +167,14 @@ class SupersetSqlAdapter:
         request = {"database_id": self._database_id, "sql": sql, "schema": self._schema, "timeout": limit}
         if dry_run:
             request["dry_run"] = True
+        if force_refresh:
+            request["force_refresh"] = True
         return self.client.call("execute_sql", request, timeout_s=limit + TRANSPORT_MARGIN_S)
+
+
+def _tuples(table: pa.Table) -> list[tuple]:
+    """`table`'s rows as tuples, each in column order."""
+    return [tuple(row.values()) for row in table.to_pylist()]
 
 
 def _superset_timeout(timeout_s: float) -> int:

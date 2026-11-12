@@ -60,6 +60,30 @@ def test_request_names_database_schema_and_timeout():
     assert adapter.dialect == SUPERSET_DIALECT == "postgres"
 
 
+def test_data_statements_never_force_refresh():
+    """Only the catalogue asks Superset to skip its result cache. A data statement may be answered from it: Superset
+    keys a cached result on the statement after its row rules are applied, and checks access before it looks. Asked on
+    an adapter that has already read its catalogue, so a catalogue read cannot change what a data statement sends."""
+
+    def answer(request: dict) -> dict:
+        if "pg_catalog" in request["sql"]:
+            return {"success": True, "rows": [], "columns": [{"name": "function_name", "type": "object"}]}
+        return DRY_RUN if request.get("dry_run") else REGION_COUNTS
+
+    adapter = _adapter(answer)
+    adapter.user_functions()
+    assert adapter.client.calls[0].request["force_refresh"] is True
+    adapter.execute_arrow(SQL)
+    adapter.execute(SQL)
+    adapter.validate(SQL)
+    adapter.dry_run(SQL)
+    data = [call.request for call in adapter.client.calls[1:]]
+    assert len(data) == 4
+    for request in data:
+        assert "force_refresh" not in request
+        assert set(request) - {"dry_run"} == {"database_id", "sql", "schema", "timeout"}
+
+
 def test_execute_returns_rows_as_tuples_in_column_order():
     assert _adapter().execute(SQL) == [("west", 16666)]
 

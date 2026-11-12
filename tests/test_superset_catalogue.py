@@ -354,6 +354,24 @@ def test_user_functions_span_schemas_reachable_ones_do_not():
     assert catalogue.builtin_functions() == ["count", "median"]
 
 
+def test_catalogue_reads_bypass_superset_cache():
+    """Superset answers a statement it has run before from its result cache unless the request says `force_refresh`
+    (`_try_get_cached_result` in `superset/sql/execution/executor.py`), and a catalogue statement is the same text every
+    time: a function created since the cached answer would read as a builtin. So every catalogue request, every page of
+    it, has Superset run the statement afresh."""
+    rows = {method: [tuple(f"{column}_1" for column in COLUMNS[method])] for method in METHODS}
+    rows["builtin_functions"] = [(f"fn{i:04}",) for i in range(2 * PAGE_ROWS + 3)]
+    source = Catalogue(**rows)
+    adapter = _adapter(source)
+    for method in ADAPTER_METHODS:
+        getattr(adapter, method)()
+    read = [source.statements[_paging(call.request["sql"])[0]] for call in adapter.client.calls]
+    assert sorted(set(read)) == sorted(METHODS) and read.count("builtin_functions") == 3
+    for call in adapter.client.calls:
+        assert call.request == {"database_id": 7, "sql": call.request["sql"], "schema": "sales", "timeout": 30,
+                                "force_refresh": True}
+
+
 def test_function_inventory_is_read_once_per_adapter():
     """`decide` reads the function inventory on every decision, and an adapter lives for one request, so each part of
     it is read once per adapter."""
