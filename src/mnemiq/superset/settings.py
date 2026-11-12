@@ -10,6 +10,7 @@ whatever log the operator keeps.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
@@ -31,6 +32,9 @@ SUPERSET_DIALECT = "postgres"
 # values that Superset's row rules would have kept from the person asking.
 SUPERSET_SOURCE_JOB = "superset:source"
 
+# The environment variable that turns on Superset mode, `Settings.superset_mcp_url` under its `MNEMIQ_` prefix.
+_SUPERSET_URL_VARIABLE = "MNEMIQ_SUPERSET_MCP_URL"
+
 # Catalogue queries write the schema into their SQL as a string literal, so it is held to a plain identifier.
 _PLAIN_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # The hosts that name this machine, where a token sent over http goes no further than loopback.
@@ -42,12 +46,20 @@ class SupersetConfigError(SystemExit):
 
 
 def refuse_a_direct_source(settings: Settings | None) -> None:
-    """Raise when `settings` are in Superset mode. Every place mnemiq opens a connection to the deployment's configured
-    source calls this first (`source_adapter`, `adapter_for` and `run_acme`), so a deployment configured for Superset
-    never reads that source with mnemiq's own credential instead."""
-    if settings is not None and settings.superset_mode:
+    """Raise in Superset mode: when `settings` are in it, or, with no settings given, when the environment sets
+    MNEMIQ_SUPERSET_MCP_URL. Every place mnemiq opens a connection to the deployment's configured source calls this
+    first (`source_adapter`, `adapter_for` and `run_acme`), so a deployment configured for Superset never reads that
+    source with mnemiq's own credential instead, whether or not its caller passed the settings along."""
+    superset_mode = settings.superset_mode if settings is not None else _superset_url_in_environment()
+    if superset_mode:
         raise SupersetConfigError("MNEMIQ_SUPERSET_MCP_URL is set, and Superset mode runs every query through Superset "
                                   "and opens no database connection of its own")
+
+
+def _superset_url_in_environment() -> bool:
+    """Whether the environment sets MNEMIQ_SUPERSET_MCP_URL to anything but blank, read as `Settings` reads it: its
+    name matched in any case, and a blank value read as unset, as `Settings.superset_mode` reads one."""
+    return any(name.upper() == _SUPERSET_URL_VARIABLE and value.strip() for name, value in os.environ.items())
 
 
 def check_superset_settings(settings: Settings, auth: AuthConfig | None) -> None:

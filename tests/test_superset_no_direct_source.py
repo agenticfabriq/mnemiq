@@ -24,8 +24,9 @@ DSN = "postgresql://reader@127.0.0.1:5432/warehouse"
 
 @pytest.fixture(autouse=True)
 def _no_mnemiq_environment(monkeypatch):
-    """`Settings()` reads the environment: a variable set in the shell running the tests must not decide them."""
-    for name in [n for n in os.environ if n.startswith("MNEMIQ_") and n != "MNEMIQ_STORE_PATH"]:
+    """`Settings()` reads the environment, matching each name in any case: a variable set in the shell running the
+    tests must not decide them."""
+    for name in [n for n in os.environ if n.upper().startswith("MNEMIQ_") and n.upper() != "MNEMIQ_STORE_PATH"]:
         monkeypatch.delenv(name)
 
 
@@ -78,6 +79,25 @@ def test_adapter_for_refuses_in_superset_mode(built):
     settings = Settings(superset_mcp_url=URL, superset_database_id=1, pg_dsn=DSN)
     _refused(lambda: resolve.adapter_for(settings.source_specs()[0], settings))
     assert built == []
+
+
+@pytest.mark.parametrize("name", ["MNEMIQ_SUPERSET_MCP_URL", "mnemiq_superset_mcp_url"])
+def test_adapter_for_without_settings_reads_the_url_from_the_environment(built, monkeypatch, name):
+    """A caller that passes no settings meets the same refusal: the URL is read from the environment as `Settings`
+    reads it, its name in any case, so `adapter_for(spec)` alone never opens a direct connection in Superset mode."""
+    spec = Settings(pg_dsn=DSN).source_specs()[0]
+    monkeypatch.setenv(name, URL)
+    _refused(lambda: resolve.adapter_for(spec))
+    assert built == []
+
+
+@pytest.mark.parametrize("unset", [None, "", "   "])
+def test_adapter_for_without_settings_builds_as_before_when_the_url_is_unset(built, monkeypatch, unset):
+    spec = Settings(pg_dsn=DSN).source_specs()[0]
+    if unset is not None:
+        monkeypatch.setenv("MNEMIQ_SUPERSET_MCP_URL", unset)
+    assert isinstance(resolve.adapter_for(spec), _Built)
+    assert len(built) == 1
 
 
 def test_a_sources_manifest_is_refused_before_federation(built, tmp_path):
