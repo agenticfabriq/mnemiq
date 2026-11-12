@@ -971,7 +971,7 @@ _PATTERNS = (exp.Like, exp.ILike, exp.SimilarTo, exp.Glob, exp.RegexpLike, exp.R
 # DATE is an affinity over text, so a date string there is a text comparison and a format mismatch
 # returns nothing (a BIRD world comparing '2013/09' with '2013-09'), nor an engine whose string to
 # date conversion follows a session format (Oracle's NLS_DATE_FORMAT). Elsewhere such a value stays
-# unchecked. Validated here, not left to the engine: DuckDB compares no row against `d = 'garbage'`
+# unchecked; Oracle's spellings that need no session format are read apart (`_oracle_day_form`). Validated here, not left to the engine: DuckDB compares no row against `d = 'garbage'`
 # and `DATE 'garbage' < d` when an earlier filter has removed every row, and returns the empty
 # result without an error (measured on 1.5.4) -- the empty case exactly.
 #
@@ -1099,6 +1099,47 @@ def _moment(text: str) -> str | None:
     return "timestamp" if parsed.tzinfo is None else "timestamptz"
 
 
+# A parse format naming the day alone (Oracle's TO_DATE 'YYYY-MM-DD', as sqlglot translates it).
+_DAY_FORMATS = frozenset({"%Y-%m-%d"})
+
+
+def _day(node: exp.Expression) -> exp.Literal | None:
+    """The string literal of a date-only bound, in one of the spellings that mean midnight of that
+    day, else None: a plain string; a CAST or TRY_CAST of one to a date or a naive timestamp; a
+    DATE literal as Oracle parses it; a parse whose format names the day alone."""
+    inner = None
+    if isinstance(node, exp.Literal):
+        inner = node
+    elif isinstance(node, (exp.Cast, exp.TryCast)):
+        if _temporal_kind(node.args.get("to"), None) in ("date", "timestamp"):
+            inner = node.this
+    elif isinstance(node, exp.DateStrToDate):
+        inner = node.this
+    elif isinstance(node, (exp.StrToDate, exp.StrToTime)):
+        fmt = node.args.get("format")
+        if isinstance(fmt, exp.Literal) and fmt.is_string and fmt.this in _DAY_FORMATS:
+            inner = node.this
+    if isinstance(inner, exp.Literal) and inner.is_string and _iso_date(inner.this):
+        return inner
+    return None
+
+
+# The spellings of a day Oracle reads without a session format (NLS_DATE_FORMAT, which a plain
+# string or a CAST of one follows): the DATE literal, which sqlglot reads as a DateStrToDate, and a
+# parse whose format names the day alone (TO_DATE or TO_TIMESTAMP with 'YYYY-MM-DD'). Each still
+# reads its year, month and day in the session's NLS_CALENDAR when it runs -- measured on Oracle 23
+# Free, `TO_DATE('2024-03-03', 'YYYY-MM-DD')` is 1481-03-03 under Thai Buddha, 2645-05-24 under
+# Persian, and sqlglot prints the DATE literal for Oracle as that TO_DATE -- so a day counts only
+# where the adapter pins every statement's session to Gregorian (`gregorian`).
+_ORACLE_DAY_FORMS = (exp.DateStrToDate, exp.StrToDate, exp.StrToTime)
+
+
+def _oracle_day_form(node: exp.Expression | None, gregorian: bool) -> exp.Literal | None:
+    """The day literal of `node` when it is an Oracle day spelling `_day` reads and the session
+    reads it as that Gregorian day (`gregorian`); else None."""
+    return _day(node) if gregorian and isinstance(node, _ORACLE_DAY_FORMS) else None
+
+
 _T = exp.DataType.Type
 _NAIVE_TIMESTAMPS = tuple(getattr(_T, n) for n in (
     "TIMESTAMP", "TIMESTAMPNTZ", "TIMESTAMP_S", "TIMESTAMP_MS", "TIMESTAMP_NS", "DATETIME",
@@ -1221,6 +1262,7 @@ def ground_values(
     types: dict[str, dict[str, str]] | None = None,
     render_as: str | None = None,
     row_filtered: set[str] | None = None,
+    gregorian: bool = False,
 ) -> ValueGrounding:
     """Every string literal of the statement, wherever it sits, each with what checked it (M146).
 
@@ -1235,16 +1277,20 @@ def ground_values(
     it (`names_one_object`). TYPED only where a date-only ISO string or a DATE literal is directly
     compared with bare columns all proven DATE (`_ISO_DATES_READ_AS_DATES`, `types`), a plain
     date-only string is the half-open start or end of a range on a bare naive TIMESTAMP column
-    (`_half_open`), or a well-formed interval with a bare date or time column. UNCHECKED everywhere else: a pattern, a
-    text range, a date against anything but a proven DATE, another typed literal, a value compared
-    with an expression or with nothing, a column the resolver cannot place, one with no indexed
-    values, or no index at all (`values` None).
+    (`_half_open`), an Oracle day spelling (`_oracle_day_form`, only when `gregorian`: the adapter
+    pins every statement's session to that calendar) on the same half-open terms on a bare naive
+    TIMESTAMP or Oracle DATE column, or a well-formed interval with a bare date or time
+    column. UNCHECKED everywhere else: a pattern, a text range, a date against anything but a
+    proven DATE, another typed literal, a value compared with an expression or with nothing, a
+    column the resolver cannot place, one with no indexed values, or no index at all (`values`
+    None).
 
     `dialect` resolves names, as `check_values` is given the target; `render_as` writes the
     filters and the never-true predicate in the dialect the caller is shown (the plan's).
     """
     resolve = _resolver(ast, visible, dialect)
     dates = (dialect or "").lower() in _ISO_DATES_READ_AS_DATES
+    oracle = (dialect or "").lower() == "oracle"
     render_as = dialect if render_as is None else render_as
     hidden_rows = row_filtered or set()
 
@@ -1370,8 +1416,32 @@ def ground_values(
             return TYPED, "", column
         return UNCHECKED, "interval", column
 
+    def oracle_day(form: exp.Expression) -> tuple[str, str, str | None]:
+        """An Oracle day spelling (`_oracle_day_form`) is a bound only as the half-open start or end of
+        a range on a bare column holding times: a naive TIMESTAMP, or a DATE, which holds a time of
+        day on Oracle. Midnight is what such a range means there, as `against` reads a plain date
+        string on engines that read one as a date. Anything else is unchecked."""
+        partners = compared_with(form) or []
+        spots = [place(p) if isinstance(p, exp.Column) else None for p in partners]
+        if not partners or None in spots:
+            return UNCHECKED, "not_on_a_date_column", None
+        for spot in spots:
+            why = withheld(*spot)
+            if why is not None:
+                return UNCHECKED, why, f"{spot[0]}.{spot[1]}"
+        column = f"{spots[0][0]}.{spots[0][1]}"
+        held = [kind(*spot) for spot in spots]
+        if any(h not in ("date", "time", *_TIMESTAMP_KINDS) for h in held):
+            return UNCHECKED, "not_on_a_date_column", column
+        if (isinstance(form.parent, _RANGES) and _half_open(form.parent, form)
+                and held[0] in ("date", "timestamp")):
+            return TYPED, "", column
+        return UNCHECKED, "date_on_time", column
+
     def classify(literal: exp.Literal) -> tuple[str, str, str | None]:
         parent, text = literal.parent, literal.this
+        if oracle and _oracle_day_form(parent, gregorian) is literal:
+            return oracle_day(parent)
         if isinstance(parent, exp.Cast) and parent.this is literal:
             to = _temporal_kind(parent.to, dialect)
             if to == "date":
@@ -1425,6 +1495,8 @@ def ground_values(
             # subscript, a wildcard, a slice or a union carry no text, and `(j->'$[9]') IS NOT NULL`
             # over `[42]` passed with no value to name. The whole path is one unchecked value.
             found.append(FilterValue(_written_as(node, render_as), UNCHECKED, "json_path", None))
+        elif oracle and node.arg_key == "format" and _oracle_day_form(node.parent, gregorian) is not None:
+            continue  # the format of an Oracle day form, which its day literal stands for
         elif isinstance(node, exp.Literal) and node.is_string:
             outcome, why, column = classify(node)
             found.append(FilterValue(node.this, outcome, why, column,

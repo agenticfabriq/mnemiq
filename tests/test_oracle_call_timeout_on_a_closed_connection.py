@@ -126,6 +126,7 @@ class _Pool:
 def _pooled(con, read_only=True):
     adapter = OracleAdapter.__new__(OracleAdapter)
     adapter._oracledb = oracledb
+    adapter._probe_timeout_ms = 0  # no bound to borrow, so the calendar pin writes no timeout of its own
     adapter._pool, adapter._con, adapter._closed = _Pool(con), None, False
     adapter._read_only, adapter._ro_ttl_s, adapter._ro_state = read_only, 0.0, "unknown"
     adapter._ro_checked_at = adapter._ro_attempted_at = None

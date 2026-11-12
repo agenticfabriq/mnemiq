@@ -92,6 +92,7 @@ def decide(
     views: dict[str, ViewDefinition] | None = None,
     keys: KeyFacts | None = None,
     types: dict[str, dict[str, str]] | None = None,
+    gregorian_calendar: bool = False,
 ) -> Verdict:
     """The deterministic decider: shape, then access, then proof against the real source.
 
@@ -253,7 +254,8 @@ def decide(
     try:
         value_grounding = ground_values(shaped, visible, values, masks=policy.masks,
                                         dialect=target, types=types, render_as=dialect,
-                                        row_filtered=set(policy.row_filters))
+                                        row_filtered=set(policy.row_filters),
+                                        gregorian=gregorian_calendar)
     except Exception:  # an advisory fact whose absence fails closed; logged, never swallowed quietly
         logger.warning("value grounding could not be read; an empty result will be declined",
                        exc_info=True)

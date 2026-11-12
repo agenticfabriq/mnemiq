@@ -656,3 +656,29 @@ def test_a_source_fault_that_survives_every_attempt_is_still_a_source_fault():
             assert outcome.code is DeferralReason.UNGOVERNABLE, outcome.code
             assert "attempts" not in outcome.reason
             assert len(generator.calls) == 3, "it did use the whole budget"
+
+
+def test_the_decider_is_told_whether_the_adapters_sessions_read_dates_in_gregorian(monkeypatch):
+    """Oracle reads TO_DATE in the session's calendar, so the grounding trusts one only where the
+    adapter pins its sessions to Gregorian (`OracleAdapter.gregorian_calendar`). The flag comes from
+    the adapter itself: an adapter that does not say so gets False."""
+    import mnemiq.generate.plan_query as module
+
+    seen = []
+
+    class _Stop(Exception):
+        pass
+
+    def recording(*args, **kwargs):
+        seen.append(kwargs.get("gregorian_calendar"))
+        raise _Stop
+
+    monkeypatch.setattr(module, "decide", recording)
+
+    class Pinned:
+        gregorian_calendar = True
+
+    for adapter in (Pinned(), object(), None):
+        with pytest.raises(_Stop):
+            _plan(['{"sql": "SELECT claim_identifier FROM CLAIM"}'], adapter=adapter)
+    assert seen == [True, False, False]

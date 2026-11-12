@@ -95,6 +95,9 @@ class _FakeCon:
     def is_healthy(self):
         return True  # read before every timeout write (`_set_call_timeout`), as a real one has it
 
+    def cursor(self):
+        return _SessionCursor([])  # the lease's calendar pin (`_pin_calendar`)
+
 
 class _FakePool:
     def __init__(self, con):
@@ -114,8 +117,11 @@ def _leased(pool):
     """An adapter that owns nothing but the lease logic. NO DATABASE: what is under test is the
     lease's control flow, which is pure Python -- an earlier version drove it through a real pool
     and failed only inside the full suite, on timing that had nothing to do with the behaviour."""
+    import oracledb
+
     a = OracleAdapter.__new__(OracleAdapter)
-    a._pool, a._con, a._closed = pool, None, False
+    a._pool, a._con, a._closed, a._oracledb = pool, None, False, oracledb
+    a._probe_timeout_ms = 0  # no bound to borrow, so the calendar pin writes no timeout of its own
     a._read_only, a._ro_ttl_s, a._ro_state, a._ro_checked_at = True, 0.0, "unknown", None
     a._lock = threading.RLock()
     return a
@@ -639,3 +645,89 @@ def test_the_first_reprobe_runs_on_a_freshly_booted_host(monkeypatch):
     con = _ProbeFails()
     a._recheck_read_only(con)
     assert con.closed == 1, "the first lease on a freshly-booted host did not probe"
+
+
+
+class _SessionCursor:
+    def __init__(self, ran, con=None):
+        self.ran, self.con = ran, con
+
+    def execute(self, sql, *args, **kwargs):
+        self.ran.append(sql)
+        if self.con is not None:
+            self.con.bounds.append(self.con.call_timeout)
+
+    def close(self):
+        pass
+
+
+class _SessionConnection:
+    def __init__(self):
+        self.ran, self.bounds = [], []
+        self.call_timeout = 0
+
+    def cursor(self):
+        return _SessionCursor(self.ran, self)
+
+    def is_healthy(self):
+        return True
+
+
+def test_every_lease_reads_dates_in_the_gregorian_calendar(monkeypatch):
+    """Oracle reads a date's year, month and day in the session's NLS_CALENDAR (1481-03-03 for
+    '2024-03-03' under Thai Buddha, measured), and a pooled session outlives the lease that changed
+    it. So every lease pins its session to Gregorian before the caller's first statement, the same
+    session again on the next lease. A read-only adapter says so for the value grounding, since its
+    gate refuses the ALTER SESSION that would undo the pin within a lease; a writable one, or one
+    over someone else's connection, does not."""
+    import oracledb
+    session = _SessionConnection()
+    pool = mock.Mock()
+    pool.acquire.return_value = session
+    monkeypatch.setattr(oracledb, "create_pool", lambda **kw: pool)
+    a = OracleAdapter("h:1521/X", "owner", "p", read_only=False)
+    for _ in range(2):
+        with a._lease() as con:
+            con.cursor().execute("SELECT 1 FROM dual")
+    assert session.ran == ["ALTER SESSION SET NLS_CALENDAR = 'GREGORIAN'", "SELECT 1 FROM dual"] * 2
+    assert a.gregorian_calendar is False
+    assert OracleAdapter("h:1521/X", "reader", "p").gregorian_calendar is True
+    assert OracleAdapter.over(mock.Mock(), oracledb, "owner").gregorian_calendar is False
+    with pytest.raises(mod.ReadOnlyViolation):
+        OracleAdapter("h:1521/X", "reader", "p").execute("ALTER SESSION SET NLS_CALENDAR = 'Thai Buddha'")
+
+
+def test_a_lease_whose_calendar_cannot_be_pinned_reads_as_the_source_not_answering(monkeypatch):
+    """The pin runs before the caller's statement, so its fault is the source's, as at acquire."""
+    import oracledb
+
+    class Dead(_SessionConnection):
+        def cursor(self):
+            cur = mock.Mock()
+            cur.execute.side_effect = oracledb.DatabaseError("a fault no code list names")
+            return cur
+
+    pool = mock.Mock()
+    pool.acquire.return_value = Dead()
+    monkeypatch.setattr(oracledb, "create_pool", lambda **kw: pool)
+    a = OracleAdapter("h:1521/X", "owner", "p", read_only=False)
+    with pytest.raises(oracledb.DatabaseError) as raised:
+        with a._lease():
+            pass
+    assert mod.unavailable_fault(raised.value)
+
+
+def test_the_calendar_pin_is_bounded_and_hands_back_the_leases_own_bound(monkeypatch):
+    """A data query's lease carries no bound until its cursor sets one, so the pin borrows the
+    probe timeout, as the read-only recheck does, and leaves the lease's bound as it found it."""
+    import oracledb
+    session = _SessionConnection()
+    pool = mock.Mock()
+    pool.acquire.return_value = session
+    monkeypatch.setattr(oracledb, "create_pool", lambda **kw: pool)
+    a = OracleAdapter("h:1521/X", "owner", "p", read_only=False, probe_timeout_s=7.0)
+    for lease_bound in (None, 2500):
+        session.bounds.clear()
+        with a._lease(lease_bound) as con:
+            assert con.call_timeout == (lease_bound or 0)
+        assert session.bounds == [7000]

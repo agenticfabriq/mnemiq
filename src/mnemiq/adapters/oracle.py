@@ -51,6 +51,12 @@ class OracleAdapter:
     """
 
     dialect = "oracle"
+    # Whether every statement this adapter runs reads a date in the Gregorian calendar: each lease
+    # of the pool pins its session first (`_pin_calendar`), so nothing one lease does reaches the
+    # next, and within a lease a read-only adapter's gate refuses the ALTER SESSION that would
+    # change it (Codex's reviews). A writable adapter runs a caller's ALTER, and one `over()`
+    # someone else's connection leaves their session as it is, so neither says so.
+    gregorian_calendar = False
 
     def __init__(self, dsn: str, user: str, password: str, schema: str | None = None,
                  read_only: bool = True, config_dir: str | None = None,
@@ -156,6 +162,7 @@ class OracleAdapter:
             ping_interval=60,
             session_callback=self._configure_session, **extra)
         self._con = None  # `over()` sets this; a pooled adapter has no one connection
+        self.gregorian_calendar = read_only  # see the class attribute and `_pin_calendar`
         self._closed = False
         # `constrained` expires: see `_recheck_read_only`.
         self._ro_ttl_s = read_only_ttl_s
@@ -208,6 +215,36 @@ class OracleAdapter:
             cur.execute(f'ALTER SESSION SET CURRENT_SCHEMA = "{self._session_schema}"')
         finally:
             cur.close()
+
+    def _pin_calendar(self, connection) -> None:
+        """Set the session's calendar to Gregorian, at the start of every lease.
+
+        Oracle reads a date's year, month and day in the session's NLS_CALENDAR, which a logon
+        trigger or the database's own default can set: measured on Oracle 23 Free,
+        `TO_DATE('2024-03-03', 'YYYY-MM-DD')` is 1481-03-03 under Thai Buddha and 2645-05-24 under
+        Persian, and sqlglot prints a `DATE '...'` literal for Oracle as that TO_DATE. The model
+        writes the dates a question names, the day-bound rewrite writes the next day from Python's
+        calendar, and the value grounding trusts a date only on this (`gregorian_calendar`).
+
+        Per lease, not once per session as `_configure_session` is: a pooled session outlives the
+        lease that changed its calendar, and an inline function with an autonomous transaction can
+        change it from a statement that leads with WITH (Codex's third review). 0.13 ms a call,
+        measured on the local database.
+
+        Bounded by the probe timeout, as `_recheck_read_only` is, then given back the lease's: a
+        data query's lease carries no bound until its cursor sets one, so an unbounded pin on a
+        wedged session would hold a pooled connection (Codex's fourth review).
+        """
+        previous = connection.call_timeout
+        cur = connection.cursor()
+        try:
+            if self._probe_timeout_ms:
+                _set_call_timeout(connection, self._probe_timeout_ms)
+            cur.execute("ALTER SESSION SET NLS_CALENDAR = 'GREGORIAN'")
+        finally:
+            cur.close()
+        if self._probe_timeout_ms:
+            _set_call_timeout(connection, previous)
 
     @classmethod
     def over(cls, connection, oracledb_module, schema: str, read_only: bool = True) -> "OracleAdapter":
@@ -363,6 +400,12 @@ class OracleAdapter:
             # pool runs out: one poisoned session becomes DPY-4005 for every healthy request,
             # which is M72's own failure mode reintroduced by M72's fix.
             _set_call_timeout(con, timeout_ms or 0)
+            try:
+                self._pin_calendar(con)
+            except (self._oracledb.Error, OSError) as exc:
+                # Before the caller's statement, so the fault is the source's, as at acquire.
+                _mark_acquire_fault(exc)
+                raise
             self._recheck_read_only(con)
             yield con
         finally:
