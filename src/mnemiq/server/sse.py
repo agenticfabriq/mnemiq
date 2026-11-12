@@ -14,6 +14,7 @@ from mnemiq.agent.route import UnknownMode
 from mnemiq.profiles import UnknownProfile
 from mnemiq.server.pump import HEARTBEAT, EnginePump
 from mnemiq.server.serialize import answer_payload, result_payload
+from mnemiq.server.superset_refusals import superset_refusal
 
 
 def frame(payload: dict) -> str:
@@ -66,12 +67,17 @@ _OPAQUE = "The engine could not complete this request."
 
 
 async def chat_stream(runtime, identity, question: str, mode: str | None,
-                      heartbeat_s: float = 15.0, history=None, profile: str | None = None):
+                      heartbeat_s: float = 15.0, history=None, profile: str | None = None, delegation=None):
+    """The run's frames. `delegation`, in Superset mode, is the token the door verified, handed to the runtime with the
+    question; the pump runs the ask on a worker thread, where the Superset client may start an event loop of its own.
+    """
     run_id, msg_id = uuid4().hex, uuid4().hex
     yield frame({"type": "RUN_STARTED", "runId": run_id})
 
+    handed = {} if delegation is None else {"delegation": delegation}
     pump = EnginePump(
-        lambda emit: runtime.ask(question, identity, mode=mode, emit=emit, history=history, profile=profile),
+        lambda emit: runtime.ask(question, identity, mode=mode, emit=emit, history=history, profile=profile,
+                                 **handed),
         heartbeat_s,
     )
     async for item in pump.events():
@@ -85,10 +91,17 @@ async def chat_stream(runtime, identity, question: str, mode: str | None,
     try:
         ans = pump.result()
     except Exception as exc:  # engine failure -> in-band error, stream ends
-        # Logged with the traceback and the run id BEFORE anything is yielded, so a
-        # failure is diagnosable even if the client hangs up on the next frame.
-        logger.exception("chat run %s failed", run_id)
-        message = _CALLER_FACING.get(type(exc), _OPAQUE)
+        # Logged with the run id BEFORE anything is yielded, so a failure is diagnosable even if
+        # the client hangs up on the next frame. A refusal from Superset is a stated outcome, said
+        # with the sentence the same refusal gets on /v1/ask; anything else keeps its traceback.
+        refused = superset_refusal(exc)
+        if refused is not None:
+            logger.info("chat run %s ended as %d for %s: %s", run_id, refused.status, type(exc).__name__,
+                        refused.detail)
+            message = refused.detail
+        else:
+            logger.exception("chat run %s failed", run_id)
+            message = _CALLER_FACING.get(type(exc), _OPAQUE)
         yield frame({"type": "RUN_ERROR", "message": message, "runId": run_id})
         return
 

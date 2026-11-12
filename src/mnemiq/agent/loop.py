@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 import time
 from dataclasses import dataclass, replace
@@ -290,6 +291,17 @@ class Agent:
         # end-to-end -- no cross-dialect transpile gap (SQLGlot can't map DuckDB YEAR()/
         # EXTRACT to SQLite strftime). The generator is constructed with the same dialect.
         self.dialect = getattr(adapter, "dialect", "duckdb")
+
+    def with_adapter(self, adapter) -> Agent:
+        """This agent with its statements run through `adapter`, every other part shared: a copy, so a request that
+        brings an adapter of its own never changes the agent another request is answered by. The model writes and
+        `decide` parses in this agent's dialect, so an adapter that runs another is refused (`ValueError`)."""
+        dialect = getattr(adapter, "dialect", "duckdb")
+        if dialect != self.dialect:
+            raise ValueError(f"this agent writes {self.dialect} SQL, and the adapter runs {dialect}")
+        twin = copy.copy(self)
+        twin.adapter = adapter
+        return twin
 
     def decline_if_too_long(self, question: str) -> AgentAnswer | None:
         """The decline for a question too long to read whole, or None. Every stage reads the question whole, so

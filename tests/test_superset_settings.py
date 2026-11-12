@@ -103,6 +103,15 @@ def test_refuses_writes():
     _refused("MNEMIQ_WRITE_ENABLED", **SUPERSET, write_enabled=True)
 
 
+def test_refuses_a_policy_file(tmp_path):
+    """Superset's roles and row rules decide what each person reads in Superset mode, and mnemiq applies no policy file
+    there: one configured would govern nothing while its author believed it masked columns or filtered rows."""
+    policy = tmp_path / "authz.json"
+    policy.write_text('{"roles": {"analyst": ["wide"]}}')
+    message = _refused("MNEMIQ_AUTHZ_PATH", **SUPERSET, authz_path=str(policy))
+    assert "roles and row rules" in message
+
+
 def test_refuses_a_sources_manifest(tmp_path):
     manifest = tmp_path / "sources.json"
     manifest.write_text("[]")
@@ -190,9 +199,12 @@ def test_direct_mode_is_not_checked(tmp_path):
 
     manifest = tmp_path / "sources.json"
     manifest.write_text("[]")
+    policy = tmp_path / "authz.json"
+    policy.write_text('{"roles": {"analyst": ["wide"]}}')
     everything = Settings(
         superset_schema="public; drop", write_enabled=True, sources_path=str(manifest), enrich_facts=True,
-        enrich_examples=True, mcp_transport="http", openwebui_jwt_secret="s" * 32, openwebui_audience="other")
+        enrich_examples=True, mcp_transport="http", openwebui_jwt_secret="s" * 32, openwebui_audience="other",
+        authz_path=str(policy))
     assert everything.superset_mode is False
     assert check_superset_settings(everything, None) is None
     assert check_superset_settings(Settings(), None) is None

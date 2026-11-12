@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from mnemiq.catalog import KEY_SUFFIXES, TableInfo, is_key_like
 from mnemiq.contract import JoinKey, Relationship
-from mnemiq.enrichment.profiling import ColumnStats, profile_column
+from mnemiq.enrichment.profiling import ColumnStats, profile_column, unharvested
 
 
 def _stem(column: str) -> str:
@@ -24,8 +24,10 @@ def _stem(column: str) -> str:
     return column
 
 
-def infer_relationships(adapter, catalog: list[TableInfo]) -> list[Relationship]:
-    """Infer foreign keys: naming gives direction, data gives the verdict.
+def infer_relationships(adapter, catalog: list[TableInfo], *,
+                        harvest_values: bool = True) -> list[Relationship]:
+    """Infer foreign keys: naming gives direction, data gives the verdict. Key detection reads counts only, and with
+    `harvest_values` False each profile is told so too.
 
     The source declares no usable keys (ACME's own DDL does not survive its sample
     data), so both sides are established from the data. Uniqueness alone cannot say
@@ -47,7 +49,8 @@ def infer_relationships(adapter, catalog: list[TableInfo]) -> list[Relationship]
             # with it so a column the source cannot aggregate is skipped rather than raising --
             # on Oracle a CLOB named `*_id` otherwise takes EVERY relationship down with it.
             stats_cache[(table, col)] = profile_column(
-                adapter, table, col, k=0, data_type=_declared_type(table, col))
+                adapter, table, col, k=0, data_type=_declared_type(table, col),
+                **unharvested(harvest_values))
         return stats_cache[(table, col)]
 
     def is_key_of(table: str, col: str) -> bool:
@@ -123,10 +126,12 @@ def relationships_from_foreign_keys(adapter, catalog: list[TableInfo]) -> list[R
     return rels
 
 
-def build_relationships(adapter, catalog: list[TableInfo]) -> list[Relationship]:
+def build_relationships(adapter, catalog: list[TableInfo], *,
+                        harvest_values: bool = True) -> list[Relationship]:
     """Declared-first, inference-fallback, per child table. A table that declares any FK is
     described by the catalog; inference runs only for tables the catalog is silent on."""
     declared = relationships_from_foreign_keys(adapter, catalog)
     covered = {r.from_ for r in declared}
-    inferred = [r for r in infer_relationships(adapter, catalog) if r.from_ not in covered]
+    inferred = [r for r in infer_relationships(adapter, catalog, **unharvested(harvest_values))
+                if r.from_ not in covered]
     return declared + inferred

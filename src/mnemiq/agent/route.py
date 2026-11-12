@@ -19,15 +19,26 @@ class Router(Protocol):
     def route(self, question: str, override: str | None) -> str: ...
 
 
+def offered_modes(router) -> list[str]:
+    """The modes `router` answers a caller's override with, sorted: the set it offers, or every registered mode when
+    it names none (a router that is not a `StaticRouter`, or none at all, names none)."""
+    offered = getattr(router, "offered", None)
+    return sorted(MODES if offered is None else offered)
+
+
 @dataclass
 class StaticRouter:
     default: str = DEFAULT_MODE
+    # The modes this deployment offers; None offers every registered mode. A mode the deployment has no agent for is
+    # refused here, never answered by the default mode's agent in its place.
+    offered: frozenset[str] | None = None
 
     def route(self, question: str, override: str | None) -> str:
         if override is not None:
-            if override not in MODES:
+            valid = MODES if self.offered is None else self.offered
+            if override not in valid:
                 raise UnknownMode(
-                    f"unknown mode {override!r}; valid modes: {sorted(MODES)}"
+                    f"unknown mode {override!r}; valid modes: {sorted(valid)}"
                 )
             return override
         return self.default

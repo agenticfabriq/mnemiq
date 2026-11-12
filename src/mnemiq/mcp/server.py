@@ -18,7 +18,7 @@ from mnemiq.adapters.oracle import DriverMissing
 from mnemiq.adapters.resolve import SourceUnconfigured, UnknownSourceKind
 from mnemiq.adapters.scoped import TablesNotFound
 from mnemiq.agent.modes import MODES
-from mnemiq.agent.route import UnknownMode
+from mnemiq.agent.route import UnknownMode, offered_modes
 from mnemiq.config import Settings
 from mnemiq.contract import IdentityContext
 from mnemiq.duckdb_extensions import ExtensionNotInstalled, ExtensionsNotReady
@@ -126,7 +126,9 @@ class _DeploymentMode(UnknownMode):
     apart from a mistyped per-call `mode`, which is the caller's to fix."""
 
 
-def _client_message(exc: Exception) -> str:
+def _client_message(exc: Exception, modes: list[str] | None = None) -> str:
+    """What the client is told for `exc`. `modes` are the modes the runtime serving this call offers, which a
+    mistyped mode is told; every registered mode when None."""
     if isinstance(exc, SnapshotMissing) and isinstance(exc.__cause__, (SourceUnconfigured, UnknownSourceKind)):
         return ("This deployment's source is not configured: the operator's server log names what "
                 "is missing.")
@@ -149,7 +151,7 @@ def _client_message(exc: Exception) -> str:
         return (f"This deployment's MNEMIQ_MODE names no mode: the operator sets it to one of "
                 f"{sorted(MODES)}.")
     if isinstance(exc, UnknownMode):
-        return f"Unknown mode; this deployment offers: {sorted(MODES)}."
+        return f"Unknown mode; this deployment offers: {sorted(MODES) if modes is None else modes}."
     if isinstance(exc, UnknownProfile):  # unknown and forbidden read alike, and neither repeats the name
         return f"Unknown profile; you may pick: {exc.offered}."
     if isinstance(exc, TablesNotFound):
@@ -203,7 +205,8 @@ def build_mcp(runtime: Runtime | Callable[[], Runtime],
             raise
         except _SETUP as exc:
             logger.warning("mnemiq MCP tool: setup failure: %s", exc)
-            raise tool_error(_client_message(exc)) from exc
+            # The modes of the runtime serving the call, once it is built: a factory has no router, and names none.
+            raise tool_error(_client_message(exc, offered_modes(getattr(runtime, "router", None)))) from exc
         except Exception as exc:
             logger.exception("mnemiq MCP tool failed")
             raise tool_error(_INTERNAL) from exc
@@ -369,7 +372,12 @@ def mcp_http_app(runtime, cfg, *, fetch: Callable[[], dict] | None = None):
 
 
 def serve(settings: Settings) -> None:
+    from mnemiq.superset.settings import refuse_superset_mode
+
     if settings.mcp_transport == "http":
         raise SystemExit("MNEMIQ_MCP_TRANSPORT=http: MCP over HTTP is served by mnemiq serve --http, at /mcp")
+    # Before anything is built: over stdio every call is answered as the one identity in settings, which Superset mode
+    # never does.
+    refuse_superset_mode(settings, "MCP over stdio")
     identity = _identity_from_settings(settings)
     build_mcp(lambda: build_runtime(settings), identity).run()  # stdio

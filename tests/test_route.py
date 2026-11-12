@@ -20,3 +20,11 @@ def test_unknown_override_fails_closed_listing_the_valid_modes():
         StaticRouter().route("any question", "fastest")
     msg = str(exc.value)
     assert "fastest" in msg and "thinking" in msg and "deep" in msg and "instant" in msg
+
+
+def test_a_mode_the_deployment_does_not_offer_is_refused_listing_the_offered():
+    router = StaticRouter(offered=frozenset({"instant", "thinking"}))
+    assert router.route("any question", "instant") == "instant"
+    with pytest.raises(UnknownMode) as exc:
+        router.route("any question", "deep")
+    assert str(exc.value) == "unknown mode 'deep'; valid modes: ['instant', 'thinking']"

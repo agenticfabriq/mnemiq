@@ -47,7 +47,7 @@ _TOO_LARGE = "Response too large:"
 # replaces the tool catalogue a client lists with a search tool and a call proxy.
 _UNKNOWN_TOOL = re.compile(r"unknown tool", re.IGNORECASE)
 # How long a call waits for Superset when neither the client nor the call says otherwise.
-_DEFAULT_TIMEOUT_S = 45.0
+DEFAULT_TIMEOUT_S = 45.0
 
 
 @dataclass(frozen=True, repr=False)
@@ -114,7 +114,7 @@ class SupersetMcp:
     """Calls Superset's MCP tools at `url`, carrying `credential` and nothing else, each call within `timeout_s`
     unless the call names a deadline of its own."""
 
-    def __init__(self, url: str, credential: Bearer, *, timeout_s: float = _DEFAULT_TIMEOUT_S) -> None:
+    def __init__(self, url: str, credential: Bearer, *, timeout_s: float = DEFAULT_TIMEOUT_S) -> None:
         if not isinstance(credential, Bearer):
             raise TypeError("SupersetMcp carries a Bearer, never a bare string")
         self._url = url
@@ -230,7 +230,7 @@ class _Exchange:
     """One call's deadline, and what the call observed beside its result: each HTTP response's status in order,
     whether time ran out, and the exception that ended it, if one did."""
 
-    deadline_s: float = _DEFAULT_TIMEOUT_S
+    deadline_s: float = DEFAULT_TIMEOUT_S
     statuses: list[int] = field(default_factory=list)
     timed_out: bool = False
     error: Exception | None = None

@@ -3,9 +3,10 @@ use as they use any other.
 
 Every statement runs as the person whose token the client carries, so Superset's permissions and row rules decide what
 it reads. For a data statement the adapter sends the database, the schema, the statement and a time limit, and nothing
-else: no `limit`, which Superset would put in place of the statement's own LIMIT; no `template_params`; and nothing
-that asks Superset to skip its result cache, which keys a result on the statement after its row rules are applied and
-is consulted only once access is checked.
+else: no `limit`, which Superset would put in place of the statement's own LIMIT; no `template_params`; and, on the ask
+path, nothing that asks Superset to skip its result cache, which keys a result on the statement after its row rules are
+applied and is consulted only once access is checked. The adapter enrichment reads through is built to send
+`force_refresh` with every statement instead, since a re-enrich is meant to read the source as it is now.
 
 The source's catalogue is read the same way, from Postgres's `pg_catalog` (`mnemiq.superset.pg_catalog`), each part of
 it once per adapter, and each statement with `force_refresh`, so Superset runs it afresh rather than answer from its
@@ -20,7 +21,15 @@ from functools import cached_property
 import pyarrow as pa
 
 from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
-from mnemiq.superset.client import SupersetMcp, SupersetRefusal, SupersetResponseTooLarge, SupersetUnavailable
+from mnemiq.superset.client import (
+    SupersetDenied,
+    SupersetMcp,
+    SupersetPermissionDenied,
+    SupersetRefusal,
+    SupersetRefusedCaller,
+    SupersetResponseTooLarge,
+    SupersetUnavailable,
+)
 from mnemiq.superset.payload import ResultCut, SupersetQueryFailed, check_execute_response, read_execute_response
 from mnemiq.superset.pg_catalog import PostgresCatalogue
 from mnemiq.superset.settings import SUPERSET_DIALECT
@@ -45,10 +54,16 @@ TRANSPORT_MARGIN_S = 15.0
 _TOO_LARGE_TO_SEND = ("Superset would not send this result, which is larger than its response size allows; aggregate, "
                       "or select fewer rows or columns.")
 
+# The refusals that end a request wherever they are met: of the caller, of the caller's roles, and one Superset does not
+# explain. Each stays the same for every later call the request makes, so no rewrite or retry can help. Superset's
+# refusal of a table is not among them: it is the model's to repair.
+TERMINAL_REFUSALS = (SupersetRefusedCaller, SupersetPermissionDenied, SupersetDenied)
+
 
 class SupersetSqlAdapter:
     """Runs statements on one Superset database and schema through `client`, each within `timeout_s` unless the
-    caller gives its own limit.
+    caller gives its own limit. With `refresh_every_statement`, every statement, data statements included, asks
+    Superset to run it rather than answer from its result cache.
 
     Each catalogue method reads its part of the catalogue from the database on the first call, never from Superset's
     result cache, and answers every later call with a copy of what it read: `decide` reads the function inventory on
@@ -61,12 +76,26 @@ class SupersetSqlAdapter:
     unaggregatable_types = frozenset({"JSON", "XML", "POINT", "LINE", "LSEG", "BOX", "PATH", "POLYGON", "CIRCLE"})
 
     def __init__(self, client: SupersetMcp, *, database_id: int, schema: str, dialect: str = SUPERSET_DIALECT,
-                 timeout_s: float = 30.0) -> None:
+                 timeout_s: float = 30.0, refresh_every_statement: bool = False) -> None:
         self.client = client
         self.dialect = dialect
         self._database_id = database_id
         self._schema = schema
         self._timeout_s = timeout_s
+        self._refresh_every_statement = refresh_every_statement
+        self._terminal_refusal: SupersetRefusal | None = None
+
+    @property
+    def terminal_refusal(self) -> SupersetRefusal | None:
+        """The refusal the request this adapter serves ends as, or None: of the `TERMINAL_REFUSALS` any statement it
+        sent was refused with, a refusal of the caller if there was one, else the first.
+
+        The query runner reads each of them as a source that did not answer, the proof seam as one it could not ask,
+        and the function inventory as one it could not read, so the refusal's own kind survives only here. Each stays
+        the same for every later call the request makes, so the request ends as that refusal rather than as an outage
+        to try again. A refusal of the caller outranks the others, since signing in again is the one thing the person
+        can do that might help. One adapter serves one request, so what it remembers is never another person's."""
+        return self._terminal_refusal
 
     @property
     def database_id(self) -> int:
@@ -196,9 +225,15 @@ class SupersetSqlAdapter:
         request = {"database_id": self._database_id, "sql": sql, "schema": self._schema, "timeout": limit}
         if dry_run:
             request["dry_run"] = True
-        if force_refresh:
+        if force_refresh or self._refresh_every_statement:
             request["force_refresh"] = True
-        return self.client.call("execute_sql", request, timeout_s=limit + TRANSPORT_MARGIN_S)
+        try:
+            return self.client.call("execute_sql", request, timeout_s=limit + TRANSPORT_MARGIN_S)
+        except TERMINAL_REFUSALS as exc:
+            kept = self._terminal_refusal
+            if kept is None or (isinstance(exc, SupersetRefusedCaller) and not isinstance(kept, SupersetRefusedCaller)):
+                self._terminal_refusal = exc
+            raise
 
 
 def _tuples(table: pa.Table) -> list[tuple]:

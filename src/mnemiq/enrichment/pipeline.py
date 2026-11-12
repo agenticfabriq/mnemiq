@@ -8,8 +8,9 @@ from datetime import UTC, datetime
 from mnemiq.catalog import introspect
 from mnemiq.contract import CodedValue, Column, Job, Snapshot, SourceBinding, ViewDefinition
 from mnemiq.enrichment.joins import build_relationships
-from mnemiq.enrichment.profiling import FAILED, profile_table
+from mnemiq.enrichment.profiling import FAILED, profile_table, unharvested
 from mnemiq.sql.fanout_check import PARTITIONS_JOB
+from mnemiq.superset.settings import SUPERSET_SOURCE_JOB
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,13 @@ def content_version(snapshot: Snapshot) -> str:
     partitions = next((j.status for j in snapshot.jobs if j.id == PARTITIONS_JOB), None)
     if partitions is not None:
         body["partitions_profiling"] = partitions
+    # The `superset:source` job's DETAIL, the Superset database and schema the snapshot was read
+    # from, for the same reason: a server in Superset mode serves the snapshot only where it names
+    # that server's own database and schema, so two snapshots alike but for it are not the same
+    # snapshot. Only when set, so a snapshot read any other way keeps its version.
+    superset_source = next((j.detail for j in snapshot.jobs if j.id == SUPERSET_SOURCE_JOB), None)
+    if superset_source is not None:
+        body["superset_source"] = superset_source
     if snapshot.ontology_version:
         body["ontology_version"] = snapshot.ontology_version
     payload = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
@@ -155,12 +163,21 @@ def partition_warning(snapshot: Snapshot) -> str | None:
             "succeeds")
 
 
-def enrich_structural(adapter, source_id: str) -> Snapshot:
+def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
+                      superset_source: tuple[int, str] | None = None) -> Snapshot:
     """The no-LLM enrichment pass: discover, profile, infer joins.
 
     Produces a Snapshot stating what the source *contains*. What any of it *means* is
     left to semantic enrichment, which fills in the blanks this pass leaves behind.
+
+    With `harvest_values` False, profiling reads each column's counts and none of its values,
+    so no column carries `coded_values`. `superset_source`, the Superset database id and schema
+    the adapter reads, records them as the `superset:source` job a server in Superset mode looks
+    for; it is given only where no value is harvested, which the job says.
     """
+    if superset_source is not None and harvest_values:
+        raise ValueError("a snapshot enriched through Superset harvests no values: pass "
+                         "harvest_values=False with superset_source")
     catalog = introspect(adapter)
     columns: list[Column] = []
     source_bindings: list[SourceBinding] = []
@@ -180,7 +197,8 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
         try:
             stats = {
                 s.column: s
-                for s in profile_table(adapter, table, key_columns=fk_children.get(table.name))
+                for s in profile_table(adapter, table, key_columns=fk_children.get(table.name),
+                                       **unharvested(harvest_values))
             }
             table_columns = [
                 Column(
@@ -242,7 +260,7 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
         )
 
     try:
-        relationships = build_relationships(adapter, catalog)
+        relationships = build_relationships(adapter, catalog, **unharvested(harvest_values))
         status = "done"
     except Exception:
         relationships, status = [], "failed"
@@ -271,6 +289,11 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
     jobs.append(Job(id=PARTITIONS_JOB, source_id=source_id, kind="profile:partitions",
                     status="partial" if partition_failures else "done",
                     detail="; ".join(partition_failures)[:2000] or None))
+    if superset_source is not None:
+        database_id, schema = superset_source
+        jobs.append(Job(id=SUPERSET_SOURCE_JOB, source_id=source_id, kind="superset", status="done",
+                        detail=json.dumps({"database_id": database_id, "schema": schema,
+                                           "backend": "postgresql", "values": "not harvested"})))
 
     snapshot = Snapshot(
         version="",
