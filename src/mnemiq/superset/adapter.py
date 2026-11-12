@@ -20,8 +20,8 @@ from functools import cached_property
 import pyarrow as pa
 
 from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
-from mnemiq.superset.client import SupersetMcp, SupersetRefusal, SupersetUnavailable
-from mnemiq.superset.payload import SupersetQueryFailed, check_execute_response, read_execute_response
+from mnemiq.superset.client import SupersetMcp, SupersetRefusal, SupersetResponseTooLarge, SupersetUnavailable
+from mnemiq.superset.payload import ResultCut, SupersetQueryFailed, check_execute_response, read_execute_response
 from mnemiq.superset.pg_catalog import PostgresCatalogue
 from mnemiq.superset.settings import SUPERSET_DIALECT
 
@@ -37,6 +37,13 @@ _SUPERSET_TIMEOUT_RANGE = (1, 300)
 # transport to give up first, the same slow statement would read as Superset being unavailable, and the turn would
 # end telling the person to try again.
 TRANSPORT_MARGIN_S = 15.0
+
+# What a result too large to send reads as. Superset's MCP service sends a result past its response size cut, where
+# dropping rows brings it under that size, and otherwise sends an error in its place (`_handle_oversized_response` in
+# `superset/mcp_service/middleware.py`). Either way the rows are not all there, and the statement is the caller's to
+# make smaller, so both raise `ResultCut`.
+_TOO_LARGE_TO_SEND = ("Superset would not send this result, which is larger than its response size allows; aggregate, "
+                      "or select fewer rows or columns.")
 
 
 class SupersetSqlAdapter:
@@ -72,7 +79,8 @@ class SupersetSqlAdapter:
         return self._schema
 
     def execute_arrow(self, sql: str, timeout_s: float | None = None) -> pa.Table:
-        return read_execute_response(self._execute_sql(sql, timeout_s))
+        """`sql`'s result. Raises `ResultCut` when Superset cut the result to size or would not send it at all."""
+        return self._result(sql, timeout_s)
 
     def execute(self, sql: str) -> list[tuple]:
         return _tuples(self.execute_arrow(sql))
@@ -132,8 +140,11 @@ class SupersetSqlAdapter:
         from its result cache unless the request says `force_refresh` (`_try_get_cached_result` in
         `superset/sql/execution/executor.py`), for as long as a day by default, and a catalogue statement is the same
         text every time. From the cache, a function created since would read as a builtin and pass the decider unseen,
-        and the pages of one read could come from different moments, skipping a row or repeating one."""
-        return _tuples(read_execute_response(self._execute_sql(sql, None, force_refresh=True)))
+        and the pages of one read could come from different moments, skipping a row or repeating one.
+
+        A page too large to send raises `ResultCut`, as a page cut to size does, so the catalogue asks for it again
+        smaller."""
+        return _tuples(self._result(sql, None, force_refresh=True))
 
     @cached_property
     def _tables(self) -> tuple[str, ...]:
@@ -166,6 +177,14 @@ class SupersetSqlAdapter:
     @cached_property
     def _virtual_columns(self) -> tuple[tuple[str, str, str], ...]:
         return tuple(self._catalogue.virtual_columns())
+
+    def _result(self, sql: str, timeout_s: float | None, *, force_refresh: bool = False) -> pa.Table:
+        """The table `sql` returns, read from `execute_sql`'s payload; a result too large to send raises `ResultCut`."""
+        try:
+            payload = self._execute_sql(sql, timeout_s, force_refresh=force_refresh)
+        except SupersetResponseTooLarge as exc:
+            raise ResultCut(_TOO_LARGE_TO_SEND) from exc
+        return read_execute_response(payload)
 
     def _execute_sql(self, sql: str, timeout_s: float | None, *, dry_run: bool = False,
                      force_refresh: bool = False) -> dict:

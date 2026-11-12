@@ -22,6 +22,7 @@ from mnemiq.superset.client import (
     SupersetMcp,
     SupersetPermissionDenied,
     SupersetRefusedCaller,
+    SupersetResponseTooLarge,
     SupersetToolError,
     SupersetUnavailable,
 )
@@ -195,6 +196,35 @@ def test_cut_result_is_repaired_not_an_outage():
         run(_adapter(cut), SQL)
     assert type(caught.value) is ExecutionError
     assert "aggregate, or select fewer rows or columns" in caught.value.repair_text
+
+
+TOO_LARGE = SupersetResponseTooLarge("Superset's answer to execute_sql was larger than its MCP service will send; ask "
+                                     "for less", detail="Error: Response too large: 61,234 bytes (limit: 50,000)")
+
+
+@pytest.mark.parametrize("method", ["execute_arrow", "execute"])
+def test_a_result_too_large_to_send_reads_as_cut(method):
+    """Superset's MCP service refuses a result too large to send when dropping rows does not bring it under its size.
+    That reads as a cut result does: one exception for a result too large, the statement's to make smaller."""
+    with pytest.raises(ResultCut) as caught:
+        getattr(_adapter(TOO_LARGE), method)(SQL)
+    assert caught.value.__cause__ is TOO_LARGE
+    assert "aggregate, or select fewer rows or columns" in str(caught.value)
+    assert "61,234" not in str(caught.value)
+
+
+def test_a_result_too_large_to_send_is_repaired_not_an_outage():
+    with pytest.raises(ExecutionError) as caught:
+        run(_adapter(TOO_LARGE), SQL)
+    assert type(caught.value) is ExecutionError
+    assert "aggregate, or select fewer rows or columns" in caught.value.repair_text
+
+
+def test_a_dry_run_too_large_to_send_raises_as_itself():
+    """A dry run returns no rows to make fewer of, and grants read its failures as Superset's tool errors, so it
+    raises as itself."""
+    with pytest.raises(SupersetResponseTooLarge):
+        _adapter(TOO_LARGE).dry_run(SQL)
 
 
 def test_timeout_reads_as_timeout():

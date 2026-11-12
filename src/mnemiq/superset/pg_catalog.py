@@ -7,10 +7,11 @@ here comes from `pg_catalog`, and the schema is written into each statement as a
 schema's name as Postgres stores it, case and all, as Superset's own search path names it (`get_prequeries` in
 `superset/db_engine_specs/postgres.py` quotes it).
 
-Each statement is read a page at a time, because Superset cuts a response past the size its MCP service allows, and
-`execute_sql` carries each row twice, so a few hundred catalogue rows can reach that size. A cut page is asked for again
-at half the size, down to a single row; a row cut on its own raises. A statement that fails raises too, whatever the
-page: a catalogue that could not be read is never answered as an empty one.
+Each statement is read a page at a time, because Superset's MCP service cuts a response past the size it allows, or
+sends an error in its place, and `execute_sql` carries each row twice, so a few hundred catalogue rows can reach that
+size. A page cut or refused as too large is asked for again at half the size, down to a single row; a row too large on
+its own raises. A statement that fails raises too, whatever the page: a catalogue that could not be read is never
+answered as an empty one.
 """
 
 from __future__ import annotations
@@ -91,7 +92,7 @@ VIEW_DIALECT = "postgres"
 class PostgresCatalogue:
     """The catalogue of `schema` in the Postgres database `rows` reads, in the shapes and order `SourceAdapter` gives
     them. `rows` runs one statement and returns its rows as the database has them now, never from a cache, raising
-    `ResultCut` when the answer was cut to size."""
+    `ResultCut` when the answer was too large to arrive whole."""
 
     def __init__(self, rows: Callable[[str], list[tuple]], schema: str) -> None:
         self._rows = rows

@@ -46,9 +46,9 @@ _CUT = "Superset cut this result to fit its response size; aggregate, or select 
 
 
 class ResultCut(RuntimeError):
-    """Superset cut the result to fit the size its MCP service allows a response (`_response_truncated`), so the rows
-    that arrived are not all of them. Never read as the answer, since a count or a sum over part of the rows reads as
-    one over all of them: the statement's to make smaller."""
+    """The result was larger than Superset's MCP service sends: cut to fit (`_response_truncated`), so the rows that
+    arrived are not all of them, or not sent at all (the adapter raises this for that too). Never read as the answer,
+    since a count or a sum over part of the rows reads as one over all of them: the statement's to make smaller."""
 
 
 class SupersetAccessRefused(RuntimeError):

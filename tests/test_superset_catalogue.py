@@ -8,6 +8,7 @@ catalogue sends is run, by sqlglot's executor, over a few rows shaped like Postg
 
 from __future__ import annotations
 
+import json
 import re
 
 import pytest
@@ -22,7 +23,7 @@ from mnemiq.catalog import introspect as read_catalog
 from mnemiq.enrichment.profiling import _UNAGGREGATABLE, UNSUPPORTED, _unaggregatable, profile_table
 from mnemiq.sql.functions import inventory_from, opaque_columns
 from mnemiq.superset.adapter import SupersetSqlAdapter
-from mnemiq.superset.client import SupersetUnavailable
+from mnemiq.superset.client import SupersetResponseTooLarge, SupersetUnavailable
 from mnemiq.superset.payload import ResultCut, SupersetAccessRefused, SupersetQueryFailed
 from mnemiq.superset.pg_catalog import CATALOGUE_SQL, PAGE_ROWS, SCHEMA_PLACEHOLDER, PostgresCatalogue
 from tests.superset_fake import RecordingClient
@@ -257,6 +258,47 @@ def test_one_row_still_cut_raises():
         PostgresCatalogue(source, "sales").views()
     assert [limit for limit, _, _ in source.asks] == [500, 250, 125, 62, 31, 15, 7, 3, 1, 1]
     assert source.asks[-2:] == [(1, 0, 1), (1, 1, None)]
+
+
+class TooLargeToSend(Catalogue):
+    """A catalogue whose `execute_sql` refuses a page whose rows pass `budget` characters as JSON, as Superset's MCP
+    service refuses an answer too large for its response size that dropping rows does not bring under it. Counts the
+    pages it refused."""
+
+    def __init__(self, budget: int, **rows: list[tuple]) -> None:
+        super().__init__(**rows)
+        self.budget = budget
+        self.refused = 0
+
+    def __call__(self, request: dict) -> dict:
+        payload = super().__call__(request)
+        if len(json.dumps(payload["rows"])) > self.budget:
+            self.refused += 1
+            raise SupersetResponseTooLarge("Superset's answer to execute_sql was larger than its MCP service will "
+                                           "send; ask for less", detail="Error: Response too large: 61,234 bytes")
+        return payload
+
+
+@pytest.mark.parametrize("method", ADAPTER_METHODS)
+def test_a_page_too_large_to_send_is_asked_again_smaller(method):
+    """A page Superset refuses as too large to send, rather than cut, is read as a cut page: asked again smaller, so the
+    adapter still answers with every row, once and in order."""
+    catalogue = ADAPTER_METHODS[method]
+    rows = [tuple(f"{column}_{i:04}" for column in COLUMNS[catalogue]) for i in range(1234)]
+    source = TooLargeToSend(8000, **{catalogue: rows})
+    expected = [(*row, "postgres") for row in rows] if catalogue == "views" else rows
+    assert [tuple(row) if isinstance(row, tuple) else (row,) for row in getattr(_adapter(source), method)()] == expected
+    assert source.refused > 0
+
+
+def test_one_row_too_large_to_send_raises_as_cut():
+    """A single row Superset will not send on its own cannot be read whole, so the read raises `ResultCut`, as it does
+    for a row cut on its own, and never answers without that row."""
+    views = [("small", "SELECT 1"), ("huge", "SELECT " + "1 + " * 5000 + "1"), ("after", "SELECT 2")]
+    source = TooLargeToSend(4000, views=views)
+    with pytest.raises(ResultCut) as caught:
+        _adapter(source).view_definitions()
+    assert isinstance(caught.value.__cause__, SupersetResponseTooLarge)
 
 
 @pytest.mark.parametrize(("failure", "raised"), [
