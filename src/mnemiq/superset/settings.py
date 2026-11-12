@@ -42,9 +42,9 @@ class SupersetConfigError(SystemExit):
 
 
 def refuse_a_direct_source(settings: Settings | None) -> None:
-    """Raise when `settings` are in Superset mode. Every place mnemiq opens a source connection of its own calls this
-    first (`source_adapter`, `adapter_for` and `run_acme`), so a deployment configured for Superset never reads a
-    source with mnemiq's own credential instead."""
+    """Raise when `settings` are in Superset mode. Every place mnemiq opens a connection to the deployment's configured
+    source calls this first (`source_adapter`, `adapter_for` and `run_acme`), so a deployment configured for Superset
+    never reads that source with mnemiq's own credential instead."""
     if settings is not None and settings.superset_mode:
         raise SupersetConfigError("MNEMIQ_SUPERSET_MCP_URL is set, and Superset mode runs every query through Superset "
                                   "and opens no database connection of its own")

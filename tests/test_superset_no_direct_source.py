@@ -1,12 +1,12 @@
-"""Superset mode opens no database connection of its own, at every place that would open one.
+"""Superset mode opens no connection of its own to the deployment's configured source, at every place that would.
 
-Every source connection mnemiq opens goes through `source_adapter` (the runtime, and the sweeps grading against the
-same sources), `adapter_for` (`source_adapter`'s single source, enrich and refresh) or `run_acme` (`mnemiq eval`,
-which reads MNEMIQ_PG_DSN itself). With MNEMIQ_SUPERSET_MCP_URL set, each refuses before it reads a manifest or
-builds an adapter, so a deployment configured for Superset never
-falls back to reading the source with mnemiq's own credential. With the URL unset, each behaves as it always has:
-the direct-mode paths are also covered by tests/test_source_resolve.py, among them
-`test_the_default_postgres_source_attaches_exactly_as_before` and `test_build_runtime_dispatches_on_the_spec_not_on_pg_dsn`.
+Every connection mnemiq opens to the deployment's configured source goes through `source_adapter` (the runtime, and
+the sweeps grading against the same sources), `adapter_for` (`source_adapter`'s single source, enrich and refresh) or
+`run_acme` (`mnemiq eval`, which reads MNEMIQ_PG_DSN itself). With MNEMIQ_SUPERSET_MCP_URL set, each refuses before it
+reads a manifest or builds an adapter, so a deployment configured for Superset never falls back to reading that source
+with mnemiq's own credential. With the URL unset, each behaves as it always has: the direct-mode paths are also
+covered by tests/test_source_resolve.py, among them `test_the_default_postgres_source_attaches_exactly_as_before` and
+`test_build_runtime_dispatches_on_the_spec_not_on_pg_dsn`.
 """
 
 import json

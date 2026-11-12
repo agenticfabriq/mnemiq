@@ -311,9 +311,9 @@ def test_a_dataset_in_another_catalog_is_not_granted():
                                ["policy"], ["claim"], ["party"]]
 
 
-def test_a_case_folded_name_superset_refuses_is_not_granted():
-    """A dataset `Party` makes a stored `party` a candidate, which the fallback asks Superset about like any other:
-    refused, it is not granted, and a single refused candidate is not asked about again."""
+def test_a_refused_folded_candidate_is_not_granted():
+    """A candidate found by folding a dataset's name, here a stored `party` for a dataset `Party`, is not granted when
+    Superset's check refuses it."""
     superset = _Superset(_access(set()), [_dataset(1, "Party")])
     grants = resolve_grants(_adapter(superset), _snapshot("party", "claim"))
     assert grants.objects == frozenset() and grants.available is True

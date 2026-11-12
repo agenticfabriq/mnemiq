@@ -313,7 +313,7 @@ def test_slow_server_is_unavailable_within_the_timeout(fake):
     with pytest.raises(SupersetUnavailable) as caught:
         _client(fake.url, timeout_s=1).call("execute_sql", REQUEST)
     assert time.monotonic() - started < 2.5
-    assert str(caught.value) == "Superset's MCP service did not answer execute_sql within 1 seconds"
+    assert str(caught.value) == "Superset's MCP service did not answer execute_sql within 1 second"
     _holds_no_credential(caught.value)
 
 
@@ -338,7 +338,7 @@ def test_a_call_can_set_a_shorter_deadline(fake):
     with pytest.raises(SupersetUnavailable) as caught:
         _client(fake.url, timeout_s=30).call("execute_sql", REQUEST, timeout_s=1)
     assert time.monotonic() - started < 2.5
-    assert str(caught.value) == "Superset's MCP service did not answer execute_sql within 1 seconds"
+    assert str(caught.value) == "Superset's MCP service did not answer execute_sql within 1 second"
 
 
 def test_a_call_from_inside_an_event_loop_is_not_read_as_an_outage(fake):

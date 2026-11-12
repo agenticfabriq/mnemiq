@@ -274,8 +274,8 @@ def test_access_refusal_text_never_leaves_the_log(caplog):
 
 
 def test_runs_through_the_real_client():
-    """The adapter over `SupersetMcp`, against the fake Superset: the request and the per-call deadline reach the
-    real client, and its payload reads as the table."""
+    """The adapter over `SupersetMcp`, against the fake Superset: the request reaches Superset as the adapter built it,
+    carrying the caller's bearer, and its payload reads as the table."""
     with FakeSuperset() as fake:
         fake.reply("execute_sql", lambda request, authorization: REGION_COUNTS)
         adapter = SupersetSqlAdapter(SupersetMcp(fake.url, DelegatedToken("tok")), database_id=7, schema="sales")

@@ -182,7 +182,7 @@ class SupersetMcp:
         finally:
             exchange.timed_out = deadline.cancel_called
         if exchange.error is None:
-            exchange.error = TimeoutError(f"no answer within {exchange.deadline_s:g} seconds")
+            exchange.error = TimeoutError(f"no answer within {_seconds(exchange.deadline_s)}")
         return None
 
     def _http_client(self, exchange: _Exchange):
@@ -218,8 +218,8 @@ class SupersetMcp:
         if status is not None and not 200 <= status < 300:
             return SupersetUnavailable(f"Superset's MCP service answered HTTP {status}", detail=detail)
         if exchange.timed_out:
-            return SupersetUnavailable(f"Superset's MCP service did not answer {tool} within {exchange.deadline_s:g} "
-                                       "seconds", detail=detail)
+            return SupersetUnavailable(f"Superset's MCP service did not answer {tool} within "
+                                       f"{_seconds(exchange.deadline_s)}", detail=detail)
         if exchange.statuses:  # it answered something: an unreadable answer, or a connection lost mid-call
             return SupersetUnavailable(f"Superset's MCP service gave no usable answer to {tool}", detail=detail)
         return SupersetUnavailable("Superset's MCP service could not be reached", detail=detail)
@@ -234,6 +234,11 @@ class _Exchange:
     statuses: list[int] = field(default_factory=list)
     timed_out: bool = False
     error: Exception | None = None
+
+
+def _seconds(value: float) -> str:
+    """`value` seconds as a sentence says it: `1 second`, `0.5 seconds`, `45 seconds`."""
+    return f"{value:g} second" if value == 1 else f"{value:g} seconds"
 
 
 def _opener():
