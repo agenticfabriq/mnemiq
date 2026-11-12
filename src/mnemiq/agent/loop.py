@@ -374,6 +374,9 @@ class Agent:
         # the retry, kept to answer with if the retry produces nothing to answer with.
         empties_left = self.empty_retries
         standing: tuple | None = None
+        # Each statement's result for the rest of the turn, so a retry that writes it again reads it
+        # here rather than running it twice when the shared cache has evicted it (Codex's review).
+        ran: dict[str, object] = {}
         tries, _attempt = self.budget.max_attempts, 0
 
         while _attempt < tries:
@@ -415,9 +418,12 @@ class Agent:
             approved: Approved = outcome
             key = cache_key(approved.plan_sql, grants.fingerprint, packet.enrichment_version)
 
-            hit = self.cache.get(key)
+            hit = ran.get(key)
+            if hit is None:
+                stored = self.cache.get(key)
+                hit = None if stored is None else from_ipc(stored)
             if hit is not None:
-                table, cached, execute_ms = from_ipc(hit), True, 0.0
+                table, cached, execute_ms = hit, True, 0.0
             else:
                 try:
                     with step(emit, Stage.EXECUTE):
@@ -459,6 +465,7 @@ class Agent:
                     continue
                 self.cache.put(key, to_ipc(result.table))
                 table, cached, execute_ms = result.table, False, result.elapsed_ms
+            ran[key] = table
 
             with step(emit, Stage.VERIFY, **({"cached": True} if cached else {})):
                 approved = self._confirmed(approved, table, snapshot, held)

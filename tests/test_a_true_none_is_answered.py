@@ -733,3 +733,25 @@ def test_a_retry_that_says_something_about_the_question_stands_over_the_result_b
         ans = agent.answer(_packet(question), snap, _GRANTS, _IDENTITY)
         assert ans.deferred is True and str(ans.reason_code) == code, (code, ans.answer)
         assert NONE_NOTE not in ans.answer and len(generator.calls) == 2, code
+
+
+def test_a_retry_that_writes_the_same_query_never_runs_it_twice_even_with_no_cache(source):
+    """The retry invites the writer to repeat its query, and the shared cache may have evicted the result by then
+    (Codex's review): a statement already run this turn is read from the turn's own results, not run again."""
+    from dataclasses import replace
+
+    from mnemiq.cache.store import NullCache
+
+    adapter, snap, values = source
+    recording = _Recording(adapter)
+    verifiers, _ = _build_mode_verifiers(Settings(), client=_CountingJudgeClient())
+    generator = FakeGenerator([json.dumps({"sql": NONE_SQL})] * 2)
+    agent = build_agent(replace(MODES["instant"], empty_retries=1, retry_answered_empties=True),
+                        generator=generator, synthesizer=FakeSynthesizer("SYNTHESIZED"), adapter=recording,
+                        cache=NullCache(), corrector=None, values=values, selector=None,
+                        verifier=verifiers["instant"])
+    ans = agent.answer(_packet("Which open claims are over 1,000,000?"), snap, _GRANTS, _IDENTITY)
+    assert ans.deferred is False and NONE_NOTE in ans.answer, ans.answer
+    assert len(generator.calls) == 2
+    ran = [s for s in recording.statements if "1000000" in s]
+    assert len(ran) == 1, ran
