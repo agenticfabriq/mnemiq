@@ -182,3 +182,15 @@ def test_the_floor_changes_no_profile_version(monkeypatch):
     for name in [n for n in os.environ if n.startswith("MNEMIQ_")]:
         monkeypatch.delenv(name)                    # so a shell's setting cannot move the version
     assert profile_version(_settings(writer_temperature=0.0), "duckdb") == VERSION_ON_MAIN
+
+
+def test_a_mode_field_added_later_moves_a_version_only_where_a_profile_sets_it(monkeypatch):
+    """`empty_retries` and `retry_answered_empties` at 0 and off run as the engine ran before they existed, so they
+    leave the version as it was (the test above), and a profile that sets either gets a version of its own."""
+    for name in [n for n in os.environ if n.startswith("MNEMIQ_")]:
+        monkeypatch.delenv(name)
+    base = profile_version(_settings(writer_temperature=0.0), "duckdb")
+    retry = profile_version(_settings(writer_temperature=0.0, mode_settings={"instant": {"empty_retries": 1}}), "duckdb")
+    every = profile_version(_settings(writer_temperature=0.0, mode_settings={
+        "instant": {"empty_retries": 1, "retry_answered_empties": True}}), "duckdb")
+    assert base == VERSION_ON_MAIN and len({base, retry, every}) == 3
