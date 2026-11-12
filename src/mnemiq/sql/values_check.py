@@ -1126,20 +1126,18 @@ def _day(node: exp.Expression) -> exp.Literal | None:
 
 # The spellings of a day Oracle reads without a session format (NLS_DATE_FORMAT, which a plain
 # string or a CAST of one follows): the DATE literal, which sqlglot reads as a DateStrToDate, and a
-# parse whose format names the day alone (TO_DATE or TO_TIMESTAMP with 'YYYY-MM-DD'). A parse
-# still reads its year, month and day in the session's NLS_CALENDAR -- measured on Oracle 23 Free,
-# `TO_DATE('2024-03-03', 'YYYY-MM-DD')` is 1481-03-03 under Thai Buddha, 2645-05-24 under Persian
-# -- so it counts only where the adapter pins its sessions to Gregorian (`gregorian`). The DATE
-# literal was 2024-03-03 under all five calendars tried.
-_ORACLE_DAY_LITERALS = (exp.DateStrToDate,)
-_ORACLE_DAY_PARSES = (exp.StrToDate, exp.StrToTime)
+# parse whose format names the day alone (TO_DATE or TO_TIMESTAMP with 'YYYY-MM-DD'). Each still
+# reads its year, month and day in the session's NLS_CALENDAR when it runs -- measured on Oracle 23
+# Free, `TO_DATE('2024-03-03', 'YYYY-MM-DD')` is 1481-03-03 under Thai Buddha, 2645-05-24 under
+# Persian, and sqlglot prints the DATE literal for Oracle as that TO_DATE -- so a day counts only
+# where the adapter pins every statement's session to Gregorian (`gregorian`).
+_ORACLE_DAY_FORMS = (exp.DateStrToDate, exp.StrToDate, exp.StrToTime)
 
 
 def _oracle_day_form(node: exp.Expression | None, gregorian: bool) -> exp.Literal | None:
-    """The day literal of `node` when it is an Oracle day spelling `_day` reads, and one this
-    session reads as that Gregorian day; else None."""
-    forms = _ORACLE_DAY_LITERALS + (_ORACLE_DAY_PARSES if gregorian else ())
-    return _day(node) if isinstance(node, forms) else None
+    """The day literal of `node` when it is an Oracle day spelling `_day` reads and the session
+    reads it as that Gregorian day (`gregorian`); else None."""
+    return _day(node) if gregorian and isinstance(node, _ORACLE_DAY_FORMS) else None
 
 
 _T = exp.DataType.Type
@@ -1279,8 +1277,8 @@ def ground_values(
     it (`names_one_object`). TYPED only where a date-only ISO string or a DATE literal is directly
     compared with bare columns all proven DATE (`_ISO_DATES_READ_AS_DATES`, `types`), a plain
     date-only string is the half-open start or end of a range on a bare naive TIMESTAMP column
-    (`_half_open`), an Oracle day spelling (`_oracle_day_form`; a parse only when `gregorian`, the
-    adapter pinning its sessions to that calendar) on the same half-open terms on a bare naive
+    (`_half_open`), an Oracle day spelling (`_oracle_day_form`, only when `gregorian`: the adapter
+    pins every statement's session to that calendar) on the same half-open terms on a bare naive
     TIMESTAMP or Oracle DATE column, or a well-formed interval with a bare date or time
     column. UNCHECKED everywhere else: a pattern, a text range, a date against anything but a
     proven DATE, another typed literal, a value compared with an expression or with nothing, a

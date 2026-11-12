@@ -95,6 +95,9 @@ class _FakeCon:
     def is_healthy(self):
         return True  # read before every timeout write (`_set_call_timeout`), as a real one has it
 
+    def cursor(self):
+        return _SessionCursor([])  # the lease's calendar pin (`_pin_calendar`)
+
 
 class _FakePool:
     def __init__(self, con):
@@ -114,8 +117,10 @@ def _leased(pool):
     """An adapter that owns nothing but the lease logic. NO DATABASE: what is under test is the
     lease's control flow, which is pure Python -- an earlier version drove it through a real pool
     and failed only inside the full suite, on timing that had nothing to do with the behaviour."""
+    import oracledb
+
     a = OracleAdapter.__new__(OracleAdapter)
-    a._pool, a._con, a._closed = pool, None, False
+    a._pool, a._con, a._closed, a._oracledb = pool, None, False, oracledb
     a._read_only, a._ro_ttl_s, a._ro_state, a._ro_checked_at = True, 0.0, "unknown", None
     a._lock = threading.RLock()
     return a
@@ -641,11 +646,12 @@ def test_the_first_reprobe_runs_on_a_freshly_booted_host(monkeypatch):
     assert con.closed == 1, "the first lease on a freshly-booted host did not probe"
 
 
+
 class _SessionCursor:
     def __init__(self, ran):
         self.ran = ran
 
-    def execute(self, sql):
+    def execute(self, sql, *args, **kwargs):
         self.ran.append(sql)
 
     def close(self):
@@ -655,28 +661,54 @@ class _SessionCursor:
 class _SessionConnection:
     def __init__(self):
         self.ran = []
+        self.call_timeout = 0
 
     def cursor(self):
         return _SessionCursor(self.ran)
 
+    def is_healthy(self):
+        return True
 
-def test_every_pooled_session_reads_dates_in_the_gregorian_calendar(monkeypatch):
-    """Oracle reads TO_DATE's year, month and day in the session's NLS_CALENDAR (1481-03-03 for
-    '2024-03-03' under Thai Buddha, measured), so every session the pool makes is pinned to
-    Gregorian before any statement runs, whether or not it also needs a schema. A read-only adapter
-    says so for the value grounding, since its gate refuses the ALTER SESSION that would undo the
-    pin on a pooled session; a writable one, or one over someone else's connection, does not."""
+
+def test_every_lease_reads_dates_in_the_gregorian_calendar(monkeypatch):
+    """Oracle reads a date's year, month and day in the session's NLS_CALENDAR (1481-03-03 for
+    '2024-03-03' under Thai Buddha, measured), and a pooled session outlives the lease that changed
+    it. So every lease pins its session to Gregorian before the caller's first statement, the same
+    session again on the next lease. A read-only adapter says so for the value grounding, since its
+    gate refuses the ALTER SESSION that would undo the pin within a lease; a writable one, or one
+    over someone else's connection, does not."""
     import oracledb
-    monkeypatch.setattr(oracledb, "create_pool", lambda **kw: mock.Mock())
-    for schema, expected in ((None, ["ALTER SESSION SET NLS_CALENDAR = 'GREGORIAN'"]),
-                             ("owner", ["ALTER SESSION SET NLS_CALENDAR = 'GREGORIAN'",
-                                        'ALTER SESSION SET CURRENT_SCHEMA = "OWNER"'])):
-        a = OracleAdapter("h:1521/X", "reader", "p", schema=schema)
-        assert a.gregorian_calendar is True
-        session = _SessionConnection()
-        a._configure_session(session, None)
-        assert session.ran == expected, schema
+    session = _SessionConnection()
+    pool = mock.Mock()
+    pool.acquire.return_value = session
+    monkeypatch.setattr(oracledb, "create_pool", lambda **kw: pool)
+    a = OracleAdapter("h:1521/X", "owner", "p", read_only=False)
+    for _ in range(2):
+        with a._lease() as con:
+            con.cursor().execute("SELECT 1 FROM dual")
+    assert session.ran == ["ALTER SESSION SET NLS_CALENDAR = 'GREGORIAN'", "SELECT 1 FROM dual"] * 2
+    assert a.gregorian_calendar is False
+    assert OracleAdapter("h:1521/X", "reader", "p").gregorian_calendar is True
     assert OracleAdapter.over(mock.Mock(), oracledb, "owner").gregorian_calendar is False
-    assert OracleAdapter("h:1521/X", "owner", "p", read_only=False).gregorian_calendar is False
     with pytest.raises(mod.ReadOnlyViolation):
         OracleAdapter("h:1521/X", "reader", "p").execute("ALTER SESSION SET NLS_CALENDAR = 'Thai Buddha'")
+
+
+def test_a_lease_whose_calendar_cannot_be_pinned_reads_as_the_source_not_answering(monkeypatch):
+    """The pin runs before the caller's statement, so its fault is the source's, as at acquire."""
+    import oracledb
+
+    class Dead(_SessionConnection):
+        def cursor(self):
+            cur = mock.Mock()
+            cur.execute.side_effect = oracledb.DatabaseError("a fault no code list names")
+            return cur
+
+    pool = mock.Mock()
+    pool.acquire.return_value = Dead()
+    monkeypatch.setattr(oracledb, "create_pool", lambda **kw: pool)
+    a = OracleAdapter("h:1521/X", "owner", "p", read_only=False)
+    with pytest.raises(oracledb.DatabaseError) as raised:
+        with a._lease():
+            pass
+    assert mod.unavailable_fault(raised.value)

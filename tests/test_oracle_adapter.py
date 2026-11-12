@@ -2198,3 +2198,27 @@ def test_a_grant_on_a_quoted_lowercase_table_does_not_read_its_unquoted_namesake
         for ddl in drops:
             with contextlib.suppress(oracledb.DatabaseError):
                 w.execute(ddl)
+
+
+def test_a_calendar_one_lease_changed_never_reaches_the_next():
+    """Oracle reads TO_DATE in the session's NLS_CALENDAR, and a pooled session outlives the lease
+    that changed it. On a one-session pool: the calendar set to Thai Buddha inside one lease reads
+    '2024-03-03' as 1481, and the next lease, on the same session, reads it as 2024 again."""
+    a = OracleAdapter(dsn=DSN, user=USER, password=PASSWORD, read_only=True, pool_max=1)
+    day = ("SELECT TO_CHAR(TO_DATE('2024-03-03', 'YYYY-MM-DD'), 'SYYYY-MM-DD', "
+           "'NLS_CALENDAR=GREGORIAN') FROM dual")
+    try:
+        assert a.gregorian_calendar is True
+        with a._lease() as con:
+            cur = con.cursor()
+            cur.execute("ALTER SESSION SET NLS_CALENDAR = 'Thai Buddha'")
+            cur.execute(day)
+            assert cur.fetchone()[0].strip() == "1481-03-03", "precondition: the calendar moved the day"
+            changed = cur.execute("SELECT SYS_CONTEXT('USERENV', 'SID') FROM dual").fetchone()[0]
+        with a._lease() as con:
+            cur = con.cursor()
+            assert cur.execute("SELECT SYS_CONTEXT('USERENV', 'SID') FROM dual").fetchone()[0] == changed
+            cur.execute(day)
+            assert cur.fetchone()[0].strip() == "2024-03-03"
+    finally:
+        a.close()

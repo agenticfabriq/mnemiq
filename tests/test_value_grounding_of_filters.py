@@ -935,14 +935,16 @@ def test_the_decider_grounds_an_oracle_day_bound_after_moving_it():
     assert read == [("2024-03-03", TYPED), ("2024-03-10", TYPED)], read
 
 
-def test_an_oracle_parse_reads_the_sessions_calendar_so_it_needs_a_gregorian_session():
+def test_an_oracle_day_reads_the_sessions_calendar_so_it_needs_a_gregorian_session():
     """Oracle reads TO_DATE's year, month and day in the session's NLS_CALENDAR: measured on Oracle
     23 Free, `TO_DATE('2024-03-03', 'YYYY-MM-DD')` is 1481-03-03 under Thai Buddha and 2645-05-24
-    under Persian, while `DATE '2024-03-03'` is 2024-03-03 under every calendar. So a parse is a
-    bound only where the adapter pins its sessions to Gregorian; the DATE literal needs nothing."""
+    under Persian. A `DATE '2024-03-03'` literal as written is Gregorian, but sqlglot prints it for
+    Oracle as that TO_DATE, and the printed statement is what runs. So no day is a bound unless the
+    adapter pins every statement's session to Gregorian."""
     parse = ("SELECT ID FROM CLAIM WHERE TS >= TO_DATE('2024-03-03', 'YYYY-MM-DD') "
              "AND TS < TO_TIMESTAMP('2024-03-04', 'YYYY-MM-DD')")
-    assert {o for _, o, _, _ in _read_oracle(parse, gregorian=False)} == {UNCHECKED}
-    assert {o for _, o, _, _ in _read_oracle(parse, gregorian=True)} == {TYPED}
     literal = "SELECT ID FROM CLAIM WHERE TS >= DATE '2024-03-03' AND TS < DATE '2024-03-04'"
-    assert {o for _, o, _, _ in _read_oracle(literal, gregorian=False)} == {TYPED}
+    assert "TO_DATE('2024-03-03', 'YYYY-MM-DD')" in sqlglot.parse_one(literal, read="oracle").sql("oracle")
+    for sql in (parse, literal):
+        assert {o for _, o, _, _ in _read_oracle(sql, gregorian=False)} == {UNCHECKED}, sql
+        assert {o for _, o, _, _ in _read_oracle(sql, gregorian=True)} == {TYPED}, sql
