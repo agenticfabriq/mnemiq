@@ -211,9 +211,19 @@ def _called(func: ast.expr) -> str | None:
     return func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
 
 
+def _argument(call: ast.Call, position: int, keyword: str) -> ast.expr | None:
+    """The argument a call passes at `position` or as `keyword`, or None."""
+    if len(call.args) > position:
+        return call.args[position]
+    return next((kw.value for kw in call.keywords if kw.arg == keyword), None)
+
+
 def _names_the_service(call: ast.Call, package: str) -> bool:
     """Whether a call to `import_module` or `__import__` names the service module: by its name, relative to the package
-    the call gives or else to the module's own, or as `service` in a `fromlist` beside the Superset package."""
+    the call gives or else to the module's own, or as `service` in a `fromlist` beside the Superset package.
+
+    `__import__` takes a relative name without its dots, and how many levels up it reaches as its fifth argument,
+    `level`; its name is read from the module's own package at that level, as `globals()` gives it."""
     strings = [node.value for node in ast.walk(call) if isinstance(node, ast.Constant) and isinstance(node.value, str)]
     given = next((kw.value.value for kw in call.keywords if kw.arg == "package" and isinstance(kw.value, ast.Constant)),
                  None)
@@ -221,6 +231,11 @@ def _names_the_service(call: ast.Call, package: str) -> bool:
         given = getattr(call.args[1], "value", None)
     anchor = given if isinstance(given, str) else package
     resolved = {_from_string(text, anchor) for text in strings}
+    if _called(call.func) == "__import__":
+        name, level = _argument(call, 0, "name"), _argument(call, 4, "level")
+        if (isinstance(level, ast.Constant) and type(level.value) is int and level.value > 0
+                and isinstance(name, ast.Constant) and isinstance(name.value, str)):
+            resolved.add(_absolute(name.value or None, level.value, package))
     return SERVICE in resolved or (SUPERSET in resolved and "service" in strings)
 
 
@@ -304,13 +319,18 @@ def test_service_module_is_imported_only_by_the_cli():
     ("superset/executor.py", "from importlib import import_module\nmodule = import_module('.service', __package__)\n"),
     ("server/app.py", "module = __import__('mnemiq.superset.service')\n"),
     ("server/app.py", "package = __import__('mnemiq.superset', fromlist=['service'])\n"),
+    ("superset/executor.py", "module = __import__('service', globals(), None, ['x'], 1)\n"),
+    ("superset/executor.py", "module = __import__('service', globals(), level=1)\n"),
+    ("superset/executor.py", "package = __import__('', globals(), None, ['service'], 1)\n"),
+    ("server/app.py", "module = __import__('superset.service', globals(), None, ['x'], 2)\n"),
     ("server/app.py", "import mnemiq\nadapter = mnemiq.superset.service.enrichment_adapter(settings, key)\n"),
     ("server/app.py", "from mnemiq import superset\nkey = superset.service.service_credential_from_env()\n"),
     ("server/app.py", "import mnemiq.superset as ss\nkey = ss.service.service_credential_from_env()\n"),
     ("server/app.py", "import sys\nmodule = sys.modules['mnemiq.superset.service']\n"),
 ], ids=["import", "import-as", "from-import", "relative-from", "relative-two-levels", "from-package",
         "relative-from-package", "from-dot-among-others", "package-init", "star", "import-module", "import-module-relative",
-        "import-module-own-package", "dunder-import", "dunder-import-fromlist", "attribute-chain", "package-attribute",
+        "import-module-own-package", "dunder-import", "dunder-import-fromlist", "dunder-import-relative-positional",
+        "dunder-import-relative-keyword", "dunder-import-relative-fromlist", "dunder-import-two-levels", "attribute-chain", "package-attribute",
         "aliased-package-attribute", "sys-modules"])
 def test_the_service_check_flags_each_planted_import(module, source):
     assert service_reaches(module, source), source
@@ -331,18 +351,35 @@ def test_the_service_check_passes_what_is_not_the_service_module(module, source)
 
 # The variable naming the service key file, as a string holds it: only the service module may name it.
 _SERVICE_KEY_VARIABLE = "SUPERSET_SERVICE_KEY"
+# The service module's constant holding the variable's name.
+_SERVICE_KEY_CONSTANT = "SERVICE_KEY_ENV"
 
 
 def names_the_key_variable(source: str) -> list[int]:
-    """The lines on which a string in `source` names the service key file's variable, f-strings' text included."""
-    return sorted({node.lineno for node in ast.walk(ast.parse(source))
-                   if isinstance(node, ast.Constant) and isinstance(node.value, str)
-                   and _SERVICE_KEY_VARIABLE in node.value})
+    """The lines on which `source` names the service key file's variable: a string holding the variable's name,
+    f-strings' text included, or the service module's constant for it, by its name, as an attribute, in an import
+    under any name, or as a string naming it, as `getattr` takes it."""
+    lines: set[int] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if _SERVICE_KEY_VARIABLE in node.value or _SERVICE_KEY_CONSTANT in node.value:
+                lines.add(node.lineno)
+        elif ((isinstance(node, ast.Name) and node.id == _SERVICE_KEY_CONSTANT)
+              or (isinstance(node, ast.Attribute) and node.attr == _SERVICE_KEY_CONSTANT)
+              or (isinstance(node, (ast.Import, ast.ImportFrom))
+                  and any(alias.name.rsplit(".", 1)[-1] == _SERVICE_KEY_CONSTANT for alias in node.names))):
+            lines.add(node.lineno)
+    return sorted(lines)
 
 
 def test_only_the_service_module_names_the_key_variable():
     """The service key file is read where it is named, in the service module, and nowhere else: not a setting, not the
-    server, not the CLI. Outside its reach: a name assembled from pieces at run time."""
+    server, not the CLI. Nothing else may name the variable, nor the service module's constant holding its name, so no
+    module reads it through that constant either. The CLI needs neither: the refusals that name the variable are the
+    service module's own.
+
+    Outside its reach: a name assembled from pieces at run time, whether the variable's or the constant's (a
+    computed key into the module's `vars()`)."""
     modules = _modules()
     found = [f"{module} line {line}" for module, source in modules.items() if module != SERVICE_MODULE
              for line in names_the_key_variable(source)]
@@ -354,6 +391,12 @@ def test_only_the_service_module_names_the_key_variable():
     "import os\npath = os.environ['MNEMIQ_SUPERSET_SERVICE_KEY_FILE']\n",
     "import os\npath = os.getenv(f'MNEMIQ_SUPERSET_SERVICE_KEY_FILE')\n",
     "service_key_file: str = Field(validation_alias='MNEMIQ_SUPERSET_SERVICE_KEY_FILE')\n",
-], ids=["environ", "f-string", "settings-alias"])
+    "import os\nfrom mnemiq.superset.service import SERVICE_KEY_ENV\npath = os.environ[SERVICE_KEY_ENV]\n",
+    "from mnemiq.superset.service import SERVICE_KEY_ENV as NAME\n",
+    "import os\nimport mnemiq.superset.service as service\npath = os.environ[service.SERVICE_KEY_ENV]\n",
+    "path = os.environ[getattr(service, 'SERVICE_KEY_ENV')]\n",
+    "import os\nfrom mnemiq.superset.service import *\npath = os.environ[SERVICE_KEY_ENV]\n",
+], ids=["environ", "f-string", "settings-alias", "the-constant", "the-constant-renamed", "the-constant-as-attribute",
+        "the-constant-by-getattr", "the-constant-by-star-import"])
 def test_the_key_variable_check_flags_each_planted_read(source):
     assert names_the_key_variable(source)

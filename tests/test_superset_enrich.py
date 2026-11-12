@@ -57,6 +57,8 @@ from tests.test_superset_runtime import PROFILES, DATABASE_ID, SCHEMA, SOURCE_ID
 # repr, or a bearer on the ask path.
 KEY = f"sst_x{secrets.token_hex(12)}"
 DSN = "postgresql://reader@127.0.0.1:5432/warehouse"
+# The most a service key file may hold, in bytes.
+KEY_FILE_LIMIT = 64 * 1024
 # Words only Superset says in these tests, so where they end up can be read.
 SAID = "superset-said-this"
 
@@ -661,6 +663,8 @@ def _key_environment(tmp_path, case: str) -> dict[str, str]:
         return {}
     if case == "blank":
         return {SERVICE_KEY_ENV: "  "}
+    if case == "the-key-itself":  # the key put where its file's path belongs
+        return {SERVICE_KEY_ENV: KEY}
     if case == "missing":
         return {SERVICE_KEY_ENV: str(path)}
     if case == "directory":
@@ -668,24 +672,57 @@ def _key_environment(tmp_path, case: str) -> dict[str, str]:
         (path / "key").write_text(KEY)
         return {SERVICE_KEY_ENV: str(path)}
     contents = {"empty": "", "whitespace": " \n\t\n", "space-inside": f"{KEY} {KEY}\n",
-                "not-ascii": f"{KEY}é\n"}
+                "not-ascii": f"{KEY}é\n", "larger-than-a-key": KEY * (KEY_FILE_LIMIT // len(KEY) + 1)}
     contents, mode = (contents[case], 0o600) if case in contents else (f"{KEY}\n", int(case, 8))
     path.write_text(contents, encoding="utf-8")
     path.chmod(mode)
     return {SERVICE_KEY_ENV: str(path)}
 
 
-@pytest.mark.parametrize("case", ["unset", "blank", "missing", "directory", "0644", "0640", "0604", "0620", "0601",
-                                  "empty", "whitespace", "space-inside", "not-ascii"])
+@pytest.mark.parametrize("case", ["unset", "blank", "the-key-itself", "missing", "directory", "0644", "0640", "0604",
+                                  "0620", "0601", "empty", "whitespace", "space-inside", "not-ascii",
+                                  "larger-than-a-key"])
 def test_service_key_file_rules(tmp_path, caplog, case):
-    """The key file must be named, a regular file, readable by its owner alone, and hold a key a header can carry.
-    Each refusal names the variable, and none of them, nor anything raised or logged on the way, holds the key."""
+    """The key file must be named, a regular file, readable by its owner alone, no larger than a key could be, and
+    hold a key a header can carry. Each refusal names the variable, and none of them, nor anything raised or logged on
+    the way, holds the key: not even where the variable holds the key itself, in place of its file's path."""
     environ = _key_environment(tmp_path, case)
     with caplog.at_level(logging.DEBUG), pytest.raises(SystemExit) as refused:
         service_credential_from_env(environ)
     assert isinstance(refused.value, SupersetConfigError)
     assert SERVICE_KEY_ENV in str(refused.value)
     _never_shows_the_key(refused.value, caplog)
+
+
+def test_a_key_file_as_large_as_the_limit_is_read(tmp_path):
+    path = tmp_path / "service-key"
+    path.write_bytes(b"k" * KEY_FILE_LIMIT)
+    path.chmod(0o600)
+    assert service_credential_from_env({SERVICE_KEY_ENV: str(path)}).value == "k" * KEY_FILE_LIMIT
+
+
+def test_a_key_file_is_read_no_further_than_the_limit(tmp_path, monkeypatch):
+    """A file far larger than any key is refused having read one byte past the limit, never the whole file."""
+    import mnemiq.superset.service as service_module
+
+    path = tmp_path / "service-key"
+    path.write_bytes(b"k" * (16 * KEY_FILE_LIMIT))
+    path.chmod(0o600)
+    read: list[int] = []
+
+    class Counting:
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        def read(self, descriptor, size):
+            chunk = os.read(descriptor, size)
+            read.append(len(chunk))
+            return chunk
+
+    monkeypatch.setattr(service_module, "os", Counting())
+    with pytest.raises(SupersetConfigError, match="larger"):
+        service_credential_from_env({SERVICE_KEY_ENV: str(path)})
+    assert 0 < sum(read) <= KEY_FILE_LIMIT + 1
 
 
 @pytest.mark.parametrize("mode", [0o600, 0o400])

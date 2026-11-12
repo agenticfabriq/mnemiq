@@ -50,6 +50,9 @@ _POSTGRES = "postgresql"
 # A key as a header carries it: visible ASCII, no spaces.
 _KEY_BYTES = re.compile(rb"[!-~]+")
 
+# The most a key file may hold, in bytes: far more than any key, so a larger file is not one.
+_KEY_FILE_LIMIT = 64 * 1024
+
 
 class ServiceKey(Bearer):
     """The API key of the Superset user enrichment reads the source as. Like every `Bearer`, it never prints."""
@@ -59,18 +62,26 @@ def service_credential_from_env(environ: Mapping[str, str] = os.environ) -> Serv
     """The service key in the file `MNEMIQ_SUPERSET_SERVICE_KEY_FILE` names.
 
     Refused with a sentence, which never holds the key, unless the variable names a regular file that grants its group
-    and others nothing, holding one key: visible ASCII with no spaces, once surrounding whitespace is stripped. The file
-    is checked as it was opened, so the file read is the file checked, and opening one that is not a regular file
-    never waits on it."""
+    and others nothing, no larger than `_KEY_FILE_LIMIT`, holding one key: visible ASCII with no spaces, once
+    surrounding whitespace is stripped. The file is checked as it was opened, so the file read is the file checked,
+    and opening one that is not a regular file never waits on it.
+
+    The variable's value is repeated in a refusal only once it has opened as a file: an operator may have put the key
+    itself there in place of its file's path, and a value that opens nothing says only why, as the system put it. That
+    refusal is raised apart from the system's error, which names what it tried to open."""
     named = environ.get(SERVICE_KEY_ENV, "")
     if not named.strip():
         raise SupersetConfigError(f"{SERVICE_KEY_ENV} is not set: enriching through Superset reads the source as a "
                                   "service user, and that variable names the file holding its API key")
+    reason = None
     try:
         descriptor = os.open(named, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     except OSError as exc:
-        raise SupersetConfigError(f"{SERVICE_KEY_ENV} names {named!r}, which cannot be opened "
-                                  f"({exc.strerror})") from None
+        reason = exc.strerror or "the system gave no reason"
+    except ValueError:  # a NUL, which no path holds
+        reason = "it is not a path"
+    if reason is not None:
+        raise SupersetConfigError(f"the file {SERVICE_KEY_ENV} names cannot be opened ({reason})")
     try:
         mode = os.fstat(descriptor).st_mode
         if not stat.S_ISREG(mode):
@@ -78,12 +89,15 @@ def service_credential_from_env(environ: Mapping[str, str] = os.environ) -> Serv
         if mode & 0o077:
             raise SupersetConfigError(f"{SERVICE_KEY_ENV} names {named!r}, which grants its group or others access "
                                       f"(mode {stat.S_IMODE(mode):04o}): make it its owner's alone, with chmod 600")
-        chunks = []
-        while chunk := os.read(descriptor, 65536):
-            chunks.append(chunk)
+        content = b""
+        while len(content) <= _KEY_FILE_LIMIT and (chunk := os.read(descriptor, _KEY_FILE_LIMIT + 1 - len(content))):
+            content += chunk
     finally:
         os.close(descriptor)
-    content = b"".join(chunks).strip()
+    if len(content) > _KEY_FILE_LIMIT:
+        raise SupersetConfigError(f"{SERVICE_KEY_ENV} names {named!r}, which is larger than "
+                                  f"{_KEY_FILE_LIMIT // 1024} KiB, far larger than a key")
+    content = content.strip()
     if not content:
         raise SupersetConfigError(f"{SERVICE_KEY_ENV} names {named!r}, which holds no key")
     if not _KEY_BYTES.fullmatch(content):
