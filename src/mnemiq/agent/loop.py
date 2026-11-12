@@ -402,7 +402,12 @@ class Agent:
                 # A source that could not be asked happened TO us, so it is a stated failure and
                 # stays out of the deferral rate, like a model or a judge that did not answer (M6).
                 outage = outcome.code is DeferralReason.SOURCE_UNAVAILABLE
-                if standing is not None and not outage:
+                if standing is not None and outcome.code is DeferralReason.INVALID_QUERY:
+                    # The retry wrote nothing the decider would run, so what it retried stands. Any
+                    # other deferral says something about the question or what this identity may
+                    # read -- an undefined term (M35, as deep's candidates read one), a table not
+                    # granted, a writer that says the data cannot answer -- and stands over it
+                    # (Codex's review).
                     return self._settled(packet, identity, deadline, emit, _attempt, *standing)
                 return AgentAnswer(answer=outcome.reason, deferred=not outage, failed=outage,
                                    reason_code=outcome.code)

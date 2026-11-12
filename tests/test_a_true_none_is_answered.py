@@ -651,13 +651,22 @@ def test_an_answered_empty_result_is_tried_again_only_when_asked(source):
     assert len(generator.calls) == 2 and "every value it filters on was found" in generator.calls[1]
 
 
+# A column the table does not have: the decider refuses it every time.
+REFUSED_SQL = "SELECT nope FROM claim"
+
+
 def test_a_retry_that_produces_nothing_leaves_the_result_before_it_standing(source):
     adapter, snap, values = source
-    # The writer has nothing more to say: the decline stands, naming the value.
-    agent, generator = _retrying(adapter, values, [MISSPELLED_SQL], empty_retries=1)
+    # Every statement the retry writes is refused: the decline stands, naming the value.
+    agent, generator = _retrying(adapter, values, [MISSPELLED_SQL] + [REFUSED_SQL] * 3, empty_retries=1)
     ans = _ask(agent, snap)
     assert ans.deferred is True and ans.verify_layer == "sanity", ans.answer
-    assert ans.answer.startswith(MISSPELLED_DECLINE) and len(generator.calls) == 2
+    assert ans.answer.startswith(MISSPELLED_DECLINE) and len(generator.calls) == 4
+    # And an answered "none" stands the same way.
+    agent, generator = _retrying(adapter, values, [NONE_SQL] + [REFUSED_SQL] * 3, empty_retries=1,
+                                 retry_answered_empties=True)
+    ans = _ask(agent, snap, "Which open claims are over 1,000,000?")
+    assert ans.deferred is False and NONE_NOTE in ans.answer, ans.answer
     # The database rejects the retry: the answered "none" stands.
     agent, generator = _retrying(adapter, values, [NONE_SQL, "SELECT CAST(region AS INTEGER) AS r FROM claim"],
                                  empty_retries=1, retry_answered_empties=True)
@@ -703,3 +712,24 @@ def test_a_database_error_before_any_empty_result_is_repaired_as_before(source):
                                  mode="thinking", empty_retries=1)
     ans = _ask(agent, snap)
     assert ans.deferred is False and len(generator.calls) == 3 and ans.attempts == 3, ans.answer
+
+
+def test_a_retry_that_says_something_about_the_question_stands_over_the_result_before_it(source):
+    """A deferral that is not the decider refusing every statement is a finding about the question or what
+    this identity may read, so it is not answered over: an undefined term the retry declares (M35), or a
+    writer that says the data cannot answer it. The earlier "none" is not answered instead."""
+    from dataclasses import replace
+
+    adapter, snap, values = source
+    question = "Which open claims are over 1,000,000?"
+    verifiers, _ = _build_mode_verifiers(Settings(), client=_CountingJudgeClient())
+    for retry_reply, code in ((json.dumps({"sql": NONE_SQL, "assumed_terms": ["lifetime value"]}), "undefined_term"),
+                              (json.dumps({"sql": None, "reason": "These tables cannot say."}), "unanswerable")):
+        generator = FakeGenerator([json.dumps({"sql": NONE_SQL}), retry_reply])
+        agent = build_agent(replace(MODES["instant"], empty_retries=1, retry_answered_empties=True),
+                            generator=generator, synthesizer=FakeSynthesizer("SYNTHESIZED"), adapter=adapter,
+                            cache=TwoTierCache(L1Cache()), corrector=None, values=values, selector=None,
+                            verifier=verifiers["instant"], guard_undefined_terms=True)
+        ans = agent.answer(_packet(question), snap, _GRANTS, _IDENTITY)
+        assert ans.deferred is True and str(ans.reason_code) == code, (code, ans.answer)
+        assert NONE_NOTE not in ans.answer and len(generator.calls) == 2, code
