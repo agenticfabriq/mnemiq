@@ -202,6 +202,20 @@ class AgentAnswer:
     verify_layer: str | None = None  # sanity | grounding | judge | judge_unavailable | pass
 
 
+# Where a model failure after a run carries the access decision that run was made under, read by
+# `Agent.answer`'s handler (`_carry_access`).
+_ACCESS = "_mnemiq_narrowed"
+
+
+def _carry_access(exc: BaseException, narrowed) -> None:
+    """Put the access decision a run of this turn was made under on `exc`; a class the attribute
+    cannot be set on is left as it is."""
+    try:
+        setattr(exc, _ACCESS, narrowed)
+    except Exception:  # noqa: BLE001 -- the record is an aid to the audit, never the failure
+        pass
+
+
 def _stamp(answer: AgentAnswer, verdict) -> AgentAnswer:
     """Carry the verifier's read onto an answer that PASSED it.
 
@@ -327,6 +341,7 @@ class Agent:
                     failed=True,
                     reason_code=DeferralReason.MODEL_UNAVAILABLE,
                     model_error=exc.kind,
+                    narrowed=getattr(exc, _ACCESS, None),
                 )
             if isinstance(exc, ContextTooLong):
                 # Refused rather than cut: the same configuration problem, told the same way.
@@ -342,6 +357,7 @@ class Agent:
                     failed=True,
                     reason_code=DeferralReason.MODEL_UNAVAILABLE,
                     model_error=exc.kind,
+                    narrowed=getattr(exc, _ACCESS, None),
                 )
             return AgentAnswer(
                 answer=(
@@ -352,6 +368,7 @@ class Agent:
                 failed=True,
                 reason_code=DeferralReason.MODEL_UNAVAILABLE,
                 model_error=exc.kind,
+                narrowed=getattr(exc, _ACCESS, None),
             )
 
     def _answer_single(
@@ -385,22 +402,29 @@ class Agent:
             # *decider* rejects (a star, a bad column) -- never disable that by capping it to
             # one attempt. This outer loop repairs what the *database* rejects, which is a
             # thing no amount of static analysis could have known.
-            with step(emit, Stage.PLAN, attempt=_attempt, of=tries):
-                outcome = plan_query(
-                    packet,
-                    snapshot,
-                    grants,
-                    self.generator,
-                    adapter=self.adapter,
-                    dialect=self.dialect,
-                    target=self.dialect,
-                    max_attempts=self.plan_attempts,
-                    feedback=feedback,
-                    corrector=self.corrector,
-                    values=self.values,
-                    guard_undefined_terms=self.guard_undefined_terms,
-                    guard_fanout=self.guard_fanout,
-                )
+            try:
+                with step(emit, Stage.PLAN, attempt=_attempt, of=tries):
+                    outcome = plan_query(
+                        packet,
+                        snapshot,
+                        grants,
+                        self.generator,
+                        adapter=self.adapter,
+                        dialect=self.dialect,
+                        target=self.dialect,
+                        max_attempts=self.plan_attempts,
+                        feedback=feedback,
+                        corrector=self.corrector,
+                        values=self.values,
+                        guard_undefined_terms=self.guard_undefined_terms,
+                        guard_fanout=self.guard_fanout,
+                    )
+            except ModelUnavailable as exc:
+                # A retry's model call failed after a query of this turn ran: the access decision
+                # that query ran under rides on the failure `answer` reports (Codex's review).
+                if standing is not None:
+                    _carry_access(exc, getattr(standing[0], "narrowed", None))
+                raise
             if isinstance(outcome, Deferred):
                 # A source that could not be asked happened TO us, so it is a stated failure and
                 # stays out of the deferral rate, like a model or a judge that did not answer (M6).

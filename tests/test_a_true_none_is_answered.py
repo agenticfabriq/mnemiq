@@ -774,3 +774,34 @@ def test_a_retry_that_defers_keeps_the_access_decision_the_turn_ran_under(source
     assert ans.deferred is True and str(ans.reason_code) == "unanswerable", ans.answer
     assert len(generator.calls) == 2
     assert ans.narrowed, "the row filter the first query ran under was dropped"
+
+
+def test_a_retry_whose_model_fails_keeps_the_access_decision_the_turn_ran_under(source):
+    """The retry's own model call can fail after a governed query ran: the failure still carries the access
+    decision that query ran under, so the audit never reads access as unevaluated (Codex's review)."""
+    from dataclasses import replace
+
+    from mnemiq.generate.generator import _parse
+    from mnemiq.llm.client import ModelUnavailable
+
+    class _FailsOnRetry:
+        def __init__(self):
+            self.calls = 0
+
+        def propose(self, packet, feedback=None, strategy=None):
+            self.calls += 1
+            if self.calls > 1:
+                raise ModelUnavailable("the provider went away")
+            return _parse(json.dumps({"sql": "SELECT id, amount FROM claim WHERE region = 'south'"}))
+
+    adapter, snap, values = source
+    verifiers, _ = _build_mode_verifiers(Settings(), client=_CountingJudgeClient())
+    generator = _FailsOnRetry()
+    agent = build_agent(replace(MODES["instant"], empty_retries=1), generator=generator,
+                        synthesizer=FakeSynthesizer("SYNTHESIZED"), adapter=adapter,
+                        cache=TwoTierCache(L1Cache()), corrector=None, values=values, selector=None,
+                        verifier=verifiers["instant"])
+    ans = agent.answer(_packet("List the south-region claims.", _NORTH_ONLY), snap, _NORTH_ONLY, _IDENTITY)
+    assert ans.failed is True and str(ans.reason_code) == "model_unavailable", ans.answer
+    assert generator.calls == 2
+    assert ans.narrowed, "the row filter the first query ran under was dropped"
