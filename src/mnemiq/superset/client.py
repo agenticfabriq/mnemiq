@@ -6,17 +6,20 @@ The call runs on `anyio.run` in the calling thread: the HTTP routes run synchron
 enrichment is synchronous, so neither has an event loop to share.
 
 Every failure is raised as one of the exceptions below, whose message is mnemiq's own sentence. Superset's text rides
-only in `.detail`, for the log: a refusal can name a table, a role or a user the caller may not see, and an
-exception's message is what reaches the model and the person asking.
+only in `.detail`, which the client logs once as it raises: a refusal can name a table, a role or a user the caller
+may not see, and an exception's message is what reaches the model and the person asking.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 # A bearer is sent as an HTTP header value, so it is held to visible ASCII without spaces: a value a header cannot
 # carry is refused when the credential is made, before an HTTP library can quote it back in an error.
@@ -129,14 +132,22 @@ class SupersetMcp:
 
         `timeout_s` is this call's own deadline, in place of the client's: a caller that gives Superset a time limit
         of its own waits longer than that limit, so Superset's answer that the statement ran out of time arrives
-        before the transport gives up on it."""
+        before the transport gives up on it.
+
+        A failed call raises one of the exceptions above, and logs its `.detail` once, at WARNING, as it does."""
         import anyio
 
         exchange = _Exchange(deadline_s=self._timeout_s if timeout_s is None else timeout_s)
         result = anyio.run(self._exchange, tool, request, exchange)
         if exchange.error is not None:
-            raise self._failure(tool, exchange) from exchange.error
-        return _payload(tool, result)
+            failure = self._failure(tool, exchange)
+            _log(tool, failure)
+            raise failure from exchange.error
+        try:
+            return _payload(tool, result)
+        except _SupersetFailure as failure:
+            _log(tool, failure)
+            raise
 
     async def _exchange(self, tool: str, request: dict, exchange: _Exchange):
         """The call itself. A failure of the exchange with Superset is kept on `exchange` for `_failure` to read;
@@ -272,6 +283,12 @@ def _payload(tool: str, result) -> dict:
     if not isinstance(payload, dict):
         raise SupersetToolError(f"Superset's answer to {tool} was not a JSON object", detail=text)
     return payload
+
+
+def _log(tool: str, failure: _SupersetFailure) -> None:
+    """Log what Superset or the transport said about a failed call of `tool`, beside mnemiq's sentence for it: the
+    exception's message, which is all that reaches the model and the person asking, says only the sentence."""
+    logger.warning("Superset's MCP service: %s failed (%s): %s", tool, failure, failure.detail or "no detail")
 
 
 def _first_text(result) -> str:

@@ -22,5 +22,6 @@ jobs:
       # The HTTP door's per-request identity too: 2.x moved its path and statelessness settings, which
       # `mcp/server.py` bridges, so only a 2.x run checks the bridge. And the Superset client, which
       # opens the transport by name and reads each response's HTTP status itself, because 2.x reports
-      # an HTTP error as a JSON-RPC error that no longer says which status it was.
-      - run: .venv/bin/python -m pytest tests/test_mcp_startup.py tests/test_mcp_http_identity.py tests/test_superset_client.py -v
+      # an HTTP error as a JSON-RPC error that no longer says which status it was. The adapter's and
+      # the grants' tests run that client joined to them, against the fake Superset.
+      - run: .venv/bin/python -m pytest tests/test_mcp_startup.py tests/test_mcp_http_identity.py tests/test_superset_client.py tests/test_superset_adapter.py tests/test_superset_grants.py -v

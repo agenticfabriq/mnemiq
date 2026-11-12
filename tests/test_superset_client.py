@@ -8,6 +8,7 @@ error's text, as the fake does by default; each way an error's text is read is c
 
 from __future__ import annotations
 
+import logging
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -195,6 +196,23 @@ def test_a_response_too_large_is_its_own_tool_error(any_shape):
     assert str(exc) == "Superset's answer to list_datasets was larger than its MCP service will send; ask for less"
     assert exc.detail == any_shape.error_text(TOO_LARGE)
     assert "61,234" not in str(exc)
+
+
+def test_supersets_own_words_are_logged_once_without_the_bearer(fake, caplog):
+    """mnemiq's sentence is what an exception shows; what Superset or the transport said is logged once, at WARNING,
+    with the tool it answered, as the call raises. The bearer is never logged."""
+    bearer = "bearer-never-logged"
+    fake.reply("execute_sql", lambda request, authorization: PermissionError(ROLE_DENIAL))
+    with caplog.at_level(logging.WARNING, logger="mnemiq.superset"), pytest.raises(SupersetPermissionDenied):
+        _client(fake.url, bearer).call("execute_sql", REQUEST)
+    fake.refuse_token(bearer)
+    with caplog.at_level(logging.WARNING, logger="mnemiq.superset"), pytest.raises(SupersetRefusedCaller) as caught:
+        _client(fake.url, bearer).call("execute_sql", REQUEST)
+    denial, refused = [record for record in caplog.records if record.name.startswith("mnemiq.superset")]
+    assert ROLE_DENIAL in denial.getMessage() and "execute_sql" in denial.getMessage()
+    assert caught.value.detail in refused.getMessage() and "execute_sql" in refused.getMessage()
+    assert {denial.levelno, refused.levelno} == {logging.WARNING}
+    assert bearer not in caplog.text
 
 
 def test_unknown_tool_names_the_tool_search_setting(fake):
