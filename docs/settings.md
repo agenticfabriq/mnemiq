@@ -327,6 +327,9 @@ title, answered empty without asking the engine. The question is the last user m
 | `oracle_read_only_ttl_s` | `300.0` | Seconds a read-only verdict stands before the engine checks the database's open mode again; 0 never checks again. |
 | `sources_path` | unset | A JSON manifest of several sources, for a federated store. |
 | `source_id` | `"acme"` | The source's id when there is one. |
+| `superset_mcp_url` | unset | Superset's MCP service. Set, the deployment runs in Superset mode: every query goes through Superset as the signed-in Superset user, and mnemiq holds no database credential of its own. http or https, with a host and no user name, password, query or fragment; http to a host other than this machine starts with a warning. It needs `oidc_issuer`, and refuses `mcp_transport = "http"`, Open WebUI's doors, `write_enabled`, `sources_path`, `enrich_facts` and `enrich_examples`. |
+| `superset_database_id` | unset | In Superset mode, the id of the Superset database mnemiq answers from. Required with `superset_mcp_url`, and refused without it. |
+| `superset_schema` | `"public"` | In Superset mode, the schema mnemiq reads in that database, its name spelled as Postgres stores it, case included (`Sales` and `sales` are two schemas): letters, digits and `_`, not starting with a digit. |
 
 ### The store and what built it
 

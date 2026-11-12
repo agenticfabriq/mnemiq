@@ -953,7 +953,11 @@ def load_current_snapshot(settings: Settings, con) -> tuple[Snapshot, dict[str, 
 def source_adapter(settings: Settings, *, read_only: bool):
     """The adapter a runtime runs its statements through, for the sources `settings` names, and
     the one anything grading against those sources runs on, so the two cannot differ.
-    `read_only` attaches every source read-only."""
+    `read_only` attaches every source read-only. Refused in Superset mode, before a manifest is read or a federated
+    store is built, since that mode opens no source connection of its own."""
+    from mnemiq.superset.settings import refuse_a_direct_source
+
+    refuse_a_direct_source(settings)
     specs = settings.source_specs()
     if len(specs) > 1:
         # Federated: ATTACH all sources into one DuckDB; the snapshot is the qualified union,
