@@ -1,18 +1,19 @@
 from __future__ import annotations
 
+import json
 import logging
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mnemiq.agent.history import scope_history
 from mnemiq.agent.loop import Agent, AgentAnswer
 from mnemiq.agent.modes import DEFAULT_MODE, MODES, Mode, build_agent, card_styles, modes_for
 from mnemiq.agent.route import Router, StaticRouter, UnknownMode
 from mnemiq.assembly import build_components
-from mnemiq.authz.grants import AuthzProvider, DenyAll, FileAuthzProvider
-from mnemiq.cache.store import L1Cache, TwoTierCache
+from mnemiq.authz.grants import UNAVAILABLE, AuthzProvider, DenyAll, FileAuthzProvider, GrantSet
+from mnemiq.cache.store import L1Cache, NullCache, TwoTierCache
 from mnemiq.config import DEFAULT_RETRIEVAL_K, Settings
 from mnemiq.contract import HistoryTurn, IdentityContext, Snapshot
 from mnemiq.execute.runner import DEFAULT_TIMEOUT_S
@@ -35,11 +36,27 @@ from mnemiq.sql.verdict import ApprovedWrite
 from mnemiq.store.bootstrap import init_store
 from mnemiq.store.control import resolve_version
 from mnemiq.store.snapshot_store import load_snapshot
+from mnemiq.superset.executor import NoSourceConnection, SupersetCredentialMissing, superset_executor
+from mnemiq.superset.grants import FixedGrants, resolve_grants
+from mnemiq.superset.settings import SUPERSET_DIALECT, SUPERSET_SOURCE_JOB
 from mnemiq.verify.judge import SemanticJudge
 from mnemiq.verify.verifier import Verifier
 
+if TYPE_CHECKING:
+    from mnemiq.superset.client import DelegatedToken
+
 
 logger = logging.getLogger(__name__)
+
+# The modes Superset mode does not offer. A deployment in that mode has no agent for them, and its router refuses them.
+_NOT_OFFERED_IN_SUPERSET_MODE = frozenset({"deep"})
+
+# What the `superset:source` job of a snapshot enriched through Superset records, as JSON: the database and schema it
+# was read from, the backend, and that no sample values were harvested.
+_SUPERSET_SOURCE_FIELDS = frozenset({"database_id", "schema", "backend", "values"})
+
+_NO_DELEGATION = ("Superset mode answers each request as the person whose verified token it carries, and this request "
+                  "carries none")
 
 
 class SnapshotMissing(RuntimeError):
@@ -93,7 +110,8 @@ class Usage:
 @dataclass
 class Runtime:
     """The engine assembled once for product use (CLI, MCP). Distinct from eval's in-memory
-    build_engine: this loads a *persisted* snapshot and connects a real source read-only."""
+    build_engine: this loads a *persisted* snapshot and connects a real source read-only. In
+    Superset mode it connects none, and each request's statements run through Superset."""
 
     con: Any
     snapshot: Snapshot | None
@@ -119,6 +137,12 @@ class Runtime:
     default_profile: str = "default"
     answer_log: AnswerLog | None = None  # one line per answer, for a deployment with no sink
     engine_commit: str | None = None
+
+    @property
+    def _superset_mode(self) -> bool:
+        """Whether this runtime answers through Superset, as the settings it was built with say. A runtime built by
+        hand with no settings, a stand-in for them, or none set at all, answers directly."""
+        return getattr(getattr(self, "settings", None), "superset_mode", False) is True
 
     def _picked(self, profile: str | None, identity: IdentityContext) -> LoadedProfile | None:
         """The profile this request runs on. First, before any work: refused, it has cost nothing and shown nothing."""
@@ -150,6 +174,10 @@ class Runtime:
             return
         snapshot, versions = load_current_snapshot(self.settings, self.con)
         if versions != self.loaded_versions:
+            if self._superset_mode and (refusal := _superset_source_refusal(snapshot, self.settings)) is not None:
+                # Held to the rule boot holds the first snapshot to. The snapshot already serving stays, and this
+                # request is refused rather than answered from one that may hold sample values.
+                raise SnapshotMissing(refusal)
             self.snapshot = snapshot
             self.loaded_versions = versions
             # Re-run every advisory whose SUBJECT is the snapshot, because the snapshot is
@@ -230,7 +258,17 @@ class Runtime:
         emit: Emit | None = None,
         history: list[HistoryTurn] | None = None,
         profile: str | None = None,
+        *,
+        delegation: DelegatedToken | None = None,
     ) -> AgentAnswer:
+        """Answer `question` for `identity`.
+
+        In Superset mode every statement of this request runs through Superset as the person whose verified token
+        `delegation` is, on an adapter built for this request alone, and what they may read is what Superset says when
+        asked as them. A request with no token is refused before any work. In direct mode `delegation` is not read."""
+        superset = self._superset_mode
+        if superset and delegation is None:
+            raise SupersetCredentialMissing(_NO_DELEGATION)
         # Route first: an unknown profile or mode fails before any work.
         picked = self._picked(profile, identity)
         name = self.router.route(question, mode)
@@ -240,18 +278,35 @@ class Runtime:
         # A question too long to read whole is declined before any work that can fail or wait on a server: the
         # snapshot reload (the control database, and on a swap the window count), retrieval (which embeds it) and
         # the fit (which counts it). It is still recorded as an answer (M147).
-        # ONE resolution per question, handed to everything below (M13). The provider may re-read
-        # its policy file per call, so asking twice let retrieval scope the cards against one
-        # version of it and the agent decide against another, within one request.
-        grants = self.authz.grants_for(identity)
-        if (declined := agent.decline_if_too_long(question)) is not None:
-            return self._record(declined, name, grants, identity, question, None,
-                                time.perf_counter(), picked)
-        self.reload_if_stale()
-        started = time.perf_counter()
+        if superset:
+            # Built before anything is asked of Superset, and calling nothing itself.
+            adapter = superset_executor(self.settings, delegation)
+            # Superset's grants are themselves work that waits on a server, so a question too long to read is
+            # declined before they are asked for. No grants were resolved for it, and the answer claims none.
+            if (declined := agent.decline_if_too_long(question)) is not None:
+                return self._record(declined, name, UNAVAILABLE, identity, question, None,
+                                    time.perf_counter(), picked)
+            self.reload_if_stale()
+            started = time.perf_counter()
+            # What this person may read, as Superset decides when asked with their token: resolved once and handed to
+            # everything that follows, as direct mode resolves the access policy's grants.
+            grants = resolve_grants(adapter, self.snapshot)
+            authz = FixedGrants(grants)
+            agent = agent.with_adapter(adapter)
+        else:
+            # ONE resolution per question, handed to everything below (M13). The provider may re-read
+            # its policy file per call, so asking twice let retrieval scope the cards against one
+            # version of it and the agent decide against another, within one request.
+            grants = self.authz.grants_for(identity)
+            authz = self.authz
+            if (declined := agent.decline_if_too_long(question)) is not None:
+                return self._record(declined, name, grants, identity, question, None,
+                                    time.perf_counter(), picked)
+            self.reload_if_stale()
+            started = time.perf_counter()
         with step(emit, Stage.RETRIEVE, mode=name):
             packet = retrieve(
-                self.con, question, identity, self.authz, self.embedder,
+                self.con, question, identity, authz, self.embedder,
                 # The default lives on the Settings field, not here. It was written out as a
                 # literal 12 and silently kept the old value when the measured default moved
                 # to 24 -- a second copy of a number is a second thing to forget.
@@ -276,8 +331,11 @@ class Runtime:
                 snapshot=self.snapshot,
                 grants=grants,
             )
-        # Scoped against THIS identity's boundary, never the one that produced the turn.
-        packet.history = scope_history(history, grants.fingerprint)
+        if superset:
+            packet.history = _superset_history(history, grants)
+        else:
+            # Scoped against THIS identity's boundary, never the one that produced the turn.
+            packet.history = scope_history(history, grants.fingerprint)
         # After the history, which the prompt carries too; before the agent, so the generator, the
         # corrector and the judge all read the cards the window has room for (M127).
         if fitter is not None:
@@ -332,24 +390,36 @@ class Runtime:
             )
         return answer
 
-    def schema(self, identity: IdentityContext) -> list[dict]:
-        """The tables and cards this identity may see, scoped by TABLE and by COLUMN."""
-        return self._cards(self.authz.grants_for(identity))
+    def schema(self, identity: IdentityContext, *, delegation: DelegatedToken | None = None) -> list[dict]:
+        """The tables and cards this identity may see, scoped by TABLE and by COLUMN. In Superset mode, what Superset
+        says the person whose token `delegation` is may read."""
+        return self._cards(self._grants_for(identity, delegation))
 
-    def scope(self, identity: IdentityContext) -> dict:
+    def scope(self, identity: IdentityContext, *, delegation: DelegatedToken | None = None) -> dict:
         """Everything an opening screen needs: the cards in scope, and the questions to offer.
 
         Both from **one** grant resolution. Two would let the panel and the starters answer to
         different versions of the policy file within a single request -- the divergence M13
-        describes, which is cheap to avoid here and awkward to detect later.
+        describes, which is cheap to avoid here and awkward to detect later. In Superset mode that
+        resolution is Superset's, asked with `delegation`, as `schema` asks it.
         """
-        grants = self.authz.grants_for(identity)
+        grants = self._grants_for(identity, delegation)
         starters: list[str] = []
         if self.snapshot is not None:
             starters = compose_starters(
                 self.snapshot, grants, build_access_policy(self.snapshot, grants)
             )
         return {"tables": self._cards(grants), "starters": starters}
+
+    def _grants_for(self, identity: IdentityContext, delegation: DelegatedToken | None) -> GrantSet:
+        """`identity`'s grants under the access policy, or in Superset mode what Superset says the person whose token
+        `delegation` is may read, asked through an adapter built for this request. Superset mode refuses a request with
+        no token before asking anything."""
+        if not self._superset_mode:
+            return self.authz.grants_for(identity)
+        if delegation is None:
+            raise SupersetCredentialMissing(_NO_DELEGATION)
+        return resolve_grants(superset_executor(self.settings, delegation), self.snapshot)
 
     def _cards(self, grants) -> list[dict]:
         """M4: this filtered on `oid in grants.objects` alone -- table level -- while promising
@@ -373,7 +443,12 @@ class Runtime:
 
     def write(self, sql: str, identity: IdentityContext) -> WriteResult:
         """Governed write: the caller supplies SQL; the decider screens it, then it executes
-        only if a write grant exists AND the source is attached read-write. Two locks."""
+        only if a write grant exists AND the source is attached read-write. Two locks.
+
+        Superset mode is read-only and refuses every write before reading it."""
+        if self._superset_mode:
+            raise SupersetCredentialMissing("Superset mode is read-only: it runs each statement through Superset as "
+                                            "the person asking, and makes no write")
         grants = self.authz.grants_for(identity)
         visible = visible_schema(self.snapshot, grants) if self.snapshot else {}
         policy = build_access_policy(self.snapshot, grants) if self.snapshot else AccessPolicy()
@@ -419,6 +494,64 @@ class Runtime:
 
 def _authz(settings: Settings) -> AuthzProvider:
     return FileAuthzProvider(settings.authz_path) if settings.authz_path else DenyAll()
+
+
+def _superset_history(history: list[HistoryTurn] | None, grants: GrantSet) -> list[HistoryTurn]:
+    """The earlier turns a Superset-mode request is reminded of: scoped as direct mode scopes them, with no rows. The
+    rows a client sends back with a turn may be another person's, or older than what this person may now read, so none
+    of them reach the prompt; a turn's question and SQL still do."""
+    return [turn.model_copy(update={"rows": []}) for turn in scope_history(history, grants.fingerprint)]
+
+
+def _superset_source_refusal(snapshot: Snapshot, settings: Settings) -> str | None:
+    """Why Superset mode will not serve `snapshot`, or None when it will.
+
+    It serves only a snapshot enriched through Superset from the database and schema it is configured for, which its
+    `superset:source` job records. A snapshot read any other way may hold sample values that Superset's row rules would
+    keep from the person asking, and one read from another database or schema describes tables this deployment does
+    not answer from."""
+    jobs = [job for job in snapshot.jobs if job.id == SUPERSET_SOURCE_JOB]
+    if not jobs:
+        return (f"the snapshot for source {snapshot.source_id!r} was not enriched through Superset, and Superset mode "
+                "serves only one that was: a snapshot read over a direct connection may hold sample values Superset's "
+                "row rules would keep from the person asking. Run `mnemiq enrich` in Superset mode, then `mnemiq build`")
+    for job in jobs:
+        if job.status != "done":
+            return (f"the snapshot's enrichment through Superset did not finish (its {SUPERSET_SOURCE_JOB} job is "
+                    f"{job.status!r}): run `mnemiq enrich` again")
+        source = _superset_source(job.detail)
+        if source is None:
+            return (f"the snapshot's record of the Superset database it was read from (its {SUPERSET_SOURCE_JOB} job) "
+                    "cannot be read, so the snapshot is not served: run `mnemiq enrich` again")
+        database_id, schema = source
+        if database_id != settings.superset_database_id:
+            return (f"the snapshot was enriched from Superset database {database_id}, and MNEMIQ_SUPERSET_DATABASE_ID is "
+                    f"{settings.superset_database_id}: enrich this deployment's database, or set the id to the one it "
+                    "was enriched from")
+        if schema != settings.superset_schema:
+            return (f"the snapshot was enriched from schema {schema!r}, and MNEMIQ_SUPERSET_SCHEMA is "
+                    f"{settings.superset_schema!r}: enrich this deployment's schema, or set the schema to the one it "
+                    "was enriched from")
+    return None
+
+
+def _superset_source(detail: str | None) -> tuple[int, str] | None:
+    """The database id and schema a `superset:source` job's detail records, or None unless the detail is exactly what
+    enrichment through Superset writes: those two, the backend `postgresql`, and `values` saying none were
+    harvested."""
+    try:
+        record = json.loads(detail or "")
+    except ValueError:
+        return None
+    if not isinstance(record, dict) or set(record) != _SUPERSET_SOURCE_FIELDS:
+        return None
+    database_id, schema = record["database_id"], record["schema"]
+    # `type(...) is int`, since a JSON true reads as a bool, which Python also counts an int.
+    if type(database_id) is not int or not isinstance(schema, str):
+        return None
+    if record["backend"] != "postgresql" or record["values"] != "not harvested":
+        return None
+    return database_id, schema
 
 
 def _warn_policy_advisories(authz: AuthzProvider, snapshot: Snapshot | None) -> None:
@@ -997,6 +1130,14 @@ def build_runtime(settings: Settings) -> Runtime:
         raise UnknownMode(
             f"MNEMIQ_MODE={default_mode!r} names no mode; valid modes: {sorted(MODES)}"
         )
+    # Decided before the store is read: Superset mode serves only a snapshot enriched through Superset, opens no source
+    # connection of its own, keeps no result cache and offers no `deep`. Each request runs its statements through an
+    # adapter built for it from the token it carries (`Runtime.ask`).
+    superset = settings.superset_mode
+    offered = frozenset(MODES) - _NOT_OFFERED_IN_SUPERSET_MODE if superset else None
+    if offered is not None and default_mode not in offered:
+        raise UnknownMode(f"MNEMIQ_MODE={default_mode!r} is not offered in Superset mode; valid modes: "
+                          f"{sorted(offered)}")
     try:
         # Before anything opens. A sentence, as a mistyped source manifest is, on every door.
         profiles, default_profile = load_profiles(settings)
@@ -1005,21 +1146,30 @@ def build_runtime(settings: Settings) -> Runtime:
     con = init_store(settings.store_path, local_only=settings.local_only)
     # Current version per source (shared pointer when a control DSN is set, else local) + snapshot.
     snapshot, loaded_versions = load_current_snapshot(settings, con)
-    # Read-only attach unless writes are explicitly enabled -- the backstop under db_write.
-    adapter = source_adapter(settings, read_only=not settings.write_enabled)
+    if superset:
+        if (refusal := _superset_source_refusal(snapshot, settings)) is not None:
+            raise SnapshotMissing(refusal)
+        # Runs nothing: `source_adapter` would refuse in this mode, and each request brings its own adapter.
+        adapter = NoSourceConnection(SUPERSET_DIALECT)
+    else:
+        # Read-only attach unless writes are explicitly enabled -- the backstop under db_write.
+        adapter = source_adapter(settings, read_only=not settings.write_enabled)
 
     # Live L2 (cross-replica) + observability sink when a control Postgres is configured;
-    # L1-only + no-op sink otherwise (today, byte-for-byte).
+    # L1-only + no-op sink otherwise (today, byte-for-byte). Superset mode keeps no result cache:
+    # Superset applies its row rules to each person's statements, and the grants mnemiq reads from
+    # it name tables, not those rules, so a result kept here could reach a person whose rules
+    # differ. Superset's own result cache checks the person's access before it answers.
     if settings.control_dsn:
         from mnemiq.cache.postgres import PostgresCache
         from mnemiq.observability.metrics import PostgresSink
 
-        cache = TwoTierCache(L1Cache(), PostgresCache(settings.control_dsn))
+        cache = NullCache() if superset else TwoTierCache(L1Cache(), PostgresCache(settings.control_dsn))
         sink = PostgresSink(settings.control_dsn)
     else:
         from mnemiq.observability.metrics import NullSink
 
-        cache = TwoTierCache(L1Cache())
+        cache = NullCache() if superset else TwoTierCache(L1Cache())
         sink = NullSink()
     # M26: the emitter shipped with NO CALLER. `Runtime.trace_sink` existed, the sink existed, its
     # tests passed, and nothing here ever constructed one -- so every answer in production emitted
@@ -1043,6 +1193,8 @@ def build_runtime(settings: Settings) -> Runtime:
         # Per-mode result verifier: sanity (free) in every mode, judge in `thinking` and `deep`; the
         # judge is built once and shared. MNEMIQ_VERIFY=0 forces off (byte-for-byte), =1 forces full.
         modes = modes_for(profile.settings)
+        if offered is not None:
+            modes = {name: mode for name, mode in modes.items() if name in offered}
         verifiers, _ = _build_mode_verifiers(profile.settings, client=kit.client, modes=modes)
         # One judge at most, shared by every mode that runs it; a self-judge calls the writer's client.
         judge = next((v.judge for v in verifiers.values() if v is not None and v.judge is not None), None)
@@ -1074,8 +1226,14 @@ def build_runtime(settings: Settings) -> Runtime:
             answer_log.record_profile(profile_name, entry.version, resolved_view(entry.settings, dialect), commit)
     _boot_authz = _authz(settings)
     _warn_policy_advisories(_boot_authz, snapshot)
-    _warn_source_enforcement(adapter, _acknowledged(settings))
-    _warn_unconfirmable_functions(adapter, _acknowledged(settings))
+    if superset:
+        # `_warn_source_enforcement` and `_warn_unconfirmable_functions` read the source, which this runtime holds no
+        # connection to.
+        logger.info("Superset mode reads the function inventory per request, through Superset as the person "
+                    "asking, so neither it nor the source's own enforcement is checked at boot")
+    else:
+        _warn_source_enforcement(adapter, _acknowledged(settings))
+        _warn_unconfirmable_functions(adapter, _acknowledged(settings))
     # SIDE BY SIDE, not nested. View discovery degrades independently of the function
     # inventory -- `lineage_for` appends the view codes without consulting it -- so
     # calling this from inside the function advisory ran it only when that one found
@@ -1095,7 +1253,7 @@ def build_runtime(settings: Settings) -> Runtime:
         settings=settings,
         agents=default.agents,
         modes=default.modes,
-        router=StaticRouter(default=default_mode),
+        router=StaticRouter(default=default_mode, offered=offered),
         loaded_versions=loaded_versions,
         sink=sink,
         trace_sink=trace_sink,
