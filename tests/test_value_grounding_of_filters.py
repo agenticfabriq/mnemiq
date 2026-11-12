@@ -803,3 +803,131 @@ def test_a_failed_probe_logs_neither_the_value_nor_its_sql(tmp_path, caplog):
     assert holds("patient", "national_id", "secret-4711") is None  # no such table: no answer
     assert "patient.national_id" in caplog.text
     assert "secret-4711" not in caplog.text and "SELECT 1" not in caplog.text
+
+
+# --- Oracle's day forms ------------------------------------------------------------------------
+#
+# Oracle reads a bare date string through the session's NLS_DATE_FORMAT, so it is left out of
+# `_ISO_DATES_READ_AS_DATES` and no plain date string is a bound there. A parse whose format names
+# the day alone (`TO_DATE('2024-03-03', 'YYYY-MM-DD')`, or TO_TIMESTAMP with that format) and the
+# `DATE '2024-03-03'` literal need no session format: each is midnight of that day. They are read by
+# the same reader the day-bound rewrite uses (`_day`), so the two never read one statement two ways.
+# An Oracle DATE holds a time of day, so like a naive TIMESTAMP it takes such a day only as the
+# half-open start or end of a range. Names are keyed as Oracle stores them (`tests/stored_names.py`).
+
+_ORACLE_VISIBLE = {"CLAIM": {"ID", "TS", "FILED", "TZ", "AT", "STATUS", "NOTE"}}
+_ORACLE_TYPES = {"CLAIM": {"ID": "NUMBER", "TS": "TIMESTAMP(6)", "FILED": "DATE",
+                           "TZ": "TIMESTAMP WITH TIME ZONE", "AT": "INTERVAL DAY TO SECOND",
+                           "STATUS": "VARCHAR2(20)", "NOTE": "VARCHAR2(200)"}}
+
+
+def _oracle(sql: str, values=None, **kw):
+    return ground_values(sqlglot.parse_one(sql, read="oracle"), _ORACLE_VISIBLE,
+                         _Values({("CLAIM", "STATUS"): {"open", "closed"}}) if values is None else values,
+                         dialect="oracle", types=_ORACLE_TYPES, **kw)
+
+
+def _read_oracle(sql: str, **kw) -> list[tuple]:
+    return [(v.text, v.outcome, v.why, v.column) for v in _oracle(sql, **kw).values]
+
+
+def test_an_oracle_day_form_bounding_a_time_column_half_open_is_a_bound():
+    """The inclusive start or the exclusive end of a range, on either side, on a TIMESTAMP or a DATE
+    column. The format is part of the bound, not a value of its own."""
+    for column in ("TS", "FILED"):
+        for sql in (f"SELECT ID FROM CLAIM WHERE {column} >= TO_DATE('2024-03-03', 'YYYY-MM-DD') "
+                    f"AND {column} < TO_DATE('2024-03-04', 'YYYY-MM-DD')",
+                    f"SELECT ID FROM CLAIM WHERE {column} >= DATE '2024-03-03' AND {column} < DATE '2024-03-04'",
+                    f"SELECT ID FROM CLAIM WHERE TO_DATE('2024-03-03', 'YYYY-MM-DD') <= {column} "
+                    f"AND DATE '2024-03-04' > {column}",
+                    f"SELECT ID FROM CLAIM WHERE {column} >= TO_TIMESTAMP('2024-03-03', 'YYYY-MM-DD')"):
+            read = _read_oracle(sql)
+            assert {(o, w, c) for _, o, w, c in read} == {(TYPED, "", f"CLAIM.{column}")}, sql
+            assert all(t.startswith("2024-03-0") for t, _, _, _ in read), (sql, read)
+
+
+def test_the_qcell_shape_an_oracle_day_range_with_grounded_values_answers_an_empty_result():
+    """A week on a TIMESTAMP column and a value the index holds: an empty result is a real "none"."""
+    sql = ("SELECT ID FROM CLAIM WHERE STATUS = 'open' AND TS >= TO_DATE('2024-03-03', 'YYYY-MM-DD') "
+           "AND TS < TO_DATE('2024-03-10', 'YYYY-MM-DD')")
+    grounding = _oracle(sql)
+    assert grounding.blocking() == []
+    assert sanity_check("which?", pa.table({"ID": pa.array([], pa.int64())}), grounding) is None
+
+
+def test_an_oracle_day_form_that_misreads_a_day_stays_unchecked():
+    """An inclusive end drops the day's hours, an exclusive start keeps them, and `=`, `<>`, IN and
+    BETWEEN compare with midnight alone, on a TIMESTAMP and on a DATE alike. The decline names the
+    day, never the format."""
+    for column in ("TS", "FILED"):
+        for op in ("<=", ">", "=", "<>"):
+            for form in ("TO_DATE('2024-03-03', 'YYYY-MM-DD')", "DATE '2024-03-03'"):
+                sql = f"SELECT ID FROM CLAIM WHERE {column} {op} {form}"
+                assert _read_oracle(sql) == [("2024-03-03", UNCHECKED, "date_on_time", f"CLAIM.{column}")], sql
+        for sql in (f"SELECT ID FROM CLAIM WHERE {column} IN (DATE '2024-03-03')",
+                    f"SELECT ID FROM CLAIM WHERE {column} BETWEEN DATE '2024-03-03' AND DATE '2024-03-04'"):
+            assert {(o, w) for _, o, w, _ in _read_oracle(sql)} == {(UNCHECKED, "date_on_time")}, sql
+
+
+def test_an_oracle_day_form_on_a_zone_aware_or_an_unknown_column_stays_unchecked():
+    """On TIMESTAMP WITH TIME ZONE a day starts in the session's zone; a column of no temporal type,
+    an expression and a column nothing places say nothing about a day."""
+    assert _read_oracle("SELECT ID FROM CLAIM WHERE TZ >= DATE '2024-03-03'") == [
+        ("2024-03-03", UNCHECKED, "date_on_time", "CLAIM.TZ")]
+    # Text holds no time of day, so the sentence must not say it does.
+    assert _read_oracle("SELECT ID FROM CLAIM WHERE NOTE >= DATE '2024-03-03'") == [
+        ("2024-03-03", UNCHECKED, "not_on_a_date_column", "CLAIM.NOTE")]
+    for sql in ("SELECT ID FROM CLAIM WHERE AT >= DATE '2024-03-03'",
+                "SELECT ID FROM CLAIM WHERE TRUNC(TS) >= DATE '2024-03-03'",
+                "SELECT ID FROM CLAIM WHERE NOPE >= DATE '2024-03-03'",
+                "SELECT ID FROM CLAIM WHERE TS >= DATE '2024-03-03' + 1"):
+        assert {o for _, o, _, _ in _read_oracle(sql)} == {UNCHECKED}, sql
+
+
+def test_an_oracle_date_in_any_other_form_stays_unchecked():
+    """A bare string, a CAST or a TO_DATE with no format follows NLS_DATE_FORMAT; a format with a time of day, one that orders
+    the day otherwise, a day that does not exist and a TIMESTAMP literal are not a day's midnight
+    read by `_day`. Each keeps the rule as it was."""
+    for sql in ("SELECT ID FROM CLAIM WHERE TS >= '2024-03-03'",
+                "SELECT ID FROM CLAIM WHERE TS >= CAST('2024-03-03' AS DATE)",
+                "SELECT ID FROM CLAIM WHERE TS >= TO_DATE('2024-03-03')",
+                "SELECT ID FROM CLAIM WHERE TS >= TO_DATE('2024-03-03 00:00', 'YYYY-MM-DD HH24:MI')",
+                "SELECT ID FROM CLAIM WHERE TS >= TO_DATE('2024-03-03', 'YYYY-DD-MM')",
+                "SELECT ID FROM CLAIM WHERE TS >= TO_DATE('03/03/2024', 'MM/DD/YYYY')",
+                "SELECT ID FROM CLAIM WHERE TS >= TO_DATE('2024-02-30', 'YYYY-MM-DD')",
+                "SELECT ID FROM CLAIM WHERE TS >= TIMESTAMP '2024-03-03 00:00:00'"):
+        assert {o for _, o, _, _ in _read_oracle(sql)} == {UNCHECKED}, sql
+
+
+def test_an_oracle_day_form_on_a_withheld_column_is_never_read():
+    """A masked column or a row-filtered table withholds what the index holds, and a bound there
+    says nothing the caller may learn from: unchecked, naming why."""
+    masked = _read_oracle("SELECT ID FROM CLAIM WHERE TS >= DATE '2024-03-03'",
+                          masks=lambda table, column: column == "TS")
+    assert masked == [("2024-03-03", UNCHECKED, "masked", "CLAIM.TS")]
+    hidden = _read_oracle("SELECT ID FROM CLAIM WHERE TS >= DATE '2024-03-03'", row_filtered={"CLAIM"})
+    assert hidden == [("2024-03-03", UNCHECKED, "row_filtered", "CLAIM.TS")]
+
+
+def test_a_day_form_outside_oracle_keeps_the_rule_as_it_was():
+    """The change is Oracle's alone: DuckDB's and Postgres's parses stay unchecked, and their DATE
+    literal stays a cast read by the rules above."""
+    for sql, dialect in (("SELECT id FROM claim WHERE ts >= STRPTIME('2024-03-03', '%Y-%m-%d')", "duckdb"),
+                         ("SELECT id FROM claim WHERE ts >= TO_DATE('2024-03-03', 'YYYY-MM-DD')", "postgres"),
+                         ("SELECT id FROM claim WHERE ts >= DATE '2024-03-03'", "duckdb")):
+        assert {o for _, o, _, _ in _read(sql, dialect=dialect)} == {UNCHECKED}, (sql, dialect)
+
+
+def test_the_decider_grounds_an_oracle_day_bound_after_moving_it():
+    """The join: the day-bound rewrite turns `<=` into the next day's exclusive end, and the grounding
+    reads that moved bound, so a week asked inclusively answers an empty result."""
+    from mnemiq.sql.decide import decide
+    from mnemiq.sql.verdict import Approved
+
+    verdict = decide("SELECT ID FROM CLAIM WHERE TS >= TO_DATE('2024-03-03', 'YYYY-MM-DD') "
+                     "AND TS <= TO_DATE('2024-03-09', 'YYYY-MM-DD')", _ORACLE_VISIBLE,
+                     dialect="oracle", target="oracle", types=_ORACLE_TYPES)
+    assert isinstance(verdict, Approved), verdict
+    assert verdict.day_bounds == 1
+    read = [(v.text, v.outcome) for v in verdict.value_grounding.values]
+    assert read == [("2024-03-03", TYPED), ("2024-03-10", TYPED)], read

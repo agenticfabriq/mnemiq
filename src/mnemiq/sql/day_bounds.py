@@ -77,9 +77,8 @@ from datetime import date, timedelta
 
 from sqlglot import exp
 
-from mnemiq.sql.values_check import _in_scope, _iso_date, _moment, _scopes, _temporal_kind
+from mnemiq.sql.values_check import _day, _in_scope, _moment, _scopes, _temporal_kind
 
-_DAY_FORMATS = frozenset({"%Y-%m-%d"})  # a parse format naming the day alone (Oracle's TO_DATE 'YYYY-MM-DD')
 _WRAPPERS = (exp.Cast, exp.TryCast, exp.DateStrToDate, exp.StrToDate, exp.StrToTime)
 _BINARY = (exp.EQ, exp.NEQ, exp.LT, exp.LTE, exp.GT, exp.GTE, exp.NullSafeEQ, exp.NullSafeNEQ, exp.Is)
 # The days every engine's timestamp holds whole: DuckDB's TIMESTAMP_NS runs from 1677-09-21 00:12:43
@@ -106,27 +105,6 @@ _MIRROR = {exp.LT: exp.GT, exp.GT: exp.LT, exp.LTE: exp.GTE, exp.GTE: exp.LTE}  
 # naive timestamp (or an Oracle DATE); any other such column, or a cast to DATE outside Oracle; opaque.
 DAY, MOMENT, NUMBER, STRING = "day", "moment", "number", "string"
 TIMES, COLUMN, OPAQUE = "times", "column", "opaque"
-
-
-def _day(node: exp.Expression) -> exp.Literal | None:
-    """The string literal of a date-only bound, in one of the spellings that mean midnight of that
-    day, else None: a plain string; a CAST or TRY_CAST of one to a date or a naive timestamp; a
-    DATE literal as Oracle parses it; a parse whose format names the day alone."""
-    inner = None
-    if isinstance(node, exp.Literal):
-        inner = node
-    elif isinstance(node, (exp.Cast, exp.TryCast)):
-        if _temporal_kind(node.args.get("to"), None) in ("date", "timestamp"):
-            inner = node.this
-    elif isinstance(node, exp.DateStrToDate):
-        inner = node.this
-    elif isinstance(node, (exp.StrToDate, exp.StrToTime)):
-        fmt = node.args.get("format")
-        if isinstance(fmt, exp.Literal) and fmt.is_string and fmt.this in _DAY_FORMATS:
-            inner = node.this
-    if isinstance(inner, exp.Literal) and inner.is_string and _iso_date(inner.this):
-        return inner
-    return None
 
 
 def _next_day(bound: exp.Expression) -> exp.Expression:
