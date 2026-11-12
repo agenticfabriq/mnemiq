@@ -41,6 +41,15 @@ class SupersetConfigError(SystemExit):
     """A configuration Superset mode cannot honour. A SystemExit, so the server stops with the message alone."""
 
 
+def refuse_a_direct_source(settings: Settings | None) -> None:
+    """Raise when `settings` are in Superset mode. Every place mnemiq opens a source connection of its own calls this
+    first (`source_adapter`, `adapter_for` and `run_acme`), so a deployment configured for Superset never reads a
+    source with mnemiq's own credential instead."""
+    if settings is not None and settings.superset_mode:
+        raise SupersetConfigError("MNEMIQ_SUPERSET_MCP_URL is set, and Superset mode runs every query through Superset "
+                                  "and opens no database connection of its own")
+
+
 def check_superset_settings(settings: Settings, auth: AuthConfig | None) -> None:
     """Refuse to start in Superset mode unless every answer can come from Superset as the person asking.
 

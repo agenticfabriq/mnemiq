@@ -43,6 +43,7 @@ from mnemiq.adapters.duckdb import DuckDBAdapter, UnparseableDSN
 from mnemiq.adapters.oracle import OracleAdapter
 from mnemiq.config import Settings, SourceSpec
 from mnemiq.duckdb_extensions import SOURCE_EXTENSIONS
+from mnemiq.superset.settings import refuse_a_direct_source
 
 # The kinds a source may declare. `federated.py` supports a SUBSET of these -- see `FEDERABLE`.
 KINDS = ("postgres", "sqlite", "duckdb", "oracle")
@@ -89,7 +90,10 @@ def adapter_for(spec: SourceSpec, settings: Settings | None = None, *, read_only
     `statement_timeout_s` bounds every statement on a Postgres source SERVER-side (M152), which
     is the only bound that stops it: the serving runtime passes its execution timeout -- writes
     on that adapter included -- while enrich and refresh pass none, since profiling a large
-    table may rightly run long. A source whose own limit is tighter keeps it."""
+    table may rightly run long. A source whose own limit is tighter keeps it.
+
+    Refused in Superset mode, which opens no source connection of its own."""
+    refuse_a_direct_source(settings)
     adapter = _adapter_for(spec, settings, read_only=read_only,
                            statement_timeout_s=statement_timeout_s)
     if spec.tables:

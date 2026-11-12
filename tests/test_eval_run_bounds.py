@@ -51,7 +51,7 @@ def test_the_engine_and_gold_share_one_server_bounded_adapter_and_the_profiling_
     monkeypatch.setattr(run, "summarize", lambda results, **kw: SimpleNamespace(render=lambda: ""))
     monkeypatch.setattr(trend, "last_run", lambda *a, **kw: None)
     settings = SimpleNamespace(pg_dsn="postgresql://x/y", local_only=False, source_id="acme", dictionary_path=None,
-                               ontology_records_path=None, control_dsn=None)
+                               ontology_records_path=None, control_dsn=None, superset_mode=False)
 
     assert run.run_acme(settings) == 0
     # One object for the engine, its re-execution and the gold, so run_case's cross-engine probe stays off.

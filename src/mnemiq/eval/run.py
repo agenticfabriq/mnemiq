@@ -27,7 +27,13 @@ def run_acme(settings: Settings, golden: str = "evals/acme.json",
 
     --gate also fails when it could not compare at all -- no baseline, or a trend store it
     could not read. Both used to pass, so the gate could not fail and did not, while the
-    number it was guarding drifted sixteen points (M34)."""
+    number it was guarding drifted sixteen points (M34).
+
+    Refused in Superset mode, which opens no source connection of its own: this command reads MNEMIQ_PG_DSN itself
+    rather than through `adapter_for`."""
+    from mnemiq.superset.settings import refuse_a_direct_source
+
+    refuse_a_direct_source(settings)
     if not settings.pg_dsn:
         print("set MNEMIQ_PG_DSN")
         return 1
