@@ -103,6 +103,12 @@ class ColumnStats:
     partition_failure: str | None = None
 
 
+def unharvested(harvest_values: bool) -> dict[str, bool]:
+    """The keyword that tells a profiling call to read no column values, or none when values are harvested: a caller
+    that harvests calls each profiling function exactly as it always has."""
+    return {} if harvest_values else {"harvest_values": False}
+
+
 def _top_k(adapter: SourceAdapter, table: str, column: str, k: int) -> list[tuple]:
     if k <= 0:  # callers that only need counts (e.g. key detection) pass k=0
         return []
@@ -129,8 +135,9 @@ def _top_k(adapter: SourceAdapter, table: str, column: str, k: int) -> list[tupl
 
 
 def profile_column(adapter: SourceAdapter, table: str, column: str, k: int = 10,
-                   data_type: str | None = None) -> ColumnStats:
-    """`data_type` lets this refuse the same column types `profile_table` skips.
+                   data_type: str | None = None, *, harvest_values: bool = True) -> ColumnStats:
+    """`data_type` lets this refuse the same column types `profile_table` skips. With `harvest_values` False the
+    column's counts are read and none of its values.
 
     Without it this was the sibling hole to the one `profile_table` closes. `infer_relationships`
     calls this for every key-LIKE column -- anything named `*_id` or `*_identifier` -- and on Oracle
@@ -157,7 +164,7 @@ def profile_column(adapter: SourceAdapter, table: str, column: str, k: int = 10,
         row_count=row_count,
         distinct_count=distinct_count,
         null_count=row_count - non_null,
-        top_k=_top_k(adapter, table, column, k),
+        top_k=_top_k(adapter, table, column, k if harvest_values else 0),
     )
 
 
@@ -167,8 +174,11 @@ def profile_table(
     k: int = 10,
     code_max_distinct: int = 25,
     key_columns: set[str] | None = None,
+    *,
+    harvest_values: bool = True,
 ) -> list[ColumnStats]:
-    """One counts query for the whole table; top-k only where it is cheap and useful."""
+    """One counts query for the whole table; top-k only where it is cheap and useful, and never with
+    `harvest_values` False, which reads the counts and none of the values."""
     if not table.columns:
         return []
     keys = key_columns or set()
@@ -296,7 +306,7 @@ def profile_table(
             # Harvest the WHOLE vocabulary, not a top-k slice: the column already qualifies as a
             # code set (<= code_max_distinct distinct), so a rare code must not be dropped -- else a
             # dictionary can never ground it and the model never sees it. Bounded by the cap.
-            s.top_k = _top_k(adapter, table.name, c, code_max_distinct)
+            s.top_k = _top_k(adapter, table.name, c, code_max_distinct if harvest_values else 0)
         stats.append(s)
     _profile_partitions(adapter, table, stats)
     return stats

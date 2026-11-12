@@ -63,6 +63,14 @@ def _qualifies(column, max_distinct: int) -> bool:
     )
 
 
+def clear_value_index(con: duckdb.DuckDBPyConnection, source_id: str) -> None:
+    """Remove every value the index holds for `source_id`. What enrichment through Superset does in
+    place of building the index, since it harvests no values: none read over a direct connection
+    before survive it."""
+    con.execute(_DDL)
+    con.execute("DELETE FROM value_index WHERE source_id = ?", [source_id])
+
+
 def build_value_index(
     adapter, snapshot: Snapshot, con: duckdb.DuckDBPyConnection, max_distinct: int = 200
 ) -> int:
@@ -73,8 +81,7 @@ def build_value_index(
     Only columns whose entire value set we can hold are indexed -- that is what makes a later
     'not found' a genuine signal rather than an artifact of sampling.
     """
-    con.execute(_DDL)
-    con.execute("DELETE FROM value_index WHERE source_id = ?", [snapshot.source_id])
+    clear_value_index(con, snapshot.source_id)
 
     physical = {sb.object_id: sb.source_object for sb in snapshot.source_bindings}
     rows: list[list[str]] = []

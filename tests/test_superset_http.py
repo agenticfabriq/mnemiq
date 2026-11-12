@@ -39,6 +39,7 @@ from mnemiq.superset.client import (
 from mnemiq.superset.executor import SupersetCredentialMissing
 from mnemiq.superset.grants import NOT_A_BUILDER, NotABuilder, SupersetMisconfigured
 from mnemiq.superset.payload import SupersetAccessRefused
+from mnemiq.superset.service import SERVICE_KEY_ENV, service_credential_from_env
 from mnemiq.superset.settings import SupersetConfigError
 from tests.auth_keys import AUDIENCE, ISSUER, claims, jwks_for, mint, owui_claims, hs256, public_pem, raw_token, rsa_key
 from tests.scripted_deployment import SQL, retrieve_the_one_table
@@ -233,16 +234,22 @@ def test_the_delegation_is_the_bearer_the_door_verified(tmp_path, jwks):
 
 
 def test_service_key_in_the_environment_is_never_sent(tmp_path, model, fake, jwks, monkeypatch, no_direct_source):
-    """The service key enrichment uses lives in a file the environment names; nothing on the ask path reads it."""
+    """The service key enrichment uses lives in a file the environment names; nothing on the ask path reads it. The
+    file is one enrichment would accept, so the key is there to be read, and still no request carries it."""
     key = tmp_path / "service-key"
     key.write_text("sst_service")
-    monkeypatch.setenv("MNEMIQ_SUPERSET_SERVICE_KEY_FILE", str(key))
+    key.chmod(0o600)
+    monkeypatch.setenv(SERVICE_KEY_ENV, str(key))
+    assert service_credential_from_env().value == "sst_service"  # in place and readable
     retrieve_the_one_table(monkeypatch)
     client, runtime = _serve(_settings(tmp_path, model, fake, jwks), monkeypatch)
     runtime.con.execute("CREATE TABLE IF NOT EXISTS semantic_object (object_id TEXT, card TEXT)")
+    tokens = []
     for method, path, body in ROUTES:
-        assert _call(client, method, path, body, _bearer(_token())).status_code == 200
+        tokens.append(_token())
+        assert _call(client, method, path, body, _bearer(tokens[-1])).status_code == 200
     assert fake.calls and not any("sst_service" in (call.authorization or "") for call in fake.calls)
+    assert {call.authorization for call in fake.calls} <= {f"Bearer {token}" for token in tokens}
 
 
 def test_chat_stream_carries_the_delegation(server, fake, monkeypatch):

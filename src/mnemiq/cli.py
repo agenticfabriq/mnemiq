@@ -368,26 +368,48 @@ def _cmd_digest_ontology(args) -> int:
     return 0
 
 
+def _enrichment_source(settings: Settings):
+    """The source `enrich` and `refresh` read, and the adapter they read it through. In Superset
+    mode that is Superset itself, as the service user, through the one adapter
+    `mnemiq.superset.service` builds, so neither command ever reaches a connection of its own.
+
+    Raises `SourceUnconfigured`, `UnknownSourceKind` or `SupersetConfigError`, each with a sentence.
+    """
+    from mnemiq.adapters.resolve import adapter_for, source_spec
+
+    if settings.superset_mode:
+        # Imported here and nowhere else in the engine: the module that reads the service key.
+        from mnemiq.superset.service import enrichment_adapter, service_credential_from_env
+
+        adapter = enrichment_adapter(settings, service_credential_from_env())
+        return source_spec(settings), adapter
+    spec = source_spec(settings)
+    return spec, adapter_for(spec, settings)
+
+
 def _cmd_enrich(settings: Settings) -> int:
-    from mnemiq.adapters.resolve import (
-        SourceUnconfigured, UnknownSourceKind, adapter_for, source_spec,
-    )
+    from mnemiq.adapters.resolve import SourceUnconfigured, UnknownSourceKind
     from mnemiq.enrichment.enricher import LLMEnricher
     from mnemiq.enrichment.examples import LLMExampleGenerator, enrich_examples
     from mnemiq.enrichment.facts import LLMFactsEnricher, enrich_table_facts
     from mnemiq.enrichment.pipeline import enrich_structural
     from mnemiq.enrichment.semantic import enrich_semantic
     from mnemiq.llm.client import LLMClient
-    from mnemiq.semantic.values import build_value_index
+    from mnemiq.semantic.values import build_value_index, clear_value_index
     from mnemiq.store.bootstrap import init_store
     from mnemiq.store.snapshot_store import save_snapshot
+    from mnemiq.superset.settings import SupersetConfigError
 
     try:
-        spec = source_spec(settings)
-        adapter = adapter_for(spec, settings)
-    except (SourceUnconfigured, UnknownSourceKind) as exc:
+        spec, adapter = _enrichment_source(settings)
+    except (SourceUnconfigured, UnknownSourceKind, SupersetConfigError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    # Superset mode reads the source as the service user, whose view of it is no one asking
+    # person's: so it reads the catalogue and the counts and harvests no values. No code set, no
+    # grounding from the source's labels, no binding probe and no value index, each of which
+    # reads a column's values; and the snapshot records the database and schema it was read from.
+    superset = settings.superset_mode
     from mnemiq.enrichment.certified import (
         apply_certified_set, certified_concept_schemes, fetch_certified_records,
         require_certified,
@@ -400,7 +422,11 @@ def _cmd_enrich(settings: Settings) -> int:
     from mnemiq.adapters.scoped import TablesNotFound
 
     try:
-        snap = enrich_structural(adapter, spec.id)
+        if superset:
+            snap = enrich_structural(adapter, spec.id, harvest_values=False,
+                                     superset_source=(adapter.database_id, adapter.schema))
+        else:
+            snap = enrich_structural(adapter, spec.id)
     except TablesNotFound as exc:  # a manifest "tables" entry matching nothing: say which (M110)
         print(str(exc), file=sys.stderr)
         return 1
@@ -441,7 +467,8 @@ def _cmd_enrich(settings: Settings) -> int:
         snap = snap.model_copy(update={"ontology_version": _onto.version})
 
     # precedence: ontology < correlated < lookup < certified < dictionary
-    snap = ground_codes(adapter, snap, dictionary=None, ontology=_onto)  # local grounding, no dict yet
+    if not superset:
+        snap = ground_codes(adapter, snap, dictionary=None, ontology=_onto)  # local grounding, no dict yet
     snap, _protected = apply_certified_set(snap, _certified_set)
     retriever = None
     if _onto is not None:
@@ -475,14 +502,18 @@ def _cmd_enrich(settings: Settings) -> int:
         )
     con = init_store(settings.store_path, local_only=settings.local_only)
     save_snapshot(con, snap)
-    n_values = build_value_index(adapter, snap, con)
+    if superset:
+        clear_value_index(con, snap.source_id)  # none harvested, and none left from a direct run
+        n_values = 0
+    else:
+        n_values = build_value_index(adapter, snap, con)
     n_concepts = 0
     if _onto is not None:
         from mnemiq.semantic.ontology_index import build_ontology_index
 
         # Persist alongside the value index so ask-time reads the store, not the records file.
         n_concepts = build_ontology_index(_onto, snap, con)
-    if _onto is not None:
+    if _onto is not None and not superset:  # the suggestions are made from each column's values
         try:
             import json
             import os
@@ -579,17 +610,15 @@ def _cmd_build(settings: Settings) -> int:
 
 
 def _cmd_refresh(settings: Settings) -> int:
-    from mnemiq.adapters.resolve import (
-        SourceUnconfigured, UnknownSourceKind, adapter_for, source_spec,
-    )
+    from mnemiq.adapters.resolve import SourceUnconfigured, UnknownSourceKind
     from mnemiq.enrichment.refresh import catalog_diff
     from mnemiq.store.bootstrap import init_store
     from mnemiq.store.snapshot_store import current_version, load_snapshot
+    from mnemiq.superset.settings import SupersetConfigError
 
     try:
-        spec = source_spec(settings)
-        adapter = adapter_for(spec, settings)
-    except (SourceUnconfigured, UnknownSourceKind) as exc:
+        spec, adapter = _enrichment_source(settings)
+    except (SourceUnconfigured, UnknownSourceKind, SupersetConfigError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     con = init_store(settings.store_path, local_only=settings.local_only)

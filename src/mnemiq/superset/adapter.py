@@ -3,9 +3,10 @@ use as they use any other.
 
 Every statement runs as the person whose token the client carries, so Superset's permissions and row rules decide what
 it reads. For a data statement the adapter sends the database, the schema, the statement and a time limit, and nothing
-else: no `limit`, which Superset would put in place of the statement's own LIMIT; no `template_params`; and nothing
-that asks Superset to skip its result cache, which keys a result on the statement after its row rules are applied and
-is consulted only once access is checked.
+else: no `limit`, which Superset would put in place of the statement's own LIMIT; no `template_params`; and, on the ask
+path, nothing that asks Superset to skip its result cache, which keys a result on the statement after its row rules are
+applied and is consulted only once access is checked. The adapter enrichment reads through is built to send
+`force_refresh` with every statement instead, since a re-enrich is meant to read the source as it is now.
 
 The source's catalogue is read the same way, from Postgres's `pg_catalog` (`mnemiq.superset.pg_catalog`), each part of
 it once per adapter, and each statement with `force_refresh`, so Superset runs it afresh rather than answer from its
@@ -54,7 +55,8 @@ _TOO_LARGE_TO_SEND = ("Superset would not send this result, which is larger than
 
 class SupersetSqlAdapter:
     """Runs statements on one Superset database and schema through `client`, each within `timeout_s` unless the
-    caller gives its own limit.
+    caller gives its own limit. With `refresh_every_statement`, every statement, data statements included, asks
+    Superset to run it rather than answer from its result cache.
 
     Each catalogue method reads its part of the catalogue from the database on the first call, never from Superset's
     result cache, and answers every later call with a copy of what it read: `decide` reads the function inventory on
@@ -67,12 +69,13 @@ class SupersetSqlAdapter:
     unaggregatable_types = frozenset({"JSON", "XML", "POINT", "LINE", "LSEG", "BOX", "PATH", "POLYGON", "CIRCLE"})
 
     def __init__(self, client: SupersetMcp, *, database_id: int, schema: str, dialect: str = SUPERSET_DIALECT,
-                 timeout_s: float = 30.0) -> None:
+                 timeout_s: float = 30.0, refresh_every_statement: bool = False) -> None:
         self.client = client
         self.dialect = dialect
         self._database_id = database_id
         self._schema = schema
         self._timeout_s = timeout_s
+        self._refresh_every_statement = refresh_every_statement
         self._refused_caller: SupersetRefusedCaller | None = None
 
     @property
@@ -213,7 +216,7 @@ class SupersetSqlAdapter:
         request = {"database_id": self._database_id, "sql": sql, "schema": self._schema, "timeout": limit}
         if dry_run:
             request["dry_run"] = True
-        if force_refresh:
+        if force_refresh or self._refresh_every_statement:
             request["force_refresh"] = True
         try:
             return self.client.call("execute_sql", request, timeout_s=limit + TRANSPORT_MARGIN_S)

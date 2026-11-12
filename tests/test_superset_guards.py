@@ -170,3 +170,190 @@ def test_the_checker_passes_imports_and_annotations():
               "    return adapter\n")
     assert references(source) == []
     assert violations("server/app.py", source) == []
+
+
+# --- the service module, imported by the CLI alone -------------------------------------------------------------------
+
+SERVICE = "mnemiq.superset.service"
+SUPERSET = "mnemiq.superset"
+# The modules that may reach the service module, by path under `src/mnemiq`. The module itself is not counted.
+SERVICE_IMPORTERS = frozenset({"cli.py"})
+SERVICE_MODULE = "superset/service.py"
+# The calls that import a module named by a string.
+_IMPORT_CALLS = frozenset({"import_module", "__import__"})
+
+
+def _package(module: str) -> str:
+    """The package a relative import in the module at `module` under `src/mnemiq` resolves against: the module's
+    parent, or for a package's `__init__.py` the package itself."""
+    parts = ["mnemiq", *module.removesuffix(".py").split("/")]
+    return ".".join(parts[:-1])
+
+
+def _absolute(name: str | None, level: int, package: str) -> str | None:
+    """`name` imported `level` dots up from `package`, as Python resolves it; None past the top of `package`."""
+    if level == 0:
+        return name
+    parts = package.split(".")
+    if level > len(parts):
+        return None
+    base = parts[:len(parts) - (level - 1)]
+    return ".".join(base + ([name] if name else []))
+
+
+def _from_string(text: str, package: str) -> str | None:
+    """A module name as `import_module` reads it: relative to `package` when it starts with dots."""
+    level = len(text) - len(text.lstrip("."))
+    return _absolute(text[level:] or None, level, package) if level else text
+
+
+def _called(func: ast.expr) -> str | None:
+    return func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
+
+
+def _names_the_service(call: ast.Call, package: str) -> bool:
+    """Whether a call to `import_module` or `__import__` names the service module: by its name, relative to the package
+    the call gives or else to the module's own, or as `service` in a `fromlist` beside the Superset package."""
+    strings = [node.value for node in ast.walk(call) if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+    given = next((kw.value.value for kw in call.keywords if kw.arg == "package" and isinstance(kw.value, ast.Constant)),
+                 None)
+    if given is None and _called(call.func) == "import_module" and len(call.args) > 1:
+        given = getattr(call.args[1], "value", None)
+    anchor = given if isinstance(given, str) else package
+    resolved = {_from_string(text, anchor) for text in strings}
+    return SERVICE in resolved or (SUPERSET in resolved and "service" in strings)
+
+
+def service_reaches(module: str, source: str) -> list[int]:
+    """The lines on which `source`, the module at `module` under `src/mnemiq`, reaches `mnemiq.superset.service`.
+
+    An import of it in any form: `import mnemiq.superset.service`; `from mnemiq.superset.service import ...` and the
+    relative `from .service import ...`, resolved against the module's package; `from mnemiq.superset import service`
+    and `from . import service` in `superset/`, where the module imported from is the package and `service` a name in
+    it; a star import from the package, which binds the module once anything has loaded it; and `import_module` or
+    `__import__` given a string that names it. And a reference that needs no import: an attribute chain ending in
+    `superset.service` (`mnemiq.superset.service.enrichment_adapter(...)`, or the package under a name an import gave
+    it), which reaches the module once something else has loaded it, and the module's full name as a string, as a key
+    into `sys.modules` would spell it."""
+    package = _package(module)
+    tree = ast.parse(source)
+    # The names an import binds to the Superset package itself.
+    packages = {"superset"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            packages |= {alias.asname for alias in node.names if alias.name == SUPERSET and alias.asname}
+        elif isinstance(node, ast.ImportFrom):
+            base = _absolute(node.module, node.level, package)
+            packages |= {alias.asname or alias.name for alias in node.names if f"{base}.{alias.name}" == SUPERSET}
+    lines: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name == SERVICE or alias.name.startswith(f"{SERVICE}.") for alias in node.names):
+                lines.add(node.lineno)
+        elif isinstance(node, ast.ImportFrom):
+            base = _absolute(node.module, node.level, package) or ""
+            if (base == SERVICE or base.startswith(f"{SERVICE}.")
+                    or any(f"{base}.{alias.name}" == SERVICE or (base == SUPERSET and alias.name == "*")
+                           for alias in node.names)):
+                lines.add(node.lineno)
+        elif isinstance(node, ast.Call) and _called(node.func) in _IMPORT_CALLS:
+            if _names_the_service(node, package):
+                lines.add(node.lineno)
+        elif isinstance(node, ast.Attribute) and node.attr == "service":
+            inner = node.value
+            if (isinstance(inner, ast.Attribute) and inner.attr == "superset") or (
+                    isinstance(inner, ast.Name) and inner.id in packages):
+                lines.add(node.lineno)
+        elif isinstance(node, ast.Constant) and node.value == SERVICE:
+            lines.add(node.lineno)
+    return sorted(lines)
+
+
+def test_service_module_is_imported_only_by_the_cli():
+    """`mnemiq.superset.service` holds the service key and the adapter built from it, so only the CLI's enrichment may
+    reach it: a module on the ask path that imported it could put the service key where only a delegated token
+    belongs. Every module under `src/mnemiq` is parsed, and only `cli.py` may reach it in any form `service_reaches`
+    reads; the module itself does not count.
+
+    Outside its reach, since no reading of the source can see them: a module name built at run time (joined, formatted
+    or read from configuration) and handed to an importer, `getattr` on the package with the name as a string,
+    `sys.modules` keyed by a name built at run time, `exec`, `eval` or `runpy` over text that imports it, loading the
+    file by its path, an object the CLI made from the module handed on to other code, and code outside `src/mnemiq`."""
+    modules = _modules()
+    assert SERVICE_MODULE in modules  # the tree read is this one
+    found = [f"{module} line {line}" for module, source in modules.items()
+             if module not in SERVICE_IMPORTERS and module != SERVICE_MODULE
+             for line in service_reaches(module, source)]
+    assert found == []
+    assert service_reaches("cli.py", modules["cli.py"])  # the known-good: the CLI's own import is read, and allowed
+
+
+@pytest.mark.parametrize("module, source", [
+    ("server/app.py", "import mnemiq.superset.service\n"),
+    ("server/app.py", "import mnemiq.superset.service as enrichment\n"),
+    ("server/app.py", "from mnemiq.superset.service import enrichment_adapter\n"),
+    ("superset/executor.py", "from .service import ServiceKey\n"),
+    ("server/app.py", "from ..superset.service import service_credential_from_env\n"),
+    ("runtime.py", "from mnemiq.superset import service\n"),
+    ("runtime.py", "from .superset import service as enrichment\n"),
+    ("superset/executor.py", "from . import client, service\n"),
+    ("superset/__init__.py", "from . import service\n"),
+    ("runtime.py", "from mnemiq.superset import *\n"),
+    ("server/app.py", "import importlib\nmodule = importlib.import_module('mnemiq.superset.service')\n"),
+    ("server/app.py", "from importlib import import_module\nmodule = import_module('.service', 'mnemiq.superset')\n"),
+    ("superset/executor.py", "from importlib import import_module\nmodule = import_module('.service', __package__)\n"),
+    ("server/app.py", "module = __import__('mnemiq.superset.service')\n"),
+    ("server/app.py", "package = __import__('mnemiq.superset', fromlist=['service'])\n"),
+    ("server/app.py", "import mnemiq\nadapter = mnemiq.superset.service.enrichment_adapter(settings, key)\n"),
+    ("server/app.py", "from mnemiq import superset\nkey = superset.service.service_credential_from_env()\n"),
+    ("server/app.py", "import mnemiq.superset as ss\nkey = ss.service.service_credential_from_env()\n"),
+    ("server/app.py", "import sys\nmodule = sys.modules['mnemiq.superset.service']\n"),
+], ids=["import", "import-as", "from-import", "relative-from", "relative-two-levels", "from-package",
+        "relative-from-package", "from-dot-among-others", "package-init", "star", "import-module", "import-module-relative",
+        "import-module-own-package", "dunder-import", "dunder-import-fromlist", "attribute-chain", "package-attribute",
+        "aliased-package-attribute", "sys-modules"])
+def test_the_service_check_flags_each_planted_import(module, source):
+    assert service_reaches(module, source), source
+
+
+@pytest.mark.parametrize("module, source", [
+    ("cli.py", "def enrich(settings):\n"
+               "    from mnemiq.superset.service import enrichment_adapter, service_credential_from_env\n"
+               "    return enrichment_adapter(settings, service_credential_from_env())\n"),
+    ("superset/executor.py", "from . import client\n"),
+    ("superset/executor.py", "from .client import DelegatedToken\nfrom .adapter import SupersetSqlAdapter\n"),
+    ("server/app.py", "from mnemiq.superset import executor\nadapter = executor.superset_executor(s, t)\n"),
+    ("server/app.py", "status = self.service.status\nname = 'mnemiq.superset.services'\n"),
+], ids=["the-cli", "client-from-dot", "relative-siblings", "executor-from-package", "other-service"])
+def test_the_service_check_passes_what_is_not_the_service_module(module, source):
+    assert (service_reaches(module, source) != []) == (module in SERVICE_IMPORTERS)
+
+
+# The variable naming the service key file, as a string holds it: only the service module may name it.
+_SERVICE_KEY_VARIABLE = "SUPERSET_SERVICE_KEY"
+
+
+def names_the_key_variable(source: str) -> list[int]:
+    """The lines on which a string in `source` names the service key file's variable, f-strings' text included."""
+    return sorted({node.lineno for node in ast.walk(ast.parse(source))
+                   if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                   and _SERVICE_KEY_VARIABLE in node.value})
+
+
+def test_only_the_service_module_names_the_key_variable():
+    """The service key file is read where it is named, in the service module, and nowhere else: not a setting, not the
+    server, not the CLI. Outside its reach: a name assembled from pieces at run time."""
+    modules = _modules()
+    found = [f"{module} line {line}" for module, source in modules.items() if module != SERVICE_MODULE
+             for line in names_the_key_variable(source)]
+    assert found == []
+    assert names_the_key_variable(modules[SERVICE_MODULE])  # the known-good: the module that reads it is seen
+
+
+@pytest.mark.parametrize("source", [
+    "import os\npath = os.environ['MNEMIQ_SUPERSET_SERVICE_KEY_FILE']\n",
+    "import os\npath = os.getenv(f'MNEMIQ_SUPERSET_SERVICE_KEY_FILE')\n",
+    "service_key_file: str = Field(validation_alias='MNEMIQ_SUPERSET_SERVICE_KEY_FILE')\n",
+], ids=["environ", "f-string", "settings-alias"])
+def test_the_key_variable_check_flags_each_planted_read(source):
+    assert names_the_key_variable(source)
