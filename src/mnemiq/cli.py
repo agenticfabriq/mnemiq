@@ -614,7 +614,22 @@ def _cmd_refresh(settings: Settings) -> int:
     return rc
 
 
+def _refused_in_superset_mode(settings: Settings, entry: str, *, writes: bool = False) -> bool:
+    """Say why `entry` does not run in Superset mode, or with half a Superset configuration, and return True; return
+    False when it may run. Before any runtime is built, so a refusal has opened nothing and asked Superset nothing."""
+    from mnemiq.superset.settings import SupersetConfigError, refuse_superset_mode
+
+    try:
+        refuse_superset_mode(settings, entry, writes=writes)
+    except SupersetConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return True
+    return False
+
+
 def _cmd_ask(settings: Settings, args) -> int:
+    if _refused_in_superset_mode(settings, "`mnemiq ask`"):
+        return 1
     try:
         rt = build_runtime(settings)
     except SnapshotMissing as exc:
@@ -655,6 +670,8 @@ def _cmd_ask(settings: Settings, args) -> int:
 
 
 def _cmd_write(settings: Settings, args) -> int:
+    if _refused_in_superset_mode(settings, "`mnemiq write`", writes=True):
+        return 1
     try:
         rt = build_runtime(settings)
     except SnapshotMissing as exc:
@@ -743,8 +760,13 @@ def _cmd_metrics(settings: Settings) -> int:
 
 def _cmd_serve(settings: Settings) -> int:
     from mnemiq.mcp.server import serve
+    from mnemiq.superset.settings import SupersetConfigError
 
-    serve(settings)
+    try:
+        serve(settings)
+    except SupersetConfigError as exc:  # MCP over stdio in Superset mode: refused before anything is built
+        print(str(exc), file=sys.stderr)
+        return 1
     return 0
 
 

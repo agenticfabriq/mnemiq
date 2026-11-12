@@ -20,7 +20,13 @@ from functools import cached_property
 import pyarrow as pa
 
 from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
-from mnemiq.superset.client import SupersetMcp, SupersetRefusal, SupersetResponseTooLarge, SupersetUnavailable
+from mnemiq.superset.client import (
+    SupersetMcp,
+    SupersetRefusal,
+    SupersetRefusedCaller,
+    SupersetResponseTooLarge,
+    SupersetUnavailable,
+)
 from mnemiq.superset.payload import ResultCut, SupersetQueryFailed, check_execute_response, read_execute_response
 from mnemiq.superset.pg_catalog import PostgresCatalogue
 from mnemiq.superset.settings import SUPERSET_DIALECT
@@ -67,6 +73,17 @@ class SupersetSqlAdapter:
         self._database_id = database_id
         self._schema = schema
         self._timeout_s = timeout_s
+        self._refused_caller: SupersetRefusedCaller | None = None
+
+    @property
+    def refused_caller(self) -> SupersetRefusedCaller | None:
+        """The first `SupersetRefusedCaller` any statement this adapter sent was refused with, or None.
+
+        The query runner reads a credential Superset refuses as a source that did not answer, and the function
+        inventory as one it could not ask, so the refusal's own kind survives only here. A refused credential stays
+        refused for every later call the request makes, so the request ends as a refused sign-in. One adapter serves
+        one request, so what it remembers is never another person's."""
+        return self._refused_caller
 
     @property
     def database_id(self) -> int:
@@ -198,7 +215,12 @@ class SupersetSqlAdapter:
             request["dry_run"] = True
         if force_refresh:
             request["force_refresh"] = True
-        return self.client.call("execute_sql", request, timeout_s=limit + TRANSPORT_MARGIN_S)
+        try:
+            return self.client.call("execute_sql", request, timeout_s=limit + TRANSPORT_MARGIN_S)
+        except SupersetRefusedCaller as exc:
+            if self._refused_caller is None:
+                self._refused_caller = exc
+            raise
 
 
 def _tuples(table: pa.Table) -> list[tuple]:

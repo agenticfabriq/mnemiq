@@ -22,6 +22,7 @@ import mnemiq.adapters.resolve as resolve_module
 import mnemiq.runtime as runtime_module
 from mnemiq.agent.loop import Agent
 from mnemiq.agent.route import UnknownMode
+from mnemiq.authz.grants import DenyAll
 from mnemiq.cache.store import NullCache, TwoTierCache
 from mnemiq.config import Settings
 from mnemiq.contract import Column, Snapshot
@@ -180,19 +181,40 @@ def test_the_sentinel_refuses_every_source_method():
             getattr(sentinel, method)(*args)
 
 
-def test_the_prompt_window_check_runs_on_the_sentinel_and_executes_nothing(tmp_path, model, fake, monkeypatch,
-                                                                         no_direct_source, caplog):
-    """The window check runs at boot as it does in direct mode. The sentinel raises on any statement and the check
-    turns any exception into "the measurement failed", so a check that ran to its verdict executed nothing."""
+def test_boot_reads_no_policy_file(tmp_path, model, fake, monkeypatch, no_direct_source, caplog):
+    """Superset's roles and row rules govern in Superset mode, so a policy file is never read: startup refuses one
+    (`check_superset_settings`), and a runtime built past that holds no access policy, runs no advisory over one, and
+    measures no role of one in the prompt window check. The check runs, and measures no view, so it sends nothing to
+    be counted and executes nothing on the sentinel."""
     authz = tmp_path / "authz.json"
     authz.write_text(json.dumps({"roles": {"analyst": ["wide"]}}))
+    advised = []
+    monkeypatch.setattr(runtime_module, "_warn_policy_advisories", lambda authz, snapshot: advised.append(authz))
     settings = superset_deployment(tmp_path, model.url, fake.url, authz_path=str(authz), llm_window_check=True)
     with caplog.at_level(logging.INFO, logger="mnemiq.runtime"):
-        build_runtime(settings)
+        runtime = build_runtime(settings)
     messages = [record.getMessage() for record in caplog.records]
-    assert model.tokenize_calls > 0  # the prompt was counted on the model server: the check ran
-    assert any(m.startswith("prompt window fits") for m in messages), messages
+    assert isinstance(runtime.authz, DenyAll) and runtime.authz.grants_for(IDENTITY).objects == frozenset()
+    assert advised == []
+    assert model.tokenize_calls == 0  # no role's prompt was sent to be counted
+    assert any(m.startswith("prompt window not checked") for m in messages), messages
     assert not any("measurement failed" in m for m in messages)
+    assert fake.calls == []
+
+    # A swap to a newer snapshot runs no advisory over a policy either.
+    runtime.settings = runtime.settings.model_copy(update={"control_dsn": "postgresql://control"})
+    monkeypatch.setattr(runtime_module, "load_current_snapshot",
+                        lambda settings, con: (_snapshot([_source_job()], version="v2"), {SOURCE_ID: "v2"}))
+    runtime.reload_if_stale()
+    assert advised == [] and model.tokenize_calls == 0
+
+
+def test_direct_mode_boot_still_reads_its_policy_file(tmp_path, model, monkeypatch):
+    advised = []
+    monkeypatch.setattr(runtime_module, "_warn_policy_advisories", lambda authz, snapshot: advised.append(authz))
+    runtime = build_runtime(deployment(tmp_path, model.url))
+    assert not isinstance(runtime.authz, DenyAll) and runtime.authz.grants_for(IDENTITY).objects == {"wide"}
+    assert advised == [runtime.authz]
 
 
 @pytest.mark.parametrize("jobs, says", [
@@ -380,9 +402,14 @@ def test_a_deployment_whose_default_mode_is_deep_does_not_start(tmp_path, model,
         build_runtime(superset_deployment(tmp_path, model.url, fake.url, default_mode="deep"))
 
 
-def test_write_is_refused(runtime, fake):
-    with pytest.raises(SupersetCredentialMissing):
+def test_write_is_refused_as_read_only(runtime, fake):
+    """Its own refusal, never the missing-token one: nothing about a write may tell the person to sign in."""
+    from mnemiq.superset.executor import SupersetReadOnly
+
+    with pytest.raises(SupersetReadOnly) as refused:
         runtime.write("UPDATE wide SET col_0 = 'two'", IDENTITY)
+    assert not isinstance(refused.value, SupersetCredentialMissing)
+    assert "read-only" in str(refused.value) and "sign in" not in str(refused.value).lower()
     assert fake.calls == []
 
 

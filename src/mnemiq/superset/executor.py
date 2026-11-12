@@ -20,10 +20,21 @@ if TYPE_CHECKING:
 
 _NO_SOURCE = "Superset mode opens no source connection of its own"
 
+# What a write asked of a deployment in Superset mode is told. It says why and nothing else: no sign-in would change it.
+READ_ONLY = ("Superset mode is read-only: mnemiq answers questions through Superset as the person asking, and makes no "
+             "write")
+
 
 class SupersetCredentialMissing(Exception):
-    """A request Superset mode cannot answer as anyone: it carries no delegated token, or it asks for a write, which
-    Superset mode never makes."""
+    """A request Superset mode cannot answer as anyone: it carries no delegated token."""
+
+
+class SupersetReadOnly(Exception):
+    """A write asked of a deployment in Superset mode, which makes none. Its own class, so that a write is never read
+    as a missing credential and told to sign in."""
+
+    def __init__(self) -> None:
+        super().__init__(READ_ONLY)
 
 
 class NoSourceConnection:

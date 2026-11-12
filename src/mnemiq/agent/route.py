@@ -19,6 +19,13 @@ class Router(Protocol):
     def route(self, question: str, override: str | None) -> str: ...
 
 
+def offered_modes(router) -> list[str]:
+    """The modes `router` answers a caller's override with, sorted: the set it offers, or every registered mode when
+    it names none (a router that is not a `StaticRouter`, or none at all, names none)."""
+    offered = getattr(router, "offered", None)
+    return sorted(MODES if offered is None else offered)
+
+
 @dataclass
 class StaticRouter:
     default: str = DEFAULT_MODE

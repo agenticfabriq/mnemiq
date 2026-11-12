@@ -36,7 +36,12 @@ from mnemiq.sql.verdict import ApprovedWrite
 from mnemiq.store.bootstrap import init_store
 from mnemiq.store.control import resolve_version
 from mnemiq.store.snapshot_store import load_snapshot
-from mnemiq.superset.executor import NoSourceConnection, SupersetCredentialMissing, superset_executor
+from mnemiq.superset.executor import (
+    NoSourceConnection,
+    SupersetCredentialMissing,
+    SupersetReadOnly,
+    superset_executor,
+)
 from mnemiq.superset.grants import FixedGrants, resolve_grants
 from mnemiq.superset.history import superset_history
 from mnemiq.superset.settings import SUPERSET_DIALECT, SUPERSET_SOURCE_JOB
@@ -225,7 +230,8 @@ class Runtime:
                                       else [(self.settings, None)]):
                 _warn_prompt_window(settings, self.con, snapshot, getattr(self, "adapter", None),
                                     self.authz, _acknowledged(self.settings), profile)
-            _warn_policy_advisories(self.authz, snapshot)
+            if not self._superset_mode:  # Superset mode holds no access policy to advise on
+                _warn_policy_advisories(self.authz, snapshot)
 
     def _card_style(self, mode: str, picked: LoadedProfile | None = None) -> str:
         """The schema form this mode's prompt carries."""
@@ -266,7 +272,8 @@ class Runtime:
 
         In Superset mode every statement of this request runs through Superset as the person whose verified token
         `delegation` is, on an adapter built for this request alone, and what they may read is what Superset says when
-        asked as them. A request with no token is refused before any work. In direct mode `delegation` is not read."""
+        asked as them. A request with no token is refused before any work, and one whose token Superset refuses at any
+        point raises `SupersetRefusedCaller`, never an answer. In direct mode `delegation` is not read."""
         superset = self._superset_mode
         if superset and delegation is None:
             raise SupersetCredentialMissing(_NO_DELEGATION)
@@ -347,6 +354,13 @@ class Runtime:
         if fitter is not None:
             packet = fitter.fit(packet, self.snapshot, grants, card_style=self._card_style(name, picked))
         answer = agent.answer(packet, self.snapshot, grants, identity, emit=emit)
+        if superset and (refused := adapter.refused_caller) is not None:
+            # Superset stopped accepting this person's token during the answer: reading the function inventory, at the
+            # proof, or running the statement. The agent read that as a source that did not answer and would tell the
+            # person to try again, which cannot help: the token stays refused. So the request ends as it does when the
+            # grants or the history meet the same refusal.
+            logger.warning("Superset refused this request's credential while it was answered; the request ends here")
+            raise refused
         return self._record(answer, name, grants, identity, packet.question, packet, started, picked)
 
     def _record(self, answer: AgentAnswer, name: str, grants, identity: IdentityContext, question: str,
@@ -453,8 +467,7 @@ class Runtime:
 
         Superset mode is read-only and refuses every write before reading it."""
         if self._superset_mode:
-            raise SupersetCredentialMissing("Superset mode is read-only: it runs each statement through Superset as "
-                                            "the person asking, and makes no write")
+            raise SupersetReadOnly()
         grants = self.authz.grants_for(identity)
         visible = visible_schema(self.snapshot, grants) if self.snapshot else {}
         policy = build_access_policy(self.snapshot, grants) if self.snapshot else AccessPolicy()
@@ -1223,8 +1236,13 @@ def build_runtime(settings: Settings) -> Runtime:
     if answer_log is not None:
         for profile_name, entry in loaded.items():
             answer_log.record_profile(profile_name, entry.version, resolved_view(entry.settings, dialect), commit)
-    _boot_authz = _authz(settings)
-    _warn_policy_advisories(_boot_authz, snapshot)
+    # Superset mode reads no policy file: Superset's roles and row rules decide what each person may read, and each
+    # request is answered under the grants Superset gives it (`FixedGrants`). A policy file there would govern nothing,
+    # so startup refuses one (`check_superset_settings`), and a runtime built past that holds none, advises on none
+    # and measures none of its roles in the prompt window check.
+    _boot_authz = DenyAll() if superset else _authz(settings)
+    if not superset:
+        _warn_policy_advisories(_boot_authz, snapshot)
     if superset:
         # `_warn_source_enforcement` and `_warn_unconfirmable_functions` read the source, which this runtime holds no
         # connection to.

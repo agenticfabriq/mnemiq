@@ -301,3 +301,30 @@ def test_a_refusal_from_the_wire_ends_the_turn(text):
 
 def _answer_with_no_rows() -> dict:
     return {**REGION_COUNTS, "rows": [], "row_count": 0}
+
+
+def test_the_adapter_remembers_the_first_refusal_of_its_caller():
+    """The runner reads a credential Superset refuses as a source that did not answer, and the function inventory as
+    one it could not ask; the refusal's kind survives on the adapter, so the request can end as a refused sign-in.
+    Every call is watched, a dry run and the catalogue included, and only a refusal of the caller is remembered."""
+    first = SupersetRefusedCaller("Superset did not accept the credential this request carries (HTTP 401)")
+    adapter = _adapter(first)
+    assert adapter.refused_caller is None
+    with pytest.raises(SupersetRefusedCaller):
+        adapter.dry_run(SQL)
+    later = SupersetRefusedCaller("Superset has no user for the credential this request carries")
+    adapter.client.answer = later
+    with pytest.raises(SourceUnavailableError):
+        run(adapter, SQL)
+    with pytest.raises(SupersetRefusedCaller):
+        adapter.user_functions()
+    assert adapter.refused_caller is first
+
+    for other in (SupersetPermissionDenied("x"), SupersetDenied("x"), SupersetUnavailable("x"), SupersetToolError("x"),
+                  HIDDEN_TABLE_REFUSAL):
+        refused = _adapter(other)
+        with pytest.raises(Exception):
+            refused.execute(SQL)
+        with pytest.raises(Exception):
+            refused.dry_run(SQL)
+        assert refused.refused_caller is None, other

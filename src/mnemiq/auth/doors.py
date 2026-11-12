@@ -6,6 +6,9 @@ fails is refused without trying another kind. `/v1` takes the identity provider'
 connection key configured it also needs that key. Open WebUI's unsigned user headers are refused on every door:
 their presence means Open WebUI is forwarding identity without signing it, and answering would hide that.
 
+In Superset mode `/v1` also hands on the Bearer it verified, unchanged, as the request's delegated token
+(`v1_delegation`), so Superset answers as the person it names.
+
 Free of the web framework on purpose: `server/app.py` hands in the headers and turns a refusal into its response.
 Every reason is composed here, and a refusal's log line carries the reason, `sub` and `jti` only, never a token,
 an email or the connection key.
@@ -16,6 +19,7 @@ from __future__ import annotations
 import hmac
 import logging
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 
 import jwt
 
@@ -25,6 +29,7 @@ from mnemiq.auth.openwebui import OpenWebUIVerifier
 from mnemiq.auth.resolve import TenantMismatch, identity_from_oidc, identity_from_openwebui
 from mnemiq.auth.token import JwtIdentityVerifier, TokenRejected, token_scopes
 from mnemiq.contract import IdentityContext
+from mnemiq.superset.client import DelegatedToken
 
 logger = logging.getLogger("mnemiq.auth")
 
@@ -40,6 +45,14 @@ class DoorRefusal(Exception):
     def __init__(self, status: int, reason: str, *, challenge: str | None = None) -> None:
         super().__init__(reason)
         self.status, self.reason, self.challenge = status, reason, challenge
+
+
+@dataclass(frozen=True)
+class Delegation:
+    """A /v1 caller as the door verified them: who they are, and the Bearer that said so, to be handed on unchanged."""
+
+    identity: IdentityContext
+    token: DelegatedToken
 
 
 class HttpDoors:
@@ -70,12 +83,22 @@ class HttpDoors:
         return self._cfg.task_header
 
     def v1(self, headers: Headers) -> IdentityContext:
-        return self._judge("/v1", headers)
+        return self._judge("/v1", headers)[0]
+
+    def v1_delegation(self, headers: Headers) -> Delegation:
+        """The /v1 caller, verified exactly as `v1` verifies them, with the Bearer that verification read: the one
+        Authorization header's token, never another header's, and never a token the door did not check."""
+        identity, bearer = self._judge("/v1", headers)
+        if bearer is None:  # /v1 takes a Bearer and no other credential, so a caller it accepts arrived with one
+            raise DoorRefusal(401, "no credential")
+        return Delegation(identity, DelegatedToken(bearer))
 
     def openai(self, headers: Headers) -> IdentityContext:
-        return self._judge("/openai/v1", headers)
+        return self._judge("/openai/v1", headers)[0]
 
-    def _judge(self, door: str, headers: Headers) -> IdentityContext:
+    def _judge(self, door: str, headers: Headers) -> tuple[IdentityContext, str | None]:
+        """The caller at `door`, and the Bearer they were verified by, or None when it was Open WebUI's signed
+        header; or the door's refusal."""
         try:
             return self._identity(door, headers)
         except DoorRefusal as exc:
@@ -87,7 +110,7 @@ class HttpDoors:
             log("refused on %s: %s (sub=%r jti=%r)", door, exc.reason, exc.sub, exc.jti)
             raise DoorRefusal(status, exc.reason) from None
 
-    def _identity(self, door: str, headers: Headers) -> IdentityContext:
+    def _identity(self, door: str, headers: Headers) -> tuple[IdentityContext, str | None]:
         cfg = self._cfg
         bearer, signed = screen(cfg, door, headers)
         if door == "/openai/v1":
@@ -102,7 +125,7 @@ class HttpDoors:
             if signed:
                 if self._owui is None:
                     raise DoorRefusal(401, "the Open WebUI header is not enabled on this deployment")
-                return identity_from_openwebui(self._owui.claims(signed[0]), cfg)
+                return identity_from_openwebui(self._owui.claims(signed[0]), cfg), None
 
         if bearer is not None:
             verifier = self._v1 if door == "/v1" else self._openai
@@ -118,7 +141,7 @@ class HttpDoors:
             if READ_SCOPE not in token_scopes(found):
                 raise DoorRefusal(403, f"insufficient scope: this token lacks {READ_SCOPE}",
                                   challenge=f'Bearer error="insufficient_scope", scope="{READ_SCOPE}"')
-            return identity
+            return identity, bearer
         raise DoorRefusal(401, "no credential")
 
 

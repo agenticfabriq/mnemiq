@@ -113,6 +113,11 @@ def check_superset_settings(settings: Settings, auth: AuthConfig | None) -> None
             "MNEMIQ_SOURCES_PATH must be unset in Superset mode: mnemiq reads one database, the one "
             "MNEMIQ_SUPERSET_DATABASE_ID names, through Superset, and a manifest names sources mnemiq connects to "
             "itself")
+    if settings.authz_path:
+        raise SupersetConfigError(
+            "MNEMIQ_AUTHZ_PATH must be unset in Superset mode, where Superset's roles and row rules decide what each "
+            "person may read: mnemiq applies no policy file of its own there, so its column masks and row filters "
+            "would govern nothing")
     phases = [name for name, on in (("MNEMIQ_ENRICH_FACTS", settings.enrich_facts),
                                     ("MNEMIQ_ENRICH_EXAMPLES", settings.enrich_examples)) if on]
     if phases:
@@ -126,6 +131,22 @@ def check_superset_settings(settings: Settings, auth: AuthConfig | None) -> None
             "MNEMIQ_SUPERSET_MCP_URL is http to %s: each person's token crosses the network to Superset unencrypted. "
             "That suits a private network such as a Compose stack's own; anywhere else use https", host)
     return None
+
+
+def refuse_superset_mode(settings: Settings, entry: str, *, writes: bool = False) -> None:
+    """Refuse `entry`, an entry point that answers as the one identity its settings name (a CLI command, or MCP over
+    stdio), in Superset mode, which answers each question as the person whose verified token reaches the HTTP API's
+    /v1. `writes` names an entry point that writes, which Superset mode never does. Outside Superset mode this checks
+    what `check_superset_settings` checks there: a Superset database id set without the URL."""
+    if settings.superset_mode:
+        if writes:
+            raise SupersetConfigError(f"{entry} does not run in Superset mode, which is read-only: mnemiq makes no write "
+                                      "through Superset, and holds no connection of its own to write through")
+        raise SupersetConfigError(
+            f"{entry} does not run in Superset mode: it answers as the one identity its settings name, and Superset "
+            "mode answers each question as the person whose verified token reaches the HTTP API's /v1. Serve that "
+            "with `mnemiq serve --http`, or unset MNEMIQ_SUPERSET_MCP_URL to answer directly")
+    check_superset_settings(settings, None)
 
 
 def _scheme_and_host(url: str) -> tuple[str, str]:
