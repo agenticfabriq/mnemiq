@@ -164,6 +164,8 @@ _LOCAL_ONLY_CHECKED_URL_FIELDS = (
     "verity_records_url", "verity_token_url", "verity_traces_url",
     # The signing-key fetch. The issuer itself is only compared with `iss`, never fetched.
     "oidc_jwks_url",
+    # Superset mode sends every query, and each person's token, to Superset's MCP service.
+    "superset_mcp_url",
 )
 
 
@@ -363,6 +365,11 @@ class Settings(BaseSettings):
     openwebui_task_header: str = Field(default="X-Mnemiq-Task", description="the custom header on mnemiq's Open WebUI connection that carries `{{TASK}}`: every /openai/v1 request must carry it, empty for a chat turn, and a request whose value is not empty is a background task, answered with an empty completion and never asked")
     identity_map_path: str | None = Field(default=None, description="a JSON file mapping each issuer's subjects, groups and verified emails to roles, for tokens that carry no roles claim")
     mcp_transport: Literal["stdio", "http"] = Field(default="stdio", description="stdio runs the MCP server for one local caller; http serves it at /mcp on the HTTP API, each request judged by its own token")
+    # --- Superset mode: every query runs through Superset as the person asking ---
+    # Startup rules for these live in `mnemiq.superset.settings.check_superset_settings`.
+    superset_mcp_url: str | None = Field(default=None, description="turns on Superset mode: the http or https URL of Superset's MCP service, through which mnemiq answers each question as the signed-in Superset user, holding no database credential of its own; unset reads the source directly")
+    superset_database_id: int | None = Field(default=None, ge=1, description="Superset mode: the id of the Superset database mnemiq answers from, as Superset numbers it; required with MNEMIQ_SUPERSET_MCP_URL")
+    superset_schema: str = Field(default="public", description="Superset mode: the schema mnemiq reads in that database; a plain identifier of letters, digits and _, not starting with a digit")
     # --- verifier ---
     answer_log_path: str | None = Field(default=None, description="where each answer's record goes: which profile, version, model and engine commit produced it, as one JSON line each, with no question text, SQL or rows; unset keeps it beside the store as <store_path>.answers.jsonl, `off` writes none. Not rotated")
     answer_log_text: bool = Field(default=False, description="opt-in: the answer log also holds the question and the SQL as asked, which carry literals from the question and values from the database; rows are never logged")
@@ -399,6 +406,12 @@ class Settings(BaseSettings):
     @property
     def verify(self) -> bool:  # eval back-compat: MNEMIQ_VERIFY=1 means "verify on"
         return self.verify_override == "1"
+
+    @property
+    def superset_mode(self) -> bool:
+        """Whether this deployment answers through Superset: true exactly when MNEMIQ_SUPERSET_MCP_URL is set. Blank
+        reads as unset, since a sourced copy of `.env.example` sets every unset setting to the empty string."""
+        return bool(self.superset_mcp_url and self.superset_mcp_url.strip())
 
     @classmethod
     def from_env(cls) -> "Settings":
