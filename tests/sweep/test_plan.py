@@ -152,3 +152,10 @@ def test_a_mode_that_never_calls_the_judge_is_priced(tmp_path):
     est = estimate(load_config(write_config(tmp_path, models={"m": elsewhere}, modes=["instant"])), tokens=tokens)
     per_case = (1000 * 2.0 + 100 * 8.0) / 1_000_000
     assert est.dollars == {runs: pytest.approx(count * per_case) for runs, count in est.case_runs.items()}
+
+
+def test_the_space_can_try_an_empty_result_again(tmp_path):
+    cfg = load_config(write_config(tmp_path, modes=["instant"],
+                                   space={"instant": {"empty_retries": [1], "retry_answered_empties": [True]}}))
+    text = render(cfg)
+    assert "instant.empty_retries=1" in text, text

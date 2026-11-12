@@ -526,10 +526,18 @@ def _no_credentials(value):
     return "(unreadable url)" if userinfo_unplaced(value) else without_credentials(value)
 
 
+# Mode fields added after profile versions were first recorded, each with the value that runs as the engine ran before
+# it existed. A field at that value is left out of the view, so a profile that does not use it keeps the version it had:
+# a version moves when what the profile runs moves (the shipped starter's evidence records its versions).
+_LATER_MODE_FIELDS = {"empty_retries": 0, "retry_answered_empties": False}
+
+
 def resolved_view(settings: Settings, dialect: str) -> dict:
     """What this profile runs, with no secret in it: its answer-time settings, its modes, what the deployment sets that
     changes an answer, and a hash of each prompt."""
-    modes = {name: asdict(mode) for name, mode in modes_for(settings).items()}
+    modes = {name: {field: value for field, value in asdict(mode).items()
+                    if not (field in _LATER_MODE_FIELDS and value == _LATER_MODE_FIELDS[field])}
+             for name, mode in modes_for(settings).items()}
     if settings.verify_override in {"0", "1"}:  # as `_resolve_verify_level` reads it: what each mode's verifier will do
         for mode in modes.values():
             mode["verify"] = "off" if settings.verify_override == "0" else "full"

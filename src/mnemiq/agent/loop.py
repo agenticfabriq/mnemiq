@@ -164,6 +164,7 @@ class AgentAnswer:
     # control read as inert when it was working exactly as designed (M33). `attempts` counts the
     # OUTER loop, which repairs what the database rejected; `corrected` is the inner surgical
     # pass, which repairs what the decider rejected. Two different judges, two different numbers.
+    # An empty result tried again (`empty_retries`) is one more round of the outer loop.
     attempts: int | None = None
     # What the access decision narrowed, carried on the ANSWER and not only via `trace`.
     #
@@ -199,6 +200,20 @@ class AgentAnswer:
     # verifier" either -- a deferral or an execution failure also leaves it unset, because the
     # verifier never saw a table.
     verify_layer: str | None = None  # sanity | grounding | judge | judge_unavailable | pass
+
+
+# Where a model failure after a run carries the access decision that run was made under, read by
+# `Agent.answer`'s handler (`_carry_access`).
+_ACCESS = "_mnemiq_narrowed"
+
+
+def _carry_access(exc: BaseException, narrowed) -> None:
+    """Put the access decision a run of this turn was made under on `exc`; a class the attribute
+    cannot be set on is left as it is."""
+    try:
+        setattr(exc, _ACCESS, narrowed)
+    except Exception:  # noqa: BLE001 -- the record is an aid to the audit, never the failure
+        pass
 
 
 def _stamp(answer: AgentAnswer, verdict) -> AgentAnswer:
@@ -245,10 +260,14 @@ class Agent:
         max_question_chars: int = DEFAULT_MAX_QUESTION_CHARS,
         plan_attempts: int = 3,
         prose: bool = True,
+        empty_retries: int = 0,
+        retry_answered_empties: bool = False,
     ) -> None:
         self.generator = generator
         self.plan_attempts = plan_attempts
         self.prose = prose
+        self.empty_retries = empty_retries
+        self.retry_answered_empties = retry_answered_empties
         # Defaults to the shipped limit, not to none: a construction site that forgets it still declines what no
         # stage would read alike (M147).
         self.max_question_chars = max_question_chars
@@ -322,6 +341,7 @@ class Agent:
                     failed=True,
                     reason_code=DeferralReason.MODEL_UNAVAILABLE,
                     model_error=exc.kind,
+                    narrowed=getattr(exc, _ACCESS, None),
                 )
             if isinstance(exc, ContextTooLong):
                 # Refused rather than cut: the same configuration problem, told the same way.
@@ -337,6 +357,7 @@ class Agent:
                     failed=True,
                     reason_code=DeferralReason.MODEL_UNAVAILABLE,
                     model_error=exc.kind,
+                    narrowed=getattr(exc, _ACCESS, None),
                 )
             return AgentAnswer(
                 answer=(
@@ -347,6 +368,7 @@ class Agent:
                 failed=True,
                 reason_code=DeferralReason.MODEL_UNAVAILABLE,
                 model_error=exc.kind,
+                narrowed=getattr(exc, _ACCESS, None),
             )
 
     def _answer_single(
@@ -364,104 +386,136 @@ class Agent:
         feedback: Feedback | None = None
         held: dict = {"spent_s": 0.0}  # what the source said about a filter value, asked once a turn
         failure: ExecutionError | None = None
+        # An empty result tried again (`empty_retries`): each retry adds one try to the budget, so
+        # `max_attempts` still counts what the database rejects. `standing` is the result before
+        # the retry, kept to answer with if the retry produces nothing to answer with.
+        empties_left = self.empty_retries
+        standing: tuple | None = None
+        # Each statement's result for the rest of the turn, so a retry that writes it again reads it
+        # here rather than running it twice when the shared cache has evicted it (Codex's review).
+        ran: dict[str, object] = {}
+        tries, _attempt = self.budget.max_attempts, 0
 
-        for _attempt in range(self.budget.max_attempts):
+        while _attempt < tries:
+            _attempt += 1
             # Two nested repair loops, answering two different judges. plan_query repairs what the
             # *decider* rejects (a star, a bad column) -- never disable that by capping it to
             # one attempt. This outer loop repairs what the *database* rejects, which is a
             # thing no amount of static analysis could have known.
-            with step(emit, Stage.PLAN, attempt=_attempt + 1, of=self.budget.max_attempts):
-                outcome = plan_query(
-                    packet,
-                    snapshot,
-                    grants,
-                    self.generator,
-                    adapter=self.adapter,
-                    dialect=self.dialect,
-                    target=self.dialect,
-                    max_attempts=self.plan_attempts,
-                    feedback=feedback,
-                    corrector=self.corrector,
-                    values=self.values,
-                    guard_undefined_terms=self.guard_undefined_terms,
-                    guard_fanout=self.guard_fanout,
-                )
+            try:
+                with step(emit, Stage.PLAN, attempt=_attempt, of=tries):
+                    outcome = plan_query(
+                        packet,
+                        snapshot,
+                        grants,
+                        self.generator,
+                        adapter=self.adapter,
+                        dialect=self.dialect,
+                        target=self.dialect,
+                        max_attempts=self.plan_attempts,
+                        feedback=feedback,
+                        corrector=self.corrector,
+                        values=self.values,
+                        guard_undefined_terms=self.guard_undefined_terms,
+                        guard_fanout=self.guard_fanout,
+                    )
+            except ModelUnavailable as exc:
+                # A retry's model call failed after a query of this turn ran: the access decision
+                # that query ran under rides on the failure `answer` reports (Codex's review).
+                if standing is not None:
+                    _carry_access(exc, getattr(standing[0], "narrowed", None))
+                raise
             if isinstance(outcome, Deferred):
                 # A source that could not be asked happened TO us, so it is a stated failure and
                 # stays out of the deferral rate, like a model or a judge that did not answer (M6).
                 outage = outcome.code is DeferralReason.SOURCE_UNAVAILABLE
+                if standing is not None and outcome.code is DeferralReason.INVALID_QUERY:
+                    # The retry wrote nothing the decider would run, so what it retried stands. Any
+                    # other deferral says something about the question or what this identity may
+                    # read -- an undefined term (M35, as deep's candidates read one), a table not
+                    # granted, a writer that says the data cannot answer -- and stands over it
+                    # (Codex's review).
+                    return self._settled(packet, identity, deadline, emit, _attempt, *standing)
+                # A query of this turn already ran when a retry defers, so the access decision it
+                # ran under rides on the answer, as on any answer after a run (Codex's review).
                 return AgentAnswer(answer=outcome.reason, deferred=not outage, failed=outage,
-                                   reason_code=outcome.code)
+                                   reason_code=outcome.code,
+                                   narrowed=getattr(standing[0], "narrowed", None) if standing else None)
 
             approved: Approved = outcome
             key = cache_key(approved.plan_sql, grants.fingerprint, packet.enrichment_version)
 
-            hit = self.cache.get(key)
+            hit = ran.get(key)
+            if hit is None:
+                stored = self.cache.get(key)
+                hit = None if stored is None else from_ipc(stored)
             if hit is not None:
-                table = from_ipc(hit)
-                with step(emit, Stage.VERIFY, cached=True):
-                    approved = self._confirmed(approved, table, snapshot, held)
+                table, cached, execute_ms = hit, True, 0.0
+            else:
+                try:
+                    with step(emit, Stage.EXECUTE):
+                        result = run(self.adapter, approved.target_sql, timeout_s=self.timeout_s)
+                except SourceUnavailableError as exc:
+                    # Not the statement's failure, so not fed back: the model would rewrite a correct
+                    # query because the network failed (M188). A failure, not a deferral (M6), as the
+                    # proof seam reports the same fault before the run. Not run again either: a cancel
+                    # or a statement timeout worded in another language, and an administrator's kill,
+                    # read as outages too, and a second run would repeat what someone stopped (Codex's
+                    # review of #179).
+                    logger.warning("the source did not answer while a query ran: %s", exc.full_text)
+                    return AgentAnswer(answer=exc.message, failed=True,
+                                       reason_code=DeferralReason.SOURCE_UNAVAILABLE,
+                                       narrowed=getattr(standing[0], "narrowed", None) if standing else None)
+                except QueryCancelledError as exc:
+                    # Someone stopped the statement, so the turn ends here: repaired, a model writing
+                    # the same SQL again would run it a second time (Codex's second review of #179).
+                    logger.warning("the source cancelled a query while it ran: %s", exc.full_text)
+                    return AgentAnswer(answer=exc.message, failed=True,
+                                       reason_code=DeferralReason.EXECUTION_FAILED,
+                                       narrowed=getattr(standing[0], "narrowed", None) if standing else None)
+                except ExecutionError as exc:
+                    # The database is the one authority that cannot be wrong about itself: its
+                    # complaint is the cheapest accuracy lever we have. Feed it back and retry.
+                    # Every attempt, not just the last: `failure` is overwritten each time round,
+                    # so an error that a later attempt repaired would otherwise be recorded nowhere.
+                    logger.warning("execution attempt %d failed; the source said: %s",
+                                   _attempt, exc.full_text)
+                    if standing is not None:
+                        # A retry of an empty result the database rejected: what it retried stands.
+                        return self._settled(packet, identity, deadline, emit, _attempt, *standing)
+                    failure = exc
+                    # The source ran the policy's rewrite, so its words can quote the policy and the
+                    # rows it removes: under a policy the model reads the error's class and nothing
+                    # else (`policy_safe_detail`). The log above keeps the whole text.
+                    detail = policy_safe_detail(exc.source_detail, asked=approved.asked_sql,
+                                                executed=approved.target_sql, dialect=self.dialect)
+                    shown = ExecutionError(exc.message, source_detail=detail)
+                    feedback = Feedback(shown.repair_text, from_source=detail is not None)
+                    continue
+                self.cache.put(key, to_ipc(result.table))
+                table, cached, execute_ms = result.table, False, result.elapsed_ms
+            ran[key] = table
+
+            with step(emit, Stage.VERIFY, **({"cached": True} if cached else {})):
+                approved = self._confirmed(approved, table, snapshot, held)
+                retry = self._empty_retry(packet, approved, table) if empties_left else None
+                if retry is None:
                     blocked, verdict = self._verified(packet, approved, table)
-                if blocked is not None:
-                    return blocked
-                return _stamp(self._synthesize(
-                    packet, approved, identity, table, deadline, cached=True, forced=False,
-                    emit=emit, attempts=_attempt + 1,
-                ), verdict)
-
-            try:
-                with step(emit, Stage.EXECUTE):
-                    result = run(self.adapter, approved.target_sql, timeout_s=self.timeout_s)
-            except SourceUnavailableError as exc:
-                # Not the statement's failure, so not fed back: the model would rewrite a correct
-                # query because the network failed (M188). A failure, not a deferral (M6), as the
-                # proof seam reports the same fault before the run. Not run again either: a cancel
-                # or a statement timeout worded in another language, and an administrator's kill,
-                # read as outages too, and a second run would repeat what someone stopped (Codex's
-                # review of #179).
-                logger.warning("the source did not answer while a query ran: %s", exc.full_text)
-                return AgentAnswer(answer=exc.message, failed=True,
-                                   reason_code=DeferralReason.SOURCE_UNAVAILABLE)
-            except QueryCancelledError as exc:
-                # Someone stopped the statement, so the turn ends here: repaired, a model writing
-                # the same SQL again would run it a second time (Codex's second review of #179).
-                logger.warning("the source cancelled a query while it ran: %s", exc.full_text)
-                return AgentAnswer(answer=exc.message, failed=True,
-                                   reason_code=DeferralReason.EXECUTION_FAILED)
-            except ExecutionError as exc:
-                # The database is the one authority that cannot be wrong about itself: its
-                # complaint is the cheapest accuracy lever we have. Feed it back and retry.
-                # Every attempt, not just the last: `failure` is overwritten each time round,
-                # so an error that a later attempt repaired would otherwise be recorded nowhere.
-                logger.warning("execution attempt %d failed; the source said: %s",
-                               _attempt + 1, exc.full_text)
-                failure = exc
-                # The source ran the policy's rewrite, so its words can quote the policy and the
-                # rows it removes: under a policy the model reads the error's class and nothing
-                # else (`policy_safe_detail`). The log above keeps the whole text.
-                detail = policy_safe_detail(exc.source_detail, asked=approved.asked_sql,
-                                            executed=approved.target_sql, dialect=self.dialect)
-                shown = ExecutionError(exc.message, source_detail=detail)
-                feedback = Feedback(shown.repair_text, from_source=detail is not None)
+            if retry is not None and not deadline.expired:
+                # Engine-written: the sentence a caller would be shown, of values the writer wrote.
+                empties_left, tries = empties_left - 1, tries + 1
+                standing = (approved, table, cached, execute_ms)
+                feedback = Feedback(retry, from_source=False)
                 continue
-
-            self.cache.put(key, to_ipc(result.table))
-            with step(emit, Stage.VERIFY):
-                approved = self._confirmed(approved, result.table, snapshot, held)
-                blocked, verdict = self._verified(packet, approved, result.table)
+            if retry is not None:  # no time left to try again: read as it would be with no retry
+                return self._settled(packet, identity, deadline, emit, _attempt, approved, table,
+                                     cached, execute_ms)
             if blocked is not None:
                 return blocked
             return _stamp(self._synthesize(
-                packet,
-                approved,
-                identity,
-                result.table,
-                deadline,
-                cached=False,
-                forced=deadline.expired,
-                execute_ms=result.elapsed_ms,
-                emit=emit,
-                attempts=_attempt + 1,
+                packet, approved, identity, table, deadline, cached=cached,
+                forced=False if cached else deadline.expired, execute_ms=execute_ms, emit=emit,
+                attempts=_attempt,
             ), verdict)
 
         # NOT a deferral. We did not decline to answer -- the source refused to serve us, and
@@ -490,6 +544,42 @@ class Agent:
             failed=True,
             reason_code=DeferralReason.EXECUTION_FAILED,
         )
+
+    def _empty_retry(self, packet: ContextPacket, approved: Approved, table) -> str | None:
+        """What the writer is told when this result is an empty one this mode tries again, else
+        None. Empty is what the sanity layer decides on the grounding (`grounding_decides`): no
+        rows, or one NULL row from aggregates over nothing. One the layer would decline is tried
+        again, the writer given its sentence; one it would answer, every value checked, only under
+        `retry_answered_empties`. Read from the grounding whether or not the layer runs, so a
+        profile's retry means the same in every mode."""
+        if not grounding_decides(table):
+            return None
+        ran = ("The query ran and returned no rows" if table.num_rows == 0
+               else "The query ran and returned only an empty value")
+        again = "If that is the true answer, write the same query again; otherwise "
+        declined = sanity_check(packet.question, table, getattr(approved, "value_grounding", None))
+        if declined is not None:
+            return (f"{ran}. {declined.reason} {again}correct the values the filters use, the "
+                    "columns they are on, or the joins.")
+        if self.retry_answered_empties:
+            return (f"{ran}, though every value it filters on was found in its column. {again}"
+                    "check the joins and which column each filter is on.")
+        return None
+
+    def _settled(self, packet: ContextPacket, identity: IdentityContext, deadline, emit,
+                 attempts: int, approved: Approved, table, cached: bool,
+                 execute_ms: float) -> AgentAnswer:
+        """The answer for a result kept while an empty retry was tried, once the retry produced
+        nothing to answer with: read and answered or declined as it would have been with no retry."""
+        with step(emit, Stage.VERIFY, **({"cached": True} if cached else {})):
+            blocked, verdict = self._verified(packet, approved, table)
+        if blocked is not None:
+            return blocked
+        return _stamp(self._synthesize(
+            packet, approved, identity, table, deadline, cached=cached,
+            forced=False if cached else deadline.expired, execute_ms=execute_ms, emit=emit,
+            attempts=attempts,
+        ), verdict)
 
     def _execute(self, approved: Approved, grants: GrantSet, packet: ContextPacket):
         """Cache-or-run one plan; None on execution error (this candidate just drops out). A

@@ -26,6 +26,10 @@ class Mode:
     card_style: str | None = None  # the schema form its prompt carries; None: `Settings.card_style`
     plan_attempts: int = 3  # writer calls spent on what the decider refuses, on the single path; deep's candidates get 1
     prose: bool = True  # a model call turns the rows into sentences; off, the rows are the answer
+    # Writer calls an empty result may buy, the writer told it was empty and why; on the single path only.
+    empty_retries: int = 0
+    # Also retry an empty result the sanity layer would answer, every value it filters on checked.
+    retry_answered_empties: bool = False
 
 
 # Verify levels: sanity (deterministic empty/null net) in every mode; the LLM judge in
@@ -78,6 +82,14 @@ def modes_for(settings: Settings) -> dict[str, Mode]:
         if mode.candidates <= 1 and unread:
             raise ValueError(f"{name} has one candidate, which {' and '.join(unread)} never read; "
                              "set candidates above 1 or leave them out")
+        retrying = [name_ for name_, value in (("empty_retries", mode.empty_retries),
+                                               ("retry_answered_empties", mode.retry_answered_empties)) if value]
+        if mode.candidates > 1 and retrying:
+            raise ValueError(f"{name} has {mode.candidates} candidates, whose results {' and '.join(retrying)} "
+                             "never read; set them on a mode with one candidate or leave them out")
+        if mode.retry_answered_empties and not mode.empty_retries:
+            raise ValueError(f"{name} sets retry_answered_empties with no empty_retries to spend; "
+                             "set empty_retries above 0 or leave it out")
     return modes
 
 
@@ -116,6 +128,8 @@ def build_agent(
         verifier=verifier,
         plan_attempts=mode.plan_attempts,
         prose=mode.prose,
+        empty_retries=mode.empty_retries,
+        retry_answered_empties=mode.retry_answered_empties,
         guard_undefined_terms=guard_undefined_terms,
         guard_fanout=guard_fanout,
         max_question_chars=max_question_chars,

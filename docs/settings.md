@@ -111,6 +111,15 @@ targeted edit, and the decider checks the result again. When the database reject
 whole step runs again with the database's error, up to `max_attempts` times. Instant mode makes one attempt and has no
 corrector.
 
+A third loop, off in every mode until a profile sets it, is for a statement that ran and returned no rows, or only an
+empty value. With `empty_retries` above 0, the writer is asked again, told the result was empty and why the result
+check would decline it, and asked to write the same statement again if "none" is the true answer. Each retry is one
+more writer call and one more run, counted apart from `max_attempts`. Only the empty results the check would decline
+are retried, unless `retry_answered_empties` is on, which retries one whose every filter value was found too, for a
+wrong join or a filter on the wrong column. A retry that produces nothing to answer with, because the writer declines
+or the database rejects it, leaves the result before it standing. Deep mode compares its candidates' results instead,
+so both settings are refused there.
+
 ### Several candidates
 
 Deep mode writes several candidate statements with different strategies (`candidates`), runs them all and groups
@@ -200,6 +209,8 @@ Each mode's own values. A profile changes them in its mode section; without a pr
 | `verify` | `"sanity"` | `"full"` | `"full"` | Checking the result | The verifier's level: `off`, `sanity` or `full`. |
 | `plan_attempts` | `3` | `3` | `3` | Repair from feedback | Writer calls spent on statements the decider refuses (each deep candidate gets one). |
 | `prose` | `true` | `true` | `true` | The answer's form | A model call turns the rows into sentences; off, the rows are the answer. |
+| `empty_retries` | `0` | `0` | `0` | Repair from feedback | Writer calls an empty result may buy, the writer told it was empty and why. Refused on a mode with several candidates. |
+| `retry_answered_empties` | `false` | `false` | `false` | Repair from feedback | Also retries an empty result whose every filter value was found. Needs `empty_retries` above 0. |
 
 ## Deployment settings
 
