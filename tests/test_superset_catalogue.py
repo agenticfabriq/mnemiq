@@ -174,6 +174,29 @@ def test_each_method_sends_its_catalogue_statement(method):
     assert _sent_by(method) == [f"{statement} LIMIT {PAGE_ROWS} OFFSET 0"]
 
 
+def _where_conjuncts(sql: str) -> set[str]:
+    """Each condition the WHERE clause of `sql` ANDs together, written back as Postgres SQL."""
+    where = sqlglot.parse_one(sql, read="postgres").args["where"].this
+    return {condition.sql("postgres") for condition in where.flatten()} if isinstance(where, exp.And) else {
+        where.sql("postgres")}
+
+
+def test_foreign_keys_stay_inside_the_configured_schema():
+    """A key is read only where the table it references is in the configured schema too, so a key to another schema's
+    table never attaches to a table of the same name here; and only as declared, never once more for each partition of
+    a partitioned table. Checked on the statement sent, and on it as a SQL parser writes it back, as Superset runs it."""
+    (sent,) = _sent_by("foreign_keys")
+    statement, _, _ = _paging(sent)
+    for sql in (statement, sqlglot.parse_one(statement, read="postgres").sql("postgres")):
+        conditions = _where_conjuncts(sql)
+        assert "n.nspname = 'sales'" in conditions
+        assert {"dst.relnamespace = src.relnamespace", "src.relnamespace = dst.relnamespace"} & conditions
+        assert "con.conparentid = 0" in conditions
+    # The check reads the WHERE clause: a statement without the two conditions fails it.
+    assert not {"dst.relnamespace = src.relnamespace", "con.conparentid = 0"} & _where_conjuncts(
+        "SELECT 1 FROM pg_catalog.pg_constraint AS con WHERE con.contype = 'f'")
+
+
 def test_paging_stops_on_a_short_page():
     sizes = iter([500, 500, 3])
     sent: list[str] = []

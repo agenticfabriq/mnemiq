@@ -47,8 +47,11 @@ CATALOGUE_SQL: dict[str, str] = {
     # One row for each column pair of each constraint, the pairs in the constraint's own order: `conkey` and `confkey`
     # read at each position `generate_subscripts` gives. Not `unnest(conkey, confkey) WITH ORDINALITY AS k(...)`:
     # Superset runs a statement as its SQL parser writes it back, and that drops the ordinality column's name from such
-    # an alias in a join, so the statement would fail. A constraint's name is unique on its table, which makes the
-    # order a key.
+    # an alias in a join, so the statement would fail. Only a key whose referenced table is in the configured schema
+    # too is read: a table here is named by its name alone, so a key to another schema's table would attach to one of
+    # the same name here. And only the key as declared (`conparentid = 0`): under it Postgres keeps a row of its own
+    # for each partition of a partitioned table the key is on or (from Postgres 12) references, each naming that
+    # partition in place of the table. A declared key's name is unique on its table, which makes the order a key.
     "foreign_keys": (
         "SELECT src.relname AS from_table, src_col.attname AS from_column, dst.relname AS to_table, "
         "dst_col.attname AS to_column, con.conname AS constraint_name "
@@ -61,7 +64,8 @@ CATALOGUE_SQL: dict[str, str] = {
         "AND src_col.attnum = con.conkey[k.key_position] "
         "JOIN pg_catalog.pg_attribute AS dst_col ON dst_col.attrelid = con.confrelid "
         "AND dst_col.attnum = con.confkey[k.key_position] "
-        f"WHERE con.contype = 'f' AND n.nspname = {SCHEMA_PLACEHOLDER} "
+        f"WHERE con.contype = 'f' AND n.nspname = {SCHEMA_PLACEHOLDER} AND dst.relnamespace = src.relnamespace "
+        "AND con.conparentid = 0 "
         "ORDER BY src.relname, k.key_position, con.conname"),
     "views": (
         f"SELECT c.relname AS view_name, pg_get_viewdef(c.oid, true) AS definition {_IN_SCHEMA} "
