@@ -406,17 +406,42 @@ def test_a_full_last_page_is_followed_by_an_empty_one():
 @pytest.mark.parametrize("cut", ["error", "flag"])
 def test_a_cut_dataset_page_is_asked_again_smaller(cut):
     """A page too large for Superset's response size is asked again for its first datasets with a smaller page, down
-    to one dataset, and the read goes on at that size: every dataset is read once, in order, none skipped."""
+    to one dataset: every dataset is read once, in order, none skipped."""
     big = _dataset(120, "big_view", sql="SELECT " + "x, " * 20_000 + "1")
     datasets = [_dataset(i, f"t{i}") for i in range(1, 231) if i != 120] + [big]
     superset = _Superset(_access({f"t{i}" for i in range(1, 231)} - {"t120"}), datasets, cut_above={120: 5}, cut=cut)
     grants = resolve_grants(_adapter(superset), _snapshot(*(f"t{i}" for i in range(1, 231))))
     assert grants.available is True
     assert grants.objects == {f"t{i}" for i in range(1, 231)} - {"t120"}
-    sizes = [r["page_size"] for r, _ in superset.pages]
-    assert sizes[0] == 100 and set(sizes[1:]) == {5}
     asked = [(request["page"], request["page_size"]) for request in superset.asked]
     assert asked[:5] == [(1, 100), (2, 100), (3, 50), (5, 25), (21, 5)]
+
+
+@pytest.mark.parametrize(("position", "fits"), [(120, 25), (120, 1), (180, 25)])
+def test_page_size_returns_after_a_cut_window(position, fits):
+    """Once the datasets of a page that was too large have been read at a smaller size, the read goes back to the size
+    that page was asked at, so one large dataset costs smaller pages around it and nowhere else. Each window ends on a
+    multiple of its own size, so the pages after it stay aligned: none skips or repeats a dataset."""
+    datasets = [_dataset(i, f"t{i}") for i in range(1, 351)]
+    superset = _Superset(_access({f"t{i}" for i in range(1, 351)}), datasets, cut_above={position: fits})
+    grants = resolve_grants(_adapter(superset), _snapshot(*(f"t{i}" for i in range(1, 351)), "secret"))
+    assert grants.objects == {f"t{i}" for i in range(1, 351)}
+    read: list[int] = []
+    for request, ids in superset.pages:
+        assert (request["page"] - 1) * request["page_size"] == len(read)
+        read.extend(ids)
+    assert read == list(range(1, 351))
+    asked = [(request["page"], request["page_size"]) for request in superset.asked]
+    if (position, fits) == (120, 25):
+        # 101-200 is cut, then 101-150; 101-125 and 126-150 fit, 151-200 at 50, then 201-300 and 301-350 at 100.
+        assert asked == [(1, 100), (2, 100), (3, 50), (5, 25), (6, 25), (4, 50), (3, 100), (4, 100)]
+    elif (position, fits) == (180, 25):
+        # 151-200 is cut at 50 inside the window 101-200: both windows end at 200, and the read is back at 100 at once.
+        assert asked == [(1, 100), (2, 100), (3, 50), (4, 50), (7, 25), (8, 25), (3, 100), (4, 100)]
+    else:
+        # 116-120 needs single datasets; 121-125 is read at 5 again, 126-150 at 25, 151-200 at 50, the rest at 100.
+        assert asked[-5:] == [(25, 5), (6, 25), (4, 50), (3, 100), (4, 100)]
+        assert [size for _, size in asked].count(1) == 5
 
 
 @pytest.mark.parametrize("position", [1, 5, 99, 100, 101, 150, 230])
@@ -681,7 +706,7 @@ def test_grants_through_the_real_client():
     assert {call.authorization for call in fake.calls} == {"Bearer person-token"}
     assert [(c.tool, c.request.get("page"), c.request.get("page_size")) for c in fake.calls] == [
         ("execute_sql", None, None), ("list_datasets", 1, 100), ("list_datasets", 1, 50), ("list_datasets", 2, 50),
-        ("list_datasets", 3, 50), ("execute_sql", None, None)]
+        ("list_datasets", 2, 100), ("execute_sql", None, None)]
     confirmation = fake.calls[-1].request
     assert confirmation["dry_run"] is True and _names(confirmation["sql"]) == [f"t{i}" for i in range(1, 121)]
 

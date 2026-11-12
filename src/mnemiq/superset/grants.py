@@ -203,10 +203,14 @@ def _read_datasets(adapter: SupersetSqlAdapter) -> list[_Dataset]:
     Superset reads page `p` of size `s` as the `s` datasets after the first `(p - 1) * s`: `list_datasets` passes
     `page - 1` on, and `BaseDAO.list` (`superset/daos/base.py`) offsets by `page * page_size`. A page too large is
     asked again for its first datasets with a smaller page that divides the last one (`_smaller`), so the datasets
-    read so far stay a whole number of pages and the next page starts right after them, and the read goes on at that
-    size. Pages are read until one holds fewer datasets than it asked for."""
+    read so far stay a whole number of pages and the next page starts right after them. Once the datasets of the page
+    that was too large are read, the read goes back to that page's size: its window ends on a multiple of that size, so
+    the next page is aligned too. Pages are read until one holds fewer datasets than it asked for."""
     datasets: list[_Dataset] = []
     size = PAGE_SIZE
+    # For each page that was too large and not yet read through, innermost last: its size, and how many datasets
+    # will have been read once its window has.
+    windows: list[tuple[int, int]] = []
     while True:
         page = len(datasets) // size + 1
         try:
@@ -230,6 +234,7 @@ def _read_datasets(adapter: SupersetSqlAdapter) -> list[_Dataset]:
                 logger.warning("list_datasets: dataset %d alone is too large for Superset's response size; granting "
                                "nothing", len(datasets) + 1)
                 raise _Unreadable
+            windows.append((size, len(datasets) + size))
             size = _smaller(size)
             continue
         found = _page_datasets(payload, size, datasets[-1].id if datasets else None)
@@ -240,6 +245,8 @@ def _read_datasets(adapter: SupersetSqlAdapter) -> list[_Dataset]:
         datasets.extend(found)
         if len(found) < size:
             return datasets
+        while windows and len(datasets) == windows[-1][1]:
+            size, _ = windows.pop()
 
 
 def _page_request(schema: str, page: int, size: int) -> dict:
