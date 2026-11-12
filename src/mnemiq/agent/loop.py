@@ -412,8 +412,11 @@ class Agent:
                     # granted, a writer that says the data cannot answer -- and stands over it
                     # (Codex's review).
                     return self._settled(packet, identity, deadline, emit, _attempt, *standing)
+                # A query of this turn already ran when a retry defers, so the access decision it
+                # ran under rides on the answer, as on any answer after a run (Codex's review).
                 return AgentAnswer(answer=outcome.reason, deferred=not outage, failed=outage,
-                                   reason_code=outcome.code)
+                                   reason_code=outcome.code,
+                                   narrowed=getattr(standing[0], "narrowed", None) if standing else None)
 
             approved: Approved = outcome
             key = cache_key(approved.plan_sql, grants.fingerprint, packet.enrichment_version)
@@ -437,13 +440,15 @@ class Agent:
                     # review of #179).
                     logger.warning("the source did not answer while a query ran: %s", exc.full_text)
                     return AgentAnswer(answer=exc.message, failed=True,
-                                       reason_code=DeferralReason.SOURCE_UNAVAILABLE)
+                                       reason_code=DeferralReason.SOURCE_UNAVAILABLE,
+                                       narrowed=getattr(standing[0], "narrowed", None) if standing else None)
                 except QueryCancelledError as exc:
                     # Someone stopped the statement, so the turn ends here: repaired, a model writing
                     # the same SQL again would run it a second time (Codex's second review of #179).
                     logger.warning("the source cancelled a query while it ran: %s", exc.full_text)
                     return AgentAnswer(answer=exc.message, failed=True,
-                                       reason_code=DeferralReason.EXECUTION_FAILED)
+                                       reason_code=DeferralReason.EXECUTION_FAILED,
+                                       narrowed=getattr(standing[0], "narrowed", None) if standing else None)
                 except ExecutionError as exc:
                     # The database is the one authority that cannot be wrong about itself: its
                     # complaint is the cheapest accuracy lever we have. Feed it back and retry.

@@ -755,3 +755,22 @@ def test_a_retry_that_writes_the_same_query_never_runs_it_twice_even_with_no_cac
     assert len(generator.calls) == 2
     ran = [s for s in recording.statements if "1000000" in s]
     assert len(ran) == 1, ran
+
+
+def test_a_retry_that_defers_keeps_the_access_decision_the_turn_ran_under(source):
+    """A query of the turn ran under a row filter before the retry deferred, so the answer carries the access
+    decision it ran under, which the audit reads (Codex's review): never "access not evaluated"."""
+    from dataclasses import replace
+
+    adapter, snap, values = source
+    verifiers, _ = _build_mode_verifiers(Settings(), client=_CountingJudgeClient())
+    generator = FakeGenerator([json.dumps({"sql": "SELECT id, amount FROM claim WHERE region = 'south'"}),
+                               json.dumps({"sql": None, "reason": "These tables cannot say."})])
+    agent = build_agent(replace(MODES["instant"], empty_retries=1), generator=generator,
+                        synthesizer=FakeSynthesizer("SYNTHESIZED"), adapter=adapter,
+                        cache=TwoTierCache(L1Cache()), corrector=None, values=values, selector=None,
+                        verifier=verifiers["instant"])
+    ans = agent.answer(_packet("List the south-region claims.", _NORTH_ONLY), snap, _NORTH_ONLY, _IDENTITY)
+    assert ans.deferred is True and str(ans.reason_code) == "unanswerable", ans.answer
+    assert len(generator.calls) == 2
+    assert ans.narrowed, "the row filter the first query ran under was dropped"
