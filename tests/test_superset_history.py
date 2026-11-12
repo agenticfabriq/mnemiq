@@ -27,7 +27,13 @@ from mnemiq.authz.grants import UNAVAILABLE, GrantSet
 from mnemiq.contract import Column, HistoryTurn, Snapshot
 from mnemiq.runtime import build_runtime
 from mnemiq.superset.adapter import SupersetSqlAdapter
-from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetRefusedCaller
+from mnemiq.superset.client import (
+    DelegatedToken,
+    SupersetDenied,
+    SupersetMcp,
+    SupersetPermissionDenied,
+    SupersetRefusedCaller,
+)
 from mnemiq.superset.history import superset_history
 from tests.scripted_deployment import IDENTITY, SQL, retrieve_the_one_table
 from tests.superset_fake import FakeSuperset
@@ -260,14 +266,11 @@ def test_a_cut_rerun_leaves_no_rows(fake, rerun):
     ({"success": False, "rows": None, "columns": None, "error": f"relation does not exist ({SAID})",
       "error_type": "GENERIC_DB_ENGINE_ERROR"}, True),
     ({"success": False, "rows": None, "columns": None, "error": SAID, "error_type": "OAUTH2_REDIRECT"}, True),
-    (RuntimeError(f"Permission denied: can_execute_sql on SQLLab ({SAID})"), True),
-    (RuntimeError(f"Permission denied for execute_sql: {SAID}"), True),
     (RuntimeError(f"something went wrong ({SAID})"), True),
-], ids=["timed-out", "stopped", "access-refused", "statement-failed", "unavailable", "roles-deny", "denied",
-        "tool-error"])
+], ids=["timed-out", "stopped", "access-refused", "statement-failed", "unavailable", "tool-error"])
 def test_every_failed_rerun_leaves_no_rows(fake, caplog, rerun, logged):
-    """Each failure the runner reports, a source that did not answer and every refusal but the caller's included,
-    leaves the turn without rows and the request going on. Superset's words reach the log where it sent any, and the
+    """Each failure the runner reports, a source that did not answer and a table Superset refuses included, leaves the
+    turn without rows and the request going on. Superset's words reach the log where it sent any, and the
     history never."""
     _serve(fake, rerun)
     with caplog.at_level(logging.WARNING):
@@ -278,12 +281,25 @@ def test_every_failed_rerun_leaves_no_rows(fake, caplog, rerun, logged):
     assert len(_reruns(fake)) == 1
 
 
-def test_a_refused_caller_at_the_rerun_ends_the_request(fake):
-    """A credential Superset does not accept stays refused for every later call of the request, so the history does not
-    swallow it into a turn without rows: it ends the request, as it does when the grants meet it."""
-    _serve(fake, RuntimeError("User 'u' not found in Superset database"))
-    with pytest.raises(SupersetRefusedCaller):
+# Superset's refusals of the caller, of the caller's roles, and one it does not explain, as its MCP service words them
+# (`superset/mcp_service/auth.py`), each with the exception it reads as.
+TERMINAL = {
+    "refused-caller": ("User 'u' not found in Superset database", SupersetRefusedCaller),
+    "permission-denied": (f"Permission denied: can_execute_sql_query on SQLLab for user u (tool: execute_sql) {SAID}",
+                          SupersetPermissionDenied),
+    "denied": (f"Permission denied for execute_sql: You don't have access to this resource. {SAID}", SupersetDenied),
+}
+
+
+@pytest.mark.parametrize("text, raised", TERMINAL.values(), ids=TERMINAL.keys())
+def test_a_terminal_refusal_at_the_rerun_ends_the_request(fake, text, raised):
+    """A refusal of the caller or of the caller's roles, or one Superset does not explain, stays the same for every
+    later call of the request, so the history does not swallow it into a turn without rows: it ends the request, as it
+    does when the grants meet it. Superset's words stay in the exception's detail."""
+    _serve(fake, RuntimeError(text))
+    with pytest.raises(raised) as ended:
         _history([_turn()], _adapter(fake))
+    assert SAID not in str(ended.value)
     assert len(_reruns(fake)) == 1
 
 
@@ -293,6 +309,22 @@ def test_a_refused_caller_while_deciding_ends_the_request(fake):
     _serve(fake, _result(("west", 16666)))
     fake.refuse_token(TOKEN)
     with pytest.raises(SupersetRefusedCaller):
+        _history([_turn()], _adapter(fake))
+    assert _reruns(fake) == []
+
+
+@pytest.mark.parametrize("text, raised", [TERMINAL["permission-denied"], TERMINAL["denied"]],
+                         ids=["permission-denied", "denied"])
+def test_a_terminal_refusal_of_the_inventory_while_deciding_ends_the_request(fake, text, raised):
+    """The decider reads the function inventory it could not get as a source that could not be asked, and refuses: a
+    refusal of the caller's roles, or one Superset does not explain, still ends the request, and nothing is run."""
+    def answer(request: dict, authorization: str | None):
+        if request.get("force_refresh"):
+            return RuntimeError(text)
+        return EMPTY if _PROBE.search(request["sql"]) else _result(("west", 16666))
+
+    fake.reply("execute_sql", answer)
+    with pytest.raises(raised):
         _history([_turn()], _adapter(fake))
     assert _reruns(fake) == []
 

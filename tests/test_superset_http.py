@@ -354,9 +354,10 @@ def test_misconfigured_superset_is_503_naming_the_setting(server, fake, model):
     assert model.calls == 0
 
 
-def test_a_permission_denied_statement_ends_the_ask_failed(server, fake, model):
-    """Raised by the answer statement itself, a role's denial is read by the runner as the source not answering: the
-    ask ends `failed`, a 200 like any stated failure, and is not repaired."""
+def test_a_permission_denied_statement_ends_the_ask_as_the_refusal_it_is(server, fake, model):
+    """Raised by the answer statement itself, a role's denial is read by the runner as the source not answering, and
+    the ask still ends as the refusal it is: the 403 naming the roles, never a "try again", with the writer asked once
+    and nothing repaired."""
     client, _ = server
 
     def denying_the_statement(request, authorization):
@@ -366,8 +367,8 @@ def test_a_permission_denied_statement_ends_the_ask_failed(server, fake, model):
 
     fake.reply("execute_sql", denying_the_statement)
     r = client.post("/v1/ask", json={"question": "q"}, headers=_bearer(_token()))
-    assert r.status_code == 200, r.text
-    assert r.json()["failed"] is True and r.json()["answer"]
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"] == NOT_A_BUILDER and "try again" not in r.text.lower()
     assert model.calls == 1
 
 
@@ -681,6 +682,122 @@ def test_expiry_mid_ask_is_a_stated_failure(server, fake, model, monkeypatch, ki
         statements = [request for request in attempted if _kind(request) == "statement"]
         assert len(statements) <= 1
         fake.reply("execute_sql", _answer_rows)
+
+
+def _failing_from(fake: FakeSuperset, index: int, failure) -> None:
+    """Superset answers the first `index` calls, and every call from then on with `failure()`: an exception, which
+    the fake sends as the tool's error, or a payload."""
+    calls = 0
+    lock = threading.Lock()
+
+    def answer(request, authorization):
+        nonlocal calls
+        with lock:
+            this, calls = calls, calls + 1
+        return _answer_rows(request, authorization) if this < index else failure()
+
+    fake.reply("execute_sql", answer)
+
+
+def _reference(client, fake, with_history: bool) -> tuple[dict, list[str]]:
+    """The body an ask sends, with an earlier turn when `with_history`, and the kinds of the calls a whole answer to it
+    makes, in order."""
+    body = {"question": "q"}
+    if with_history:
+        first = client.post("/v1/ask", json=body, headers=_bearer(_token(jti="first"))).json()
+        body["history"] = [{"question": "how many", "sql": SQL, "grant_fingerprint": first["grant_fingerprint"]}]
+    fake.calls.clear()
+    reference = client.post("/v1/ask", json=body, headers=_bearer(_token(jti="reference")))
+    assert reference.status_code == 200 and not reference.json()["failed"], reference.text
+    return body, [_kind(call.request) for call in fake.calls]
+
+
+# Superset's refusals of a known caller's roles and the one it does not explain, as its MCP service words them; each
+# with the status and the sentence it reaches the person as.
+TERMINAL = {
+    "permission-denied": (ROLE_DENIAL, 403, NOT_A_BUILDER),
+    "denied": (GENERIC_DENIAL, 403, DENIED),
+}
+
+
+@pytest.mark.parametrize("place", [p for p in PLACES if p != "grants"])
+@pytest.mark.parametrize("said, status, sentence", TERMINAL.values(), ids=TERMINAL.keys())
+def test_a_terminal_refusal_after_the_grants_is_its_own_refusal(server, fake, model, monkeypatch, said, status,
+                                                               sentence, place):
+    """Superset refuses the person's roles, or refuses without saying why, at a call after the grants were read: the
+    function inventory, the proof, the answer statement, or an earlier turn run again. A retry meets the same refusal,
+    so the person is told what the refusal is, as when the grants meet it: the status and sentence on `/v1/ask`, and
+    the same sentence in the stream's failure on `/v1/chat`. Never "try again", a repair, a second statement, or
+    Superset's own words."""
+    client, _ = server
+    attempted: list[dict] = []
+    real_call = SupersetMcp.call
+
+    def recording_call(self, tool, request, **kwargs):
+        attempted.append(request)
+        return real_call(self, tool, request, **kwargs)
+
+    monkeypatch.setattr(SupersetMcp, "call", recording_call)
+    kind, with_history = PLACES[place]
+    body, kinds = _reference(client, fake, with_history)
+    index = kinds.index(kind)
+
+    for door in ("ask", "chat"):
+        _failing_from(fake, index, lambda: RuntimeError(said))
+        attempted.clear()
+        asked = model.calls
+        if door == "ask":
+            r = client.post("/v1/ask", json=body, headers=_bearer(_token(jti=door)))
+            assert r.status_code == status, r.text
+            assert r.json()["detail"] == sentence
+        else:
+            r = client.post("/v1/chat", json=body, headers=_bearer(_token(jti=door)))
+            assert r.status_code == 200
+            frames = _frames(r.text)
+            assert frames[-1]["type"] == "RUN_ERROR" and frames[-1]["message"] == sentence, frames
+            assert not any(f.get("name") == "mnemiq.answer" for f in frames)
+        assert "try again" not in r.text.lower()
+        assert said not in r.text and "can_execute_sql_query" not in r.text and "this resource" not in r.text
+        # The writer is asked at most once, and not at all when the earlier turn met the refusal: nothing is repaired.
+        assert model.calls - asked == (0 if with_history else 1)
+        assert [_kind(request) for request in attempted[:index + 1]] == kinds[:index + 1]
+        assert len([request for request in attempted if _kind(request) == "statement"]) <= 1
+        fake.reply("execute_sql", _answer_rows)
+
+
+def test_a_table_superset_refuses_in_the_answer_statement_stays_the_models_to_repair(server, fake, model):
+    """The control: Superset refusing a table the statement reads is not a refusal of the person, so it is not raised
+    after the answer as one. The model is told so in mnemiq's words and asked again, and the ask ends as a stated
+    answer, a 200, carrying none of Superset's words."""
+    client, _ = server
+    body, kinds = _reference(client, fake, False)
+    asked = model.calls
+    _failing_from(fake, kinds.index("statement"), lambda: {
+        "success": False, "rows": None, "columns": None, "error": f"You need access to the following tables: `wide` "
+        f"{SAID}", "error_type": "TABLE_SECURITY_ACCESS_ERROR"})
+    r = client.post("/v1/ask", json=body, headers=_bearer(_token()))
+    assert r.status_code == 200, r.text
+    assert SAID not in r.text
+    assert model.calls - asked > 1  # repaired: the writer was asked again
+
+
+def test_superset_not_answering_the_statement_stays_an_outage(server, fake, model, monkeypatch):
+    """The control: Superset not answering the answer statement is an outage, as before: the ask ends `failed`, a 200,
+    and is not raised after the answer as a refusal."""
+    client, _ = server
+    body, _kinds = _reference(client, fake, False)
+    real_call = SupersetMcp.call
+
+    def unavailable_for_the_statement(self, tool, request, **kwargs):
+        if tool == "execute_sql" and _kind(request) == "statement":
+            raise SupersetUnavailable("Superset's MCP service could not be reached", detail=SAID)
+        return real_call(self, tool, request, **kwargs)
+
+    monkeypatch.setattr(SupersetMcp, "call", unavailable_for_the_statement)
+    r = client.post("/v1/ask", json=body, headers=_bearer(_token()))
+    assert r.status_code == 200, r.text
+    assert r.json()["failed"] is True and r.json()["reason_code"] == "source_unavailable", r.json()
+    assert SAID not in r.text
 
 
 # --- entry points that answer as one identity -----------------------------------------------------------------------

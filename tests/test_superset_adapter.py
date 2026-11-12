@@ -303,28 +303,66 @@ def _answer_with_no_rows() -> dict:
     return {**REGION_COUNTS, "rows": [], "row_count": 0}
 
 
-def test_the_adapter_remembers_the_first_refusal_of_its_caller():
-    """The runner reads a credential Superset refuses as a source that did not answer, and the function inventory as
-    one it could not ask; the refusal's kind survives on the adapter, so the request can end as a refused sign-in.
-    Every call is watched, a dry run and the catalogue included, and only a refusal of the caller is remembered."""
-    first = SupersetRefusedCaller("Superset did not accept the credential this request carries (HTTP 401)")
+TERMINAL = {
+    "refused-caller": lambda: SupersetRefusedCaller("Superset did not accept the credential this request carries "
+                                                    "(HTTP 401)"),
+    "permission-denied": lambda: SupersetPermissionDenied("Superset's roles for this user do not permit execute_sql"),
+    "denied": lambda: SupersetDenied("Superset refused execute_sql and did not say why"),
+}
+
+
+@pytest.mark.parametrize("make", TERMINAL.values(), ids=TERMINAL.keys())
+def test_the_adapter_remembers_the_first_terminal_refusal(make):
+    """The runner reads a refusal of the caller, or of the caller's roles, or one Superset does not explain, as a
+    source that did not answer, and the function inventory as one it could not ask; the refusal's kind survives on
+    the adapter, so the request can end as that refusal. Every call is watched, a dry run, a run and the catalogue
+    included, and the first refusal is the one kept."""
+    first = make()
     adapter = _adapter(first)
-    assert adapter.refused_caller is None
-    with pytest.raises(SupersetRefusedCaller):
+    assert adapter.terminal_refusal is None
+    with pytest.raises(type(first)):
         adapter.dry_run(SQL)
-    later = SupersetRefusedCaller("Superset has no user for the credential this request carries")
-    adapter.client.answer = later
+    adapter.client.answer = make()
     with pytest.raises(SourceUnavailableError):
         run(adapter, SQL)
-    with pytest.raises(SupersetRefusedCaller):
+    with pytest.raises(type(first)):
         adapter.user_functions()
-    assert adapter.refused_caller is first
+    assert adapter.terminal_refusal is first
 
-    for other in (SupersetPermissionDenied("x"), SupersetDenied("x"), SupersetUnavailable("x"), SupersetToolError("x"),
-                  HIDDEN_TABLE_REFUSAL):
-        refused = _adapter(other)
+
+@pytest.mark.parametrize("before", ["permission-denied", "denied"])
+def test_a_refused_caller_outranks_an_earlier_terminal_refusal(before):
+    """Signing in again is the one thing the person can do that might help, so a refusal of the caller met at any
+    point is the one kept, over another terminal refusal met before it; nothing met after it replaces it."""
+    adapter = _adapter(TERMINAL[before]())
+    with pytest.raises(Exception):
+        adapter.execute(SQL)
+    caller = TERMINAL["refused-caller"]()
+    adapter.client.answer = caller
+    with pytest.raises(SupersetRefusedCaller):
+        adapter.dry_run(SQL)
+    adapter.client.answer = TERMINAL[before]()
+    with pytest.raises(Exception):
+        adapter.validate(SQL)
+    assert adapter.terminal_refusal is caller
+
+
+@pytest.mark.parametrize("answer", [
+    SupersetUnavailable("Superset's MCP service could not be reached"),
+    SupersetToolError("Superset's execute_sql tool failed"),
+    SupersetResponseTooLarge("Superset's answer to execute_sql was larger than its MCP service will send"),
+    HIDDEN_TABLE_REFUSAL,
+    _failed("timed_out"),
+    _failed("stopped"),
+    _failed("GENERIC_DB_ENGINE_ERROR"),
+], ids=["unavailable", "tool-error", "too-large", "access-refused", "timed-out", "stopped", "statement-failed"])
+def test_no_other_failure_is_remembered(answer):
+    """A table Superset refuses stays the model's to repair, and an outage, a tool error, a cut result, a time limit
+    and a cancel keep the readings they have: none of them is a refusal of the caller."""
+    adapter = _adapter(answer)
+    for call in (adapter.execute, adapter.dry_run, adapter.validate):
         with pytest.raises(Exception):
-            refused.execute(SQL)
-        with pytest.raises(Exception):
-            refused.dry_run(SQL)
-        assert refused.refused_caller is None, other
+            call(SQL)
+    with pytest.raises(Exception):
+        adapter.user_functions()
+    assert adapter.terminal_refusal is None

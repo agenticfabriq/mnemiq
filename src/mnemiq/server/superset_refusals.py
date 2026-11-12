@@ -5,10 +5,12 @@ stream's opaque error, and each says what the person can do about it, or that no
 status and the sentence are chosen by the exception's type. Where a message is passed on, it is one mnemiq composed
 (`mnemiq.superset.client` keeps Superset's own words in `.detail`, which goes to the log only).
 
-Several of these never reach a route as the code stands, because a layer below catches them first: a statement's
-refusal becomes the runner's `ExecutionError`, the function inventory reads a catalogue method that raises as an
-answer it could not get, and the grants read a refused probe as "not database-wide". This is the backstop for any
-other path.
+A refusal of the caller, of the caller's roles, or one Superset does not explain reaches a route however deep in the
+answer it was met: the runner, the proof seam and the function inventory each read it as a source that did not answer,
+so the request's adapter remembers it (`SupersetSqlAdapter.terminal_refusal`) and `Runtime.ask` raises it once the
+agent has answered. Superset's refusal of a table a statement reads never reaches a route: it becomes the runner's
+`ExecutionError`, which the model repairs, and the grants read a refused probe as "not database-wide". This is the
+backstop for any other path.
 """
 
 from __future__ import annotations

@@ -281,8 +281,10 @@ class Runtime:
 
         In Superset mode every statement of this request runs through Superset as the person whose verified token
         `delegation` is, on an adapter built for this request alone, and what they may read is what Superset says when
-        asked as them. A request with no token is refused before any work, and one whose token Superset refuses at any
-        point raises `SupersetRefusedCaller`, never an answer. In direct mode `delegation` is not read."""
+        asked as them. A request with no token is refused before any work. One that Superset refuses at any point, its
+        token (`SupersetRefusedCaller`), its roles (`SupersetPermissionDenied`) or without saying why
+        (`SupersetDenied`), raises that refusal, never an answer; a refusal of the token outranks the others. In direct
+        mode `delegation` is not read."""
         superset = self._superset_mode
         if superset and delegation is None:
             raise SupersetCredentialMissing(_NO_DELEGATION)
@@ -367,12 +369,13 @@ class Runtime:
         if fitter is not None:
             packet = fitter.fit(packet, self.snapshot, grants, card_style=self._card_style(name, picked))
         answer = agent.answer(packet, self.snapshot, grants, identity, emit=emit)
-        if superset and (refused := adapter.refused_caller) is not None:
-            # Superset stopped accepting this person's token during the answer: reading the function inventory, at the
-            # proof, or running the statement. The agent read that as a source that did not answer and would tell the
-            # person to try again, which cannot help: the token stays refused. So the request ends as it does when the
-            # grants or the history meet the same refusal.
-            logger.warning("Superset refused this request's credential while it was answered; the request ends here")
+        if superset and (refused := adapter.terminal_refusal) is not None:
+            # Superset refused the person during the answer, reading the function inventory, at the proof, or running
+            # the statement: their token, their roles, or without saying why. The agent read that as a source that did
+            # not answer and would tell the person to try again, which cannot help: every retry meets the same refusal.
+            # So the request ends as that refusal, as it does when the grants or the history meet it.
+            logger.warning("Superset refused this request (%s) while it was answered; the request ends here",
+                           type(refused).__name__)
             raise refused
         return self._record(answer, name, grants, identity, packet.question, packet, started, picked)
 

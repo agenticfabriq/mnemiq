@@ -22,7 +22,9 @@ import pyarrow as pa
 
 from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
 from mnemiq.superset.client import (
+    SupersetDenied,
     SupersetMcp,
+    SupersetPermissionDenied,
     SupersetRefusal,
     SupersetRefusedCaller,
     SupersetResponseTooLarge,
@@ -52,6 +54,11 @@ TRANSPORT_MARGIN_S = 15.0
 _TOO_LARGE_TO_SEND = ("Superset would not send this result, which is larger than its response size allows; aggregate, "
                       "or select fewer rows or columns.")
 
+# The refusals that end a request wherever they are met: of the caller, of the caller's roles, and one Superset does not
+# explain. Each stays the same for every later call the request makes, so no rewrite or retry can help. Superset's
+# refusal of a table is not among them: it is the model's to repair.
+TERMINAL_REFUSALS = (SupersetRefusedCaller, SupersetPermissionDenied, SupersetDenied)
+
 
 class SupersetSqlAdapter:
     """Runs statements on one Superset database and schema through `client`, each within `timeout_s` unless the
@@ -76,17 +83,19 @@ class SupersetSqlAdapter:
         self._schema = schema
         self._timeout_s = timeout_s
         self._refresh_every_statement = refresh_every_statement
-        self._refused_caller: SupersetRefusedCaller | None = None
+        self._terminal_refusal: SupersetRefusal | None = None
 
     @property
-    def refused_caller(self) -> SupersetRefusedCaller | None:
-        """The first `SupersetRefusedCaller` any statement this adapter sent was refused with, or None.
+    def terminal_refusal(self) -> SupersetRefusal | None:
+        """The refusal the request this adapter serves ends as, or None: of the `TERMINAL_REFUSALS` any statement it
+        sent was refused with, a refusal of the caller if there was one, else the first.
 
-        The query runner reads a credential Superset refuses as a source that did not answer, and the function
-        inventory as one it could not ask, so the refusal's own kind survives only here. A refused credential stays
-        refused for every later call the request makes, so the request ends as a refused sign-in. One adapter serves
-        one request, so what it remembers is never another person's."""
-        return self._refused_caller
+        The query runner reads each of them as a source that did not answer, the proof seam as one it could not ask,
+        and the function inventory as one it could not read, so the refusal's own kind survives only here. Each stays
+        the same for every later call the request makes, so the request ends as that refusal rather than as an outage
+        to try again. A refusal of the caller outranks the others, since signing in again is the one thing the person
+        can do that might help. One adapter serves one request, so what it remembers is never another person's."""
+        return self._terminal_refusal
 
     @property
     def database_id(self) -> int:
@@ -220,9 +229,10 @@ class SupersetSqlAdapter:
             request["force_refresh"] = True
         try:
             return self.client.call("execute_sql", request, timeout_s=limit + TRANSPORT_MARGIN_S)
-        except SupersetRefusedCaller as exc:
-            if self._refused_caller is None:
-                self._refused_caller = exc
+        except TERMINAL_REFUSALS as exc:
+            kept = self._terminal_refusal
+            if kept is None or (isinstance(exc, SupersetRefusedCaller) and not isinstance(kept, SupersetRefusedCaller)):
+                self._terminal_refusal = exc
             raise
 
 
