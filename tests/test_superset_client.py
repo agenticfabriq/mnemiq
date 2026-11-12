@@ -180,15 +180,59 @@ def test_a_server_error_is_unavailable(fake):
     _holds_no_credential(caught.value)
 
 
-def test_an_answer_that_is_not_json_rpc_is_unavailable(fake):
-    """A 200 whose body is not a JSON-RPC message (a proxy's page, say) is no answer at all: mcp 2.x reports it as a
-    parse error of its own and 1.x waits out the deadline, and neither is Superset saying something about the tool."""
-    fake.fail_http(200)
+@pytest.mark.parametrize("content_type", ["text/html", "application/json"])
+def test_an_answer_that_is_not_json_rpc_is_unavailable_at_once(fake, content_type):
+    """A 200 that is not a JSON-RPC message (a proxy's sign-in page, or JSON of some other shape) is no answer at all.
+    mcp 2.x reports it as a JSON-RPC error of its own making, and 1.x hands it to the session's message handler;
+    neither is Superset saying something about the tool, and neither should wait out the deadline."""
+    fake.fail_http(200, content_type=content_type)
+    started = time.monotonic()
     with pytest.raises(SupersetUnavailable) as caught:
-        _client(fake.url, timeout_s=2).call("execute_sql", REQUEST)
-    assert str(caught.value) in ("Superset's MCP service gave no usable answer to execute_sql",
-                                 "Superset's MCP service did not answer execute_sql within 2 seconds")
+        _client(fake.url, timeout_s=30).call("execute_sql", REQUEST)
+    # Half the deadline: a call that fails at once takes a few seconds at most, even on a loaded machine.
+    assert time.monotonic() - started < 15
+    assert str(caught.value) == "Superset's MCP service gave no usable answer to execute_sql"
     _holds_no_credential(caught.value)
+
+
+def test_an_event_stream_closed_before_its_result_is_unavailable(fake):
+    """mcp 2.x resolves the call with a JSON-RPC "connection closed" error of its own; 1.x waits out the deadline."""
+    fake.close_stream_before_result()
+    with pytest.raises(SupersetUnavailable) as caught:
+        _client(fake.url, timeout_s=3).call("execute_sql", REQUEST)
+    assert str(caught.value) in ("Superset's MCP service gave no usable answer to execute_sql",
+                                 "Superset's MCP service did not answer execute_sql within 3 seconds")
+    _holds_no_credential(caught.value)
+
+
+def test_no_json_rpc_error_reads_as_superset_answering():
+    """Superset sends its refusals and tool failures as error results, never as JSON-RPC errors. A JSON-RPC error is
+    the SDK's own report of a transport problem (a closed connection, an answer of the wrong type, one it could not
+    parse) or a protocol-level failure, so whatever its code and text, it reads as Superset being unavailable."""
+    import mcp
+    from mcp.types import CONNECTION_CLOSED, INVALID_PARAMS, INVALID_REQUEST, PARSE_ERROR, ErrorData
+
+    from mnemiq.superset.client import _Exchange
+
+    error_class = getattr(mcp, "MCPError", None) or getattr(mcp, "McpError")
+
+    def jsonrpc_error(code: int, message: str) -> Exception:
+        try:
+            return error_class(code, message)  # mcp 2.x
+        except TypeError:
+            return error_class(ErrorData(code=code, message=message))  # mcp 1.x
+
+    errors = [(CONNECTION_CLOSED, "Connection closed"), (INVALID_REQUEST, "Unexpected content type: text/html"),
+              (PARSE_ERROR, "Failed to parse JSON response"), (INVALID_PARAMS, ROLE_DENIAL),
+              (INVALID_PARAMS, "Unknown tool: execute_sql")]
+    client = _client("http://127.0.0.1:1/mcp")
+    for code, message in errors:
+        for statuses, sentence in (([200, 202], "Superset's MCP service gave no usable answer to execute_sql"),
+                                   ([], "Superset's MCP service could not be reached")):
+            exchange = _Exchange(statuses=statuses, error=ExceptionGroup("t", [jsonrpc_error(code, message)]))
+            exc = client._failure("execute_sql", exchange)
+            assert type(exc) is SupersetUnavailable, (code, message, type(exc))
+            assert str(exc) == sentence, (code, message)
 
 
 def test_connection_refused_is_unavailable():

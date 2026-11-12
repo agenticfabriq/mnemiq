@@ -53,7 +53,8 @@ class FakeSuperset:
         self._structured = structured_output
         self._handlers: dict[str, Handler] = {}
         self._refused: set[str] = set()
-        self._http_status: int | None = None
+        self._http_failure: tuple[int, str] | None = None
+        self._close_streams = False
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
 
@@ -67,9 +68,14 @@ class FakeSuperset:
         """Answer 401 at the transport for a request carrying this bearer, before any tool runs."""
         self._refused.add(value)
 
-    def fail_http(self, status: int) -> None:
-        """Answer every later request with this HTTP status at the transport, before any tool runs."""
-        self._http_status = status
+    def fail_http(self, status: int, *, content_type: str = "application/json") -> None:
+        """Answer every later request with this HTTP status at the transport, before any tool runs: a small JSON
+        object, or with `content_type="text/html"` a sign-in page, as a proxy in front of Superset might send."""
+        self._http_failure = (status, content_type)
+
+    def close_stream_before_result(self) -> None:
+        """Answer every later tool call with an event stream that ends before it carries the call's result."""
+        self._close_streams = True
 
     async def _answer(self, tool: str, request: dict):
         from mcp.types import CallToolResult, TextContent
@@ -142,14 +148,23 @@ class _Transport:
         authorization = next((value.decode("latin-1") for name, value in scope.get("headers", [])
                               if name.lower() == b"authorization"), None)
         scheme, _, bearer = (authorization or "").partition(" ")
-        if self.fake._http_status is not None:
-            await _respond(scope, receive, send, self.fake._http_status, {"error": "the fake failed this request"})
+        if self.fake._http_failure is not None:
+            status, content_type = self.fake._http_failure
+            if content_type == "text/html":
+                await _send(send, status, b"text/html; charset=utf-8", b"<html><body><h1>Sign in</h1></body></html>")
+            else:
+                await _respond(scope, receive, send, status, {"error": "the fake failed this request"})
             return
         if scheme.lower() != "bearer" or not bearer or bearer in self.fake._refused:
             await _respond(scope, receive, send, 401, {"error": "invalid_token",
                                                        "error_description": "Authentication required"},
                            headers={"WWW-Authenticate": 'Bearer error="invalid_token"'})
             return
+        if self.fake._close_streams and scope.get("method") == "POST":
+            body, receive = await _buffered(receive)
+            if _jsonrpc_method(body) == "tools/call":
+                await _send(send, 200, b"text/event-stream", b"")
+                return
         token = _authorization.set(authorization)
         try:
             await self.app(scope, receive, send)
@@ -161,3 +176,36 @@ async def _respond(scope, receive, send, status: int, body: dict, headers: dict 
     from starlette.responses import JSONResponse
 
     await JSONResponse(body, status_code=status, headers=headers)(scope, receive, send)
+
+
+async def _send(send, status: int, content_type: bytes, body: bytes) -> None:
+    """A complete response with this status, content type and body; an empty event stream ends at once."""
+    await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", content_type)]})
+    await send({"type": "http.response.body", "body": body, "more_body": False})
+
+
+async def _buffered(receive):
+    """Read the whole request body, and return it with a `receive` that hands it on to the app unchanged."""
+    chunks, more = [], True
+    while more:
+        message = await receive()
+        chunks.append(message.get("body", b""))
+        more = message.get("more_body", False)
+    body, replayed = b"".join(chunks), False
+
+    async def replay():
+        nonlocal replayed
+        if not replayed:
+            replayed = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return await receive()
+
+    return body, replay
+
+
+def _jsonrpc_method(body: bytes) -> str | None:
+    try:
+        message = json.loads(body)
+    except ValueError:
+        return None
+    return message.get("method") if isinstance(message, dict) else None

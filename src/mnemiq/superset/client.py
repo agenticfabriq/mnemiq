@@ -32,8 +32,9 @@ _ROLE_DENIAL = re.compile(r"Permission denied: \S+ on \S+")
 _DENIAL = re.compile(r"Permission denied for \S+:")
 # Superset's refusal of a verified token whose user it has no account for (`superset/mcp_service/auth.py`).
 _UNKNOWN_USER = "not found in Superset database"
-# Superset's tool search (`MCP_TOOL_SEARCH_CONFIG` in `superset/mcp_service/mcp_config.py`, on by default) replaces
-# the tool catalogue with a search tool and a call proxy, so a tool called by its own name can come back unknown.
+# A tool the server does not serve: an MCP server built on the SDK answers "Unknown tool: <name>". The advice names
+# Superset's tool search (`MCP_TOOL_SEARCH_CONFIG` in `superset/mcp_service/mcp_config.py`, on by default), which
+# replaces the tool catalogue a client lists with a search tool and a call proxy.
 _UNKNOWN_TOOL = re.compile(r"unknown tool", re.IGNORECASE)
 
 
@@ -129,18 +130,29 @@ class SupersetMcp:
         # One deadline over the whole call (connecting, the handshake and the tool call), so a slow Superset costs
         # at most `timeout_s` whichever step it is slow in.
         deadline = anyio.move_on_after(self._timeout_s)
+        # Cancelled when the transport reports an answer it could not read (a proxy's page, say): mcp 1.x hands that
+        # to the session's message handler and leaves the call waiting for a result that will never come.
+        abandon = anyio.CancelScope()
+
+        async def on_message(message) -> None:
+            if isinstance(message, Exception):
+                exchange.error = exchange.error or message
+                abandon.cancel()
+
         try:
             with deadline:
                 async with self._open(self._url, http_client) as (read, write):
-                    async with ClientSession(read, write) as session:
-                        await session.initialize()
-                        return await session.call_tool(tool, {"request": request})
+                    async with ClientSession(read, write, message_handler=on_message) as session:
+                        with abandon:
+                            await session.initialize()
+                            return await session.call_tool(tool, {"request": request})
         except Exception as exc:
-            exchange.error = exc
+            exchange.error = exchange.error or exc
             return None
         finally:
             exchange.timed_out = deadline.cancel_called
-        exchange.error = TimeoutError(f"no answer within {self._timeout_s:g} seconds")
+        if exchange.error is None:
+            exchange.error = TimeoutError(f"no answer within {self._timeout_s:g} seconds")
         return None
 
     def _http_client(self, exchange: _Exchange):
@@ -159,8 +171,15 @@ class SupersetMcp:
         return client
 
     def _failure(self, tool: str, exchange: _Exchange) -> _SupersetFailure:
-        """Read a failed exchange. The HTTP status comes first: mcp 1.x raises an HTTP error as such, but 2.x reports
-        it as a JSON-RPC error of its own making, which would otherwise read as Superset's answer."""
+        """Read a failed exchange: a call that ended without a tool result.
+
+        Superset sends a refusal or a tool's failure as an error result, which `_payload` reads. A call that ends
+        without any result is therefore never Superset answering about the tool: it is the transport, whatever the
+        SDK raised for it. That includes the JSON-RPC errors the SDK makes up on the client side for a closed
+        connection, an answer of the wrong content type or one it could not parse, so their text is never read.
+
+        The HTTP status comes first: mcp 1.x raises an HTTP error as such, but 2.x reports it as a JSON-RPC error of
+        its own making that no longer says which status it was."""
         detail = _describe(exchange.error)
         status = exchange.statuses[-1] if exchange.statuses else None
         if status in (401, 403):
@@ -171,18 +190,9 @@ class SupersetMcp:
         if exchange.timed_out:
             return SupersetUnavailable(f"Superset's MCP service did not answer {tool} within {self._timeout_s:g} "
                                        "seconds", detail=detail)
-        error = _protocol_error(exchange.error)
-        # A parse error is the SDK's own report that Superset's answer was not JSON-RPC (mcp 2.x; 1.x waits out the
-        # deadline instead), not something Superset said.
-        if error is not None and error.code != _JSONRPC_PARSE_ERROR:
-            return _tool_failure(tool, error.message)
         if exchange.statuses:  # it answered something: an unreadable answer, or a connection lost mid-call
             return SupersetUnavailable(f"Superset's MCP service gave no usable answer to {tool}", detail=detail)
         return SupersetUnavailable("Superset's MCP service could not be reached", detail=detail)
-
-
-# JSON-RPC's code for a message that could not be parsed.
-_JSONRPC_PARSE_ERROR = -32700
 
 
 @dataclass
@@ -260,15 +270,6 @@ def _tool_failure(tool: str, text: str) -> _SupersetFailure:
         return SupersetToolError(f"Superset's MCP service does not offer {tool} by name; if its tool search is on, set "
                                  'MCP_TOOL_SEARCH_CONFIG["enabled"] = False in superset_config.py', detail=text)
     return SupersetToolError(f"Superset's {tool} tool failed", detail=text)
-
-
-def _protocol_error(exc: BaseException):
-    """The JSON-RPC error (its `code` and `message`) that ended the call, if one did: `McpError` on mcp 1.x,
-    `MCPError` on 2.x."""
-    import mcp
-
-    error_class = getattr(mcp, "MCPError", None) or getattr(mcp, "McpError")
-    return next((leaf.error for leaf in _leaves(exc) if isinstance(leaf, error_class)), None)
 
 
 def _leaves(exc: BaseException) -> Iterator[BaseException]:
