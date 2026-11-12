@@ -2,8 +2,10 @@
 
 It offers the three tools mnemiq calls, each taking `request: dict` as Superset's do, and answers each call from a
 handler the test sets. What a handler returns reaches the client the way Superset sends it: a dict as structured
-content beside its JSON text, an exception as an error result whose text is exactly the exception's message (the
-shape `GlobalErrorHandlerMiddleware` in `superset/mcp_service/middleware.py` gives a refusal).
+content beside its JSON text, an exception as an error result whose text is `Error: ` and then the exception's message.
+That is the shape Superset's outermost middleware, `ToolResultCompatibilityMiddleware` in
+`superset/mcp_service/middleware.py`, gives every error that reaches it, a refusal from `GlobalErrorHandlerMiddleware`
+included. `bare_errors=True` sends the message alone.
 
 Like Superset with authentication on, the transport answers 401 before any tool runs when a request carries no bearer,
 or one the test refuses. Runs on mcp 1.x and 2.x.
@@ -71,12 +73,13 @@ class FakeSuperset:
     """`with FakeSuperset() as fake:` serves at `fake.url` until the block ends.
 
     `structured_output=False` sends each answer as JSON text only, as Superset does when its structured output is
-    off."""
+    off. `bare_errors=True` sends an error result's text without the `Error: ` Superset puts before it."""
 
-    def __init__(self, *, structured_output: bool = True) -> None:
+    def __init__(self, *, structured_output: bool = True, bare_errors: bool = False) -> None:
         self.calls: list[Call] = []
         self.url: str | None = None
         self._structured = structured_output
+        self._bare_errors = bare_errors
         self._handlers: dict[str, Handler] = {}
         self._refused: set[str] = set()
         self._http_failure: tuple[int, str] | None = None
@@ -89,6 +92,10 @@ class FakeSuperset:
         if tool not in TOOLS:
             raise ValueError(f"the fake serves only {TOOLS}")
         self._handlers[tool] = fn
+
+    def error_text(self, message: str) -> str:
+        """The text of the error result this fake sends for an exception whose message is `message`."""
+        return message if self._bare_errors else f"Error: {message}"
 
     def refuse_token(self, value: str) -> None:
         """Answer 401 at the transport for a request carrying this bearer, before any tool runs."""
@@ -115,7 +122,7 @@ class FakeSuperset:
             # In a worker thread, so a slow handler holds up only its own call.
             outcome = await anyio.to_thread.run_sync(handler, request, authorization)
         if isinstance(outcome, Exception):
-            return CallToolResult(content=[TextContent(type="text", text=str(outcome))], isError=True)
+            return CallToolResult(content=[TextContent(type="text", text=self.error_text(str(outcome)))], isError=True)
         structured = outcome if self._structured and isinstance(outcome, dict) else None
         return CallToolResult(content=[TextContent(type="text", text=json.dumps(outcome))],
                               structuredContent=structured)

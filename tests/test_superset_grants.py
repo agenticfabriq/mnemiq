@@ -27,6 +27,7 @@ from mnemiq.superset.client import (
     SupersetMcp,
     SupersetPermissionDenied,
     SupersetRefusedCaller,
+    SupersetResponseTooLarge,
     SupersetToolError,
     SupersetUnavailable,
 )
@@ -148,7 +149,8 @@ class _Superset:
         window = rows[(page - 1) * size:page * size]
         if any(size > self.cut_above[d["id"]] for d in window if d["id"] in self.cut_above):
             if self.cut == "error":
-                return SupersetToolError("Superset's list_datasets tool failed", detail=TOO_LARGE)
+                return SupersetResponseTooLarge("Superset's answer to list_datasets was larger than its MCP service "
+                                                "will send; ask for less", detail=f"Error: {TOO_LARGE}")
             return {"datasets": [], "page": page, "page_size": size, "_response_truncated": True,
                     "_truncation_notes": ["datasets cut to fit"]}
         self.pages.append((request, [d["id"] for d in window]))
@@ -522,6 +524,21 @@ def test_permission_denied_is_not_a_builder():
     assert caught.value.message == str(caught.value) == NOT_A_BUILDER
 
 
+@pytest.mark.parametrize("tool", ["execute_sql", "list_datasets"])
+def test_a_role_denial_from_the_wire_is_not_a_builder(tool):
+    """A role denial as Superset sends it, after its `Error: `, reaches the grant over the real client as a person who
+    is not a builder, from the probe and from the listing alike."""
+    text = ROLE_DENIAL if tool == "execute_sql" else LIST_ROLE_DENIAL
+    with FakeSuperset() as fake:
+        fake.reply("execute_sql", lambda request, authorization: PermissionError(text) if tool == "execute_sql"
+                   else _refused())
+        fake.reply("list_datasets", lambda request, authorization: PermissionError(text))
+        adapter = SupersetSqlAdapter(SupersetMcp(fake.url, DelegatedToken("tok")), database_id=DATABASE_ID,
+                                     schema=SCHEMA)
+        with pytest.raises(NotABuilder):
+            resolve_grants(adapter, _snapshot("policy"))
+
+
 def test_a_role_denial_on_list_datasets_is_not_a_builder():
     denial = SupersetPermissionDenied("Superset's roles for this user do not permit list_datasets",
                                       detail=LIST_ROLE_DENIAL)
@@ -651,9 +668,8 @@ def test_grants_through_the_real_client():
 
     def list_datasets(request, authorization):
         answer = superset(request)
-        if isinstance(answer, SupersetToolError):
-            return RuntimeError(answer.detail)
-        return answer
+        # The size guard's own text; the fake puts `Error: ` before it, as Superset does.
+        return RuntimeError(TOO_LARGE) if isinstance(answer, SupersetResponseTooLarge) else answer
 
     with FakeSuperset() as fake:
         fake.reply("execute_sql", lambda request, authorization: superset(request))

@@ -33,7 +33,12 @@ from mnemiq.contract.semantic import Snapshot
 from mnemiq.sql.identifiers import resolve_stored
 from mnemiq.sql.reserved_words import BARE_TABLE_UNSAFE, RESERVED
 from mnemiq.superset.adapter import SupersetSqlAdapter
-from mnemiq.superset.client import SupersetPermissionDenied, SupersetToolError, SupersetUnavailable
+from mnemiq.superset.client import (
+    SupersetPermissionDenied,
+    SupersetResponseTooLarge,
+    SupersetToolError,
+    SupersetUnavailable,
+)
 from mnemiq.superset.payload import SupersetAccessRefused, SupersetQueryFailed
 from mnemiq.superset.settings import SUPERSET_DIALECT
 
@@ -49,12 +54,6 @@ PAGE_SIZE = 100
 # orders the pages; its table, schema and database; and its SQL, which only a virtual dataset has. Each is a column of
 # Superset's dataset model, which `list_datasets` serves by name.
 DATASET_FIELDS = ("id", "table_name", "schema", "database_id", "sql")
-
-# How the error opens that Superset's response size guard raises for a response too large to send
-# (`format_size_limit_error` in `superset/mcp_service/utils/response_size_utils.py`). The guard cuts only the tools it
-# names (`INFO_TOOLS`, `DATA_QUERY_TOOLS` and their kin there), and `list_datasets` is not among them, so a page too
-# large is refused whole with this error rather than sent cut. A page marked `_response_truncated` reads the same way.
-_TOO_LARGE = "Response too large:"
 
 # A name Postgres reads unquoted as one identifier, and folds: ASCII letters, digits and underscores, not opening with
 # a digit.
@@ -214,10 +213,13 @@ def _read_datasets(adapter: SupersetSqlAdapter) -> list[_Dataset]:
             payload = adapter.client.call(LIST_DATASETS, _page_request(adapter.schema, page, size))
         except SupersetPermissionDenied as exc:
             raise _not_a_builder(exc) from exc
-        except SupersetToolError as exc:
-            if not exc.detail.startswith(_TOO_LARGE):
-                raise _misconfigured(exc) from exc
+        except SupersetResponseTooLarge:
+            # Superset's response size guard cuts only the tools it names (`INFO_TOOLS`, `DATA_QUERY_TOOLS` and their
+            # kin in `superset/mcp_service/utils/response_size_utils.py`), and `list_datasets` is not among them, so a
+            # page too large is refused whole rather than sent cut. A page marked `_response_truncated` reads the same.
             cut = True
+        except SupersetToolError as exc:
+            raise _misconfigured(exc) from exc
         except SupersetUnavailable as exc:
             logger.warning("list_datasets got no answer from Superset (%s: %s); granting nothing", exc, exc.detail)
             raise _Unreadable from exc

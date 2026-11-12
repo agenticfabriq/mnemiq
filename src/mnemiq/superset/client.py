@@ -22,6 +22,10 @@ from dataclasses import dataclass, field
 # carry is refused when the credential is made, before an HTTP library can quote it back in an error.
 _HEADER_SAFE = re.compile(r"[!-~]+")
 
+# What Superset's outermost middleware, `ToolResultCompatibilityMiddleware` (`superset/mcp_service/middleware.py`), puts
+# before the text of every error that reaches it, the refusals below included: it catches the error and answers with
+# the text `Error: <message>`. The shapes below are read after one such prefix, wherever they say they open the text.
+_ERROR_PREFIX = "Error: "
 # The refusal `MCPPermissionDeniedError` (`superset/mcp_service/auth.py`) carries when a known caller's roles lack a
 # permission a tool needs. `GlobalErrorHandlerMiddleware` (`superset/mcp_service/middleware.py`) passes its text on
 # unwrapped: "Permission denied: <permission> on <view>", then the user and the tool.
@@ -32,6 +36,9 @@ _ROLE_DENIAL = re.compile(r"Permission denied: \S+ on \S+")
 _DENIAL = re.compile(r"Permission denied for \S+:")
 # Superset's refusal of a verified token whose user it has no account for (`superset/mcp_service/auth.py`).
 _UNKNOWN_USER = "not found in Superset database"
+# How the error opens that Superset's response size guard raises for an answer too large to send and that it does not
+# cut instead (`format_size_limit_error` in `superset/mcp_service/utils/response_size_utils.py`).
+_TOO_LARGE = "Response too large:"
 # A tool the server does not serve: an MCP server built on the SDK answers "Unknown tool: <name>". The advice names
 # Superset's tool search (`MCP_TOOL_SEARCH_CONFIG` in `superset/mcp_service/mcp_config.py`, on by default), which
 # replaces the tool catalogue a client lists with a search tool and a call proxy.
@@ -93,6 +100,11 @@ class SupersetDenied(SupersetRefusal):
 
 class SupersetToolError(_SupersetFailure):
     """The tool reported an error that is not a refusal, or answered with something other than a JSON object."""
+
+
+class SupersetResponseTooLarge(SupersetToolError):
+    """The tool's answer was larger than Superset's MCP service will send, and it sent an error in its place: the
+    request is the caller's to make smaller."""
 
 
 class SupersetMcp:
@@ -267,14 +279,19 @@ def _first_text(result) -> str:
 
 
 def _tool_failure(tool: str, text: str) -> _SupersetFailure:
-    """Read an error Superset's MCP service sent about `tool`; its text is kept as the detail only."""
-    if _UNKNOWN_USER in text:
+    """Read an error Superset's MCP service sent about `tool`, after the one `Error: ` its outermost middleware puts
+    before it; the whole text, prefix and all, is kept as the detail only."""
+    message = text.removeprefix(_ERROR_PREFIX)
+    if _UNKNOWN_USER in message:
         return SupersetRefusedCaller("Superset has no user for the credential this request carries", detail=text)
-    if _ROLE_DENIAL.match(text):
+    if _ROLE_DENIAL.match(message):
         return SupersetPermissionDenied(f"Superset's roles for this user do not permit {tool}", detail=text)
-    if _DENIAL.match(text):
+    if _DENIAL.match(message):
         return SupersetDenied(f"Superset refused {tool} and did not say why", detail=text)
-    if _UNKNOWN_TOOL.search(text):
+    if message.startswith(_TOO_LARGE):
+        return SupersetResponseTooLarge(f"Superset's answer to {tool} was larger than its MCP service will send; ask "
+                                        "for less", detail=text)
+    if _UNKNOWN_TOOL.search(message):
         return SupersetToolError(f"Superset's MCP service does not offer {tool} by name; if its tool search is on, set "
                                  'MCP_TOOL_SEARCH_CONFIG["enabled"] = False in superset_config.py', detail=text)
     return SupersetToolError(f"Superset's {tool} tool failed", detail=text)

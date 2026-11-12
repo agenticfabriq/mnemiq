@@ -2,7 +2,8 @@
 into mnemiq's own sentence, with Superset's words kept in `.detail` for the log.
 
 Every test runs against `FakeSuperset`, a real MCP server over streamable HTTP on loopback, with the SDK's own
-transport in between. Runs on mcp 1.x (the lock) and 2.x (the mcp-2x workflow).
+transport in between. Runs on mcp 1.x (the lock) and 2.x (the mcp-2x workflow). Superset puts `Error: ` before every
+error's text, as the fake does by default; each way an error's text is read is checked with and without it.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from mnemiq.superset.client import (
     SupersetPermissionDenied,
     SupersetRefusal,
     SupersetRefusedCaller,
+    SupersetResponseTooLarge,
     SupersetToolError,
     SupersetUnavailable,
 )
@@ -37,11 +39,23 @@ ROLE_DENIAL = "Permission denied: can_execute_sql_query on SQLLab for user west 
 GENERIC_DENIAL = "Permission denied for execute_sql: You don't have access to this resource."
 UNKNOWN_USER = ("Invalid parameter in execute_sql: JWT authenticated user not found in Superset database. "
                 "Ensure the user exists before granting MCP access.")
+# The error Superset's response size guard raises for an answer too large to send that it does not cut
+# (`format_size_limit_error` in `superset/mcp_service/utils/response_size_utils.py`).
+TOO_LARGE = ("Response too large: 61,234 bytes (limit: 50,000)\n\nThis response would overwhelm the LLM context window.\n"
+             "Please modify your query to reduce the response size:\n\n1. Add a LIMIT clause to your SQL query\n\n"
+             "Tool: execute_sql\nReduction needed: ~18%")
 
 
 @pytest.fixture
 def fake():
     with FakeSuperset() as served:
+        yield served
+
+
+@pytest.fixture(params=["prefixed", "bare"])
+def any_shape(request):
+    """The fake Superset sending each error's text as Superset does, after `Error: `, and without it."""
+    with FakeSuperset(bare_errors=request.param == "bare") as served:
         yield served
 
 
@@ -116,43 +130,71 @@ def test_403_at_the_transport_is_a_refused_caller(fake):
     _holds_no_credential(caught.value)
 
 
-def test_a_user_superset_does_not_know_is_a_refused_caller(fake):
-    exc = _raised_for(fake, ValueError(UNKNOWN_USER))
+def test_a_user_superset_does_not_know_is_a_refused_caller(any_shape):
+    exc = _raised_for(any_shape, ValueError(UNKNOWN_USER))
     assert type(exc) is SupersetRefusedCaller
     assert str(exc) == "Superset has no user for the credential this request carries"
-    assert exc.detail == UNKNOWN_USER
+    assert exc.detail == any_shape.error_text(UNKNOWN_USER)
     _holds_no_credential(exc)
 
 
-def test_permission_denied_is_its_own_refusal(fake):
-    exc = _raised_for(fake, PermissionError(ROLE_DENIAL))
+def test_permission_denied_is_its_own_refusal(any_shape):
+    exc = _raised_for(any_shape, PermissionError(ROLE_DENIAL))
     assert type(exc) is SupersetPermissionDenied
     assert isinstance(exc, SupersetRefusal)
-    # Superset's text names the permission, the view and the user; it rides only in `.detail`.
-    assert exc.detail == ROLE_DENIAL
+    # Superset's text names the permission, the view and the user; it rides only in `.detail`, whole.
+    assert exc.detail == any_shape.error_text(ROLE_DENIAL)
     assert "SQLLab" not in str(exc) and "west" not in str(exc)
     _holds_no_credential(exc)
 
 
-def test_a_generic_permission_error_claims_no_cause(fake):
-    generic = _raised_for(fake, PermissionError(GENERIC_DENIAL))
+def test_a_generic_permission_error_claims_no_cause(any_shape):
+    generic = _raised_for(any_shape, PermissionError(GENERIC_DENIAL))
     assert type(generic) is SupersetDenied
     assert str(generic) == "Superset refused execute_sql and did not say why"
-    assert generic.detail == GENERIC_DENIAL
+    assert generic.detail == any_shape.error_text(GENERIC_DENIAL)
     _holds_no_credential(generic)
 
-    fake.refuse_token(TOKEN)
+    any_shape.refuse_token(TOKEN)
     with pytest.raises(SupersetRefusal) as caught:
-        _client(fake.url).call("execute_sql", REQUEST)
+        _client(any_shape.url).call("execute_sql", REQUEST)
     assert type(caught.value) is SupersetRefusedCaller
     for exc in (generic, caught.value):
         assert not isinstance(exc, SupersetPermissionDenied)
 
 
-def test_a_denial_text_is_read_only_at_its_start(fake):
+def test_a_denial_text_is_read_only_at_its_start(any_shape):
     """A tool error that merely quotes a denial is not one: the shapes are matched where Superset writes them."""
-    exc = _raised_for(fake, RuntimeError(f"Invalid parameter in execute_sql: {ROLE_DENIAL}"))
+    exc = _raised_for(any_shape, RuntimeError(f"Invalid parameter in execute_sql: {ROLE_DENIAL}"))
     assert type(exc) is SupersetToolError
+
+
+def test_one_error_prefix_is_read_past_and_no_more(fake):
+    """Superset puts one `Error: ` before an error's text; a text that opens with another after it does not open with
+    the denial."""
+    exc = _raised_for(fake, PermissionError(f"Error: {ROLE_DENIAL}"))
+    assert type(exc) is SupersetToolError
+    assert exc.detail == f"Error: Error: {ROLE_DENIAL}"
+
+
+def test_unknown_tool_text_names_the_tool_search_setting(any_shape):
+    """The text Superset's MCP service sends for a tool it does not offer by name, read in either shape."""
+    exc = _raised_for(any_shape, RuntimeError("Unknown tool: execute_sql"))
+    assert type(exc) is SupersetToolError
+    assert 'MCP_TOOL_SEARCH_CONFIG["enabled"] = False' in str(exc)
+    assert exc.detail == any_shape.error_text("Unknown tool: execute_sql")
+
+
+def test_a_response_too_large_is_its_own_tool_error(any_shape):
+    """An answer larger than Superset's MCP service will send, refused whole: a tool error of its own kind, which a
+    caller paging a listing reads as a page to ask for again smaller. Superset's text, with its sizes, rides only in
+    `.detail`."""
+    exc = _raised_for(any_shape, RuntimeError(TOO_LARGE), tool="list_datasets")
+    assert type(exc) is SupersetResponseTooLarge
+    assert isinstance(exc, SupersetToolError)
+    assert str(exc) == "Superset's answer to list_datasets was larger than its MCP service will send; ask for less"
+    assert exc.detail == any_shape.error_text(TOO_LARGE)
+    assert "61,234" not in str(exc)
 
 
 def test_unknown_tool_names_the_tool_search_setting(fake):
@@ -163,12 +205,12 @@ def test_unknown_tool_names_the_tool_search_setting(fake):
     _holds_no_credential(caught.value)
 
 
-def test_any_other_tool_error_is_a_tool_error(fake):
+def test_any_other_tool_error_is_a_tool_error(any_shape):
     text = "Datasource error in execute_sql: the query against the underlying datasource failed (secret_table)"
-    exc = _raised_for(fake, RuntimeError(text))
+    exc = _raised_for(any_shape, RuntimeError(text))
     assert type(exc) is SupersetToolError
     assert str(exc) == "Superset's execute_sql tool failed"
-    assert exc.detail == text
+    assert exc.detail == any_shape.error_text(text)
     _holds_no_credential(exc)
 
 

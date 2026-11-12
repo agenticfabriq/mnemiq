@@ -254,5 +254,19 @@ def test_runs_through_the_real_client():
     assert fake.calls[0].authorization == "Bearer tok"
 
 
+@pytest.mark.parametrize("text", [
+    "Permission denied: can_execute_sql_query on SQLLab for user west (tool: execute_sql)",
+    "Permission denied for execute_sql: You don't have access to this resource.",
+], ids=["role denial", "generic denial"])
+def test_a_refusal_from_the_wire_ends_the_turn(text):
+    """A refusal as Superset sends it, after the `Error: ` it puts before every error, reaches the runner over the real
+    client as the end of the turn, never as a statement for the model to repair."""
+    with FakeSuperset() as fake:
+        fake.reply("execute_sql", lambda request, authorization: PermissionError(text))
+        adapter = SupersetSqlAdapter(SupersetMcp(fake.url, DelegatedToken("tok")), database_id=7, schema="sales")
+        with pytest.raises(SourceUnavailableError):
+            run(adapter, SQL)
+
+
 def _answer_with_no_rows() -> dict:
     return {**REGION_COUNTS, "rows": [], "row_count": 0}
