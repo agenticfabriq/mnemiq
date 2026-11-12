@@ -369,7 +369,7 @@ class Settings(BaseSettings):
     # Startup rules for these live in `mnemiq.superset.settings.check_superset_settings`.
     superset_mcp_url: str | None = Field(default=None, description="turns on Superset mode: the http or https URL of Superset's MCP service, through which mnemiq answers each question as the signed-in Superset user, holding no database credential of its own; unset reads the source directly")
     superset_database_id: int | None = Field(default=None, ge=1, description="Superset mode: the id of the Superset database mnemiq answers from, as Superset numbers it; required with MNEMIQ_SUPERSET_MCP_URL")
-    superset_schema: str = Field(default="public", description="Superset mode: the schema mnemiq reads in that database; a plain identifier of letters, digits and _, not starting with a digit")
+    superset_schema: str = Field(default="public", description="Superset mode: the schema mnemiq reads in that database, its name spelled as Postgres stores it, case included; a plain identifier of letters, digits and _, not starting with a digit")
     # --- verifier ---
     answer_log_path: str | None = Field(default=None, description="where each answer's record goes: which profile, version, model and engine commit produced it, as one JSON line each, with no question text, SQL or rows; unset keeps it beside the store as <store_path>.answers.jsonl, `off` writes none. Not rotated")
     answer_log_text: bool = Field(default=False, description="opt-in: the answer log also holds the question and the SQL as asked, which carry literals from the question and values from the database; rows are never logged")

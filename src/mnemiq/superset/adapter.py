@@ -5,17 +5,22 @@ Every statement runs as the person whose token the client carries, so Superset's
 it reads. The adapter sends the database, the schema, the statement and a time limit, and nothing else: no `limit`,
 which Superset would put in place of the statement's own LIMIT; no `template_params`; and nothing that asks Superset to
 skip its result cache.
+
+The source's catalogue is read the same way, from Postgres's `pg_catalog` (`mnemiq.superset.pg_catalog`), and each part
+of it once per adapter.
 """
 
 from __future__ import annotations
 
 import math
+from functools import cached_property
 
 import pyarrow as pa
 
 from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
 from mnemiq.superset.client import SupersetMcp, SupersetRefusal, SupersetUnavailable
 from mnemiq.superset.payload import SupersetQueryFailed, check_execute_response, read_execute_response
+from mnemiq.superset.pg_catalog import PostgresCatalogue
 from mnemiq.superset.settings import SUPERSET_DIALECT
 
 # `execute_sql` renders every statement as a Jinja template before it checks access and runs it, so a statement holding
@@ -34,7 +39,16 @@ TRANSPORT_MARGIN_S = 15.0
 
 class SupersetSqlAdapter:
     """Runs statements on one Superset database and schema through `client`, each within `timeout_s` unless the
-    caller gives its own limit."""
+    caller gives its own limit.
+
+    Each catalogue method reads its part of the catalogue on the first call and answers every later call with a copy of
+    what it read: `decide` reads the function inventory on every decision, and one adapter serves one request, so the
+    inventory is read live once per request. A read that raises is not remembered, and the next call asks again."""
+
+    # The Postgres types with no equality operator, which `count(DISTINCT ...)` and `GROUP BY` refuse, as
+    # `format_type` names them, upper-cased as profiling compares them. Profiling reads this in place of its table by
+    # dialect: a direct Postgres adapter declares the same dialect and profiles as it always has.
+    unaggregatable_types = frozenset({"JSON", "XML", "POINT", "LINE", "LSEG", "BOX", "PATH", "POLYGON", "CIRCLE"})
 
     def __init__(self, client: SupersetMcp, *, database_id: int, schema: str, dialect: str = SUPERSET_DIALECT,
                  timeout_s: float = 30.0) -> None:
@@ -71,6 +85,66 @@ class SupersetSqlAdapter:
         it; the runner asks for both before it asks this, so there they stay the statement's cost and the cancel.
         Superset's refusal of a table, a result cut to size and a tool error are answers, which the model repairs."""
         return isinstance(exc, (SupersetUnavailable, SupersetRefusal, QueryTimedOut, QueryCancelled))
+
+    def introspect(self) -> list[str]:
+        return list(self._tables)
+
+    def list_columns(self) -> list[tuple[str, str, str]]:
+        return list(self._columns)
+
+    def foreign_keys(self) -> list[tuple[str, str, str, str, str]]:
+        return list(self._foreign_keys)
+
+    def view_definitions(self) -> list[tuple[str, str, str]]:
+        return list(self._views)
+
+    def user_functions(self) -> list[str]:
+        return list(self._user_functions)
+
+    def builtin_functions(self) -> list[str]:
+        return list(self._builtin_functions)
+
+    def reachable_user_functions(self) -> list[str]:
+        return list(self._reachable_user_functions)
+
+    def virtual_columns(self) -> list[tuple[str, str, str]]:
+        return list(self._virtual_columns)
+
+    @cached_property
+    def _catalogue(self) -> PostgresCatalogue:
+        return PostgresCatalogue(self.execute, self._schema)
+
+    @cached_property
+    def _tables(self) -> tuple[str, ...]:
+        return tuple(self._catalogue.tables())
+
+    @cached_property
+    def _columns(self) -> tuple[tuple[str, str, str], ...]:
+        return tuple(self._catalogue.columns())
+
+    @cached_property
+    def _foreign_keys(self) -> tuple[tuple[str, str, str, str, str], ...]:
+        return tuple(self._catalogue.foreign_keys())
+
+    @cached_property
+    def _views(self) -> tuple[tuple[str, str, str], ...]:
+        return tuple(self._catalogue.views())
+
+    @cached_property
+    def _user_functions(self) -> tuple[str, ...]:
+        return tuple(self._catalogue.user_functions())
+
+    @cached_property
+    def _builtin_functions(self) -> tuple[str, ...]:
+        return tuple(self._catalogue.builtin_functions())
+
+    @cached_property
+    def _reachable_user_functions(self) -> tuple[str, ...]:
+        return tuple(self._catalogue.reachable_user_functions())
+
+    @cached_property
+    def _virtual_columns(self) -> tuple[tuple[str, str, str], ...]:
+        return tuple(self._catalogue.virtual_columns())
 
     def _execute_sql(self, sql: str, timeout_s: float | None, *, dry_run: bool = False) -> dict:
         for delimiter in JINJA_DELIMITERS:

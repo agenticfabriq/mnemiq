@@ -7,6 +7,9 @@ shape `GlobalErrorHandlerMiddleware` in `superset/mcp_service/middleware.py` giv
 
 Like Superset with authentication on, the transport answers 401 before any tool runs when a request carries no bearer,
 or one the test refuses. Runs on mcp 1.x and 2.x.
+
+`RecordingClient` stands in for the client instead, without a wire, where a test needs only what mnemiq sends and what
+it makes of the answer.
 """
 
 from __future__ import annotations
@@ -39,6 +42,29 @@ class Call:
     tool: str
     request: dict
     authorization: str | None
+
+
+@dataclass(frozen=True)
+class Sent:
+    tool: str
+    request: dict
+    timeout_s: float | None
+
+
+class RecordingClient:
+    """Stands in for `SupersetMcp`: records each call, and answers it with `answer`, a payload to return or an
+    exception to raise, or a function of the call's request that returns or raises one."""
+
+    def __init__(self, answer: dict | Exception | Callable[[dict], dict]) -> None:
+        self.answer = answer
+        self.calls: list[Sent] = []
+
+    def call(self, tool: str, request: dict, *, timeout_s: float | None = None) -> dict:
+        self.calls.append(Sent(tool, request, timeout_s))
+        answer = self.answer(request) if callable(self.answer) else self.answer
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
 
 
 class FakeSuperset:

@@ -53,6 +53,12 @@ def _is_type_error(adapter: SourceAdapter, exc: Exception) -> bool:
 
 
 def _unaggregatable(adapter: SourceAdapter) -> frozenset[str]:
+    """The base type names `adapter`'s source cannot aggregate: the adapter's own `unaggregatable_types` where it
+    declares them, else its dialect's entry above. An adapter declares its own where its dialect's entry would be wrong
+    for another adapter of the same dialect."""
+    declared = getattr(adapter, "unaggregatable_types", None)
+    if declared is not None:
+        return frozenset(declared)
     return _UNAGGREGATABLE.get(getattr(adapter, "dialect", ""), frozenset())
 
 

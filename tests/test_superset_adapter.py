@@ -9,7 +9,6 @@ turn. One test runs the adapter over the real client against the fake Superset, 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 
 import pytest
 
@@ -28,7 +27,7 @@ from mnemiq.superset.client import (
 )
 from mnemiq.superset.payload import ResultCut, SupersetAccessRefused, SupersetQueryFailed
 from mnemiq.superset.settings import SUPERSET_DIALECT
-from tests.superset_fake import FakeSuperset
+from tests.superset_fake import FakeSuperset, RecordingClient
 
 SQL = "SELECT region, count(*) AS policy_count FROM policies GROUP BY region"
 REGION_COUNTS = {"success": True, "rows": [{"region": "west", "policy_count": 16666}],
@@ -45,28 +44,6 @@ SECRET_REFUSAL = {"success": False, "rows": None, "columns": None,
 
 def _failed(error_type: str, error: str = "Superset's own words") -> dict:
     return {"success": False, "rows": None, "columns": None, "error": error, "error_type": error_type}
-
-
-@dataclass(frozen=True)
-class Sent:
-    tool: str
-    request: dict
-    timeout_s: float | None
-
-
-class RecordingClient:
-    """Stands in for `SupersetMcp`: records each call, and answers it with `answer`, a payload to return or an
-    exception to raise."""
-
-    def __init__(self, answer: dict | Exception) -> None:
-        self.answer = answer
-        self.calls: list[Sent] = []
-
-    def call(self, tool: str, request: dict, *, timeout_s: float | None = None) -> dict:
-        self.calls.append(Sent(tool, request, timeout_s))
-        if isinstance(self.answer, Exception):
-            raise self.answer
-        return self.answer
 
 
 def _adapter(answer: dict | Exception = REGION_COUNTS, **kwargs) -> SupersetSqlAdapter:
