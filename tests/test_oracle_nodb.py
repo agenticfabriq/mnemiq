@@ -121,6 +121,7 @@ def _leased(pool):
 
     a = OracleAdapter.__new__(OracleAdapter)
     a._pool, a._con, a._closed, a._oracledb = pool, None, False, oracledb
+    a._probe_timeout_ms = 0  # no bound to borrow, so the calendar pin writes no timeout of its own
     a._read_only, a._ro_ttl_s, a._ro_state, a._ro_checked_at = True, 0.0, "unknown", None
     a._lock = threading.RLock()
     return a
@@ -648,11 +649,13 @@ def test_the_first_reprobe_runs_on_a_freshly_booted_host(monkeypatch):
 
 
 class _SessionCursor:
-    def __init__(self, ran):
-        self.ran = ran
+    def __init__(self, ran, con=None):
+        self.ran, self.con = ran, con
 
     def execute(self, sql, *args, **kwargs):
         self.ran.append(sql)
+        if self.con is not None:
+            self.con.bounds.append(self.con.call_timeout)
 
     def close(self):
         pass
@@ -660,11 +663,11 @@ class _SessionCursor:
 
 class _SessionConnection:
     def __init__(self):
-        self.ran = []
+        self.ran, self.bounds = [], []
         self.call_timeout = 0
 
     def cursor(self):
-        return _SessionCursor(self.ran)
+        return _SessionCursor(self.ran, self)
 
     def is_healthy(self):
         return True
@@ -712,3 +715,19 @@ def test_a_lease_whose_calendar_cannot_be_pinned_reads_as_the_source_not_answeri
         with a._lease():
             pass
     assert mod.unavailable_fault(raised.value)
+
+
+def test_the_calendar_pin_is_bounded_and_hands_back_the_leases_own_bound(monkeypatch):
+    """A data query's lease carries no bound until its cursor sets one, so the pin borrows the
+    probe timeout, as the read-only recheck does, and leaves the lease's bound as it found it."""
+    import oracledb
+    session = _SessionConnection()
+    pool = mock.Mock()
+    pool.acquire.return_value = session
+    monkeypatch.setattr(oracledb, "create_pool", lambda **kw: pool)
+    a = OracleAdapter("h:1521/X", "owner", "p", read_only=False, probe_timeout_s=7.0)
+    for lease_bound in (None, 2500):
+        session.bounds.clear()
+        with a._lease(lease_bound) as con:
+            assert con.call_timeout == (lease_bound or 0)
+        assert session.bounds == [7000]

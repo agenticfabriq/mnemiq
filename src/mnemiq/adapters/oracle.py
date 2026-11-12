@@ -230,12 +230,21 @@ class OracleAdapter:
         lease that changed its calendar, and an inline function with an autonomous transaction can
         change it from a statement that leads with WITH (Codex's third review). 0.13 ms a call,
         measured on the local database.
+
+        Bounded by the probe timeout, as `_recheck_read_only` is, then given back the lease's: a
+        data query's lease carries no bound until its cursor sets one, so an unbounded pin on a
+        wedged session would hold a pooled connection (Codex's fourth review).
         """
+        previous = connection.call_timeout
         cur = connection.cursor()
         try:
+            if self._probe_timeout_ms:
+                _set_call_timeout(connection, self._probe_timeout_ms)
             cur.execute("ALTER SESSION SET NLS_CALENDAR = 'GREGORIAN'")
         finally:
             cur.close()
+        if self._probe_timeout_ms:
+            _set_call_timeout(connection, previous)
 
     @classmethod
     def over(cls, connection, oracledb_module, schema: str, read_only: bool = True) -> "OracleAdapter":
