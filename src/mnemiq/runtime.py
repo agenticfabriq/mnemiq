@@ -4,7 +4,7 @@ import json
 import logging
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from mnemiq.agent.history import scope_history
@@ -29,6 +29,7 @@ from mnemiq.semantic.ontology_index import OntologyIndex
 from mnemiq.sql.decide_write import decide_write
 from mnemiq.semantic.cards import build_cards
 from mnemiq.semantic.starters import compose_starters
+from mnemiq.semantic.values import NoValueIndex
 from mnemiq.sql.views import inventory_for
 from mnemiq.sql.policy import AccessPolicy, build_access_policy
 from mnemiq.sql.schema import visible_schema
@@ -180,7 +181,7 @@ class Runtime:
             return
         snapshot, versions = load_current_snapshot(self.settings, self.con)
         if versions != self.loaded_versions:
-            if self._superset_mode and (refusal := _superset_source_refusal(snapshot, self.settings)) is not None:
+            if self._superset_mode and (refusal := superset_source_refusal(snapshot, self.settings)) is not None:
                 # Held to the rule boot holds the first snapshot to. The snapshot already serving stays, and this
                 # request is refused rather than answered from one that may hold sample values.
                 raise SnapshotMissing(refusal)
@@ -515,7 +516,7 @@ def _authz(settings: Settings) -> AuthzProvider:
     return FileAuthzProvider(settings.authz_path) if settings.authz_path else DenyAll()
 
 
-def _superset_source_refusal(snapshot: Snapshot, settings: Settings) -> str | None:
+def superset_source_refusal(snapshot: Snapshot, settings: Settings) -> str | None:
     """Why Superset mode will not serve `snapshot`, or None when it will.
 
     It serves only a snapshot enriched through Superset from the database and schema it is configured for, which its
@@ -1159,7 +1160,7 @@ def build_runtime(settings: Settings) -> Runtime:
     # Current version per source (shared pointer when a control DSN is set, else local) + snapshot.
     snapshot, loaded_versions = load_current_snapshot(settings, con)
     if superset:
-        if (refusal := _superset_source_refusal(snapshot, settings)) is not None:
+        if (refusal := superset_source_refusal(snapshot, settings)) is not None:
             raise SnapshotMissing(refusal)
         # Runs nothing: `source_adapter` would refuse in this mode, and each request brings its own adapter.
         adapter = NoSourceConnection(SUPERSET_DIALECT)
@@ -1202,6 +1203,11 @@ def build_runtime(settings: Settings) -> Runtime:
     loaded: dict[str, LoadedProfile] = {}
     for profile_name, profile in profiles.items():
         kit = build_components(profile.settings, adapter, con)
+        if superset:
+            # Superset mode harvests no values, so it serves none, whatever the store holds: a direct
+            # enrichment's values may be there, under this source id or another, and `ValueIndex`
+            # reads every row of the table.
+            kit = replace(kit, values=NoValueIndex())
         # Per-mode result verifier: sanity (free) in every mode, judge in `thinking` and `deep`; the
         # judge is built once and shared. MNEMIQ_VERIFY=0 forces off (byte-for-byte), =1 forces full.
         modes = modes_for(profile.settings)

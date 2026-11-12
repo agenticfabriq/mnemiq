@@ -28,7 +28,7 @@ import mnemiq.runtime as runtime_module
 from mnemiq.adapters.sqlite import SQLiteAdapter
 from mnemiq.cli import _cmd_enrich, _cmd_refresh
 from mnemiq.config import Settings
-from mnemiq.contract.semantic import Job
+from mnemiq.contract.semantic import CodeScheme, Job
 from mnemiq.enrichment.grounding import ground_codes
 from mnemiq.enrichment.pipeline import content_version, enrich_structural
 from mnemiq.ontology.records import Concept, ConceptScheme, OntologyRecords
@@ -36,9 +36,10 @@ from mnemiq.runtime import SnapshotMissing, build_runtime
 from mnemiq.sql.decide import decide
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
 from mnemiq.store.bootstrap import init_store
-from mnemiq.store.snapshot_store import current_version, load_snapshot
+from mnemiq.semantic.values import ValueIndex
+from mnemiq.store.snapshot_store import current_version, load_snapshot, save_snapshot
 from mnemiq.superset.adapter import TRANSPORT_MARGIN_S
-from mnemiq.superset.client import Bearer, DelegatedToken, SupersetMcp, SupersetUnavailable
+from mnemiq.superset.client import DEFAULT_TIMEOUT_S, Bearer, DelegatedToken, SupersetMcp, SupersetUnavailable
 from mnemiq.superset.executor import NoSourceConnection, superset_executor
 from mnemiq.superset.pg_catalog import CATALOGUE_SQL, PAGE_ROWS, PostgresCatalogue
 from mnemiq.superset.service import (
@@ -50,7 +51,7 @@ from mnemiq.superset.service import (
 from mnemiq.superset.settings import SUPERSET_SOURCE_JOB, SupersetConfigError
 from tests.superset_fake import FakeSuperset
 from tests.sweep.stub_model import StubModel
-from tests.test_superset_runtime import DATABASE_ID, SCHEMA, SOURCE_ID, _answer_rows, superset_deployment
+from tests.test_superset_runtime import PROFILES, DATABASE_ID, SCHEMA, SOURCE_ID, _answer_rows, superset_deployment
 
 # The service key, made for this run. Each test that reads it checks it never shows: in a message, a log line, a
 # repr, or a bearer on the ask path.
@@ -280,6 +281,32 @@ def test_refresh_reads_through_superset_and_reenriches_a_change(tmp_path, model,
     assert {call.authorization for call in fake.calls} == {f"Bearer {KEY}"}
 
 
+@pytest.mark.parametrize("stored", ["direct", "another-database", "another-schema"])
+def test_refresh_reenriches_a_snapshot_not_read_from_this_source(tmp_path, model, fake, key_file, no_direct_source,
+                                                                 capsys, stored):
+    """With the catalogue unchanged, refresh still re-enriches where the stored snapshot is not one this deployment's
+    server would serve: read over a direct connection, or through Superset from another database or schema."""
+    settings = _settings(tmp_path, model, fake)
+    assert _cmd_enrich(settings) == 0
+    enriched = _saved(settings)
+    jobs = [job for job in enriched.jobs if job.id != SUPERSET_SOURCE_JOB]
+    if stored == "another-database":
+        jobs.append(_source_job(database_id=DATABASE_ID + 1))
+    elif stored == "another-schema":
+        jobs.append(_source_job(schema="sales"))
+    other = enriched.model_copy(update={"jobs": jobs})
+    other.version = content_version(other)
+    assert other.version != enriched.version
+    save_snapshot(init_store(settings.store_path), other)
+    assert _saved(settings).version == other.version
+    capsys.readouterr()
+    assert _cmd_refresh(settings) == 0
+    out = capsys.readouterr().out
+    assert "added=[] changed=[] dropped=[]" in out and "nothing to refresh" not in out
+    assert [job for job in _saved(settings).jobs if job.id == SUPERSET_SOURCE_JOB] == [_source_job()]
+    assert no_direct_source == []
+
+
 # --- no values ------------------------------------------------------------------------------------------------------
 
 
@@ -330,6 +357,52 @@ def test_concept_schemes_bind_nothing_from_values(tmp_path, model, fake, key_fil
     assert not [value for value in CELL_TEXT if value in _saved(settings).model_dump_json()]
 
 
+def test_an_explicit_concept_binding_is_applied_without_reading_values(tmp_path, model, fake, key_file):
+    """An operator's explicit binding of a column to a concept scheme is taken on their word and reads nothing, so
+    enrichment through Superset applies it; only the binder's probe for bindings of its own reads values."""
+    records = tmp_path / "records.json"
+    records.write_text(OntologyRecords(
+        schemes=[ConceptScheme(id="region", label="Region", concepts=[
+            Concept(id=f"region:{code}", notation=code, pref_label=f"Region {code}") for code in ("N1", "S1")])],
+        bindings={"claim.region": "region"}).model_dump_json())
+    settings = _settings(tmp_path, model, fake, ontology_records_path=str(records))
+    assert _cmd_enrich(settings) == 0
+    schemes = {column.id: column.code_scheme for column in _saved(settings).columns if column.code_scheme}
+    assert schemes == {"claim.region": CodeScheme(id="region", label="Region")}
+    assert not [request["sql"] for request in _statements(fake) if _reads_values(request["sql"])]
+
+
+def test_the_binder_without_its_probe_reads_nothing(tmp_path):
+    """`bind_schemes(..., probe=False)` applies the explicit bindings and sends the source nothing, even given an
+    adapter; with its probe, the same call reads the values of each column it may bind."""
+    from mnemiq.ontology.binder import bind_schemes
+
+    path = tmp_path / "shop.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript("CREATE TABLE sale (id INTEGER PRIMARY KEY, city TEXT, region TEXT);"
+                      "INSERT INTO sale VALUES (1, 'NYC', 'N1'), (2, 'LA', 'S1'), (3, 'NYC', 'N1');")
+    con.commit()
+    con.close()
+    snapshot = enrich_structural(SQLiteAdapter(str(path)), "shop", harvest_values=False)
+    records = OntologyRecords(schemes=[ConceptScheme(id="region", label="Region", concepts=[
+        Concept(id=f"region:{code}", notation=code, pref_label=code) for code in ("N1", "S1")])],
+        bindings={"sale.city": "region"})
+
+    class Recording(SQLiteAdapter):
+        sent: list[str] = []
+
+        def execute(self, sql):
+            self.sent.append(sql)
+            return super().execute(sql)
+
+    adapter = Recording(str(path))
+    bound = bind_schemes(adapter, snapshot, records, probe=False)
+    assert {c.id: c.code_scheme.id for c in bound.columns if c.code_scheme} == {"sale.city": "region"}
+    assert adapter.sent == []
+    bind_schemes(adapter, snapshot, records)
+    assert [sql for sql in adapter.sent if "DISTINCT" in sql.upper()]  # the control: the probe reads values
+
+
 def test_relationship_inference_is_told_to_harvest_nothing(monkeypatch):
     """Key detection reads counts only. With harvesting off, every profile it asks for is told so as well; with it on,
     each is asked exactly as before."""
@@ -373,6 +446,27 @@ def test_a_value_index_left_by_a_direct_enrichment_is_cleared(tmp_path, model, f
     con.execute("INSERT INTO value_index VALUES (?, 'claim', 'region', 'Northgate')", [SOURCE_ID])
     assert _cmd_enrich(settings) == 0
     assert con.execute("SELECT count(*) FROM value_index WHERE source_id = ?", [SOURCE_ID]).fetchone() == (0,)
+
+
+def test_superset_mode_serves_no_value_index(tmp_path, model, fake, no_direct_source):
+    """Superset mode harvests no values, so it serves none, whatever the store holds: here, values a direct
+    enrichment left under another source id, which the index reads with no regard to source. Every agent of every
+    profile, the ask path's every read of the index, finds no column indexed and no value."""
+    settings = superset_deployment(tmp_path, model.url, fake.url, profiles=PROFILES)
+    con = init_store(settings.store_path)
+    con.execute("CREATE TABLE IF NOT EXISTS value_index (source_id TEXT, object_id TEXT, column_name TEXT, "
+                "value_text TEXT)")
+    con.execute("INSERT INTO value_index VALUES ('acme', 'wide', 'col_0', 'Northgate')")
+    con.close()
+    runtime = build_runtime(settings)
+    assert ValueIndex(runtime.con).nearest("wide", "col_0", "North") == ["Northgate"]  # the rows are there
+    agents = [agent for loaded in runtime.profiles.values() for agent in loaded.agents.values()]
+    assert len(runtime.profiles) == 2 and agents
+    for agent in agents:
+        assert not agent.values.has("wide", "col_0")
+        assert not agent.values.contains("wide", "col_0", "Northgate")
+        assert agent.values.nearest("wide", "col_0", "North") == []
+    assert no_direct_source == []
 
 
 def test_direct_enrichment_harvests_as_before(tmp_path):
@@ -498,20 +592,21 @@ def test_the_ask_path_never_forces_a_refresh_on_a_data_statement(tmp_path):
 
 def test_the_enrichment_deadlines(tmp_path, model, fake, key_file, monkeypatch):
     """Enrichment gives Superset 300 seconds a statement, the most `execute_sql` accepts, and waits that plus the
-    adapter's margin for each answer; the client's own deadline, which the backend check runs under, is no shorter, so
-    nothing undercuts a statement's."""
-    adapter = enrichment_adapter(_settings(tmp_path, model, fake), service_credential_from_env())
-    assert adapter.client._timeout_s >= 300 + TRANSPORT_MARGIN_S
-    deadlines: list[float | None] = []
+    adapter's margin for each answer; the client's own deadline is no shorter, so nothing undercuts a statement's. The
+    backend check is a metadata call, and waits only the client's default."""
+    deadlines: list[tuple[str, float | None]] = []
     real = SupersetMcp.call
 
     def recording(self, tool, request, *, timeout_s=None):
-        deadlines.append(timeout_s)
+        deadlines.append((tool, timeout_s))
         return real(self, tool, request, timeout_s=timeout_s)
 
     monkeypatch.setattr(SupersetMcp, "call", recording)
+    adapter = enrichment_adapter(_settings(tmp_path, model, fake), service_credential_from_env())
+    assert deadlines == [("get_database_info", DEFAULT_TIMEOUT_S)] and DEFAULT_TIMEOUT_S == 45
+    assert adapter.client._timeout_s >= 300 + TRANSPORT_MARGIN_S
     assert adapter.execute('SELECT count(*) FROM "claim"') == [(6,)]
-    assert deadlines == [300 + TRANSPORT_MARGIN_S]
+    assert deadlines[1:] == [("execute_sql", 300 + TRANSPORT_MARGIN_S)]
     assert _statements(fake)[-1]["timeout"] == 300
 
 

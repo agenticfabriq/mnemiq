@@ -108,6 +108,20 @@ def build_value_index(
     return len(rows)
 
 
+class NoValueIndex:
+    """The value index a deployment that harvests no values serves: no column is indexed, so value
+    grounding reads every literal as unknown, never as absent, as it does over an empty index."""
+
+    def has(self, object_id: str, column: str) -> bool:
+        return False
+
+    def contains(self, object_id: str, column: str, literal: str) -> bool:
+        return False
+
+    def nearest(self, object_id: str, column: str, literal: str, k: int = 8) -> list[str]:
+        return []
+
+
 class ValueIndex:
     """Read side of the value index. Resilient to a store built before value grounding: the
     table is ensured on construction, so an un-indexed store simply answers 'not indexed'."""

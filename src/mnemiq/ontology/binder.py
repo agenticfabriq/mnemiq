@@ -106,11 +106,15 @@ def _gate(column, values: list[str], scheme: ConceptScheme, notations: set[str],
 
 
 def bind_schemes(adapter, snapshot: Snapshot, records: OntologyRecords,
-                 sentinels: frozenset[str] = DEFAULT_SENTINELS) -> Snapshot:
+                 sentinels: frozenset[str] = DEFAULT_SENTINELS, *, probe: bool = True) -> Snapshot:
     """Attach a code scheme to each column that demonstrably draws from one.
 
     Explicit bindings are taken on the operator's word. Auto-binding is precision-first: when
     two schemes both fit, bind NEITHER -- the same rule the in-DB grounders use.
+
+    Explicit bindings read nothing from the source. Auto-binding probes each column's values, and
+    `probe=False` leaves it out, so the explicit bindings alone are applied and `adapter` is never
+    read.
     """
     by_scheme = {s.id: s for s in records.schemes}
     notations = {
@@ -134,7 +138,7 @@ def bind_schemes(adapter, snapshot: Snapshot, records: OntologyRecords,
     # No scheme, nothing a probe could match: without this, a glossary with no code systems still
     # cost one DISTINCT scan of the source per column -- on a production schema, a full scan of
     # every wide table, column by column, for no possible bind.
-    for column in snapshot.columns if records.schemes else ():
+    for column in snapshot.columns if records.schemes and probe else ():
         if column.id in bound or is_key_like(column.name) or is_sensitive_name(column.name):
             continue
         values = _observed(adapter, snapshot, column)

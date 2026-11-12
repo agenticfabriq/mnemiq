@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from mnemiq.superset.adapter import TRANSPORT_MARGIN_S, SupersetSqlAdapter
 from mnemiq.superset.client import (
+    DEFAULT_TIMEOUT_S,
     Bearer,
     SupersetMcp,
     SupersetRefusal,
@@ -97,7 +98,8 @@ def enrichment_adapter(settings: Settings, credential: ServiceKey) -> SupersetSq
 
     Every statement it sends asks Superset to run it afresh (`force_refresh`), so a re-enrich reads the source as it is
     now. Each is given `ENRICHMENT_TIMEOUT_S`, and the adapter adds its own margin for the transport; the client's own
-    deadline, which the backend check runs under, is no shorter, so it never cuts a statement's short.
+    deadline is no shorter, so it never cuts a statement's short. The backend check is a metadata call, and waits only
+    the client's default deadline.
 
     Before it returns, it asks Superset which backend the database is, and refuses anything but PostgreSQL. Refuses
     anything but a `ServiceKey`, and settings `check_superset_enrichment` refuses, before Superset is asked anything."""
@@ -119,7 +121,7 @@ def _require_postgres(client: SupersetMcp, database_id: int) -> None:
     it does not find, or one the caller may not see, with a `DatabaseError` (`error`, `error_type`) in place of the
     description. Whatever Superset said is logged, and the refusal says only mnemiq's sentence."""
     try:
-        info = client.call("get_database_info", {"identifier": database_id})
+        info = client.call("get_database_info", {"identifier": database_id}, timeout_s=DEFAULT_TIMEOUT_S)
     except SupersetRefusedCaller as exc:
         raise SupersetConfigError(f"Superset did not accept the service key the file {SERVICE_KEY_ENV} names: check "
                                   "that the key is current and that its user exists in Superset") from exc

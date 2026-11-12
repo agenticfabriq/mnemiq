@@ -15,7 +15,7 @@ from mnemiq.generate.correct import LLMCorrector
 from mnemiq.generate.generator import LLMGenerator
 from mnemiq.llm.client import LLMClient
 from mnemiq.semantic.fit import PromptFitter, fitter_for
-from mnemiq.semantic.values import ValueIndex
+from mnemiq.semantic.values import NoValueIndex, ValueIndex
 
 
 @dataclass(frozen=True)
@@ -24,7 +24,7 @@ class Components:
     generator: LLMGenerator
     synthesizer: LLMSynthesizer
     corrector: LLMCorrector
-    values: ValueIndex
+    values: ValueIndex | NoValueIndex
     selector: LLMSelector
     # Both doors fit the packet to the window with this one (M127), so the eval measures the
     # prompt the product sends.

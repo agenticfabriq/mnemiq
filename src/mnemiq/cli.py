@@ -469,6 +469,13 @@ def _cmd_enrich(settings: Settings) -> int:
     # precedence: ontology < correlated < lookup < certified < dictionary
     if not superset:
         snap = ground_codes(adapter, snap, dictionary=None, ontology=_onto)  # local grounding, no dict yet
+    elif _onto is not None:
+        from mnemiq.ontology.binder import bind_schemes
+
+        # The operator's explicit bindings, which read nothing: no adapter is given, and the
+        # binder's own probe, which reads each column's values, is left out.
+        snap = bind_schemes(None, snap, _onto, probe=False)
+        snap.version = content_version(snap)
     snap, _protected = apply_certified_set(snap, _certified_set)
     retriever = None
     if _onto is not None:
@@ -628,15 +635,27 @@ def _cmd_refresh(settings: Settings) -> int:
         return 1
     from mnemiq.adapters.scoped import TablesNotFound
 
+    snapshot = load_snapshot(con, version)
     try:
-        diff = catalog_diff(adapter, load_snapshot(con, version))
+        diff = catalog_diff(adapter, snapshot)
     except TablesNotFound as exc:
         print(str(exc), file=sys.stderr)
         return 1
     print(f"added={diff.added} changed={diff.changed} dropped={diff.dropped}")
-    if not diff.has_changes:
+    # In Superset mode a snapshot the server would not serve, by the check it boots with (read over
+    # a direct connection, or through Superset from another database or schema), is out of date
+    # however its catalogue compares.
+    unserved = False
+    if settings.superset_mode:
+        from mnemiq.runtime import superset_source_refusal
+
+        unserved = superset_source_refusal(snapshot, settings) is not None
+    if not diff.has_changes and not unserved:
         print("catalog unchanged -- nothing to refresh")
         return 0
+    if unserved:
+        print("the stored snapshot was not enriched through this deployment's Superset database and "
+              "schema -- enriching it again")
     rc = _cmd_enrich(settings)
     if rc == 0:
         rc = _cmd_build(settings)  # build publishes the new version when a control DSN is set
