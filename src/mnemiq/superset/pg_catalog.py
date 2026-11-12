@@ -130,22 +130,31 @@ class PostgresCatalogue:
     def _read(self, method: str) -> list[tuple]:
         """Every row of `method`'s statement, a page at a time, until a page holds fewer rows than it asked for.
 
-        A cut page is asked for again at the same offset with half as many rows, and the read goes on at that size: a
-        page that was too large once is likely to be again. A single row that is still cut raises `ResultCut`."""
+        A cut page is asked for again at the same offset with half as many rows, and the read goes on at that size
+        until the rows the cut page asked for have been read; then it goes back to that page's size, through each
+        level of halving in turn, so one wide row does not make every later page small. Each page starts at the rows
+        read so far, whatever its size, so none is skipped or repeated. A single row that is still cut raises
+        `ResultCut`."""
         statement = self.statement(method)
         rows: list[tuple] = []
         size = PAGE_ROWS
+        # For each page that was cut and not yet read through, innermost last: its size, and how many rows will have
+        # been read once its rows have.
+        windows: list[tuple[int, int]] = []
         while True:
             try:
                 page = self._rows(f"{statement} LIMIT {size} OFFSET {len(rows)}")
             except ResultCut:
                 if size == 1:
                     raise
+                windows.append((size, len(rows) + size))
                 size //= 2
                 continue
             rows.extend(page)
             if len(page) < size:
                 return rows
+            while windows and len(rows) >= windows[-1][1]:
+                size, _ = windows.pop()
 
 
 def _literal(text: str) -> str:

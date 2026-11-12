@@ -250,6 +250,24 @@ def test_a_page_past_the_first_is_cut_too():
     assert any(given is None and offset > 0 for _, offset, given in source.asks)
 
 
+def test_page_size_returns_after_a_cut_window():
+    """One wide view makes its page too large. Once the rows of the page that was cut have been read at the smaller
+    sizes, the read goes back to full pages, so one wide view early does not make every later page small; and every row
+    still arrives once, in order."""
+    views = [(f"v{i:04}", "SELECT 1" + (" " * 7900 if i == 520 else "")) for i in range(2345)]
+    source = CuttingSource(views, _over_characters(8000))
+    assert PostgresCatalogue(source, "sales").views() == [(name, body, "postgres") for name, body in views]
+    # The page at 500 was cut, so its window ran to 1000; every page asked from there on is a full one.
+    assert (PAGE_ROWS, 500, None) in source.asks
+    after = [limit for limit, offset, _ in source.asks if offset >= 2 * PAGE_ROWS]
+    assert after and set(after) == {PAGE_ROWS}
+    received = 0
+    for limit, offset, given in source.asks:
+        assert offset == received, "a row was skipped or repeated"
+        received += given or 0
+    assert received == len(views)
+
+
 def test_one_row_still_cut_raises():
     """A row Superset cuts on its own cannot be read whole, so the read raises rather than answer without it."""
     views = [("small", "SELECT 1"), ("huge", "SELECT " + "1 + " * 5000 + "1"), ("after", "SELECT 2")]
