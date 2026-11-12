@@ -61,6 +61,16 @@ class SupersetSqlAdapter:
         self._schema = schema
         self._timeout_s = timeout_s
 
+    @property
+    def database_id(self) -> int:
+        """The Superset database every statement runs on."""
+        return self._database_id
+
+    @property
+    def schema(self) -> str:
+        """The schema every statement runs in, spelled as Postgres stores it."""
+        return self._schema
+
     def execute_arrow(self, sql: str, timeout_s: float | None = None) -> pa.Table:
         return read_execute_response(self._execute_sql(sql, timeout_s))
 
