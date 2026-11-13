@@ -29,7 +29,15 @@ from typing import Any
 import anyio
 import uvicorn
 
-TOOLS = ("execute_sql", "list_datasets", "get_database_info")
+from mnemiq.superset.extension import EXTENSION_TOOLS, TOOL_PREFIX
+
+# Superset's own tools mnemiq calls, and every tool of the extension (the names come from `mnemiq.superset.extension`,
+# their one source).
+SUPERSET_TOOLS = ("execute_sql", "list_datasets", "get_database_info", "list_metrics", "get_dataset_info",
+                  "get_chart_info", "get_chart_data", "query_dataset", "list_charts", "list_dashboards",
+                  "generate_chart", "create_dataset", "create_virtual_dataset", "delete_chart",
+                  "remove_chart_from_dashboard")
+TOOLS = SUPERSET_TOOLS + tuple(TOOL_PREFIX + base for base in EXTENSION_TOOLS)
 
 # A handler answers one tool call: given the call's `request` and the Authorization header it arrived with, it returns
 # the payload, or an exception whose message becomes the error result's text.
@@ -73,13 +81,17 @@ class FakeSuperset:
     """`with FakeSuperset() as fake:` serves at `fake.url` until the block ends.
 
     `structured_output=False` sends each answer as JSON text only, as Superset does when its structured output is
-    off. `bare_errors=True` sends an error result's text without the `Error: ` Superset puts before it."""
+    off. `bare_errors=True` sends an error result's text without the `Error: ` Superset puts before it.
+    `extension=False` is a Superset without the extension: every `extensions.*` call answers as rc2 does for a tool it
+    does not have, with the text its `GlobalErrorHandlerMiddleware` (`superset/mcp_service/middleware.py`) puts in the
+    place of the not-found error, which names the tool and an error id and says nothing of a missing tool."""
 
-    def __init__(self, *, structured_output: bool = True, bare_errors: bool = False) -> None:
+    def __init__(self, *, structured_output: bool = True, bare_errors: bool = False, extension: bool = True) -> None:
         self.calls: list[Call] = []
         self.url: str | None = None
         self._structured = structured_output
         self._bare_errors = bare_errors
+        self._extension = extension
         self._handlers: dict[str, Handler] = {}
         self._refused: set[str] = set()
         self._http_failure: tuple[int, str] | None = None
@@ -125,8 +137,11 @@ class FakeSuperset:
         authorization = _authorization.get()
         self.calls.append(Call(tool, request, authorization))
         handler = self._handlers.get(tool)
-        if handler is None:
-            outcome: Any = RuntimeError(f"the fake has no reply for {tool}")
+        if not self._extension and tool.startswith("extensions."):
+            outcome: Any = RuntimeError(f"Internal error in {tool}: An unexpected error occurred. Error ID: 3f9c0a1b. "
+                                        "Please contact support if this persists.")
+        elif handler is None:
+            outcome = RuntimeError(f"the fake has no reply for {tool}")
         else:
             # In a worker thread, so a slow handler holds up only its own call.
             outcome = await anyio.to_thread.run_sync(handler, request, authorization)
