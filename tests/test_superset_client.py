@@ -180,11 +180,15 @@ def test_one_error_prefix_is_read_past_and_no_more(fake):
     assert exc.detail == f"Error: Error: {ROLE_DENIAL}"
 
 
-def test_unknown_tool_text_names_the_tool_search_setting(any_shape):
-    """The text Superset's MCP service sends for a tool it does not offer by name, read in either shape."""
+def test_unknown_tool_text_names_what_removes_a_tool(any_shape):
+    """The text Superset's MCP service sends for a tool it does not offer, read in either shape. Superset 7.0.0rc2
+    serves a tool called by name whether its tool search is on or not (measured live, on mcp 1.x and 2.x), so the
+    sentence names what does remove one: a Superset older than mnemiq needs, or `MCP_DISABLED_TOOLS`."""
     exc = _raised_for(any_shape, RuntimeError("Unknown tool: execute_sql"))
     assert type(exc) is SupersetToolError
-    assert 'MCP_TOOL_SEARCH_CONFIG["enabled"] = False' in str(exc)
+    assert str(exc) == ("Superset's MCP service does not offer execute_sql: Superset mode needs Superset 7.0.0rc2 or "
+                        "later, with execute_sql not named in MCP_DISABLED_TOOLS")
+    assert "MCP_TOOL_SEARCH_CONFIG" not in str(exc)
     assert exc.detail == any_shape.error_text("Unknown tool: execute_sql")
 
 
@@ -217,11 +221,11 @@ def test_supersets_own_words_are_logged_once_without_the_bearer(fake, caplog):
     assert bearer not in caplog.text
 
 
-def test_unknown_tool_names_the_tool_search_setting(fake):
+def test_an_unknown_tool_on_the_wire_names_what_removes_a_tool(fake):
     with pytest.raises(SupersetToolError) as caught:
-        _client(fake.url).call("search_tools_hid_this", {})
-    assert 'MCP_TOOL_SEARCH_CONFIG["enabled"] = False' in str(caught.value)
-    assert "search_tools_hid_this" in str(caught.value)
+        _client(fake.url).call("not_offered", {})
+    assert str(caught.value) == ("Superset's MCP service does not offer not_offered: Superset mode needs Superset "
+                                 "7.0.0rc2 or later, with not_offered not named in MCP_DISABLED_TOOLS")
     _holds_no_credential(caught.value)
 
 

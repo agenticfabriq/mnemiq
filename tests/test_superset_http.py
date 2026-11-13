@@ -349,8 +349,8 @@ def test_misconfigured_superset_is_503_naming_the_setting(server, fake, model):
     for method, path, body in [("post", "/v1/ask", {"question": "q"}), ("get", "/v1/schema", None)]:
         r = _call(client, method, path, body, _bearer(_token()))
         assert r.status_code == 503, r.text
-        assert "MCP_TOOL_SEARCH_CONFIG" in r.json()["detail"]
-    assert "MCP_TOOL_SEARCH_CONFIG" in _refusal_in_band(client, _token())["message"]
+        assert "MCP_DISABLED_TOOLS" in r.json()["detail"]
+    assert "MCP_DISABLED_TOOLS" in _refusal_in_band(client, _token())["message"]
     assert model.calls == 0
 
 

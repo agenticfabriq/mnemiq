@@ -42,9 +42,10 @@ _UNKNOWN_USER = "not found in Superset database"
 # How the error opens that Superset's response size guard raises for an answer too large to send and that it does not
 # cut instead (`format_size_limit_error` in `superset/mcp_service/utils/response_size_utils.py`).
 _TOO_LARGE = "Response too large:"
-# A tool the server does not serve: an MCP server built on the SDK answers "Unknown tool: <name>". The advice names
-# Superset's tool search (`MCP_TOOL_SEARCH_CONFIG` in `superset/mcp_service/mcp_config.py`, on by default), which
-# replaces the tool catalogue a client lists with a search tool and a call proxy.
+# A tool the server does not serve: an MCP server built on the SDK answers "Unknown tool: <name>". Superset's tool search
+# (`MCP_TOOL_SEARCH_CONFIG` in `superset/mcp_service/mcp_config.py`, on by default) hides tools from the catalogue a
+# client lists and still serves each one called by name, so it is not the cause; a Superset without the tool is, and
+# `MCP_DISABLED_TOOLS`, which removes a tool from the service.
 _UNKNOWN_TOOL = re.compile(r"unknown tool", re.IGNORECASE)
 # How long a call waits for Superset when neither the client nor the call says otherwise.
 DEFAULT_TIMEOUT_S = 45.0
@@ -327,8 +328,8 @@ def _tool_failure(tool: str, text: str) -> _SupersetFailure:
         return SupersetResponseTooLarge(f"Superset's answer to {tool} was larger than its MCP service will send; ask "
                                         "for less", detail=text)
     if _UNKNOWN_TOOL.search(message):
-        return SupersetToolError(f"Superset's MCP service does not offer {tool} by name; if its tool search is on, set "
-                                 'MCP_TOOL_SEARCH_CONFIG["enabled"] = False in superset_config.py', detail=text)
+        return SupersetToolError(f"Superset's MCP service does not offer {tool}: Superset mode needs Superset 7.0.0rc2 "
+                                 f"or later, with {tool} not named in MCP_DISABLED_TOOLS", detail=text)
     return SupersetToolError(f"Superset's {tool} tool failed", detail=text)
 
 

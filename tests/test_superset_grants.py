@@ -600,9 +600,10 @@ def test_a_generic_denial_is_not_told_about_roles():
 
 
 @pytest.mark.parametrize("on", ["probe", "list_datasets"])
-def test_tool_search_left_on_is_misconfigured(on):
-    """With Superset's tool search on, its tools are not offered by name; the message names the setting to change, so
-    nobody is told to request roles they may already hold."""
+def test_a_tool_superset_does_not_offer_is_misconfigured(on):
+    """A Superset that does not offer a tool mnemiq asks with (older than Superset mode needs, or with the tool in
+    `MCP_DISABLED_TOOLS`) is misconfigured; the message names what to change, so nobody is told to request roles they
+    may already hold."""
     with FakeSuperset() as fake:
         unknown = RuntimeError(f"Unknown tool: {'execute_sql' if on == 'probe' else 'list_datasets'}")
         fake.reply("execute_sql", lambda request, authorization: unknown if on == "probe" else _refused())
@@ -614,7 +615,7 @@ def test_tool_search_left_on_is_misconfigured(on):
     message = caught.value.message
     assert message == str(caught.value)
     assert message.startswith("Superset's MCP service is not set up as mnemiq needs")
-    assert 'MCP_TOOL_SEARCH_CONFIG["enabled"] = False' in message
+    assert "MCP_DISABLED_TOOLS" in message
     assert "Alpha" not in message
 
 
