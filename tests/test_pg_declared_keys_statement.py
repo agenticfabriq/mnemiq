@@ -91,6 +91,22 @@ def test_the_direct_adapter_sends_the_statement_the_superset_catalogue_sends(sch
     assert f"n.nspname = {pg_keys.quoted(schema)}" in direct
 
 
+def test_the_direct_adapter_orders_the_keys_it_reads_by_the_statements_key():
+    """Postgres orders the rows by the statement's key; DuckDB orders them again by the same columns, so the order a
+    composite key's columns come in, and the relationships made from them, rest on neither side keeping the other's.
+    The key's position is ordered by without being returned."""
+    con = _Recording()
+    _postgres_adapter("public", con).foreign_keys()
+    (sent,) = [sql for sql in con.sent if "pg_constraint" in sql]
+    head, tail = sent.rsplit(TAG, 1)
+    assert head.startswith("SELECT from_table, from_column, to_table, to_column, constraint_name FROM "), sent
+    assert tail == ") ORDER BY from_table, key_position, constraint_name", sent
+    assert DECLARED_KEYS.key == ("src.relname", "k.key_position", "con.conname")
+    assert "src.relname AS from_table" in DECLARED_KEYS.select
+    assert "k.key_position AS key_position" in DECLARED_KEYS.select
+    assert "con.conname AS constraint_name" in DECLARED_KEYS.select
+
+
 def test_the_direct_adapter_reads_the_schema_by_its_stored_name():
     """The configured schema is matched to a stored one as tables are, without regard to case and on DuckDB's side, the
     configured name a parameter there; the key statement names the schema as Postgres stores it, as the Superset

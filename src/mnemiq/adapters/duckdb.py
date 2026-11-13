@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 # The tag of the dollar-quoted string a statement is given to `postgres_query` in.
 _DOLLAR_TAG = "$q$"
 
+# The columns `DECLARED_KEYS` selects its key's expressions as, in the key's order: the declared keys
+# are ordered by them on DuckDB's side too, so the order of a composite key's columns, and of the
+# relationships made from them, does not rest on DuckDB keeping `postgres_query`'s row order.
+_DECLARED_KEYS_ORDER = "from_table, key_position, constraint_name"
+
 # Every schema name a Postgres database stores. The configured schema is matched against them on
 # DuckDB's side, without regard to case, as `introspect` and `list_columns` match it.
 _PG_SCHEMAS = "SELECT nspname FROM pg_catalog.pg_namespace"
@@ -341,7 +346,8 @@ class DuckDBAdapter:
             schema = self._stored_schema()
             rows = self._con.execute(
                 "SELECT from_table, from_column, to_table, to_column, constraint_name FROM "
-                f"{_postgres_query(self._catalog, DECLARED_KEYS.whole(schema))}"
+                f"{_postgres_query(self._catalog, DECLARED_KEYS.whole(schema))} "
+                f"ORDER BY {_DECLARED_KEYS_ORDER}"
             ).fetchall()
         except Exception as exc:  # noqa: BLE001 -- any failure: enrichment falls back to inference
             why = str(exc) if isinstance(exc, _SchemaUnresolved) else type(exc).__name__
