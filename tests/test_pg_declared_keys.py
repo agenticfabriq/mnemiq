@@ -5,7 +5,8 @@ drops when it is done: a single-column key, a composite key declared in another 
 between one pair of tables, two tables each declaring a key of one name, a key into another schema's table whose name
 `public` has too, a partitioned table that declares a key and is referenced by one, a second schema, `sales`, with keys
 of its own, a schema stored in mixed case, and two schemas whose names differ only in letter case. Without the variable
-every test here skips, naming it.
+each of those tests skips, naming it, or fails where MNEMIQ_TEST_PG_KEYS_REQUIRED is `1`, as in the CI job that runs
+them against a Postgres of its own. The tests of that switch need no server.
 
 Not marked `integration`: the root conftest seeds ACME into MNEMIQ_PG_DSN whenever an integration test is collected and
 both MNEMIQ_PG_DSN and MNEMIQ_ACME_DATA_DIR are set, and these tests need nothing of ACME's.
@@ -15,8 +16,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
 from collections.abc import Iterator
+from pathlib import Path
 
 import psycopg
 import pytest
@@ -29,6 +32,7 @@ from mnemiq.config import SourceSpec
 from mnemiq.enrichment.joins import relationships_from_foreign_keys
 
 DSN_VARIABLE = "MNEMIQ_TEST_PG_KEYS_DSN"
+REQUIRED_VARIABLE = "MNEMIQ_TEST_PG_KEYS_REQUIRED"
 
 # The objects each test database holds. Every key is named, so a test can say which constraint a row belongs to.
 _DDL = """
@@ -113,10 +117,19 @@ SALES_KEYS = [("deal", "region_id", "region", "id", "deal_region_fk")]
 
 
 def _server_dsn() -> str:
-    """The Postgres server the tests make their database on, from MNEMIQ_TEST_PG_KEYS_DSN. Without it, they skip."""
+    """The Postgres server the tests make their database on, from MNEMIQ_TEST_PG_KEYS_DSN. Without it they skip, unless
+    MNEMIQ_TEST_PG_KEYS_REQUIRED is `1`, as in the CI job that gives them a server: there they fail instead, so that job
+    cannot pass by skipping them. A switch set to anything but `1` or `0` fails too, rather than reading as unset."""
+    required = os.environ.get(REQUIRED_VARIABLE, "").strip()
+    if required not in ("", "0", "1"):
+        pytest.fail(f"{REQUIRED_VARIABLE} is {required!r}: set it to 1 to make these tests fail rather than skip "
+                    f"without {DSN_VARIABLE}, or to 0 or nothing to let them skip", pytrace=False)
     dsn = os.environ.get(DSN_VARIABLE, "").strip()
     if not dsn:
-        pytest.skip(f"{DSN_VARIABLE} is not set: these tests need a Postgres server to make their own database on")
+        reason = f"{DSN_VARIABLE} is not set: these tests need a Postgres server to make their own database on"
+        if required == "1":
+            pytest.fail(f"{reason}, and {REQUIRED_VARIABLE}=1 says they must run here, not skip", pytrace=False)
+        pytest.skip(reason)
     return dsn
 
 
@@ -173,6 +186,108 @@ def _keys(dsn: str, schema: str = "") -> list[tuple[str, str, str, str, str]]:
 def _of(keys: list[tuple], *tables: str) -> list[tuple]:
     """The rows of `keys` whose source or target table is one of `tables`."""
     return [key for key in keys if key[0] in tables or key[2] in tables]
+
+
+# The gate itself, with no server. Its outcome is caught rather than let through: a test of whether the gate skips must
+# not be one the gate can skip. The switch is spelled as the CI job that runs this module sets it.
+SWITCH = "MNEMIQ_TEST_PG_KEYS_REQUIRED"
+
+
+def _gate(monkeypatch, dsn: str | None, switch: str | None) -> tuple[str, str]:
+    """What `_server_dsn` does with `dsn` and `switch` as the environment's values (None: unset): `returned`, `skipped`
+    or `failed`, with the DSN it returned or the reason it gave."""
+    for name, value in ((DSN_VARIABLE, dsn), (SWITCH, switch)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    try:
+        return "returned", _server_dsn()
+    except pytest.skip.Exception as exc:
+        return "skipped", str(exc)
+    except pytest.fail.Exception as exc:
+        return "failed", str(exc)
+
+
+@pytest.mark.parametrize("switch", [None, "", "0"])
+def test_without_the_dsn_and_without_the_switch_the_tests_skip_naming_the_dsn(monkeypatch, switch):
+    outcome, reason = _gate(monkeypatch, None, switch)
+    assert outcome == "skipped", reason
+    assert DSN_VARIABLE in reason
+
+
+def test_with_the_switch_and_without_the_dsn_the_tests_fail_naming_both(monkeypatch):
+    """The CI job that runs this module sets the switch, so it cannot pass by skipping every test here."""
+    outcome, reason = _gate(monkeypatch, None, "1")
+    assert outcome == "failed", reason
+    assert DSN_VARIABLE in reason and SWITCH in reason, reason
+
+
+@pytest.mark.parametrize("switch", [None, "1"])
+def test_with_the_dsn_the_tests_run_whatever_the_switch(monkeypatch, switch):
+    assert _gate(monkeypatch, "postgresql://keys@127.0.0.1/postgres", switch) == (
+        "returned", "postgresql://keys@127.0.0.1/postgres")
+
+
+@pytest.mark.parametrize("dsn", [None, "postgresql://keys@127.0.0.1/postgres"])
+@pytest.mark.parametrize("switch", ["true", "yes", "on"])
+def test_a_switch_set_to_anything_but_1_or_0_fails_naming_it(monkeypatch, dsn, switch):
+    """`true` is what an unquoted YAML `true` becomes in a workflow's environment. Read as unset, it would let the job
+    pass by skipping; it fails instead, with or without the DSN, so the mistake shows on the run that makes it."""
+    outcome, reason = _gate(monkeypatch, dsn, switch)
+    assert outcome == "failed", reason
+    assert SWITCH in reason and repr(switch) in reason, reason
+
+
+# The workflow that gives these tests a server. Read as text: no YAML parser is a dependency of the `dev` extra.
+WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "postgres-keys.yml"
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _scalar(raw: str) -> str:
+    """A plain or quoted YAML scalar's text, without a trailing comment."""
+    quoted = re.match(r"""(["'])(.*?)\1""", raw)
+    return quoted.group(2) if quoted else raw.split(" #", 1)[0].strip()
+
+
+def _key_step_env(text: str) -> dict[str, str]:
+    """The `env` of the one step in `text` whose `- run:` line runs pytest on this module, name to value. Read by
+    indentation, as YAML nests it: the step is every line indented past its dash, its `env:` is the step's own key, and
+    the variables are the lines indented past that. Blank lines and full-line comments are passed over."""
+    lines = text.splitlines()
+    module = f"tests/{Path(__file__).name}"
+    starts = [i for i, line in enumerate(lines)
+              if line.lstrip().startswith("- run:") and {"pytest", module} <= set(line.split())]
+    assert len(starts) == 1, f"expected one step running pytest on {module} in {WORKFLOW.name}, found {len(starts)}"
+    dash = _indent(lines[starts[0]])
+    body = []
+    for line in lines[starts[0] + 1:]:
+        if line.strip() and not line.lstrip().startswith("#"):
+            if _indent(line) <= dash:
+                break
+            body.append(line)
+    envs = [i for i, line in enumerate(body) if line.strip() == "env:" and _indent(line) == dash + 2]
+    assert len(envs) == 1, f"the step running {module} has no env of its own in {WORKFLOW.name}"
+    env = {}
+    for line in body[envs[0] + 1:]:
+        if _indent(line) <= dash + 2:
+            break
+        name, _, value = line.strip().partition(":")
+        env[name] = _scalar(value.strip())
+    return env
+
+
+def test_the_ci_workflow_sets_what_the_gate_reads():
+    """The job that gives these tests a server sets the DSN and the switch under the names `_server_dsn` reads, the
+    switch to `1`. A line dropped, or renamed on one side only, would leave the gate not reading what the job sets: the
+    tests would fail there for want of a DSN set under another name, or, with the switch gone too, skip, and the job
+    pass."""
+    env = _key_step_env(WORKFLOW.read_text())
+    assert env.get(DSN_VARIABLE), f"{WORKFLOW.name} does not set {DSN_VARIABLE} for the key tests: {env}"
+    assert env.get(REQUIRED_VARIABLE) == "1", f"{WORKFLOW.name} does not set {REQUIRED_VARIABLE} to 1: {env}"
 
 
 @pytest.mark.usefixtures("no_superset_mode")

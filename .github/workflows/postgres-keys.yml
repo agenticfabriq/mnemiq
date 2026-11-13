@@ -1,0 +1,61 @@
+name: postgres-keys
+# Its own workflow, not a job in ci.yml, for the reason mcp-2x is: `test_ci_runs_what_it_claims`
+# replays ci.yml's one pytest invocation, and a second would make that ambiguous.
+on:
+  # ci.yml's events, for ci.yml's reasons: see the comment on its `on`.
+  push:
+    branches: [main]
+  pull_request:
+# A workflow inherits no floor from another file, so this one declares ci.yml's.
+permissions:
+  contents: read
+jobs:
+  # The tests that read a Postgres source's declared foreign keys from a real Postgres. They need
+  # a server to make their own database on, and ci.yml's `unit` gives them none, so there they
+  # skipped silently and a green build said nothing about the key read. Here they get a Postgres
+  # of their own, and MNEMIQ_TEST_PG_KEYS_REQUIRED turns a missing DSN into a failure, so this job
+  # cannot pass by skipping them. The database-free tests of the same read run beside them -- the
+  # statement's own, and the joins built from its rows -- so the read is covered from the SQL to
+  # the relationships in one place. `unit` still collects all three files; its selection is
+  # unchanged.
+  #
+  # From the network it needs what `unit` needs (the actions, Python packages through uv) and two
+  # things more: the `postgres:16` image, from Docker Hub, and DuckDB's `postgres` extension,
+  # which the adapter INSTALLs from extensions.duckdb.org on its first connection, as it does on
+  # any connected machine where local-only is off.
+  postgres-keys:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          # No password, so nothing to keep secret, and a fork's pull request -- which receives no
+          # secrets -- runs this job exactly as a branch here does. The server lives as long as the
+          # job and holds nothing but the databases the tests make and drop.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        # Over TCP, not the socket: on its first start the image initialises through a temporary
+        # server that listens on the socket alone, and a socket check passes against it just
+        # before it stops. The tests connect over TCP, so TCP is what must be ready.
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      # `dev` alone, for pytest: the three files import nothing else outside the core
+      # dependencies, which carry psycopg and duckdb.
+      - run: uv sync --extra dev
+      # `-ra`, not `-rs`: an explicit `-r` replaces pytest's default `fE`, and a summary that
+      # lists skips but drops failures and errors would hide the lines this job exists to show.
+      - run: uv run pytest -q -ra tests/test_pg_declared_keys.py tests/test_pg_declared_keys_statement.py tests/test_joins.py
+        # tests/test_pg_declared_keys.py reads these two lines, by the names its gate reads, and
+        # fails in `unit` if either goes missing or is renamed on one side only.
+        env:
+          MNEMIQ_TEST_PG_KEYS_DSN: postgresql://postgres@127.0.0.1:5432/postgres
+          # The tests read `1`, `0` or nothing here and fail on anything else, so a `true` fails the
+          # job rather than reading as unset and letting it pass by skipping.
+          MNEMIQ_TEST_PG_KEYS_REQUIRED: "1"
