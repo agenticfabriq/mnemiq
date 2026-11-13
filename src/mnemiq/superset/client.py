@@ -86,8 +86,10 @@ class SupersetUnavailable(_SupersetFailure):
 
 
 class SupersetCallTimedOut(SupersetUnavailable):
-    """The call's deadline passed after the tool call was sent and before its answer came: Superset was reached and
-    took the call, and what the tool does took longer than the call allowed. Superset may still be doing it.
+    """The call's deadline passed after Superset took the tool call and before it answered: its response to the call
+    had started and its result had not come. What the tool does took longer than the call allowed, and Superset may
+    still be doing it. A deadline that passes before Superset takes the call, or after its result is in, is
+    `SupersetUnavailable`.
 
     A reader that knows what the tool was doing may read this more closely than as an outage: Superset's own time limit
     on a statement takes effect only once the database call returns (`SigalrmTimeout` in `superset/utils/core.py`), so
@@ -185,7 +187,6 @@ class SupersetMcp:
                     async with ClientSession(read, write, message_handler=on_message) as session:
                         with abandon:
                             await session.initialize()
-                            exchange.call_sent = True
                             return await session.call_tool(tool, {"request": request})
         except Exception as exc:
             exchange.error = exchange.error or exc
@@ -203,12 +204,21 @@ class SupersetMcp:
 
         client = create_mcp_http_client(headers={"Authorization": f"Bearer {self._credential.value}"})
 
+        async def sent(request) -> None:
+            # The SDK sends a session's requests one after another, so a request sent after the tool call means the
+            # call's result is in: the `tools/list` the SDK sends to read the tool's output schema, say.
+            if exchange.call_taken and _jsonrpc_request(request) not in (None, "tools/call"):
+                exchange.call_answered = True
+
         async def record(response) -> None:
             exchange.statuses.append(response.status_code)
+            # Superset starts its answer to a tool call (an event stream) as it takes the call, before the tool runs.
+            if _jsonrpc_request(response.request) == "tools/call" and 200 <= response.status_code < 300:
+                exchange.call_taken = True
 
         # mcp 2.x turns an HTTP error into a JSON-RPC error that no longer says which status it was, so the client
         # reads the status of each response itself.
-        client.event_hooks = {"request": [], "response": [record]}
+        client.event_hooks = {"request": [sent], "response": [record]}
         return client
 
     def _failure(self, tool: str, exchange: _Exchange) -> _SupersetFailure:
@@ -229,8 +239,9 @@ class SupersetMcp:
         if status is not None and not 200 <= status < 300:
             return SupersetUnavailable(f"Superset's MCP service answered HTTP {status}", detail=detail)
         if exchange.timed_out:
-            # Once the tool call was sent, Superset had taken it: the time ran out in the tool, not in reaching Superset.
-            late = SupersetCallTimedOut if exchange.call_sent else SupersetUnavailable
+            # Superset had taken the tool call and not yet answered it: the time ran out in the tool, not in reaching
+            # Superset or in what the SDK asks after the answer.
+            late = SupersetCallTimedOut if exchange.call_taken and not exchange.call_answered else SupersetUnavailable
             return late(f"Superset's MCP service did not answer {tool} within {_seconds(exchange.deadline_s)}",
                         detail=detail)
         if exchange.statuses:  # it answered something: an unreadable answer, or a connection lost mid-call
@@ -241,11 +252,13 @@ class SupersetMcp:
 @dataclass
 class _Exchange:
     """One call's deadline, and what the call observed beside its result: each HTTP response's status in order,
-    whether the tool call itself was sent, whether time ran out, and the exception that ended it, if one did."""
+    whether Superset took the tool call (its response to the call had started) and whether it then answered it (a
+    later request was sent), whether time ran out, and the exception that ended it, if one did."""
 
     deadline_s: float = DEFAULT_TIMEOUT_S
     statuses: list[int] = field(default_factory=list)
-    call_sent: bool = False
+    call_taken: bool = False
+    call_answered: bool = False
     timed_out: bool = False
     error: Exception | None = None
 
@@ -308,6 +321,16 @@ def _log(tool: str, failure: _SupersetFailure) -> None:
     """Log what Superset or the transport said about a failed call of `tool`, beside mnemiq's sentence for it: the
     exception's message, which is all that reaches the model and the person asking, says only the sentence."""
     logger.warning("Superset's MCP service: %s failed (%s): %s", tool, failure, failure.detail or "no detail")
+
+
+def _jsonrpc_request(request) -> str | None:
+    """The JSON-RPC method an HTTP request carries when it is a request (it has an id), else None: a notification, a
+    body that is not JSON, and a request with no body read as None."""
+    try:
+        message = json.loads(request.content)
+    except Exception:  # noqa: BLE001 -- a body this cannot read is not a tool call
+        return None
+    return message.get("method") if isinstance(message, dict) and "id" in message else None
 
 
 def _first_text(result) -> str:

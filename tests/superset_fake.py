@@ -84,6 +84,7 @@ class FakeSuperset:
         self._refused: set[str] = set()
         self._http_failure: tuple[int, str] | None = None
         self._close_streams = False
+        self._held: dict[str, float] = {}
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
 
@@ -109,6 +110,11 @@ class FakeSuperset:
     def close_stream_before_result(self) -> None:
         """Answer every later tool call with an event stream that ends before it carries the call's result."""
         self._close_streams = True
+
+    def hold(self, method: str, seconds: float) -> None:
+        """Hold every later request of this JSON-RPC method (`tools/call`, `tools/list`) for `seconds` before the
+        server sees it, so no response to it starts until then: a server slow to take a request at all."""
+        self._held[method] = seconds
 
     async def _answer(self, tool: str, request: dict):
         from mcp.types import CallToolResult, TextContent
@@ -193,9 +199,12 @@ class _Transport:
                                                        "error_description": "Authentication required"},
                            headers={"WWW-Authenticate": 'Bearer error="invalid_token"'})
             return
-        if self.fake._close_streams and scope.get("method") == "POST":
+        if (self.fake._close_streams or self.fake._held) and scope.get("method") == "POST":
             body, receive = await _buffered(receive)
-            if _jsonrpc_method(body) == "tools/call":
+            method = _jsonrpc_method(body)
+            if method in self.fake._held:
+                await anyio.sleep(self.fake._held[method])
+            if self.fake._close_streams and method == "tools/call":
                 await _send(send, 200, b"text/event-stream", b"")
                 return
         token = _authorization.set(authorization)

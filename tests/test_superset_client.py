@@ -340,6 +340,21 @@ def test_a_deadline_that_passes_while_the_tool_runs_is_a_timed_out_call(fake):
     _holds_no_credential(caught.value)
 
 
+@pytest.mark.parametrize("held", ["tools/call", "tools/list"])
+def test_a_deadline_that_passes_outside_the_tool_is_not_a_timed_out_call(fake, held):
+    """Only a deadline that passes while Superset is answering the tool call is a timed-out call. Held before the
+    server takes the tool call (no response to it has started), the time ran out reaching Superset, not in the tool.
+    Held at the `tools/list` the SDK sends once the call's result is in (to read the tool's output schema), the tool
+    had already answered."""
+    fake.reply("execute_sql", lambda request, authorization: PAYLOAD)
+    fake.hold(held, 3)
+    with pytest.raises(SupersetUnavailable) as caught:
+        _client(fake.url, timeout_s=1).call("execute_sql", REQUEST)
+    assert not isinstance(caught.value, SupersetCallTimedOut)
+    assert str(caught.value) == "Superset's MCP service did not answer execute_sql within 1 second"
+    assert [call.tool for call in fake.calls] == (["execute_sql"] if held == "tools/list" else [])
+
+
 def test_a_deadline_that_passes_before_the_call_is_sent_is_not_a_timed_out_call():
     """A server that takes the connection and never answers holds the call before the tool call is sent: that is
     Superset not answering, never a tool that ran long."""
