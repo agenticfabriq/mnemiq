@@ -12,6 +12,7 @@ Nothing here sends anything. Every number a chart shows is formatted from the ki
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -115,13 +116,19 @@ def _kind(ref: MeasureRef) -> MeasureKind:
     return ref.kind if isinstance(ref, SavedRef) else ref.measure.kind
 
 
-def _currency(ref: MeasureRef, saved: dict[str, SavedMetric]) -> str | None:
-    """The ISO code a measure shows its currency in: its own, or the saved metric's when that says one."""
+_ISO = re.compile(r"^[A-Z]{3}$")
+
+
+def _currency(ref: MeasureRef, saved: dict[str, SavedMetric], deployment: str) -> str | None:
+    """The ISO code a currency measure shows its currency in: its own, or a reused saved metric's own when that is an
+    ISO code, else the deployment currency (decision 8). A measure of another kind has none."""
+    if _kind(ref) is not MeasureKind.CURRENCY:
+        return None
     if isinstance(ref, WrittenRef):
-        return ref.measure.currency
+        return ref.measure.currency or deployment
     held = saved.get(ref.name)
-    currency = held.currency if held is not None else None
-    return currency.get("symbol") if isinstance(currency, dict) else None
+    own = held.currency.get("symbol") if held is not None and isinstance(held.currency, dict) else None
+    return own if isinstance(own, str) and _ISO.match(own) else deployment
 
 
 def _axis_refusal(refs: tuple[MeasureRef, ...], axis: str) -> str | None:
@@ -199,9 +206,9 @@ def _label(ref: MeasureRef, measures: dict[str, Measure]) -> str:
     return held.name if isinstance(held, SavedRef) else held.label
 
 
-def _format(refs: tuple[MeasureRef, ...], saved: dict[str, SavedMetric]) -> tuple[str, dict | None]:
+def _format(refs: tuple[MeasureRef, ...], saved: dict[str, SavedMetric], deployment: str) -> tuple[str, dict | None]:
     """The d3 format and currency of the first measure in `refs`; `plan_refusal` has made the rest agree."""
-    return display_format(_kind(refs[0]), _currency(refs[0], saved))
+    return display_format(_kind(refs[0]), _currency(refs[0], saved, deployment))
 
 
 def _filter(item: Filter) -> dict:
@@ -228,7 +235,7 @@ def _with_currency(config: dict, key: str, currency: dict | None) -> None:
         config[key] = currency
 
 
-def _config(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, SavedMetric]) -> dict:
+def _config(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, SavedMetric], deployment: str) -> dict:
     family, refs, dims = spec.family, spec.measures, list(spec.dimensions)
     columns = [_column(ref, measures) for ref in refs]
     config: dict = {}
@@ -242,7 +249,7 @@ def _config(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, Save
             config["group_by"] = _cols(rest)
         if spec.time_grain:
             config["time_grain"] = spec.time_grain
-        fmt, currency = _format(refs, saved)
+        fmt, currency = _format(refs, saved, deployment)
         config["y_axis"] = {"format": fmt}
         _with_currency(config, "currency_format", currency)
     elif family is Family.TABLE:
@@ -253,11 +260,11 @@ def _config(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, Save
             config["column_config"] = formats
     elif family is Family.PIE:
         config = {"chart_type": "pie", "dimension": {"name": dims[0]}, "metric": columns[0]}
-        config["number_format"], currency = _format(refs, saved)
+        config["number_format"], currency = _format(refs, saved, deployment)
         _with_currency(config, "currency_format", currency)
     elif family is Family.BIG_NUMBER:
         config = {"chart_type": "big_number", "metric": columns[0], "show_trendline": False}
-        config["y_axis_format"], currency = _format(refs, saved)
+        config["y_axis_format"], currency = _format(refs, saved, deployment)
         _with_currency(config, "currency_format", currency)
         if spec.time_grain:
             config["time_grain"] = spec.time_grain
@@ -265,7 +272,7 @@ def _config(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, Save
         config = {"chart_type": "gauge", "metric": columns[0]}
         if dims:
             config["groupby"] = _cols(dims)
-        config["number_format"], currency = _format(refs, saved)
+        config["number_format"], currency = _format(refs, saved, deployment)
         _with_currency(config, "currency_format", currency)
     elif family is Family.HISTOGRAM:
         config = {"chart_type": "histogram", "column": {"name": dims[0]}}
@@ -277,7 +284,7 @@ def _config(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, Save
         config = {"chart_type": "box_plot", "metrics": columns, "distribute_across": _cols(across)}
         if split:
             config["dimensions"] = _cols(split)
-        config["number_format"] = _format(refs, saved)[0]
+        config["number_format"] = _format(refs, saved, deployment)[0]
     elif family in (Family.PIVOT, Family.INTERACTIVE_PIVOT):
         config = {"chart_type": "pivot_table" if family is Family.PIVOT else "interactive_pivot",
                   "rows": _cols(dims[:1]), "columns": _cols(dims[1:]), "metrics": columns}
@@ -285,7 +292,7 @@ def _config(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, Save
             del config["columns"]
         if family is Family.INTERACTIVE_PIVOT and spec.time_grain:
             config["time_grain"] = spec.time_grain
-        config["value_format"], currency = _format(refs, saved)
+        config["value_format"], currency = _format(refs, saved, deployment)
         _with_currency(config, "currency_format", currency)
     elif family is Family.TREEMAP:
         config = {"chart_type": "treemap_v2", "groupby": _cols(dims), "metric": columns[0]}
@@ -297,7 +304,7 @@ def _config(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, Save
             config["breakdown"] = {"name": breakdown[0]}
         if spec.time_grain:
             config["time_grain"] = spec.time_grain
-        config["y_axis_format"], currency = _format(refs, saved)
+        config["y_axis_format"], currency = _format(refs, saved, deployment)
         _with_currency(config, "currency_format", currency)
     elif family is Family.MIXED:
         config = {"chart_type": "mixed_timeseries", "x": {"name": spec.time_column}, "y": columns[:1],
@@ -307,10 +314,10 @@ def _config(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, Save
             config["group_by_secondary"] = _cols(dims)
         if spec.time_grain:
             config["time_grain"] = spec.time_grain
-        fmt, currency = _format(refs[:1], saved)
+        fmt, currency = _format(refs[:1], saved, deployment)
         config["y_axis"] = {"format": fmt}
         _with_currency(config, "currency_format", currency)
-        fmt, currency = _format(refs[1:], saved)
+        fmt, currency = _format(refs[1:], saved, deployment)
         config["y_axis_secondary"] = {"format": fmt}
         _with_currency(config, "currency_format_secondary", currency)
     elif family is Family.HANDLEBARS:
@@ -323,35 +330,37 @@ def _config(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, Save
     return _shared(spec, config)
 
 
-def generate_chart_request(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, SavedMetric]) -> dict:
+def generate_chart_request(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, SavedMetric], *,
+                           currency: str) -> dict:
     """The request for MCP's `generate_chart` that saves `spec` as a chart: `save_chart` on and no preview, since the
     chart is read where it is saved. `measures` holds the written measures by name, and wins over the one a
     `WrittenRef` carries; `saved` holds the reused saved metrics by name. The caller has passed `plan_refusal`."""
     if spec.family in EXTENSION_FAMILIES:
         raise ValueError(f"{spec.family.name.lower()} is not an MCP chart type; build it with extension_chart_request")
-    return {"dataset_id": spec.dataset_id, "config": _config(spec, measures, saved), "chart_name": spec.title,
+    return {"dataset_id": spec.dataset_id, "config": _config(spec, measures, saved, currency), "chart_name": spec.title,
             "save_chart": True, "generate_preview": False}
 
 
-def owed_format_params(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, SavedMetric]) -> dict:
+def owed_format_params(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, SavedMetric], *,
+                       currency: str) -> dict:
     """The top-level `params` keys to set after the chart is created, for a format rc2's renderers read and MCP's
     models cannot send: a table's per-column `currencyFormat` (`TableColumnConfig` has only `d3NumberFormat`) and a
     treemap's `number_format` and `currency_format` (`TreemapChartConfig` has no format field). Empty when the request
     already carries the measure's whole format. The table's value is the whole `column_config`, every column the request
     set included, since a patch replaces a top-level key. Histogram and handlebars have no metric format key at all, so
     they owe nothing."""
-    refs = spec.measures
+    refs, deployment = spec.measures, currency
     if spec.family is Family.TABLE:
-        if not any(_kind(ref) is MeasureKind.CURRENCY and _currency(ref, saved) for ref in refs):
+        if not any(_kind(ref) is MeasureKind.CURRENCY and _currency(ref, saved, deployment) for ref in refs):
             return {}
         config = {}
         for ref in refs:
-            fmt, currency = display_format(_kind(ref), _currency(ref, saved))
+            fmt, currency = display_format(_kind(ref), _currency(ref, saved, deployment))
             config[_label(ref, measures)] = {"d3NumberFormat": fmt, **({"currencyFormat": currency} if currency else {})}
         return {"column_config": config}
     if spec.family is Family.TREEMAP:
-        fmt, currency = _format(refs, saved)
-        return {"number_format": fmt, **({"currency_format": currency} if currency else {})}
+        fmt, shown = _format(refs, saved, deployment)
+        return {"number_format": fmt, **({"currency_format": shown} if shown else {})}
     return {}
 
 
@@ -377,7 +386,8 @@ def _form_metric(ref: MeasureRef, measures: dict[str, Measure]):
     return {"expressionType": "SQL", "sqlExpression": held.expression, "label": held.label}
 
 
-def extension_chart_request(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, SavedMetric]) -> dict:
+def extension_chart_request(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, SavedMetric], *,
+                            currency: str) -> dict:
     """The request for the extension's `create_chart` for a funnel or a sankey: the minimal `form_data` their plugins
     read. A sankey has no number format control, so it carries none."""
     if spec.family not in EXTENSION_FAMILIES:
@@ -386,8 +396,8 @@ def extension_chart_request(spec: ChartSpec, measures: dict[str, Measure], saved
                     "metric": _form_metric(spec.measures[0], measures)}
     if spec.family is Family.FUNNEL:
         params["groupby"] = list(spec.dimensions)
-        params["number_format"], currency = _format(spec.measures, saved)
-        _with_currency(params, "currency_format", currency)
+        params["number_format"], shown = _format(spec.measures, saved, currency)
+        _with_currency(params, "currency_format", shown)
     else:
         params["source"], params["target"] = spec.source, spec.target
     if spec.filters:

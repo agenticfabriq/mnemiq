@@ -37,7 +37,7 @@ def _written(*measures: Measure) -> dict[str, Measure]:
 
 
 def _build(spec: ChartSpec, measures=None, saved=None) -> dict:
-    return generate_chart_request(spec, measures or {}, saved or {})
+    return generate_chart_request(spec, measures or {}, saved or {}, currency="USD")
 
 
 WRITTEN_COLUMN = {"sql_expression": "SUM(amount)", "label": "Revenue"}
@@ -176,7 +176,7 @@ def test_filters_use_the_filter_config_fields():
 
 def test_funnel_and_sankey_go_to_the_extension():
     funnel = _spec(Family.FUNNEL, dimensions=("stage",))
-    request = extension_chart_request(funnel, {}, {})
+    request = extension_chart_request(funnel, {}, {}, currency="USD")
     assert request["viz_type"] == "funnel" and request["dataset_id"] == 7 and request["slice_name"] == "A chart"
     params = request["params"]
     assert params["viz_type"] == "funnel" and params["datasource"] == "7__table"
@@ -186,7 +186,7 @@ def test_funnel_and_sankey_go_to_the_extension():
 
     sankey = _spec(Family.SANKEY, measures=[WrittenRef(_measure("orders", K.COUNT, expression="COUNT(*)"))],
                    dimensions=(), source="origin", target="destination")
-    params = extension_chart_request(sankey, {}, {})["params"]
+    params = extension_chart_request(sankey, {}, {}, currency="USD")["params"]
     assert params["viz_type"] == "sankey_v2" and params["datasource"] == "7__table"
     assert (params["source"], params["target"]) == ("origin", "destination")
     assert params["metric"]["label"] == "Orders"
@@ -195,14 +195,14 @@ def test_funnel_and_sankey_go_to_the_extension():
 
 def test_a_saved_metric_on_funnel_is_its_name():
     spec = _spec(Family.FUNNEL, measures=[SavedRef("m", K.COUNT)], dimensions=("stage",))
-    assert extension_chart_request(spec, {}, {})["params"]["metric"] == "m"
+    assert extension_chart_request(spec, {}, {}, currency="USD")["params"]["metric"] == "m"
 
 
 def test_the_two_requests_are_not_interchangeable():
     with pytest.raises(ValueError):
         _build(_spec(Family.FUNNEL))
     with pytest.raises(ValueError):
-        extension_chart_request(_spec(Family.PIE), {}, {})
+        extension_chart_request(_spec(Family.PIE), {}, {}, currency="USD")
 
 
 @pytest.mark.parametrize("family", [Family.SANKEY, Family.BOX_PLOT, Family.HISTOGRAM])
@@ -278,27 +278,56 @@ def test_table_currency_is_owed_as_column_config():
     spec = _spec(Family.TABLE, measures=[WrittenRef(_measure()), WrittenRef(_measure("orders", K.COUNT,
                                                                                   expression="COUNT(*)")),
                                          SavedRef("saved_rate", K.PERCENT)])
-    assert owed_format_params(spec, {}, {}) == {"column_config": {
+    assert owed_format_params(spec, {}, {}, currency="USD") == {"column_config": {
         "Revenue": {"d3NumberFormat": ",.2f", "currencyFormat": USD},
         "Orders": {"d3NumberFormat": ",d"},
         "saved_rate": {"d3NumberFormat": ",.1%"}}}
     saved = {"s": SavedMetric(7, "s", "SUM(x)", None, None, {"symbol": "EUR", "symbolPosition": "prefix"}, None,
                               None)}
-    got = owed_format_params(_spec(Family.TABLE, measures=[SavedRef("s", K.CURRENCY)]), {}, saved)
+    got = owed_format_params(_spec(Family.TABLE, measures=[SavedRef("s", K.CURRENCY)]), {}, saved, currency="USD")
     assert got["column_config"]["s"]["currencyFormat"] == {"symbol": "EUR", "symbolPosition": "prefix"}
     # no currency measure: the request already carries every column's format
     plain = _spec(Family.TABLE, measures=[WrittenRef(_measure("orders", K.COUNT, expression="COUNT(*)"))])
-    assert owed_format_params(plain, {}, {}) == {}
+    assert owed_format_params(plain, {}, {}, currency="USD") == {}
 
 
 def test_treemap_format_is_owed():
     """`TreemapChartConfig` has no format field; the treemap plugin reads `number_format` and `currency_format`."""
-    assert owed_format_params(_spec(Family.TREEMAP), {}, {}) == {"number_format": ",.2f", "currency_format": USD}
+    assert owed_format_params(_spec(Family.TREEMAP), {}, {}, currency="USD") == {"number_format": ",.2f", "currency_format": USD}
     pct = _spec(Family.TREEMAP, measures=[WrittenRef(_measure("rate", K.PERCENT, expression="AVG(r)"))])
-    assert owed_format_params(pct, {}, {}) == {"number_format": ",.1%"}
+    assert owed_format_params(pct, {}, {}, currency="USD") == {"number_format": ",.1%"}
 
 
 @pytest.mark.parametrize("family", sorted(MCP_FAMILIES - {Family.TABLE, Family.TREEMAP}, key=str))
 def test_families_whose_request_carries_the_format_owe_nothing(family):
     changes, _ = CASES[family]
-    assert owed_format_params(_spec(family, **changes), {}, {}) == {}
+    assert owed_format_params(_spec(family, **changes), {}, {}, currency="USD") == {}
+
+
+@pytest.mark.parametrize("held", [None, UNKNOWN, {"symbol": "$", "symbolPosition": "prefix"},
+                                  {"symbol": "usd", "symbolPosition": "prefix"}])
+def test_a_saved_currency_metric_without_its_own_iso_currency_uses_the_deployment_currency(held):
+    """Decision 8: the deployment currency, unless the saved metric carries its own ISO code; a symbol is not one."""
+    saved = {"m": SavedMetric(7, "m", "SUM(x)", None, None, held, None, None)}
+    spec = _spec(Family.PIE, measures=[SavedRef("m", K.CURRENCY)])
+    config = generate_chart_request(spec, {}, saved, currency="EUR")["config"]
+    assert config["currency_format"] == {"symbol": "EUR", "symbolPosition": "prefix"}
+    table = _spec(Family.TABLE, measures=[SavedRef("m", K.CURRENCY)])
+    owed = owed_format_params(table, {}, saved, currency="EUR")
+    assert owed["column_config"]["m"]["currencyFormat"]["symbol"] == "EUR"
+    treemap = _spec(Family.TREEMAP, measures=[SavedRef("m", K.CURRENCY)])
+    assert owed_format_params(treemap, {}, saved, currency="EUR")["currency_format"]["symbol"] == "EUR"
+    funnel = _spec(Family.FUNNEL, measures=[SavedRef("m", K.CURRENCY)], dimensions=("s",))
+    assert extension_chart_request(funnel, {}, saved, currency="EUR")["params"]["currency_format"]["symbol"] == "EUR"
+
+
+def test_a_saved_metric_with_its_own_iso_currency_keeps_it():
+    saved = {"m": SavedMetric(7, "m", "SUM(x)", None, None, {"symbol": "GBP", "symbolPosition": "prefix"}, None, None)}
+    spec = _spec(Family.PIE, measures=[SavedRef("m", K.CURRENCY)])
+    config = generate_chart_request(spec, {}, saved, currency="EUR")["config"]
+    assert config["currency_format"]["symbol"] == "GBP"
+
+
+def test_a_written_currency_measure_without_a_currency_uses_the_deployment_currency():
+    spec = _spec(Family.PIE, measures=[WrittenRef(_measure(currency=None))])
+    assert generate_chart_request(spec, {}, {}, currency="EUR")["config"]["currency_format"]["symbol"] == "EUR"
