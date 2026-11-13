@@ -169,3 +169,14 @@ def test_over_limit_answer_is_a_stated_failure(fake):
     with pytest.raises(SupersetResponseTooLarge):
         read_saved_metrics(_client(fake), dataset_ids=(1,))
     assert sizes == [25, 5]
+
+
+def test_a_metric_the_extension_does_not_answer_for_is_unknown_not_none(fake):
+    _serve_metrics(fake, {1: [_metric(1, "a"), _metric(1, "b"), _metric(1, "c")], 2: [_metric(2, "z")]})
+    # Dataset 2 is absent from the answer, and so is metric "b" of dataset 1; "c" is answered with null fields.
+    _serve_extension(fake, {1: [_extension_row("a", currency=USD, certified_by="finance"), _extension_row("c")]})
+    by_name = {(s.dataset_id, s.name): s for s in read_saved_metrics(_client(fake), dataset_ids=(1, 2))}
+    for key in ((1, "b"), (2, "z")):
+        assert by_name[key].currency is UNKNOWN and by_name[key].certified_by is UNKNOWN
+    assert by_name[(1, "c")].currency is None and by_name[(1, "c")].certified_by is None
+    assert by_name[(1, "a")].currency == USD and by_name[(1, "a")].certified_by == "finance"

@@ -25,8 +25,9 @@ __all__ = ["SavedMetric", "UNKNOWN", "normalized", "read_saved_metrics", "reusab
 UNKNOWN: object = object()
 
 PAGE_SIZE = 25
-# The page size a retry asks for after Superset's response size guard refused a page: `list_metrics` documents 4 as the
-# largest with margin, in `ListMetricsRequest` (`superset/mcp_service/semantic_layer/schemas.py`).
+# The page size a retry asks for after Superset's response size guard refused a page: the plan's value, a fifth of the
+# default. `EMBEDDED_DIMENSIONS_MAX_PAGE_SIZE` (4) in `superset/mcp_service/semantic_layer/schemas.py` is the cap only
+# when `include_compatible_dimensions` is on, which mnemiq never sends, so it does not bind this request.
 SMALL_PAGE_SIZE = 5
 
 
@@ -83,12 +84,15 @@ def read_saved_metrics(client, *, dataset_ids: tuple[int, ...]) -> list[SavedMet
         for row in rows:
             if not row.get("expression") or not row.get("name"):
                 continue
-            more = extra.get((dataset_id, row["name"]), {})
+            # A metric the extension does not answer for is unknown, not "without currency or certification": the
+            # builder was just shown it by `list_metrics`, so the two views disagree or it changed between the calls.
+            more = extra.get((dataset_id, row["name"]))
+            known = not missing and more is not None
             saved.append(SavedMetric(
                 dataset_id=dataset_id, name=row["name"], expression=row["expression"],
                 verbose_name=row.get("verbose_name"), d3format=row.get("d3format"),
-                currency=UNKNOWN if missing else more.get("currency"),
-                certified_by=UNKNOWN if missing else more.get("certified_by"),
+                currency=more.get("currency") if known else UNKNOWN,
+                certified_by=more.get("certified_by") if known else UNKNOWN,
                 warning_text=row.get("warning_text")))
     return saved
 
