@@ -84,6 +84,7 @@ class FakeSuperset:
         self._refused: set[str] = set()
         self._http_failure: tuple[int, str] | None = None
         self._close_streams = False
+        self._cut_streams = False
         self._held: dict[str, float] = {}
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
@@ -107,9 +108,11 @@ class FakeSuperset:
         object, or with `content_type="text/html"` a sign-in page, as a proxy in front of Superset might send."""
         self._http_failure = (status, content_type)
 
-    def close_stream_before_result(self) -> None:
-        """Answer every later tool call with an event stream that ends before it carries the call's result."""
+    def close_stream_before_result(self, *, cut: bool = False) -> None:
+        """Answer every later tool call with an event stream that ends before it carries the call's result. With
+        `cut=True` the connection closes partway through the stream instead, so the client's read of it fails."""
         self._close_streams = True
+        self._cut_streams = cut
 
     def hold(self, method: str, seconds: float) -> None:
         """Hold every later request of this JSON-RPC method (`tools/call`, `tools/list`) for `seconds` before the
@@ -205,6 +208,11 @@ class _Transport:
             if method in self.fake._held:
                 await anyio.sleep(self.fake._held[method])
             if self.fake._close_streams and method == "tools/call":
+                if self.fake._cut_streams:
+                    await send({"type": "http.response.start", "status": 200,
+                                "headers": [(b"content-type", b"text/event-stream")]})
+                    await send({"type": "http.response.body", "body": b": cut\n\n", "more_body": True})
+                    return  # uvicorn closes the connection of a response left unfinished
                 await _send(send, 200, b"text/event-stream", b"")
                 return
         token = _authorization.set(authorization)

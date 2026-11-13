@@ -51,7 +51,7 @@ MCP_TOOL_SEARCH_CONFIG = {**_TOOL_SEARCH, "enabled": False}
 FAB_API_KEY_ENABLED = True
 
 # Superset's result cache, on a directory, for the MCP service the suite runs its cached tests against: a narrowed row
-# rule, a revoked grant and a new function must each be seen through a real cache, not only through none.
+# rule and a new function must each be seen through a real cache, not only through none.
 if _cache_dir := os.environ.get("MNEMIQ_TEST_SUPERSET_DATA_CACHE_DIR"):
     DATA_CACHE_CONFIG = {
         "CACHE_TYPE": "FileSystemCache",

@@ -261,11 +261,15 @@ def test_an_answer_that_is_not_json_rpc_is_unavailable_at_once(fake, content_typ
     _holds_no_credential(caught.value)
 
 
-def test_an_event_stream_closed_before_its_result_is_unavailable(fake):
-    """mcp 2.x resolves the call with a JSON-RPC "connection closed" error of its own; 1.x waits out the deadline."""
-    fake.close_stream_before_result()
+@pytest.mark.parametrize("cut", [False, True], ids=["stream ended", "connection cut"])
+def test_an_event_stream_closed_before_its_result_is_unavailable(fake, cut):
+    """mcp 2.x resolves the call with a JSON-RPC "connection closed" error of its own; 1.x waits out the deadline.
+    Superset had taken the call (its response started), but the response ended without the result, whether the stream
+    ended or the connection was cut, so the deadline 1.x waits out is no tool still running: never a timed-out call."""
+    fake.close_stream_before_result(cut=cut)
     with pytest.raises(SupersetUnavailable) as caught:
         _client(fake.url, timeout_s=3).call("execute_sql", REQUEST)
+    assert not isinstance(caught.value, SupersetCallTimedOut)
     assert str(caught.value) in ("Superset's MCP service gave no usable answer to execute_sql",
                                  "Superset's MCP service did not answer execute_sql within 3 seconds")
     _holds_no_credential(caught.value)
