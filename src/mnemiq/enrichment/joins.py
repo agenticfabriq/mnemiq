@@ -99,20 +99,18 @@ def relationships_from_foreign_keys(adapter, catalog: list[TableInfo]) -> list[R
     known = {t.name for t in catalog}
     # Group by constraint, not by (child, parent): a composite FK's columns share a
     # constraint id, while independent FKs to the same parent do not -- so eye/hair/skin
-    # -> colour stay three relationships, not one bogus composite.
-    grouped: dict[str, tuple[str, str, list[JoinKey]]] = {}
-    order: list[str] = []
+    # -> colour stay three relationships, not one bogus composite. And by the child table with
+    # it: Postgres keeps a constraint's name unique on its table, not in its schema, so two
+    # tables may each declare `fk_customer`. A constraint has one target, so the pair is enough.
+    grouped: dict[tuple[str, str], tuple[str, str, list[JoinKey]]] = {}
     for from_table, from_col, to_table, to_col, cid in adapter.foreign_keys():
         if from_table not in known or to_table not in known:
             continue
-        if cid not in grouped:
-            grouped[cid] = (from_table, to_table, [])
-            order.append(cid)
-        grouped[cid][2].append(JoinKey(left=from_col, right=to_col))
+        grouped.setdefault((from_table, cid), (from_table, to_table, []))[2].append(
+            JoinKey(left=from_col, right=to_col))
 
     rels: list[Relationship] = []
-    for cid in order:
-        child, parent, keys = grouped[cid]
+    for child, parent, keys in grouped.values():
         cols = "+".join(k.left for k in keys)
         rels.append(
             Relationship(
