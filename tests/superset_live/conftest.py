@@ -35,6 +35,17 @@ import pytest
 from tests.superset_live.live import DATABASE_NAME, GATE, Live, enrich_and_build, record_calls, superset_settings
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _seed_acme():
+    """Replaces the root conftest's ACME seeder for this suite, and does nothing.
+
+    The suite reads its own seeded source through Superset and never needs ACME. The root seeder drops and reloads
+    ACME's tables in MNEMIQ_PG_DSN whenever integration tests are selected and MNEMIQ_ACME_DATA_DIR is set too, and as a
+    session fixture it would run before this suite's environment cleaning and skip gate, so a shell holding those two
+    variables would have that database seeded by a run whose live tests all skip. Tests outside this folder still get
+    the root seeder. `tests/test_superset_live_isolation.py` holds both to that."""
+
+
 @pytest.fixture(scope="session")
 def live() -> Live:
     missing = [name for name in GATE if not os.environ.get(name, "").strip()]
