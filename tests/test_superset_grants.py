@@ -600,9 +600,10 @@ def test_a_generic_denial_is_not_told_about_roles():
 
 
 @pytest.mark.parametrize("on", ["probe", "list_datasets"])
-def test_tool_search_left_on_is_misconfigured(on):
-    """With Superset's tool search on, its tools are not offered by name; the message names the setting to change, so
-    nobody is told to request roles they may already hold."""
+def test_a_tool_superset_does_not_offer_is_misconfigured(on):
+    """A Superset that does not offer a tool mnemiq asks with (older than Superset mode needs, or with the tool in
+    `MCP_DISABLED_TOOLS`) is misconfigured; the message names what to change, so nobody is told to request roles they
+    may already hold."""
     with FakeSuperset() as fake:
         unknown = RuntimeError(f"Unknown tool: {'execute_sql' if on == 'probe' else 'list_datasets'}")
         fake.reply("execute_sql", lambda request, authorization: unknown if on == "probe" else _refused())
@@ -612,9 +613,13 @@ def test_tool_search_left_on_is_misconfigured(on):
         with pytest.raises(SupersetMisconfigured) as caught:
             resolve_grants(adapter, _snapshot("policy"))
     message = caught.value.message
+    tool = "execute_sql" if on == "probe" else "list_datasets"
     assert message == str(caught.value)
-    assert message.startswith("Superset's MCP service is not set up as mnemiq needs")
-    assert 'MCP_TOOL_SEARCH_CONFIG["enabled"] = False' in message
+    # One sentence, naming Superset's MCP service once.
+    assert message == (f"Superset is not set up as mnemiq needs: Superset's MCP service does not offer {tool}, which "
+                       "Superset mode calls, and which Superset 7.0.0rc2 and later offer unless MCP_DISABLED_TOOLS "
+                       "names it")
+    assert message.count("Superset's MCP service") == 1
     assert "Alpha" not in message
 
 
@@ -623,6 +628,7 @@ def test_any_other_tool_error_is_misconfigured(caplog):
     adapter = _adapter(_Superset(_refused(), list_answer=error))
     with caplog.at_level(logging.WARNING, logger="mnemiq.superset"), pytest.raises(SupersetMisconfigured) as caught:
         resolve_grants(adapter, _snapshot("policy"))
+    assert caught.value.message == "Superset is not set up as mnemiq needs: Superset's list_datasets tool failed"
     assert "boom" not in caught.value.message
     assert "boom" in caplog.text
 

@@ -352,4 +352,5 @@ def _not_a_builder(exc: SupersetPermissionDenied) -> NotABuilder:
 
 def _misconfigured(exc: SupersetToolError) -> SupersetMisconfigured:
     logger.warning("Superset's MCP service answered with a tool error (%s): %s", exc, exc.detail)
-    return SupersetMisconfigured(f"Superset's MCP service is not set up as mnemiq needs: {exc}")
+    # The client's sentence names Superset's MCP service where it is the subject, so this one names Superset alone.
+    return SupersetMisconfigured(f"Superset is not set up as mnemiq needs: {exc}")

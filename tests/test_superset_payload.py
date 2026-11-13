@@ -7,7 +7,9 @@ the rows as one JSON object each, and each column's name beside the pandas dtype
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pyarrow as pa
 import pytest
@@ -146,3 +148,24 @@ def test_each_error_type_raises_its_reading(error_type, raised):
         assert str(caught.value) == SUPERSET_TEXT
     else:
         assert SUPERSET_TEXT not in str(caught.value)
+
+
+def test_a_recorded_live_payload_reads_with_its_types():
+    """One payload Superset 7.0.0rc2 sent, recorded by the live suite (`tests/superset_live/test_contract.py`,
+    `test_value_encodings`, which also checks it is still what Superset sends): a `numeric`, a `date`, a `timestamp`, a
+    `timestamptz`, a `json` value and NULLs, the values synthetic. Superset reports the timestamp `datetime64[us]` and
+    the zoned one `datetime64[ns, UTC]`, each value ISO 8601 text; the rest `object`, read as pyarrow infers them:
+    the numeric as a number, the date as text, the json value as a struct, and an all-NULL column as null."""
+    recorded = json.loads((Path(__file__).parent / "fixtures" / "superset_execute_sql_types.json").read_text())
+    table = read_execute_response(recorded)
+    assert dict(zip(table.column_names, table.schema.types, strict=True)) == {
+        "id": pa.int64(), "premium": pa.float64(), "issued": pa.string(), "issued_at": pa.timestamp("us"),
+        "issued_utc": pa.timestamp("us", tz="UTC"),
+        "doc": pa.struct([("channel", pa.string()), ("riders", pa.int64())]), "nothing": pa.null()}
+    assert table.to_pylist() == [
+        {"id": 24, "premium": 988.12, "issued": "2024-06-17", "issued_at": datetime(2024, 6, 17, 9, 30),
+         "issued_utc": datetime(2024, 6, 17, 9, 30, tzinfo=timezone.utc), "doc": {"channel": "web", "riders": 0},
+         "nothing": None},
+        {"id": 25, "premium": 125.25, "issued": "2024-06-24", "issued_at": datetime(2024, 6, 24, 9, 30),
+         "issued_utc": datetime(2024, 6, 24, 9, 30, tzinfo=timezone.utc), "doc": None, "nothing": None},
+    ]

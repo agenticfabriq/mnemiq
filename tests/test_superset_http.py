@@ -349,8 +349,8 @@ def test_misconfigured_superset_is_503_naming_the_setting(server, fake, model):
     for method, path, body in [("post", "/v1/ask", {"question": "q"}), ("get", "/v1/schema", None)]:
         r = _call(client, method, path, body, _bearer(_token()))
         assert r.status_code == 503, r.text
-        assert "MCP_TOOL_SEARCH_CONFIG" in r.json()["detail"]
-    assert "MCP_TOOL_SEARCH_CONFIG" in _refusal_in_band(client, _token())["message"]
+        assert "MCP_DISABLED_TOOLS" in r.json()["detail"]
+    assert "MCP_DISABLED_TOOLS" in _refusal_in_band(client, _token())["message"]
     assert model.calls == 0
 
 
@@ -397,8 +397,8 @@ RAISED = {
                   "Superset's answer to list_datasets was larger than its MCP service will send; ask for less"),
     "unavailable": (lambda: SupersetUnavailable("Superset's MCP service could not be reached", detail=SAID), 503,
                     "Superset's MCP service could not be reached"),
-    "misconfigured": (lambda: SupersetMisconfigured("Superset's MCP service is not set up as mnemiq needs: x"), 503,
-                      "Superset's MCP service is not set up as mnemiq needs: x"),
+    "misconfigured": (lambda: SupersetMisconfigured("Superset is not set up as mnemiq needs: x"), 503,
+                      "Superset is not set up as mnemiq needs: x"),
     "credential-missing": (lambda: SupersetCredentialMissing("Superset mode answers each request as the person whose "
                                                              "verified token it carries, and this request carries "
                                                              "none"), 401,

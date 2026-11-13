@@ -9,6 +9,7 @@ turn. One test runs the adapter over the real client against the fake Superset, 
 from __future__ import annotations
 
 import logging
+import time
 
 import pytest
 
@@ -233,6 +234,51 @@ def test_timeout_reads_as_timeout():
         run(_adapter(_failed("timed_out", "Query exceeded the timeout limit")), SQL, timeout_s=30)
     assert type(caught.value) is ExecutionError
     assert caught.value.message.startswith("The query timed out after 30")
+
+
+def test_a_statement_still_running_at_the_transport_deadline_reads_as_timed_out(monkeypatch):
+    """Superset's own time limit ends no statement: it fires once the database call returns (measured on 7.0.0rc2), so
+    a statement running past its limit and the transport's margin is still running when the transport gives up. Over
+    the real client that reads as the statement's time limit (`QueryTimedOut`), which the runner gives the model to
+    make cheaper, never as Superset being unavailable, which would tell the person to try again."""
+    import mnemiq.superset.adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "TRANSPORT_MARGIN_S", 0.5)
+
+    def slow(request, authorization):
+        time.sleep(3)
+        return REGION_COUNTS
+
+    with FakeSuperset() as fake:
+        fake.reply("execute_sql", slow)
+        adapter = SupersetSqlAdapter(SupersetMcp(fake.url, DelegatedToken("tok")), database_id=7, schema="sales")
+        with pytest.raises(QueryTimedOut):
+            adapter.execute_arrow(SQL, timeout_s=1)
+        with pytest.raises(ExecutionError) as caught:
+            run(adapter, SQL, timeout_s=1)
+    assert type(caught.value) is ExecutionError
+    assert caught.value.message.startswith("The query timed out after 1")
+    assert adapter.terminal_refusal is None
+
+
+@pytest.mark.parametrize("cut", [False, True], ids=["stream ended", "connection cut"])
+def test_a_response_that_ends_before_its_result_reads_as_an_outage(monkeypatch, cut):
+    """Superset's response to the statement ends without its result (a worker restarted, a proxy cut the connection):
+    that is Superset not answering, which the runner reads as the source unavailable, never as the statement's time
+    limit. mcp 2.x reports the closed response at once; 1.x waits out the transport's deadline, and that deadline must
+    not read as a statement still running, which would have the model make a statement cheaper that never ran long."""
+    import mnemiq.superset.adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "TRANSPORT_MARGIN_S", 0.5)
+    with FakeSuperset() as fake:
+        fake.reply("execute_sql", lambda request, authorization: REGION_COUNTS)
+        fake.close_stream_before_result(cut=cut)
+        adapter = SupersetSqlAdapter(SupersetMcp(fake.url, DelegatedToken("tok")), database_id=7, schema="sales")
+        with pytest.raises(SupersetUnavailable):
+            adapter.execute_arrow(SQL, timeout_s=1)
+        with pytest.raises(SourceUnavailableError):
+            run(adapter, SQL, timeout_s=1)
+    assert adapter.terminal_refusal is None
 
 
 def test_stopped_reads_as_cancelled():

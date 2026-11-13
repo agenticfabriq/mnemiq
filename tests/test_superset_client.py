@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import socket
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ import pytest
 from mnemiq.superset.client import (
     Bearer,
     DelegatedToken,
+    SupersetCallTimedOut,
     SupersetDenied,
     SupersetMcp,
     SupersetPermissionDenied,
@@ -178,11 +180,15 @@ def test_one_error_prefix_is_read_past_and_no_more(fake):
     assert exc.detail == f"Error: Error: {ROLE_DENIAL}"
 
 
-def test_unknown_tool_text_names_the_tool_search_setting(any_shape):
-    """The text Superset's MCP service sends for a tool it does not offer by name, read in either shape."""
+def test_unknown_tool_text_names_what_removes_a_tool(any_shape):
+    """The text Superset's MCP service sends for a tool it does not offer, read in either shape. Superset 7.0.0rc2
+    serves a tool called by name whether its tool search is on or not (measured live, on mcp 1.x and 2.x), so the
+    sentence names what does remove one: a Superset older than mnemiq needs, or `MCP_DISABLED_TOOLS`."""
     exc = _raised_for(any_shape, RuntimeError("Unknown tool: execute_sql"))
     assert type(exc) is SupersetToolError
-    assert 'MCP_TOOL_SEARCH_CONFIG["enabled"] = False' in str(exc)
+    assert str(exc) == ("Superset's MCP service does not offer execute_sql, which Superset mode calls, and which "
+                        "Superset 7.0.0rc2 and later offer unless MCP_DISABLED_TOOLS names it")
+    assert "MCP_TOOL_SEARCH_CONFIG" not in str(exc)
     assert exc.detail == any_shape.error_text("Unknown tool: execute_sql")
 
 
@@ -215,11 +221,11 @@ def test_supersets_own_words_are_logged_once_without_the_bearer(fake, caplog):
     assert bearer not in caplog.text
 
 
-def test_unknown_tool_names_the_tool_search_setting(fake):
+def test_an_unknown_tool_on_the_wire_names_what_removes_a_tool(fake):
     with pytest.raises(SupersetToolError) as caught:
-        _client(fake.url).call("search_tools_hid_this", {})
-    assert 'MCP_TOOL_SEARCH_CONFIG["enabled"] = False' in str(caught.value)
-    assert "search_tools_hid_this" in str(caught.value)
+        _client(fake.url).call("not_offered", {})
+    assert str(caught.value) == ("Superset's MCP service does not offer not_offered, which Superset mode calls, and "
+                                 "which Superset 7.0.0rc2 and later offer unless MCP_DISABLED_TOOLS names it")
     _holds_no_credential(caught.value)
 
 
@@ -255,11 +261,15 @@ def test_an_answer_that_is_not_json_rpc_is_unavailable_at_once(fake, content_typ
     _holds_no_credential(caught.value)
 
 
-def test_an_event_stream_closed_before_its_result_is_unavailable(fake):
-    """mcp 2.x resolves the call with a JSON-RPC "connection closed" error of its own; 1.x waits out the deadline."""
-    fake.close_stream_before_result()
+@pytest.mark.parametrize("cut", [False, True], ids=["stream ended", "connection cut"])
+def test_an_event_stream_closed_before_its_result_is_unavailable(fake, cut):
+    """mcp 2.x resolves the call with a JSON-RPC "connection closed" error of its own; 1.x waits out the deadline.
+    Superset had taken the call (its response started), but the response ended without the result, whether the stream
+    ended or the connection was cut, so the deadline 1.x waits out is no tool still running: never a timed-out call."""
+    fake.close_stream_before_result(cut=cut)
     with pytest.raises(SupersetUnavailable) as caught:
         _client(fake.url, timeout_s=3).call("execute_sql", REQUEST)
+    assert not isinstance(caught.value, SupersetCallTimedOut)
     assert str(caught.value) in ("Superset's MCP service gave no usable answer to execute_sql",
                                  "Superset's MCP service did not answer execute_sql within 3 seconds")
     _holds_no_credential(caught.value)
@@ -315,6 +325,70 @@ def test_slow_server_is_unavailable_within_the_timeout(fake):
     assert time.monotonic() - started < 2.5
     assert str(caught.value) == "Superset's MCP service did not answer execute_sql within 1 second"
     _holds_no_credential(caught.value)
+
+
+def test_a_deadline_that_passes_while_the_tool_runs_is_a_timed_out_call(fake):
+    """A deadline that passes after the tool call was sent, while Superset is still working on it, is
+    `SupersetCallTimedOut`: Superset was reached and took the call, and what the tool does took longer than the call
+    allowed. It is a `SupersetUnavailable` still, with the same sentence, so a reader that knows no better reads it as
+    one; the adapter knows better for a statement (`test_superset_adapter.py`)."""
+    def slow(request, authorization):
+        time.sleep(3)
+        return PAYLOAD
+
+    fake.reply("execute_sql", slow)
+    with pytest.raises(SupersetCallTimedOut) as caught:
+        _client(fake.url, timeout_s=1).call("execute_sql", REQUEST)
+    assert isinstance(caught.value, SupersetUnavailable)
+    assert str(caught.value) == "Superset's MCP service did not answer execute_sql within 1 second"
+    _holds_no_credential(caught.value)
+
+
+@pytest.mark.parametrize("held", ["tools/call", "tools/list"])
+def test_a_deadline_that_passes_outside_the_tool_is_not_a_timed_out_call(fake, held):
+    """Only a deadline that passes while Superset is answering the tool call is a timed-out call. Held before the
+    server takes the tool call (no response to it has started), the time ran out reaching Superset, not in the tool.
+    Held at the `tools/list` the SDK sends once the call's result is in (to read the tool's output schema), the tool
+    had already answered."""
+    fake.reply("execute_sql", lambda request, authorization: PAYLOAD)
+    fake.hold(held, 3)
+    with pytest.raises(SupersetUnavailable) as caught:
+        _client(fake.url, timeout_s=1).call("execute_sql", REQUEST)
+    assert not isinstance(caught.value, SupersetCallTimedOut)
+    assert str(caught.value) == "Superset's MCP service did not answer execute_sql within 1 second"
+    assert [call.tool for call in fake.calls] == (["execute_sql"] if held == "tools/list" else [])
+
+
+def test_a_deadline_that_passes_before_the_call_is_sent_is_not_a_timed_out_call():
+    """A server that takes the connection and never answers holds the call before the tool call is sent: that is
+    Superset not answering, never a tool that ran long."""
+    held: list[socket.socket] = []
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen(4)
+        server.settimeout(0.1)
+        stop = threading.Event()
+
+        def take():
+            while not stop.is_set():
+                try:
+                    held.append(server.accept()[0])
+                except OSError:
+                    continue
+
+        taker = threading.Thread(target=take, daemon=True)
+        taker.start()
+        try:
+            with pytest.raises(SupersetUnavailable) as caught:
+                _client(f"http://127.0.0.1:{server.getsockname()[1]}/mcp", timeout_s=1).call("execute_sql", REQUEST)
+        finally:
+            stop.set()
+            taker.join(5)
+            for connection in held:
+                connection.close()
+    assert held  # the passing control: the connection was taken, so the deadline passed waiting for an answer
+    assert not isinstance(caught.value, SupersetCallTimedOut)
+    assert str(caught.value) == "Superset's MCP service did not answer execute_sql within 1 second"
 
 
 def test_a_call_can_wait_longer_than_the_client_deadline(fake):
