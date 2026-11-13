@@ -27,13 +27,16 @@ TAG = "$q$"
 class _Recording:
     """A DuckDB connection that records each statement it is sent, with its parameters. The read of the stored schema
     names matching the configured one is answered with `stored`, by default the configured name itself, as though a
-    schema of exactly that name were stored; the key statement with no rows. Or every statement raises `error`."""
+    schema of exactly that name were stored; the key statement with no rows, or by raising `key_error`. Or every
+    statement raises `error`."""
 
-    def __init__(self, stored: tuple[str, ...] | None = None, error: Exception | None = None) -> None:
+    def __init__(self, stored: tuple[str, ...] | None = None, error: Exception | None = None,
+                 key_error: Exception | None = None) -> None:
         self.sent: list[str] = []
         self.params: list[list | None] = []
         self.stored = stored
         self.error = error
+        self.key_error = key_error
         self._rows: list[tuple] = []
 
     def execute(self, sql: str, params: list | None = None):
@@ -42,6 +45,8 @@ class _Recording:
         if self.error is not None:
             raise self.error
         if "pg_constraint" in sql:
+            if self.key_error is not None:
+                raise self.key_error
             self._rows = []
         else:
             self._rows = [(name,) for name in (self.stored if self.stored is not None else params)]
@@ -140,6 +145,23 @@ def test_a_failed_read_logs_one_warning_naming_the_type_and_returns_nothing(capl
     con = _Recording(error=duckdb.IOException(f'IO Error: Unable to connect to Postgres at "{dsn}"'))
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         assert _postgres_adapter("public", con).foreign_keys() == []
+    (record,) = _warnings(caplog)
+    assert record.levelno == logging.WARNING
+    message = record.getMessage()
+    assert "(IOException)" in message, message
+    for part in ("hunter2", "db.internal", "warehouse", "Unable to connect"):
+        assert part not in message, message
+
+
+def test_a_failed_key_read_after_the_schema_is_found_logs_its_type_and_returns_nothing(caplog):
+    """The schema resolves and the key statement is sent, and fails: `[]`, and one WARNING naming the exception's type
+    only, as for a failure of the schema's own read."""
+    dsn = "user=reader password=hunter2 host=db.internal port=5432 dbname=warehouse"
+    con = _Recording(stored=("public",),
+                     key_error=duckdb.IOException(f'IO Error: Unable to connect to Postgres at "{dsn}"'))
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        assert _postgres_adapter("public", con).foreign_keys() == []
+    assert len(con.key_statements()) == 1
     (record,) = _warnings(caplog)
     assert record.levelno == logging.WARNING
     message = record.getMessage()
