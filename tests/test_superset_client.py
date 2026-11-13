@@ -186,8 +186,8 @@ def test_unknown_tool_text_names_what_removes_a_tool(any_shape):
     sentence names what does remove one: a Superset older than mnemiq needs, or `MCP_DISABLED_TOOLS`."""
     exc = _raised_for(any_shape, RuntimeError("Unknown tool: execute_sql"))
     assert type(exc) is SupersetToolError
-    assert str(exc) == ("Superset's MCP service does not offer execute_sql: Superset mode needs Superset 7.0.0rc2 or "
-                        "later, with execute_sql not named in MCP_DISABLED_TOOLS")
+    assert str(exc) == ("Superset's MCP service does not offer execute_sql, which Superset mode calls, and which "
+                        "Superset 7.0.0rc2 and later offer unless MCP_DISABLED_TOOLS names it")
     assert "MCP_TOOL_SEARCH_CONFIG" not in str(exc)
     assert exc.detail == any_shape.error_text("Unknown tool: execute_sql")
 
@@ -224,8 +224,8 @@ def test_supersets_own_words_are_logged_once_without_the_bearer(fake, caplog):
 def test_an_unknown_tool_on_the_wire_names_what_removes_a_tool(fake):
     with pytest.raises(SupersetToolError) as caught:
         _client(fake.url).call("not_offered", {})
-    assert str(caught.value) == ("Superset's MCP service does not offer not_offered: Superset mode needs Superset "
-                                 "7.0.0rc2 or later, with not_offered not named in MCP_DISABLED_TOOLS")
+    assert str(caught.value) == ("Superset's MCP service does not offer not_offered, which Superset mode calls, and "
+                                 "which Superset 7.0.0rc2 and later offer unless MCP_DISABLED_TOOLS names it")
     _holds_no_credential(caught.value)
 
 

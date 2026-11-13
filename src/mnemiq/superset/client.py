@@ -351,8 +351,8 @@ def _tool_failure(tool: str, text: str) -> _SupersetFailure:
         return SupersetResponseTooLarge(f"Superset's answer to {tool} was larger than its MCP service will send; ask "
                                         "for less", detail=text)
     if _UNKNOWN_TOOL.search(message):
-        return SupersetToolError(f"Superset's MCP service does not offer {tool}: Superset mode needs Superset 7.0.0rc2 "
-                                 f"or later, with {tool} not named in MCP_DISABLED_TOOLS", detail=text)
+        return SupersetToolError(f"Superset's MCP service does not offer {tool}, which Superset mode calls, and which "
+                                 "Superset 7.0.0rc2 and later offer unless MCP_DISABLED_TOOLS names it", detail=text)
     return SupersetToolError(f"Superset's {tool} tool failed", detail=text)
 
 

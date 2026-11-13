@@ -397,8 +397,8 @@ RAISED = {
                   "Superset's answer to list_datasets was larger than its MCP service will send; ask for less"),
     "unavailable": (lambda: SupersetUnavailable("Superset's MCP service could not be reached", detail=SAID), 503,
                     "Superset's MCP service could not be reached"),
-    "misconfigured": (lambda: SupersetMisconfigured("Superset's MCP service is not set up as mnemiq needs: x"), 503,
-                      "Superset's MCP service is not set up as mnemiq needs: x"),
+    "misconfigured": (lambda: SupersetMisconfigured("Superset is not set up as mnemiq needs: x"), 503,
+                      "Superset is not set up as mnemiq needs: x"),
     "credential-missing": (lambda: SupersetCredentialMissing("Superset mode answers each request as the person whose "
                                                              "verified token it carries, and this request carries "
                                                              "none"), 401,
