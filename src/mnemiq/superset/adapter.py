@@ -22,6 +22,7 @@ import pyarrow as pa
 
 from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
 from mnemiq.superset.client import (
+    SupersetCallTimedOut,
     SupersetDenied,
     SupersetMcp,
     SupersetPermissionDenied,
@@ -41,10 +42,11 @@ JINJA_DELIMITERS = ("{{", "{%", "{#")
 # The whole seconds `ExecuteSqlRequest.timeout` accepts (`superset/mcp_service/sql_lab/schemas.py`).
 _SUPERSET_TIMEOUT_RANGE = (1, 300)
 
-# How much longer the transport waits than the time limit sent to Superset. Superset ends a statement at that limit
-# and answers `timed_out`, which the runner reads as the statement's cost for the model to make cheaper. Were the
-# transport to give up first, the same slow statement would read as Superset being unavailable, and the turn would
-# end telling the person to try again.
+# How much longer the transport waits than the time limit sent to Superset. Superset answers `timed_out` for a
+# statement past that limit, which the runner reads as the statement's cost for the model to make cheaper. Its limit
+# takes effect only once the database call returns, though, so a statement can still be running when the transport
+# gives up; that is read as the time limit too (`SupersetCallTimedOut`), never as Superset being unavailable, which
+# would end the turn telling the person to try again.
 TRANSPORT_MARGIN_S = 15.0
 
 # What a result too large to send reads as. Superset's MCP service sends a result past its response size cut, where
@@ -229,6 +231,11 @@ class SupersetSqlAdapter:
             request["force_refresh"] = True
         try:
             return self.client.call("execute_sql", request, timeout_s=limit + TRANSPORT_MARGIN_S)
+        except SupersetCallTimedOut as exc:
+            # Superset took the statement and was still running it at the time limit plus the margin: its own limit
+            # takes effect only once the database call returns, so the statement outran it. The statement's cost,
+            # as Superset's own `timed_out` answer is, never Superset being unavailable.
+            raise QueryTimedOut("the statement was still running in Superset past its time limit") from exc
         except TERMINAL_REFUSALS as exc:
             kept = self._terminal_refusal
             if kept is None or (isinstance(exc, SupersetRefusedCaller) and not isinstance(kept, SupersetRefusedCaller)):

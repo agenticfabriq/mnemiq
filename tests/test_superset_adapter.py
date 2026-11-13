@@ -9,6 +9,7 @@ turn. One test runs the adapter over the real client against the fake Superset, 
 from __future__ import annotations
 
 import logging
+import time
 
 import pytest
 
@@ -233,6 +234,31 @@ def test_timeout_reads_as_timeout():
         run(_adapter(_failed("timed_out", "Query exceeded the timeout limit")), SQL, timeout_s=30)
     assert type(caught.value) is ExecutionError
     assert caught.value.message.startswith("The query timed out after 30")
+
+
+def test_a_statement_still_running_at_the_transport_deadline_reads_as_timed_out(monkeypatch):
+    """Superset's own time limit ends no statement: it fires once the database call returns (measured on 7.0.0rc2), so
+    a statement running past its limit and the transport's margin is still running when the transport gives up. Over
+    the real client that reads as the statement's time limit (`QueryTimedOut`), which the runner gives the model to
+    make cheaper, never as Superset being unavailable, which would tell the person to try again."""
+    import mnemiq.superset.adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "TRANSPORT_MARGIN_S", 0.5)
+
+    def slow(request, authorization):
+        time.sleep(3)
+        return REGION_COUNTS
+
+    with FakeSuperset() as fake:
+        fake.reply("execute_sql", slow)
+        adapter = SupersetSqlAdapter(SupersetMcp(fake.url, DelegatedToken("tok")), database_id=7, schema="sales")
+        with pytest.raises(QueryTimedOut):
+            adapter.execute_arrow(SQL, timeout_s=1)
+        with pytest.raises(ExecutionError) as caught:
+            run(adapter, SQL, timeout_s=1)
+    assert type(caught.value) is ExecutionError
+    assert caught.value.message.startswith("The query timed out after 1")
+    assert adapter.terminal_refusal is None
 
 
 def test_stopped_reads_as_cancelled():

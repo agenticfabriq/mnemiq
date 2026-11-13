@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import socket
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ import pytest
 from mnemiq.superset.client import (
     Bearer,
     DelegatedToken,
+    SupersetCallTimedOut,
     SupersetDenied,
     SupersetMcp,
     SupersetPermissionDenied,
@@ -315,6 +317,55 @@ def test_slow_server_is_unavailable_within_the_timeout(fake):
     assert time.monotonic() - started < 2.5
     assert str(caught.value) == "Superset's MCP service did not answer execute_sql within 1 second"
     _holds_no_credential(caught.value)
+
+
+def test_a_deadline_that_passes_while_the_tool_runs_is_a_timed_out_call(fake):
+    """A deadline that passes after the tool call was sent, while Superset is still working on it, is
+    `SupersetCallTimedOut`: Superset was reached and took the call, and what the tool does took longer than the call
+    allowed. It is a `SupersetUnavailable` still, with the same sentence, so a reader that knows no better reads it as
+    one; the adapter knows better for a statement (`test_superset_adapter.py`)."""
+    def slow(request, authorization):
+        time.sleep(3)
+        return PAYLOAD
+
+    fake.reply("execute_sql", slow)
+    with pytest.raises(SupersetCallTimedOut) as caught:
+        _client(fake.url, timeout_s=1).call("execute_sql", REQUEST)
+    assert isinstance(caught.value, SupersetUnavailable)
+    assert str(caught.value) == "Superset's MCP service did not answer execute_sql within 1 second"
+    _holds_no_credential(caught.value)
+
+
+def test_a_deadline_that_passes_before_the_call_is_sent_is_not_a_timed_out_call():
+    """A server that takes the connection and never answers holds the call before the tool call is sent: that is
+    Superset not answering, never a tool that ran long."""
+    held: list[socket.socket] = []
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen(4)
+        server.settimeout(0.1)
+        stop = threading.Event()
+
+        def take():
+            while not stop.is_set():
+                try:
+                    held.append(server.accept()[0])
+                except OSError:
+                    continue
+
+        taker = threading.Thread(target=take, daemon=True)
+        taker.start()
+        try:
+            with pytest.raises(SupersetUnavailable) as caught:
+                _client(f"http://127.0.0.1:{server.getsockname()[1]}/mcp", timeout_s=1).call("execute_sql", REQUEST)
+        finally:
+            stop.set()
+            taker.join(5)
+            for connection in held:
+                connection.close()
+    assert held  # the passing control: the connection was taken, so the deadline passed waiting for an answer
+    assert not isinstance(caught.value, SupersetCallTimedOut)
+    assert str(caught.value) == "Superset's MCP service did not answer execute_sql within 1 second"
 
 
 def test_a_call_can_wait_longer_than_the_client_deadline(fake):

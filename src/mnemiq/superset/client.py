@@ -84,6 +84,15 @@ class SupersetUnavailable(_SupersetFailure):
     error, or the database asked for a sign-in of its own (an OAuth2 redirect) that mnemiq cannot give."""
 
 
+class SupersetCallTimedOut(SupersetUnavailable):
+    """The call's deadline passed after the tool call was sent and before its answer came: Superset was reached and
+    took the call, and what the tool does took longer than the call allowed. Superset may still be doing it.
+
+    A reader that knows what the tool was doing may read this more closely than as an outage: Superset's own time limit
+    on a statement takes effect only once the database call returns (`SigalrmTimeout` in `superset/utils/core.py`), so
+    a statement still running past its limit and the transport's margin ends the call here."""
+
+
 class SupersetRefusal(_SupersetFailure):
     """Superset answered, and said no."""
 
@@ -175,6 +184,7 @@ class SupersetMcp:
                     async with ClientSession(read, write, message_handler=on_message) as session:
                         with abandon:
                             await session.initialize()
+                            exchange.call_sent = True
                             return await session.call_tool(tool, {"request": request})
         except Exception as exc:
             exchange.error = exchange.error or exc
@@ -218,8 +228,10 @@ class SupersetMcp:
         if status is not None and not 200 <= status < 300:
             return SupersetUnavailable(f"Superset's MCP service answered HTTP {status}", detail=detail)
         if exchange.timed_out:
-            return SupersetUnavailable(f"Superset's MCP service did not answer {tool} within "
-                                       f"{_seconds(exchange.deadline_s)}", detail=detail)
+            # Once the tool call was sent, Superset had taken it: the time ran out in the tool, not in reaching Superset.
+            late = SupersetCallTimedOut if exchange.call_sent else SupersetUnavailable
+            return late(f"Superset's MCP service did not answer {tool} within {_seconds(exchange.deadline_s)}",
+                        detail=detail)
         if exchange.statuses:  # it answered something: an unreadable answer, or a connection lost mid-call
             return SupersetUnavailable(f"Superset's MCP service gave no usable answer to {tool}", detail=detail)
         return SupersetUnavailable("Superset's MCP service could not be reached", detail=detail)
@@ -228,10 +240,11 @@ class SupersetMcp:
 @dataclass
 class _Exchange:
     """One call's deadline, and what the call observed beside its result: each HTTP response's status in order,
-    whether time ran out, and the exception that ended it, if one did."""
+    whether the tool call itself was sent, whether time ran out, and the exception that ended it, if one did."""
 
     deadline_s: float = DEFAULT_TIMEOUT_S
     statuses: list[int] = field(default_factory=list)
+    call_sent: bool = False
     timed_out: bool = False
     error: Exception | None = None
 
