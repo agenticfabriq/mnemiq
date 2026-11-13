@@ -278,6 +278,8 @@ file. See [`workbench/README.md`](workbench/README.md).
 
 Under an identity provider, `/openai/v1` answers Open WebUI or any OpenAI client, each request as its own verified user ([settings](docs/settings.md#identity-from-tokens)). [docs/open-webui.md](docs/open-webui.md) sets that up end to end, with a Compose example running Open WebUI, Keycloak, oauth2-proxy and mnemiq.
 
+In Superset mode, mnemiq answers each person through Superset's MCP service as that person, and holds no database credential of its own. [docs/superset.md](docs/superset.md) sets it up.
+
 ## Use it from an AI agent (MCP)
 
 `uv run mnemiq serve` exposes two read-only, access-scoped tools over stdio — `db_read(question)`
