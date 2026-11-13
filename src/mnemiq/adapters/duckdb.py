@@ -9,29 +9,16 @@ import duckdb
 import pyarrow as pa
 
 from mnemiq.adapters.base import QueryCancelled
+from mnemiq.adapters.pg_keys import DECLARED_KEYS
 from mnemiq.duckdb_extensions import connect_duckdb, load_extension, lock_configuration
 
 logger = logging.getLogger(__name__)
 
-# The declared-FK query for Postgres sources: run through postgres_query so the
-# information_schema joins execute with real Postgres semantics, not DuckDB's proxy.
-_PG_FK_QUERY = (
-    "SELECT kcu.table_name, kcu.column_name, ccu.table_name, ccu.column_name, "
-    "  tc.constraint_name "
-    "FROM information_schema.table_constraints tc "
-    "JOIN information_schema.key_column_usage kcu "
-    "  ON tc.constraint_name = kcu.constraint_name "
-    "  AND tc.table_schema = kcu.table_schema "
-    "JOIN information_schema.constraint_column_usage ccu "
-    "  ON tc.constraint_name = ccu.constraint_name "
-    "  AND tc.table_schema = ccu.table_schema "
-    "WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public' "
-    "ORDER BY kcu.table_name, kcu.ordinal_position"
-)
+# The tag of the dollar-quoted string a statement is given to `postgres_query` in.
+_DOLLAR_TAG = "$q$"
 
-
-# Views for a Postgres source, for the same reason as the FK query: DuckDB's proxy reports
-# every attached-Postgres view as a BASE TABLE, so asking it finds nothing at all.
+# Views for a Postgres source, read through `postgres_query` as declared keys are: DuckDB's proxy
+# reports every attached-Postgres view as a BASE TABLE, so asking it finds nothing at all.
 _PG_VIEW_QUERY = (
     "SELECT c.relname, pg_get_viewdef(c.oid, true) "
     "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
@@ -176,6 +163,16 @@ def attach_postgres(con, target: str, catalog: str, clause: str,
     con.execute(f"ATTACH {attach_literal(bounded)} AS {catalog} {clause}")
 
 
+def _postgres_query(catalog: str, sql: str) -> str:
+    """`postgres_query` on the attached Postgres `catalog`, running `sql` there as written: `sql`
+    in a dollar-quoted string, which DuckDB reads with no escapes, so nothing in it is changed on
+    the way. A `sql` holding the quote's tag would end the string early and is refused instead
+    (`ValueError`), whatever put the tag there."""
+    if _DOLLAR_TAG in sql:
+        raise ValueError("the statement holds the tag of the dollar-quoted string it would be sent in")
+    return f"postgres_query({attach_literal(catalog)}, {_DOLLAR_TAG}{sql}{_DOLLAR_TAG})"
+
+
 def _ended_by_statement_timeout(exc: Exception) -> bool:
     return "canceling statement due to statement timeout" in str(exc)
 
@@ -317,19 +314,28 @@ class DuckDBAdapter:
         return [(r[0], r[1], r[2]) for r in rows]
 
     def foreign_keys(self) -> list[tuple[str, str, str, str, str]]:
-        """Declared FKs: (from_table, from_col, to_table, to_col, constraint_id).
+        """Declared FKs: (from_table, from_col, to_table, to_col, constraint_id), one row for each
+        column pair of a key, each source column with the target column at its own position.
 
-        Postgres exposes them via information_schema; DuckDB's SQLite scanner does not, so a
-        SQLite source returns [] (enrichment falls back to data-driven inference). Any
-        failure -> [] (fall back to inference), never an exception.
+        A Postgres source is read by the statement the Superset catalogue reads keys with
+        (`DECLARED_KEYS`), run whole in Postgres through `postgres_query`, in this adapter's own
+        schema: only keys declared there whose target is there too, never a partition's copy of
+        one. Only a Postgres source is read for keys: a SQLite source, whose keys DuckDB's scanner
+        does not expose, and a DuckDB file return []. A read that fails returns [] as well, and
+        enrichment infers relationships from the data instead; it logs a WARNING naming the
+        exception's type, never its text, which can carry the DSN.
         """
         if not self._fk_via_postgres:
             return []
         try:
             rows = self._con.execute(
-                f"SELECT * FROM postgres_query('{self._catalog}', $q${_PG_FK_QUERY}$q$)"
+                "SELECT from_table, from_column, to_table, to_column, constraint_name FROM "
+                f"{_postgres_query(self._catalog, DECLARED_KEYS.whole(self._table_schema))}"
             ).fetchall()
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 -- any failure: enrichment falls back to inference
+            logger.warning("the declared foreign keys of Postgres schema %r could not be read (%s); "
+                           "relationships will be inferred from the data instead",
+                           self._table_schema, type(exc).__name__)
             return []
         return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
 

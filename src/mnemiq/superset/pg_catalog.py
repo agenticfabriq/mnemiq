@@ -23,15 +23,12 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from typing import NamedTuple
 
+from mnemiq.adapters.pg_keys import DECLARED_KEYS, SCHEMA_PLACEHOLDER, CatalogueStatement, quoted
 from mnemiq.superset.payload import ResultCut, SupersetQueryFailed
 
 # The rows asked for in a statement's first page.
 PAGE_ROWS = 500
-
-# Where the configured schema goes in a statement, as a string literal.
-SCHEMA_PLACEHOLDER = ":schema"
 
 # The relations Postgres's own `information_schema.tables` lists: tables, partitioned tables, views and foreign tables.
 _LISTED = "c.relkind IN ('r', 'p', 'v', 'f')"
@@ -39,18 +36,6 @@ _IN_SCHEMA = ("FROM pg_catalog.pg_class AS c JOIN pg_catalog.pg_namespace AS n O
               f"WHERE n.nspname = {SCHEMA_PLACEHOLDER}")
 _FUNCTIONS = ("SELECT DISTINCT lower(p.proname) AS function_name FROM pg_catalog.pg_proc AS p "
               "JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace")
-
-
-class CatalogueStatement(NamedTuple):
-    """A catalogue method's statement. `select` is the statement before its order and its page, with the configured
-    schema as `SCHEMA_PLACEHOLDER` and a WHERE clause that only ANDs its conditions together, so one more can follow.
-    `key` is the expressions its rows are ordered by, which no two of its rows share, so that a page can continue from
-    the last row read; `key_columns` is where each of their values is in a row. A value of the key that the method does
-    not return is selected after the columns it does."""
-
-    select: str
-    key: tuple[str, ...]
-    key_columns: tuple[int, ...]
 
 
 # Each catalogue method's statement.
@@ -64,30 +49,8 @@ CATALOGUE_SQL: dict[str, CatalogueStatement] = {
         "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
         f"WHERE n.nspname = {SCHEMA_PLACEHOLDER} AND {_LISTED} AND a.attnum > 0 AND NOT a.attisdropped",
         ("c.relname", "a.attnum"), (0, 3)),
-    # One row for each column pair of each constraint, the pairs in the constraint's own order: `conkey` and `confkey`
-    # read at each position `generate_subscripts` gives. Not `unnest(conkey, confkey) WITH ORDINALITY AS k(...)`:
-    # Superset runs a statement as its SQL parser writes it back, and that drops the ordinality column's name from such
-    # an alias in a join, so the statement would fail. Only a key whose referenced table is in the configured schema
-    # too is read: a table here is named by its name alone, so a key to another schema's table would attach to one of
-    # the same name here. And only the key as declared (`conparentid = 0`): under it Postgres keeps a row of its own
-    # for each partition of a partitioned table the key is on or (from Postgres 12) references, each naming that
-    # partition in place of the table. The order is a key: a table's name is unique in its schema, a declared key's
-    # name on its table, and a position in its key.
-    "foreign_keys": CatalogueStatement(
-        "SELECT src.relname AS from_table, src_col.attname AS from_column, dst.relname AS to_table, "
-        "dst_col.attname AS to_column, con.conname AS constraint_name, k.key_position AS key_position "
-        "FROM pg_catalog.pg_constraint AS con "
-        "JOIN pg_catalog.pg_class AS src ON src.oid = con.conrelid "
-        "JOIN pg_catalog.pg_namespace AS n ON n.oid = src.relnamespace "
-        "JOIN pg_catalog.pg_class AS dst ON dst.oid = con.confrelid "
-        "CROSS JOIN LATERAL generate_subscripts(con.conkey, 1) AS k(key_position) "
-        "JOIN pg_catalog.pg_attribute AS src_col ON src_col.attrelid = con.conrelid "
-        "AND src_col.attnum = con.conkey[k.key_position] "
-        "JOIN pg_catalog.pg_attribute AS dst_col ON dst_col.attrelid = con.confrelid "
-        "AND dst_col.attnum = con.confkey[k.key_position] "
-        f"WHERE con.contype = 'f' AND n.nspname = {SCHEMA_PLACEHOLDER} AND dst.relnamespace = src.relnamespace "
-        "AND con.conparentid = 0",
-        ("src.relname", "k.key_position", "con.conname"), (0, 5, 4)),
+    # The declared keys, read by the statement the direct Postgres adapter runs too (`mnemiq.adapters.pg_keys`).
+    "foreign_keys": DECLARED_KEYS,
     "views": CatalogueStatement(
         f"SELECT c.relname AS view_name, pg_get_viewdef(c.oid, true) AS definition {_IN_SCHEMA} AND c.relkind = 'v'",
         ("c.relname",), (0,)),
@@ -120,7 +83,8 @@ VIEW_DIALECT = "postgres"
 
 # The characters a value a page continues from is never written with as itself, each written as `chr(<code>)` instead:
 # a backslash, which escapes the character after it in a literal where a server has `standard_conforming_strings` off
-# (see `_literal`), and an opening brace, which starts each of the template markers Superset reads, `{{`, `{%` and `{#`.
+# (see `schema_literal` in `mnemiq.adapters.pg_keys`), and an opening brace, which starts each of the template markers
+# Superset reads, `{{`, `{%` and `{#`.
 _BY_CODE = re.compile(r"([\\{])")
 
 
@@ -143,7 +107,7 @@ class PostgresCatalogue:
         two agree on which rows come after. The schema goes in first, so a value holding the placeholder stays as it
         is."""
         statement = CATALOGUE_SQL[method]
-        sql = statement.select.replace(SCHEMA_PLACEHOLDER, _literal(self._schema))
+        sql = statement.in_schema(self._schema)
         if after is not None:
             sql += f" AND {_row(statement.key)} > {_row(tuple(_key_value(value) for value in after))}"
         return f"{sql} ORDER BY {', '.join(statement.key)}"
@@ -225,25 +189,8 @@ def _text(text: str) -> str:
     """`text` as a Postgres string expression that holds neither a backslash nor an opening brace: each of those as
     `chr(<code>)`, each run of text between them as a literal, its quotes doubled, joined by `||` in parentheses. A
     name in the catalogue can hold either, which a literal cannot carry here (`_BY_CODE`)."""
-    parts = [f"chr({ord(part)})" if _BY_CODE.fullmatch(part) else _quoted(part)
+    parts = [f"chr({ord(part)})" if _BY_CODE.fullmatch(part) else quoted(part)
              for part in _BY_CODE.split(text) if part]
     if len(parts) <= 1:
         return parts[0] if parts else "''"
     return f"({' || '.join(parts)})"
-
-
-def _quoted(text: str) -> str:
-    """`text` as a Postgres string literal, each `'` in it doubled."""
-    return "'" + text.replace("'", "''") + "'"
-
-
-def _literal(text: str) -> str:
-    """`text` as a Postgres string literal: quoted, each `'` in it doubled.
-
-    A backslash is refused. Where a server has `standard_conforming_strings` off, a backslash in a literal escapes the
-    character after it, so a doubled quote could end the literal; and the escape string that reads the same either way,
-    `E'...'`, does not survive Superset, which runs a statement as its SQL parser writes it back, and that writes the
-    escape string's doubled backslashes as single ones."""
-    if "\\" in text:
-        raise ValueError(f"a schema name holding a backslash cannot be written as a literal here: {text!r}")
-    return _quoted(text)
