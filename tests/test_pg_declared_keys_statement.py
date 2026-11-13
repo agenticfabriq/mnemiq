@@ -1,7 +1,8 @@
 """The statement a direct Postgres source reads its declared foreign keys with is the one the Superset catalogue reads
-them with, rendered for the adapter's own schema, and a read the direct adapter cannot make returns `[]` with one
-WARNING naming the exception's type. No database: the adapter is a bare instance over a connection that records what it
-is sent. `tests/test_pg_declared_keys.py` runs the statement against a real Postgres.
+them with, rendered for the adapter's own schema by the name Postgres stores it under, and a read the direct adapter
+cannot make returns `[]` with one WARNING: naming the exception's type, or why the schema could not be resolved. No
+database: the adapter is a bare instance over a connection that records what it is sent.
+`tests/test_pg_declared_keys.py` runs the statements against a real Postgres.
 """
 
 from __future__ import annotations
@@ -24,20 +25,35 @@ TAG = "$q$"
 
 
 class _Recording:
-    """A DuckDB connection that records each statement it is sent and answers with no rows, or raises `error`."""
+    """A DuckDB connection that records each statement it is sent, with its parameters. The read of the stored schema
+    names matching the configured one is answered with `stored`, by default the configured name itself, as though a
+    schema of exactly that name were stored; the key statement with no rows. Or every statement raises `error`."""
 
-    def __init__(self, error: Exception | None = None) -> None:
+    def __init__(self, stored: tuple[str, ...] | None = None, error: Exception | None = None) -> None:
         self.sent: list[str] = []
+        self.params: list[list | None] = []
+        self.stored = stored
         self.error = error
+        self._rows: list[tuple] = []
 
-    def execute(self, sql: str, *args):
+    def execute(self, sql: str, params: list | None = None):
         self.sent.append(sql)
+        self.params.append(params)
         if self.error is not None:
             raise self.error
+        if "pg_constraint" in sql:
+            self._rows = []
+        else:
+            self._rows = [(name,) for name in (self.stored if self.stored is not None else params)]
         return self
 
     def fetchall(self) -> list[tuple]:
-        return []
+        return self._rows
+
+    def key_statements(self) -> list[str]:
+        """The statement sent to Postgres inside each key read sent, which is the only statement reading
+        `pg_constraint`."""
+        return [sql.split(TAG)[1] for sql in self.sent if "pg_constraint" in sql]
 
 
 def _postgres_adapter(schema: str, con: _Recording) -> DuckDBAdapter:
@@ -64,9 +80,9 @@ def test_the_direct_adapter_sends_the_statement_the_superset_catalogue_sends(sch
     which the catalogue sends with a page size after it."""
     con = _Recording()
     assert _postgres_adapter(schema, con).foreign_keys() == []
-    (sent,) = con.sent
+    (sent,) = [sql for sql in con.sent if "pg_constraint" in sql]
     assert sent.count(TAG) == 2, sent
-    direct = sent.split(TAG)[1]
+    (direct,) = con.key_statements()
 
     superset: list[str] = []
     PostgresCatalogue(lambda sql: superset.append(sql) or [], schema).foreign_keys()
@@ -75,10 +91,37 @@ def test_the_direct_adapter_sends_the_statement_the_superset_catalogue_sends(sch
     assert f"n.nspname = {pg_keys.quoted(schema)}" in direct
 
 
+def test_the_direct_adapter_reads_the_schema_by_its_stored_name():
+    """The configured schema is matched to a stored one as tables are, without regard to case and on DuckDB's side, the
+    configured name a parameter there; the key statement names the schema as Postgres stores it, as the Superset
+    catalogue's statement does for that stored name."""
+    con = _Recording(stored=("sales",))
+    assert _postgres_adapter("SALES", con).foreign_keys() == []
+    resolve, _ = con.sent
+    assert "lower(nspname) = lower(?)" in resolve and con.params[0] == ["SALES"]
+    assert "SALES" not in resolve
+    assert con.key_statements() == [PostgresCatalogue(lambda sql: [], "sales").statement("foreign_keys")]
+
+
+@pytest.mark.parametrize(("stored", "reason"), [
+    ((), "no schema is stored under that name, in any letter case"),
+    (("Sales", "sales"), "schemas 'Sales' and 'sales' both match it without regard to case"),
+    (("SALES", "Sales", "sales"), "schemas 'SALES', 'Sales' and 'sales' all match it without regard to case"),
+])
+def test_a_schema_resolving_to_no_stored_schema_or_to_two_reads_nothing(stored, reason, caplog):
+    """No key statement is sent: `[]`, and one WARNING saying which, naming no more than schemas."""
+    con = _Recording(stored=stored)
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        assert _postgres_adapter("SALES", con).foreign_keys() == []
+    assert con.key_statements() == []
+    (record,) = _warnings(caplog)
+    assert f"({reason})" in record.getMessage(), record.getMessage()
+
+
 def test_a_failed_read_logs_one_warning_naming_the_type_and_returns_nothing(caplog):
     """The exception's text can carry the DSN, password and all, so the WARNING names only its type."""
     dsn = "user=reader password=hunter2 host=db.internal port=5432 dbname=warehouse"
-    con = _Recording(duckdb.IOException(f'IO Error: Unable to connect to Postgres at "{dsn}"'))
+    con = _Recording(error=duckdb.IOException(f'IO Error: Unable to connect to Postgres at "{dsn}"'))
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         assert _postgres_adapter("public", con).foreign_keys() == []
     (record,) = _warnings(caplog)
@@ -90,24 +133,24 @@ def test_a_failed_read_logs_one_warning_naming_the_type_and_returns_nothing(capl
 
 
 def test_a_schema_the_literal_cannot_carry_is_a_read_not_made(caplog):
-    """A backslash in the schema is refused by the literal it is written as, so nothing is sent: `[]`, and the WARNING
-    any failed read logs."""
-    con = _Recording()
+    """A stored schema name holding a backslash is refused by the literal it is written as, so no key statement is
+    sent: `[]`, and the WARNING any failed read logs."""
+    con = _Recording(stored=("sa\\les' OR true --",))
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        assert _postgres_adapter("sa\\les' OR true --", con).foreign_keys() == []
-    assert con.sent == []
+        assert _postgres_adapter("SA\\LES' OR TRUE --", con).foreign_keys() == []
+    assert con.key_statements() == []
     (record,) = _warnings(caplog)
     assert "(ValueError)" in record.getMessage()
 
 
 def test_a_statement_holding_the_quote_tag_is_not_sent(caplog):
-    """The statement goes to `postgres_query` in a dollar-quoted string, which the quote's tag would end early. A schema
-    holding the tag makes such a statement, and it is refused rather than sent. The control: a schema holding a dollar
-    sign, without the tag, is sent as the statement itself."""
+    """The statement goes to `postgres_query` in a dollar-quoted string, which the quote's tag would end early. A stored
+    schema name holding the tag makes such a statement, and it is refused rather than sent. The control: a schema
+    holding a dollar sign, without the tag, is sent as the statement itself."""
     con = _Recording()
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         assert _postgres_adapter(f"a{TAG}) --", con).foreign_keys() == []
-    assert con.sent == []
+    assert con.key_statements() == []
     (record,) = _warnings(caplog)
     assert "(ValueError)" in record.getMessage()
 
@@ -115,8 +158,7 @@ def test_a_statement_holding_the_quote_tag_is_not_sent(caplog):
     control = _Recording()
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         assert _postgres_adapter("a$b", control).foreign_keys() == []
-    (sent,) = control.sent
-    assert sent.split(TAG)[1] == DECLARED_KEYS.whole("a$b")
+    assert control.key_statements() == [DECLARED_KEYS.whole("a$b")]
     assert _warnings(caplog) == []
 
 

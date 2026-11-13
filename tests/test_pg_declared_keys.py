@@ -2,9 +2,10 @@
 
 Each test reads keys from a database this module makes for itself on the server MNEMIQ_TEST_PG_KEYS_DSN names, and
 drops when it is done: a single-column key, a composite key declared in another column order than its tables', two keys
-between one pair of tables, two tables each declaring a key of one name, a key into another schema's table whose name `public` has too, a partitioned table that
-declares a key and is referenced by one, and a second schema, `sales`, with keys of its own. Without the variable every
-test here skips, naming it.
+between one pair of tables, two tables each declaring a key of one name, a key into another schema's table whose name
+`public` has too, a partitioned table that declares a key and is referenced by one, a second schema, `sales`, with keys
+of its own, a schema stored in mixed case, and two schemas whose names differ only in letter case. Without the variable
+every test here skips, naming it.
 
 Not marked `integration`: the root conftest seeds ACME into MNEMIQ_PG_DSN whenever an integration test is collected and
 both MNEMIQ_PG_DSN and MNEMIQ_ACME_DATA_DIR are set, and these tests need nothing of ACME's.
@@ -77,6 +78,20 @@ CREATE TABLE sales.region (id int PRIMARY KEY);
 CREATE TABLE sales.deal (id int PRIMARY KEY, region_id int, customer_id int,
     CONSTRAINT deal_region_fk FOREIGN KEY (region_id) REFERENCES sales.region (id),
     CONSTRAINT deal_customer_fk FOREIGN KEY (customer_id) REFERENCES public.customers (id));
+
+-- A schema stored in mixed case, and two schemas whose names differ only in letter case, each with a key.
+CREATE SCHEMA "Archive";
+CREATE TABLE "Archive".box (id int PRIMARY KEY);
+CREATE TABLE "Archive".item (id int PRIMARY KEY, box_id int,
+    CONSTRAINT item_box_fk FOREIGN KEY (box_id) REFERENCES "Archive".box (id));
+CREATE SCHEMA "Twin";
+CREATE TABLE "Twin".upper_parent (id int PRIMARY KEY);
+CREATE TABLE "Twin".upper_child (id int PRIMARY KEY, parent_id int,
+    CONSTRAINT upper_child_fk FOREIGN KEY (parent_id) REFERENCES "Twin".upper_parent (id));
+CREATE SCHEMA twin;
+CREATE TABLE twin.lower_parent (id int PRIMARY KEY);
+CREATE TABLE twin.lower_child (id int PRIMARY KEY, parent_id int,
+    CONSTRAINT lower_child_fk FOREIGN KEY (parent_id) REFERENCES twin.lower_parent (id));
 """
 
 # Every declared key in `public` whose two ends are both in `public`, one row for each column pair, in the order the
@@ -224,6 +239,35 @@ def test_a_configured_schema_other_than_public_reads_its_own_keys(keys_dsn):
     the default source reads none of `sales`'s."""
     assert _keys(keys_dsn, "sales") == SALES_KEYS
     assert not {"deal_region_fk", "deal_customer_fk"} & {key[4] for key in _keys(keys_dsn)}
+
+
+@pytest.mark.usefixtures("no_superset_mode")
+@pytest.mark.parametrize(("configured", "keys"), [
+    ("SALES", SALES_KEYS),
+    ("Sales", SALES_KEYS),
+    ("archive", [("item", "box_id", "box", "id", "item_box_fk")]),
+    ("ARCHIVE", [("item", "box_id", "box", "id", "item_box_fk")]),
+])
+def test_a_schema_configured_in_another_letter_case_reads_the_stored_schemas_keys(keys_dsn, configured, keys, caplog):
+    """The adapter lists a schema's tables without regard to case, and so reads its keys: `SALES` reads the stored
+    `sales`, `archive` the stored `Archive`, with nothing logged."""
+    with caplog.at_level(logging.WARNING, logger="mnemiq.adapters.duckdb"):
+        assert _keys(keys_dsn, configured) == keys
+    assert [r for r in caplog.records if r.name == "mnemiq.adapters.duckdb"] == []
+
+
+@pytest.mark.usefixtures("no_superset_mode")
+@pytest.mark.parametrize("configured", ["twin", "Twin", "TWIN"])
+def test_two_schemas_differing_only_in_letter_case_read_no_keys(keys_dsn, configured, caplog):
+    """`Twin` and `twin` are both stored, and the configured name, matched without regard to case, names both, whether
+    or not it spells one of them exactly. Which one is meant is not settled, so no key is read rather than one schema's
+    keys given as the other's: `[]`, and one WARNING naming both schemas."""
+    adapter = _adapter(keys_dsn, configured)
+    with caplog.at_level(logging.WARNING, logger="mnemiq.adapters.duckdb"):
+        assert adapter.foreign_keys() == []
+    (record,) = [r for r in caplog.records if r.name == "mnemiq.adapters.duckdb"]
+    assert record.levelno == logging.WARNING
+    assert "schemas 'Twin' and 'twin' both match it without regard to case" in record.getMessage()
 
 
 @pytest.mark.usefixtures("no_superset_mode")

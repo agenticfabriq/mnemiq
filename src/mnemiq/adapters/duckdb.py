@@ -17,6 +17,10 @@ logger = logging.getLogger(__name__)
 # The tag of the dollar-quoted string a statement is given to `postgres_query` in.
 _DOLLAR_TAG = "$q$"
 
+# Every schema name a Postgres database stores. The configured schema is matched against them on
+# DuckDB's side, without regard to case, as `introspect` and `list_columns` match it.
+_PG_SCHEMAS = "SELECT nspname FROM pg_catalog.pg_namespace"
+
 # Views for a Postgres source, read through `postgres_query` as declared keys are: DuckDB's proxy
 # reports every attached-Postgres view as a BASE TABLE, so asking it finds nothing at all.
 _PG_VIEW_QUERY = (
@@ -173,6 +177,11 @@ def _postgres_query(catalog: str, sql: str) -> str:
     return f"postgres_query({attach_literal(catalog)}, {_DOLLAR_TAG}{sql}{_DOLLAR_TAG})"
 
 
+class _SchemaUnresolved(LookupError):
+    """The configured schema matches no stored Postgres schema, or more than one, without regard to
+    case. Its message is written here from schema names alone, and quotes no DSN."""
+
+
 def _ended_by_statement_timeout(exc: Exception) -> bool:
     return "canceling statement due to statement timeout" in str(exc)
 
@@ -319,25 +328,47 @@ class DuckDBAdapter:
 
         A Postgres source is read by the statement the Superset catalogue reads keys with
         (`DECLARED_KEYS`), run whole in Postgres through `postgres_query`, in this adapter's own
-        schema: only keys declared there whose target is there too, never a partition's copy of
-        one. Only a Postgres source is read for keys: a SQLite source, whose keys DuckDB's scanner
-        does not expose, and a DuckDB file return []. A read that fails returns [] as well, and
-        enrichment infers relationships from the data instead; it logs a WARNING naming the
-        exception's type, never its text, which can carry the DSN.
+        schema, by the name Postgres stores it under (`_stored_schema`): only keys declared there
+        whose target is there too, never a partition's copy of one. Only a Postgres source is read
+        for keys: a SQLite source, whose keys DuckDB's scanner does not expose, and a DuckDB file
+        return []. A read that fails returns [] as well, and enrichment infers relationships from
+        the data instead; it logs a WARNING naming the exception's type, never its text, which can
+        carry the DSN, or saying why the schema could not be resolved.
         """
         if not self._fk_via_postgres:
             return []
         try:
+            schema = self._stored_schema()
             rows = self._con.execute(
                 "SELECT from_table, from_column, to_table, to_column, constraint_name FROM "
-                f"{_postgres_query(self._catalog, DECLARED_KEYS.whole(self._table_schema))}"
+                f"{_postgres_query(self._catalog, DECLARED_KEYS.whole(schema))}"
             ).fetchall()
         except Exception as exc:  # noqa: BLE001 -- any failure: enrichment falls back to inference
+            why = str(exc) if isinstance(exc, _SchemaUnresolved) else type(exc).__name__
             logger.warning("the declared foreign keys of Postgres schema %r could not be read (%s); "
                            "relationships will be inferred from the data instead",
-                           self._table_schema, type(exc).__name__)
+                           self._table_schema, why)
             return []
         return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
+
+    def _stored_schema(self) -> str:
+        """The configured schema's name as Postgres stores it, which the key statement compares
+        exactly.
+
+        The configured name is matched to the stored names without regard to case, so a source
+        configured as `SALES` reads the keys of a stored `sales`. Where it matches no stored schema,
+        or names two (`Sales` and `sales`), which one is meant is not settled: this raises, and no
+        key is read, rather than one schema's keys given as another's."""
+        stored = [name for (name,) in self._con.execute(
+            f"SELECT nspname FROM {_postgres_query(self._catalog, _PG_SCHEMAS)} "
+            "WHERE lower(nspname) = lower(?) ORDER BY nspname", [self._table_schema]).fetchall()]
+        if not stored:
+            raise _SchemaUnresolved("no schema is stored under that name, in any letter case")
+        if len(stored) > 1:
+            names = f"{', '.join(map(repr, stored[:-1]))} and {stored[-1]!r}"
+            raise _SchemaUnresolved(f"schemas {names} {'both' if len(stored) == 2 else 'all'} "
+                                    "match it without regard to case")
+        return stored[0]
 
     @property
     def functions_cover_view_bodies(self) -> bool:
