@@ -75,7 +75,8 @@ def _saved(name: str, expression: str, *, dataset_id: int = 1, certified_by=None
 def test_list_metrics_paged_by_dataset(fake):
     many = [_metric(1, f"m{i:02d}") for i in range(30)]
     _serve_metrics(fake, {1: many, 2: [_metric(2, "total", "SUM(x)", d3format=",d", verbose_name="Total")]})
-    _serve_extension(fake, {1: [_extension_row("m00", currency=USD, certified_by="finance")],
+    _serve_extension(fake, {1: [_extension_row("m00", currency=USD, certified_by="finance")]
+                            + [_extension_row(m["name"]) for m in many[1:]],
                             2: [_extension_row("total")]})
     saved = read_saved_metrics(_client(fake), dataset_ids=(1, 2))
     listed = [c.request for c in fake.calls if c.tool == "list_metrics"]
