@@ -74,6 +74,17 @@ def test_nested_aggregate_in_window_aggregates():
     assert aggregates("SUM(SUM(x)) OVER ()") is Aggregation.AGGREGATES
 
 
+@pytest.mark.parametrize("expression, expected", [
+    ("SUM(x) FILTER (WHERE y > 0) OVER ()", Aggregation.ROW_LEVEL),
+    ("COUNT(*) FILTER (WHERE y > 0) OVER (PARTITION BY z)", Aggregation.ROW_LEVEL),
+    ("SUM(x) FILTER (WHERE y > 0)", Aggregation.AGGREGATES),
+    ("SUM(SUM(x) FILTER (WHERE y > 0)) OVER ()", Aggregation.AGGREGATES),
+    ("FIRST_VALUE(x) IGNORE NULLS OVER ()", Aggregation.ROW_LEVEL),
+])
+def test_a_filtered_aggregate_under_a_window_is_row_level(expression, expected):
+    assert aggregates(expression) is expected
+
+
 def test_bare_column_is_row_level():
     assert aggregates("x") is Aggregation.ROW_LEVEL
 

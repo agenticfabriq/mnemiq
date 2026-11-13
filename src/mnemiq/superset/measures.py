@@ -71,6 +71,19 @@ _FORMATS = {
 }
 
 
+# What sqlglot puts between a window and its own function: `SUM(x) FILTER (WHERE y > 0) OVER ()` parses as a Window over
+# a Filter over the Sum, and `FIRST_VALUE(x) IGNORE NULLS OVER ()` as a Window over an IgnoreNulls.
+_WINDOW_WRAPPERS = (exp.Filter, exp.IgnoreNulls, exp.RespectNulls)
+
+
+def _is_windowed(agg: exp.Expression) -> bool:
+    """Whether `agg` is the function a window computes over, looking through the wrappers sqlglot places between them."""
+    node = agg
+    while isinstance(node.parent, _WINDOW_WRAPPERS) and node.parent.this is node:
+        node = node.parent
+    return isinstance(node.parent, exp.Window)
+
+
 def aggregates(expression: str) -> Aggregation:
     """Whether `expression` aggregates: some aggregate function not directly under a window. `SUM(x) OVER ()` is a
     row-level value, `SUM(SUM(x)) OVER ()` aggregates. A function mnemiq does not model, SQL that does not parse and
@@ -84,7 +97,7 @@ def aggregates(expression: str) -> Aggregation:
         return Aggregation.CANNOT_TELL
     if any(tree.find_all(exp.Anonymous)):
         return Aggregation.CANNOT_TELL
-    if any(not isinstance(agg.parent, exp.Window) for agg in tree.find_all(exp.AggFunc)):
+    if any(not _is_windowed(agg) for agg in tree.find_all(exp.AggFunc)):
         return Aggregation.AGGREGATES
     return Aggregation.ROW_LEVEL
 
@@ -100,7 +113,8 @@ def display_format(kind: MeasureKind, currency: str | None) -> tuple[str, dict |
 
 def measure_statement(measure: Measure, source: str, dimensions: tuple[str, ...] = (),
                       filters: tuple[str, ...] = ()) -> str:
-    """The statement that computes `measure` over `source` (a quoted table name or a parenthesized join), grouped by
+    """The statement that computes `measure` over `source` (a quoted table name or an unparenthesized join,
+    `a JOIN b ON ...`: the deciders refuse a parenthesized one as an unmodelled source), grouped by
     `dimensions` and narrowed by `filters`."""
     select = ", ".join([*dimensions, f"{measure.expression} AS {measure.name}"])
     sql = f"SELECT {select} FROM {source}"
