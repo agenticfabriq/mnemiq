@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from mnemiq.superset.charts import (HANDLEBARS_TEMPLATE, MCP_FAMILIES, ChartSpec, Family, Filter, SavedRef, WrittenRef,
-                                    extension_chart_request, generate_chart_request, plan_refusal)
+                                    extension_chart_request, generate_chart_request, owed_format_params, plan_refusal)
 from mnemiq.superset.measures import Measure, MeasureKind
 from mnemiq.superset.saved_metrics import UNKNOWN, SavedMetric
 
@@ -271,3 +271,34 @@ def test_row_limit_is_held_to_what_the_chart_model_accepts():
     assert plan_refusal(_spec(Family.GAUGE, row_limit=10), interactive_pivot_available=True) is None
     assert plan_refusal(_spec(Family.PIE, row_limit=0), interactive_pivot_available=True)
     assert "row_limit" not in _build(_spec(Family.BIG_NUMBER, row_limit=50))["config"]
+
+
+def test_table_currency_is_owed_as_column_config():
+    """`TableColumnConfig` cannot send a currency; the table plugin reads `column_config[col].currencyFormat`."""
+    spec = _spec(Family.TABLE, measures=[WrittenRef(_measure()), WrittenRef(_measure("orders", K.COUNT,
+                                                                                  expression="COUNT(*)")),
+                                         SavedRef("saved_rate", K.PERCENT)])
+    assert owed_format_params(spec, {}, {}) == {"column_config": {
+        "Revenue": {"d3NumberFormat": ",.2f", "currencyFormat": USD},
+        "Orders": {"d3NumberFormat": ",d"},
+        "saved_rate": {"d3NumberFormat": ",.1%"}}}
+    saved = {"s": SavedMetric(7, "s", "SUM(x)", None, None, {"symbol": "EUR", "symbolPosition": "prefix"}, None,
+                              None)}
+    got = owed_format_params(_spec(Family.TABLE, measures=[SavedRef("s", K.CURRENCY)]), {}, saved)
+    assert got["column_config"]["s"]["currencyFormat"] == {"symbol": "EUR", "symbolPosition": "prefix"}
+    # no currency measure: the request already carries every column's format
+    plain = _spec(Family.TABLE, measures=[WrittenRef(_measure("orders", K.COUNT, expression="COUNT(*)"))])
+    assert owed_format_params(plain, {}, {}) == {}
+
+
+def test_treemap_format_is_owed():
+    """`TreemapChartConfig` has no format field; the treemap plugin reads `number_format` and `currency_format`."""
+    assert owed_format_params(_spec(Family.TREEMAP), {}, {}) == {"number_format": ",.2f", "currency_format": USD}
+    pct = _spec(Family.TREEMAP, measures=[WrittenRef(_measure("rate", K.PERCENT, expression="AVG(r)"))])
+    assert owed_format_params(pct, {}, {}) == {"number_format": ",.1%"}
+
+
+@pytest.mark.parametrize("family", sorted(MCP_FAMILIES - {Family.TABLE, Family.TREEMAP}, key=str))
+def test_families_whose_request_carries_the_format_owe_nothing(family):
+    changes, _ = CASES[family]
+    assert owed_format_params(_spec(family, **changes), {}, {}) == {}

@@ -19,7 +19,7 @@ from mnemiq.superset.measures import Measure, MeasureKind, display_format
 from mnemiq.superset.saved_metrics import SavedMetric
 
 __all__ = ["ChartSpec", "Family", "Filter", "MCP_FAMILIES", "MeasureRef", "SavedRef", "WrittenRef",
-           "extension_chart_request", "generate_chart_request", "plan_refusal"]
+           "extension_chart_request", "generate_chart_request", "owed_format_params", "plan_refusal"]
 
 
 class Family(StrEnum):
@@ -331,6 +331,28 @@ def generate_chart_request(spec: ChartSpec, measures: dict[str, Measure], saved:
         raise ValueError(f"{spec.family.name.lower()} is not an MCP chart type; build it with extension_chart_request")
     return {"dataset_id": spec.dataset_id, "config": _config(spec, measures, saved), "chart_name": spec.title,
             "save_chart": True, "generate_preview": False}
+
+
+def owed_format_params(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, SavedMetric]) -> dict:
+    """The top-level `params` keys to set after the chart is created, for a format rc2's renderers read and MCP's
+    models cannot send: a table's per-column `currencyFormat` (`TableColumnConfig` has only `d3NumberFormat`) and a
+    treemap's `number_format` and `currency_format` (`TreemapChartConfig` has no format field). Empty when the request
+    already carries the measure's whole format. The table's value is the whole `column_config`, every column the request
+    set included, since a patch replaces a top-level key. Histogram and handlebars have no metric format key at all, so
+    they owe nothing."""
+    refs = spec.measures
+    if spec.family is Family.TABLE:
+        if not any(_kind(ref) is MeasureKind.CURRENCY and _currency(ref, saved) for ref in refs):
+            return {}
+        config = {}
+        for ref in refs:
+            fmt, currency = display_format(_kind(ref), _currency(ref, saved))
+            config[_label(ref, measures)] = {"d3NumberFormat": fmt, **({"currencyFormat": currency} if currency else {})}
+        return {"column_config": config}
+    if spec.family is Family.TREEMAP:
+        fmt, currency = _format(refs, saved)
+        return {"number_format": fmt, **({"currency_format": currency} if currency else {})}
+    return {}
 
 
 # Superset's simple-filter operators, as the explore filter control writes them, for the operators FilterConfig allows.
