@@ -2,7 +2,7 @@
 
 Each test reads keys from a database this module makes for itself on the server MNEMIQ_TEST_PG_KEYS_DSN names, and
 drops when it is done: a single-column key, a composite key declared in another column order than its tables', two keys
-between one pair of tables, a key into another schema's table whose name `public` has too, a partitioned table that
+between one pair of tables, two tables each declaring a key of one name, a key into another schema's table whose name `public` has too, a partitioned table that
 declares a key and is referenced by one, and a second schema, `sales`, with keys of its own. Without the variable every
 test here skips, naming it.
 
@@ -23,7 +23,9 @@ from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 from mnemiq.adapters.resolve import adapter_for
+from mnemiq.catalog import introspect
 from mnemiq.config import SourceSpec
+from mnemiq.enrichment.joins import relationships_from_foreign_keys
 
 DSN_VARIABLE = "MNEMIQ_TEST_PG_KEYS_DSN"
 
@@ -43,6 +45,13 @@ CREATE TABLE account (id int PRIMARY KEY);
 CREATE TABLE transfer (id int PRIMARY KEY, from_account int, to_account int,
     CONSTRAINT transfer_from_fk FOREIGN KEY (from_account) REFERENCES account (id),
     CONSTRAINT transfer_to_fk FOREIGN KEY (to_account) REFERENCES account (id));
+
+-- Two tables each declaring a key named `fk_customer`: Postgres keeps a key's name unique on its table, not in its
+-- schema.
+CREATE TABLE invoices (id int PRIMARY KEY, cust int,
+    CONSTRAINT fk_customer FOREIGN KEY (cust) REFERENCES customers (id));
+CREATE TABLE payments (id int PRIMARY KEY, customer_id int,
+    CONSTRAINT fk_customer FOREIGN KEY (customer_id) REFERENCES customers (id));
 
 -- A key into schema `other`, whose `region` has a namesake in `public`, beside a key into that namesake.
 CREATE SCHEMA other;
@@ -76,9 +85,11 @@ PUBLIC_KEYS = [
     ("event", "warehouse_id", "warehouse", "id", "event_warehouse_fk"),
     ("event_note", "event_id", "event", "id", "note_event_fk"),
     ("event_note", "event_region", "event", "region_id", "note_event_fk"),
+    ("invoices", "cust", "customers", "id", "fk_customer"),
     ("orders", "customer_id", "customers", "id", "orders_customer_fk"),
     ("pair_line", "b_id", "pair", "b_id", "line_pair_fk"),
     ("pair_line", "a_id", "pair", "a_id", "line_pair_fk"),
+    ("payments", "customer_id", "customers", "id", "fk_customer"),
     ("store", "home_region_id", "region", "id", "store_home_region_fk"),
     ("transfer", "from_account", "account", "id", "transfer_from_fk"),
     ("transfer", "to_account", "account", "id", "transfer_to_fk"),
@@ -133,10 +144,15 @@ def no_superset_mode(monkeypatch) -> None:
             monkeypatch.delenv(name)
 
 
+def _adapter(dsn: str, schema: str = ""):
+    """A Postgres source on `dsn`, built as a source spec builds it: `schema` is the spec's schema, which the resolver
+    reads as `public` when empty."""
+    return adapter_for(SourceSpec(id="keys", kind="postgres", target=dsn, catalog="src", schema=schema))
+
+
 def _keys(dsn: str, schema: str = "") -> list[tuple[str, str, str, str, str]]:
-    """The keys a Postgres source on `dsn` reports, built as a source spec builds it: `schema` is the spec's schema,
-    which the resolver reads as `public` when empty."""
-    return adapter_for(SourceSpec(id="keys", kind="postgres", target=dsn, catalog="src", schema=schema)).foreign_keys()
+    """The keys that source reports."""
+    return _adapter(dsn, schema).foreign_keys()
 
 
 def _of(keys: list[tuple], *tables: str) -> list[tuple]:
@@ -187,6 +203,19 @@ def test_a_partitioned_table_lists_only_its_declared_keys(keys_dsn):
 def test_two_keys_between_one_pair_of_tables_stay_two(keys_dsn):
     assert _of(_keys(keys_dsn), "transfer") == [("transfer", "from_account", "account", "id", "transfer_from_fk"),
                                                 ("transfer", "to_account", "account", "id", "transfer_to_fk")]
+
+
+@pytest.mark.usefixtures("no_superset_mode")
+def test_two_tables_declaring_a_key_of_one_name_are_two_relationships(keys_dsn):
+    """`invoices` and `payments` each declare `fk_customer`. Read through the adapter and made relationships by
+    enrichment, each is a relationship of its own table, with its own column, beside `orders`'s key to the same table."""
+    adapter = _adapter(keys_dsn)
+    relationships = [r for r in relationships_from_foreign_keys(adapter, introspect(adapter)) if r.to == "customers"]
+    assert [(r.id, r.from_, [(k.left, k.right) for k in r.join_keys]) for r in relationships] == [
+        ("invoices.cust->customers", "invoices", [("cust", "id")]),
+        ("orders.customer_id->customers", "orders", [("customer_id", "id")]),
+        ("payments.customer_id->customers", "payments", [("customer_id", "id")]),
+    ]
 
 
 @pytest.mark.usefixtures("no_superset_mode")

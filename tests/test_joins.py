@@ -195,3 +195,22 @@ def test_a_true_composite_fk_is_one_relationship_with_two_keys(tmp_path):
 
     assert len(rels) == 1
     assert {(k.left, k.right) for k in rels[0].join_keys} == {("pa", "a"), ("pb", "b")}
+
+
+def test_keys_of_one_name_on_two_tables_are_two_relationships():
+    """A key's name is unique on its table, not in its schema (Postgres), so `fk_customer` on `invoices` and on `orders`
+    are two keys: two relationships, each with its own table's column, never one merged across both tables."""
+    from mnemiq.catalog import TableInfo
+
+    class _Keys:
+        def foreign_keys(self):
+            return [("invoices", "cust", "customers", "id", "fk_customer"),
+                    ("orders", "customer_id", "customers", "id", "fk_customer")]
+
+    catalog = [TableInfo(name) for name in ("customers", "invoices", "orders")]
+    rels = relationships_from_foreign_keys(_Keys(), catalog)
+
+    assert [(r.id, r.from_, r.to, [(k.left, k.right) for k in r.join_keys]) for r in rels] == [
+        ("invoices.cust->customers", "invoices", "customers", [("cust", "id")]),
+        ("orders.customer_id->customers", "orders", "customers", [("customer_id", "id")]),
+    ]
