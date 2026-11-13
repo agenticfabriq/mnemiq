@@ -1,0 +1,140 @@
+{
+  "success": true,
+  "rows": [
+    {
+      "id": 24,
+      "premium": 988.12,
+      "issued": "2024-06-17",
+      "issued_at": "2024-06-17T09:30:00",
+      "issued_utc": "2024-06-17T09:30:00Z",
+      "doc": {
+        "channel": "web",
+        "riders": 0
+      },
+      "nothing": null
+    },
+    {
+      "id": 25,
+      "premium": 125.25,
+      "issued": "2024-06-24",
+      "issued_at": "2024-06-24T09:30:00",
+      "issued_utc": "2024-06-24T09:30:00Z",
+      "doc": null,
+      "nothing": null
+    }
+  ],
+  "columns": [
+    {
+      "name": "id",
+      "type": "int64",
+      "is_nullable": null
+    },
+    {
+      "name": "premium",
+      "type": "object",
+      "is_nullable": null
+    },
+    {
+      "name": "issued",
+      "type": "object",
+      "is_nullable": null
+    },
+    {
+      "name": "issued_at",
+      "type": "datetime64[us]",
+      "is_nullable": null
+    },
+    {
+      "name": "issued_utc",
+      "type": "datetime64[ns, UTC]",
+      "is_nullable": null
+    },
+    {
+      "name": "doc",
+      "type": "object",
+      "is_nullable": null
+    },
+    {
+      "name": "nothing",
+      "type": "object",
+      "is_nullable": null
+    }
+  ],
+  "row_count": 2,
+  "affected_rows": null,
+  "execution_time": 0.06321477890014648,
+  "error": null,
+  "error_type": null,
+  "statements": [
+    {
+      "original_sql": "SELECT\n  id,\n  premium,\n  issued,\n  issued + CAST('09:30' AS TIME) AS issued_at,\n  (\n    issued + CAST('09:30' AS TIME)\n  ) AT TIME ZONE 'UTC' AS issued_utc,\n  doc,\n  CAST(NULL AS TEXT) AS nothing\nFROM policy\nWHERE\n  id IN (24, 25)\nORDER BY\n  id",
+      "executed_sql": "SELECT\n  id,\n  premium,\n  issued,\n  issued + CAST('09:30' AS TIME) AS issued_at,\n  (\n    issued + CAST('09:30' AS TIME)\n  ) AT TIME ZONE 'UTC' AS issued_utc,\n  doc,\n  CAST(NULL AS TEXT) AS nothing\nFROM policy\nWHERE\n  id IN (24, 25)\nORDER BY\n  id",
+      "row_count": 2,
+      "execution_time_ms": 2.6297569274902344,
+      "data": {
+        "rows": [
+          {
+            "id": 24,
+            "premium": 988.12,
+            "issued": "2024-06-17",
+            "issued_at": "2024-06-17T09:30:00",
+            "issued_utc": "2024-06-17T09:30:00Z",
+            "doc": {
+              "channel": "web",
+              "riders": 0
+            },
+            "nothing": null
+          },
+          {
+            "id": 25,
+            "premium": 125.25,
+            "issued": "2024-06-24",
+            "issued_at": "2024-06-24T09:30:00",
+            "issued_utc": "2024-06-24T09:30:00Z",
+            "doc": null,
+            "nothing": null
+          }
+        ],
+        "columns": [
+          {
+            "name": "id",
+            "type": "int64",
+            "is_nullable": null
+          },
+          {
+            "name": "premium",
+            "type": "object",
+            "is_nullable": null
+          },
+          {
+            "name": "issued",
+            "type": "object",
+            "is_nullable": null
+          },
+          {
+            "name": "issued_at",
+            "type": "datetime64[us]",
+            "is_nullable": null
+          },
+          {
+            "name": "issued_utc",
+            "type": "datetime64[ns, UTC]",
+            "is_nullable": null
+          },
+          {
+            "name": "doc",
+            "type": "object",
+            "is_nullable": null
+          },
+          {
+            "name": "nothing",
+            "type": "object",
+            "is_nullable": null
+          }
+        ]
+      }
+    }
+  ],
+  "multi_statement_warning": null,
+  "template_warning": null
+}

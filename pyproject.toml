@@ -101,7 +101,7 @@ exclude = ["src/mnemiq/starter_profiles/.publish.lock", "src/mnemiq/starter_prof
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = [".", "src"]
-markers = ["integration: needs a live database (Postgres, Oracle via MNEMIQ_ORACLE_TEST_DSN, or MySQL via MNEMIQ_TEST_MYSQL_DSN)", "live_llm: needs a live LLM endpoint"]
+markers = ["integration: needs a live database (Postgres, Oracle via MNEMIQ_ORACLE_TEST_DSN, or MySQL via MNEMIQ_TEST_MYSQL_DSN) or a live Superset (MNEMIQ_TEST_SUPERSET_*, see tests/superset_live/conftest.py)", "live_llm: needs a live LLM endpoint"]
 
 [tool.ruff]
 line-length = 100
