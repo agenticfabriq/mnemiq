@@ -181,3 +181,18 @@ def test_a_metric_the_extension_does_not_answer_for_is_unknown_not_none(fake):
         assert by_name[key].currency is UNKNOWN and by_name[key].certified_by is UNKNOWN
     assert by_name[(1, "c")].currency is None and by_name[(1, "c")].certified_by is None
     assert by_name[(1, "a")].currency == USD and by_name[(1, "a")].certified_by == "finance"
+
+
+def test_a_dataset_the_extension_marked_too_large_is_unknown_not_none(fake):
+    """The extension answers a dataset whose metrics do not fit its size cap as `{dataset_id, too_large}` with no
+    `metrics`: its saved metrics are unknown (the builder saw them in `list_metrics`), never "without currency"."""
+    _serve_metrics(fake, {1: [_metric(1, "a")], 2: [_metric(2, "z")]})
+
+    def answer(request, authorization):
+        return {"datasets": [{"dataset_id": 1, "metrics": [_extension_row("a", currency=USD)]},
+                             {"dataset_id": 2, "too_large": True}]}
+
+    fake.reply(DATASET_METRICS, answer)
+    by_name = {(s.dataset_id, s.name): s for s in read_saved_metrics(_client(fake), dataset_ids=(1, 2))}
+    assert by_name[(2, "z")].currency is UNKNOWN and by_name[(2, "z")].certified_by is UNKNOWN
+    assert by_name[(1, "a")].currency == USD

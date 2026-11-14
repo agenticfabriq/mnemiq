@@ -137,3 +137,59 @@ def test_get_layout_refuses_an_answer_over_forty_kilobytes(monkeypatch):
 def test_a_bad_request_is_answered_not_raised():
     assert reads.dataset_metrics({"dataset_ids": [0]}) == {"refused": "request", "field": "dataset_ids"}
     assert reads.get_layout("nope") == {"refused": "request"}
+
+
+# ---------------------------------------------------------------- the size cap, one for all three tools
+
+def size(answer):
+    return len(json.dumps(answer).encode())
+
+
+def test_dataset_metrics_marks_the_datasets_that_do_not_fit(monkeypatch):
+    """Superset's size guard raises (with its own text) on an over-limit extension answer, so the tool keeps the
+    envelope and answers the datasets that do not fit, in request order, as `{dataset_id, too_large}`."""
+    fat = "x" * 15_000
+    held = {i: SimpleNamespace(id=i, metrics=[metric(f"m{i}", warning=fat)]) for i in (1, 2, 3, 4)}
+    monkeypatch.setattr(writes, "_dataset", lambda dataset_id: held.get(dataset_id))
+    answer = reads.dataset_metrics({"dataset_ids": [1, 2, 3, 4]})
+    assert set(answer) == {"datasets"}
+    assert [d["dataset_id"] for d in answer["datasets"]] == [1, 2, 3, 4]
+    assert ["metrics" in d for d in answer["datasets"]] == [True, True, False, False]
+    assert answer["datasets"][2] == {"dataset_id": 3, "too_large": True}
+    assert size(answer) <= reads.MAX_ANSWER_BYTES
+
+
+def test_one_dataset_alone_over_the_cap_is_marked(monkeypatch):
+    held = {1: SimpleNamespace(id=1, metrics=[metric("m", warning="x" * 50_000)]),
+            2: SimpleNamespace(id=2, metrics=[metric("small")])}
+    monkeypatch.setattr(writes, "_dataset", lambda dataset_id: held.get(dataset_id))
+    answer = reads.dataset_metrics({"dataset_ids": [1]})
+    assert answer == {"datasets": [{"dataset_id": 1, "too_large": True}]}
+    # Order is kept and the rest are marked once one does not fit, so a later small one is not answered out of turn.
+    both = reads.dataset_metrics({"dataset_ids": [1, 2]})
+    assert both == {"datasets": [{"dataset_id": 1, "too_large": True}, {"dataset_id": 2, "too_large": True}]}
+
+
+def test_editors_of_marks_the_entries_that_do_not_fit(monkeypatch):
+    def subject(label):
+        return SimpleNamespace(label=label)
+
+    fat = "x" * 15_000
+    charts = {i: SimpleNamespace(editors=[subject(fat + str(i))]) for i in (1, 2, 3)}
+    datasets = {5: SimpleNamespace(editors=[subject("amy")])}
+    monkeypatch.setattr(reads, "_chart", lambda chart_id: charts.get(chart_id))
+    monkeypatch.setattr(writes, "_dataset", lambda dataset_id: datasets.get(dataset_id))
+    answer = reads.editors_of({"chart_ids": [1, 2, 3], "dataset_ids": [5]})
+    assert set(answer) == {"charts", "datasets"}
+    assert [("editors" in c) for c in answer["charts"]] == [True, True, False]
+    assert answer["charts"][2] == {"chart_id": 3, "too_large": True}
+    assert answer["datasets"] == [{"dataset_id": 5, "too_large": True}]
+    assert size(answer) <= reads.MAX_ANSWER_BYTES
+
+
+def test_the_three_tools_share_one_cap():
+    assert reads.MAX_ANSWER_BYTES == reads.MAX_LAYOUT_BYTES == 40_000
+
+
+def test_an_empty_currency_is_answered_as_none():
+    assert reads.metric_answer(metric("a", currency={}))["currency"] is None

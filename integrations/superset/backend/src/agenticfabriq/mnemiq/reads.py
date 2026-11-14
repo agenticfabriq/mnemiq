@@ -12,10 +12,12 @@ They change nothing. Each keeps the write tools' rules that apply to a read:
 An editor's label (`Subject.label`) is returned only for an object the caller may read, and only in the answer
 itself, which mnemiq passes to the person's panel; no label goes into a log line or an error.
 
-Superset's MCP response size guard (`superset/mcp_service/middleware.py`, `ResponseSizeGuardMiddleware`) raises on an
-answer over its limit (50,000 bytes by default). `get_layout` is the one answer a person's work can make that large,
-so it refuses an answer over `MAX_LAYOUT_BYTES` itself with `{"too_large": True}`; the others are bounded by their
-request (`MAX_DATASETS`, `MAX_CHARTS`).
+Superset's MCP response size guard (`superset/mcp_service/middleware.py`, `ResponseSizeGuardMiddleware`) does not
+truncate an extension tool's answer: over its limit (50,000 bytes by default) the call fails with Superset's own text.
+So every read tool keeps its answer under `MAX_ANSWER_BYTES` itself, by one helper (`fit`): `get_layout` refuses a
+layout over it with `{"too_large": True}`, and the tools that answer a list keep their envelope and answer each entry
+that does not fit as `{<id field>: N, "too_large": True}` (entries fill in request order, and once one does not fit
+the rest are marked). A caller treats a marked entry as unanswered.
 
 Superset is imported inside the tools, as in `writes`, so this module imports without it.
 """
@@ -30,8 +32,9 @@ from agenticfabriq.mnemiq.writes import _Field
 
 MAX_DATASETS = 20
 MAX_CHARTS = 100
-# A layout answer larger than this, in bytes of its JSON text, is refused: well under the guard's 50,000.
-MAX_LAYOUT_BYTES = 40_000
+# An answer larger than this, in bytes of its JSON text, is not sent: well under the guard's 50,000.
+MAX_ANSWER_BYTES = 40_000
+MAX_LAYOUT_BYTES = MAX_ANSWER_BYTES
 TOO_LARGE = {"too_large": True}
 
 
@@ -54,6 +57,24 @@ REQUESTS: dict[str, dict[str, _Field]] = {
 }
 
 
+def _size(answer: Any) -> int:
+    return len(json.dumps(answer).encode())
+
+
+def fit(entries: list, build, mark) -> dict:
+    """`build(entries)`'s answer with as many of `entries`, in order, as keep it within `MAX_ANSWER_BYTES`; each entry
+    after the first that does not fit is `mark(entry)` in its place. The one cap every read tool answers under."""
+    kept: list = []
+    full = False
+    for entry in entries:
+        if not full and _size(build([*kept, entry])) <= MAX_ANSWER_BYTES:
+            kept.append(entry)
+        else:
+            full = True
+            kept.append(mark(entry))
+    return build(kept)
+
+
 def read(tool: str, request: Any) -> dict:
     """`request` read for the read tool `tool`; raises `Refused` as `writes.read` does."""
     return writes.read(tool, request, REQUESTS)
@@ -73,7 +94,7 @@ def metric_answer(metric: Any) -> dict:
     certification = _certification(metric)
     currency = getattr(metric, "currency", None)
     return {"metric_name": metric.metric_name, "expression": metric.expression, "d3format": metric.d3format,
-            "currency": dict(currency) if isinstance(currency, dict) else None,
+            "currency": (dict(currency) or None) if isinstance(currency, dict) else None,
             "certified_by": certification.get("certified_by"), "certification_details": certification.get("details"),
             "warning_text": metric.warning_text}
 
@@ -89,7 +110,7 @@ def dataset_metrics(found: dict) -> dict:
         dataset = writes._dataset(dataset_id)
         if dataset is not None:
             datasets.append({"dataset_id": dataset_id, "metrics": [metric_answer(m) for m in dataset.metrics]})
-    return {"datasets": datasets}
+    return fit(datasets, lambda kept: {"datasets": kept}, lambda d: {"dataset_id": d["dataset_id"], **TOO_LARGE})
 
 
 def _chart(chart_id: int) -> Any:
@@ -110,23 +131,32 @@ def _labels(resource: Any) -> list[str]:
 def editors_of(found: dict) -> dict:
     """The editors' labels of each chart and dataset the caller may read, for the person's panel (who to ask for
     access). An object the caller may not read, or that does not exist, is left out."""
-    charts = [{"chart_id": chart_id, "editors": _labels(chart)}
-              for chart_id in found["chart_ids"] if (chart := _chart(chart_id)) is not None]
-    datasets = [{"dataset_id": dataset_id, "editors": _labels(dataset)}
+    entries = [("charts", {"chart_id": chart_id, "editors": _labels(chart)})
+               for chart_id in found["chart_ids"] if (chart := _chart(chart_id)) is not None]
+    entries += [("datasets", {"dataset_id": dataset_id, "editors": _labels(dataset)})
                 for dataset_id in found["dataset_ids"] if (dataset := writes._dataset(dataset_id)) is not None]
-    return {"charts": charts, "datasets": datasets}
+
+    def build(kept: list) -> dict:
+        return {key: [entry for kind, entry in kept if kind == key] for key in ("charts", "datasets")}
+
+    def mark(pair: tuple) -> tuple:
+        kind, entry = pair
+        field = "chart_id" if kind == "charts" else "dataset_id"
+        return kind, {field: entry[field], **TOO_LARGE}
+
+    return fit(entries, build, mark)
 
 
 @writes._answering("get_layout", REQUESTS)
 def get_layout(found: dict) -> dict:
     """The dashboard's stored `position_json` as the text it is stored in, and its `changed_on` as ISO 8601 text (what
     MCP's `get_dashboard_info` answers, and `set_layout` takes back as `expect_changed_on`), for a dashboard the caller
-    may read; else `{"not_found": "dashboard"}`. An answer over `MAX_LAYOUT_BYTES` is `{"too_large": True}`."""
+    may read; else `{"not_found": "dashboard"}`. An answer over `MAX_ANSWER_BYTES` is `{"too_large": True}`."""
     dashboard = writes._dashboard(found["dashboard_id"])
     if dashboard is None:
         return writes._not_found("dashboard")
     answer = {"dashboard_id": found["dashboard_id"], "position_json": dashboard.position_json,
               "changed_on": dashboard.changed_on.isoformat() if dashboard.changed_on is not None else None}
-    if len(json.dumps(answer).encode()) > MAX_LAYOUT_BYTES:
+    if _size(answer) > MAX_ANSWER_BYTES:
         return dict(TOO_LARGE)
     return answer
