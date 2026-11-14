@@ -973,6 +973,84 @@ def test_non_editor_gets_editor_labels_not_a_change(live, extension, policy_id):
     observe("not_editor", editors=refused["editors"])
 
 
+def subject_of(*, username: str | None = None, role: str | None = None) -> int:
+    """The editor subject standing for the user `username`, or for the role `role`."""
+    if username is not None:
+        (row,) = metadata("SELECT s.id FROM subjects s JOIN ab_user u ON u.id = s.user_id "
+                          "WHERE u.username = %s AND s.type = 1", (username,))
+    else:
+        (row,) = metadata("SELECT s.id FROM subjects s JOIN ab_role r ON r.id = s.role_id "
+                          "WHERE r.name = %s AND s.type = 2", (role,))
+    return row[0]
+
+
+def labels_of(subject_ids: list[int]) -> list[str]:
+    return [row[0] for row in metadata("SELECT label FROM subjects WHERE id = ANY(%s) ORDER BY 1", (subject_ids,))]
+
+
+def set_dashboard_editors(live, username: str, dashboard_id: int, subject_ids: list[int]) -> None:
+    """As `username`, signed in, the dashboard's editors set to `subject_ids` through Superset's own REST API
+    (`PUT /api/v1/dashboard/<id>`), as a person sets them in Superset: users and roles alike."""
+    with live.signed_in(username) as (client, headers):
+        csrf = live.csrf_token(client, headers)
+        answer = client.put(f"/api/v1/dashboard/{dashboard_id}", json={"editors": subject_ids},
+                            headers={**headers, "X-CSRFToken": csrf})
+    assert answer.status_code == 200, f"HTTP {answer.status_code}"
+
+
+def dataset_rows_as(live, username: str, dataset_id: int):
+    """`username`'s request, signed in, for the dataset's policies by region through Superset's own chart data API
+    (`POST /api/v1/chart/data`), whose access check (`raise_for_access` on the query context's datasource) counts
+    being the dataset's editor as access."""
+    body = {"datasource": {"id": dataset_id, "type": "table"}, "force": True, "result_format": "json",
+            "result_type": "full",
+            "queries": [{"columns": ["region"], "orderby": [], "row_limit": 100,
+                         "metrics": [{"expressionType": "SQL", "sqlExpression": "COUNT(*)", "label": "policies"}]}]}
+    with live.signed_in(username) as (client, headers):
+        csrf = live.csrf_token(client, headers)
+        return client.post("/api/v1/chart/data", json=body, headers={**headers, "X-CSRFToken": csrf})
+
+
+def test_a_claimed_dataset_gets_only_editors_who_could_already_read_it(live, extension):
+    """In rc2 a dataset's editors may read its data (`raise_for_access` admits them), and a role made an editor makes
+    every member one, so `claim_dataset` adds as editors the caller and only those of the dashboard's users who may
+    already read the dataset, never a role.
+
+    analyst's dashboard is edited, through Superset's own API, by analyst, `west` (Alpha: may read every dataset),
+    `gamma_only` (Gamma: may not read the dataset), `policy_only` (granted the `policy` dataset alone, not this one),
+    and the roles Gamma and Alpha. analyst makes a virtual dataset over `policy` and claims it for the dashboard:
+    - the dataset's editors are then exactly analyst and west;
+    - `gamma_only` still may not read the dataset: Superset's chart data API answers its request 403, where
+      analyst's same request answers each region's count, the source's;
+    - `east` (Alpha, who may read the dataset, and edits the dashboard through the Alpha role alone) adding a metric
+      to it is answered `{not_editor: true, editors: [analyst's and west's labels]}`, and the dataset's metrics are as
+      they were."""
+    analyst = as_user(live, BUILDER)
+    build = new_build(analyst, "dataset editors")
+    editors = ([subject_of(username=name) for name in (BUILDER, "west", "gamma_only", "policy_only")]
+               + [subject_of(role=name) for name in ("Gamma", "Alpha")])
+    set_dashboard_editors(live, BUILDER, build.dashboard_id, editors)
+    assert editor_ids("dashboard_editors", "dashboard_id", build.dashboard_id) == sorted(editors)
+    dataset_id = _claimed_dataset(live, build, "data")
+    after = editor_ids("sqlatable_editors", "table_id", dataset_id)
+    refused_data = dataset_rows_as(live, "gamma_only", dataset_id)
+    observe("dataset_editors", dashboard=labels_of(editors), dataset=labels_of(after),
+            gamma_only_data=refused_data.status_code)
+    assert after == sorted([subject_of(username=BUILDER), subject_of(username="west")]), labels_of(after)
+    assert refused_data.status_code == 403 and "result" not in refused_data.json(), refused_data.status_code
+    control = dataset_rows_as(live, BUILDER, dataset_id)
+    assert control.status_code == 200, control.status_code
+    rows = sorted((row["region"], row["policies"]) for row in control.json()["result"][0]["data"])
+    assert rows == sorted(ground_truth(live, "SELECT region, count(*) FROM policy GROUP BY 1"))
+    metrics_before = stored_metrics(dataset_id)
+    east = as_user(live, "east")
+    refused = {"not_editor": True, "editors": sorted([label_of(BUILDER), label_of("west")])}
+    assert call(east, "add_saved_metric", dataset_id=dataset_id, metric=_metric("east_metric"),
+                expect_changed_on=changed_on(east, "dataset", dataset_id)) == refused
+    assert stored_metrics(dataset_id) == metrics_before
+    observe("dataset_editors_not_editor", editors=refused["editors"], analyst_rows=len(rows))
+
+
 def test_delete_dataset_refuses_while_a_chart_uses_it(live, extension):
     """A dataset the build made and claimed for its dashboard, with a funnel on it: `delete_dataset` answers
     `{in_use: true, chart_ids: [the funnel]}` and the dataset stays. Once the funnel is deleted (MCP's
