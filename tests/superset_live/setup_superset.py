@@ -3,12 +3,18 @@ with `SUPERSET_CONFIG_PATH` naming `superset_config.py` beside this file and its
 it reads):
 
     python setup_superset.py keys          before Superset first starts: the test identity provider's key pair, its
-                                           key set, its issuer and audience, and Superset's secret key, each written
-                                           once and kept after that
+                                           key set, its issuer, audience and tenant, and Superset's secret key, each
+                                           written once and kept after that
+    python setup_superset.py extension     before Superset starts: mnemiq's Superset extension, built from this
+                                           checkout into `MNEMIQ_TEST_SUPERSET_EXTENSION_DIR`, which every process
+                                           loads; run `superset init` once it is in place, so roles hold its route
     python setup_superset.py               once `superset db upgrade` and `superset init` have run: the source
-                                           database, the users, roles and row rules, and the service user's API key
+                                           database, the users, roles and row rules, the users' passwords, and the
+                                           service user's API key
     python setup_superset.py narrow west   narrows west's row rule to west's active policies
     python setup_superset.py widen west    puts it back to all of west's policies
+    python setup_superset.py filter-and-report DASHBOARD USER
+                                           as USER, a native filter on the dashboard and an active report that names it
 
 Everything is made through Superset's commands and its security manager, never by writing a model, wherever Superset
 has one: a dataset built from the model directly carries no catalog, and the access check then matches it to nothing.
@@ -22,19 +28,23 @@ What it makes, against the database `MNEMIQ_TEST_SUPERSET_PG_DSN` names (seeded 
 - users `west` and `east` (Alpha, sql_lab and their rule's role), `analyst` (Alpha and sql_lab, whom no rule narrows),
   `gamma_only` (Gamma), `policy_only` (Gamma, sql_lab and `policy_reader`: a builder granted one dataset and not the
   database), and `svc` (Alpha and sql_lab), the service user enrichment reads as;
-- an API key for `svc`, written to `svc.key` in the keys directory, readable by its owner alone, and never printed.
-
-No password is kept: every user is reached with a token or an API key, so each password is random and discarded.
+- an API key for `svc`, written to `svc.key` in the keys directory, readable by its owner alone, and never printed;
+- a password for each of those users, random per install, kept in `passwords.json` in the keys directory, readable by
+  its owner alone and never printed: the suite signs in to the web server with it to call the extension's token route.
+  Every other call reaches Superset with a token or an API key.
 """
 
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
 import os
 import secrets
 import sys
 from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
 
 DATABASE_NAME = "mnemiq_live"
 SCHEMA = "public"
@@ -44,6 +54,10 @@ REGIONS = ("west", "east")
 ISSUER = "https://idp.mnemiq-live.invalid/realms/live"
 AUDIENCE = "mnemiq-live"
 KEY_ID = "live-1"
+# The tenant mnemiq's deployment in the suite serves, which a token's `tenant` claim must name.
+TENANT = "live"
+# Everyone `provision` makes, who signs in with a password from `passwords.json`.
+USERS = ("west", "east", "analyst", "gamma_only", "policy_only", "svc")
 
 
 def _keys_dir() -> Path:
@@ -78,10 +92,37 @@ def keys() -> None:
     jwk = {"kty": "RSA", "use": "sig", "alg": "RS256", "kid": KEY_ID, "n": _b64_uint(numbers.n),
            "e": _b64_uint(numbers.e)}
     (folder / "jwks.json").write_text(json.dumps({"keys": [jwk]}, indent=2))
-    (folder / "issuer.json").write_text(json.dumps({"issuer": ISSUER, "audience": AUDIENCE, "kid": KEY_ID}, indent=2))
+    (folder / "issuer.json").write_text(json.dumps({"issuer": ISSUER, "audience": AUDIENCE, "kid": KEY_ID,
+                                                    "tenant": TENANT}, indent=2))
     if not (folder / "secret_key").exists():
         _write_private(folder / "secret_key", secrets.token_urlsafe(48).encode())
     print(f"keys in place: {sorted(path.name for path in folder.iterdir())}")
+
+
+def extension() -> None:
+    """mnemiq's Superset extension, built from this checkout by the packer it ships with
+    (`scripts/build_superset_extension.py`) into the directory `MNEMIQ_TEST_SUPERSET_EXTENSION_DIR` names, which
+    `superset_config.py` loads. Running processes keep the extension they started with."""
+    script = REPO / "scripts" / "build_superset_extension.py"
+    spec = importlib.util.spec_from_file_location("build_superset_extension", script)
+    packer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(packer)
+    bundle = packer.build(Path(os.environ["MNEMIQ_TEST_SUPERSET_EXTENSION_DIR"]))
+    print(f"extension built: dist/ and {bundle.name}")
+
+
+def _passwords() -> dict[str, str]:
+    """Each suite user's password, made once per install and kept in `passwords.json`, readable by its owner alone."""
+    path = _keys_dir() / "passwords.json"
+    found = json.loads(path.read_text()) if path.exists() else {}
+    if all(username in found for username in USERS):
+        return found
+    found = {**{username: secrets.token_urlsafe(24) for username in USERS}, **found}
+    staged = path.with_name("passwords.json.new")
+    staged.unlink(missing_ok=True)
+    _write_private(staged, json.dumps(found, indent=2).encode())
+    staged.replace(path)
+    return found
 
 
 def _b64_uint(value: int) -> str:
@@ -106,12 +147,13 @@ def provision() -> None:
             rule_roles = {region: _rule_role(region, policy) for region in REGIONS}
             reader = _reader_role(policy)
         alpha, gamma, sql_lab = (security_manager.find_role(name) for name in ("Alpha", "Gamma", "sql_lab"))
+        passwords = _passwords()
         for region in REGIONS:
-            _user(region, [alpha, sql_lab, rule_roles[region]])
-        _user("analyst", [alpha, sql_lab])
-        _user("gamma_only", [gamma])
-        _user("policy_only", [gamma, sql_lab, reader])
-        svc = _user("svc", [alpha, sql_lab])
+            _user(region, [alpha, sql_lab, rule_roles[region]], passwords[region])
+        _user("analyst", [alpha, sql_lab], passwords["analyst"])
+        _user("gamma_only", [gamma], passwords["gamma_only"])
+        _user("policy_only", [gamma, sql_lab, reader], passwords["policy_only"])
+        svc = _user("svc", [alpha, sql_lab], passwords["svc"])
         _service_key(svc)
         db.session.commit()
         _report(database, policy)
@@ -171,20 +213,24 @@ def _reader_role(policy):
     return role
 
 
-def _user(username: str, roles: list):
+def _user(username: str, roles: list, password: str):
     from superset import security_manager
+    from werkzeug.security import check_password_hash
 
     if any(role is None for role in roles):
         sys.exit(f"a role for {username} is missing: run `superset init` first")
     user = security_manager.find_user(username=username)
     if user is None:
         user = security_manager.add_user(username, username, "Live", f"{username}@mnemiq-live.invalid", roles,
-                                         password=secrets.token_urlsafe(24))
+                                         password=password)
         if not user:
             sys.exit(f"Superset did not create the user {username}")
-    elif sorted(role.name for role in user.roles) != sorted(role.name for role in roles):
+        return user
+    if sorted(role.name for role in user.roles) != sorted(role.name for role in roles):
         user.roles = roles
         security_manager.update_user(user)
+    if not user.password or not check_password_hash(user.password, password):
+        security_manager.reset_password(user.id, password)
     return user
 
 
@@ -233,6 +279,42 @@ def set_rule(region: str, *, narrowed: bool) -> None:
         print(f"rule {rule.name!r}: {rule.clause}")
 
 
+def filter_and_report(dashboard_id: int, username: str) -> None:
+    """As `username`, a native filter on the dashboard (a region picker on `policy`) and an active report on the
+    dashboard that names the filter, each made through Superset's own command; prints the filter's id and the report's
+    as JSON. A layout save that dropped the filter would deactivate the report
+    (`UpdateDashboardCommand.process_native_filter_diff`)."""
+    from superset import db, security_manager
+    from superset.app import create_app
+
+    app = create_app()
+    with app.app_context(), app.test_request_context():
+        from superset.commands.dashboard.update import UpdateDashboardNativeFiltersCommand
+        from superset.commands.report.create import CreateReportScheduleCommand
+        from superset.connectors.sqla.models import SqlaTable
+        from superset.utils.core import override_user
+
+        policy = db.session.query(SqlaTable).filter_by(table_name="policy", schema=SCHEMA).one()
+        filter_id = f"NATIVE_FILTER-{secrets.token_hex(6)}"
+        native_filter = {
+            "id": filter_id, "name": "Region", "type": "NATIVE_FILTER", "filterType": "filter_select",
+            "targets": [{"datasetId": policy.id, "column": {"name": "region"}}],
+            "controlValues": {"multiSelect": True, "enableEmptyFilter": False}, "defaultDataMask": {},
+            "cascadeParentIds": [], "scope": {"rootPath": ["ROOT_ID"], "excluded": []}, "description": ""}
+        with override_user(security_manager.find_user(username=username)):
+            UpdateDashboardNativeFiltersCommand(dashboard_id, {"modified": [native_filter], "deleted": [],
+                                                               "reordered": []}).run()
+            report = CreateReportScheduleCommand({
+                "type": "Report", "name": f"mnemiq live report {secrets.token_hex(4)}", "crontab": "0 9 * * *",
+                "dashboard": dashboard_id, "creation_method": "alerts_reports", "active": True,
+                "report_format": "PNG", "timezone": "UTC",
+                "recipients": [{"type": "Email", "recipient_config_json": {"target": "live@mnemiq-live.invalid"}}],
+                "extra": {"dashboard": {"nativeFilters": [{"nativeFilterId": filter_id, "filterType": "filter_select",
+                                                           "columnName": "region", "filterValues": ["west"]}]}},
+            }).run()
+        print(json.dumps({"filter_id": filter_id, "report_id": report.id}))
+
+
 def _report(database, policy) -> None:
     from superset import db, security_manager
     from superset.connectors.sqla.models import RowLevelSecurityFilter
@@ -244,11 +326,16 @@ def _report(database, policy) -> None:
         user = security_manager.find_user(username=username)
         print(f"user {username}: {sorted(role.name for role in user.roles)}")
     print("service key in place:", (_keys_dir() / "svc.key").exists())
+    print("passwords in place:", (_keys_dir() / "passwords.json").exists())
 
 
 def main(argv: list[str]) -> None:
     if argv == ["keys"]:
         keys()
+    elif argv == ["extension"]:
+        extension()
+    elif len(argv) == 3 and argv[0] == "filter-and-report":
+        filter_and_report(int(argv[1]), argv[2])
     elif not argv:
         provision()
     elif len(argv) == 2 and argv[0] in ("narrow", "widen"):

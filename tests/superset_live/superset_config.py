@@ -4,9 +4,13 @@ through, as `SUPERSET_CONFIG_PATH` names it to every Superset process the suite 
 Nothing here is a value of its own. Every setting comes from the environment or from the keys directory the
 environment names, and the keys are generated for each install by `setup_superset.py keys`, never committed:
 
-- `MNEMIQ_TEST_SUPERSET_KEYS_DIR`: the test identity provider's public key (`public.pem`), the issuer and audience its
-  tokens carry (`issuer.json`), and this Superset's own secret key (`secret_key`).
+- `MNEMIQ_TEST_SUPERSET_KEYS_DIR`: the test identity provider's key pair (`private.pem`, `public.pem`), the issuer,
+  audience, key id and tenant its tokens carry (`issuer.json`), and this Superset's own secret key (`secret_key`).
 - `MNEMIQ_TEST_SUPERSET_METADATA_URI`: the SQLAlchemy URI of Superset's metadata database.
+- `MNEMIQ_TEST_SUPERSET_EXTENSION_DIR`: where `setup_superset.py extension` built mnemiq's Superset extension (its
+  `dist/`). Superset's own processes (the web server, both MCP services, `superset init`) are started with it set and
+  load the extension. Unset, none is loaded: the setup script's runs from inside the suite (`narrow`, `widen`) need
+  none.
 - `MNEMIQ_TEST_SUPERSET_DATA_CACHE_DIR`, optional: a directory for Superset's result cache. Unset, Superset keeps the
   default, which caches nothing.
 
@@ -45,6 +49,30 @@ MCP_JWT_AUDIENCE = _IDENTITY_PROVIDER["audience"]
 from superset.mcp_service.mcp_config import MCP_TOOL_SEARCH_CONFIG as _TOOL_SEARCH  # noqa: E402
 
 MCP_TOOL_SEARCH_CONFIG = {**_TOOL_SEARCH, "enabled": False}
+
+# mnemiq's extension: its token route in the web server, its tools in the MCP services. Extensions load at startup
+# only, so a rebuilt one needs the processes restarted.
+if _extension := os.environ.get("MNEMIQ_TEST_SUPERSET_EXTENSION_DIR", "").strip():
+    FEATURE_FLAGS = {"ENABLE_EXTENSIONS": True}
+    LOCAL_EXTENSIONS = [_extension]
+
+# The token route signs with the test identity provider's own key, so the token it mints is one the MCP service above
+# and mnemiq's door already verify: the same key, issuer, audience and key id, and the tenant mnemiq's deployment
+# serves.
+MNEMIQ_TOKEN_KEY_FILE = str(_KEYS / "private.pem")
+MNEMIQ_TOKEN_KID = _IDENTITY_PROVIDER["kid"]
+MNEMIQ_TOKEN_ISSUER = _IDENTITY_PROVIDER["issuer"]
+MNEMIQ_TOKEN_AUDIENCE = _IDENTITY_PROVIDER["audience"]
+# A keys directory made before tokens carried a tenant has none in `issuer.json`. Superset still starts, and the token
+# route answers 503 naming MNEMIQ_TOKEN_TENANT until `setup_superset.py keys` is run again.
+if _tenant := _IDENTITY_PROVIDER.get("tenant"):
+    MNEMIQ_TOKEN_TENANT = _tenant
+else:
+    import logging
+
+    logging.getLogger("superset_config").warning(
+        "%s has no tenant, so mnemiq's token route is not configured: run `setup_superset.py keys` again",
+        _KEYS / "issuer.json")
 
 # API keys on, so the service user enrichment reads through authenticates with an API key, as a deployment's would:
 # the MCP service accepts them beside tokens when this is on (`get_mcp_api_key_enabled`).

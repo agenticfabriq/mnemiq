@@ -1,0 +1,283 @@
+"""The Superset extension's token route: the pure minting code and the handler behind the Flask route. Neither
+module imports Flask or Superset, so these run in `unit` with no install."""
+
+import os
+import time
+from types import SimpleNamespace
+
+import jwt
+import pytest
+
+from mnemiq.config import Settings
+from tests.auth_keys import AUDIENCE, ISSUER, jwks_for, rsa_key
+from tests.superset_extension_path import BACKEND_SRC, use_extension_source
+
+use_extension_source()
+
+ASK = {"db.read", "superset:sqllab:write", "superset:dataset:read"}  # what the Superset mode asks with
+BUILD = ASK | {"superset:chart:read", "superset:chart:write", "superset:dashboard:read",
+               "superset:dashboard:write", "superset:dataset:write"}
+
+
+def _pem(tmp_path, mode=0o600, name="mint.pem"):
+    from cryptography.hazmat.primitives import serialization
+
+    path = tmp_path / name
+    path.write_bytes(rsa_key().private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                             serialization.NoEncryption()))
+    os.chmod(path, mode)
+    return path
+
+
+def _mapping(tmp_path, **over):
+    base = {"MNEMIQ_TOKEN_KEY_FILE": str(_pem(tmp_path)), "MNEMIQ_TOKEN_KID": "k1", "MNEMIQ_TOKEN_ISSUER": ISSUER,
+            "MNEMIQ_TOKEN_AUDIENCE": AUDIENCE, "MNEMIQ_TOKEN_TENANT": "acme"}
+    base.update(over)
+    return {k: v for k, v in base.items() if v is not None}
+
+
+def _cfg(tmp_path, **over):
+    from agenticfabriq.mnemiq.token import SigningConfig
+
+    return SigningConfig.from_mapping(_mapping(tmp_path, **over))
+
+
+def _decode(token):
+    return jwt.decode(token, rsa_key().public_key(), algorithms=["RS256"], audience=AUDIENCE, issuer=ISSUER)
+
+
+def test_mint_claims(tmp_path):
+    from agenticfabriq.mnemiq.token import mint
+
+    now = 1_800_000_000.0
+    token = mint(_cfg(tmp_path), username="ana", purpose="ask", now=now)
+    assert jwt.get_unverified_header(token) == {"alg": "RS256", "typ": "JWT", "kid": "k1"}
+    found = jwt.decode(token, rsa_key().public_key(), algorithms=["RS256"], audience=AUDIENCE, issuer=ISSUER,
+                       options={"verify_exp": False, "verify_nbf": False, "verify_iat": False})
+    assert found["iss"] == ISSUER and found["aud"] == AUDIENCE
+    assert found["sub"] == "ana" and found["preferred_username"] == "ana"
+    assert found["iat"] == int(now) and found["exp"] == int(now) + 300
+    # Superset's MCP verifier refuses a token whose `nbf` is after its own clock, with no leeway
+    # (`superset/mcp_service/jwt_verifier.py`, the not-before check): `nbf` is a few seconds back, so an MCP process
+    # whose clock is a little behind the web server's still takes a token minted the moment before.
+    assert found["nbf"] == int(now) - 5
+    assert found["tenant"] == "acme" and found["jti"]
+    again = mint(_cfg(tmp_path), username="ana", purpose="ask", now=now)
+    assert jwt.decode(again, options={"verify_signature": False})["jti"] != found["jti"]
+
+
+def test_lifetime_is_capped_at_300(tmp_path):
+    from agenticfabriq.mnemiq.token import mint
+
+    cfg = _cfg(tmp_path, MNEMIQ_TOKEN_LIFETIME_S="9999")
+    assert cfg.lifetime_s == 300
+    found = jwt.decode(mint(cfg, username="ana", purpose="ask", now=time.time()), options={"verify_signature": False})
+    assert found["exp"] - found["iat"] == 300
+    assert _cfg(tmp_path, MNEMIQ_TOKEN_LIFETIME_S="60").lifetime_s == 60
+    assert _cfg(tmp_path).lifetime_s == 300
+    with pytest.raises(ValueError):
+        _cfg(tmp_path, MNEMIQ_TOKEN_LIFETIME_S="0")
+
+
+def test_purpose_scopes(tmp_path):
+    from agenticfabriq.mnemiq.token import mint
+
+    cfg = _cfg(tmp_path)
+    now = time.time()
+    ask = _decode(mint(cfg, username="ana", purpose="ask", now=now))["scope"]
+    build = _decode(mint(cfg, username="ana", purpose="build", now=now))["scope"]
+    assert len(ask.split()) == len(ASK) and set(ask.split()) == ASK
+    assert set(build.split()) == BUILD
+    with pytest.raises(ValueError):
+        mint(cfg, username="ana", purpose="admin", now=now)  # type: ignore[arg-type]
+
+
+def test_refuses_a_world_readable_key(tmp_path):
+    from agenticfabriq.mnemiq.token import SigningConfig
+
+    for mode in (0o644, 0o640, 0o604):
+        loose = _pem(tmp_path, mode, name=f"loose-{mode:o}.pem")
+        with pytest.raises(ValueError, match="0600"):
+            SigningConfig.from_mapping(_mapping(tmp_path, MNEMIQ_TOKEN_KEY_FILE=str(loose)))
+    link = tmp_path / "link.pem"
+    link.symlink_to(_pem(tmp_path))
+    with pytest.raises(ValueError, match="regular file"):
+        SigningConfig.from_mapping(_mapping(tmp_path, MNEMIQ_TOKEN_KEY_FILE=str(link)))
+    with pytest.raises(ValueError, match="regular file"):
+        SigningConfig.from_mapping(_mapping(tmp_path, MNEMIQ_TOKEN_KEY_FILE=str(tmp_path)))
+    _cfg(tmp_path)  # the control: a 0600 file is accepted
+
+
+@pytest.mark.parametrize("missing", ["MNEMIQ_TOKEN_KEY_FILE", "MNEMIQ_TOKEN_KID", "MNEMIQ_TOKEN_ISSUER",
+                                     "MNEMIQ_TOKEN_AUDIENCE", "MNEMIQ_TOKEN_TENANT"])
+def test_refuses_missing_settings(tmp_path, missing):
+    from agenticfabriq.mnemiq.token import SigningConfig
+
+    with pytest.raises(ValueError, match=missing):
+        SigningConfig.from_mapping(_mapping(tmp_path, **{missing: None}))
+    with pytest.raises(ValueError, match=missing):
+        SigningConfig.from_mapping(_mapping(tmp_path, **{missing: "  "}))
+
+
+def test_token_verifies_with_mnemiqs_door(tmp_path):
+    from mnemiq.auth.config import auth_config_from_settings
+    from mnemiq.auth.doors import DoorRefusal, HttpDoors
+
+    from agenticfabriq.mnemiq.token import mint
+
+    cfg = auth_config_from_settings(Settings(tenant="acme", oidc_issuer=ISSUER, oidc_audience=AUDIENCE))
+    doors = HttpDoors(cfg, fetch=lambda: jwks_for((rsa_key(), "k1")))
+    signing = _cfg(tmp_path)
+
+    def headers(token):
+        return {"authorization": [f"Bearer {token}"]}
+
+    fresh = mint(signing, username="ana", purpose="build", now=time.time())
+    delegation = doors.v1_delegation(headers(fresh))
+    assert delegation.identity.tenant_id == "acme"
+    assert delegation.token  # the door hands on the very Bearer it verified
+    with pytest.raises(DoorRefusal) as exc:
+        doors.v1(headers(mint(signing, username="ana", purpose="build", now=time.time() - 1000)))
+    assert exc.value.status == 401
+
+
+def signed_in(username: str = "ana", user_id=7) -> SimpleNamespace:
+    """A signed-in user as Flask-AppBuilder's `User` model is one (`flask_appbuilder/security/sqla/models.py`): a
+    positive integer `id`, `is_anonymous` False, and no `is_guest_user`."""
+    return SimpleNamespace(id=user_id, username=username, is_anonymous=False, is_authenticated=True, is_active=True)
+
+
+def guest(username: str, **more) -> SimpleNamespace:
+    """rc2's embedded guest as `GuestUser` is one (`superset/security/guest_token.py`): `is_guest_user` True,
+    authenticated and not anonymous, no `id`, and the username the embedding host wrote into its guest token."""
+    return SimpleNamespace(is_guest_user=True, username=username, is_anonymous=False, is_authenticated=True,
+                           is_active=True, **more)
+
+
+def anonymous() -> SimpleNamespace:
+    """Nobody signed in, as flask_login's `AnonymousUserMixin` is (`flask_login/mixins.py`): anonymous, no `id`, no
+    username. It reaches the route when the Public role holds the route's permission."""
+    return SimpleNamespace(is_anonymous=True, is_authenticated=False, is_active=False)
+
+
+NOT_SIGNED_IN = [
+    pytest.param(guest("admin"), id="a guest naming admin"),
+    # `SupersetSecurityManager.guest_user_cls` (`superset/security/manager.py`) is a class a deployment's own security
+    # manager may replace, so a guest may carry an id: the guest check stands on its own.
+    pytest.param(guest("admin", id=1), id="a guest with an id"),
+    pytest.param(anonymous(), id="anonymous"),
+    pytest.param(SimpleNamespace(username="admin", is_anonymous=False), id="no id"),
+    pytest.param(SimpleNamespace(username="admin"), id="nothing says signed in"),
+    *(pytest.param(signed_in("admin", bad), id=f"id {bad!r}") for bad in (0, -1, True, "7", None, 7.0)),
+]
+
+
+@pytest.mark.parametrize("user", NOT_SIGNED_IN)
+def test_the_route_mints_only_for_a_signed_in_superset_user(tmp_path, user):
+    """An embedded guest's username is whatever its guest token says, and the token the route mints would resolve in
+    MCP to the real user of that name; nobody signed in has no name at all. So a token is minted only for a user who
+    is not a guest, not anonymous and has a positive integer id, and the refusal comes before the body is read."""
+    from agenticfabriq.mnemiq.token import NotSignedIn, mint_for
+
+    cfg = _cfg(tmp_path)
+    for body in ({"purpose": "build"}, {"purpose": "ask"}, None):
+        with pytest.raises(NotSignedIn):
+            mint_for(user, body, cfg, time.time())
+    # The control: the same name, signed in.
+    assert _decode(mint_for(signed_in("admin"), {"purpose": "build"}, cfg, time.time())["token"])["sub"] == "admin"
+
+
+def test_api_ignores_a_username_in_the_body(tmp_path):
+    from agenticfabriq.mnemiq.token import BadRequest, mint_for
+
+    cfg = _cfg(tmp_path)
+    user = signed_in("ana")
+    answer = mint_for(user, {"purpose": "ask", "username": "root", "sub": "root", "preferred_username": "root"},
+                      cfg, time.time())
+    assert set(answer) == {"token", "expires_in"} and answer["expires_in"] == 300
+    found = _decode(answer["token"])
+    assert found["sub"] == found["preferred_username"] == "ana"
+    for bad in ({}, {"purpose": "x"}, {"purpose": ["ask"]}, None, []):
+        with pytest.raises(BadRequest):
+            mint_for(user, bad, cfg, time.time())
+
+
+API_SOURCE = BACKEND_SRC / "agenticfabriq" / "mnemiq" / "api.py"
+
+
+def route(monkeypatch, user, body, config) -> tuple[int, dict]:
+    """What the token route's handler (`MnemiqApi.mint` in `api.py`) responds, as its status and fields, with Flask,
+    Flask-AppBuilder and `superset_core` stood in: `g.user` is `user`, the request's JSON `body`, Superset's config
+    `config`. Their decorators pass the handler through, so what runs is the handler alone; authentication and CSRF
+    are Superset's and the live suite's. `api.py` is loaded from its file under a name of its own, so no stand-in
+    outlives the test."""
+    import importlib.util
+    import sys
+    import types
+
+    def passthrough(*args, **kwargs):
+        return lambda target: target
+
+    class RestApi:
+        def response(self, status, **fields):
+            return status, fields
+
+    stood_in = {
+        "flask": {"Response": object, "current_app": SimpleNamespace(config=config), "g": SimpleNamespace(user=user),
+                  "request": SimpleNamespace(get_json=lambda silent=False: body)},
+        "flask_appbuilder": {},
+        "flask_appbuilder.api": {"expose": passthrough, "permission_name": passthrough, "protect": passthrough,
+                                 "safe": lambda handler: handler},
+        "superset_core": {}, "superset_core.rest_api": {},
+        "superset_core.rest_api.api": {"RestApi": RestApi},
+        "superset_core.rest_api.decorators": {"api": passthrough},
+    }
+    for name, attributes in stood_in.items():
+        module = types.ModuleType(name)
+        module.__dict__.update(attributes)
+        monkeypatch.setitem(sys.modules, name, module)
+    spec = importlib.util.spec_from_file_location("token_route_under_test", API_SOURCE)
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    return loaded.MnemiqApi().mint()
+
+
+def test_the_route_answers_403_to_anyone_not_signed_in(monkeypatch, tmp_path):
+    config = _mapping(tmp_path)
+    for user in (guest("admin"), guest("admin", id=1), anonymous()):
+        status, fields = route(monkeypatch, user, {"purpose": "build"}, config)
+        assert status == 403 and "token" not in fields, (status, fields)
+        assert fields["message"] == "the token route mints only for a signed-in Superset user"
+    # The controls: a signed-in user gets a token; a bad body is a 400, a missing setting a 503 naming it.
+    status, fields = route(monkeypatch, signed_in("ana"), {"purpose": "build"}, config)
+    assert status == 200 and _decode(fields["token"])["sub"] == "ana"
+    assert route(monkeypatch, signed_in("ana"), {"purpose": "admin"}, config)[0] == 400
+    unset = {k: v for k, v in config.items() if k != "MNEMIQ_TOKEN_TENANT"}
+    assert route(monkeypatch, signed_in("ana"), {"purpose": "build"}, unset) == (
+        503, {"message": "MNEMIQ_TOKEN_TENANT is not set"})
+    # A guest is refused before the route reads its settings: it learns nothing of how the route is set up.
+    assert route(monkeypatch, guest("admin"), {"purpose": "build"}, unset)[0] == 403
+
+
+def csrf_problems(source: str) -> list[str]:
+    """Whether the token route's API class opts out of Flask-AppBuilder's CSRF exemption, read with `ast`: FAB
+    exempts an API's blueprint unless the class sets `csrf_exempt = False` (`BaseApi.csrf_exempt` is True), and
+    `superset_core`'s `RestApi` does not set it."""
+    import ast
+
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.ClassDef) and node.name == "MnemiqApi":
+            values = [stmt.value.value for stmt in node.body if isinstance(stmt, ast.Assign)
+                      and any(getattr(t, "id", None) == "csrf_exempt" for t in stmt.targets)
+                      and isinstance(stmt.value, ast.Constant)]
+            return [] if values == [False] else [f"MnemiqApi.csrf_exempt is {values or 'not set'}"]
+    return ["no MnemiqApi class"]
+
+
+def test_the_token_route_needs_csrf():
+    assert csrf_problems(API_SOURCE.read_text()) == []
+    # The planted defect, as the route first shipped: the class does not say, so FAB exempts the route.
+    assert csrf_problems(API_SOURCE.read_text().replace("    csrf_exempt = False\n", "")) == [
+        "MnemiqApi.csrf_exempt is not set"]
+    assert csrf_problems(API_SOURCE.read_text().replace("csrf_exempt = False", "csrf_exempt = True")) == [
+        "MnemiqApi.csrf_exempt is [True]"]

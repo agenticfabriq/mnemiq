@@ -1,0 +1,11 @@
+{
+  "publisher": "agenticfabriq",
+  "name": "mnemiq",
+  "displayName": "mnemiq",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "description": "Lets mnemiq build and edit dashboards as the person asking: a token route and MCP write tools.",
+  "backend": {
+    "files": ["backend/src/agenticfabriq/mnemiq/**/*.py"]
+  }
+}

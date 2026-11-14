@@ -1,0 +1,11 @@
+[project]
+name = "agenticfabriq-mnemiq"
+version = "0.1.0"
+license = "Apache-2.0"
+
+[tool.apache_superset_extensions.build]
+# Files to include in the extension build/bundle
+include = [
+    "src/agenticfabriq/mnemiq/**/*.py",
+]
+exclude = []
