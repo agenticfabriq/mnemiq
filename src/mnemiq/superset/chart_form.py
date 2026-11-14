@@ -292,6 +292,11 @@ def _renderer_sum(viz_type: str, form: dict, dimensions: list[str]) -> str | Non
         # far, whatever `showTotal` says; with `showTotal` (the `show_total` control, which MCP's
         # `map_waterfall_config` writes, True by default) `transformer` also adds total bars summed from the steps.
         shown = "the waterfall's running totals"
+    elif viz_type == "sankey_v2":
+        # `Sankey/transformProps.ts`: its `seriesData` gives a node no value of its own, so each node shows the sum of
+        # its links, and `nodeValues` (the larger of a node's `incomingFlows` and `outgoingFlows` sums) is what
+        # `tooltipFormatter` shows each link as a share of.
+        shown = "each of the sankey's nodes"
     else:
         return None
     if all(_summable(item) for item in _metric_items(viz_type, form)):

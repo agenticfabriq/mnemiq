@@ -819,6 +819,12 @@ def _grouped(viz: str, **changes) -> dict:
             "row_limit": 100} | changes
 
 
+def _sankey(**changes) -> dict:
+    """A sankey's form_data as the extension's `create_chart` saves mnemiq's request: source, target and one metric."""
+    return {"viz_type": "sankey_v2", "source": "region", "target": "channel", "metric": copy.deepcopy(PREMIUM),
+            "adhoc_filters": [], "row_limit": 10000} | changes
+
+
 TWO = ["region", "channel"]
 
 
@@ -841,16 +847,29 @@ TWO = ["region", "channel"]
     (_grouped("pie", show_total=True, metric=SUM_PREMIUM), None),
     (_grouped("pie", show_total=True, metric=COUNT_PREMIUM), None),
     (_grouped("pie", show_total=False), None),
+    (_sankey(metric=copy.deepcopy(AVERAGE)), "sum"),
+    (_sankey(metric=copy.deepcopy(RATIO)), "sum"),
+    (_sankey(metric=copy.deepcopy(DISTINCT)), "sum"),
+    (_sankey(metric=MIN_PREMIUM), "sum"),
+    (_sankey(metric=M_SAVED), "sum"),
+    (_sankey(), None),
+    (_sankey(metric=copy.deepcopy(POLICIES)), None),
+    (_sankey(metric=SUM_PREMIUM), None),
+    (_sankey(metric=COUNT_PREMIUM), None),
 ], ids=["treemap parents of a ratio", "treemap parents of a COUNT(DISTINCT)", "treemap parents of a MIN",
         "treemap parents of a saved metric", "treemap parents of an SQL SUM", "treemap parents of a SUM",
         "treemap parents of a COUNT", "a treemap of one level", "a pie's Other slice, even of a SUM",
         "a pie's Other slice of an SQL SUM", "a pie with no Other slice", "a pie's total of an AVG",
         "a pie's total of a MIN", "a pie's total of an SQL SUM", "a pie's total of an SQL COUNT(*)",
-        "a pie's total of a SUM", "a pie's total of a COUNT", "a pie with no total"])
+        "a pie's total of a SUM", "a pie's total of a COUNT", "a pie with no total", "a sankey's nodes of an AVG",
+        "a sankey's nodes of a ratio", "a sankey's nodes of a COUNT(DISTINCT)", "a sankey's nodes of a MIN",
+        "a sankey's nodes of a saved metric", "a sankey's nodes of an SQL SUM", "a sankey's nodes of an SQL COUNT(*)",
+        "a sankey's nodes of a SUM", "a sankey's nodes of a COUNT"])
 def test_a_number_the_renderer_sums_is_checked_only_when_the_sum_is_the_measures_own(form, said):
     """rc2's renderer sums some of what a chart shows from the query's rows, so the data tool's rows never hold it: a
     treemap's parent from its children (`treeBuilder` in `plugin-chart-echarts/src/utils/treeBuilder.ts`), a pie's
-    Other slice from the slices under its threshold and its total from every slice (`Pie/transformProps.ts`). A sum of
+    Other slice from the slices under its threshold and its total from every slice (`Pie/transformProps.ts`), a
+    sankey's node from its links (`nodeValues` in `Sankey/transformProps.ts`). A sum of
     a SUM or a COUNT, SIMPLE or an SQL metric that is one of them whole, is that measure over the groups summed, and so
     is checked by the groups it sums; a sum of anything else is not, and the Other slice hides the slices it folds
     in."""
@@ -1020,16 +1039,18 @@ def test_an_sql_metric_is_a_sum_only_when_its_whole_expression_is_one(expression
     checks is read from the metric's expression, parsed as Postgres: one top-level SUM, or one COUNT of a column or of
     every row, with nothing around it. A distinct count or sum, a ratio, an average, a minimum or a maximum, a filtered
     or windowed aggregate, anything wrapped around the aggregate, and SQL that does not parse are not. The same reading
-    decides a waterfall's running totals and a pivot table's totals."""
+    decides a waterfall's running totals, a pivot table's totals and a sankey's nodes."""
     metric = PREMIUM | {"sqlExpression": expression}
     waterfall = expectation_from_form_data(_waterfall(metric=metric), dataset=PHYSICAL)
     pivot = expectation_from_form_data({"viz_type": "pivot_table_v2", "metrics": [metric], "groupbyRows": ["region"],
                                         "groupbyColumns": ["channel"], "rowTotals": True, "colTotals": True,
                                         "adhoc_filters": [], "row_limit": 10000}, dataset=PHYSICAL)
+    sankey = expectation_from_form_data(_sankey(metric=metric), dataset=PHYSICAL)
     assert isinstance(waterfall, Expectation) is additive, waterfall
     assert isinstance(pivot, Expectation) is additive, pivot
+    assert isinstance(sankey, Expectation) is additive, sankey
     if not additive:
-        assert "sum" in waterfall.reason and "totals" in pivot.reason
+        assert "sum" in waterfall.reason and "totals" in pivot.reason and "sankey" in sankey.reason
 
 
 # --- the saved query context mnemiq's extension writes ----------------------------------------------------------------
@@ -1221,6 +1242,11 @@ EXCLUDED = {
     "a pivot's totals of a COUNT(DISTINCT)": (_pivot_table(metrics=[copy.deepcopy(DISTINCT)]),
                                               (["region", "channel", "Channels"], BY_REGION, REGION_AND_CHANNEL),
                                               "totals"),
+    "a sankey's nodes of an AVG": (_sankey(metric=copy.deepcopy(AVERAGE)),
+                                   (["region", "channel", "Average premium"], BY_REGION, REGION_AND_CHANNEL), "sum"),
+    "a sankey's nodes of a ratio": (_sankey(metric=copy.deepcopy(RATIO)),
+                                    (["region", "channel", "Premium per policy"], BY_REGION, REGION_AND_CHANNEL),
+                                    "sum"),
     "a pivot's cells as shares": (_pivot_table(showValuesAs="percent_row"),
                                   (["region", "channel", "Total premium"], BY_REGION, REGION_AND_CHANNEL), "share"),
     "a table's totals row": (_table(groupby=["channel"], adhoc_filters=[], show_totals=True), BY_CHANNEL_ROWS, "total"),
