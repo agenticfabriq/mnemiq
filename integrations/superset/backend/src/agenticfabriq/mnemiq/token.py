@@ -5,6 +5,10 @@ route (`mint_for`) run, and are tested, without either. `api.py` is the thin Fla
 
 The signing key is a file the operator provides, readable by its owner only. The token is RS256 with a `kid`, so
 mnemiq's door and Superset's MCP verifier check it against the public half they hold. It lives at most 300 seconds.
+
+A token is minted only for a user signed in to Superset itself (`signed_in`), never for an embedded guest or for nobody
+at all: the MCP service resolves a token to the Superset user of its name, and a guest's name is whatever its guest
+token says.
 """
 
 from __future__ import annotations
@@ -21,6 +25,10 @@ import jwt
 Purpose = Literal["ask", "build"]
 
 MAX_LIFETIME_S = 300
+# How far back `nbf` is set. Superset's MCP verifier refuses a token whose `nbf` is after its own clock, with no leeway
+# (`superset/mcp_service/jwt_verifier.py`, the not-before check), and the token is minted by the web server, often
+# another process or machine: a token used the moment it is minted must not fail on a clock a second behind.
+NOT_BEFORE_SKEW_S = 5
 
 # What an ask token carries: the scopes the existing Superset mode asks with.
 ASK_SCOPES: tuple[str, ...] = ("db.read", "superset:sqllab:write", "superset:dataset:read")
@@ -36,6 +44,37 @@ _REQUIRED = ("MNEMIQ_TOKEN_KEY_FILE", "MNEMIQ_TOKEN_KID", "MNEMIQ_TOKEN_ISSUER",
 
 class BadRequest(ValueError):
     """The route's body is not one it answers: a 400."""
+
+
+NOT_SIGNED_IN = "the token route mints only for a signed-in Superset user"
+
+
+class NotSignedIn(PermissionError):
+    """The request's user is not one the route mints for (`signed_in`): a 403."""
+
+    def __init__(self) -> None:
+        super().__init__(NOT_SIGNED_IN)
+
+
+def signed_in(user) -> bool:
+    """Whether `user` is a user signed in to Superset itself: not an embedded guest, not anonymous, and with a positive
+    integer id, as Flask-AppBuilder's `User` model is (`flask_appbuilder/security/sqla/models.py`).
+
+    - An embedded guest is refused whatever else it says. With `EMBEDDED_SUPERSET` on, a request carrying a guest
+      token is run as a `GuestUser` (`superset/security/guest_token.py`; `request_loader` and
+      `get_guest_user_from_token` in `superset/security/manager.py`), which is authenticated and not anonymous, has
+      no id, and has the `username` the embedding host wrote into the guest token; its role (`GUEST_ROLE_NAME`) may
+      hold this route's permission. A deployment's security manager may replace the class
+      (`SupersetSecurityManager.guest_user_cls`), so the guest check does not rest on the missing id.
+    - Nobody signed in (flask_login's `AnonymousUserMixin`, `is_anonymous` True) reaches the route when the Public
+      role holds its permission (`PUBLIC_ROLE_LIKE`, `is_item_public` in Flask-AppBuilder's `protect`).
+    - A user without an id is no row of Superset's users table: no MCP lookup of its name could be its own."""
+    if getattr(user, "is_guest_user", False):
+        return False
+    if getattr(user, "is_anonymous", True):
+        return False
+    user_id = getattr(user, "id", None)
+    return isinstance(user_id, int) and not isinstance(user_id, bool) and user_id > 0
 
 
 @dataclass(frozen=True)
@@ -94,14 +133,18 @@ def mint(cfg: SigningConfig, *, username: str, purpose: Purpose, now: float) -> 
         raise ValueError("a token needs a username")
     issued = int(now)
     claims = {"iss": cfg.issuer, "aud": cfg.audience, "sub": username, "preferred_username": username,
-              "iat": issued, "nbf": issued, "exp": issued + cfg.lifetime_s, "jti": secrets.token_urlsafe(16),
+              "iat": issued, "nbf": issued - NOT_BEFORE_SKEW_S, "exp": issued + cfg.lifetime_s,
+              "jti": secrets.token_urlsafe(16),
               "tenant": cfg.tenant, "scope": " ".join(SCOPES[purpose])}
     return jwt.encode(claims, cfg.key_pem, algorithm="RS256", headers={"kid": cfg.kid})
 
 
 def mint_for(user, body, cfg: SigningConfig, now: float) -> dict:
     """What the route answers. The token is for `user.username` and nobody else: the body names a purpose and is
-    read for nothing more, so a username in it changes nothing."""
+    read for nothing more, so a username in it changes nothing. Raises `NotSignedIn` for a user `signed_in` refuses,
+    before the body is read, and `BadRequest` for a body without a purpose."""
+    if not signed_in(user):
+        raise NotSignedIn()
     purpose = body.get("purpose") if isinstance(body, dict) else None
     if not isinstance(purpose, str) or purpose not in SCOPES:
         raise BadRequest('the body must be {"purpose": "ask"} or {"purpose": "build"}')
