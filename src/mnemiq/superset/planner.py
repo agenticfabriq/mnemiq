@@ -273,11 +273,12 @@ a table's name, or "join": "a JOIN b ON ...", "description": optional, "currency
 - a saved metric of a table's dataset: {"name": the plan's own name for it, "saved_metric": the saved metric's name, \
 "kind": ..., "table": ...}. The same saved metric on two tables is two measures, each with a name of its own.
 Use a saved metric where one says what a measure needs. Write a join only where the charts need columns of more than \
-one table. On a join, a measure names each column alone (amount, not claim.amount), and only a column one joined table \
-alone has. A column two joined tables share is in the joined dataset as <table>_<column> (claim_created_at), for \
-dimensions, filters, time columns, source and target only. A written measure's name and label are never a saved \
-metric's name on its table, and no two measures share a label. A table with no dataset gets one, with Superset's saved \
-metric count (COUNT(*)).
+one table. A join is tables joined with JOIN, LEFT JOIN, RIGHT JOIN or FULL JOIN, each ON a condition on their \
+columns, each table named alone or with an alias. On a join, a measure names each column alone (amount, not \
+claim.amount), and only a column one joined table alone has. A column two joined tables share is in the joined \
+dataset as <table>_<column> (claim_created_at), for dimensions, filters, time columns, source and target only. A \
+written measure's name and label are never a saved metric's name on its table, and no two measures share a label. A \
+table with no dataset gets one, with Superset's saved metric count (COUNT(*)).
 
 Charts: {"key": lower case letters, digits and _, at most 40, one per chart, "family": one of FAMILIES, "title", \
 "measures": [measure names], "dimensions": [columns], "time_column": a date or timestamp column, or omitted, \
@@ -739,9 +740,16 @@ def _made_count(dataset_id: int) -> SavedMetric:
 
 def _virtual_name(key: str, tables: Sequence[str]) -> str:
     """A virtual dataset's name: its key, unique within the build, then its tables, cut to the 250 characters rc2's
-    `table_name` holds. The build adds its own id to make it unique across builds."""
-    return f"mnemiq_{key}_{'_'.join(tables)}"[:MAX_TITLE]
+    `table_name` holds. A `:` ends the key, which no key holds, so two keys never give one name, whatever the tables
+    are called. The build adds its own id to make it unique across builds."""
+    return f"mnemiq_{key}:{'_'.join(tables)}"[:MAX_TITLE]
 
+
+# A join's own arguments mnemiq reads: its table, its ON condition, and LEFT, RIGHT or FULL (`side`) with INNER or
+# OUTER (`kind`). NATURAL (`method`), USING and every other clause are refused.
+_JOIN_ARGS = frozenset({"this", "on", "side", "kind"})
+# How a join is parsed: as the FROM of a SELECT.
+_JOIN_PREFIX = "SELECT 1 FROM "
 
 # Postgres's time types a time column groups by: a date or a timestamp, never a time of day.
 _TIME_OF_DAY = (exp.DataType.Type.TIME, exp.DataType.Type.TIMETZ)
@@ -762,7 +770,10 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
     """The rows of a planned join, with the SELECT its virtual dataset is made from, or why the join is refused.
 
     The join is held to an allow-list: its SELECT is the only one in it, and its only tables are the FROM's and each
-    JOIN's, so nothing in an ON condition (an EXISTS, an IN or a scalar subquery, a CTE) reads another table.
+    JOIN's, so nothing in an ON condition (an EXISTS, an IN or a scalar subquery, a CTE) reads another table. Each table
+    is named alone or with an alias (`_table_problem`), each join is a plain, LEFT, RIGHT or FULL JOIN ON a condition,
+    and the conditions name only the joined tables' columns (`_condition_problem`). The dataset runs the join as sqlglot
+    prints it, the text each measure over it was decided on.
 
     The dataset names a column one joined table alone has without its table, so a measure decided over the join names
     the same column on the dataset; a measure names only those. A column two joined tables share is in the dataset once
@@ -771,14 +782,20 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
     if (marker := next((d for d in JINJA_DELIMITERS if d in planned.join), None)) is not None:
         return f"it holds {marker}, which Superset reads as a template marker; write it without {marker}"
     try:
-        tree = sqlglot.parse_one(f"SELECT 1 FROM {planned.join}", read=SUPERSET_DIALECT)
+        tree = sqlglot.parse_one(f"{_JOIN_PREFIX}{planned.join}", read=SUPERSET_DIALECT)
     except SqlglotError:
         return "it is not one SQL join"
     if not isinstance(tree, exp.Select) or {key for key, value in tree.args.items() if value} - {"expressions",
                                                                                                  "from_", "joins"}:
         return "it is a join of tables and nothing else: no WHERE, GROUP BY or LIMIT"
     joins = tree.args.get("joins") or []
-    if not joins or any(join.args.get("on") is None or join.args.get("using") for join in joins):
+    for join in joins:
+        if join.args.get("method"):
+            return f"a {join.args['method']} JOIN is not one mnemiq reads: join each table ON a condition"
+        if {key for key, value in join.args.items() if value} - _JOIN_ARGS \
+                or (join.args.get("kind") or "INNER").upper() not in ("INNER", "OUTER"):
+            return "it joins with JOIN, LEFT JOIN, RIGHT JOIN or FULL JOIN, each ON a condition"
+    if not joins or any(join.args.get("on") is None for join in joins):
         return "it is a JOIN of two or more tables, each joined ON a condition"
     nodes = [tree.args["from_"].this, *(join.this for join in joins)]
     if len(list(tree.find_all(exp.Select))) != 1 or not all(isinstance(node, exp.Table) for node in nodes) \
@@ -786,24 +803,29 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
         return ("it joins tables, each ON a condition on their columns: no subquery, EXISTS, CTE or table function "
                 "anywhere in it")
     names: list[str] = []
+    qualifiers: dict[str | None, str] = {}
     for node in nodes:
+        if (problem := _table_problem(node)) is not None:
+            return problem
         name = resolve_identifier(node.this, SUPERSET_DIALECT)
-        if node.args.get("db") or node.args.get("catalog"):
-            return "it names its tables without a schema"
         if name not in catalogue.columns:
             return f"{node.name!r} is not a table this builder can read"
         if name in names:
             return f"it joins {node.name!r} to itself"
         names.append(name)
+        alias = node.args.get("alias")
+        qualifiers[resolve_identifier(alias.this if alias else node.this, SUPERSET_DIALECT)] = name
+    if (problem := _condition_problem(tree, qualifiers, catalogue)) is not None:
+        return problem
     having: dict[str, list[str]] = {}
     for name in names:
         for column in catalogue.columns[name]:
             having.setdefault(column, []).append(name)
-    picked: list[str] = []
+    picked: list[exp.Expression] = []
     owners: dict[str, str] = {}
     types: dict[str, str | None] = {}
     for node, name in zip(nodes, names):
-        qualifier = (node.args["alias"].this if node.args.get("alias") else node.this).sql(dialect=SUPERSET_DIALECT)
+        qualifier = node.args["alias"].this if node.args.get("alias") else node.this
         for column in sorted(catalogue.columns[name]):
             shown = column if len(having[column]) == 1 else f"{name}_{column}"
             if shown in owners:
@@ -811,14 +833,60 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
             if len(shown.encode()) > MAX_IDENTIFIER:
                 return f"the joined dataset's column {shown!r} is longer than the {MAX_IDENTIFIER} bytes of a name"
             owners[shown], types[shown] = name, catalogue.types[name].get(column)
-            picked.append(f"{qualifier}.{_quoted(column)} AS {_quoted(shown)}")
+            picked.append(exp.alias_(exp.Column(this=exp.to_identifier(column, quoted=True), table=qualifier.copy()),
+                                     exp.to_identifier(shown, quoted=True)))
     shared = {column: tuple(f"{table}_{column}" for table in tables) for column, tables in having.items()
               if len(tables) > 1}
+    # The dataset's SELECT is the parsed join's own tree with these columns, printed as the deciders print each
+    # measure's statement over the same join text: the dataset runs the FROM that was decided, never the raw text.
+    select = tree.copy()
+    select.set("expressions", picked)
     made = PlannedDataset(key=planned.key, placeholder=planned.placeholder, join=planned.join,
-                          sql=f"SELECT {', '.join(picked)} FROM {planned.join}", name=_virtual_name(planned.key, names))
+                          sql=select.sql(dialect=SUPERSET_DIALECT), name=_virtual_name(planned.key, names))
     return _Rows(frozenset(owners), planned.join, (_made_count(planned.placeholder),), f"the join {planned.join!r}",
                  types, made, measured=frozenset(c for c, tables in having.items() if len(tables) == 1),
                  owners=owners, shared=shared)
+
+
+def _table_problem(node: exp.Table) -> str | None:
+    """Why a joined table is not named alone, or with an alias alone: a function in its place, a schema, ONLY, a
+    TABLESAMPLE (which would make the dataset a sample of the table), or an alias's column list."""
+    if not isinstance(node.this, exp.Identifier):
+        return f"it joins tables only, never a function such as {node.this.sql(dialect=SUPERSET_DIALECT)}"
+    clauses = {key for key, value in node.args.items() if value} - {"this", "alias"}
+    if clauses & {"db", "catalog"}:
+        return "it names its tables without a schema"
+    if "only" in clauses:
+        return f"it names {node.name!r} without ONLY"
+    if "sample" in clauses:
+        return f"it reads {node.name!r} whole: a TABLESAMPLE would make the dataset a sample of it"
+    if clauses:
+        return f"it names {node.name!r} alone, with an alias at most"
+    alias = node.args.get("alias")
+    if alias is not None and {key for key, value in alias.args.items() if value} - {"this"}:
+        return f"the alias of {node.name!r} takes no column list: the dataset names the table's own columns"
+    return None
+
+
+def _condition_problem(tree: exp.Select, qualifiers: Mapping[str | None, str], catalogue: _Catalogue) -> str | None:
+    """Why a join's ON conditions name something other than a joined table's column: a column of a table not in the
+    join, one no joined table has, or a `TABLE` read as a column (`= ANY (TABLE t)`, which sqlglot reads that way)."""
+    for column in tree.find_all(exp.Column):
+        written = column.sql(dialect=SUPERSET_DIALECT)
+        name = resolve_identifier(column.this, SUPERSET_DIALECT)
+        if column.name.casefold() == "table":
+            return f"its conditions name {written}: a table is joined, never read in a condition"
+        if column.args.get("db") or column.args.get("catalog"):
+            return f"its conditions name {written} with a schema; name a joined table's column"
+        if column.table:
+            owner = qualifiers.get(resolve_identifier(column.args.get("table"), SUPERSET_DIALECT))
+            if owner is None:
+                return f"its conditions name {written}, and {column.table!r} is no table of the join"
+            if name not in catalogue.columns[owner]:
+                return f"its conditions name {written}, which is no column of {owner!r}"
+        elif not any(name in catalogue.columns[owner] for owner in qualifiers.values()):
+            return f"its conditions name {column.name!r}, which is no column of a joined table"
+    return None
 
 
 def _expression_columns(expression: str) -> list[exp.Column] | None:

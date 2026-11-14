@@ -135,9 +135,9 @@ def _settings() -> Settings:
     return Settings(guard_fanout=False, superset_currency="USD")
 
 
-def _plan(goal: str, planner, tools: Tools, *, grants=GRANTS, **more):
+def _plan(goal: str, planner, tools: Tools, *, grants=GRANTS, snapshot=SNAPSHOT, **more):
     adapter = _adapter(tools)
-    return plan_build(goal, planner=planner, client=adapter.client, adapter=adapter, snapshot=SNAPSHOT, grants=grants,
+    return plan_build(goal, planner=planner, client=adapter.client, adapter=adapter, snapshot=snapshot, grants=grants,
                       settings=_settings(), **more)
 
 
@@ -523,7 +523,7 @@ def test_a_measure_that_needs_a_join_plans_a_virtual_dataset():
                         'policy."start_date" AS "start_date", claim."amount" AS "amount", '
                         'claim."claim_id" AS "claim_id", claim."created_at" AS "claim_created_at", '
                         'claim."policy_id" AS "claim_policy_id", claim."status" AS "status" FROM ' + JOIN)
-    assert made.name == "mnemiq_dataset_1_policy_claim"
+    assert made.name == "mnemiq_dataset_1:policy_claim"
     assert (made.key, made.placeholder, made.join, made.table, made.table_name) == ("dataset_1", -1, JOIN, None, None)
 
 
@@ -797,6 +797,9 @@ def test_a_join_holds_tables_and_conditions_only(join):
 @pytest.mark.parametrize("join, dims", [
     (JOIN, ["region"]),
     (JOIN + " JOIN agent ON agent.agent_id = claim.claim_id", ["office"]),
+    ("policy INNER JOIN claim ON claim.policy_id = policy.policy_id", ["region"]),
+    ("policy LEFT OUTER JOIN claim ON claim.policy_id = policy.policy_id", ["region"]),
+    ("policy FULL JOIN claim ON claim.policy_id = policy.policy_id", ["region"]),
 ])
 def test_a_join_of_two_or_three_tables_is_planned(join, dims):
     paid = _measure("paid", "Paid", "SUM(amount)", K.NUMBER, dataset_id=-1)
@@ -889,10 +892,10 @@ def test_a_virtual_datasets_name_carries_its_key():
     """M3: unique within a build by its key, and never longer than rc2's 250."""
     from mnemiq.superset.planner import _virtual_name
 
-    assert _virtual_name("dataset_1", ["policy", "claim"]) == "mnemiq_dataset_1_policy_claim"
+    assert _virtual_name("dataset_1", ["policy", "claim"]) == "mnemiq_dataset_1:policy_claim"
     long = [f"t{i}_" + "x" * 60 for i in range(6)]
     one, two = _virtual_name("dataset_1", long), _virtual_name("dataset_2", long)
-    assert len(one) == 250 and len(two) == 250 and one != two and one.startswith("mnemiq_dataset_1_")
+    assert len(one) == 250 and len(two) == 250 and one != two and one.startswith("mnemiq_dataset_1:")
 
 
 def test_two_joins_get_two_names():
@@ -906,7 +909,7 @@ def test_two_joins_get_two_names():
                                PlannedDataset(key="dataset_2", placeholder=-2, join=other)))
     checked = _plan(GOAL, FakePlanner(plan), _tools())
     assert isinstance(checked, BuildPlan), checked
-    assert [d.name for d in checked.datasets] == ["mnemiq_dataset_1_policy_claim", "mnemiq_dataset_2_claim_agent"]
+    assert [d.name for d in checked.datasets] == ["mnemiq_dataset_1:policy_claim", "mnemiq_dataset_2:claim_agent"]
 
 
 def test_a_checked_dataset_holds_only_what_the_check_wrote():
@@ -992,3 +995,73 @@ def test_a_measures_description_is_bounded():
     plan = _valid_plan(charts=(_chart("by_region", Family.BAR, [WrittenRef(fits)], dims=["region"]),),
                        measures=(fits,))
     assert _plan(GOAL, FakePlanner(plan), _tools()) == plan
+
+
+# ---------------------------------------------------------------- fix round 2
+
+def _joined_plan(join: str) -> BuildPlan:
+    paid = _measure("paid", "Paid", "SUM(amount)", K.NUMBER, dataset_id=-1)
+    return BuildPlan(charts=(_chart("paid", Family.BAR, [WrittenRef(paid)], dataset_id=-1, dims=["region"]),),
+                     measures=(paid,), reuse_candidates=(),
+                     datasets=(PlannedDataset(key="dataset_1", placeholder=-1, join=join),))
+
+
+@pytest.mark.parametrize("join, why", [
+    ("policy JOIN claim AS c(policy_id, claim_id) ON c.policy_id = policy.policy_id", "column list"),
+    ("policy JOIN generate_series(1, 3) g ON true", "function"),
+    ("policy JOIN agent() ON true", "function"),
+    ("policy NATURAL JOIN claim", "NATURAL"),
+    ("policy NATURAL JOIN claim ON claim.policy_id = policy.policy_id", "NATURAL"),
+    ("policy JOIN ONLY claim ON claim.policy_id = policy.policy_id", "ONLY"),
+    ("ONLY policy JOIN claim ON claim.policy_id = policy.policy_id", "ONLY"),
+    ("policy JOIN claim TABLESAMPLE SYSTEM (10) ON claim.policy_id = policy.policy_id", "TABLESAMPLE"),
+    (JOIN + " AND claim.policy_id = ANY (TABLE payroll)", "TABLE"),
+    (JOIN + " AND claim.policy_id = agent_id", "agent_id"),
+    (JOIN + " AND agent.agent_id = 1", "no table of the join"),
+    (JOIN + " AND claim.office = 'x'", "office"),
+    ("policy SEMI JOIN claim ON claim.policy_id = policy.policy_id", "LEFT JOIN"),
+    ("policy ANTI JOIN claim ON claim.policy_id = policy.policy_id", "LEFT JOIN"),
+    ("policy CROSS JOIN claim ON claim.policy_id = policy.policy_id", "LEFT JOIN"),
+])
+def test_a_joined_table_is_named_alone_and_joined_on_its_columns(join, why):
+    """Fix round 2: what the allow-list still let through. TABLESAMPLE would have made the dataset a sample."""
+    refused = _plan(GOAL, FakePlanner(_joined_plan(join)), _tools())
+    assert isinstance(refused, PlanRefused), refused
+    assert f"the join {join!r}" in _parts(refused)
+    assert why in _parts(refused)[f"the join {join!r}"]
+
+
+@pytest.mark.parametrize("written, rendered", [
+    ("policy  join claim on claim.policy_id=policy.policy_id", JOIN),
+    ("policy p LEFT JOIN claim c ON c.policy_id = p.policy_id",
+     "policy AS p LEFT JOIN claim AS c ON c.policy_id = p.policy_id"),
+])
+def test_a_virtual_dataset_runs_the_join_as_it_was_decided(written, rendered):
+    """Fix round 2: the dataset's SQL is the parsed join's rendering, the text the dry run decided, not the raw
+    text."""
+    tools = _tools()
+    checked = _plan(GOAL, FakePlanner(_joined_plan(written)), tools)
+    assert isinstance(checked, BuildPlan), checked
+    (made,) = checked.datasets
+    assert made.join == written, "the plan keeps the join as the model wrote it"
+    assert made.sql.endswith(" FROM " + rendered)
+    assert any(f"AS paid FROM {rendered}" in sql for sql in tools.statements())
+
+
+def test_virtual_dataset_names_cannot_meet():
+    """Fix round 2: a key holds no `:`, so the name's key part is the key and nothing else."""
+    from mnemiq.superset.planner import _virtual_name
+
+    assert _virtual_name("a", ["b", "c_d"]) != _virtual_name("a_b", ["c", "d"])
+
+
+def test_table_in_a_condition_is_refused_even_where_a_column_is_named_table():
+    """`= ANY (TABLE payroll)` reads as a column `TABLE`; where claim has a column of that name, only the rule on the
+    name itself refuses it, since every joined table's column would otherwise match."""
+    with_table = SNAPSHOT.model_copy(update={"columns": [
+        *SNAPSHOT.columns, Column(id="claim.table", object_id="claim", name="table", data_type="VARCHAR")]})
+    join = JOIN + " AND claim.policy_id = ANY (TABLE payroll)"
+    refused = _plan(GOAL, FakePlanner(_joined_plan(join)), _tools(), snapshot=with_table)
+    assert isinstance(refused, PlanRefused), refused
+    assert f"the join {join!r}" in _parts(refused)
+    assert "never read in a condition" in _parts(refused)[f"the join {join!r}"]
