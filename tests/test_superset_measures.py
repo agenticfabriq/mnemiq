@@ -4,6 +4,8 @@ ask-path statement meets. Run against `FakeSuperset` where the deciders need an 
 from __future__ import annotations
 
 import re
+import shlex
+from pathlib import Path
 
 import pytest
 
@@ -182,3 +184,16 @@ def test_measure_value_is_a_float_or_none():
         assert measure_value(approved, adapter, 30.0) == 12.0
         rows.clear()
         assert measure_value(approved, adapter, 30.0) is None
+
+
+# The workflow that runs the Superset client on mcp 2.x. Read as text: no YAML parser is a dependency of the `dev` extra.
+MCP_2X = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "mcp-2x.yml"
+
+
+def test_the_mcp_2x_workflow_runs_this_module():
+    """These tests drive the deciders through `SupersetMcp` over the wire to `FakeSuperset`, so they run where the
+    client meets mcp 2.x too: the workflow's one pytest line names this module."""
+    runs = [line for line in MCP_2X.read_text().splitlines() if re.search(r"\brun:.*\bpytest\b", line)]
+    assert len(runs) == 1, f"expected one pytest line in {MCP_2X.name}, found {runs}"
+    module = f"tests/{Path(__file__).name}"
+    assert module in shlex.split(runs[0].split("run:", 1)[1]), f"{MCP_2X.name}'s pytest line does not run {module}"
