@@ -13,13 +13,18 @@ from __future__ import annotations
 
 from mnemiq.superset.client import SupersetToolError
 
-__all__ = ["EXTENSION_TOOLS", "ExtensionMissing", "TOOL_PREFIX", "call_tool", "dataset_metrics"]
+__all__ = ["DATASET_METRICS_BATCH", "EXTENSION_TOOLS", "ExtensionMissing", "TOOL_PREFIX", "call_tool",
+           "dataset_metrics"]
 
 TOOL_PREFIX = "extensions.agenticfabriq.mnemiq."
 
 # The base name of every tool the extension offers; the single source the client and the test fake build names from.
 EXTENSION_TOOLS = ("create_dashboard", "claim_chart", "claim_dataset", "create_chart", "patch_chart",
                    "add_saved_metric", "delete_dataset", "set_layout", "dataset_metrics", "editors_of", "get_layout")
+
+# The most dataset ids one `dataset_metrics` call takes: the extension refuses a request naming more
+# (`reads.MAX_DATASETS` in the extension).
+DATASET_METRICS_BATCH = 20
 
 _PROBE = "dataset_metrics"
 _MASKED = "An unexpected error occurred"
@@ -61,7 +66,12 @@ def call_tool(client, base: str, request: dict) -> dict:
 
 
 def dataset_metrics(client, dataset_ids: tuple[int, ...]) -> list[dict]:
-    """The extension's saved metrics of these datasets, each `{dataset_id, metrics: [...]}`; a dataset the caller cannot
-    access is absent."""
-    answer = call_tool(client, "dataset_metrics", {"dataset_ids": list(dataset_ids)})
-    return list(answer.get("datasets") or [])
+    """The extension's saved metrics of these datasets, each `{dataset_id, metrics: [...]}`, asked
+    `DATASET_METRICS_BATCH` datasets a call, in order. A dataset the caller cannot access is absent, and so is one
+    an answer leaves out for any other reason: a caller reads an absent dataset's metrics as unknown."""
+    found: list[dict] = []
+    ids = list(dataset_ids)
+    for start in range(0, len(ids), DATASET_METRICS_BATCH):
+        answer = call_tool(client, "dataset_metrics", {"dataset_ids": ids[start:start + DATASET_METRICS_BATCH]})
+        found.extend(answer.get("datasets") or [])
+    return found

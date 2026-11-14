@@ -92,6 +92,36 @@ def test_list_metrics_paged_by_dataset(fake):
     assert [c.request for c in fake.calls if c.tool == DATASET_METRICS] == [{"dataset_ids": [1, 2]}]
 
 
+def test_the_extension_is_asked_twenty_datasets_at_a_time():
+    """The extension's `dataset_metrics` takes at most 20 dataset ids a call and refuses more
+    (`reads.MAX_DATASETS`); 45 datasets are asked in calls of 20, 20 and 5, in order, and every metric's
+    certification is known."""
+    from tests.superset_extension_path import use_extension_source
+
+    use_extension_source()
+    from agenticfabriq.mnemiq import reads
+
+    from mnemiq.superset import extension
+
+    ids = tuple(range(101, 146))
+    with FakeSuperset() as fake:
+        _serve_metrics(fake, {i: [_metric(i, f"m{i}")] for i in ids})
+
+        def answer(request, authorization):
+            if len(request["dataset_ids"]) > reads.MAX_DATASETS:
+                return {"refused": "request", "field": "dataset_ids"}
+            return {"datasets": [{"dataset_id": i, "metrics": [_extension_row(f"m{i}", certified_by="finance")]}
+                                 for i in request["dataset_ids"]]}
+
+        fake.reply(DATASET_METRICS, answer)
+        saved = read_saved_metrics(_client(fake), dataset_ids=ids)
+        asked = [c.request["dataset_ids"] for c in fake.calls if c.tool == DATASET_METRICS]
+    assert asked == [list(ids[:20]), list(ids[20:40]), list(ids[40:])]
+    assert len(saved) == 45 and all(s.certified_by == "finance" for s in saved)
+    # mnemiq's batch is the extension's own limit.
+    assert extension.DATASET_METRICS_BATCH == reads.MAX_DATASETS
+
+
 def test_without_the_extension_certification_is_unknown():
     with FakeSuperset(extension=False) as fake:
         _serve_metrics(fake, {1: [_metric(1, "a"), _metric(1, "b")]})
