@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import io
+import json
 import os
 import subprocess
 import threading
@@ -31,6 +32,8 @@ DATABASE_NAME = "mnemiq_live"
 # any scope to its own scope map (`_token_scope_allows` in `superset/mcp_service/auth.py`), so the token also names
 # Superset's scopes for `execute_sql` and `list_datasets`.
 SCOPES = "openid db.read superset:sqllab:write superset:dataset:read"
+# The extension's token route (`integrations/superset`), under the prefix Superset gives an extension's routes.
+TOKEN_ROUTE = "/extensions/agenticfabriq/mnemiq/token/"
 
 
 def required(*names: str) -> dict[str, str]:
@@ -64,6 +67,36 @@ class Live:
                 **claims}
         return jwt.encode(body, (self.keys / "private.pem").read_bytes(), algorithm="RS256",
                           headers={"kid": self.kid})
+
+    @contextlib.contextmanager
+    def signed_in(self, username: str):
+        """An HTTP client signed in to Superset's web server as `username` through `/api/v1/security/login`, with the
+        password `setup_superset.py` keeps for that user, and the Bearer the sign-in answered; closed when the block
+        ends. The password is read here and sent nowhere else; no message this raises carries it."""
+        import httpx
+
+        password = json.loads((self.keys / "passwords.json").read_text())[username]
+        with httpx.Client(base_url=self.url, timeout=30) as client:
+            login = client.post("/api/v1/security/login",
+                                json={"username": username, "password": password, "provider": "db", "refresh": False})
+            assert login.status_code == 200, f"Superset refused {username}'s sign-in: HTTP {login.status_code}"
+            yield client, {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    def csrf_token(self, client, headers: dict) -> str:
+        """A CSRF token for this signed-in client, from `/api/v1/security/csrf_token/`; its session cookie stays on
+        the client."""
+        answer = client.get("/api/v1/security/csrf_token/", headers=headers)
+        assert answer.status_code == 200, f"no CSRF token: HTTP {answer.status_code}"
+        return answer.json()["result"]
+
+    def minted(self, username: str, purpose: str) -> str:
+        """A token the extension's token route mints for `username`, signed in, with a CSRF token: what mnemiq's
+        panel asks for on a person's behalf."""
+        with self.signed_in(username) as (client, headers):
+            csrf = self.csrf_token(client, headers)
+            answer = client.post(TOKEN_ROUTE, json={"purpose": purpose}, headers={**headers, "X-CSRFToken": csrf})
+        assert answer.status_code == 200, f"the token route answered HTTP {answer.status_code}"
+        return answer.json()["token"]
 
     @property
     def jwks_file(self) -> str:
@@ -132,6 +165,16 @@ def run_setup(*args: str) -> str:
                           capture_output=True, text=True, timeout=300)
     assert done.returncode == 0, done.stderr[-2000:]
     return done.stdout.strip().splitlines()[-1]
+
+
+def metadata(sql: str, params: tuple = ()) -> list[tuple]:
+    """`sql`'s rows read from Superset's metadata database directly: by the suite, to see what a tool wrote, and never
+    by mnemiq or the extension."""
+    import psycopg
+
+    uri = required("MNEMIQ_TEST_SUPERSET_METADATA_URI")["MNEMIQ_TEST_SUPERSET_METADATA_URI"]
+    with psycopg.connect(uri, connect_timeout=10) as con:
+        return [tuple(row) for row in con.execute(sql, params).fetchall()]
 
 
 def fingerprint_of(value: str) -> str:

@@ -10,7 +10,7 @@ import pytest
 
 from mnemiq.config import Settings
 from tests.auth_keys import AUDIENCE, ISSUER, jwks_for, rsa_key
-from tests.superset_extension_path import use_extension_source
+from tests.superset_extension_path import BACKEND_SRC, use_extension_source
 
 use_extension_source()
 
@@ -150,3 +150,30 @@ def test_api_ignores_a_username_in_the_body(tmp_path):
     for bad in ({}, {"purpose": "x"}, {"purpose": ["ask"]}, None, []):
         with pytest.raises(BadRequest):
             mint_for(user, bad, cfg, time.time())
+
+
+API_SOURCE = BACKEND_SRC / "agenticfabriq" / "mnemiq" / "api.py"
+
+
+def csrf_problems(source: str) -> list[str]:
+    """Whether the token route's API class opts out of Flask-AppBuilder's CSRF exemption, read with `ast`: FAB
+    exempts an API's blueprint unless the class sets `csrf_exempt = False` (`BaseApi.csrf_exempt` is True), and
+    `superset_core`'s `RestApi` does not set it."""
+    import ast
+
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.ClassDef) and node.name == "MnemiqApi":
+            values = [stmt.value.value for stmt in node.body if isinstance(stmt, ast.Assign)
+                      and any(getattr(t, "id", None) == "csrf_exempt" for t in stmt.targets)
+                      and isinstance(stmt.value, ast.Constant)]
+            return [] if values == [False] else [f"MnemiqApi.csrf_exempt is {values or 'not set'}"]
+    return ["no MnemiqApi class"]
+
+
+def test_the_token_route_needs_csrf():
+    assert csrf_problems(API_SOURCE.read_text()) == []
+    # The planted defect, as the route first shipped: the class does not say, so FAB exempts the route.
+    assert csrf_problems(API_SOURCE.read_text().replace("    csrf_exempt = False\n", "")) == [
+        "MnemiqApi.csrf_exempt is not set"]
+    assert csrf_problems(API_SOURCE.read_text().replace("csrf_exempt = False", "csrf_exempt = True")) == [
+        "MnemiqApi.csrf_exempt is [True]"]

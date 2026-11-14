@@ -27,6 +27,10 @@ class MnemiqApi(RestApi):
     resource_name = "token"
     class_permission_name = "mnemiq"
     openapi_spec_tag = "mnemiq"
+    # Flask-AppBuilder exempts an API's blueprint from CSRF unless the class says otherwise (`BaseApi.csrf_exempt`),
+    # and `superset_core.rest_api.api.RestApi` does not; Superset's own APIs do (`BaseSupersetApiMixin`). This route
+    # mints a token for whoever's session reaches it, so it needs the session's CSRF token.
+    csrf_exempt = False
 
     @expose("/", methods=("POST",))
     @protect()
