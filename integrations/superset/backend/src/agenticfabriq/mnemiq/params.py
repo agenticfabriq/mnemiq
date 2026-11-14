@@ -749,14 +749,23 @@ def layout_metadata(positions: Mapping, current_json_metadata: Mapping | None) -
     """The `json_metadata` a layout save sends through `UpdateDashboardCommand`: the `positions` (which set the
     layout and the membership) and the dashboard's current `native_filter_configuration`. Without the filters,
     `UpdateDashboardCommand.process_native_filter_diff` reads every filter as deleted and deactivates each report on
-    one. The keys `set_dash_metadata` would otherwise reset go back as stored; the legacy `default_filters` and
-    `filter_scopes` are not sent, as rc2's own dashboard save sends them empty."""
+    one. The keys `set_dash_metadata` would otherwise reset go back as stored.
+
+    So do the legacy `default_filters` and `filter_scopes` when the dashboard has them: `set_dash_metadata` rewrites
+    `default_filters` from the value sent alone and drops `filter_scopes` when none are sent, which would undo them on
+    a dashboard made by hand. It reads `default_filters` as JSON text, so a value stored as an object goes back as
+    its JSON."""
     current = current_json_metadata if isinstance(current_json_metadata, Mapping) else {}
     metadata = {"positions": copy.deepcopy(dict(positions)),
                 "native_filter_configuration": copy.deepcopy(current.get("native_filter_configuration", []))}
     for key in _RESET_WHEN_ABSENT:
         if key in current:
             metadata[key] = copy.deepcopy(current[key])
+    if "default_filters" in current:
+        stored = current["default_filters"]
+        metadata["default_filters"] = json.dumps(stored) if isinstance(stored, Mapping) else stored
+    if "filter_scopes" in current:
+        metadata["filter_scopes"] = copy.deepcopy(current["filter_scopes"])
     return metadata
 
 

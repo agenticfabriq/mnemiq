@@ -540,6 +540,59 @@ def test_layout_metadata_keeps_native_filters():
     assert ext.layout_metadata(positions, None) == {"positions": positions, "native_filter_configuration": []}
 
 
+def _legacy_filters_after_save(stored: dict, sent: dict) -> tuple:
+    """What rc2's `DashboardDAO.set_dash_metadata` (`superset/daos/dashboard.py`) stores for the legacy
+    `default_filters` and `filter_scopes` when a save sends `sent`, holding `positions`, over the stored metadata
+    `stored`: it rewrites `default_filters` from the sent value alone (keeping the charts the layout holds), and
+    keeps `filter_scopes` only when they are sent (`copy_filter_scopes`, the layout's charts again)."""
+    md = copy.deepcopy(stored)
+    chart_ids = [node.get("meta", {}).get("chartId") for node in sent["positions"].values() if isinstance(node, dict)]
+    kept = {chart_id: chart_id for chart_id in chart_ids}
+    scopes: dict = {}
+    if "filter_scopes" in sent:
+        sent_scopes = sent["filter_scopes"]
+        sent_scopes = json.loads(sent_scopes or "{}") if isinstance(sent_scopes, str) else copy.deepcopy(sent_scopes)
+        for filter_id, filter_scopes in sent_scopes.items():
+            if kept.get(int(filter_id)):
+                scopes[str(filter_id)] = filter_scopes
+                for scope in filter_scopes.values():
+                    scope["immune"] = [i for i in scope.get("immune", []) if int(i) in kept]
+    try:
+        defaults = json.loads(sent.get("default_filters", "{}"))
+    except (json.JSONDecodeError, TypeError):
+        defaults = {}
+    md["default_filters"] = json.dumps({key: v for key, v in defaults.items() if int(key) in chart_ids})
+    if scopes:
+        md["filter_scopes"] = scopes
+    else:
+        md.pop("filter_scopes", None)
+    return json.loads(md["default_filters"]), md.get("filter_scopes")
+
+
+def test_layout_metadata_keeps_legacy_filters():
+    """A dashboard made by hand may still carry the legacy filter settings. rc2 rebuilds both from what a save sends,
+    so a layout save sends them back as they are stored, or it would undo them."""
+    defaults = {"1": {"region": ["west"]}}
+    scopes = {"1": {"region": {"scope": ["ROOT_ID"], "immune": [2]}}}
+    stored = {"native_filter_configuration": [], "default_filters": json.dumps(defaults), "filter_scopes": scopes}
+    positions = layout([1, 2])
+    metadata = ext.layout_metadata(positions, stored)
+    assert metadata["default_filters"] == stored["default_filters"]
+    assert metadata["filter_scopes"] == scopes
+    assert _legacy_filters_after_save(stored, metadata) == (defaults, scopes)
+    # The control: a save without them stores no default filters and drops the scopes.
+    assert _legacy_filters_after_save(stored, {"positions": positions, "native_filter_configuration": []}) == ({}, None)
+    # Sent as a copy: what rc2 does to the sent scopes never reaches the stored ones.
+    metadata["filter_scopes"]["1"]["region"]["immune"].append(9)
+    assert scopes == {"1": {"region": {"scope": ["ROOT_ID"], "immune": [2]}}}
+    # Stored as an object rather than JSON text, the default filters go back as the JSON text rc2 reads.
+    as_object = ext.layout_metadata(positions, {"default_filters": defaults})
+    assert json.loads(as_object["default_filters"]) == defaults
+    assert _legacy_filters_after_save({"default_filters": defaults}, as_object) == (defaults, None)
+    # Absent, neither is sent.
+    assert not {"default_filters", "filter_scopes"} & set(ext.layout_metadata(positions, {}))
+
+
 # ---------------------------------------------------------------- the saved metric add
 
 def test_metric_stub_list_keeps_every_existing_id():
