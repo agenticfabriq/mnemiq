@@ -17,7 +17,10 @@ Every tool keeps these rules:
 - A caller who is not an editor of the object is told so before anything about the object's state (a stale
   `changed_on`, another build's marker): no retry changes it, and the answer names whom to ask.
 - An object the caller may not read is answered as one that does not exist.
-- It takes no user id from the caller. The editors a tool sets are a dashboard's.
+- It takes no user id from the caller. The editors a tool sets come from a dashboard's editors, and an object whose
+  editors may read data for being its editors (a dataset, in rc2) gets as editors only the caller and the users who
+  may already read that data (`_data_editors`), never a role or a group, so that being made an editor widens no
+  one's access.
 
 Superset is imported inside the tools, never at module level, so this module imports without it and the request
 checks run in mnemiq's unit tests.
@@ -25,12 +28,13 @@ checks run in mnemiq's unit tests.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import functools
 import json
 import logging
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -448,6 +452,85 @@ def _editor_ids(dashboard: Any) -> list[int]:
     return [subject.id for subject in dashboard.editors]
 
 
+@contextlib.contextmanager
+def _as_user(user: Any) -> Iterator[None]:
+    """`g.user` is `user` inside the block, and the request's own user again after it, also when the block raises:
+    rc2's `override_user` (`superset/utils/core.py`) puts the user back only when its block returns."""
+    from flask import g
+
+    had, previous = hasattr(g, "user"), getattr(g, "user", None)
+    g.user = user
+    try:
+        yield
+    finally:
+        if had:
+            g.user = previous
+        else:
+            del g.user
+
+
+def _reads_by_a_grant(dataset: Any) -> bool:
+    """Whether `g.user` may read `dataset` by a grant its roles hold: the legs of rc2's `raise_for_access` for a
+    datasource (`superset/security/manager.py`) other than editorship. `can_access_schema` holds all-datasource,
+    all-database, database, catalog and schema access; `datasource_access` on the dataset's own `perm` is the other.
+    Not counted: being an editor; the legs a chart's or a dashboard's request opens (an embedded guest, a viewer in
+    promiscuous mode); a semantic layer's grant, which covers semantic views only; and a deployment's
+    `EXTRA_RAISE_FOR_ACCESS_BYPASS`, whose reach the extension cannot know."""
+    security = _security()
+    return bool(security.can_access_schema(dataset) or security.can_access("datasource_access", dataset.perm or ""))
+
+
+def _data_editors(dataset: Any, dashboard: Any, kept: Iterable[Any]) -> list[int]:
+    """The editor subjects for an object whose editors may read `dataset`'s data. rc2 admits a dataset's editors to
+    its data (`raise_for_access`) and, in SQL Lab, to the table under it, and a role or a group made an editor makes
+    every member one. So: every subject in `kept` (the object's editors now, whoever added them), the caller's own
+    user subject, and each user among `dashboard`'s editors who may already read `dataset` by a grant, judged as that
+    user (`_reads_by_a_grant`). Never a role or a group."""
+    from superset.subjects.types import SubjectType
+    from superset.subjects.utils import get_user_subject
+    from superset.utils.core import get_user_id
+
+    chosen = [subject.id for subject in kept]
+    caller = get_user_subject(user_id) if (user_id := get_user_id()) is not None else None
+    if caller is not None and caller.id not in chosen:
+        chosen.append(caller.id)
+    for subject in dashboard.editors:
+        if dataset is None or subject.id in chosen or subject.type != SubjectType.USER or subject.user is None:
+            continue
+        with _as_user(subject.user):
+            readable = _reads_by_a_grant(dataset)
+        if readable:
+            chosen.append(subject.id)
+    return chosen
+
+
+def _chart_data_by_editorship() -> bool:
+    """Whether a chart's editors may read its dataset's data for being its editors: rc2 admits a chart's editors and
+    viewers to it when `ENABLE_VIEWERS` is on and `VIEWER_PROMISCUOUS_MODE` is set (`raise_for_access`,
+    `has_promiscuous_chart_access`)."""
+    from flask import current_app
+    from superset import is_feature_enabled
+
+    return bool(is_feature_enabled("ENABLE_VIEWERS") and current_app.config.get("VIEWER_PROMISCUOUS_MODE"))
+
+
+def _chart_editors(dataset: Any, dashboard: Any, kept: Iterable[Any]) -> list[int]:
+    """The editor subjects for a chart on `dataset` made or claimed for `dashboard`: the dashboard's editors, unless
+    a chart's editors may read its data for being its editors (`_chart_data_by_editorship`); then they are chosen as
+    a dataset's are (`_data_editors`), `kept` being the chart's editors now."""
+    if _chart_data_by_editorship():
+        return _data_editors(dataset, dashboard, kept)
+    return _editor_ids(dashboard)
+
+
+def _claimed_chart_editors(chart: Any, dashboard: Any) -> list[int]:
+    return _chart_editors(chart.datasource, dashboard, chart.editors)
+
+
+def _claimed_dataset_editors(dataset: Any, dashboard: Any) -> list[int]:
+    return _data_editors(dataset, dashboard, dataset.editors)
+
+
 # ---------------------------------------------------------------- the tools
 
 @_answering("create_dashboard")
@@ -467,10 +550,10 @@ def create_dashboard(found: dict) -> dict:
 
 
 def _claim(found: dict, resource: Any, *, kind: str, extra: Callable[[Any], dict | Mapping],
-           command: Callable[[int, dict], Any]) -> dict:
+           editors: Callable[[Any, Any], list[int]], command: Callable[[int, dict], Any]) -> dict:
     """What `claim_chart` and `claim_dataset` share: under the resource's lock, refuse one the caller does not edit or
     whose dashboard the caller does not edit, then one another build's marker holds; then one command sets the
-    dashboard's editors and the marker (and `extra(resource)`'s properties)."""
+    editors `editors(resource, dashboard)` chooses and the marker (and `extra(resource)`'s properties)."""
     readable = resource is not None and (_security().can_access_chart(resource) if kind == "chart"
                                          else _security().can_access_datasource(resource))
     if not readable:
@@ -488,8 +571,8 @@ def _claim(found: dict, resource: Any, *, kind: str, extra: Callable[[Any], dict
     more = extra(resource)
     if "refused" in more:
         return dict(more)
-    properties = {"editors": _editor_ids(dashboard), "description": with_marker(resource.description, found["marker"]),
-                  **more}
+    properties = {"editors": editors(resource, dashboard),
+                  "description": with_marker(resource.description, found["marker"]), **more}
     try:
         command(resource.id, properties).run()
     except _command_errors() as exc:
@@ -514,28 +597,33 @@ def _chart_query_context(chart: Any) -> dict:
 
 @_answering("claim_chart")
 def claim_chart(found: dict) -> dict:
-    """Makes a chart the dashboard's: its editors become the dashboard's, its description ends with the build's
-    marker, and it gets the query context of its family, in one `UpdateChartCommand` under the chart's lock. A chart
-    another build's marker holds is refused; the same claim made again is answered as the first was."""
+    """Makes a chart the dashboard's: its editors become the dashboard's (or, where a chart's editors may read its
+    data, are chosen as a dataset's: `_chart_editors`), its description ends with the build's marker, and it gets the
+    query context of its family, in one `UpdateChartCommand` under the chart's lock. A chart another build's marker
+    holds is refused; the same claim made again is answered as the first was."""
     if claim_marker(found["marker"], found["dashboard_id"]) is None:
         return BAD_MARKER
     from superset.commands.chart.update import UpdateChartCommand
     from superset.models.slice import Slice
 
     return _locked(Slice, found["chart_id"], lambda chart: _claim(
-        found, chart, kind="chart", extra=_chart_query_context, command=UpdateChartCommand))
+        found, chart, kind="chart", extra=_chart_query_context, editors=_claimed_chart_editors,
+        command=UpdateChartCommand))
 
 
 @_answering("claim_dataset")
 def claim_dataset(found: dict) -> dict:
-    """Makes a dataset the dashboard's, as `claim_chart` makes a chart, through `UpdateDatasetCommand`."""
+    """Makes a dataset the dashboard's, as `claim_chart` makes a chart, through `UpdateDatasetCommand`. Its editors
+    are those it has, the caller, and the dashboard's users who may already read it (`_data_editors`): a co-editor
+    left out is answered `{"not_editor": true, "editors": [...]}` when it asks to change or delete the dataset."""
     if claim_marker(found["marker"], found["dashboard_id"]) is None:
         return BAD_MARKER
     from superset.commands.dataset.update import UpdateDatasetCommand
     from superset.connectors.sqla.models import SqlaTable
 
     return _locked(SqlaTable, found["dataset_id"], lambda dataset: _claim(
-        found, dataset, kind="dataset", extra=lambda _: {}, command=UpdateDatasetCommand))
+        found, dataset, kind="dataset", extra=lambda _: {}, editors=_claimed_dataset_editors,
+        command=UpdateDatasetCommand))
 
 
 def _check_query(context: dict) -> dict | None:
@@ -572,9 +660,9 @@ def _check_query(context: dict) -> dict | None:
 @_answering("create_chart")
 def create_chart(found: dict) -> dict:
     """A funnel or a sankey on the dataset, for the dashboard: its query is run first and the chart saved only if it
-    runs; then `CreateChartCommand` saves its params, its query context, the dashboard's editors and the build's
-    marker. The editors are read in the create's own transaction. The chart joins the dashboard when a layout places
-    it (`set_layout`)."""
+    runs; then `CreateChartCommand` saves its params, its query context, the editors `_chart_editors` chooses and the
+    build's marker. The editors are read in the create's own transaction. The chart joins the dashboard when a layout
+    places it (`set_layout`)."""
     if claim_marker(found["marker"], found["dashboard_id"]) is None:
         return BAD_MARKER
     dataset_id, viz_type, form_data = found["dataset_id"], found["viz_type"], found["params"]
@@ -589,7 +677,8 @@ def create_chart(found: dict) -> dict:
         context = params.query_context(viz_type, form_data, dataset_id)
     except ValueError:
         return {"refused": "params"}
-    if _dataset(dataset_id) is None:
+    dataset = _dataset(dataset_id)
+    if dataset is None:
         return _not_found("dataset")
     dashboard = _dashboard(found["dashboard_id"])
     if dashboard is None:
@@ -604,7 +693,7 @@ def create_chart(found: dict) -> dict:
         chart = CreateChartCommand({
             "slice_name": found["slice_name"], "viz_type": viz_type, "datasource_id": dataset_id,
             "datasource_type": "table", "params": json.dumps(form_data), "query_context": json.dumps(context),
-            "editors": _editor_ids(dashboard), "description": found["marker"]}).run()
+            "editors": _chart_editors(dataset, dashboard, ()), "description": found["marker"]}).run()
     except _command_errors() as exc:
         return _command_answer("create_chart", exc, kind="dataset")
     return {"chart_id": chart.id}

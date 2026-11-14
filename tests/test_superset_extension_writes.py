@@ -7,6 +7,7 @@ What the tools do inside Superset (the locks, the commands, the answers) is the 
 """
 
 import ast
+import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -673,3 +674,173 @@ def test_set_layout_adds_only_charts_the_caller_may_read(superset, monkeypatch):
     assert [name for name, _ in superset.ran] == ["UpdateDashboardCommand"]
     assert writes._readable_chart(11) is True
     assert writes._readable_chart(12) is False and writes._readable_chart(13) is False
+
+
+# ---------------------------------------------------------------- who becomes an editor
+
+USER, ROLE, GROUP = stubs.SubjectType.USER, stubs.SubjectType.ROLE, stubs.SubjectType.GROUP
+DATASET_PERM = "[warehouse].[sales](id:4)"
+SCHEMA_PERM = "[warehouse].[public]"
+
+
+def _person(user_id: int, name: str, grants=(), member_of=()) -> SimpleNamespace:
+    """A user, its own subject (id 100 + its id) and the role and group subjects it is a member of; `grants` are the
+    `(permission, view)` pairs its roles hold."""
+    user = SimpleNamespace(id=user_id, username=name, grants=set(grants))
+    user.subject = SimpleNamespace(id=100 + user_id, type=USER, label=f"{name} Live", user=user)
+    user.subject_ids = {user.subject.id, *member_of}
+    return user
+
+
+class Security:
+    """rc2's security manager, stood in for the checks a claim makes, each read as `flask.g.user`, as rc2 reads them
+    (`superset/security/manager.py`): `can_access` is a grant of the user's roles; `can_access_schema` is
+    all-datasource, database or schema access; `is_editor` is any of the user's subjects (its own, its roles', its
+    groups') among the object's editors; and `can_access_datasource` is `raise_for_access`'s datasource leg, which
+    counts editorship. `judged` records each user the checks were asked as."""
+
+    def __init__(self, g, raises_for: str | None = None) -> None:
+        self.g, self.raises_for, self.judged = g, raises_for, []
+
+    def can_access(self, permission: str, view: str) -> bool:
+        user = self.g.user
+        self.judged.append(user.username)
+        if user.username == self.raises_for:
+            raise RuntimeError("the metadata database went away")
+        return (permission, view) in user.grants
+
+    def can_access_schema(self, dataset) -> bool:
+        return (self.can_access("all_datasource_access", "all_datasource_access")
+                or self.can_access("database_access", dataset.database.perm)
+                or self.can_access("schema_access", dataset.schema_perm))
+
+    def is_editor(self, resource) -> bool:
+        return bool(self.g.user.subject_ids & {subject.id for subject in resource.editors})
+
+    def can_access_datasource(self, dataset) -> bool:
+        return (self.can_access_schema(dataset) or self.can_access("datasource_access", dataset.perm)
+                or self.is_editor(dataset))
+
+    def can_access_dashboard(self, dashboard) -> bool:
+        return True
+
+    def can_access_chart(self, chart) -> bool:
+        return True
+
+
+@pytest.fixture
+def claiming(monkeypatch, superset):
+    """A dashboard (3) a builder edits with five co-editors, and a dataset (4) on table `sales`:
+    - `builder`, the caller, who may read every dataset and made the dataset;
+    - `reader`, granted `datasource_access` on the dataset, and `schema_reader`, granted its schema: both may read it;
+    - `outsider`, granted nothing, and `member`, granted nothing but a member of the role `R2`, which already edits the
+      dataset: neither may read it by a grant (`member` reads it only as an editor);
+    - the role `R` and the group `G`, editors of the dashboard.
+    The dataset's editors before the claim: its creator `creator` (not on the dashboard), the builder and `R2`."""
+    people = {name: _person(user_id, name, grants, member_of) for user_id, name, grants, member_of in (
+        (1, "builder", {("all_datasource_access", "all_datasource_access")}, ()),
+        (2, "reader", {("datasource_access", DATASET_PERM)}, ()),
+        (3, "outsider", set(), ()),
+        (4, "creator", set(), ()),
+        (5, "schema_reader", {("schema_access", SCHEMA_PERM)}, ()),
+        (6, "member", set(), (302,)))}
+    role, group, role_2 = (SimpleNamespace(id=301, type=ROLE, label="R", user=None),
+                           SimpleNamespace(id=401, type=GROUP, label="G", user=None),
+                           SimpleNamespace(id=302, type=ROLE, label="R2", user=None))
+    builder = people["builder"]
+    superset.g.user = builder
+    superset.user_subjects = {person.id: person.subject for person in people.values()}
+    dashboard = SimpleNamespace(id=3, editors=[people[name].subject for name in (
+        "builder", "reader", "outsider", "schema_reader", "member")] + [role, group])
+    dataset = SimpleNamespace(id=4, perm=DATASET_PERM, schema_perm=SCHEMA_PERM, description=None,
+                              database=SimpleNamespace(perm="[warehouse].(id:1)"),
+                              editors=[people["creator"].subject, builder.subject, role_2])
+    superset.dashboards, superset.datasets = {3: dashboard}, {4: dataset}
+    security = Security(superset.g)
+    monkeypatch.setattr(writes, "_security", lambda: security)
+    monkeypatch.setattr(writes, "_session", lambda: SimpleNamespace(rollback=lambda: None))
+    locked = {"SqlaTable": dataset}
+    monkeypatch.setattr(writes, "lock_row", lambda model, entity_id: locked[model.__name__])
+    return SimpleNamespace(superset=superset, security=security, people=people, dashboard=dashboard,
+                           dataset=dataset, locked=locked, ids={name: p.subject.id for name, p in people.items()})
+
+
+def _sent_editors(superset, command: str) -> list[int]:
+    """The editors the one `command` run sent: an update command takes `(id, properties)`, a create `properties`."""
+    (properties,) = [arguments if isinstance(arguments, dict) else arguments[-1] for name, arguments in superset.ran
+                     if name == command]
+    return properties["editors"]
+
+
+def test_a_claimed_dataset_gets_only_editors_who_could_already_read_it(claiming):
+    """rc2 admits a dataset's editors to its data (`raise_for_access`) and, in SQL Lab, to its table, and an editor
+    subject that is a role or a group makes every member an editor. So `claim_dataset` keeps the dataset's editors,
+    adds the caller, and adds only those of the dashboard's users who may already read the dataset by a grant, judged
+    as each of them: `reader` (datasource access) and `schema_reader` (schema access). Not `outsider`, not `member`
+    (who reads it only as an editor, through `R2`), never the role `R` or the group `G`. The request's user is the
+    builder again afterwards."""
+    ids = claiming.ids
+    answer = writes.claim_dataset({"dataset_id": 4, "dashboard_id": 3, "marker": format_marker(BUILD, "data", 3)})
+    assert answer == {"ok": True}
+    assert _sent_editors(claiming.superset, "UpdateDatasetCommand") == [
+        ids["creator"], ids["builder"], 302, ids["reader"], ids["schema_reader"]]
+    assert {"reader", "schema_reader", "outsider", "member"} <= set(claiming.security.judged)
+    assert claiming.superset.g.user is claiming.people["builder"]
+    (properties,) = [arguments[1] for name, arguments in claiming.superset.ran if name == "UpdateDatasetCommand"]
+    assert properties["description"] == format_marker(BUILD, "data", 3)
+
+
+def test_the_request_user_comes_back_when_a_check_fails(claiming):
+    """A check that raises while the claim judges a co-editor leaves the request's user the builder, which rc2's
+    `override_user` would not (it puts the user back only when its block returns), and saves nothing."""
+    claiming.security.raises_for = "outsider"
+    with pytest.raises(RuntimeError):
+        writes.claim_dataset({"dataset_id": 4, "dashboard_id": 3, "marker": format_marker(BUILD, "data", 3)})
+    assert claiming.superset.g.user is claiming.people["builder"]
+    assert claiming.superset.ran == []
+
+
+def _chart(claiming, editors) -> SimpleNamespace:
+    form_data = {"viz_type": "funnel", "groupby": ["status"], "metric": "count", "datasource": "4__table"}
+    return SimpleNamespace(id=9, description=None, datasource_type="table", datasource_id=4, viz_type="funnel",
+                           params=json.dumps(form_data), datasource=claiming.dataset, editors=editors)
+
+
+@pytest.mark.parametrize("features, promiscuous", [(set(), False), ({"ENABLE_VIEWERS"}, False), (set(), True)])
+def test_a_chart_gets_the_dashboards_editors(claiming, features, promiscuous):
+    """A chart's editors may not read its data for being its editors unless `ENABLE_VIEWERS` is on and
+    `VIEWER_PROMISCUOUS_MODE` is set (`has_promiscuous_chart_access` in rc2's `raise_for_access`), so short of both a
+    claimed or created chart gets the dashboard's editors, every one, roles and groups included, as before."""
+    claiming.superset.features, claiming.superset.config["VIEWER_PROMISCUOUS_MODE"] = features, promiscuous
+    claiming.locked["Slice"] = _chart(claiming, [claiming.people["builder"].subject,
+                                                 claiming.people["creator"].subject])
+    everyone = [subject.id for subject in claiming.dashboard.editors]
+    assert writes.claim_chart({"chart_id": 9, "dashboard_id": 3,
+                               "marker": format_marker(BUILD, "kpi", 3)}) == {"ok": True}
+    assert _sent_editors(claiming.superset, "UpdateChartCommand") == everyone
+    made = writes.create_chart({"dataset_id": 4, "viz_type": "funnel", "slice_name": "stages",
+                                "params": {"groupby": ["status"], "metric": "count"}, "dashboard_id": 3,
+                                "marker": format_marker(BUILD, "stages", 3)})
+    assert set(made) == {"chart_id"}, made
+    assert _sent_editors(claiming.superset, "CreateChartCommand") == everyone
+
+
+def test_a_chart_whose_editors_read_its_data_gets_the_dataset_rule(claiming):
+    """With `ENABLE_VIEWERS` on and `VIEWER_PROMISCUOUS_MODE` set, a chart's editors may read its dataset's data, so a
+    claimed chart keeps its editors and adds the caller and the dashboard's users who may already read the chart's
+    dataset by a grant; a created chart gets the caller and those users."""
+    claiming.superset.features, claiming.superset.config["VIEWER_PROMISCUOUS_MODE"] = {"ENABLE_VIEWERS"}, True
+    ids = claiming.ids
+    claiming.locked["Slice"] = _chart(claiming, [claiming.people["creator"].subject,
+                                                 claiming.people["builder"].subject])
+    assert writes.claim_chart({"chart_id": 9, "dashboard_id": 3,
+                               "marker": format_marker(BUILD, "kpi", 3)}) == {"ok": True}
+    assert _sent_editors(claiming.superset, "UpdateChartCommand") == [
+        ids["creator"], ids["builder"], ids["reader"], ids["schema_reader"]]
+    made = writes.create_chart({"dataset_id": 4, "viz_type": "funnel", "slice_name": "stages",
+                                "params": {"groupby": ["status"], "metric": "count"}, "dashboard_id": 3,
+                                "marker": format_marker(BUILD, "stages", 3)})
+    assert set(made) == {"chart_id"}, made
+    assert _sent_editors(claiming.superset, "CreateChartCommand") == [ids["builder"], ids["reader"],
+                                                                       ids["schema_reader"]]
+    assert claiming.superset.g.user is claiming.people["builder"]

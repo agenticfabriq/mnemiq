@@ -92,14 +92,25 @@ def database_error(sqlstate: str) -> DBAPIError:
     return error
 
 
+class SubjectType:
+    """rc2's `SubjectType` (`superset/subjects/types.py`): what an editor subject stands for."""
+
+    USER = 1
+    ROLE = 2
+    GROUP = 3
+
+
 def install(monkeypatch) -> SimpleNamespace:
     """The stand-ins, installed for this test. The answer holds what a test may set (`chart_data`: what running a
     query context does, a payload or an exception; `delete`, `restore`: what each command's `run` does, None or an
     exception; `update`: what `UpdateDashboardCommand.run` does; `config`: Superset's config, as
-    `flask.current_app.config`; `charts`: the charts `ChartDAO.find_by_id` finds, by id) and what the tools did (`ran`:
-    each command run, in order, with its arguments)."""
+    `flask.current_app.config`; `features`: the feature flags `is_feature_enabled` answers on; `g`: `flask.g`, whose
+    `user` is the request's user; `user_subjects`: each user's own subject, by user id, as `get_user_subject` finds it;
+    `charts`, `dashboards`, `datasets`: what `ChartDAO`, `DashboardDAO` and `DatasetDAO` find, by id) and what the
+    tools did (`ran`: each command run, in order, with its arguments)."""
     state = SimpleNamespace(chart_data={"queries": [{"data": [], "status": "success"}]}, delete=None, restore=None,
-                            update=None, ran=[], config={}, charts={})
+                            update=None, ran=[], config={}, features=set(), g=SimpleNamespace(), user_subjects={},
+                            charts={}, dashboards={}, datasets={}, next_chart_id=500)
 
     class ChartDataQueryContextSchema:
         def load(self, context: dict) -> dict:
@@ -134,8 +145,33 @@ def install(monkeypatch) -> SimpleNamespace:
         Command.__name__ = name
         return Command
 
+    class CreateChartCommand:
+        def __init__(self, properties: dict) -> None:
+            self.properties = properties
+
+        def run(self) -> SimpleNamespace:
+            state.ran.append(("CreateChartCommand", self.properties))
+            state.next_chart_id += 1
+            return SimpleNamespace(id=state.next_chart_id)
+
+    def get_user_id():
+        return getattr(getattr(state.g, "user", None), "id", None)
+
     modules = {
-        "flask": {"current_app": SimpleNamespace(config=state.config)},
+        "flask": {"current_app": SimpleNamespace(config=state.config), "g": state.g},
+        "superset": {"is_feature_enabled": lambda name: name in state.features},
+        "superset.utils.core": {"get_user_id": get_user_id},
+        "superset.subjects.types": {"SubjectType": SubjectType},
+        "superset.subjects.utils": {"get_user_subject": lambda user_id: state.user_subjects.get(user_id)},
+        "superset.models.slice": {"Slice": type("Slice", (), {"id": "slices.id"})},
+        "superset.connectors.sqla.models": {"SqlaTable": type("SqlaTable", (), {"id": "tables.id"})},
+        "superset.daos.dashboard": {"DashboardDAO": SimpleNamespace(
+            find_by_id=lambda dashboard_id: state.dashboards.get(dashboard_id))},
+        "superset.daos.dataset": {"DatasetDAO": SimpleNamespace(
+            find_by_id=lambda dataset_id: state.datasets.get(dataset_id))},
+        "superset.commands.chart.update": {"UpdateChartCommand": command("UpdateChartCommand", "update")},
+        "superset.commands.chart.create": {"CreateChartCommand": CreateChartCommand},
+        "superset.commands.dataset.update": {"UpdateDatasetCommand": command("UpdateDatasetCommand", "update")},
         "marshmallow": {"ValidationError": MarshmallowValidationError},
         "sqlalchemy": {"text": lambda sql: sql},
         "sqlalchemy.exc": {"SQLAlchemyError": SQLAlchemyError, "DBAPIError": DBAPIError},

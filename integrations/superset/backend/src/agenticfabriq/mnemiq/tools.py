@@ -27,14 +27,15 @@ def create_dashboard(request: dict[str, Any]) -> dict[str, Any]:
 
 
 @tool(name="claim_chart", class_permission_name="Chart", method_permission_name="write",
-      description="Give a chart a dashboard's editors and a build marker, and save its query. "
+      description="Make a chart a dashboard's: the dashboard's editors, a build marker and its saved query. "
                   "request: {chart_id, dashboard_id, marker}.")
 def claim_chart(request: dict[str, Any]) -> dict[str, Any]:
     return writes.claim_chart(request)
 
 
 @tool(name="claim_dataset", class_permission_name="Dataset", method_permission_name="write",
-      description="Give a dataset a dashboard's editors and a build marker. request: {dataset_id, dashboard_id, marker}.")
+      description="Make a dataset a dashboard's: a build marker, and as editors the caller and the dashboard's users "
+                  "who may already read it. request: {dataset_id, dashboard_id, marker}.")
 def claim_dataset(request: dict[str, Any]) -> dict[str, Any]:
     return writes.claim_dataset(request)
 

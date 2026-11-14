@@ -67,13 +67,34 @@ from them what it already may do through Superset's own tools.
 | Tool | Gated by | What it does |
 |---|---|---|
 | `create_dashboard` | Dashboard | An unpublished, empty dashboard with the caller as its editor. |
-| `claim_chart` | Chart | Gives a chart a dashboard's editors and a build marker, and saves its query context. |
-| `claim_dataset` | Dataset | Gives a dataset a dashboard's editors and a build marker. |
+| `claim_chart` | Chart | Gives a chart the dashboard's editors and a build marker, and saves its query context. |
+| `claim_dataset` | Dataset | Gives a dataset a build marker and, as editors, the caller and the dashboard's users who may read it. |
 | `create_chart` | Chart | A funnel or a sankey, saved only once its query runs. |
 | `patch_chart` | Chart | Sets and unsets named params keys, keeping every other key. |
 | `add_saved_metric` | Dataset | Adds one aggregating saved metric, keeping the others. |
 | `delete_dataset` | Dataset | Moves a dataset a build made to the trash once no chart uses it. |
 | `set_layout` | Dashboard | Writes the layout, and with it the charts, keeping filters and every tab under its id. |
+
+### Who becomes an editor
+
+In Superset 7.0.0rc2 an editor of a dataset may read its data: the access check admits a dataset's editors, and
+SQL Lab admits an editor of any dataset over a table to that table. Editors are users, roles and groups, and a role or
+a group made an editor makes every member one. So the tools choose editors so that being made one widens no one's
+access:
+
+- **A dataset** `claim_dataset` makes a dashboard's keeps the editors it has (its creator among them: the claim removes
+  none), and adds the caller and each user among the dashboard's editors who may already read it
+  by a grant: datasource access to the dataset, or access to its schema, catalog or database, or to all datasources.
+  Each user is judged as that user, and being an editor of the dataset does not count. A role or a group among the
+  dashboard's editors is never added.
+- **A chart** `claim_chart` or `create_chart` makes a dashboard's gets the dashboard's editors. When
+  `ENABLE_VIEWERS` is on and `VIEWER_PROMISCUOUS_MODE` is set, a chart's editors may read its dataset's data, so a
+  chart's editors are then chosen as a dataset's are, against the chart's dataset.
+
+A co-editor of the dashboard who is not an editor of one of its datasets, and asks mnemiq to change or remove it, is
+answered `{"not_editor": true, "editors": [...]}` naming the dataset's editors: whom to ask.
+
+### Locks
 
 Every write to an existing row first locks that row and compares the `changed_on` the caller read, so of two racing
 writers the second answers `{"stale": true}`. A write that waits for the row longer than `MNEMIQ_LOCK_TIMEOUT_S`
