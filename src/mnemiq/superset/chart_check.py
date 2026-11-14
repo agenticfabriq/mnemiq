@@ -174,12 +174,18 @@ _UNREADABLE = "mnemiq could not read the chart's settings: "
 
 
 def _metric_items(viz_type: str, form: dict) -> list:
-    """The chart's metrics as `form_data` holds them, read as `resolve_metrics_and_groupby` does: a one-metric type's
-    `metric` (else its first of `metrics`), any other type's `metrics` (else its `metric`), and a mixed chart's
-    `metrics_b` after them."""
+    """The metrics the chart shows, as its renderer reads them from `form_data`: a one-metric type's `metric` alone
+    (each plugin's `transformProps` shows `formData.metric`: `Pie/transformProps.ts`, `Gauge/`, `Treemap/`, `Funnel/`,
+    `Waterfall/`, `Sankey/`, `BigNumber/BigNumberTotal/`), any other type's `metrics` (else its `metric`), and a mixed
+    chart's `metrics_b` after them.
+
+    This is not how rc2's data tool reads them: `resolve_metrics_and_groupby` in
+    `superset/mcp_service/chart/chart_helpers.py` reads `metric` first (else the first of `metrics`) only for
+    big_number, big_number_total and pop_kpi, and for every other type `metrics` first, else `metric`. Where its rows
+    then lack the metric the chart shows, `_line_up` finds them not to carry the chart's columns, and nothing is
+    checked."""
     if viz_type in _ONE_METRIC:
-        one = form.get("metric") or next(iter(form.get("metrics") or []), None)
-        items = [one] if one else []
+        items = [form["metric"]] if form.get("metric") else []
     else:
         items = list(form.get("metrics") or []) or ([form["metric"]] if form.get("metric") else [])
     if viz_type == "mixed_timeseries":
@@ -332,8 +338,10 @@ def _second_series(form: dict, dimensions: list[str]) -> NotCheckable | None:
     each `_b` key the form holds in place of the primary's, an empty `adhoc_filters_b` included
     (`retainFormDataSuffix` in `plugin-chart-echarts/src/utils/formDataSuffix.ts`); the data tool's rebuild
     (`_build_mixed_timeseries_secondary` in `superset/mcp_service/chart/chart_helpers.py`) reads an empty one as
-    absent and filters the series with the primary's filters, and never reads `row_limit_b`. So each `_b` key present
-    must say what the primary's says."""
+    absent and filters the series with the primary's filters. It reads `row_limit_b` only when its caller passes no
+    row limit, and `get_chart_data` always passes one (`_coerce_row_limit` of the request's limit or the form's
+    `row_limit`), so the second series comes back under the primary's limit. So each `_b` key present must say what
+    the primary's says."""
     if _as_list(form.get("groupby_b")) != _as_list(form.get("groupby")):
         return NotCheckable("the mixed chart groups its second series differently from its first")
     if "adhoc_filters_b" in form:
@@ -734,7 +742,9 @@ def _dataset_rows(client, expectation: Expectation, dataset: DatasetFacts) -> _R
 
 
 def _same(a, b) -> bool:
-    """Two values agree: integers exactly, other numbers within `rel_tol=1e-9`, anything else by equality."""
+    """Two values agree: integers exactly, other numbers within `rel_tol=1e-12`, anything else by equality. Both sides
+    are computed by the same database, so the tolerance absorbs no more than floats summed in another order; at
+    `1e-9` a cent apart on a value above about 1e7 would agree, although `,.2f` shows it."""
     if a is None or b is None:
         return a is None and b is None
     if isinstance(a, bool) or isinstance(b, bool):
@@ -742,7 +752,7 @@ def _same(a, b) -> bool:
     if isinstance(a, int) and isinstance(b, int):
         return a == b
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-        return math.isclose(a, b, rel_tol=1e-9)
+        return math.isclose(a, b, rel_tol=1e-12)
     return a == b
 
 
@@ -818,10 +828,12 @@ def _describe(shown: Displayed) -> str:
     return f"{fmt}, with the currency {symbol}"
 
 
-def _format_problem(viz_type: str, form: dict, kinds: dict[str, MeasureKind], saved: dict) -> str | None:
-    """Why a metric mnemiq knows the kind of is shown in a format that does not fit it, or None. A format the renderer
-    decides from what mnemiq cannot see (`CANNOT_TELL`), and a saved metric whose own record the caller did not pass,
-    are not judged."""
+def _format_problem(viz_type: str, form: dict, kinds: dict[str, MeasureKind],
+                    saved: dict) -> tuple[str | None, str | None]:
+    """Of the metrics mnemiq knows the kind of: why one is shown in a format that does not fit it, and why one's format
+    could not be judged, each the first found, or None. A format the renderer decides from what mnemiq cannot see
+    (`CANNOT_TELL`), and a saved metric whose own record the caller did not pass, cannot be judged."""
+    unjudged = None
     for item in _metric_items(viz_type, form):
         label = metric_label(item)
         kind = kinds.get(label) if label else None
@@ -831,12 +843,16 @@ def _format_problem(viz_type: str, form: dict, kinds: dict[str, MeasureKind], sa
         if isinstance(item, str):
             record = saved.get(item)
             if record is None:
+                unjudged = unjudged or (f"the format the chart shows {label!r} in could not be judged: mnemiq has no "
+                                        "record of that saved metric's own format")
                 continue
         shown = displayed(viz_type, form, item, record)
-        if shown is CANNOT_TELL or fits(kind, shown):
-            continue
-        return f"the chart shows {label!r} {_describe(shown)}, which does not fit a {kind.value} measure"
-    return None
+        if shown is CANNOT_TELL:
+            unjudged = unjudged or (f"the format the chart shows {label!r} in could not be judged: Superset decides it "
+                                    "from what mnemiq does not read")
+        elif not fits(kind, shown):
+            return f"the chart shows {label!r} {_describe(shown)}, which does not fit a {kind.value} measure", unjudged
+    return None, unjudged
 
 
 # ---------------------------------------------------------------- the check
@@ -909,23 +925,30 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
     return found
 
 
-def check_chart(client, adapter, *, chart_id: int, dataset_id: int, kinds: dict[str, MeasureKind],
+def check_chart(adapter, *, chart_id: int, dataset_id: int, kinds: dict[str, MeasureKind],
                 saved: dict[str, SavedMetric], snapshot: Snapshot, grants: GrantSet, guard_fanout: bool | None,
                 timeout_s: float = DEFAULT_TIMEOUT_S) -> ChartCheck:
-    """Check chart `chart_id` as `client`'s caller, the builder: `client` is `adapter.client`, and `adapter` runs
-    mnemiq's own statement under `grants` and `snapshot`. `dataset_id` is the dataset mnemiq built the chart on, which
-    a chart saved since in Explore overrides with its own. `kinds` gives the kind of each metric mnemiq knows, by the
-    label Superset names its values by; `saved` the dataset's saved metrics mnemiq read, by name.
+    """Check chart `chart_id` as the caller `adapter` acts for, the builder: Superset is read through `adapter.client`
+    and no other, and `adapter` runs mnemiq's own statement under `grants` and `snapshot`. `dataset_id` is the dataset
+    mnemiq built the chart on, which a chart saved since in Explore overrides with its own. `kinds` gives the kind of
+    each metric mnemiq knows, by the label Superset names its values by; `saved` the dataset's saved metrics mnemiq
+    read, by name.
 
-    A wrong format is reported whatever the numbers, unless they are a mismatch or the chart is empty. A refusal of the
-    caller (`SupersetRefusal`) is raised: it stays the same for every later call the request makes."""
+    A wrong format is reported whatever the numbers, unless they are a mismatch or the chart is empty. A chart is
+    checked only when the format of every metric mnemiq knows the kind of was judged: numbers that match beside a
+    format mnemiq could not judge are not checked, their values kept. A refusal of the caller (`SupersetRefusal`) is
+    raised: it stays the same for every later call the request makes."""
+    client = adapter.client
     read = _read_chart(client, chart_id)
     if isinstance(read, NotCheckable):
         return _outcome(chart_id, ChartStatus.NOT_CHECKED, read.reason)
     viz_type, form = read
-    problem = _format_problem(viz_type, form, kinds, saved)
+    problem, unjudged = _format_problem(viz_type, form, kinds, saved)
     found = _numbers(client, adapter, chart_id=chart_id, form=form, dataset_id=dataset_id, snapshot=snapshot,
                      grants=grants, guard_fanout=guard_fanout, timeout_s=timeout_s)
+    if problem is None and unjudged is not None and found.status is ChartStatus.CHECKED:
+        return _outcome(chart_id, ChartStatus.NOT_CHECKED, f"{found.reason}, but {unjudged}", found.chart_values,
+                        found.mnemiq_values)
     if problem is None or found.status in (ChartStatus.MISMATCH, ChartStatus.EMPTY):
         return found
     reason = problem if found.status is ChartStatus.CHECKED else f"{problem}. Its numbers were not compared: " \

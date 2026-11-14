@@ -9,6 +9,7 @@ Runs against `FakeSuperset`, a real MCP server over streamable HTTP, through the
 from __future__ import annotations
 
 import copy
+import inspect
 import logging
 import re
 from datetime import datetime, timedelta
@@ -145,8 +146,7 @@ def _adapter(fake) -> SupersetSqlAdapter:
 
 
 def _check(fake, *, kinds=None, saved=None, dataset_id: int = DATASET_ID):
-    adapter = _adapter(fake)
-    return check_chart(adapter.client, adapter, chart_id=CHART_ID, dataset_id=dataset_id,
+    return check_chart(_adapter(fake), chart_id=CHART_ID, dataset_id=dataset_id,
                        kinds=TOTAL["kinds"] if kinds is None else kinds, saved=saved or {}, snapshot=SNAPSHOT,
                        grants=GRANTS, guard_fanout=False)
 
@@ -367,7 +367,9 @@ def test_virtual_dataset_chart_is_never_checked_by_raw_sql(fake):
            query={"dataset_id": DATASET_ID, "dataset_name": "policy",
                   "columns": [{"name": "region"}, {"name": M_SAVED}],
                   "data": [{"region": r, M_SAVED: v} for r, v in rows], "row_count": 2, "total_rows": 2})
-    check = _check(fake, kinds={M_SAVED: MeasureKind.CURRENCY})
+    record = SavedMetric(dataset_id=DATASET_ID, name=M_SAVED, expression="SUM(premium)", verbose_name=None,
+                         d3format=None, currency=None, certified_by=None, warning_text=None)
+    check = _check(fake, kinds={M_SAVED: MeasureKind.CURRENCY}, saved={M_SAVED: record})
     assert check.status is ChartStatus.CHECKED, check.reason
     assert check.chart_values == check.mnemiq_values == rows
     [query] = [call.request for call in fake.calls if call.tool == "query_dataset"]
@@ -379,11 +381,16 @@ def test_virtual_dataset_chart_is_never_checked_by_raw_sql(fake):
 @pytest.mark.parametrize("chart_value, mnemiq_value, dtype, status", [
     (0.30000000000000004, 0.3, "float64", ChartStatus.CHECKED),
     (1.0, 1.000001, "float64", ChartStatus.MISMATCH),
+    (100_000_000.0, 100_000_000.00005, "float64", ChartStatus.CHECKED),
+    (100_000_000.0, 100_000_000.0002, "float64", ChartStatus.MISMATCH),
+    (123_456_789.01, 123_456_789.02, "float64", ChartStatus.MISMATCH),
     (1_000_000_000_000, 1_000_000_000_001, "int64", ChartStatus.MISMATCH),
     (12, 12.0, "float64", ChartStatus.CHECKED),
-], ids=["float within rel_tol", "float beyond rel_tol", "integers exact", "int beside float"])
+], ids=["float summation noise", "float beyond rel_tol", "just inside rel_tol (5e-13)",
+        "just outside rel_tol (2e-12)", "a cent apart above 1e8", "integers exact", "int beside float"])
 def test_float_tolerance(fake, chart_value, mnemiq_value, dtype, status):
-    """Floats agree within `rel_tol=1e-9`; two integers must be equal."""
+    """Floats agree within `rel_tol=1e-12`, which absorbs the noise of summing floats in another order, and no more: a
+    cent apart on a value above 1e7 shows in `,.2f`, so it is a mismatch. Two integers must be equal."""
     form = {"viz_type": "big_number_total", "metric": copy.deepcopy(PREMIUM), "adhoc_filters": [],
             "y_axis_format": ",.2f", "currency_format": dict(USD)}
     _serve(fake, form_data=form, chart=_chart_data(["Total premium"], (chart_value,)),
@@ -634,16 +641,23 @@ def test_expectation_names_what_it_cannot_translate(form, said):
 
 
 def test_a_saved_metrics_format_without_its_record_is_not_judged(fake):
-    """A saved metric the caller did not read has no known format of its own, so a big number showing it is not
-    judged; given its record, a wrong one is caught."""
+    """A saved metric the caller did not read has no known format of its own, so a big number showing it cannot be
+    judged, and the chart is not reported checked: its numbers are kept, and the reason names the metric. Given its
+    record, a wrong format is caught and a right one checked."""
     form = {"viz_type": "big_number_total", "metric": M_SAVED, "adhoc_filters": []}
     _serve(fake, form_data=form, chart=_chart_data([M_SAVED], (5,)), mnemiq=_result((5,), columns=(("m0", "int64"),)),
            dataset=_dataset(metrics=[(M_SAVED, "SUM(premium)")]))
-    assert _check(fake, kinds={M_SAVED: MeasureKind.CURRENCY}).status is ChartStatus.CHECKED
+    check = _check(fake, kinds={M_SAVED: MeasureKind.CURRENCY})
+    assert check.status is ChartStatus.NOT_CHECKED, check.reason
+    assert repr(M_SAVED) in check.reason and "could not be judged" in check.reason
+    assert check.chart_values == check.mnemiq_values == ((5,),)
     record = SavedMetric(dataset_id=DATASET_ID, name=M_SAVED, expression="SUM(premium)", verbose_name=None,
                          d3format=",d", currency=None, certified_by=None, warning_text=None)
     check = _check(fake, kinds={M_SAVED: MeasureKind.CURRENCY}, saved={M_SAVED: record})
     assert check.status is ChartStatus.FORMAT_WRONG
+    priced = SavedMetric(dataset_id=DATASET_ID, name=M_SAVED, expression="SUM(premium)", verbose_name=None,
+                         d3format=",.2f", currency=dict(USD), certified_by=None, warning_text=None)
+    assert _check(fake, kinds={M_SAVED: MeasureKind.CURRENCY}, saved={M_SAVED: priced}).status is ChartStatus.CHECKED
 
 
 # --- what rc2's renderer shows that its data tool does not ------------------------------------------------------------
@@ -754,7 +768,7 @@ def test_only_a_postgres_adapter_checks_with_its_own_sql(fake):
            mnemiq=_result(("east", 1)))
     adapter = SupersetSqlAdapter(SupersetMcp(fake.url, DelegatedToken(TOKEN)), database_id=DATABASE_ID,
                                  schema=SCHEMA, dialect="duckdb")
-    check = check_chart(adapter.client, adapter, chart_id=CHART_ID, dataset_id=DATASET_ID, kinds={}, saved={},
+    check = check_chart(adapter, chart_id=CHART_ID, dataset_id=DATASET_ID, kinds={}, saved={},
                         snapshot=SNAPSHOT, grants=GRANTS, guard_fanout=False)
     assert check.status is ChartStatus.NOT_CHECKED and "Postgres" in check.reason
     assert "execute_sql" not in _tools(fake)
@@ -865,3 +879,65 @@ def test_a_table_without_totals_is_checked(fake):
     _serve(fake, form_data=_table(show_totals=False), chart=REBUILT, mnemiq=_result(*ROWS))
     check = _check(fake)
     assert check.status is ChartStatus.CHECKED, check.reason
+
+
+# --- a format mnemiq cannot judge, and the client the check reads through -----------------------------------------------
+
+
+@pytest.mark.parametrize("form", [
+    _bar(currency_format={"symbol": "AUTO", "symbolPosition": "prefix"}),
+    _table(column_config={"Total premium": {"d3NumberFormat": ",.2f", "d3SmallNumberFormat": ",.4f",
+                                            "currencyFormat": dict(USD)}}),
+], ids=["an AUTO currency", "a table's small-number format"])
+def test_a_format_mnemiq_cannot_judge_is_not_reported_checked(fake, form):
+    """rc2 decides these formats from what mnemiq does not read (the data's own currency, each value's size), so the
+    chart is not reported checked: its numbers are kept, and the reason names the metric. The same chart is checked for
+    a metric mnemiq knows no kind of, and its numbers are a mismatch whatever its format."""
+    _serve(fake, form_data=form, chart=_chart_data(["region", "Total premium"], *ROWS), mnemiq=_result(*ROWS))
+    check = _check(fake)
+    assert check.status is ChartStatus.NOT_CHECKED, check.reason
+    assert "'Total premium'" in check.reason and "could not be judged" in check.reason
+    assert check.chart_values == check.mnemiq_values == ROWS
+    assert _check(fake, kinds={}).status is ChartStatus.CHECKED
+    _serve(fake, form_data=form, chart=_chart_data(["region", "Total premium"], *ROWS), mnemiq=_result(*ROWS[:1]))
+    assert _check(fake).status is ChartStatus.MISMATCH
+
+
+def test_superset_is_read_only_through_the_adapters_own_client(fake):
+    """The check reads Superset as the caller the adapter acts for, through `adapter.client`: no other client can be
+    passed, so the chart and mnemiq's own statement are read by the same caller."""
+    assert "client" not in inspect.signature(check_chart).parameters
+    _serve(fake, form_data=_bar(), chart=_chart_data(["region", "Total premium"], *ROWS), mnemiq=_result(*ROWS))
+    adapter = SupersetSqlAdapter(SupersetMcp(fake.url, DelegatedToken("tok-other")), database_id=DATABASE_ID,
+                                 schema=SCHEMA)
+    check = check_chart(adapter, chart_id=CHART_ID, dataset_id=DATASET_ID, kinds=TOTAL["kinds"], saved={},
+                        snapshot=SNAPSHOT, grants=GRANTS, guard_fanout=False)
+    assert check.status is ChartStatus.CHECKED, check.reason
+    assert {call.authorization for call in fake.calls} == {"Bearer tok-other"}
+
+
+# --- which metric a one-metric chart shows ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("viz", ["pie", "gauge_chart", "treemap_v2", "funnel", "big_number_total"])
+def test_a_one_metric_chart_is_read_by_the_metric_its_renderer_shows(viz):
+    """Each one-metric plugin's `transformProps` shows `formData.metric` and nothing else (`Pie/transformProps.ts`,
+    `Gauge/`, `Treemap/`, `Funnel/`, `BigNumber/BigNumberTotal/`). rc2's data tool reads `metric` first only for the
+    big numbers (`resolve_metrics_and_groupby` in `superset/mcp_service/chart/chart_helpers.py`) and `metrics` first
+    for the rest, but a `metrics` list is not what the chart shows: without a `metric` there is nothing to compare."""
+    only_list = {"viz_type": viz, "metrics": [copy.deepcopy(PREMIUM)], "groupby": ["region"], "adhoc_filters": []}
+    found = expectation_from_form_data(only_list, dataset=PHYSICAL)
+    assert isinstance(found, NotCheckable) and "no metric" in found.reason, found
+    shown = only_list | {"metric": copy.deepcopy(PREMIUM), "metrics": [M_SAVED]}
+    found = expectation_from_form_data(shown, dataset=PHYSICAL)
+    assert isinstance(found, Expectation) and found.metrics == (("Total premium", "SUM(premium)"),), found
+
+
+def test_a_pies_metric_the_data_tool_does_not_return_is_not_checked(fake):
+    """A pie holding a `metrics` list beside its `metric`: rc2's data tool rebuilds its query from the list, so its rows
+    do not hold the metric the pie shows, and nothing is reported checked."""
+    form = _grouped("pie", metrics=[M_SAVED], number_format=",.2f", currency_format=dict(USD))
+    _serve(fake, form_data=form, chart=_chart_data(["region", M_SAVED], ("east", 1)), mnemiq=_result(("east", 1)),
+           dataset=_dataset(metrics=[(M_SAVED, "SUM(premium)")]))
+    check = _check(fake)
+    assert check.status is ChartStatus.NOT_CHECKED and "columns" in check.reason, check.reason
