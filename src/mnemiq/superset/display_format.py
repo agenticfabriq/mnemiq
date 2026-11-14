@@ -158,9 +158,14 @@ def displayed(viz_type: str, form_data: dict, metric_key, saved: SavedMetric | N
 
 
 def _currency_shown(shown: Displayed) -> bool:
-    """A currency is on screen when it is an ISO code (`Intl.NumberFormat` throws on anything else and
-    `CurrencyFormatter.format` then returns the bare number), or when the d3 format itself starts with `$`."""
-    return bool(_ISO.match(_symbol(shown.currency))) or (shown.d3format or "").startswith("$")
+    """A currency is on screen when the effective currency's symbol is an ISO code (`Intl.NumberFormat` throws on
+    anything else and `CurrencyFormatter.format` then returns the bare number), or, when no symbol is set, when the
+    d3 format itself starts with `$`. With a symbol set a `CurrencyFormatter` is built, and its
+    `getNormalizedD3Format` strips every `$`, so a `$` format beside a non-ISO symbol shows no currency."""
+    symbol = _symbol(shown.currency)
+    if symbol:
+        return bool(_ISO.match(symbol))
+    return (shown.d3format or "").startswith("$")
 
 
 def fits(kind: MeasureKind, shown: Displayed) -> bool:

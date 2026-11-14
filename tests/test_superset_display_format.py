@@ -155,3 +155,10 @@ def test_mixed_secondary_axis_reads_its_own_keys():
 
 def test_unknown_viz_type_cannot_tell():
     assert displayed("deck_scatter", {}, "revenue", None) is CANNOT_TELL
+
+
+def test_a_dollar_format_counts_only_when_no_currency_symbol_is_set():
+    assert not fits(MeasureKind.CURRENCY, Displayed("$,.2f", {"symbol": "$"}))
+    assert fits(MeasureKind.CURRENCY, Displayed("$,.2f", None))
+    assert fits(MeasureKind.CURRENCY, Displayed("$,.2f", {"symbol": ""}))
+    assert fits(MeasureKind.CURRENCY, Displayed("$,.2f", {"symbol": "USD"}))
