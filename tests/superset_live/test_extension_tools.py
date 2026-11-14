@@ -23,7 +23,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import jwt
@@ -355,6 +355,131 @@ def test_token_route_needs_csrf(live, extension):
     assert refused.status_code == 400 and "token" not in refused.json(), refused.status_code
 
 
+REPO = Path(__file__).resolve().parents[2]
+# A configuration of a throwaway Superset process's own: the suite's (`superset_config.py`), then `settings`.
+_OVERLAY = """import os
+import runpy
+
+for _name, _value in runpy.run_path(os.environ["MNEMIQ_TEST_SUPERSET_BASE_CONFIG"]).items():
+    if _name.isupper():
+        globals()[_name] = _value
+"""
+
+
+@pytest.fixture(scope="module")
+def built_extension(tmp_path_factory) -> Path:
+    """The extension built from this checkout by its own packer (`scripts/build_superset_extension.py`), for the
+    throwaway Superset processes a test starts: they load the code under test, whatever the running services were
+    built from."""
+    import importlib.util
+
+    out = tmp_path_factory.mktemp("extension")
+    spec = importlib.util.spec_from_file_location("build_superset_extension",
+                                                  REPO / "scripts" / "build_superset_extension.py")
+    packer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(packer)
+    assert packer.main(["--out", str(out)]) == 0
+    return out
+
+
+@contextlib.contextmanager
+def throwaway_superset(args: list[str], settings: str, extension_dir: Path, ready: Callable[[bytes], bool],
+                       **env: str):
+    """A Superset process of the test's own, `superset <args>`, on the suite's configuration followed by `settings`
+    (Python, run after it), loading the extension in `extension_dir`, with `env` added to its environment; yielded
+    once `ready(its output so far)`, and stopped when the block ends. It shares the metadata database and keys with
+    the running services and changes nothing in them: Superset starts with `AppBuilder(update_perms=False)`
+    (`superset/extensions/__init__.py`), so a start writes no permission."""
+    python = required("MNEMIQ_TEST_SUPERSET_PYTHON", "MNEMIQ_TEST_SUPERSET_KEYS_DIR",
+                      "MNEMIQ_TEST_SUPERSET_METADATA_URI")["MNEMIQ_TEST_SUPERSET_PYTHON"]
+    with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryFile() as log:
+        config = Path(folder) / "superset_config.py"
+        config.write_text(_OVERLAY + settings)
+        child_env = {**os.environ, "SUPERSET_CONFIG_PATH": str(config), "FLASK_APP": "superset",
+                     "MNEMIQ_TEST_SUPERSET_BASE_CONFIG": str(Path(__file__).with_name("superset_config.py")),
+                     "MNEMIQ_TEST_SUPERSET_EXTENSION_DIR": str(extension_dir), **env}
+        process = subprocess.Popen([str(Path(python).with_name("superset")), *args], env=child_env, stdout=log,
+                                   stderr=subprocess.STDOUT)
+        try:
+            deadline = time.monotonic() + 180
+            while True:
+                log.seek(0)
+                if ready(log.read()):
+                    break
+                assert process.poll() is None, "the throwaway Superset process exited"
+                assert time.monotonic() < deadline, "the throwaway Superset process did not start"
+                time.sleep(1)
+            yield
+        finally:
+            process.terminate()
+            try:
+                process.wait(30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+
+GUEST_AUDIENCE = "mnemiq-live-guest"
+# Embedded Superset on, as a deployment that embeds dashboards runs it: a guest token (`superset/security/
+# guest_token.py`, `GuestUser`) makes the request's user a guest in `GUEST_ROLE_NAME`, here Gamma, which `superset init`
+# grants the token route's permission (`can_read on mnemiq`).
+_EMBEDDED = """
+FEATURE_FLAGS = {**globals().get("FEATURE_FLAGS", {}), "EMBEDDED_SUPERSET": True}
+GUEST_ROLE_NAME = "Gamma"
+GUEST_TOKEN_JWT_SECRET = os.environ["MNEMIQ_TEST_GUEST_SECRET"]
+GUEST_TOKEN_JWT_AUDIENCE = "%s"
+""" % GUEST_AUDIENCE
+
+
+def guest_token(secret: str, username: str) -> str:
+    """A guest token as Superset's `/api/v1/security/guest_token/` signs one (`GuestToken`: `user`, `resources`,
+    `rls_rules`, `type: guest`), for a guest the embedding host names `username`."""
+    now = int(time.time())
+    return jwt.encode({"user": {"username": username, "first_name": "Guest", "last_name": "User"}, "resources": [],
+                       "rls_rules": [], "type": "guest", "iat": now, "exp": now + 300, "aud": GUEST_AUDIENCE},
+                      secret, algorithm="HS256")
+
+
+def test_token_route_refuses_an_embedded_guest(live, extension, built_extension):
+    """In a web server of the test's own with embedded Superset on (the suite's configuration plus guests in the Gamma
+    role; the running services are not touched), a POST to the token route carrying a guest token whose user is named
+    analyst, with a CSRF token of its own session, answers 403 with the route's own message and no token: a guest's
+    username is whatever the embedding host wrote, not a Superset sign-in. That the route's own message answers shows
+    Superset took the guest as a Gamma user who holds the route's permission. The
+    controls, on the same server: a guest token signed with another secret is no guest at all (401), and west, signed
+    in, still gets a token for west."""
+    import secrets as secrets_module
+
+    import httpx
+
+    secret = secrets_module.token_urlsafe(32)
+    port = 18090
+    url = f"http://127.0.0.1:{port}"
+
+    def up(_output: bytes) -> bool:
+        try:
+            return httpx.get(f"{url}/health", timeout=2).status_code == 200
+        except httpx.HTTPError:
+            return False
+
+    with throwaway_superset(["run", "-h", "127.0.0.1", "-p", str(port), "--with-threads"], _EMBEDDED,
+                            built_extension, up, MNEMIQ_TEST_GUEST_SECRET=secret):
+        with httpx.Client(base_url=url, timeout=30) as browser:
+            login_page = browser.get("/login/").text
+            csrf = login_page.split('name="csrf_token"', 1)[1].split('value="', 1)[1].split('"', 1)[0]
+            asked = browser.post(TOKEN_ROUTE, json={"purpose": "build"},
+                                 headers={"X-CSRFToken": csrf, "X-GuestToken": guest_token(secret, BUILDER)})
+            forged = browser.post(TOKEN_ROUTE, json={"purpose": "build"},
+                                  headers={"X-CSRFToken": csrf,
+                                           "X-GuestToken": guest_token(secrets_module.token_urlsafe(32), BUILDER)})
+        minted = asked.json().get("token") if asked.status_code == 200 else None
+        observe("guest", status=asked.status_code, forged_status=forged.status_code,
+                minted_for=_claims(live, minted)["sub"] if minted else None)
+        assert asked.status_code == 403, (asked.status_code, "token" in asked.text)
+        assert asked.json() == {"message": "the token route mints only for a signed-in Superset user"}
+        assert forged.status_code == 401, forged.status_code
+        assert _claims(live, replace(live, url=url).minted("west", "build"))["sub"] == "west"
+
+
 def _serve(settings, monkeypatch):
     """The app `mnemiq serve --http` serves for `settings`, uvicorn alone replaced (as `test_contract.serve`)."""
     from fastapi.testclient import TestClient
@@ -433,22 +558,27 @@ def test_saved_query_context_keeps_pivot_and_waterfall_grouping(live, extension,
     """A pivot (rows region, columns status, COUNT(*)) made by `generate_chart` and claimed answers `get_chart_data`
     with one row per region and status, nine in all, each count the source's, and no totals row. A waterfall
     (x-axis `issued` by month, broken down by status) answers one row per month and status, each count the source's:
-    its x-axis kept and its grain applied. Before the claim, each answers otherwise (rc2's rebuild from `form_data`
-    reads neither the pivot's rows and columns nor the waterfall's x-axis); what each answered is observed."""
+    its x-axis kept and its grain applied. The control: before the claim, neither answers as many rows as the
+    source's grouping has (rc2's rebuild from `form_data` reads neither the pivot's rows and columns nor the
+    waterfall's x-axis); what each answered is observed."""
     client = as_user(live, BUILDER)
     build = new_build(client, "grouping")
     pivot = mcp_chart(client, spec(Family.PIVOT, policy_id, dimensions=("region", "status")))
     waterfall = mcp_chart(client, spec(Family.WATERFALL, policy_id, time_column="issued", time_grain="P1M",
                                        dimensions=("status",)))
+    pivot_truth = sorted(ground_truth(live, BY_REGION_AND_STATUS))
+    waterfall_truth = ground_truth(live, MONTHLY_BY_STATUS)
+    assert len(pivot_truth) == 9
     before = {name: chart_data(client, chart_id) for name, chart_id in (("pivot", pivot), ("waterfall", waterfall))}
+    assert len(before["pivot"].get("data") or []) != len(pivot_truth)
+    assert len(before["waterfall"].get("data") or []) != len(waterfall_truth)
     for name, chart_id in (("pivot", pivot), ("waterfall", waterfall)):
         assert call(client, "claim_chart", chart_id=chart_id, dashboard_id=build.dashboard_id,
                     marker=build.marker(name)) == {"ok": True}
     pivot_rows = sorted((r["region"], r["status"], r["policies"]) for r in chart_data(client, pivot)["data"])
-    assert pivot_rows == sorted(ground_truth(live, BY_REGION_AND_STATUS))
-    assert len(pivot_rows) == 9
+    assert pivot_rows == pivot_truth
     waterfall_rows = [(r["issued"], r["status"], r["policies"]) for r in chart_data(client, waterfall)["data"]]
-    assert ranked(waterfall_rows) == ranked(ground_truth(live, MONTHLY_BY_STATUS))
+    assert ranked(waterfall_rows) == ranked(waterfall_truth)
     observe("grouping", pivot_before_rows=len(before["pivot"].get("data") or []),
             pivot_before_error=before["pivot"].get("error_type"),
             waterfall_before_rows=len(before["waterfall"].get("data") or []),
@@ -517,6 +647,52 @@ def test_simultaneous_patches_lose_nothing(live, extension, policy_id):
 
 
 # --- add_saved_metric -----------------------------------------------------------------------------------------------
+
+
+def test_a_write_held_up_past_the_lock_timeout_answers_busy(live, extension, policy_id, built_extension):
+    """With the lock timeout at 3 seconds (`MNEMIQ_LOCK_TIMEOUT_S`, in an MCP process of the test's own on the suite's
+    configuration; the running services keep the default), a `patch_chart` on a chart whose row another transaction
+    holds answers exactly `{busy: true}` once it has waited about 3 seconds, while the row is still held (the test
+    holds it 20 seconds at most), and changes nothing. The control: once the row is let go, the same request answers
+    `{ok}` and sets the key."""
+    client = as_user(live, BUILDER)
+    _, chart_id = _claimed_line(live, client, policy_id, "busy")
+    request = {"chart_id": chart_id, "set": {"row_limit": 77}, "unset": [],
+               "expect_changed_on": changed_on(client, "chart", chart_id)}
+    port = 15011
+    with throwaway_superset(["mcp", "run", "--host", "127.0.0.1", "--port", str(port)], "MNEMIQ_LOCK_TIMEOUT_S = 3\n",
+                            built_extension, lambda output: b"Application startup complete" in output):
+        bounded = SupersetMcp(f"http://127.0.0.1:{port}/mcp", DelegatedToken(live.token(BUILDER, scope=BUILD)),
+                              timeout_s=90)
+        answers: list = []
+        errors: list[BaseException] = []
+
+        def patch() -> None:
+            try:
+                answers.append(call(bounded, "patch_chart", **request))
+            except BaseException as exc:  # noqa: BLE001 (reported below)
+                errors.append(exc)
+
+        held = _hold("slices", chart_id)
+        try:
+            started = time.monotonic()
+            worker = threading.Thread(target=patch)
+            worker.start()
+            worker.join(20)
+            waited = time.monotonic() - started
+            answered_while_held = bool(answers or errors)
+        finally:
+            held.rollback()
+            held.close()
+        worker.join(90)
+        observe("busy", answers=answers, waited_s=round(waited, 1), answered_while_held=answered_while_held)
+        assert not errors, errors
+        assert answered_while_held, "no answer while the chart's row was held"
+        assert answers == [{"busy": True}]
+        assert 3 <= waited < 20, waited
+        assert "row_limit" not in stored_chart(chart_id)["params"] or stored_chart(chart_id)["params"]["row_limit"] != 77
+        assert call(bounded, "patch_chart", **request) == {"ok": True}
+    assert stored_chart(chart_id)["params"]["row_limit"] == 77
 
 
 def _claimed_dataset(live, build: Build, step: str, **more) -> int:
@@ -913,6 +1089,32 @@ def test_gamma_sees_only_what_its_roles_allow(live, extension, policy_id):
         call(gamma, "add_saved_metric", dataset_id=policy_id, metric=_metric("gamma_metric"),
              expect_changed_on="2026-01-01T00:00:00")
     observe("gamma", listed=sorted(chart_and_dashboard), editors=refused["editors"])
+
+
+def test_set_layout_refuses_a_chart_the_caller_cannot_read(live, extension, policy_id):
+    """`set_dash_metadata` makes every chart a layout names a member with no access check of its own, so `set_layout`
+    asks first (`can_access_chart`). `gamma_only`, on a dashboard it made and edits, adding analyst's chart on `policy`
+    (a dataset `gamma_only` may not read) answers exactly `{refused: "chart_access", chart_ids: [that chart]}`, and the
+    dashboard has no member and the layout it had. The control: analyst adding the same chart to a dashboard of its
+    own answers `{ok}`, so the refusal is the caller's access, not the chart."""
+    analyst = as_user(live, BUILDER)
+    chart_id = mcp_chart(analyst, spec(Family.BIG_NUMBER, policy_id))
+    gamma = as_user(live, "gamma_only")
+    gamma_build = new_build(gamma, "gamma's layout")
+    (before,) = metadata("SELECT position_json, json_metadata FROM dashboards WHERE id = %s",
+                         (gamma_build.dashboard_id,))
+    answer = call(gamma, "set_layout", dashboard_id=gamma_build.dashboard_id, positions=positions([chart_id]),
+                  add_chart_ids=[chart_id], expect_changed_on=changed_on(gamma, "dashboard", gamma_build.dashboard_id))
+    assert answer == {"refused": "chart_access", "chart_ids": [chart_id]}
+    assert members(gamma_build.dashboard_id) == []
+    assert metadata("SELECT position_json, json_metadata FROM dashboards WHERE id = %s",
+                    (gamma_build.dashboard_id,)) == [before]
+    own = new_build(analyst, "analyst's layout")
+    assert call(analyst, "set_layout", dashboard_id=own.dashboard_id, positions=positions([chart_id]),
+                add_chart_ids=[chart_id], expect_changed_on=changed_on(analyst, "dashboard", own.dashboard_id)) == {
+        "ok": True}
+    assert members(own.dashboard_id) == [chart_id]
+    observe("chart_access", chart_id=chart_id)
 
 
 # --- the read tools -------------------------------------------------------------------------------------------------
