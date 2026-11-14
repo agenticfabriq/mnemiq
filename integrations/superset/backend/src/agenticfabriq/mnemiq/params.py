@@ -5,8 +5,8 @@
   chart's params and drops the time grain on the way (`superset/mcp_service/chart/chart_helpers.py`,
   `build_query_dicts_from_form_data`).
 - `merge_params` and `patch`: an edit that sets and unsets named params keys and keeps every other one.
-- `check_positions` and `layout_metadata`: a layout save that changes membership only as asked, keeps every tab, and
-  keeps the native filters.
+- `check_positions` and `layout_metadata`: a layout save that changes membership only as asked, keeps every tab rc2
+  knows under its id, and keeps the native filters.
 - `metric_stub_list`: the metric list that adds one saved metric and keeps every other one.
 - `parse_marker` and `format_marker`: the build marker. mnemiq carries the same two (`mnemiq/superset/marker.py`),
   and one table of cases runs through both.
@@ -21,6 +21,7 @@ import copy
 import json
 import math
 import re
+from collections import deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -355,8 +356,10 @@ def _extra_metrics(fd: Mapping) -> list:
 
 
 def _timeseries(fd: dict) -> list[tuple[dict, dict]]:
-    """Line, bar, area and scatter: `plugin-chart-echarts/src/Timeseries/buildQuery.ts`, `buildQuery` (each kind
-    registers it: `Timeseries/Area/index.ts`, `Timeseries/Regular/{Line,Bar,Scatter}/index.ts`). The x-axis, then the
+    """Line, bar, area and scatter, and the step, smooth and generic time-series charts a line chart becomes by hand:
+    `plugin-chart-echarts/src/Timeseries/buildQuery.ts`, `buildQuery` (each kind registers it: `Timeseries/Area/
+    index.ts`, `Timeseries/Regular/{Line,Bar,Scatter,SmoothLine}/index.ts`, `Timeseries/Step/index.ts`,
+    `Timeseries/index.ts`). The x-axis, then the
     group-by; left out are the pivot, resample, rolling, time-compare, contribution, rename, sort, flatten and prophet
     operators, and `time_offsets`."""
     base = _base_query(fd)
@@ -559,6 +562,12 @@ _BUILDERS = {
     "echarts_timeseries_bar": _timeseries,
     "echarts_area": _timeseries,
     "echarts_timeseries_scatter": _timeseries,
+    # Not made by the builder, and the types a person reaches by changing a line chart's type in Explore; built with
+    # the same `buildQuery` (`VizType.Step`, `VizType.SmoothLine`, `VizType.Timeseries`), so a later patch keeps the
+    # chart's grain.
+    "echarts_timeseries_step": _timeseries,
+    "echarts_timeseries_smooth": _timeseries,
+    "echarts_timeseries": _timeseries,
     "mixed_timeseries": _mixed,
     "table": _table,
     "pie": _sorted_by_metric,
@@ -571,8 +580,9 @@ _BUILDERS = {
     "sankey_v2": _sankey,
 }
 
-# The families the builder makes that get a query context. A box plot, a histogram, handlebars and the
-# interactive pivot get none, nor does anything else, including a big number with a trendline.
+# The types that get a query context: the families the builder makes, and the line-like types above. A box plot, a
+# histogram, handlebars and the interactive pivot get none, nor does anything else, including a big number with a
+# trendline.
 BUILT_FAMILIES: frozenset[str] = frozenset(_BUILDERS)
 
 
@@ -698,29 +708,53 @@ def _layout_chart_ids(positions: Mapping) -> set[int] | None:
     return found
 
 
-def _is_tab(node: Any) -> bool:
-    return isinstance(node, Mapping) and node.get("type") == "TAB"
+# The node types whose children `Dashboard.tabs` walks into; it reads past every other node without entering it.
+_WALKED = frozenset({"ROOT", "GRID", "TABS", "TAB"})
 
 
-def _tab_ids(positions: Any) -> list[str]:
-    """The tabs of a layout, by the id rc2 knows them by (`superset/models/dashboard.py`, `Dashboard.tabs`): a report
-    on a tab names it so."""
-    if not isinstance(positions, Mapping):
+def _reachable_tabs(positions: Any) -> list[tuple[str, Mapping]]:
+    """The TAB nodes of a layout that rc2 knows as its tabs, each with the key it is stored under, read as
+    `Dashboard.tabs` (`superset/models/dashboard.py`) reads them: breadth first from `ROOT_ID`, entering the children
+    of the root, the grid, tab groups and tabs only, each node reached once (a node a second parent lists is passed
+    over), a node without a type entered no further. A report on a tab names it by its `id`. A node no walk from
+    `ROOT_ID` reaches is dropped by the next save (`DashboardDAO.set_dash_metadata` runs `repair_position`,
+    `superset/dashboards/layout.py`), so it is no tab at all."""
+    if not isinstance(positions, Mapping) or not isinstance(positions.get("ROOT_ID"), Mapping):
         return []
-    return [node["id"] for node in positions.values() if _is_tab(node) and isinstance(node.get("id"), str)]
+    found: list[tuple[str, Mapping]] = []
+    visited = {"ROOT_ID"}
+    queue: deque[tuple[str, Mapping]] = deque([("ROOT_ID", positions["ROOT_ID"])])
+    while queue:
+        key, node = queue.popleft()
+        if "type" not in node:
+            continue
+        children = node.get("children", [])
+        for child_key in children if isinstance(children, list) else []:
+            child = positions.get(child_key) if isinstance(child_key, str) else None
+            if not isinstance(child, Mapping) or child_key in visited:
+                continue
+            visited.add(child_key)
+            if node["type"] in _WALKED:
+                queue.append((child_key, child))
+        if node["type"] == "TAB":
+            found.append((key, node))
+    return found
 
 
 def check_positions(positions: Any, *, current_positions: Any, current_chart_ids: Iterable[int],
                     add_chart_ids: Iterable[int] = (), remove_chart_ids: Iterable[int] = ()) -> dict | None:
     """Why `set_layout` refuses `positions`, or None. `current_positions` is the dashboard's layout now and
     `current_chart_ids` its charts. Refused:
-    - `malformed`: not a layout `set_dash_metadata` reads cleanly, or a chart id that is not a positive integer;
+    - `malformed`: not a layout `set_dash_metadata` reads cleanly, a chart id that is not a positive integer, or a
+      tab stored under a key that is not its id (rc2 walks a layout by its keys and knows a tab by its id);
     - `add_and_remove`: a chart both added and removed;
     - `chart_set`: the layout's charts are not exactly the current ones plus the added minus the removed. Writing
       `positions` replaces the dashboard's membership wholesale, so a chart left out would be dropped from it;
-    - `drops_tab`: a tab of the current layout is no longer a tab. rc2 deactivates the reports on a deleted tab only
-      when `position_json` itself is sent (`UpdateDashboardCommand.process_tab_diff`), which a `positions` save is
-      not."""
+    - `drops_tab`: a tab of the current layout, as rc2 knows its tabs (`_reachable_tabs`), is not one of the new
+      layout's under the same id: gone, no longer a tab, detached from the walk from `ROOT_ID`, or under another id.
+      rc2 deactivates the reports on a deleted tab only when `position_json` itself is sent
+      (`UpdateDashboardCommand.process_tab_diff`), which a `positions` save is not. A tab the current layout holds
+      but does not reach is not required: rc2 does not know it, and the save drops it anyway."""
     add, remove = list(add_chart_ids), list(remove_chart_ids)
     current = list(current_chart_ids)
     if not isinstance(positions, Mapping) or not all(_is_id(i) for i in [*add, *remove, *current]):
@@ -729,12 +763,14 @@ def check_positions(positions: Any, *, current_positions: Any, current_chart_ids
     if both:
         return {"refused": "add_and_remove", "chart_ids": sorted(both)}
     found = _layout_chart_ids(positions)
-    if found is None:
+    tabs = _reachable_tabs(positions)
+    if found is None or any(node.get("id") != key for key, node in tabs):
         return {"refused": "malformed"}
     expected = (set(current) | set(add)) - set(remove)
     if found != expected:
         return {"refused": "chart_set", "missing": sorted(expected - found), "unexpected": sorted(found - expected)}
-    dropped = sorted({tab for tab in _tab_ids(current_positions) if not _is_tab(positions.get(tab))})
+    known = {node["id"] for _, node in _reachable_tabs(current_positions) if isinstance(node.get("id"), str)}
+    dropped = sorted(known - {key for key, _ in tabs})
     if dropped:
         return {"refused": "drops_tab", "tabs": dropped}
     return None

@@ -140,6 +140,13 @@ CASES = {
 FOURTEEN = {"echarts_timeseries_line", "echarts_timeseries_bar", "echarts_area", "echarts_timeseries_scatter",
                "mixed_timeseries", "table", "pie", "big_number_total", "gauge_chart", "pivot_table_v2", "treemap_v2",
                "waterfall", "funnel", "sankey_v2"}
+# The types a person reaches by changing a line chart's type by hand, which rc2 builds with the very `buildQuery` the
+# line chart uses (`plugin-chart-echarts/src/Timeseries/buildQuery.ts`, imported by `Timeseries/index.ts`,
+# `Timeseries/Step/index.ts` and `Timeseries/Regular/SmoothLine/index.ts`; their keys are `VizType.Timeseries`,
+# `VizType.Step` and `VizType.SmoothLine`).
+LINE_LIKE = {"echarts_timeseries", "echarts_timeseries_step", "echarts_timeseries_smooth"}
+# Each queries as the line chart does.
+CASES.update({viz_type: ({**LINE, "viz_type": viz_type}, CASES["echarts_timeseries_line"][1]) for viz_type in LINE_LIKE})
 
 BOX_PLOT = {"viz_type": "box_plot", "columns": ["region"], "groupby": [], "metrics": [SALES],
             "whiskerOptions": "Tukey", "row_limit": 10000}
@@ -155,9 +162,22 @@ NOT_BUILT = {
 }
 
 
-def test_built_families_are_the_fourteen():
-    assert ext.BUILT_FAMILIES == frozenset(FOURTEEN)
-    assert set(CASES) == FOURTEEN
+def test_built_families_are_the_fourteen_and_the_line_like_types():
+    assert ext.BUILT_FAMILIES == frozenset(FOURTEEN | LINE_LIKE)
+    assert set(CASES) == FOURTEEN | LINE_LIKE
+
+
+def test_a_type_changed_by_hand_to_step_or_smooth_keeps_the_grain():
+    """A line chart a person turns into a step, smooth or generic time-series chart keeps its query: the next patch
+    regenerates the same query context, the grain on its x-axis included, rather than clearing it."""
+    line = ext.query_context("echarts_timeseries_line", LINE, DATASET)
+    for viz_type in sorted(LINE_LIKE):
+        changed = ext.patch("echarts_timeseries_line", LINE, {"viz_type": viz_type}, [], DATASET)
+        assert changed.viz_type == viz_type
+        assert changed.query_context["queries"] == line["queries"]
+        again = ext.patch(viz_type, changed.params, {"row_limit": 50}, [], DATASET)
+        (axis_column, *_) = again.query_context["queries"][0]["columns"]
+        assert axis_column == axis("order_date", "P1M") and again.query_context["queries"][0]["row_limit"] == 50
 
 
 @pytest.mark.parametrize("viz_type", sorted(CASES))
@@ -502,6 +522,68 @@ def test_positions_may_not_drop_a_tab():
     assert check(positions) == {"refused": "drops_tab", "tabs": ["TAB-b"]}
     # A dashboard with no layout yet has no tab to drop.
     assert ext.check_positions(layout([5]), current_positions=None, current_chart_ids=[], add_chart_ids=[5]) is None
+
+
+def test_a_tab_is_kept_only_when_it_stays_reachable_under_its_id():
+    """rc2 knows a dashboard's tabs as `Dashboard.tabs` (`superset/models/dashboard.py`) walks them: from `ROOT_ID`,
+    through the children of the root, the grid, tab groups and tabs, each TAB node known by its own `id`. A save drops
+    every node no walk from `ROOT_ID` reaches (`DashboardDAO.set_dash_metadata` runs `repair_position`,
+    `superset/dashboards/layout.py`), and deactivates no report on it. So a tab still in the layout's nodes but no
+    longer reached, or reached under another id, is a dropped tab; and a tab node stored under a key that is not its
+    id is malformed."""
+    current = layout([1, 2], tabs=("TAB-a", "TAB-b"))
+
+    def check(positions):
+        return ext.check_positions(positions, current_positions=current, current_chart_ids=[1, 2])
+
+    # Detached: TAB-b's node is kept, and its tab group no longer lists it.
+    positions = layout([1, 2], tabs=("TAB-a", "TAB-b"))
+    positions["TABS-1"]["children"] = ["TAB-a"]
+    assert check(positions) == {"refused": "drops_tab", "tabs": ["TAB-b"]}
+    # The whole tab group detached from the grid.
+    positions = layout([1, 2], tabs=("TAB-a", "TAB-b"))
+    positions["GRID_ID"]["children"] = []
+    assert check(positions) == {"refused": "drops_tab", "tabs": ["TAB-a", "TAB-b"]}
+    # The tab group under a row, which the walk does not enter.
+    positions = layout([1, 2], tabs=("TAB-a", "TAB-b"))
+    positions["GRID_ID"]["children"] = ["ROW-x"]
+    positions["ROW-x"] = {"type": "ROW", "id": "ROW-x", "children": ["TABS-1"], "meta": {}}
+    assert check(positions) == {"refused": "drops_tab", "tabs": ["TAB-a", "TAB-b"]}
+    # Re-keyed whole, its parent following: rc2 now knows it as TAB-c.
+    assert check(layout([1, 2], tabs=("TAB-a", "TAB-c"))) == {"refused": "drops_tab", "tabs": ["TAB-b"]}
+    # Its id changed under the same key, and its id kept under another key: neither is a layout rc2 reads one way.
+    positions = layout([1, 2], tabs=("TAB-a", "TAB-b"))
+    positions["TAB-b"]["id"] = "TAB-c"
+    assert check(positions) == {"refused": "malformed"}
+    positions = layout([1, 2], tabs=("TAB-a", "TAB-c"))
+    positions["TAB-c"]["id"] = "TAB-b"
+    assert check(positions) == {"refused": "malformed"}
+    # The controls: the tabs reached by another path under the same ids (the tab group moved into a new outer tab),
+    # and a node reached twice, are kept tabs.
+    positions = layout([1, 2], tabs=("TAB-a", "TAB-b"))
+    positions["GRID_ID"]["children"] = ["TABS-outer"]
+    positions["TABS-outer"] = {"type": "TABS", "id": "TABS-outer", "children": ["TAB-outer"]}
+    positions["TAB-outer"] = {"type": "TAB", "id": "TAB-outer", "children": ["TABS-1"], "meta": {"text": "outer"}}
+    assert check(positions) is None
+    positions = layout([1, 2], tabs=("TAB-a", "TAB-b"))
+    positions["TABS-1"]["children"] = ["TAB-a", "TAB-b", "TAB-a"]
+    assert check(positions) is None
+
+
+def test_an_unreachable_tab_of_the_current_layout_is_not_required():
+    """A TAB node the current layout holds but does not reach is no tab rc2 knows (`Dashboard.tabs` does not list it,
+    so no report can be on it) and the next save drops it anyway: a layout without it is not refused. The control: the
+    same tab, reached, is required."""
+    current = layout([1, 2], tabs=("TAB-a", "TAB-b"))
+    current["TAB-z"] = {"type": "TAB", "id": "TAB-z", "children": [], "meta": {"text": "z"},
+                        "parents": ["ROOT_ID", "GRID_ID", "TABS-1"]}
+
+    def check(positions):
+        return ext.check_positions(positions, current_positions=current, current_chart_ids=[1, 2])
+
+    assert check(layout([1, 2], tabs=("TAB-a", "TAB-b"))) is None
+    current["TABS-1"]["children"].append("TAB-z")
+    assert check(layout([1, 2], tabs=("TAB-a", "TAB-b"))) == {"refused": "drops_tab", "tabs": ["TAB-z"]}
 
 
 def _deleted_native_filter_ids(current_metadata, new_metadata):
