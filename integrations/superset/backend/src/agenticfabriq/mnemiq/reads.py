@@ -62,17 +62,18 @@ def _size(answer: Any) -> int:
 
 
 def fit(entries: list, build, mark) -> dict:
-    """`build(entries)`'s answer with as many of `entries`, in order, as keep it within `MAX_ANSWER_BYTES`; each entry
-    after the first that does not fit is `mark(entry)` in its place. The one cap every read tool answers under."""
-    kept: list = []
-    full = False
-    for entry in entries:
-        if not full and _size(build([*kept, entry])) <= MAX_ANSWER_BYTES:
-            kept.append(entry)
-        else:
-            full = True
-            kept.append(mark(entry))
-    return build(kept)
+    """`build(entries)`'s answer with as many of `entries`, in order, as keep the answer sent within
+    `MAX_ANSWER_BYTES`; from the first that does not fit on, each entry is `mark(entry)` in its place. What is measured
+    is what would be sent: the entries kept, this one, and the marks of every entry after it. So whenever an entry is
+    kept the answer that ends the loop is no larger than the one just measured, and the final answer is within the
+    cap (the marks alone, which a request's id limits, are far below it)."""
+    marks = [mark(entry) for entry in entries]
+    kept = 0
+    for index, entry in enumerate(entries):
+        if _size(build([*entries[:index + 1], *marks[index + 1:]])) > MAX_ANSWER_BYTES:
+            break
+        kept = index + 1
+    return build([*entries[:kept], *marks[kept:]])
 
 
 def read(tool: str, request: Any) -> dict:
@@ -90,7 +91,8 @@ def _certification(metric: Any) -> dict:
 
 def metric_answer(metric: Any) -> dict:
     """One metric as the tool answers it. `currency` is rc2's own object, `{symbol, symbolPosition}`, as `CurrencyType`
-    reads it; anything else stored there is answered as none."""
+    reads it; an empty object (what rc2 reads from text it cannot parse) and anything else stored there are answered
+    as none."""
     certification = _certification(metric)
     currency = getattr(metric, "currency", None)
     return {"metric_name": metric.metric_name, "expression": metric.expression, "d3format": metric.d3format,

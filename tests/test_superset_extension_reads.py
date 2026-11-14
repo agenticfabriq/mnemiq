@@ -193,3 +193,22 @@ def test_the_three_tools_share_one_cap():
 
 def test_an_empty_currency_is_answered_as_none():
     assert reads.metric_answer(metric("a", currency={}))["currency"] is None
+
+
+def test_the_marks_are_counted_in_the_cap_at_the_request_limits(monkeypatch):
+    """The worst case: the request caps (20 datasets; 100 charts and 20 datasets) with real entries that just fill the
+    cap, so the marks of the entries that do not fit are what tips the answer over unless they are counted too."""
+    for fat in range(1_000, 2_200, 37):
+        held = {i: SimpleNamespace(id=i, metrics=[metric("m", warning="x" * fat)]) for i in range(1, 21)}
+        monkeypatch.setattr(writes, "_dataset", lambda dataset_id: held.get(dataset_id))
+        answer = reads.dataset_metrics({"dataset_ids": list(range(1, 21))})
+        assert size(answer) <= reads.MAX_ANSWER_BYTES, (fat, size(answer))
+    subject = SimpleNamespace
+    for fat in range(150, 420, 7):
+        charts = {i: subject(editors=[subject(label="x" * fat)]) for i in range(1, 101)}
+        datasets = {i: subject(editors=[subject(label="x" * fat)]) for i in range(1, 21)}
+        monkeypatch.setattr(reads, "_chart", lambda chart_id: charts.get(chart_id))
+        monkeypatch.setattr(writes, "_dataset", lambda dataset_id: datasets.get(dataset_id))
+        answer = reads.editors_of({"chart_ids": list(range(1, 101)), "dataset_ids": list(range(1, 21))})
+        assert size(answer) <= reads.MAX_ANSWER_BYTES, (fat, size(answer))
+        assert len(answer["charts"]) == 100 and len(answer["datasets"]) == 20
