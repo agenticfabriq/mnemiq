@@ -480,3 +480,138 @@ def test_a_command_failure_is_answered_by_its_kind(deleting):
     deleting.charts = [[]]
     deleting.superset.delete = stubs.ForbiddenError()
     assert delete(_dataset(MARKED)) == {"not_editor": True, "editors": ["analyst Live"]}
+
+
+# ---------------------------------------------------------------- waiting on a lock
+
+class Slice:
+    """A model stood in: `lock_row` reads its `id` column and its name."""
+
+    id = "slices.id"
+
+
+class _Query:
+    def __init__(self, log: list) -> None:
+        self.log = log
+
+    def __getattr__(self, name):
+        def step(*args):
+            self.log.append((name, *args))
+            return "the row" if name == "one_or_none" else self
+
+        return step
+
+
+class _Session:
+    """A session stood in, on a database of `dialect`: it records what `lock_row` executes and queries."""
+
+    def __init__(self, dialect: str) -> None:
+        self.log: list = []
+        self.rollbacks = 0
+        self.bind = SimpleNamespace(dialect=SimpleNamespace(name=dialect))
+
+    def get_bind(self):
+        return self.bind
+
+    def execute(self, statement, parameters=None) -> None:
+        self.log.append(("execute", statement, parameters))
+
+    def query(self, model):
+        self.log.append(("query", model))
+        return _Query(self.log)
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+
+
+LOCK_TIMEOUT = "SELECT set_config('lock_timeout', :timeout, true)"
+
+
+def test_the_row_lock_waits_at_most_the_lock_timeout(superset, monkeypatch):
+    """On Postgres, `lock_row` first sets the transaction's `lock_timeout` (`SET LOCAL`, as `set_config(..., true)`),
+    30 seconds unless Superset's config sets `MNEMIQ_LOCK_TIMEOUT_S`, and only then takes the row's lock. So a tool
+    stuck behind a long transaction stops waiting well inside mnemiq's deadline for the call (45 seconds by default)
+    with SQLSTATE 55P03, which rc2 counts as contention, and answers `{busy}` instead of writing after mnemiq gave up."""
+    session = _Session("postgresql")
+    monkeypatch.setattr(writes, "_session", lambda: session)
+    assert writes.lock_row(Slice, 4) == "the row"
+    assert session.log[0] == ("execute", LOCK_TIMEOUT, {"timeout": "30000ms"})
+    assert [entry[0] for entry in session.log[1:]] == ["query", "populate_existing", "enable_eagerloads", "filter",
+                                                      "with_for_update", "one_or_none"]
+    for configured, waits in ((3, "3000ms"), (2.5, "2500ms"), (0, "30000ms"), (-1, "30000ms"), ("10", "30000ms"),
+                              (True, "30000ms"), (float("nan"), "30000ms")):
+        session.log.clear()
+        superset.config["MNEMIQ_LOCK_TIMEOUT_S"] = configured
+        writes.lock_row(Slice, 4)
+        assert session.log[0] == ("execute", LOCK_TIMEOUT, {"timeout": waits}), configured
+    # SQLite takes no row locks and MySQL has no transaction-local lock timeout: the lock is taken as it was.
+    for dialect in ("sqlite", "mysql"):
+        session = _Session(dialect)
+        monkeypatch.setattr(writes, "_session", lambda: session)
+        writes.lock_row(Slice, 4)
+        assert session.log[0] == ("query", Slice)
+
+
+def test_a_contended_lock_answers_busy_and_ends_the_transaction(superset, monkeypatch):
+    """A lock wait past the timeout (55P03), a deadlock (40P01) or a serialization failure (40001) on the lock answers
+    `{busy}`: the same request may be sent again. Nothing is written and the transaction ends. Any other database
+    error is not contention: it is raised, and the transaction still ends."""
+    session = _Session("postgresql")
+    monkeypatch.setattr(writes, "_session", lambda: session)
+    wrote: list = []
+    for sqlstate in stubs.PG_LOCK_CONTENTION:
+        monkeypatch.setattr(writes, "lock_row", lambda model, entity_id, code=sqlstate: (_ for _ in ()).throw(
+            stubs.database_error(code)))
+        assert writes._locked(Slice, 4, wrote.append) == {"busy": True}, sqlstate
+    assert wrote == [] and session.rollbacks == 3
+    monkeypatch.setattr(writes, "lock_row", lambda model, entity_id: (_ for _ in ()).throw(
+        stubs.database_error("42P01")))
+    with pytest.raises(stubs.DBAPIError):
+        writes._locked(Slice, 4, wrote.append)
+    assert wrote == [] and session.rollbacks == 4
+
+
+def test_a_command_that_loses_a_lock_race_answers_busy(deleting):
+    """A command whose own write waits past the lock timeout fails as its command's error raised from the database
+    error (`superset/utils/decorators.py`, `on_error`: `raise reraise() from ex`), and the tool answers `{busy}`. The
+    control: the same command failure from any other database error answers `{failed}`."""
+    for sqlstate, answer in (("55P03", {"busy": True}), ("40P01", {"busy": True}), ("23505", {"failed": True})):
+        failure = stubs.DeleteFailedError()
+        failure.__cause__ = stubs.database_error(sqlstate)
+        deleting.charts, deleting.superset.delete = [[]], failure
+        assert delete(_dataset(MARKED)) == answer, sqlstate
+
+
+# ---------------------------------------------------------------- set_layout's access check
+
+def _one_chart_layout(chart_id: int) -> dict:
+    return {"ROOT_ID": {"type": "ROOT", "id": "ROOT_ID", "children": ["GRID_ID"]},
+            "GRID_ID": {"type": "GRID", "id": "GRID_ID", "children": [f"CHART-{chart_id}"]},
+            f"CHART-{chart_id}": {"type": "CHART", "id": f"CHART-{chart_id}", "children": [],
+                                  "meta": {"chartId": chart_id, "width": 4, "height": 50}}}
+
+
+def test_set_layout_adds_only_charts_the_caller_may_read(superset, monkeypatch):
+    """`DashboardDAO.set_dash_metadata` makes every chart a layout names a member with no access check of its own, so
+    `set_layout` asks `can_access_chart` of each chart it adds: one the caller may not read, or that does not exist,
+    is refused by id, and no command runs. The control: a chart the caller may read is added, in one command."""
+    superset.charts = {11: SimpleNamespace(id=11), 12: SimpleNamespace(id=12)}
+    security = SimpleNamespace(can_access_dashboard=lambda dashboard: True, is_editor=lambda resource: True,
+                               can_access_chart=lambda chart: chart.id == 11)
+    monkeypatch.setattr(writes, "_security", lambda: security)
+    monkeypatch.setattr(writes, "_member_chart_ids", lambda dashboard_id: [])
+    dashboard = SimpleNamespace(id=3, changed_on=datetime.fromisoformat(WHEN), position_json=None, json_metadata=None,
+                                editors=[])
+
+    def layout(chart_id: int) -> dict:
+        found = writes.read("set_layout", {"dashboard_id": 3, "positions": _one_chart_layout(chart_id),
+                                           "add_chart_ids": [chart_id], "expect_changed_on": WHEN})
+        return writes._layout(found, dashboard)
+
+    assert layout(12) == {"refused": "chart_access", "chart_ids": [12]}
+    assert layout(13) == {"refused": "chart_access", "chart_ids": [13]}
+    assert superset.ran == []
+    assert layout(11) == {"ok": True}
+    assert [name for name, _ in superset.ran] == ["UpdateDashboardCommand"]
+    assert writes._readable_chart(11) is True
+    assert writes._readable_chart(12) is False and writes._readable_chart(13) is False

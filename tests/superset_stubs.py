@@ -74,12 +74,32 @@ class MarshmallowValidationError(Exception):
     pass
 
 
+# rc2's Postgres SQLSTATEs for lock contention: serialization_failure, deadlock_detected and lock_not_available, the
+# last what a `lock_timeout` raises (`superset/versioning/db_errors.py`, `_PG_LOCK_CONTENTION`).
+PG_LOCK_CONTENTION = ("40001", "40P01", "55P03")
+
+
+def is_lock_contention_error(exc) -> bool:
+    """rc2's `is_lock_contention_error` (`superset/versioning/db_errors.py`) for a Postgres driver: decided by the
+    driver error's SQLSTATE alone."""
+    return getattr(getattr(exc, "orig", None), "pgcode", None) in PG_LOCK_CONTENTION
+
+
+def database_error(sqlstate: str) -> DBAPIError:
+    """A database error as SQLAlchemy wraps a psycopg2 one, its SQLSTATE on the driver error (`orig.pgcode`)."""
+    error = DBAPIError(f"(psycopg2.errors) SQLSTATE {sqlstate}")
+    error.orig = SimpleNamespace(pgcode=sqlstate)
+    return error
+
+
 def install(monkeypatch) -> SimpleNamespace:
     """The stand-ins, installed for this test. The answer holds what a test may set (`chart_data`: what running a
     query context does, a payload or an exception; `delete`, `restore`: what each command's `run` does, None or an
-    exception) and what the tools did (`ran`: each command run, in order)."""
+    exception; `update`: what `UpdateDashboardCommand.run` does; `config`: Superset's config, as
+    `flask.current_app.config`; `charts`: the charts `ChartDAO.find_by_id` finds, by id) and what the tools did (`ran`:
+    each command run, in order, with its arguments)."""
     state = SimpleNamespace(chart_data={"queries": [{"data": [], "status": "success"}]}, delete=None, restore=None,
-                            ran=[])
+                            update=None, ran=[], config={}, charts={})
 
     class ChartDataQueryContextSchema:
         def load(self, context: dict) -> dict:
@@ -103,8 +123,8 @@ def install(monkeypatch) -> SimpleNamespace:
 
     def command(name: str, outcome: str):
         class Command:
-            def __init__(self, argument) -> None:
-                self.argument = argument
+            def __init__(self, *arguments) -> None:
+                self.argument = arguments[0] if len(arguments) == 1 else arguments
 
             def run(self) -> None:
                 state.ran.append((name, self.argument))
@@ -115,7 +135,9 @@ def install(monkeypatch) -> SimpleNamespace:
         return Command
 
     modules = {
+        "flask": {"current_app": SimpleNamespace(config=state.config)},
         "marshmallow": {"ValidationError": MarshmallowValidationError},
+        "sqlalchemy": {"text": lambda sql: sql},
         "sqlalchemy.exc": {"SQLAlchemyError": SQLAlchemyError, "DBAPIError": DBAPIError},
         "superset.exceptions": {"SupersetException": SupersetException,
                                 "SupersetSecurityException": SupersetSecurityException,
@@ -130,7 +152,9 @@ def install(monkeypatch) -> SimpleNamespace:
         "superset.mcp_service.chart.query_result": {"query_result_failure": query_result_failure},
         "superset.commands.dataset.delete": {"DeleteDatasetCommand": command("DeleteDatasetCommand", "delete")},
         "superset.commands.dataset.restore": {"RestoreDatasetCommand": command("RestoreDatasetCommand", "restore")},
-        "superset.versioning.db_errors": {"is_lock_contention_error": lambda exc: False},
+        "superset.commands.dashboard.update": {"UpdateDashboardCommand": command("UpdateDashboardCommand", "update")},
+        "superset.daos.chart": {"ChartDAO": SimpleNamespace(find_by_id=lambda chart_id: state.charts.get(chart_id))},
+        "superset.versioning.db_errors": {"is_lock_contention_error": is_lock_contention_error},
     }
     made: dict[str, types.ModuleType] = {}
 

@@ -10,7 +10,8 @@ Every tool keeps these rules:
   (`superset/utils/decorators.py`) commits in the same session, and that commit releases the lock. Only under the lock
   does a tool compare the `changed_on` its caller read, so of two racing writers the second waits, then sees the first
   one's `changed_on`, and answers `{"stale": true}`. `{"busy": true}` is for a lock-contention error alone
-  (`superset/versioning/db_errors.py`, `is_lock_contention_error`), and the same request may be sent again.
+  (`superset/versioning/db_errors.py`, `is_lock_contention_error`), a wait past the lock timeout among them
+  (`lock_row`), and the same request may be sent again.
 - Its answer is short and structured. Superset's own text never reaches it: any of Superset's exceptions is logged
   here and answered by its kind.
 - A caller who is not an editor of the object is told so before anything about the object's state (a stale
@@ -350,10 +351,36 @@ def _command_errors() -> tuple[type[Exception], ...]:
     return (SupersetException,)
 
 
+# How long a write waits for a row another transaction holds, unless Superset's config sets `MNEMIQ_LOCK_TIMEOUT_S`:
+# well inside mnemiq's own deadline for a call (45 seconds by default), so a tool stuck behind a long transaction
+# answers `{"busy": true}` while mnemiq still waits for it, rather than writing after mnemiq gave up on the call.
+LOCK_TIMEOUT_S = 30
+
+
+def _lock_timeout() -> str:
+    """The `lock_timeout` to set, as Postgres reads it: `MNEMIQ_LOCK_TIMEOUT_S` seconds when that is a positive
+    number, else `LOCK_TIMEOUT_S`."""
+    from flask import current_app
+
+    value = current_app.config.get("MNEMIQ_LOCK_TIMEOUT_S", LOCK_TIMEOUT_S)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value < float("inf"):
+        logger.warning("mnemiq extension: MNEMIQ_LOCK_TIMEOUT_S is not a positive number of seconds; waiting %s",
+                       LOCK_TIMEOUT_S)
+        value = LOCK_TIMEOUT_S
+    return f"{max(1, round(value * 1000))}ms"
+
+
 def lock_row(model: type, entity_id: int) -> Any:
     """Row `entity_id` of `model`, locked for update and refreshed to its committed state, or None when no such row is
     visible (a row in the trash is not). A blocking `SELECT ... FOR UPDATE` of the primary-key row, so it serialises
     against every other writer that locks the row, rc2's own dataset `PUT` included.
+
+    On Postgres the wait is bounded first: `SET LOCAL lock_timeout` (written `set_config(..., true)`, so the value is a
+    bound parameter) holds until the transaction ends, which is the command's commit or `_locked`'s rollback, so it
+    bounds the lock and every write of the command after it. A wait past it fails with SQLSTATE 55P03
+    (lock_not_available), which rc2's `is_lock_contention_error` counts as contention (`superset/versioning/
+    db_errors.py`, `_PG_LOCK_CONTENTION`), so the tool answers `{"busy": true}`. SQLite takes no row locks, and MySQL
+    has no lock timeout that ends with the transaction: there the database's own setting applies.
 
     This is rc2's `lock_entity_for_update` (`superset/versioning/api_helpers.py`) with eager loads off, as rc2 reads a
     row it locks for a version restore (`superset/commands/version_restore.py`). `lock_entity_for_update` cannot lock
@@ -361,7 +388,12 @@ def lock_row(model: type, entity_id: int) -> Any:
     FOR UPDATE`, and Postgres rejects `FOR UPDATE` with `DISTINCT`. With eager loads off only the row itself is read;
     its relationships (editors, metrics, charts) load when first read, in the same locked transaction. Every locked
     tool takes its lock here, so the rule is one rule."""
-    return (_session().query(model).populate_existing().enable_eagerloads(False)
+    from sqlalchemy import text
+
+    session = _session()
+    if session.get_bind().dialect.name == "postgresql":
+        session.execute(text("SELECT set_config('lock_timeout', :timeout, true)"), {"timeout": _lock_timeout()})
+    return (session.query(model).populate_existing().enable_eagerloads(False)
             .filter(model.id == entity_id).with_for_update().one_or_none())
 
 
@@ -766,7 +798,7 @@ def set_layout(found: dict) -> dict:
     """Writes a dashboard's layout, which also sets its charts (`json_metadata.positions`, through
     `UpdateDashboardCommand`), under the dashboard's lock, once the `changed_on` the caller read is still the
     dashboard's. The layout must hold exactly the dashboard's charts plus those added minus those removed, keep every
-    tab, and add only charts the caller may read. The dashboard's native filters and the settings rc2 would otherwise
+    tab rc2 knows reachable under its id (`params.check_positions`), and add only charts the caller may read. The dashboard's native filters and the settings rc2 would otherwise
     reset are sent back as they are (`params.layout_metadata`), so no report on a filter is deactivated."""
     from superset.models.dashboard import Dashboard
 
