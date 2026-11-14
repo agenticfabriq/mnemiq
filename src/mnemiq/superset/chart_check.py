@@ -132,9 +132,15 @@ _NOT_CHECKED_TYPES = {
     "ag-grid-pivot-table": "the interactive pivot table's plugin is not in Superset 7.0.0rc2, so what it shows is "
                            "unknown",
 }
-# A pivot table aggregates the rows of each cell in the browser (`aggregateFunction`). Each cell holds one row of the
-# query, which these functions leave as it is; the others (counts, fractions, lists) show something else.
-_PIVOT_KEEPS_VALUE = frozenset({"Sum", "Average", "Median", "Minimum", "Maximum", "First", "Last"})
+# The pivot shows each cell as its value only for these `showValuesAs` settings (`ShowValuesAsEnum.ACTUAL` in
+# `plugin-chart-pivot-table/src/types.ts`, the control's default); the others show it as a share of a total.
+_PIVOT_SHOWS_VALUE = frozenset({None, "", "actual"})
+# The pivot's total and subtotal toggles. With a metric that is not additive, its `buildQuery` asks for every total
+# shown in the same query as grouping sets, whose total rows carry null grouping values.
+_PIVOT_TOTALS = ("rowTotals", "colTotals", "rowSubTotals", "colSubTotals")
+# What `allMetricsAdditive` (`plugin-chart-pivot-table/src/plugin/utilities.ts`) counts as additive: a SIMPLE metric
+# with one of these aggregates. A saved or SQL metric never is.
+_ADDITIVE = frozenset({"SUM", "COUNT", "MIN", "MAX"})
 
 # Postgres's grain expressions (`_time_grain_expressions` in `superset/db_engine_specs/postgres.py`), the ones that are
 # one `DATE_TRUNC`.
@@ -240,8 +246,6 @@ def _dimensions(viz_type: str, form: dict) -> list[str] | NotCheckable:
         if not x_axis:
             return NotCheckable("the chart has no x-axis column")
         found = _column_list([x_axis, *_as_list(form.get("groupby"))])
-        if viz_type == "mixed_timeseries" and _as_list(form.get("groupby_b")) != _as_list(form.get("groupby")):
-            return NotCheckable("the mixed chart groups its two series differently")
     elif viz_type in _GROUPED_ONE_METRIC or viz_type == "table":
         if viz_type == "table" and form.get("query_mode") == "raw":
             return NotCheckable("a table of rows has no measure: its numbers are the rows themselves")
@@ -283,6 +287,50 @@ def _after_the_query(viz_type: str, form: dict) -> str | None:
         return "series stacked to 100%"
     if form.get("forecastEnabled"):
         return "a forecast"
+    # The line chart's control (`Timeseries/Regular/Line/controlPanel.tsx`), which `Timeseries/transformProps.ts` reads
+    # camel-cased and applies to every point.
+    if form.get("rebase_percent_change") or form.get("rebasePercentChange"):
+        return "each series as its percent change from its first point"
+    return None
+
+
+def _neutral_range(value) -> str | None:
+    return None if value in (None, "", _NO_TIME_RANGE) else value
+
+
+def _second_series(form: dict, dimensions: list[str]) -> NotCheckable | None:
+    """Why a mixed chart's second series is shown otherwise than Superset's rows hold it, or None. The renderer takes
+    each `_b` key the form holds in place of the primary's, an empty `adhoc_filters_b` included
+    (`retainFormDataSuffix` in `plugin-chart-echarts/src/utils/formDataSuffix.ts`); the data tool's rebuild
+    (`_build_mixed_timeseries_secondary` in `superset/mcp_service/chart/chart_helpers.py`) reads an empty one as
+    absent and filters the series with the primary's filters, and never reads `row_limit_b`. So each `_b` key present
+    must say what the primary's says."""
+    if _as_list(form.get("groupby_b")) != _as_list(form.get("groupby")):
+        return NotCheckable("the mixed chart groups its second series differently from its first")
+    if "adhoc_filters_b" in form:
+        mine, theirs = _filters({"adhoc_filters": form["adhoc_filters_b"]}), _filters(form)
+        if isinstance(mine, NotCheckable) or (not isinstance(theirs, NotCheckable) and mine != theirs):
+            return NotCheckable("the mixed chart filters its second series differently from its first")
+    if "time_range_b" in form and _neutral_range(form["time_range_b"]) != _neutral_range(form.get("time_range")):
+        return NotCheckable("the mixed chart keeps its second series within another time range")
+    if "row_limit_b" in form and _row_limit({"row_limit": form["row_limit_b"]}) != _row_limit(form):
+        return NotCheckable("the mixed chart limits the rows of its second series differently from its first")
+    if len(dimensions) > 1 and (form.get("series_limit_b") or form.get("limit_b")):
+        return NotCheckable("the mixed chart keeps only the top groups of its second series (a series limit)")
+    return None
+
+
+def _pivot(form: dict) -> NotCheckable | None:
+    """Why a pivot table shows its cells otherwise than Superset's rows hold them, or None."""
+    if form.get("showValuesAs") not in _PIVOT_SHOWS_VALUE:
+        return NotCheckable("the pivot table shows each cell as its share of a total")
+    additive = [isinstance(m, dict) and m.get("expressionType") == "SIMPLE" and m.get("aggregate") in _ADDITIVE
+                for m in form.get("metrics") or []]
+    if not (additive and all(additive)) and any(form.get(key) for key in _PIVOT_TOTALS):
+        return NotCheckable("the pivot table asks for its totals in the same query as its cells (grouping sets), whose "
+                            "total rows mnemiq does not reproduce")
+    if (form.get("currency_format") or {}).get("symbol") == "AUTO":
+        return NotCheckable("the pivot table's AUTO currency adds the dataset's currency column to its grouping")
     return None
 
 
@@ -352,18 +400,19 @@ def expectation_from_form_data(form_data: dict, *, dataset: DatasetFacts) -> Exp
     if viz_type in _X_AXIS and len(dimensions) > 1 and (form.get("series_limit") or form.get("limit")):
         return NotCheckable("the chart keeps only its top series (a series limit), which Superset's data tool does not "
                             "apply")
-    if viz_type == "mixed_timeseries" and any(form.get(f"{key}_b") not in (None, "", [], form.get(key))
-                                              for key in ("adhoc_filters", "time_range", "row_limit")):
-        return NotCheckable("the mixed chart filters or limits its two series differently")
-    if viz_type == "pivot_table_v2":
-        if form.get("aggregateFunction", "Sum") not in _PIVOT_KEEPS_VALUE:
-            return NotCheckable("the pivot table shows each cell through an aggregate that changes its value")
-        if (form.get("currency_format") or {}).get("symbol") == "AUTO":
-            return NotCheckable("the pivot table's AUTO currency adds the dataset's currency column to its grouping")
+    if viz_type == "mixed_timeseries" and (second := _second_series(form, dimensions)) is not None:
+        return second
+    if viz_type == "pivot_table_v2" and (pivot := _pivot(form)) is not None:
+        return pivot
     grain = form.get("time_grain_sqla") or None
     if grain is not None and viz_type in ("table", "pivot_table_v2"):
         return NotCheckable("the chart applies a time grain to whichever of its grouping columns the dataset marks "
                             "temporal, which mnemiq does not read")
+    if grain is not None and viz_type not in _X_AXIS and form.get("x_axis") in dimensions:
+        # `buildQueryContext` runs `normalizeTimeColumn` (`superset-ui-core/src/query/normalizeTimeColumn.ts`) for
+        # every chart, so a grouping column that is also the form's `x_axis` is shown by the grain.
+        return NotCheckable("the chart groups its x-axis column by a time grain, which Superset's data tool does not "
+                            "apply")
     if viz_type not in _X_AXIS:
         grain = None
     if grain is not None and grain not in _GRAINS:
@@ -466,7 +515,7 @@ class _Rows:
 
     values: dict[tuple, list]
     largest: int = 0  # the most rows any one of the side's results held
-    capped: bool = False  # the side may hold only some of the groups
+    cap: int | None = None  # the row cap put on the side's one read, when it reached it: it may hold only some groups
 
 
 def _canonical(value):
@@ -608,9 +657,15 @@ def _own_rows(sql: str, expectation: Expectation, *, chart_id: int, adapter, sna
         return NotCheckable("mnemiq's own statement for this chart returned other columns than it asked for")
     values: dict[tuple, list] = {}
     for row in zip(*(table.column(i).to_pylist() for i in range(table.num_columns))) if table.num_rows else ():
-        values[tuple(_canonical(v) for v in row[:width])] = [_canonical(v) for v in row[width:]]
+        key = tuple(_canonical(v) for v in row[:width])
+        if key in values:
+            # Two groups the database told apart read as one once made comparable (`2026-01-01` and
+            # `2026-01-01 00:00:00` in a text column): which one the chart's row is cannot be told.
+            return NotCheckable("mnemiq's own rows for this chart repeat a group, so they cannot be lined up with the "
+                                "chart's")
+        values[key] = [_canonical(v) for v in row[width:]]
     cap = decided.approved.row_cap
-    return _Rows(values, table.num_rows, capped=cap is not None and table.num_rows >= cap)
+    return _Rows(values, table.num_rows, cap=cap if cap is not None and table.num_rows >= cap else None)
 
 
 def _dataset_rows(client, expectation: Expectation, dataset: DatasetFacts) -> _Rows | NotCheckable:
@@ -635,7 +690,7 @@ def _dataset_rows(client, expectation: Expectation, dataset: DatasetFacts) -> _R
               [_canonical(row.get(label)) for label, _ in expectation.metrics] for row in rows}
     if len(values) != len(rows):
         return NotCheckable("the dataset's rows repeat a group, so they cannot be lined up with the chart's")
-    return _Rows(values, len(rows), capped=len(rows) >= MAX_ROWS)
+    return _Rows(values, len(rows), cap=MAX_ROWS if len(rows) >= MAX_ROWS else None)
 
 
 # ---------------------------------------------------------------- comparing
@@ -667,7 +722,13 @@ def _outcome(chart_id: int, status: ChartStatus, reason: str, chart: tuple | Non
     return ChartCheck(chart_id, status, reason, chart, mine)
 
 
-def _compare(chart_id: int, chart: _Rows, mine: _Rows, row_limit: int | None) -> ChartCheck:
+# What mnemiq's side of the comparison is, for the reasons: its own decided SQL over the physical table, or Superset's
+# own query of a virtual dataset's saved metrics.
+_OWN_SQL = "mnemiq's own SQL"
+_QUERY_DATASET = "Superset's own query of the dataset's saved metrics (query_dataset)"
+
+
+def _compare(chart_id: int, chart: _Rows, mine: _Rows, row_limit: int | None, *, source: str) -> ChartCheck:
     shown = list(chart.values)
     order = [key for key in shown if key in mine.values] + [key for key in mine.values if key not in chart.values]
     both = (_values(chart.values, shown), _values(mine.values, order))
@@ -677,20 +738,26 @@ def _compare(chart_id: int, chart: _Rows, mine: _Rows, row_limit: int | None) ->
         return _outcome(chart_id, status, reason, *values)
 
     if any(key in mine.values and not all(map(_same, chart.values[key], mine.values[key])) for key in shown):
-        return outcome(ChartStatus.MISMATCH, "the chart shows a value mnemiq's own SQL does not compute")
-    if mine.capped:
-        return outcome(ChartStatus.NOT_CHECKED, f"the chart has more groups than mnemiq reads in one statement "
-                                                f"({MAX_ROWS:,}), so not all of them were compared")
+        return outcome(ChartStatus.MISMATCH, f"the chart shows a value {source} does not compute")
+    if mine.cap is not None:
+        return outcome(ChartStatus.NOT_CHECKED, f"the chart has more groups than {source} returns in one read "
+                                                f"({mine.cap:,}), so not all of them were compared")
     if any(key not in mine.values for key in shown):
-        return outcome(ChartStatus.MISMATCH, "the chart shows a group mnemiq's own SQL does not find")
+        return outcome(ChartStatus.MISMATCH, f"the chart shows a group {source} does not find")
     if len(mine.values) > len(shown):
         if row_limit is not None and chart.largest >= row_limit:
             return outcome(ChartStatus.NOT_CHECKED, f"the chart's row limit ({row_limit:,}) keeps only some of its "
                                                     "groups, so not all of them were compared")
-        return outcome(ChartStatus.MISMATCH, "mnemiq's own SQL finds a group the chart does not show")
+        return outcome(ChartStatus.MISMATCH, f"{source} finds a group the chart does not show")
     if not shown:
-        return outcome(ChartStatus.EMPTY, "the chart shows no rows, and mnemiq's own SQL finds none")
-    return outcome(ChartStatus.CHECKED, "the chart's numbers are the ones mnemiq's own SQL computes")
+        return outcome(ChartStatus.EMPTY, f"the chart shows no rows, and {source} finds none")
+    return outcome(ChartStatus.CHECKED, f"the chart's numbers match {source}")
+
+
+def _all_found(chart: _Rows, mine: _Rows) -> bool:
+    """Positive evidence that the chart's rows are `mine`: there are some, and each is there with equal values."""
+    return bool(chart.values) and all(key in mine.values and all(map(_same, values, mine.values[key]))
+                                      for key, values in chart.values.items())
 
 
 def _row_limit(form: dict) -> int | None:
@@ -764,6 +831,9 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
             return not_checked("the chart groups a virtual dataset by a time grain, which Superset's query_dataset "
                                "cannot ask for")
     else:
+        if getattr(adapter, "dialect", None) != "postgres":
+            return not_checked("mnemiq's own statement for a chart is written for Postgres, Superset mode's one "
+                               "dialect, and this adapter speaks another")
         if dataset.database_id != getattr(adapter, "database_id", dataset.database_id) \
                 or (dataset.schema or None) != getattr(adapter, "schema", dataset.schema):
             return not_checked("the chart's dataset is on another database or schema than the one mnemiq reads")
@@ -782,21 +852,20 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
     if isinstance(chart, ChartCheck):
         return chart
     if dataset.is_virtual:
-        mine = _dataset_rows(client, expectation, dataset)
+        mine, source = _dataset_rows(client, expectation, dataset), _QUERY_DATASET
     else:
-        mine = _own_rows(sql, expectation, chart_id=chart_id, adapter=adapter, snapshot=snapshot, grants=grants,
-                         timeout_s=timeout_s, guard_fanout=guard_fanout)
+        mine, source = _own_rows(sql, expectation, chart_id=chart_id, adapter=adapter, snapshot=snapshot, grants=grants,
+                                 timeout_s=timeout_s, guard_fanout=guard_fanout), _OWN_SQL
     if isinstance(mine, NotCheckable):
         return not_checked(mine.reason)
-    found = _compare(chart_id, chart, mine, _row_limit(form))
-    if found.status is ChartStatus.MISMATCH and expectation.time_grain and not dataset.is_virtual:
+    found = _compare(chart_id, chart, mine, _row_limit(form), source=source)
+    if found.status is ChartStatus.MISMATCH and expectation.time_grain and source is _OWN_SQL:
         plain = _own_rows(_statement(expectation, dataset, grained=False), expectation, chart_id=chart_id,
                           adapter=adapter, snapshot=snapshot, grants=grants, timeout_s=timeout_s,
                           guard_fanout=guard_fanout)
-        # Agreeing without the grain (all of it, or all mnemiq could line up before a row limit or its row cap): the
-        # chart's rows are the ungrouped ones.
-        if not isinstance(plain, NotCheckable) and _compare(chart_id, chart, plain, _row_limit(form)).status in (
-                ChartStatus.CHECKED, ChartStatus.NOT_CHECKED):
+        # Only on positive evidence: every one of the chart's rows found among mnemiq's ungrouped ones, with equal
+        # values. An ungrouped read at its row cap, or an empty chart, proves nothing, and the grouped finding stands.
+        if not isinstance(plain, NotCheckable) and _all_found(chart, plain):
             return not_checked("Superset's data tool returned this chart's rows without its time grain, as it does for "
                                "a chart with no saved query context, so the numbers the chart shows by its time grain "
                                "were not compared")

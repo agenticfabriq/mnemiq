@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import logging
 import re
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -279,6 +280,7 @@ POST_PROCESSING = [
                          "adhoc_filters": [], "row_limit": 100}, "percentage"),
     ("stack Expand", _bar(viz_type="echarts_area", stack="Expand"), "100%"),
     ("forecast", _bar(forecastEnabled=True, forecastPeriods=10), "forecast"),
+    ("rebase_percent_change", _bar(viz_type="echarts_timeseries_line", rebase_percent_change=True), "percent change"),
     ("big number with trendline", {"viz_type": "big_number", "metric": copy.deepcopy(PREMIUM),
                                    "granularity_sqla": "order_date", "time_grain_sqla": "P1M",
                                    "show_trend_line": True, "adhoc_filters": []}, "trendline"),
@@ -629,3 +631,135 @@ def test_a_saved_metrics_format_without_its_record_is_not_judged(fake):
                          d3format=",d", currency=None, certified_by=None, warning_text=None)
     check = _check(fake, kinds={M_SAVED: MeasureKind.CURRENCY}, saved={M_SAVED: record})
     assert check.status is ChartStatus.FORMAT_WRONG
+
+
+# --- what rc2's renderer shows that its data tool does not ------------------------------------------------------------
+
+
+def _mixed(**changes) -> dict:
+    orders = {"expressionType": "SQL", "sqlExpression": "COUNT(*)", "label": "Orders"}
+    return _line(viz_type="mixed_timeseries", metrics_b=[orders], groupby_b=[], y_axis_format_secondary=",d") | changes
+
+
+@pytest.mark.parametrize("changes, checkable", [
+    ({"adhoc_filters_b": []}, False),
+    ({"adhoc_filters_b": [copy.deepcopy(WEB_ONLY)]}, True),
+    ({"adhoc_filters_b": [], "adhoc_filters": [copy.deepcopy(NO_TIME_FILTER)]}, True),
+    ({"adhoc_filters_b": [WEB_ONLY | {"comparator": ["store"]}]}, False),
+    ({"row_limit_b": 10}, False),
+    ({"row_limit_b": 100}, True),
+    ({"groupby": ["region"], "groupby_b": ["region"], "limit_b": 5}, False),
+], ids=["B's filters emptied", "B's filters the primary's", "both effectively none", "B filtered otherwise",
+        "B limited otherwise", "B limited alike", "B's series limited"])
+def test_mixed_chart_reads_its_second_series_as_the_renderer_does(changes, checkable):
+    """rc2's renderer takes each `_b` key the form holds in place of the primary's (`retainFormDataSuffix` in
+    `plugin-chart-echarts/src/utils/formDataSuffix.ts`), an empty `adhoc_filters_b` included, while its data tool
+    reads an empty one as absent and filters the second series with the primary's filters. Only a second series the
+    renderer shows as Superset's rows hold it is checked."""
+    found = expectation_from_form_data(_mixed(**changes), dataset=PHYSICAL)
+    assert isinstance(found, Expectation) is checkable, found
+    if not checkable:
+        assert "second series" in found.reason
+
+
+@pytest.mark.parametrize("changes, checkable, said", [
+    ({"showValuesAs": "percent_row"}, False, "share"),
+    ({"showValuesAs": "percent_total"}, False, "share"),
+    ({"showValuesAs": "actual"}, True, ""),
+    ({}, True, ""),
+    ({"rowTotals": True}, False, "totals"),
+    ({"colSubTotals": True}, False, "totals"),
+    ({"rowTotals": True, "colTotals": True, "metrics": [{"expressionType": "SIMPLE", "aggregate": "SUM",
+                                                         "column": {"column_name": "premium"}, "label": "P"}]},
+     True, ""),
+    ({"aggregateFunction": "Count"}, True, ""),
+], ids=["% of row", "% of grand total", "actual values", "no setting", "SQL metric with totals",
+        "SQL metric with subtotals", "additive metrics with totals", "an aggregateFunction rc2 never reads"])
+def test_pivot_reads_its_values_and_totals_as_the_plugin_does(changes, checkable, said):
+    """rc2's pivot shows a cell as a share of a total when `showValuesAs` asks (`plugin-chart-pivot-table`'s control
+    panel), with no post-processing, and with a metric that is not additive asks for its totals in the same query as
+    grouping sets (`buildQuery.ts`, `allMetricsAdditive`), whose total rows carry null keys. It never reads
+    `aggregateFunction`."""
+    pivot = {"viz_type": "pivot_table_v2", "metrics": [copy.deepcopy(PREMIUM)], "groupbyRows": ["region"],
+             "groupbyColumns": ["channel"], "adhoc_filters": [], "row_limit": 100} | changes
+    found = expectation_from_form_data(pivot, dataset=PHYSICAL)
+    assert isinstance(found, Expectation) is checkable, found
+    if not checkable:
+        assert said in found.reason
+
+
+@pytest.mark.parametrize("viz", ["pie", "funnel", "gauge_chart", "treemap_v2"])
+def test_a_leftover_x_axis_among_the_grouping_is_grouped_by_the_grain(viz):
+    """rc2's `buildQueryContext` runs `normalizeTimeColumn` for every chart, so a grouping column that is also the
+    form's `x_axis` is shown by the time grain, which the data tool's rebuild never applies."""
+    form = {"viz_type": viz, "metric": copy.deepcopy(PREMIUM), "groupby": ["order_date"], "x_axis": "order_date",
+            "adhoc_filters": [], "row_limit": 100}
+    found = expectation_from_form_data(form | {"time_grain_sqla": "P1M"}, dataset=PHYSICAL)
+    assert isinstance(found, NotCheckable) and "time grain" in found.reason
+    assert isinstance(expectation_from_form_data(form, dataset=PHYSICAL), Expectation)
+
+
+def _days(count: int) -> tuple:
+    start = datetime(2023, 1, 1)
+    return tuple(((start + timedelta(days=i)).isoformat(), 1) for i in range(count))
+
+
+@pytest.mark.parametrize("chart", [
+    NO_DATA,
+    _chart_data(["order_date", "Total premium"], ("2026-01-01T00:00:00", 31), ("2026-02-01T00:00:00", 12)),
+], ids=["an empty chart", "a chart whose months are off"])
+def test_the_grain_is_blamed_only_on_positive_evidence(fake, chart):
+    """The ungrouped statement at its row cap proves nothing about the chart's rows: the chart is reported as the
+    grouped comparison found it, never as "the grain was not applied"."""
+    _serve(fake, form_data=_line(), chart=chart,
+           mnemiq=lambda sql: _result(*(MONTHS if "DATE_TRUNC" in sql.upper() else _days(1000)), columns=TIME))
+    check = _check(fake)
+    assert check.status is ChartStatus.MISMATCH, check.reason
+    assert "time grain" not in check.reason
+
+
+def test_the_reason_names_what_the_chart_was_compared_with(fake):
+    """A virtual dataset's saved metric is compared with Superset's own query of the dataset, not with mnemiq's SQL,
+    and the reason says which."""
+    rows = (("east", 1200),)
+    _serve(fake, form_data=_bar(), chart=_chart_data(["region", "Total premium"], *rows), mnemiq=_result(*rows))
+    assert "mnemiq's own SQL" in _check(fake).reason
+    fake.calls.clear()
+    _serve(fake, form_data=_bar(metrics=[M_SAVED]), chart=_chart_data(["region", M_SAVED], *rows),
+           dataset=_dataset(virtual=True, metrics=[(M_SAVED, "SUM(premium)")]),
+           query={"dataset_id": DATASET_ID, "dataset_name": "policy", "columns": [{"name": "region"},
+                                                                                 {"name": M_SAVED}],
+                  "data": [{"region": "east", M_SAVED: 1200}], "row_count": 1, "total_rows": 1})
+    check = _check(fake, kinds={})
+    assert check.status is ChartStatus.CHECKED
+    assert "query_dataset" in check.reason and "mnemiq's own SQL" not in check.reason
+
+
+def test_only_a_postgres_adapter_checks_with_its_own_sql(fake):
+    """mnemiq's statement, its grain expression above all, is written for Postgres, Superset mode's one dialect."""
+    _serve(fake, form_data=_bar(), chart=_chart_data(["region", "Total premium"], ("east", 1)),
+           mnemiq=_result(("east", 1)))
+    adapter = SupersetSqlAdapter(SupersetMcp(fake.url, DelegatedToken(TOKEN)), database_id=DATABASE_ID,
+                                 schema=SCHEMA, dialect="duckdb")
+    check = check_chart(adapter.client, adapter, chart_id=CHART_ID, dataset_id=DATASET_ID, kinds={}, saved={},
+                        snapshot=SNAPSHOT, grants=GRANTS, guard_fanout=False)
+    assert check.status is ChartStatus.NOT_CHECKED and "Postgres" in check.reason
+    assert "execute_sql" not in _tools(fake)
+
+
+def test_mnemiqs_own_rows_that_repeat_a_group_are_not_checked(fake):
+    """Two of mnemiq's groups that read as one after their timestamps are made comparable are never collapsed."""
+    _serve(fake, form_data=_bar(), chart=_chart_data(["region", "Total premium"], ("2026-01-01", 5)),
+           mnemiq=_result(("2026-01-01 00:00:00", 7), ("2026-01-01", 5)))
+    check = _check(fake, kinds={})
+    assert check.status is ChartStatus.NOT_CHECKED and "repeat" in check.reason
+
+
+def test_the_cap_named_is_the_one_applied(fake, monkeypatch):
+    """The reason quotes the row cap the decider put on mnemiq's statement."""
+    monkeypatch.setattr(chart_check, "MAX_ROWS", 7)
+    _serve(fake, form_data=_line(time_grain_sqla=None), chart=_chart_data(["order_date", "Total premium"],
+                                                                          ("2023-01-01T00:00:00", 1)),
+           mnemiq=_result(*_days(1000), columns=TIME))
+    check = _check(fake)
+    assert check.status is ChartStatus.NOT_CHECKED and "1,000" in check.reason and "(7)" not in check.reason
