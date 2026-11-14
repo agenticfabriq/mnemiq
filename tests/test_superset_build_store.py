@@ -19,10 +19,11 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,6 +33,7 @@ from psycopg import sql
 from psycopg.conninfo import make_conninfo
 from psycopg.types.json import Jsonb
 
+import mnemiq.superset.build_store as build_store
 from mnemiq.superset.build_store import (
     BUILD_TABLE,
     MEASURE_TABLE,
@@ -79,8 +81,16 @@ MEASURE = Measure(name="premium", label="Premium", expression="SUM(premium)", ki
 CLAIMS = Measure(name="claims", label="Claims", expression="COUNT(*)", kind=MeasureKind.COUNT, dataset_id=42,
                  description="Claims filed", asked_by=BO)
 
-# What a value is kept under. The guard flags a column or a jsonb key at any depth of any of these names.
-VALUE_SHAPED = frozenset({"value", "values", "rows", "data", "result"})
+# What a value, a row or a sample is kept under. The guard flags a column or a jsonb key at any depth whose name, folded
+# (`_fold`), is one of these. It keeps its own list rather than reading the store's: a guard that shared the store's list
+# could not catch that list being short.
+VALUE_SHAPED = frozenset({"value", "values", "row", "rows", "data", "result", "results", "sample", "samples"})
+
+
+def _fold(name: str) -> str:
+    """A name as the guard compares it: NFKC (a fullwidth or compatibility spelling is the plain one), stripped of
+    surrounding space, casefolded."""
+    return unicodedata.normalize("NFKC", name).strip().casefold()
 
 # The store's tables and their columns, each in its order.
 STORE_COLUMNS = {
@@ -256,9 +266,18 @@ def test_a_build_needs_a_tenant_a_principal_and_a_goal(tenant, principal, goal):
     {"result": {"chart": 1}},
     {"Data": []},
     {"charts": [{"values": []}]},
+    {"row": {"region": "West"}},
+    {"measures": [{"results": []}]},
+    {"sample": "West"},
+    {"Samples": ["West", "East"]},
+    {"ｖａｌｕｅ": 1},
+    {"charts": [{"value ": 1}]},
+    {" DATA\t": []},
 ])
 def test_a_plan_holding_a_value_shaped_key_is_refused(plan):
-    """At any depth, in any letter case: the store keeps no value, so a plan that names one is not kept."""
+    """At any depth, in any letter case, in a fullwidth spelling or with space around it: a key that reads, folded, as
+    one a value, a row or a sample is kept under is refused. A backstop: the guarantee is that the planner is given no
+    value. `test_the_json_the_store_writes_is_jsonb_postgres_reads` keeps a `row_limit`, which only contains a word."""
     with pytest.raises(ValueError):
         _offline_store().create_build(TENANT, ANA, GOAL, plan, STEPS)
 
@@ -408,14 +427,14 @@ def _keys(doc, path: str = "") -> Iterator[tuple[str, str]]:
 
 def value_shaped_names(con: psycopg.Connection) -> tuple[list[str], dict[str, list[str]], int]:
     """The guard: every column of the store's tables, and every key at any depth of every row of their jsonb columns,
-    whose name is one a value is kept under. The tables and columns are read from Postgres's own
+    whose name, folded, is one a value, a row or a sample is kept under. The tables and columns are read from Postgres's own
     `information_schema.columns`, in the connection's current schema, every table named as the store's are; so is
     which columns are jsonb. Returns what it flagged, the columns it read by table, and how many jsonb keys it read."""
     columns = con.execute(
         "SELECT table_name, column_name, data_type FROM information_schema.columns "
         "WHERE table_schema = current_schema() AND table_name LIKE %s ORDER BY table_name, ordinal_position",
         (r"mnemiq\_superset\_%",)).fetchall()
-    flagged = [f"{table}.{column}" for table, column, _ in columns if column.casefold() in VALUE_SHAPED]
+    flagged = [f"{table}.{column}" for table, column, _ in columns if _fold(column) in VALUE_SHAPED]
     read: dict[str, list[str]] = {}
     keys = 0
     for table, column, data_type in columns:
@@ -425,7 +444,7 @@ def value_shaped_names(con: psycopg.Connection) -> tuple[list[str], dict[str, li
         for (doc,) in con.execute(sql.SQL("SELECT {} FROM {}").format(sql.Identifier(column), sql.Identifier(table))):
             for path, key in _keys(doc):
                 keys += 1
-                if key.casefold() in VALUE_SHAPED:
+                if _fold(key) in VALUE_SHAPED:
                     flagged.append(f"{table}.{column}{path}")
     return flagged, read, keys
 
@@ -465,11 +484,20 @@ def test_store_holds_no_value(store, store_dsn):
     (sql.SQL("UPDATE {} SET check_status = check_status || '{{\"43\": {{\"result\": 1}}}}'").format(
         sql.Identifier(MEASURE_TABLE)),
      f"{MEASURE_TABLE}.check_status.43.result"),
-], ids=["a column", "a key deep in a plan", "a key in a check status"])
+    (sql.SQL('ALTER TABLE {} ADD COLUMN "Samples" text').format(sql.Identifier(MEASURE_TABLE)),
+     f"{MEASURE_TABLE}.Samples"),
+    (sql.SQL("UPDATE {} SET plan = plan || '{{\"ｖａｌｕｅ\": 1}}'").format(sql.Identifier(BUILD_TABLE)),
+     f"{BUILD_TABLE}.plan.ｖａｌｕｅ"),
+    (sql.SQL("UPDATE {} SET steps = jsonb_set(steps, ARRAY['0', 'intent', 'value '], '1')").format(
+        sql.Identifier(BUILD_TABLE)),
+     f"{BUILD_TABLE}.steps[0].intent.value "),
+], ids=["a column", "a key deep in a plan", "a key in a check status", "a mixed-case column", "a fullwidth key",
+        "a key with a trailing space"])
 def test_store_holds_no_value_catches_a_planted_value(store, store_dsn, plant, caught):
     """The guard's planted-violation twin. The store refuses a value-shaped key itself, so the defect is planted past
-    it, in a transaction that is rolled back: a `value` column, a filter's `value` deep in a stored plan, and a
-    `result` inside a check status. Each is flagged, by its place, and once rolled back the store reads clean again."""
+    it, in a transaction that is rolled back: a `value` column, a filter's `value` deep in a stored plan, a `result`
+    inside a check status, a quoted `"Samples"` column, a fullwidth `ｖａｌｕｅ` key and a `value ` key with a trailing
+    space. Each is flagged, by its place, and once rolled back the store reads clean again."""
     _run_build(store)
     with psycopg.connect(store_dsn) as con:
         con.execute(plant)
@@ -802,15 +830,36 @@ def test_intent_is_saved_before_the_call(store, store_dsn, stores):
     assert seen["loaded"].intent == intent and seen["loaded"].lease_id == claimed.lease_id
 
 
-def test_a_lease_is_read_by_postgres_clock(store, store_dsn):
-    """`started_at` and the lease are the database's time, not the worker's: they agree with `now()` there."""
+class _AnHourAhead(datetime):
+    """A Python clock an hour ahead of Postgres's. The store reads the time only from Postgres, so it never sees this;
+    a store that read the worker's clock would put `started_at` and every lease an hour late."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return datetime.now(tz) + timedelta(hours=1)
+
+    @classmethod
+    def utcnow(cls):
+        return datetime.now(tz=None) + timedelta(hours=1)
+
+
+def test_a_lease_is_read_by_postgres_clock(store, store_dsn, monkeypatch):
+    """`started_at` and the lease are the database's time, not the worker's: with the store's Python clock an hour
+    ahead, they still agree with `now()` in Postgres, at the claim and at a renewal."""
+    monkeypatch.setattr(build_store, "datetime", _AnHourAhead)
     build = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS)
     claimed = store.claim_next_step(TENANT, build.build_id, ANA, _intent("dashboard", "dashboard"), lease_s=600)
     with psycopg.connect(store_dsn, autocommit=True) as con:
-        [(started_s, lease_s)] = con.execute(
-            "SELECT extract(epoch FROM now() - %s::timestamptz), extract(epoch FROM %s::timestamptz - %s::timestamptz)",
-            (claimed.started_at, claimed.lease_until, claimed.started_at)).fetchall()
-    assert 0 <= started_s < 60 and lease_s == 600
+        def seconds(sql_text: str, *args) -> float:
+            [(value,)] = con.execute(sql_text, args).fetchall()
+            return float(value)
+
+        assert 0 <= seconds("SELECT extract(epoch FROM now() - %s::timestamptz)", claimed.started_at) < 60
+        assert seconds("SELECT extract(epoch FROM %s::timestamptz - %s::timestamptz)", claimed.lease_until,
+                       claimed.started_at) == 600
+        assert store.renew_lease(TENANT, build.build_id, "dashboard", claimed.lease_id, lease_s=300)
+        renewed = _raw_step(store_dsn, build.build_id, "dashboard")["lease_until"]
+        assert 240 < seconds("SELECT extract(epoch FROM %s::timestamptz - now())", renewed) <= 300
 
 
 def test_a_store_reconnects_after_its_connection_drops(store_dsn):
@@ -859,3 +908,79 @@ def test_a_store_is_safe_to_share_between_threads(store):
     assert errors == []
     assert [store.load_build(TENANT, build.build_id, ANA).step("premium_by_region").status for build in builds] == [
         "done"] * 4
+
+
+def test_a_lease_that_has_passed_is_not_renewed(store, store_dsn):
+    """Nobody has taken the step again, but its lease has passed: the worker's renewal fails and leaves the lease as it
+    was, so the worker starts no further call and the step waits to be reconciled. The control is
+    `test_a_renewed_lease_runs_from_the_renewal`, where the same renewal inside the lease succeeds."""
+    build = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS)
+    claimed = store.claim_next_step(TENANT, build.build_id, ANA, _intent("dashboard", "dashboard"), lease_s=1)
+    time.sleep(1.2)
+    before = _raw_step(store_dsn, build.build_id, "dashboard")
+    assert before["lease_id"] == claimed.lease_id  # still this worker's claim: nobody took the step
+    assert store.renew_lease(TENANT, build.build_id, "dashboard", claimed.lease_id) is False
+    after = _raw_step(store_dsn, build.build_id, "dashboard")
+    assert after == before and after["lease_until"] == claimed.lease_until
+    assert store.load_build(TENANT, build.build_id, ANA).step("dashboard").status == "uncertain"
+
+
+def test_a_worker_past_its_lease_still_finishes_when_nobody_took_the_step(store):
+    """A call that began inside the lease and returned after it: while no claim has taken the step, the worker records
+    what it made, and the step needs no reconciling."""
+    build = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS)
+    claimed = store.claim_next_step(TENANT, build.build_id, ANA, _intent("dashboard", "dashboard"), lease_s=1)
+    time.sleep(1.2)
+    assert store.load_build(TENANT, build.build_id, ANA).step("dashboard").status == "uncertain"
+    finished = store.finish_step(TENANT, build.build_id, "dashboard", "done", 41, lease_id=claimed.lease_id)
+    step = finished.step("dashboard")
+    assert (step.status, step.object_id, step.lease_id, finished.dashboard_id) == ("done", 41, None, 41)
+
+
+def test_finish_after_another_worker_took_the_step_is_lease_lost(store, store_dsn):
+    """Once another claim has taken the step to reconcile it, the first worker's finish raises `LeaseLost` and writes
+    nothing: the step stays the second claim's, which finishes it."""
+    build = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS)
+    first = store.claim_next_step(TENANT, build.build_id, ANA, _intent("dashboard", "dashboard"), lease_s=1)
+    time.sleep(1.2)
+    second = store.claim_next_step(TENANT, build.build_id, ANA, _intent("dashboard", "dashboard"))
+    assert isinstance(second, StepState) and second.status == "uncertain"
+    before = _raw_build(store_dsn, build.build_id)
+    with pytest.raises(LeaseLost):
+        store.finish_step(TENANT, build.build_id, "dashboard", "done", 41, lease_id=first.lease_id)
+    assert _raw_build(store_dsn, build.build_id) == before
+    assert store.finish_step(TENANT, build.build_id, "dashboard", "done", 41, lease_id=second.lease_id).step(
+        "dashboard").status == "done"
+
+
+@pytest.mark.parametrize(("lock_ms", "statement_ms", "raised"), [
+    (500, 30_000, psycopg.errors.LockNotAvailable),
+    (30_000, 1_000, psycopg.errors.QueryCanceled),
+], ids=["the lock timeout", "the statement timeout"])
+def test_a_held_row_makes_a_claim_fail_promptly_not_hang(store_dsn, monkeypatch, lock_ms, statement_ms, raised):
+    """A store's session waits a bounded time for a lock and for a statement, so one blocked statement cannot stall
+    every build behind the store's one connection. With another connection holding the build's row, the claim raises
+    within its timeout instead of waiting for the row, writes nothing, and once the row is let go the next claim takes
+    the step. Each timeout is shown alone, the other set long."""
+    monkeypatch.setattr(build_store, "LOCK_TIMEOUT_MS", lock_ms)
+    monkeypatch.setattr(build_store, "STATEMENT_TIMEOUT_MS", statement_ms)
+    with BuildStore(store_dsn) as store:
+        build = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS)
+        with psycopg.connect(store_dsn) as holder, ThreadPoolExecutor(max_workers=1) as pool:
+            holder.execute(sql.SQL("SELECT 1 FROM {} WHERE build_id = %s FOR UPDATE").format(
+                sql.Identifier(BUILD_TABLE)), (build.build_id,))
+            started = time.monotonic()
+            claiming = pool.submit(store.claim_next_step, TENANT, build.build_id, ANA, _intent("dashboard", "dashboard"))
+            try:
+                error = claiming.exception(timeout=10)
+            except TimeoutError:
+                holder.rollback()  # let the claim through, so the test ends, then fail it
+                claiming.exception(timeout=30)
+                pytest.fail("the claim waited on the held row for 10 s instead of failing within its timeout")
+            elapsed = time.monotonic() - started
+            holder.rollback()
+        assert isinstance(error, raised), repr(error)
+        assert elapsed < 5, elapsed
+        assert _raw_step(store_dsn, build.build_id, "dashboard")["lease_id"] is None
+        assert isinstance(store.claim_next_step(TENANT, build.build_id, ANA, _intent("dashboard", "dashboard")),
+                          StepState)

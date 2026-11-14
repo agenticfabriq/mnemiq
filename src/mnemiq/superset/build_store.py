@@ -3,10 +3,15 @@ measures, in two tables of mnemiq's control Postgres (`MNEMIQ_CONTROL_DSN`), mad
 
 Nothing kept is a value. A build's row holds the goal it was asked for, its plan, and for each step its state, the
 intent it was claimed with and the id of the object it made. A measure's row holds the measure's definition, the ids of
-the charts that show it and of the datasets mnemiq made for it, and each chart's check status. No number computed from
-the data, no row and no sample has a place to go: an intent holds four named fields, a measure's row ids and statuses,
-and a plan, the one free-form document, is refused when any key at any depth is one a value is kept under
-(`VALUE_SHAPED_KEYS`). A measure's value is computed through Superset as whoever asks, each time, and kept nowhere.
+the charts that show it and of the datasets mnemiq made for it, and each chart's check status.
+
+The guarantee is upstream, not here: the planner is given no value (it sees the schema, saved metrics' names and
+expressions, and dashboards' titles), a value check's numbers ride back in its response only, and a measure's value is
+computed through Superset as whoever asks, each time, and kept nowhere. The store's own checks are a backstop. An intent
+holds four named fields and a measure's row ids and statuses, so neither has room for a number. A plan, the one
+free-form document, is refused when any key at any depth reads, folded (NFKC, stripped, casefolded), as one a value, a
+row or a sample is kept under (`VALUE_SHAPED_KEYS`); that catches a value kept under its usual names, not one kept
+under any name.
 
 A build is read only by its tenant and the principal who started it. A dashboard's measures are the dashboard's: any
 principal of the tenant reads them, and Superset checks editorship on each action that changes the dashboard.
@@ -31,6 +36,7 @@ import copy
 import hashlib
 import math
 import threading
+import unicodedata
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -48,7 +54,8 @@ from mnemiq.superset.measures import Measure, MeasureKind
 if TYPE_CHECKING:
     from mnemiq.config import Settings
 
-__all__ = ["BUILD_TABLE", "DEFAULT_LEASE_S", "MEASURE_TABLE", "STEP_KINDS", "STORE_MISSING", "VALUE_SHAPED_KEYS",
+__all__ = ["BUILD_TABLE", "DEFAULT_LEASE_S", "LOCK_TIMEOUT_MS", "MEASURE_TABLE", "STATEMENT_TIMEOUT_MS", "STEP_KINDS",
+           "STORE_MISSING", "VALUE_SHAPED_KEYS",
            "BuildNotFound", "BuildStore", "BuildStoreMissing", "DashboardMeasure", "LeaseLost", "StepBusy",
            "StepState", "StoredBuild"]
 
@@ -70,8 +77,9 @@ _FINISHED_AS = frozenset({DONE, FAILED, UNCERTAIN})
 # A build's own status, read from its steps on every write: any step failed, every step done, or neither.
 BUILDING = "building"
 
-# The names a value, a row or a result is kept under. No key of a stored plan is one of them, in any letter case.
-VALUE_SHAPED_KEYS = frozenset({"value", "values", "rows", "data", "result"})
+# The names a value, a row, a result or a sample is kept under. No key of a stored plan reads, folded (`_folded`), as
+# one of them.
+VALUE_SHAPED_KEYS = frozenset({"value", "values", "row", "rows", "data", "result", "results", "sample", "samples"})
 _INTENT_KEYS = ("key", "kind", "name", "dataset_id")
 
 DEFAULT_LEASE_S = 600  # longer than any one Superset call's deadline
@@ -82,6 +90,12 @@ _MAX_ID = 2**31 - 1
 # build while the lease holds, so a second attempt is the most that is ever needed.
 _ATTEMPTS = 3
 _CONTENDED = object()
+
+# How long one of the store's statements may wait for a lock, and run in all, before Postgres cancels it. Every server
+# thread shares the store's one connection, so without a bound one statement blocked on a held row would stall every
+# build behind it. Each statement here is a single-row read or write that takes milliseconds.
+LOCK_TIMEOUT_MS = 10_000
+STATEMENT_TIMEOUT_MS = 30_000
 
 STORE_MISSING = ("Building a dashboard needs mnemiq's control Postgres, where each build keeps its plan and its steps; "
                  "set MNEMIQ_CONTROL_DSN.")
@@ -202,7 +216,8 @@ class BuildStore:
     """The builds and measure lists in the control Postgres at `dsn`.
 
     One connection, made on the first call and again after it breaks, never when the store is made; each call holds it
-    alone, so one store is shared safely across a server's threads. Every argument is checked before anything is sent,
+    alone, so one store is shared safely across a server's threads. Its session waits at most `LOCK_TIMEOUT_MS` for a
+    lock and `STATEMENT_TIMEOUT_MS` for a statement, then raises. Every argument is checked before anything is sent,
     and nothing fails soft: a store that cannot answer raises, since a build step that is not recorded must not run."""
 
     def __init__(self, dsn: str | None) -> None:
@@ -411,6 +426,7 @@ class BuildStore:
                 self._discard()
                 con = psycopg.connect(self._dsn, autocommit=True)
                 try:
+                    _bound_waits(con)
                     _make_tables(con)
                 except BaseException:
                     con.close()
@@ -428,6 +444,12 @@ class BuildStore:
                 self._con.close()
             finally:
                 self._con = None
+
+
+def _bound_waits(con: psycopg.Connection) -> None:
+    """Bound how long the session's statements wait for a lock and run, read when the store connects."""
+    con.execute("SELECT set_config('lock_timeout', %s, false), set_config('statement_timeout', %s, false)",
+                (f"{LOCK_TIMEOUT_MS}ms", f"{STATEMENT_TIMEOUT_MS}ms"))
 
 
 def _make_tables(con: psycopg.Connection) -> None:
@@ -639,7 +661,7 @@ def _plain_json(doc: object, path: str) -> Any:
         for key, item in doc.items():
             if not isinstance(key, str):
                 raise ValueError(f"{path} has a key that is not a string")
-            if key.casefold() in VALUE_SHAPED_KEYS:
+            if _folded(key) in VALUE_SHAPED_KEYS:
                 raise ValueError(f"{path} holds a key named {key!r}: a build keeps no value, row or result")
             copied[key] = _plain_json(item, f"{path}.{key}")
         return copied
@@ -650,6 +672,12 @@ def _plain_json(doc: object, path: str) -> Any:
     if doc is None or isinstance(doc, (str, int, float)):
         return doc
     raise ValueError(f"{path} holds a {type(doc).__name__}, which is not JSON")
+
+
+def _folded(key: str) -> str:
+    """A key as the plan check compares it: NFKC (a fullwidth or other compatibility spelling is the plain one), with
+    surrounding space stripped, casefolded."""
+    return unicodedata.normalize("NFKC", key).strip().casefold()
 
 
 def _definition(measure: object) -> dict:
