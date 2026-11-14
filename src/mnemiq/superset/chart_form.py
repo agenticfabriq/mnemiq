@@ -3,8 +3,9 @@ mnemiq's own SQL can compute too, or why mnemiq cannot compute the same (`NotChe
 
 Read as Superset 7.0.0rc2 reads it: the grouping columns in the order the chart's query selects them, the metrics its
 renderer shows, the SIMPLE filters, and the time grain of an x-axis. A chart whose shown numbers are computed after its
-query, or summed by its renderer from the query's rows, or filtered in a way mnemiq does not translate, is not
-checkable, and the reason says which. `chart_check.py` reads Superset, runs mnemiq's statement and compares.
+query, or summed by its renderer from the rows of a measure that is not a sum or a count, or filtered in a way mnemiq
+does not translate, is not checkable, and the reason says which. `chart_check.py` reads Superset, runs mnemiq's
+statement and compares.
 """
 
 from __future__ import annotations
@@ -12,7 +13,9 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import sqlglot
 from sqlglot import exp
+from sqlglot.errors import SqlglotError
 
 from mnemiq.superset.charts import Filter
 from mnemiq.superset.display_format import metric_label
@@ -76,10 +79,12 @@ _PIVOT_SHOWS_VALUE = frozenset({None, "", "actual"})
 # shown in the same query as grouping sets, whose total rows carry null grouping values.
 _PIVOT_TOTALS = ("rowTotals", "colTotals", "rowSubTotals", "colSubTotals")
 # What `allMetricsAdditive` (`plugin-chart-pivot-table/src/plugin/utilities.ts`) counts as additive: a SIMPLE metric
-# with one of these aggregates. A saved or SQL metric never is.
+# with one of these aggregates, whose totals the plugin reduces from the cells by `additiveReducerFor` (a sum, the
+# minimum, the maximum). It counts a saved or SQL metric as never additive.
 _ADDITIVE = frozenset({"SUM", "COUNT", "MIN", "MAX"})
 # Of those, the aggregates whose sum over some groups is the same aggregate over them all: a sum of sums, a sum of
-# counts. A sum of minimums is not a minimum. A saved or SQL metric is read as `isAdditiveMetric` reads it: never.
+# counts. A sum of minimums is not a minimum. A saved metric never is; an SQL metric is when its whole expression is one
+# of these (`_one_sum_or_count`).
 _SUMMABLE = frozenset({"SUM", "COUNT"})
 
 # Postgres's grain expressions (`_time_grain_expressions` in `superset/db_engine_specs/postgres.py`), the ones that are
@@ -236,8 +241,35 @@ def _set(form: dict, *keys: str) -> bool:
     return any(form.get(key) not in (None, False, 0, "") for key in keys)
 
 
+def _one_sum_or_count(expression) -> bool:
+    """Whether an SQL metric's whole expression, parsed as Postgres, is one SUM, or one COUNT of a column or of every
+    row, and nothing more: no DISTINCT, no FILTER or OVER, nothing around the aggregate, no aggregate, window or query
+    within the sum. mnemiq writes every measure as an SQL metric, so this is how a measure's totals are known to be the
+    sums of its groups. SQL that does not parse, or is not one expression, is not."""
+    if not isinstance(expression, str) or not expression.strip():
+        return False
+    try:
+        node = sqlglot.parse_one(expression, read="postgres")
+    except (SqlglotError, ValueError):
+        return False
+    if isinstance(node, exp.Sum):
+        inner = node.this
+        return (isinstance(inner, exp.Expression) and not isinstance(inner, exp.Distinct)
+                and inner.find(exp.AggFunc, exp.Window, exp.Subquery, exp.Select) is None)
+    if isinstance(node, exp.Count):
+        return isinstance(node.this, (exp.Star, exp.Column)) and not node.expressions
+    return False
+
+
 def _summable(item) -> bool:
-    return isinstance(item, dict) and item.get("expressionType") == "SIMPLE" and item.get("aggregate") in _SUMMABLE
+    """Whether a sum of the metric's values over some groups is the metric over them all: a SIMPLE SUM or COUNT, or an
+    SQL metric that is one SUM or one COUNT whole (`_one_sum_or_count`). A saved metric is not read here, so it never
+    is."""
+    if not isinstance(item, dict):
+        return False
+    if item.get("expressionType") == "SIMPLE":
+        return item.get("aggregate") in _SUMMABLE
+    return item.get("expressionType") == "SQL" and _one_sum_or_count(item.get("sqlExpression"))
 
 
 def _renderer_sum(viz_type: str, form: dict, dimensions: list[str]) -> str | None:
@@ -308,11 +340,13 @@ def _pivot(form: dict) -> NotCheckable | None:
     """Why a pivot table shows its cells otherwise than Superset's rows hold them, or None."""
     if form.get("showValuesAs") not in _PIVOT_SHOWS_VALUE:
         return NotCheckable("the pivot table shows each cell as its share of a total")
-    additive = [isinstance(m, dict) and m.get("expressionType") == "SIMPLE" and m.get("aggregate") in _ADDITIVE
-                for m in form.get("metrics") or []]
+    # The totals shown are the cells' own only for a metric whose total the cells give: one the plugin reduces from them
+    # itself, or an SQL SUM or COUNT, whose totals from grouping sets are the sums of its cells.
+    additive = [(isinstance(m, dict) and m.get("expressionType") == "SIMPLE" and m.get("aggregate") in _ADDITIVE)
+                or _summable(m) for m in form.get("metrics") or []]
     if not (additive and all(additive)) and any(form.get(key) for key in _PIVOT_TOTALS):
-        return NotCheckable("the pivot table asks for its totals in the same query as its cells (grouping sets), whose "
-                            "total rows mnemiq does not reproduce")
+        return NotCheckable("the pivot table shows totals of a metric that is not a sum or a count, which Superset "
+                            "computes in the same query as its cells (grouping sets) and mnemiq does not reproduce")
     if (form.get("currency_format") or {}).get("symbol") == "AUTO":
         return NotCheckable("the pivot table's AUTO currency adds the dataset's currency column to its grouping")
     return None
