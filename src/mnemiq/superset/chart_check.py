@@ -141,6 +141,9 @@ _PIVOT_TOTALS = ("rowTotals", "colTotals", "rowSubTotals", "colSubTotals")
 # What `allMetricsAdditive` (`plugin-chart-pivot-table/src/plugin/utilities.ts`) counts as additive: a SIMPLE metric
 # with one of these aggregates. A saved or SQL metric never is.
 _ADDITIVE = frozenset({"SUM", "COUNT", "MIN", "MAX"})
+# Of those, the aggregates whose sum over some groups is the same aggregate over them all: a sum of sums, a sum of
+# counts. A sum of minimums is not a minimum. A saved or SQL metric is read as `isAdditiveMetric` reads it: never.
+_SUMMABLE = frozenset({"SUM", "COUNT"})
 
 # Postgres's grain expressions (`_time_grain_expressions` in `superset/db_engine_specs/postgres.py`), the ones that are
 # one `DATE_TRUNC`.
@@ -223,6 +226,15 @@ def _column_list(value) -> list[str] | NotCheckable:
     return items
 
 
+def _table_of_rows(form: dict) -> bool:
+    """Whether a table shows rows, not groups, as `getQueryMode` (`plugin-chart-table/src/buildQuery.ts`) reads it: the
+    mode saved, else rows when it has columns of rows chosen."""
+    mode = form.get("query_mode")
+    if mode in ("aggregate", "raw"):
+        return mode == "raw"
+    return bool(form.get("all_columns"))
+
+
 def _dimensions(viz_type: str, form: dict) -> list[str] | NotCheckable:
     """The chart's grouping columns, in the order its query selects them."""
     if viz_type in _X_AXIS:
@@ -231,7 +243,7 @@ def _dimensions(viz_type: str, form: dict) -> list[str] | NotCheckable:
             return NotCheckable("the chart has no x-axis column")
         found = _column_list([x_axis, *_as_list(form.get("groupby"))])
     elif viz_type in _GROUPED_ONE_METRIC or viz_type == "table":
-        if viz_type == "table" and form.get("query_mode") == "raw":
+        if viz_type == "table" and _table_of_rows(form):
             return NotCheckable("a table of rows has no measure: its numbers are the rows themselves")
         found = _column_list(form.get("groupby"))
     elif viz_type == "pivot_table_v2":
@@ -276,6 +288,39 @@ def _after_the_query(viz_type: str, form: dict) -> str | None:
     if form.get("rebase_percent_change") or form.get("rebasePercentChange"):
         return "each series as its percent change from its first point"
     return None
+
+
+def _set(form: dict, *keys: str) -> bool:
+    """Whether a renderer reads any of `keys` as set, as JavaScript reads a value as true: not absent, null, false, 0 or
+    the empty string. A saved chart holds the control's own name; the renderer reads it camel-cased."""
+    return any(form.get(key) not in (None, False, 0, "") for key in keys)
+
+
+def _summable(item) -> bool:
+    return isinstance(item, dict) and item.get("expressionType") == "SIMPLE" and item.get("aggregate") in _SUMMABLE
+
+
+def _renderer_sum(viz_type: str, form: dict, dimensions: list[str]) -> str | None:
+    """A number the chart shows that its renderer sums from the query's rows, which neither side's rows hold, or None.
+    Each is a sum of numbers the check does compare, so it is the measure's own only for a SUM or a COUNT; a pie's
+    Other slice also hides the slices it folds in."""
+    if viz_type == "pie" and _set(form, "threshold_for_other", "thresholdForOther"):
+        # `Pie/transformProps.ts`: `if (thresholdForOther)` folds the slices under it into one, `otherSum`.
+        return ("the pie folds its smallest slices into an Other slice its renderer sums, which mnemiq does not "
+                "reproduce")
+    if viz_type == "pie" and _set(form, "show_total", "showTotal"):
+        # `Pie/transformProps.ts`: `totalValue`, shown as `t('Total: %s', ...)` when `showTotal`.
+        shown = "the pie's total"
+    elif viz_type == "treemap_v2" and len(dimensions) > 1:
+        # `treeBuilder` (`plugin-chart-echarts/src/utils/treeBuilder.ts`) sets each parent's value to the sum of its
+        # children's, which `Treemap/transformProps.ts` labels and shows in `formatTooltip`.
+        shown = "each of the treemap's parents"
+    else:
+        return None
+    if all(_summable(item) for item in _metric_items(viz_type, form)):
+        return None
+    return (f"the chart shows {shown} as a sum its renderer computes from the groups, which is that measure's own "
+            "number only for a SUM or a COUNT")
 
 
 def _neutral_range(value) -> str | None:
@@ -381,6 +426,14 @@ def expectation_from_form_data(form_data: dict, *, dataset: DatasetFacts) -> Exp
     if (after := _after_the_query(viz_type, form)) is not None:
         return NotCheckable(f"the chart shows numbers computed after its query ({after}), which mnemiq does not "
                             "reproduce")
+    if (summed := _renderer_sum(viz_type, form, dimensions)) is not None:
+        return NotCheckable(summed)
+    if viz_type == "table" and _set(form, "show_totals"):
+        # `plugin-chart-table/src/buildQuery.ts` adds, for `formData.show_totals` in aggregate mode, a query of its own
+        # over no grouping (`getTotalsMetrics`, `toTotalsAggregate`), which the data tool's rebuild leaves out and
+        # whose one row `_line_up` passes over in a saved query context's answer.
+        return NotCheckable("the table shows a totals row Superset computes in a query of its own, which mnemiq does "
+                            "not reproduce")
     if viz_type in _X_AXIS and len(dimensions) > 1 and (form.get("series_limit") or form.get("limit")):
         return NotCheckable("the chart keeps only its top series (a series limit), which Superset's data tool does not "
                             "apply")

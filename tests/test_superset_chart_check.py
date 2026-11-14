@@ -623,8 +623,11 @@ def test_expectation_reads_saved_and_simple_metrics():
     (_bar(time_range="Last year"), "time range"),
     (_bar(viz_type="world_map"), "world_map"),
     ({"viz_type": "table", "query_mode": "raw", "all_columns": ["region"], "adhoc_filters": []}, "rows"),
+    # `getQueryMode` (`plugin-chart-table/src/buildQuery.ts`): no mode saved, and columns of rows chosen, is raw
+    ({"viz_type": "table", "all_columns": ["region"], "metrics": [copy.deepcopy(PREMIUM)], "adhoc_filters": []},
+     "rows"),
 ], ids=["unknown saved metric", "custom x-axis", "custom grouping", "relative time filter", "time range",
-        "a type mnemiq does not check", "raw table"])
+        "a type mnemiq does not check", "raw table", "a table of rows by its saved columns"])
 def test_expectation_names_what_it_cannot_translate(form, said):
     found = expectation_from_form_data(form, dataset=PHYSICAL)
     assert isinstance(found, NotCheckable) and said in found.reason
@@ -773,3 +776,92 @@ def test_the_cap_named_is_the_one_applied(fake, monkeypatch):
            mnemiq=_result(*_days(1000), columns=TIME))
     check = _check(fake)
     assert check.status is ChartStatus.NOT_CHECKED and "1,000" in check.reason and "(7)" not in check.reason
+
+
+# --- numbers the renderer computes from the query's rows --------------------------------------------------------------
+
+SUM_PREMIUM = {"expressionType": "SIMPLE", "aggregate": "SUM", "column": {"column_name": "premium"}, "label": "P"}
+COUNT_PREMIUM = SUM_PREMIUM | {"aggregate": "COUNT"}
+MIN_PREMIUM = SUM_PREMIUM | {"aggregate": "MIN"}
+
+
+def _grouped(viz: str, **changes) -> dict:
+    return {"viz_type": viz, "metric": copy.deepcopy(PREMIUM), "groupby": ["region"], "adhoc_filters": [],
+            "row_limit": 100} | changes
+
+
+TWO = ["region", "channel"]
+
+
+@pytest.mark.parametrize("form, said", [
+    (_grouped("treemap_v2", groupby=TWO), "sum"),
+    (_grouped("treemap_v2", groupby=TWO, metric=MIN_PREMIUM), "sum"),
+    (_grouped("treemap_v2", groupby=TWO, metric=M_SAVED), "sum"),
+    (_grouped("treemap_v2", groupby=TWO, metric=SUM_PREMIUM), None),
+    (_grouped("treemap_v2", groupby=TWO, metric=COUNT_PREMIUM), None),
+    (_grouped("treemap_v2"), None),
+    (_grouped("pie", threshold_for_other=5, metric=SUM_PREMIUM), "Other"),
+    (_grouped("pie", threshold_for_other=0), None),
+    (_grouped("pie", show_total=True), "sum"),
+    (_grouped("pie", show_total=True, metric=MIN_PREMIUM), "sum"),
+    (_grouped("pie", show_total=True, metric=SUM_PREMIUM), None),
+    (_grouped("pie", show_total=True, metric=COUNT_PREMIUM), None),
+    (_grouped("pie", show_total=False), None),
+], ids=["treemap parents of a SQL metric", "treemap parents of a MIN", "treemap parents of a saved metric",
+        "treemap parents of a SUM", "treemap parents of a COUNT", "a treemap of one level",
+        "a pie's Other slice, even of a SUM", "a pie with no Other slice", "a pie's total of a SQL metric",
+        "a pie's total of a MIN", "a pie's total of a SUM", "a pie's total of a COUNT", "a pie with no total"])
+def test_a_number_the_renderer_sums_is_checked_only_when_the_sum_is_the_measures_own(form, said):
+    """rc2's renderer sums some of what a chart shows from the query's rows, so the data tool's rows never hold it: a
+    treemap's parent from its children (`treeBuilder` in `plugin-chart-echarts/src/utils/treeBuilder.ts`), a pie's
+    Other slice from the slices under its threshold and its total from every slice (`Pie/transformProps.ts`). A sum of
+    a SIMPLE SUM or COUNT is that measure over the groups summed; a sum of anything else is not, and the Other slice
+    hides the slices it folds in."""
+    found = expectation_from_form_data(form, dataset=PHYSICAL)
+    if said is None:
+        assert isinstance(found, Expectation), found
+    else:
+        assert isinstance(found, NotCheckable) and said in found.reason, found
+
+
+def test_a_treemaps_parents_of_a_written_measure_are_not_checked(fake):
+    """Nothing is asked for the chart's data or computed: a parent's number is not in either side's rows."""
+    form = _grouped("treemap_v2", groupby=TWO, number_format=",.2f", currency_format=dict(USD))
+    _serve(fake, form_data=form, chart=_chart_data(["region", "channel", "Total premium"], ("east", "web", 1)),
+           mnemiq=_result(("east", "web", 1), columns=(("region", "object"), ("channel", "object"), ("m0", "int64"))))
+    check = _check(fake)
+    assert check.status is ChartStatus.NOT_CHECKED and "sum" in check.reason
+    assert "get_chart_data" not in _tools(fake) and _statements(fake) == []
+
+
+def _table(**changes) -> dict:
+    return {"viz_type": "table", "query_mode": "aggregate", "groupby": ["region"],
+            "metrics": [copy.deepcopy(PREMIUM)], "adhoc_filters": [copy.deepcopy(WEB_ONLY)], "row_limit": 100,
+            "column_config": {"Total premium": {"d3NumberFormat": ",.2f", "currencyFormat": dict(USD)}}} | changes
+
+
+ROWS = (("east", 1200), ("west", 800))
+REBUILT = _chart_data(["region", "Total premium"], *ROWS)
+# The table's saved query context answers its totals query too: one row, the metrics over no grouping.
+SAVED_CONTEXT = _chart_data(["region", "Total premium"], *ROWS, query_results=[
+    {"query_index": 0, "columns": ["region", "Total premium"],
+     "data": [{"region": r, "Total premium": v} for r, v in ROWS], "row_count": 2, "total_rows": 2},
+    {"query_index": 1, "columns": ["Total premium"], "data": [{"Total premium": 2000}], "row_count": 1,
+     "total_rows": 1}])
+
+
+@pytest.mark.parametrize("answer", [REBUILT, SAVED_CONTEXT], ids=["rebuilt from form_data", "its saved query context"])
+def test_a_tables_totals_row_is_not_checked(fake, answer):
+    """rc2's table asks for its totals row in a query of its own (`show_totals` in `plugin-chart-table/src/buildQuery.ts`,
+    with `getTotalsMetrics`), which the data tool's rebuild leaves out and mnemiq does not reproduce: the table is not
+    checked, however the data tool answers."""
+    _serve(fake, form_data=_table(show_totals=True), chart=answer, mnemiq=_result(*ROWS))
+    check = _check(fake)
+    assert check.status is ChartStatus.NOT_CHECKED and "total" in check.reason
+    assert "get_chart_data" not in _tools(fake) and _statements(fake) == []
+
+
+def test_a_table_without_totals_is_checked(fake):
+    _serve(fake, form_data=_table(show_totals=False), chart=REBUILT, mnemiq=_result(*ROWS))
+    check = _check(fake)
+    assert check.status is ChartStatus.CHECKED, check.reason
