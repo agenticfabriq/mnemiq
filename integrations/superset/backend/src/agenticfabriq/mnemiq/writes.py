@@ -198,10 +198,11 @@ REQUESTS: dict[str, dict[str, _Field]] = {
 }
 
 
-def read(tool: str, request: Any) -> dict:
-    """`request` read field by field for `tool`. Raises `Refused` for a request that is not an object, a missing or
-    misread field, or a field the tool does not take (a misspelt one is refused, never ignored)."""
-    fields = REQUESTS[tool]
+def read(tool: str, request: Any, requests: Mapping[str, dict[str, _Field]] = REQUESTS) -> dict:
+    """`request` read field by field for `tool`, whose fields `requests` names (the write tools' by default; `reads`
+    passes its own). Raises `Refused` for a request that is not an object, a missing or misread field, or a field
+    the tool does not take (a misspelt one is refused, never ignored)."""
+    fields = requests[tool]
     if not isinstance(request, Mapping):
         raise Refused({"refused": "request"})
     unknown = sorted(str(key)[:64] for key in request if key not in fields)
@@ -244,14 +245,16 @@ def with_marker(description: str | None, marker: str) -> str:
     return f"{prose}\n{marker}" if prose else marker
 
 
-def _answering(tool: str) -> Callable[[Callable[[dict], dict]], Callable[[Any], dict]]:
-    """Reads the request for `tool` before the body runs, and answers a `Refused` with its answer."""
+def _answering(tool: str, requests: Mapping[str, dict[str, _Field]] = REQUESTS) -> Callable[
+        [Callable[[dict], dict]], Callable[[Any], dict]]:
+    """Reads the request for `tool` (its fields in `requests`) before the body runs, and answers a `Refused` with its
+    answer."""
 
     def wrap(body: Callable[[dict], dict]) -> Callable[[Any], dict]:
         @functools.wraps(body)
         def run(request: Any) -> dict:
             try:
-                return body(read(tool, request))
+                return body(read(tool, request, requests))
             except Refused as refused:
                 return refused.answer
 

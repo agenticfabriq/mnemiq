@@ -181,13 +181,16 @@ TOOLS_SOURCE = Path(writes.__file__).with_name("tools.py")
 WRITE_CLASSES = {"create_dashboard": "Dashboard", "claim_chart": "Chart", "claim_dataset": "Dataset",
                  "create_chart": "Chart", "patch_chart": "Chart", "add_saved_metric": "Dataset",
                  "delete_dataset": "Dataset", "set_layout": "Dashboard"}
-READS = {"dataset_metrics", "editors_of", "get_layout"}  # the read tools, registered by a later change
+# The class permission each read tool is gated by; its method is `read`.
+READ_CLASSES = {"dataset_metrics": "Dataset", "editors_of": "Chart", "get_layout": "Dashboard"}
+ALL_CLASSES = {**WRITE_CLASSES, **READ_CLASSES}
 
 
 def registration_problems(source: str) -> list[str]:
     """What is wrong with the `@tool` registrations in `source`, read with `ast`: each must be named one of mnemiq's
-    write tool names, with that tool's stock class permission and the method `write`, take one `request`, and call
-    `writes.<its name>` and nothing else of `writes`; and every write tool must be there once."""
+    tool names, with that tool's stock class permission and the method `write` (a write tool) or `read` (a read
+    tool), take one `request`, and call `writes.<its name>` or `reads.<its name>` (by kind) and nothing else of
+    either; and every tool must be there once."""
     problems, seen = [], []
     for node in ast.parse(source).body:
         if not isinstance(node, ast.FunctionDef):
@@ -198,41 +201,50 @@ def registration_problems(source: str) -> list[str]:
             keywords = {k.arg: k.value.value for k in decorator.keywords if isinstance(k.value, ast.Constant)}
             name = keywords.get("name")
             seen.append(name)
-            if name not in WRITE_CLASSES:
-                problems.append(f"{name!r} is not one of mnemiq's write tools")
+            if name not in ALL_CLASSES:
+                problems.append(f"{name!r} is not one of mnemiq's tools")
                 continue
-            if keywords.get("class_permission_name") != WRITE_CLASSES[name]:
-                problems.append(f"{name} is not gated by {WRITE_CLASSES[name]}")
-            if keywords.get("method_permission_name") != "write":
-                problems.append(f"{name} is not gated as a write")
+            module, method = ("reads", "read") if name in READ_CLASSES else ("writes", "write")
+            if keywords.get("class_permission_name") != ALL_CLASSES[name]:
+                problems.append(f"{name} is not gated by {ALL_CLASSES[name]}")
+            if keywords.get("method_permission_name") != method:
+                problems.append(f"{name} is not gated as a {method}")
             if [arg.arg for arg in node.args.args] != ["request"]:
                 problems.append(f"{name} does not take one request")
-            called = [call.func.attr for call in ast.walk(node) if isinstance(call, ast.Call)
-                      and isinstance(call.func, ast.Attribute) and getattr(call.func.value, "id", None) == "writes"]
-            if called != [name]:
-                problems.append(f"{name} calls writes.{called}")
-    if sorted(seen) != sorted(WRITE_CLASSES):
-        problems.append(f"registered {sorted(filter(None, seen))}, not each write tool once")
+            called = [f"{call.func.value.id}.{call.func.attr}" for call in ast.walk(node)
+                      if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                      and getattr(call.func.value, "id", None) in ("writes", "reads")]
+            if called != [f"{module}.{name}"]:
+                problems.append(f"{name} calls {called}")
+    if sorted(seen) != sorted(ALL_CLASSES):
+        problems.append(f"registered {sorted(filter(None, seen))}, not each tool once")
     return problems
 
 
-def test_the_write_tools_are_mnemiqs_names_with_stock_permissions():
+def test_the_tools_are_mnemiqs_names_with_stock_permissions():
     from mnemiq.superset.extension import EXTENSION_TOOLS
 
-    assert set(EXTENSION_TOOLS) == set(WRITE_CLASSES) | READS
+    assert set(EXTENSION_TOOLS) == set(ALL_CLASSES) and len(EXTENSION_TOOLS) == 11
     assert set(writes.REQUESTS) == set(WRITE_CLASSES)
     assert registration_problems(TOOLS_SOURCE.read_text()) == []
 
 
 @pytest.mark.parametrize(("old", "new", "flagged"), [
-    ('name="patch_chart"', 'name="patch_charts"', "'patch_charts' is not one of mnemiq's write tools"),
+    ('name="patch_chart"', 'name="patch_charts"', "'patch_charts' is not one of mnemiq's tools"),
+    ('name="get_layout", class_permission_name="Dashboard", method_permission_name="read"',
+     'name="get_layout", class_permission_name="Dashboard", method_permission_name="write"',
+     "get_layout is not gated as a read"),
+    ('name="editors_of", class_permission_name="Chart"', 'name="editors_of", class_permission_name="Dataset"',
+     "editors_of is not gated by Chart"),
+    ("return reads.dataset_metrics(request)", "return writes.dataset_metrics(request)",
+     "dataset_metrics calls ['writes.dataset_metrics']"),
     ('name="set_layout", class_permission_name="Dashboard"', 'name="set_layout", class_permission_name="mnemiq"',
      "set_layout is not gated by Dashboard"),
     ('name="delete_dataset", class_permission_name="Dataset", method_permission_name="write"',
      'name="delete_dataset", class_permission_name="Dataset", method_permission_name="read"',
      "delete_dataset is not gated as a write"),
     ("return writes.claim_dataset(request)", "return writes.claim_chart(request)",
-     "claim_dataset calls writes.['claim_chart']"),
+     "claim_dataset calls ['writes.claim_chart']"),
 ])
 def test_the_registration_check_flags_a_planted_defect(old, new, flagged):
     source = TOOLS_SOURCE.read_text()

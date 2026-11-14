@@ -1,4 +1,4 @@
-"""mnemiq's Superset extension, live: its token route on Superset's web server, and its write tools on Superset's MCP
+"""mnemiq's Superset extension, live: its token route on Superset's web server, and its write and read tools on Superset's MCP
 service, in the suite's Superset 7.0.0rc2 with the extension loaded (`setup_superset.py extension`).
 
 Every tool is called over MCP as a person whose token Superset verifies, with the scopes a build token carries, and
@@ -14,12 +14,17 @@ which `pytest -rA` shows for passing tests too.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import subprocess
+import tempfile
 import threading
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 import jwt
 import pytest
@@ -50,6 +55,7 @@ BUILD = " ".join(BUILD_SCOPES)
 ASK = " ".join(ASK_SCOPES)
 WRITE_TOOLS = ("create_dashboard", "claim_chart", "claim_dataset", "create_chart", "patch_chart", "add_saved_metric",
                "delete_dataset", "set_layout")
+READ_TOOLS = ("dataset_metrics", "editors_of", "get_layout")
 # The builder in most tests: Alpha and sql_lab, narrowed by no row rule.
 BUILDER = "analyst"
 MONTHLY = ("SELECT date_trunc('month', issued)::date AS month, count(*) FROM policy GROUP BY 1 ORDER BY 1")
@@ -94,7 +100,7 @@ def listed_tools(live, token: str) -> set[str]:
 def extension(live) -> None:
     """Superset serves the extension's write tools; else every test here fails saying how to put them there."""
     listed = listed_tools(live, live.token(BUILDER, scope=BUILD))
-    missing = [base for base in WRITE_TOOLS if TOOL_PREFIX + base not in listed]
+    missing = [base for base in (*WRITE_TOOLS, *READ_TOOLS) if TOOL_PREFIX + base not in listed]
     assert not missing, (f"Superset's MCP service does not serve {missing}: build the extension with "
                          "`setup_superset.py extension`, set MNEMIQ_TEST_SUPERSET_EXTENSION_DIR for Superset's "
                          "processes, run `superset init`, and restart them")
@@ -907,3 +913,222 @@ def test_gamma_sees_only_what_its_roles_allow(live, extension, policy_id):
         call(gamma, "add_saved_metric", dataset_id=policy_id, metric=_metric("gamma_metric"),
              expect_changed_on="2026-01-01T00:00:00")
     observe("gamma", listed=sorted(chart_and_dashboard), editors=refused["editors"])
+
+
+# --- the read tools -------------------------------------------------------------------------------------------------
+
+# Superset's MCP response size guard (`superset/mcp_service/middleware.py`) blocks an answer over this many bytes.
+SIZE_GUARD = 50_000
+
+
+def write_metadata(sql: str, params: tuple = ()) -> None:
+    """A write the suite makes to Superset's metadata database directly, only to set up what Superset's own API does not
+    set (a metric's certification, an oversized layout): never by mnemiq or the extension."""
+    import psycopg
+
+    uri = required("MNEMIQ_TEST_SUPERSET_METADATA_URI")["MNEMIQ_TEST_SUPERSET_METADATA_URI"]
+    with psycopg.connect(uri, connect_timeout=10) as con:
+        con.execute(sql, params)
+
+
+def test_dataset_metrics_answers_an_empty_request(live, extension):
+    """The probe contract mnemiq's client relies on: `dataset_ids: []` answers exactly `{datasets: []}` and does not
+    fail, as every role that may call the tool (analyst, Alpha; `gamma_only`, Gamma)."""
+    for username in (BUILDER, "gamma_only"):
+        assert call(as_user(live, username), "dataset_metrics", dataset_ids=[]) == {"datasets": []}
+
+
+def test_dataset_metrics_reads_currency_and_certification(live, extension):
+    """A dataset the build made with a metric of its own (`total_premium`, with a format and a warning), then
+    `avg_premium` added with a verbose name, a `,.2f` format, a USD currency and a description, and a certification
+    written on `avg_premium` (`extra`: certified by `Finance`, `audited`) the way Superset's own dataset editor stores
+    it. `dataset_metrics` for that dataset answers one entry `{dataset_id, metrics}` whose metrics, in the dataset's
+    order, carry exactly the seven fields `metric_name, expression, d3format, currency, certified_by,
+    certification_details, warning_text`: `avg_premium` with currency the dict `{symbol: USD, symbolPosition: prefix}`
+    (rc2's `Currency` object, as stored), `,.2f`, `Finance` and `audited`; `total_premium` with its format and
+    warning, no currency (`null`) and no certification (`null`, `null`). Each value equals what the metadata database
+    stores."""
+    client = as_user(live, BUILDER)
+    build = new_build(client, "metric details")
+    dataset_id = _claimed_dataset(live, build, "metrics", metrics=[{
+        "metric_name": "total_premium", "expression": "SUM(premium)", "d3format": ",.0f",
+        "warning_text": "counts every row"}])
+    assert call(client, "add_saved_metric", dataset_id=dataset_id, metric=_metric(
+        "avg_premium", verbose_name="Average premium", d3format=",.2f",
+        currency={"symbol": "USD", "symbolPosition": "prefix"}, description="per policy"),
+        expect_changed_on=changed_on(client, "dataset", dataset_id)) == {"ok": True}
+    write_metadata("UPDATE sql_metrics SET extra = %s WHERE table_id = %s AND metric_name = 'avg_premium'",
+                   (json.dumps({"certification": {"certified_by": "Finance", "details": "audited"}}), dataset_id))
+    answer = call(client, "dataset_metrics", dataset_ids=[dataset_id])
+    assert set(answer) == {"datasets"} and [d["dataset_id"] for d in answer["datasets"]] == [dataset_id], answer
+    (entry,) = answer["datasets"]
+    assert set(entry) == {"dataset_id", "metrics"}
+    fields = {"metric_name", "expression", "d3format", "currency", "certified_by", "certification_details",
+              "warning_text"}
+    assert all(set(metric) == fields for metric in entry["metrics"]), entry["metrics"]
+    by_name = {metric["metric_name"]: metric for metric in entry["metrics"]}
+    # `create_virtual_dataset` adds Superset's own `count` metric to every dataset.
+    assert set(by_name) == {"total_premium", "avg_premium", "count"}
+    assert by_name["avg_premium"] == {
+        "metric_name": "avg_premium", "expression": "AVG(premium)", "d3format": ",.2f",
+        "currency": {"symbol": "USD", "symbolPosition": "prefix"}, "certified_by": "Finance",
+        "certification_details": "audited", "warning_text": None}
+    assert by_name["total_premium"] == {
+        "metric_name": "total_premium", "expression": "SUM(premium)", "d3format": ",.0f", "currency": None,
+        "certified_by": None, "certification_details": None, "warning_text": "counts every row"}
+    stored = stored_metrics(dataset_id)
+    assert json.loads(stored["avg_premium"][9]) == by_name["avg_premium"]["currency"]
+    assert json.loads(stored["total_premium"][9] or "null") is None  # a stored JSON null
+    observe("dataset_metrics", metrics=sorted(by_name), currency=by_name["avg_premium"]["currency"])
+
+
+def test_dataset_metrics_leaves_out_an_unreachable_dataset_without_naming_it(live, extension, policy_id):
+    """`policy_only` (Gamma and sql_lab, granted the `policy` dataset alone) asks for analyst's virtual dataset, a
+    dataset id that does not exist, and `policy`. It is answered `policy`'s entry only, and that answer is identical to
+    the one for `policy` alone: neither the unreachable dataset's id nor its name appears, and a dataset that exists but
+    is out of reach reads as one that does not. `gamma_only`, which reaches no dataset, is answered `{datasets: []}`
+    for all three."""
+    analyst = as_user(live, BUILDER)
+    build = new_build(analyst, "unreachable")
+    hidden = _claimed_dataset(live, build, "hidden")
+    (name,) = metadata("SELECT table_name FROM tables WHERE id = %s", (hidden,))[0]
+    missing = 2_000_000_000
+    reader = as_user(live, "policy_only")
+    alone = call(reader, "dataset_metrics", dataset_ids=[policy_id])
+    asked = call(reader, "dataset_metrics", dataset_ids=[hidden, missing, policy_id])
+    assert [d["dataset_id"] for d in alone["datasets"]] == [policy_id]
+    assert asked == alone
+    assert name not in json.dumps(asked) and str(hidden) not in json.dumps(asked)
+    assert call(analyst, "dataset_metrics", dataset_ids=[hidden])["datasets"][0]["dataset_id"] == hidden
+    assert call(as_user(live, "gamma_only"), "dataset_metrics", dataset_ids=[hidden, missing, policy_id]) == {
+        "datasets": []}
+    observe("unreachable", answered=[d["dataset_id"] for d in asked["datasets"]])
+
+
+def test_editors_of_names_editors_of_readable_objects_only(live, extension, policy_id):
+    """analyst's claimed chart and claimed dataset (editors: the build dashboard's, analyst) are answered to analyst as
+    `{charts: [{chart_id, editors: [analyst's label]}], datasets: [{dataset_id, editors: [analyst's label]}]}`; a chart
+    and a dataset id that do not exist are left out. `gamma_only`, which reads neither, is answered
+    `{charts: [], datasets: []}`, with no id and no label."""
+    analyst = as_user(live, BUILDER)
+    build = new_build(analyst, "editors of")
+    chart_id = mcp_chart(analyst, spec(Family.BIG_NUMBER, policy_id))
+    assert call(analyst, "claim_chart", chart_id=chart_id, dashboard_id=build.dashboard_id,
+                marker=build.marker("kpi")) == {"ok": True}
+    dataset_id = _claimed_dataset(live, build, "data")
+    missing = 2_000_000_000
+    answer = call(analyst, "editors_of", chart_ids=[chart_id, missing], dataset_ids=[dataset_id, missing])
+    assert answer == {"charts": [{"chart_id": chart_id, "editors": [label_of(BUILDER)]}],
+                      "datasets": [{"dataset_id": dataset_id, "editors": [label_of(BUILDER)]}]}, answer
+    hidden = call(as_user(live, "gamma_only"), "editors_of", chart_ids=[chart_id], dataset_ids=[dataset_id])
+    assert hidden == {"charts": [], "datasets": []}, hidden
+    observe("editors_of", editors=[label_of(BUILDER)])
+
+
+def test_get_layout_round_trips_through_set_layout(live, extension, policy_id):
+    """After a layout of two charts is saved, `get_layout` answers `{dashboard_id, position_json, changed_on}`:
+    `position_json` the stored text exactly (equal to the metadata database's), `changed_on` the very text MCP's
+    `get_dashboard_info` answers. Sending the layout it read back through `set_layout`, with that `changed_on`,
+    answers `{ok: true}`, the dashboard's charts are as they were and `get_layout` answers the same layout. A layout
+    changed (chart `one` made wider) and sent back with the `changed_on` just read answers `{ok: true}`; `get_layout`
+    then answers the wider chart and a `changed_on` that is not the one sent. A dashboard that does not exist is
+    answered `{not_found: "dashboard"}`."""
+    client = as_user(live, BUILDER)
+    build = new_build(client, "layout read")
+    one, two = (mcp_chart(client, spec(Family.BIG_NUMBER, policy_id)) for _ in range(2))
+    assert _layout(build, [one, two], add=[one, two]) == {"ok": True}
+    answer = call(client, "get_layout", dashboard_id=build.dashboard_id)
+    assert set(answer) == {"dashboard_id", "position_json", "changed_on"} and answer["dashboard_id"] == build.dashboard_id
+    ((stored,),) = metadata("SELECT position_json FROM dashboards WHERE id = %s", (build.dashboard_id,))
+    assert answer["position_json"] == stored
+    assert answer["changed_on"] == changed_on(client, "dashboard", build.dashboard_id)
+    layout = json.loads(answer["position_json"])
+    assert {node["meta"]["chartId"] for node in layout.values() if isinstance(node, dict) and node.get("type") == "CHART"
+            } == {one, two}
+    assert call(client, "set_layout", dashboard_id=build.dashboard_id, positions=layout,
+                expect_changed_on=answer["changed_on"]) == {"ok": True}
+    assert members(build.dashboard_id) == sorted([one, two])
+    again = call(client, "get_layout", dashboard_id=build.dashboard_id)
+    assert json.loads(again["position_json"]) == layout
+    layout[f"CHART-{one}"]["meta"]["width"] = 8
+    assert call(client, "set_layout", dashboard_id=build.dashboard_id, positions=layout,
+                expect_changed_on=again["changed_on"]) == {"ok": True}
+    wider = call(client, "get_layout", dashboard_id=build.dashboard_id)
+    assert json.loads(wider["position_json"])[f"CHART-{one}"]["meta"]["width"] == 8
+    assert wider["changed_on"] != again["changed_on"]
+    assert call(client, "get_layout", dashboard_id=2_000_000_000) == {"not_found": "dashboard"}
+    observe("layout_round_trip", bytes=len(answer["position_json"]))
+
+
+def test_answers_stay_under_the_size_guard(live, extension, policy_id):
+    """A 20-dataset request (analyst's twenty virtual datasets, three saved metrics each and Superset's own `count`) is answered all twenty,
+    well under Superset's 50,000-byte response guard. `get_layout` of a dashboard whose stored layout is made over 40 KB
+    (set directly) is answered exactly `{too_large: true}` and not an error; the same dashboard with its layout cut
+    back answers its layout again, also under the guard."""
+    client = as_user(live, BUILDER)
+    build = new_build(client, "size")
+    metrics = [{"metric_name": f"m{i}", "expression": "SUM(premium)", "d3format": ",.2f"} for i in range(3)]
+    ids = [virtual_dataset(live, client, build.marker(f"d{i}"), metrics=metrics) for i in range(20)]
+    answer = call(client, "dataset_metrics", dataset_ids=ids)
+    size = len(json.dumps(answer).encode())
+    assert [d["dataset_id"] for d in answer["datasets"]] == ids and all(len(d["metrics"]) == 4 for d in answer["datasets"])
+    assert size < SIZE_GUARD, size
+    assert call(client, "get_layout", dashboard_id=build.dashboard_id)["dashboard_id"] == build.dashboard_id
+    small = json.dumps({"ROOT_ID": {"type": "ROOT", "id": "ROOT_ID", "children": []}})
+    big = json.dumps({"ROOT_ID": {"type": "ROOT", "id": "ROOT_ID", "children": []}, "PAD": "x" * 41_000})
+    write_metadata("UPDATE dashboards SET position_json = %s WHERE id = %s", (big, build.dashboard_id))
+    assert call(client, "get_layout", dashboard_id=build.dashboard_id) == {"too_large": True}
+    write_metadata("UPDATE dashboards SET position_json = %s WHERE id = %s", (small, build.dashboard_id))
+    layout = call(client, "get_layout", dashboard_id=build.dashboard_id)
+    assert layout["position_json"] == small and len(json.dumps(layout).encode()) < SIZE_GUARD
+    observe("sizes", dataset_metrics_bytes=size)
+
+
+def test_mnemiqs_client_finds_the_extension_and_a_superset_without_it_is_missing(live, extension, policy_id):
+    """mnemiq's own `call_tool`, against the running MCP service, answers `dataset_metrics` and does not raise
+    `ExtensionMissing`, with an ask token (the read tools need `superset:dataset:read`, which an ask token carries);
+    its probe of the same tool is that very answer. Against a second MCP process started here
+    on Superset's configuration without the extension (the same Superset, the same keys, no extension directory),
+    the same call raises `ExtensionMissing`, naming mnemiq's own sentence and not Superset's text."""
+    from mnemiq.superset.extension import ExtensionMissing, call_tool
+
+    answer = call_tool(as_user(live, BUILDER, ASK), "dataset_metrics", {"dataset_ids": [policy_id]})
+    assert [d["dataset_id"] for d in answer["datasets"]] == [policy_id]
+    with _mcp_without_the_extension(live) as url:
+        bare = SupersetMcp(url, DelegatedToken(live.token(BUILDER, scope=BUILD)), timeout_s=90)
+        with pytest.raises(ExtensionMissing) as caught:
+            call_tool(bare, "dataset_metrics", {"dataset_ids": [policy_id]})
+        assert "Superset does not offer mnemiq's extension tool" in str(caught.value)
+        observe("missing_extension", message=str(caught.value))
+
+
+@contextlib.contextmanager
+def _mcp_without_the_extension(live, port: int = 15010):
+    """A throwaway MCP process on `port`: the suite's Superset configuration with no extension directory, so it
+    serves Superset's own tools alone. It shares the metadata database and keys with the running services and changes
+    nothing in them."""
+    env = required("MNEMIQ_TEST_SUPERSET_PYTHON", "MNEMIQ_TEST_SUPERSET_KEYS_DIR", "MNEMIQ_TEST_SUPERSET_METADATA_URI",
+                   "MNEMIQ_TEST_SUPERSET_PG_DSN")
+    child_env = {**os.environ, "SUPERSET_CONFIG_PATH": str(Path(__file__).with_name("superset_config.py")),
+                 "FLASK_APP": "superset"}
+    child_env.pop("MNEMIQ_TEST_SUPERSET_EXTENSION_DIR", None)
+    superset = Path(env["MNEMIQ_TEST_SUPERSET_PYTHON"]).with_name("superset")
+    with tempfile.TemporaryFile() as log:
+        process = subprocess.Popen([str(superset), "mcp", "run", "--host", "127.0.0.1", "--port", str(port)],
+                                   env=child_env, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            deadline = time.monotonic() + 180
+            while True:
+                log.seek(0)
+                if b"Application startup complete" in log.read():
+                    break
+                assert process.poll() is None, "the extension-less MCP process exited"
+                assert time.monotonic() < deadline, "the extension-less MCP process did not start"
+                time.sleep(1)
+            yield f"http://127.0.0.1:{port}/mcp"
+        finally:
+            process.terminate()
+            try:
+                process.wait(30)
+            except subprocess.TimeoutExpired:
+                process.kill()

@@ -1,9 +1,11 @@
-"""The extension's MCP tools: registration only. What each tool does is its function in `writes`.
+"""The extension's MCP tools: registration only. What each tool does is its function in `writes` (the eight that change
+Superset) or `reads` (the three that only read).
 
 Superset registers each under `extensions.agenticfabriq.mnemiq.<name>` (`superset/core/mcp/core_mcp_injection.py`,
 `create_tool_decorator`) and wraps it in `mcp_auth_hook`, which runs it as the caller its token names. Each is gated by
-a stock class permission with the method `write`, so Superset's own RBAC (`can_write` on Chart, Dataset or Dashboard)
-and the per-resource token scopes (`superset:chart:write` and the like) govern it, and no role is granted anything
+a stock class permission with the method `write` (a read tool: `read`), so Superset's own RBAC (`can_write` or
+`can_read` on Chart, Dataset or Dashboard) and the per-resource token scopes (`superset:chart:write` and the like)
+govern it, and no role is granted anything
 new. A tool takes one `request` object, as Superset's own tools do.
 
 The names are mnemiq's `mnemiq.superset.extension.EXTENSION_TOOLS`; mnemiq calls them by those names.
@@ -15,7 +17,7 @@ from typing import Any
 
 from superset_core.mcp.decorators import tool
 
-from agenticfabriq.mnemiq import writes
+from agenticfabriq.mnemiq import reads, writes
 
 
 @tool(name="create_dashboard", class_permission_name="Dashboard", method_permission_name="write",
@@ -70,3 +72,24 @@ def delete_dataset(request: dict[str, Any]) -> dict[str, Any]:
                   "request: {dashboard_id, positions, add_chart_ids, remove_chart_ids, expect_changed_on}.")
 def set_layout(request: dict[str, Any]) -> dict[str, Any]:
     return writes.set_layout(request)
+
+
+@tool(name="dataset_metrics", class_permission_name="Dataset", method_permission_name="read",
+      description="Every saved metric of the datasets the caller may access, with its currency and certification. "
+                  "request: {dataset_ids} (at most 20).")
+def dataset_metrics(request: dict[str, Any]) -> dict[str, Any]:
+    return reads.dataset_metrics(request)
+
+
+@tool(name="editors_of", class_permission_name="Chart", method_permission_name="read",
+      description="The editors' labels of the charts and datasets the caller may read. "
+                  "request: {chart_ids, dataset_ids}.")
+def editors_of(request: dict[str, Any]) -> dict[str, Any]:
+    return reads.editors_of(request)
+
+
+@tool(name="get_layout", class_permission_name="Dashboard", method_permission_name="read",
+      description="A dashboard's stored layout as text, with its changed_on, when the caller may read it. "
+                  "request: {dashboard_id}.")
+def get_layout(request: dict[str, Any]) -> dict[str, Any]:
+    return reads.get_layout(request)
