@@ -18,8 +18,8 @@ Every tool keeps these rules:
   `changed_on`, another build's marker): no retry changes it, and the answer names whom to ask.
 - An object the caller may not read is answered as one that does not exist.
 - It takes no user id from the caller. The editors a tool sets come from a dashboard's editors, and an object whose
-  editors may read data for being its editors (a dataset, in rc2) gets as editors only the caller and the users who
-  may already read that data (`_data_editors`), never a role or a group, so that being made an editor widens no
+  editors may read data for being its editors (a dataset, in rc2) gets as editors only the caller and the users whose
+  grants already reach that data (`_data_editors`), never a role or a group, so that being made an editor widens no
   one's access.
 
 Superset is imported inside the tools, never at module level, so this module imports without it and the request
@@ -475,22 +475,25 @@ def _as_user(user: Any) -> Iterator[None]:
 
 
 def _reads_by_a_grant(dataset: Any) -> bool:
-    """Whether `g.user` may read `dataset` by a grant its roles hold: the legs of rc2's `raise_for_access` for a
-    datasource (`superset/security/manager.py`) other than editorship. `can_access_schema` holds all-datasource,
-    all-database, database, catalog and schema access; `datasource_access` on the dataset's own `perm` is the other.
-    Not counted: being an editor; the legs a chart's or a dashboard's request opens (an embedded guest, a viewer in
-    promiscuous mode); a semantic layer's grant, which covers semantic views only; and a deployment's
-    `EXTRA_RAISE_FOR_ACCESS_BYPASS`, whose reach the extension cannot know."""
+    """Whether a grant `g.user`'s roles hold already reaches `dataset` and the table under it, wherever rc2 checks
+    (`superset/security/manager.py`, `raise_for_access`): `can_access_database` (all-datasource, all-database or
+    database access) or `datasource_access` on the dataset's own `perm`. These are the grants SQL Lab's strict check
+    of a table admits (`force_dataset_match`, as `Query.raise_for_access` and MCP's `execute_sql` ask it), besides
+    being an editor of a dataset over the table. Catalog and schema access read the dataset but are skipped there,
+    so one of them alone does not count. Nor do being an editor; the legs a chart's or a dashboard's request opens
+    (an embedded guest, a viewer in promiscuous mode); a semantic layer's grant, which covers semantic views only;
+    and a deployment's `EXTRA_RAISE_FOR_ACCESS_BYPASS`, whose reach the extension cannot know."""
     security = _security()
-    return bool(security.can_access_schema(dataset) or security.can_access("datasource_access", dataset.perm or ""))
+    return bool(security.can_access_database(dataset.database)
+                or security.can_access("datasource_access", dataset.perm or ""))
 
 
 def _data_editors(dataset: Any, dashboard: Any, kept: Iterable[Any]) -> list[int]:
     """The editor subjects for an object whose editors may read `dataset`'s data. rc2 admits a dataset's editors to
     its data (`raise_for_access`) and, in SQL Lab, to the table under it, and a role or a group made an editor makes
     every member one. So: every subject in `kept` (the object's editors now, whoever added them), the caller's own
-    user subject, and each user among `dashboard`'s editors who may already read `dataset` by a grant, judged as that
-    user (`_reads_by_a_grant`). Never a role or a group."""
+    user subject, and each user among `dashboard`'s editors whose grants already reach `dataset` and its table,
+    judged as that user (`_reads_by_a_grant`). Never a role or a group."""
     from superset.subjects.types import SubjectType
     from superset.subjects.utils import get_user_subject
     from superset.utils.core import get_user_id
@@ -619,7 +622,7 @@ def claim_chart(found: dict) -> dict:
 @_answering("claim_dataset")
 def claim_dataset(found: dict) -> dict:
     """Makes a dataset the dashboard's, as `claim_chart` makes a chart, through `UpdateDatasetCommand`. Its editors
-    are those it has, the caller, and the dashboard's users who may already read it (`_data_editors`): a co-editor
+    are those it has, the caller, and the dashboard's users whose grants already reach it (`_data_editors`): a co-editor
     left out is answered `{"not_editor": true, "editors": [...]}` when it asks to change or delete the dataset."""
     if claim_marker(found["marker"], found["dashboard_id"]) is None:
         return BAD_MARKER

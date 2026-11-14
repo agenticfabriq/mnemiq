@@ -35,7 +35,7 @@ def claim_chart(request: dict[str, Any]) -> dict[str, Any]:
 
 @tool(name="claim_dataset", class_permission_name="Dataset", method_permission_name="write",
       description="Make a dataset a dashboard's: a build marker, and as editors the caller and the dashboard's users "
-                  "who may already read it. request: {dataset_id, dashboard_id, marker}.")
+                  "whose grants already reach it. request: {dataset_id, dashboard_id, marker}.")
 def claim_dataset(request: dict[str, Any]) -> dict[str, Any]:
     return writes.claim_dataset(request)
 

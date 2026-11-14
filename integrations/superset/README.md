@@ -68,7 +68,7 @@ from them what it already may do through Superset's own tools.
 |---|---|---|
 | `create_dashboard` | Dashboard | An unpublished, empty dashboard with the caller as its editor. |
 | `claim_chart` | Chart | Gives a chart the dashboard's editors and a build marker, and saves its query context. |
-| `claim_dataset` | Dataset | Gives a dataset a build marker and, as editors, the caller and the dashboard's users who may read it. |
+| `claim_dataset` | Dataset | Gives a dataset a build marker and, as editors, the caller and the dashboard's users whose grants reach it. |
 | `create_chart` | Chart | A funnel or a sankey, saved only once its query runs. |
 | `patch_chart` | Chart | Sets and unsets named params keys, keeping every other key. |
 | `add_saved_metric` | Dataset | Adds one aggregating saved metric, keeping the others. |
@@ -83,8 +83,10 @@ a group made an editor makes every member one. So the tools choose editors so th
 access:
 
 - **A dataset** `claim_dataset` makes a dashboard's keeps the editors it has (its creator among them: the claim removes
-  none), and adds the caller and each user among the dashboard's editors who may already read it
-  by a grant: datasource access to the dataset, or access to its schema, catalog or database, or to all datasources.
+  none), and adds the caller and each user among the dashboard's editors whose grants already reach both the dataset
+  and its table: datasource access to the dataset, or access to its database, to all databases or to all datasources.
+  These are the grants SQL Lab's strict check of a table admits. Schema or catalog access alone does not count: it
+  reads the dataset, but SQL Lab's strict check skips it, and there editorship of the dataset would reach the table.
   Each user is judged as that user, and being an editor of the dataset does not count. A role or a group among the
   dashboard's editors is never added.
 - **A chart** `claim_chart` or `create_chart` makes a dashboard's gets the dashboard's editors. When

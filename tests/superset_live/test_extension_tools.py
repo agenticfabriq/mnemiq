@@ -1013,8 +1013,8 @@ def dataset_rows_as(live, username: str, dataset_id: int):
 
 def test_a_claimed_dataset_gets_only_editors_who_could_already_read_it(live, extension):
     """In rc2 a dataset's editors may read its data (`raise_for_access` admits them), and a role made an editor makes
-    every member one, so `claim_dataset` adds as editors the caller and only those of the dashboard's users who may
-    already read the dataset, never a role.
+    every member one, so `claim_dataset` adds as editors the caller and only those of the dashboard's users whose
+    grants already reach the dataset and its table, never a role.
 
     analyst's dashboard is edited, through Superset's own API, by analyst, `west` (Alpha: may read every dataset),
     `gamma_only` (Gamma: may not read the dataset), `policy_only` (granted the `policy` dataset alone, not this one),
