@@ -7,6 +7,7 @@ What the tools do inside Superset (the locks, the commands, the answers) is the 
 """
 
 import ast
+import re
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -250,6 +251,63 @@ def test_the_registration_check_flags_a_planted_defect(old, new, flagged):
     source = TOOLS_SOURCE.read_text()
     assert source.count(old) == 1
     assert flagged in registration_problems(source.replace(old, new))
+
+
+README = TOOLS_SOURCE.parents[4] / "README.md"
+
+
+def registered(source: str) -> dict[str, tuple[str, str]]:
+    """Each `@tool` registration in `source`, read with `ast`: its name, with its class permission and method."""
+    found = {}
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "tool":
+            keywords = {k.arg: k.value.value for k in node.keywords if isinstance(k.value, ast.Constant)}
+            found[keywords["name"]] = (keywords["class_permission_name"], keywords["method_permission_name"])
+    return found
+
+
+def readme_problems(readme: str, tools_source: str, extension_sources: list[str]) -> list[str]:
+    """What the extension's README does not say that its code does: each registered tool has a row in the table of
+    its kind (`## The write tools` for the method `write`, `## The read tools` for `read`) naming the class
+    permission it is gated by, and each `MNEMIQ_*` setting the extension reads has a row in `## Configuration`."""
+    sections: dict[str, list[list[str]]] = {}
+    heading = ""
+    for line in readme.splitlines():
+        if line.startswith("## "):
+            heading = line[3:].strip()
+        elif line.startswith("| `"):
+            sections.setdefault(heading, []).append([cell.strip() for cell in line.strip("|").split("|")])
+    problems = []
+    for name, (class_name, method) in sorted(registered(tools_source).items()):
+        rows = {row[0].strip("`"): row[1] for row in sections.get(f"The {method} tools", [])}
+        if rows.get(name) != class_name:
+            problems.append(f"{name} has no row gated by {class_name} under 'The {method} tools'")
+    settings = {row[0].strip("`") for row in sections.get("Configuration", [])}
+    read = sorted({key for source in extension_sources for key in re.findall(r'"(MNEMIQ_[A-Z_]+)"', source)})
+    problems += [f"{key} is not in the configuration table" for key in read if key not in settings]
+    return problems
+
+
+def _extension_sources() -> list[str]:
+    return [path.read_text() for path in sorted(TOOLS_SOURCE.parent.glob("*.py"))]
+
+
+def test_the_readme_documents_every_tool_and_setting():
+    assert readme_problems(README.read_text(), TOOLS_SOURCE.read_text(), _extension_sources()) == []
+    assert len(registered(TOOLS_SOURCE.read_text())) == 11
+
+
+@pytest.mark.parametrize(("old", "new", "flagged"), [
+    ("| `get_layout` | Dashboard |", "| `get_layout` | Chart |",
+     "get_layout has no row gated by Dashboard under 'The read tools'"),
+    ("| `set_layout` | Dashboard |", "| `set_layouts` | Dashboard |",
+     "set_layout has no row gated by Dashboard under 'The write tools'"),
+    ("| `MNEMIQ_LOCK_TIMEOUT_S` |", "| `MNEMIQ_LOCK_TIMEOUT` |", "MNEMIQ_LOCK_TIMEOUT_S is not in the configuration table"),
+])
+def test_the_readme_check_flags_a_planted_defect(old, new, flagged):
+    readme = README.read_text()
+    assert readme.count(old) == 1, old
+    assert flagged in readme_problems(readme.replace(old, new), TOOLS_SOURCE.read_text(), _extension_sources())
 
 
 # ---------------------------------------------------------------- the lock

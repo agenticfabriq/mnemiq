@@ -1,7 +1,7 @@
 # mnemiq extension for Superset
 
 Superset extension `agenticfabriq.mnemiq` (Superset 7.0.0rc2). It lets mnemiq build and edit dashboards as the person
-who asked. It carries a token route on Superset's web server and write tools on Superset's MCP service.
+who asked. It carries a token route on Superset's web server, and write and read tools on Superset's MCP service.
 
 ## Build
 
@@ -34,8 +34,9 @@ Run `superset init` after the first load so roles receive the route's permission
 | `MNEMIQ_TOKEN_AUDIENCE` | The `aud` claim. |
 | `MNEMIQ_TOKEN_TENANT` | The `tenant` claim. |
 | `MNEMIQ_TOKEN_LIFETIME_S` | Seconds a token lives. At most 300, which is also the default. |
+| `MNEMIQ_LOCK_TIMEOUT_S` | Seconds a write tool waits for a row another transaction holds before it answers `{"busy": true}`. Default 30: keep it under mnemiq's deadline for a call (45 seconds by default), or a write could land after mnemiq gave up on it. Applies on a Postgres metadata database; on MySQL the database's own lock wait applies. |
 
-All but the lifetime are required; the route answers 503 naming the one that is missing.
+All but the lifetime and the lock timeout are required; the route answers 503 naming the one that is missing.
 
 ## The token route
 
@@ -43,9 +44,18 @@ All but the lifetime are required; the route answers 503 naming the one that is 
 `X-CSRFToken`. It answers `{"token": "...", "expires_in": 300}`. The token is for the signed-in user only; the body
 cannot name anyone else. An `ask` token carries `db.read superset:sqllab:write superset:dataset:read`; a `build` token
 adds `superset:chart:read superset:chart:write superset:dashboard:read superset:dashboard:write superset:dataset:write`.
+A token's `nbf` is five seconds before its `iat`, so an MCP service whose clock is a little behind the web server's
+still takes it.
+
+It mints only for a user signed in to Superset itself. An embedded guest (a request carrying a guest token, with
+`EMBEDDED_SUPERSET` on) and a request with nobody signed in are answered 403, whatever role they hold: a guest's name is
+whatever its guest token says, not a Superset sign-in, and the MCP service runs a token as the user of its name.
 
 Superset's MCP service must verify these tokens: set its `MCP_JWT_PUBLIC_KEY` (or `MCP_JWKS_URI`), `MCP_JWT_AUDIENCE`
-and `MCP_JWT_ISSUER` to match the key, audience and issuer above.
+and `MCP_JWT_ISSUER` to match the key, audience and issuer above. If the MCP service also trusts an identity provider,
+`MCP_JWT_ISSUER` lists both issuers, and Superset then refuses to start its MCP service until `MCP_USER_RESOLVER` names
+a resolver: its default finds a user by name alone, so two issuers' tokens for one name would be one user. Give it a
+resolver that binds the token's issuer.
 
 ## The write tools
 
@@ -63,8 +73,23 @@ from them what it already may do through Superset's own tools.
 | `patch_chart` | Chart | Sets and unsets named params keys, keeping every other key. |
 | `add_saved_metric` | Dataset | Adds one aggregating saved metric, keeping the others. |
 | `delete_dataset` | Dataset | Moves a dataset a build made to the trash once no chart uses it. |
-| `set_layout` | Dashboard | Writes the layout, and with it the charts, keeping filters and tabs. |
+| `set_layout` | Dashboard | Writes the layout, and with it the charts, keeping filters and every tab under its id. |
 
 Every write to an existing row first locks that row and compares the `changed_on` the caller read, so of two racing
-writers the second answers `{"stale": true}`. Answers are short structured objects; Superset's own error text never
-reaches them.
+writers the second answers `{"stale": true}`. A write that waits for the row longer than `MNEMIQ_LOCK_TIMEOUT_S`
+answers `{"busy": true}` and changes nothing; the same request may be sent again. Answers are short structured objects;
+Superset's own error text never reaches them.
+
+## The read tools
+
+Registered beside the write tools, each gated by a stock permission with the method `read` (`can_read` on Chart,
+Dataset or Dashboard) and the matching token scope, and changing nothing. An object the caller may not read is left out
+of an answer, or answered as not found, exactly as one that does not exist. Every answer stays under 40,000 bytes of
+JSON, inside Superset's MCP response size guard: an entry of a list that does not fit is answered with its id and
+`"too_large": true`, and a layout that does not fit as `{"too_large": true}`.
+
+| Tool | Gated by | What it answers |
+|---|---|---|
+| `dataset_metrics` | Dataset | Every saved metric of up to 20 datasets, with its currency and certification. |
+| `editors_of` | Chart | The editors' labels of up to 100 charts and 20 datasets, for whom to ask for access. |
+| `get_layout` | Dashboard | A dashboard's stored layout, as text, with the `changed_on` that `set_layout` takes back. |
