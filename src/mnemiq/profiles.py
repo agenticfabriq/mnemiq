@@ -57,7 +57,7 @@ DEPLOYMENT_SETTINGS = frozenset({
     "oracle_acquire_timeout_s", "oracle_probe_timeout_s", "oracle_read_only_ttl_s", "sources_path", "source_id",
     "store_path", "control_dsn", "embed_model", "embed_base_url", "embed_api_key", "enrich_facts", "enrich_examples",
     "dictionary_path", "ontology_records_path", "definition_index_max_concepts", "binding_suggestions_path",
-    "superset_mcp_url", "superset_database_id", "superset_schema",
+    "superset_mcp_url", "superset_database_id", "superset_schema", "superset_currency",
     # Secrets are never read from a file: a profile names a variable instead.
     "llm_api_key", "verify_api_key",
     # The deployment's own running.

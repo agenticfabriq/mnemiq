@@ -17,7 +17,10 @@ result cache may answer it, and that cache checks the person's access before it 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+import pyarrow as pa
 
 from mnemiq.agent.history import MAX_COLUMNS, MAX_ROWS, scope_history
 from mnemiq.authz.grants import GrantSet
@@ -27,7 +30,7 @@ from mnemiq.sql.decide import decide
 from mnemiq.sql.fanout_check import guard_on, key_facts
 from mnemiq.sql.policy import build_access_policy
 from mnemiq.sql.schema import column_types, visible_schema
-from mnemiq.sql.verdict import Approved
+from mnemiq.sql.verdict import Approved, Refusal
 from mnemiq.sql.views import inventory_for
 
 if TYPE_CHECKING:
@@ -75,24 +78,12 @@ def _rows_now(sql: str, *, grants: GrantSet, snapshot: Snapshot, adapter, timeou
     Decided as `plan_query` decides the writer's SQL, argument for argument, in the source's dialect, so nothing is
     looser for a turn than for a new question. With no table granted a new question is deferred before anything is
     decided, and a turn is not run either."""
-    visible = visible_schema(snapshot, grants)
-    if not visible:
+    if not visible_schema(snapshot, grants):
         logger.info("no table is granted, so the earlier turn is not run again and keeps no rows")
         return None
-    dialect = adapter.dialect
-    verdict = decide(
-        sql, visible, adapter=adapter, dialect=dialect, target=dialect, values=values,
-        policy=build_access_policy(snapshot, grants), registry=getattr(snapshot, "registry", {}),
-        views=inventory_for(snapshot), keys=key_facts(snapshot) if guard_on(guard_fanout, snapshot) else None,
-        types=column_types(snapshot), gregorian_calendar=getattr(adapter, "gregorian_calendar", False) is True,
-    )
-    if not isinstance(verdict, Approved):
-        # The subject and the source's words are the operator's to read, never the model's.
-        logger.warning("an earlier turn's SQL was refused when decided again (%s, %r): it is not run, and keeps no "
-                       "rows. %s", verdict.code.value, verdict.subject, verdict.source_detail or "")
-        return None
     try:
-        table = run(adapter, verdict.target_sql, timeout_s=timeout_s).table
+        outcome = run_decided(sql, adapter=adapter, snapshot=snapshot, grants=grants, timeout_s=timeout_s,
+                              guard_fanout=guard_fanout, values=values)
     except ExecutionError as exc:
         # Every failure of the run reaches here as one: a result cut to size, a time limit, a cancel, a refusal, and
         # Superset not answering. What Superset said is in the exception's detail, or in the one it was raised from.
@@ -100,7 +91,46 @@ def _rows_now(sql: str, *, grants: GrantSet, snapshot: Snapshot, adapter, timeou
         logger.warning("an earlier turn did not run again, and keeps no rows: %s%s", exc.full_text,
                        f" ({detail})" if detail else "")
         return None
+    if isinstance(outcome, Refusal):
+        # The subject and the source's words are the operator's to read, never the model's.
+        logger.warning("an earlier turn's SQL was refused when decided again (%s, %r): it is not run, and keeps no "
+                       "rows. %s", outcome.code.value, outcome.subject, outcome.source_detail or "")
+        return None
+    table = outcome.table
     width = min(table.num_columns, MAX_COLUMNS)
     head = table.slice(0, MAX_ROWS)
     columns = [head.column(i).to_pylist() for i in range(width)]
     return list(table.column_names[:width]), [list(row) for row in zip(*columns)]
+
+
+@dataclass(frozen=True)
+class Decided:
+    """A statement mnemiq approved, and the table it returned when run through the request's adapter."""
+
+    approved: Approved
+    table: pa.Table
+
+
+def decide_statement(sql: str, *, adapter, snapshot: Snapshot, grants: GrantSet, guard_fanout: bool | None,
+                     values=None) -> Approved | Refusal:
+    """`sql` decided under `grants` as `plan_query` decides the writer's SQL, argument for argument, in the source's
+    dialect, so nothing is looser here than for a new question."""
+    dialect = adapter.dialect
+    return decide(
+        sql, visible_schema(snapshot, grants), adapter=adapter, dialect=dialect, target=dialect, values=values,
+        policy=build_access_policy(snapshot, grants), registry=getattr(snapshot, "registry", {}),
+        views=inventory_for(snapshot), keys=key_facts(snapshot) if guard_on(guard_fanout, snapshot) else None,
+        types=column_types(snapshot), gregorian_calendar=getattr(adapter, "gregorian_calendar", False) is True,
+    )
+
+
+def run_decided(sql: str, *, adapter, snapshot: Snapshot, grants: GrantSet, timeout_s: float,
+                guard_fanout: bool | None, values=None) -> Decided | Refusal:
+    """Decide `sql` under `grants`, and when it is approved run the approved statement through `adapter` as the person.
+
+    A refusal is returned. A run that fails raises `ExecutionError`, whose detail is the caller's to log."""
+    verdict = decide_statement(sql, adapter=adapter, snapshot=snapshot, grants=grants, guard_fanout=guard_fanout,
+                               values=values)
+    if not isinstance(verdict, Approved):
+        return verdict
+    return Decided(verdict, run(adapter, verdict.target_sql, timeout_s=timeout_s).table)

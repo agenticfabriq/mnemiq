@@ -1,0 +1,210 @@
+"""The number format and currency Superset 7.0.0rc2's renderer shows for a chart's metric.
+
+What shows is decided by the chart's saved `form_data` and, for a metric saved on the dataset, the saved metric's
+`d3format` and `currency`, and which of the two wins differs by chart type. Each branch below names the renderer
+file and symbol it mirrors (under `superset-frontend/plugins/` unless noted). The shared resolver is
+`getValueFormatter` / `buildCustomFormatters` in `packages/superset-ui-core/src/currency-format/utils.ts`.
+
+A saved metric applies only when the chart names it by its name (a string); an ad hoc metric (a dict) has no saved entry.
+Anything the renderer decides from data mnemiq does not have (an AUTO currency, a forced percent display, a plugin
+whose source is not in the tree) is `CANNOT_TELL`, never a guess.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+from mnemiq.superset.measures import MeasureKind
+from mnemiq.superset.saved_metrics import UNKNOWN, SavedMetric
+
+__all__ = ["CANNOT_TELL", "Displayed", "displayed", "fits", "metric_label", "shows_currency"]
+
+AUTO = "AUTO"
+# A currency code `Intl.NumberFormat` takes (ECMA-402's IsWellFormedCurrencyCode): three ASCII letters, in either case.
+# rc2's `getCurrencySymbol` (`currency-format/CurrencyFormatter.ts`) hands the symbol to it as it is, so `usd` shows
+# `$`. A request mnemiq sends still carries the code in capitals.
+_CODE = re.compile(r"[A-Za-z]{3}")
+
+
+class _CannotTell:
+    def __repr__(self) -> str:
+        return "CANNOT_TELL"
+
+
+CANNOT_TELL = _CannotTell()
+
+
+@dataclass(frozen=True)
+class Displayed:
+    """The effective d3 format (None: the renderer's default, SMART_NUMBER) and currency (None: no currency)."""
+
+    d3format: str | None
+    currency: dict | None
+
+
+# Every type rendered by `Timeseries/transformProps.ts` (each plugin's `index.ts` under `Timeseries/` imports it).
+_TIMESERIES = {"echarts_timeseries_line", "echarts_timeseries_bar", "echarts_area", "echarts_timeseries_scatter",
+               "echarts_timeseries_smooth", "echarts_timeseries_step", "echarts_timeseries"}
+_BIG_NUMBER = {"big_number_total", "big_number"}
+_CHART_WINS = {"pie", "gauge_chart", "funnel", "treemap_v2"}
+
+
+def _saved_of(metric_key, saved: SavedMetric | None) -> SavedMetric | None:
+    """`isSavedMetric`: only a metric the chart names by a string can match a saved metric."""
+    return saved if isinstance(metric_key, str) else None
+
+
+def metric_label(item) -> str | None:
+    """The name Superset keys a metric's values by: a saved metric's name, else an ad hoc metric's label, its SQL, or
+    `AGGREGATE(column)` (`getMetricLabel` in `superset-ui-core/src/query/getMetricLabel.ts`, which the renderers key
+    their formats by; `get_metric_name` in `superset/utils/core.py` names the result's column the same way). None for
+    what is neither."""
+    if isinstance(item, str):
+        return item
+    if not isinstance(item, dict):
+        return None
+    if isinstance(item.get("label"), str) and item["label"]:
+        return item["label"]
+    if item.get("expressionType") == "SQL" and isinstance(item.get("sqlExpression"), str):
+        return item["sqlExpression"]
+    column = (item.get("column") or {}).get("column_name") if isinstance(item.get("column"), dict) else None
+    if item.get("expressionType") == "SIMPLE" and column and item.get("aggregate"):
+        return f"{item['aggregate']}({column})"
+    return column
+
+
+def _named(metric, key) -> bool:
+    label = metric_label(key)
+    return label is not None and any(metric_label(m) == label for m in (metric or []))
+
+
+def _symbol(currency) -> str:
+    return currency.get("symbol") if isinstance(currency, dict) and currency.get("symbol") else ""
+
+
+def _finish(d3format, currency):
+    """`Displayed`, or `CANNOT_TELL` when the currency that decides is AUTO (it needs the data's detected currency)."""
+    if _symbol(currency) == AUTO:
+        return CANNOT_TELL
+    return Displayed(d3format or None, currency if _symbol(currency) else None)
+
+
+def _chart_then_saved(chart_currency, saved: SavedMetric | None):
+    """`getEffectiveCurrencyFormat`: the chart's currency when it has a symbol, else the saved metric's. Returns the
+    currency, or `CANNOT_TELL` when the saved currency would decide and could not be read."""
+    if _symbol(chart_currency):
+        return chart_currency
+    if saved is None:
+        return None
+    return CANNOT_TELL if saved.currency is UNKNOWN else saved.currency
+
+
+def _with_currency(d3format, chart_currency, saved: SavedMetric | None):
+    currency = _chart_then_saved(chart_currency, saved)
+    return CANNOT_TELL if currency is CANNOT_TELL else _finish(d3format, currency)
+
+
+def displayed(viz_type: str, form_data: dict, metric_key, saved: SavedMetric | None):
+    """What Superset shows for `metric_key` on a `viz_type` chart saved with `form_data`: a `Displayed`, or
+    `CANNOT_TELL`. `saved` is the saved metric `metric_key` names, or None."""
+    saved = _saved_of(metric_key, saved)
+    if viz_type in _TIMESERIES:
+        # Timeseries/transformProps.ts, `buildCustomFormatters(..., yAxisFormat, ...)` and `forcePercentFormatter`. A saved
+        # chart holds the control's own name, `rebase_percent_change` (Regular/Line/controlPanel.tsx), which the
+        # renderer sees camel-cased; `contributionMode` and `stack` are saved under those same names.
+        # `isAreaExpand = stack === StackControlsValue.Expand` there, whatever the type.
+        if form_data.get("contributionMode") or form_data.get("rebase_percent_change") \
+                or form_data.get("stack") == "Expand":
+            return CANNOT_TELL
+        d3 = form_data.get("y_axis_format")
+        if d3 is None and saved is not None:
+            d3 = saved.d3format
+        return _with_currency(d3, form_data.get("currency_format"), saved)
+    if viz_type == "mixed_timeseries":
+        # MixedTimeseries/transformProps.ts, `customFormatters` / `customFormattersSecondary` over `metrics` + `metricsB`.
+        if form_data.get("contributionMode"):
+            return CANNOT_TELL
+        secondary = _named(form_data.get("metrics_b"), metric_key)
+        suffix = "_secondary" if secondary else ""
+        d3 = form_data.get(f"y_axis_format{suffix}")
+        if d3 is None and saved is not None:
+            d3 = saved.d3format
+        return _with_currency(d3, form_data.get(f"currency_format{suffix}"), saved)
+    if viz_type in _BIG_NUMBER:
+        # BigNumber/BigNumberTotal/transformProps.ts and BigNumberWithTrendline/transformProps.ts:
+        # `getValueFormatter(..., metricEntry?.d3format || yAxisFormat, currencyFormat, ...)`: the saved format wins.
+        d3 = (saved.d3format if saved is not None else None) or form_data.get("y_axis_format")
+        return _with_currency(d3, form_data.get("currency_format"), saved)
+    if viz_type in _CHART_WINS:
+        # Pie/transformProps.ts, Gauge/transformProps.ts, Funnel/transformProps.ts, Treemap/transformProps.ts:
+        # `{...DEFAULT_<X>_FORM_DATA, ...formData}` makes `numberFormat` a string ('SMART_NUMBER'), so `d3Format ??
+        # saved` takes the chart's. A key saved as null survives `convertKeysToCamelCase` and falls to the saved format.
+        d3 = form_data["number_format"] if "number_format" in form_data else "SMART_NUMBER"
+        if d3 is None and saved is not None:
+            d3 = saved.d3format
+        return _with_currency(d3, form_data.get("currency_format"), saved)
+    if viz_type == "waterfall":
+        # Waterfall/transformProps.ts, `defaultFormatter`: chart `currencyFormat?.symbol` only, no saved metric.
+        return _finish(form_data.get("y_axis_format"), form_data.get("currency_format"))
+    if viz_type == "sankey_v2":
+        # Sankey/transformProps.ts: `getNumberFormatter(NumberFormats.FLOAT_2_POINT)`; no format controls.
+        return Displayed(",.2f", None)
+    if viz_type == "histogram_v2":
+        # Histogram/transformProps.ts: `y_axis_format` for the counts, no currency.
+        return Displayed(form_data.get("y_axis_format") or None, None)
+    if viz_type == "box_plot":
+        # BoxPlot/transformProps.ts: `getNumberFormatter(numberFormat)`; no currency, no saved metric.
+        return Displayed(form_data.get("number_format") or None, None)
+    if viz_type == "table":
+        # plugin-chart-table/src/transformProps.ts, `processColumns`: `config.d3NumberFormat || savedFormat` and
+        # `config.currencyFormat?.symbol ? config.currencyFormat : savedCurrency`, keyed by the result column name.
+        config = (form_data.get("column_config") or {}).get(metric_label(metric_key)) or {}
+        if config.get("d3SmallNumberFormat"):
+            return CANNOT_TELL
+        d3 = config.get("d3NumberFormat") or (saved.d3format if saved is not None else None)
+        return _with_currency(d3, config.get("currencyFormat"), saved)
+    if viz_type == "pivot_table_v2":
+        # plugin-chart-pivot-table/src/PivotTableChart.tsx, `customFormatsArray`: `columnFormats[metric] || valueFormat`
+        # and `currencyFormats[metric] || currencyFormat`: the saved metric wins both.
+        # The control (`plugin/controlPanel.tsx`, name 'showValuesAs') defaults to 'actual', which a saved chart holds.
+        if (form_data.get("showValuesAs") or "actual") != "actual":
+            return CANNOT_TELL
+        d3 = (saved.d3format if saved is not None else None) or form_data.get("valueFormat")
+        if saved is not None and saved.currency is UNKNOWN:
+            return CANNOT_TELL
+        currency = saved.currency if saved is not None and saved.currency is not None \
+            else form_data.get("currency_format")
+        return _finish(d3, currency)
+    # handlebars (plugin-chart-handlebars: no number formatting by the plugin), the interactive pivot (its plugin is not
+    # in the tree) and any other type.
+    return CANNOT_TELL
+
+
+def shows_currency(symbol) -> bool:
+    """Whether rc2's renderer shows `symbol` as a currency: `Intl.NumberFormat` takes it as a code (three ASCII letters,
+    either case), where it throws on anything else and `CurrencyFormatter.format` returns the bare number."""
+    return isinstance(symbol, str) and bool(_CODE.fullmatch(symbol))
+
+
+def _currency_shown(shown: Displayed) -> bool:
+    """A currency is on screen when the effective currency's symbol is a code `Intl.NumberFormat` takes
+    (`shows_currency`), or, when no symbol is set, when the d3 format itself starts with `$`. With a symbol set a
+    `CurrencyFormatter` is built, and its `getNormalizedD3Format` strips every `$`, so a `$` format beside a symbol that
+    is not a code shows no currency."""
+    symbol = _symbol(shown.currency)
+    if symbol:
+        return shows_currency(symbol)
+    return (shown.d3format or "").startswith("$")
+
+
+def fits(kind: MeasureKind, shown: Displayed) -> bool:
+    """Whether `shown` displays a `kind` measure as it should. A percent format beside any shown currency loses its
+    `%` (`CurrencyFormatter.normalizeForCurrency`)."""
+    currency = _currency_shown(shown)
+    has_percent = "%" in (shown.d3format or "")
+    if kind is MeasureKind.CURRENCY:
+        return currency
+    if kind is MeasureKind.PERCENT:
+        return has_percent and not currency
+    return not currency and not has_percent
