@@ -25,9 +25,9 @@ __all__ = ["SavedMetric", "UNKNOWN", "normalized", "read_saved_metrics", "reusab
 UNKNOWN: object = object()
 
 PAGE_SIZE = 25
-# The page size a retry asks for after Superset's response size guard refused a page: the plan's value, a fifth of the
-# default. `EMBEDDED_DIMENSIONS_MAX_PAGE_SIZE` (4) in `superset/mcp_service/semantic_layer/schemas.py` is the cap only
-# when `include_compatible_dimensions` is on, which mnemiq never sends, so it does not bind this request.
+# The page size a retry asks for after Superset's response size guard refused a page: a fifth of the default.
+# `EMBEDDED_DIMENSIONS_MAX_PAGE_SIZE` (4) in `superset/mcp_service/semantic_layer/schemas.py` is the cap only when
+# `include_compatible_dimensions` is on, which mnemiq never sends, so it does not bind this request.
 SMALL_PAGE_SIZE = 5
 
 

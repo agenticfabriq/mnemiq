@@ -36,6 +36,11 @@ def _written(*measures: Measure) -> dict[str, Measure]:
     return {m.name: m for m in measures}
 
 
+def _refusal(spec: ChartSpec, *, interactive_pivot_available: bool = True, saved=None, currency: str = "USD"):
+    return plan_refusal(spec, interactive_pivot_available=interactive_pivot_available, saved=saved or {},
+                        currency=currency)
+
+
 def _build(spec: ChartSpec, measures=None, saved=None) -> dict:
     return generate_chart_request(spec, measures or {}, saved or {}, currency="USD")
 
@@ -115,7 +120,7 @@ def test_family_request_matches_rc2_schema(family):
     """Each field is one of the `*ChartConfig` model's own (GenerateChartRequest.config, a union on `chart_type`)."""
     changes, config = CASES[family]
     spec = _spec(family, **changes)
-    assert plan_refusal(spec, interactive_pivot_available=True) is None
+    assert _refusal(spec, interactive_pivot_available=True) is None
     request = _build(spec)
     assert request["dataset_id"] == 7
     assert request["chart_name"] == "A chart"
@@ -209,48 +214,101 @@ def test_the_two_requests_are_not_interchangeable():
 @pytest.mark.parametrize("kind", [K.CURRENCY, K.PERCENT])
 def test_currency_on_sankey_box_plot_histogram_is_refused(family, kind):
     spec = _spec(family, measures=[WrittenRef(_measure("m", kind, expression="AVG(x)"))], source="a", target="b")
-    reason = plan_refusal(spec, interactive_pivot_available=True)
+    reason = _refusal(spec, interactive_pivot_available=True)
     assert reason and kind.value in reason
     ok = _spec(family, measures=[WrittenRef(_measure("m", K.NUMBER, expression="AVG(x)"))], source="a", target="b")
-    assert plan_refusal(ok, interactive_pivot_available=True) is None
+    assert _refusal(ok, interactive_pivot_available=True) is None
     reused = _spec(family, measures=[SavedRef("m", kind)], source="a", target="b")
-    assert plan_refusal(reused, interactive_pivot_available=True)
+    assert _refusal(reused, interactive_pivot_available=True)
 
 
 def test_two_kinds_on_one_axis_are_refused():
     two = [WrittenRef(_measure()), WrittenRef(_measure("orders", K.COUNT, expression="COUNT(*)"))]
     for family in (Family.LINE, Family.PIVOT, Family.INTERACTIVE_PIVOT, Family.BAR):
-        reason = plan_refusal(_spec(family, measures=two), interactive_pivot_available=True)
+        reason = _refusal(_spec(family, measures=two), interactive_pivot_available=True)
         assert reason and "axis" in reason, family
     # a mixed chart's primary and secondary axes may differ, and a table has one format per column
     mixed = _spec(Family.MIXED, measures=two, time_column="d")
-    assert plan_refusal(mixed, interactive_pivot_available=True) is None
-    assert plan_refusal(_spec(Family.TABLE, measures=two), interactive_pivot_available=True) is None
+    assert _refusal(mixed, interactive_pivot_available=True) is None
+    assert _refusal(_spec(Family.TABLE, measures=two), interactive_pivot_available=True) is None
     # but two kinds on the mixed chart's secondary axis are not
     three = [*two, WrittenRef(_measure("share", K.PERCENT, expression="AVG(s)"))]
-    assert plan_refusal(_spec(Family.MIXED, measures=three, time_column="d"), interactive_pivot_available=True)
+    assert _refusal(_spec(Family.MIXED, measures=three, time_column="d"), interactive_pivot_available=True)
 
 
 def test_two_currencies_on_one_axis_are_refused():
     two = [WrittenRef(_measure("a", currency="USD")), WrittenRef(_measure("b", currency="EUR"))]
-    assert plan_refusal(_spec(Family.LINE, measures=two), interactive_pivot_available=True)
+    assert _refusal(_spec(Family.LINE, measures=two), interactive_pivot_available=True)
     same = [WrittenRef(_measure("a")), WrittenRef(_measure("b"))]
-    assert plan_refusal(_spec(Family.LINE, measures=same), interactive_pivot_available=True) is None
+    assert _refusal(_spec(Family.LINE, measures=same), interactive_pivot_available=True) is None
+
+
+EUR = {"symbol": "EUR", "symbolPosition": "prefix"}
+
+
+def _held(name: str, currency) -> SavedMetric:
+    return SavedMetric(7, name, "SUM(x)", None, None, currency, None, None)
+
+
+def test_two_saved_currencies_on_one_axis_are_refused():
+    """A chart shows one currency per axis: `generate_chart_request` sets it from the first measure. Each measure's
+    currency is the one the request would show it in, a saved metric's own ISO code included."""
+    saved = {"usd": _held("usd", USD), "eur": _held("eur", EUR)}
+    two = [SavedRef("usd", K.CURRENCY), SavedRef("eur", K.CURRENCY)]
+    assert _refusal(_spec(Family.LINE, measures=two), saved=saved)
+    assert _refusal(_spec(Family.PIVOT, measures=two), saved=saved)
+    alike = {"usd": _held("usd", USD), "eur": _held("eur", USD)}
+    assert _refusal(_spec(Family.LINE, measures=two), saved=alike) is None
+
+
+def test_a_saved_and_a_written_currency_on_one_axis_are_refused():
+    saved = {"eur": _held("eur", EUR)}
+    mixed = [WrittenRef(_measure("a", currency="USD")), SavedRef("eur", K.CURRENCY)]
+    assert _refusal(_spec(Family.BAR, measures=mixed), saved=saved)
+    # the written measure without a currency of its own is shown in the deployment's
+    assert _refusal(_spec(Family.BAR, measures=[WrittenRef(_measure("a", currency=None)), SavedRef("eur", K.CURRENCY)]),
+                    saved=saved, currency="EUR") is None
+
+
+@pytest.mark.parametrize("held", [None, UNKNOWN, {"symbol": "$", "symbolPosition": "prefix"}])
+def test_a_saved_metric_without_its_own_code_counts_as_the_deployment_currency(held):
+    """As the request builder shows it: a saved metric whose currency is none, unknown (no extension to read it) or not
+    a code is shown in the deployment's currency."""
+    saved = {"m": _held("m", held)}
+    refs = [SavedRef("m", K.CURRENCY), WrittenRef(_measure("a", currency="EUR"))]
+    assert _refusal(_spec(Family.LINE, measures=refs), saved=saved, currency="EUR") is None
+    assert _refusal(_spec(Family.LINE, measures=refs), saved=saved, currency="USD")
+
+
+def test_a_written_measure_without_a_currency_is_the_deployment_currency():
+    """A written currency measure with no currency of its own and one written in the deployment's code show the same
+    currency, so they may share an axis; one in another code may not."""
+    refs = [WrittenRef(_measure("a", currency=None)), WrittenRef(_measure("b", currency="USD"))]
+    assert _refusal(_spec(Family.LINE, measures=refs), currency="USD") is None
+    assert _refusal(_spec(Family.LINE, measures=refs), currency="EUR")
+
+
+def test_a_mixed_charts_axes_may_show_different_currencies():
+    saved = {"eur": _held("eur", EUR)}
+    refs = [WrittenRef(_measure("a", currency="USD")), SavedRef("eur", K.CURRENCY)]
+    assert _refusal(_spec(Family.MIXED, measures=refs, time_column="d"), saved=saved) is None
+    three = [*refs, WrittenRef(_measure("b", currency="USD"))]
+    assert _refusal(_spec(Family.MIXED, measures=three, time_column="d"), saved=saved)
 
 
 def test_handlebars_takes_count_or_number_only():
     for kind, allowed in ((K.COUNT, True), (K.NUMBER, True), (K.CURRENCY, False), (K.PERCENT, False)):
         spec = _spec(Family.HANDLEBARS, measures=[WrittenRef(_measure("m", kind, expression="SUM(x)"))])
-        assert (plan_refusal(spec, interactive_pivot_available=True) is None) is allowed, kind
-    assert plan_refusal(_spec(Family.HANDLEBARS, measures=[SavedRef("m", K.PERCENT)]),
+        assert (_refusal(spec, interactive_pivot_available=True) is None) is allowed, kind
+    assert _refusal(_spec(Family.HANDLEBARS, measures=[SavedRef("m", K.PERCENT)]),
                         interactive_pivot_available=True)
 
 
 def test_interactive_pivot_only_when_advertised():
     spec = _spec(Family.INTERACTIVE_PIVOT)
-    assert plan_refusal(spec, interactive_pivot_available=False)
-    assert plan_refusal(spec, interactive_pivot_available=True) is None
-    assert plan_refusal(_spec(Family.PIVOT), interactive_pivot_available=False) is None
+    assert _refusal(spec, interactive_pivot_available=False)
+    assert _refusal(spec, interactive_pivot_available=True) is None
+    assert _refusal(_spec(Family.PIVOT), interactive_pivot_available=False) is None
 
 
 @pytest.mark.parametrize("family,changes", [
@@ -262,14 +320,14 @@ def test_interactive_pivot_only_when_advertised():
     (Family.WATERFALL, dict(dimensions=())), (Family.TABLE, dict(dimensions=(), measures=[])),
 ])
 def test_a_spec_that_cannot_be_built_is_refused_not_a_crash(family, changes):
-    assert plan_refusal(_spec(family, **changes), interactive_pivot_available=True)
+    assert _refusal(_spec(family, **changes), interactive_pivot_available=True)
 
 
 def test_row_limit_is_held_to_what_the_chart_model_accepts():
     """`GaugeChartConfig.row_limit` is at most 10, and `BigNumberChartConfig` has no row_limit field."""
-    assert plan_refusal(_spec(Family.GAUGE, row_limit=50), interactive_pivot_available=True)
-    assert plan_refusal(_spec(Family.GAUGE, row_limit=10), interactive_pivot_available=True) is None
-    assert plan_refusal(_spec(Family.PIE, row_limit=0), interactive_pivot_available=True)
+    assert _refusal(_spec(Family.GAUGE, row_limit=50), interactive_pivot_available=True)
+    assert _refusal(_spec(Family.GAUGE, row_limit=10), interactive_pivot_available=True) is None
+    assert _refusal(_spec(Family.PIE, row_limit=0), interactive_pivot_available=True)
     assert "row_limit" not in _build(_spec(Family.BIG_NUMBER, row_limit=50))["config"]
 
 
@@ -307,7 +365,8 @@ def test_families_whose_request_carries_the_format_owe_nothing(family):
 @pytest.mark.parametrize("held", [None, UNKNOWN, {"symbol": "$", "symbolPosition": "prefix"},
                                   {"symbol": "usd", "symbolPosition": "prefix"}])
 def test_a_saved_currency_metric_without_its_own_iso_currency_uses_the_deployment_currency(held):
-    """Decision 8: the deployment currency, unless the saved metric carries its own ISO code; a symbol is not one."""
+    """The deployment currency (`superset_currency`, `MNEMIQ_SUPERSET_CURRENCY`), unless the saved metric carries its own
+    ISO code; a symbol is not one."""
     saved = {"m": SavedMetric(7, "m", "SUM(x)", None, None, held, None, None)}
     spec = _spec(Family.PIE, measures=[SavedRef("m", K.CURRENCY)])
     config = generate_chart_request(spec, {}, saved, currency="EUR")["config"]

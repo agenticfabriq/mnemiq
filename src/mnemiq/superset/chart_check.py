@@ -81,8 +81,8 @@ class ChartCheck:
 @dataclass(frozen=True)
 class DatasetFacts:
     """The chart's dataset, as `get_dataset_info` gives it to the builder. `database_id`, `schema` and
-    `saved_metric_sql` (each saved metric's name and expression) are what mnemiq's own statement needs beyond the
-    plan's five fields: where the table is, and what a saved metric the chart names computes."""
+    `saved_metric_sql` (each saved metric's name and expression) are what mnemiq's own statement needs beyond whether
+    the dataset can be checked: where the table is, and what a saved metric the chart names computes."""
 
     dataset_id: int
     is_virtual: bool

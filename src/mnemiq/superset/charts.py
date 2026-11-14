@@ -121,7 +121,8 @@ _ISO = re.compile(r"^[A-Z]{3}$")
 
 def _currency(ref: MeasureRef, saved: dict[str, SavedMetric], deployment: str) -> str | None:
     """The ISO code a currency measure shows its currency in: its own, or a reused saved metric's own when that is an
-    ISO code, else the deployment currency (decision 8). A measure of another kind has none."""
+    ISO code, else the deployment currency (`superset_currency`, `MNEMIQ_SUPERSET_CURRENCY`): a saved metric whose
+    currency is none, `UNKNOWN` or a symbol is shown in the deployment's. A measure of another kind has none."""
     if _kind(ref) is not MeasureKind.CURRENCY:
         return None
     if isinstance(ref, WrittenRef):
@@ -131,21 +132,27 @@ def _currency(ref: MeasureRef, saved: dict[str, SavedMetric], deployment: str) -
     return own if isinstance(own, str) and _ISO.match(own) else deployment
 
 
-def _axis_refusal(refs: tuple[MeasureRef, ...], axis: str) -> str | None:
+def _axis_refusal(refs: tuple[MeasureRef, ...], axis: str, saved: dict[str, SavedMetric],
+                  deployment: str) -> str | None:
     kinds = {_kind(ref) for ref in refs}
     if len(kinds) > 1:
         return (f"the {axis}axis would show {' and '.join(sorted(k.value for k in kinds))} measures in one number "
                 "format; plot one kind on an axis")
-    currencies = {ref.measure.currency for ref in refs if isinstance(ref, WrittenRef) and _kind(ref) is
-                  MeasureKind.CURRENCY}
+    # Each as the request shows it: `_format` gives the whole axis the first measure's currency.
+    currencies = {_currency(ref, saved, deployment) for ref in refs if _kind(ref) is MeasureKind.CURRENCY}
     if len(currencies) > 1:
         return f"the {axis}axis would show more than one currency; plot one currency on an axis"
     return None
 
 
-def plan_refusal(spec: ChartSpec, *, interactive_pivot_available: bool) -> str | None:
+def plan_refusal(spec: ChartSpec, *, interactive_pivot_available: bool, saved: dict[str, SavedMetric],
+                 currency: str) -> str | None:
     """Why `spec` cannot be built as asked, or None. The checks are on what the chart would show wrongly or cannot be
-    built from, never on what Superset would accept."""
+    built from, never on what Superset would accept. `saved` holds the reused saved metrics by name and `currency` is
+    the deployment's ISO code, as the request builders take them: two currency measures on one axis are refused when
+    the request would show them in different currencies, each resolved as `generate_chart_request` resolves it (a saved
+    metric's own ISO code, a written measure's own currency, else the deployment's; a saved metric whose currency is
+    `UNKNOWN` is the deployment's)."""
     family, refs = spec.family, spec.measures
     if family is Family.INTERACTIVE_PIVOT and not interactive_pivot_available:
         return "this Superset does not offer the interactive pivot table; use the pivot table"
@@ -179,9 +186,10 @@ def plan_refusal(spec: ChartSpec, *, interactive_pivot_available: bool) -> str |
             return "a mixed chart needs a time column"
         if len(refs) < 2:
             return "a mixed chart needs a primary and a secondary measure"
-        return _axis_refusal(refs[:1], "primary ") or _axis_refusal(refs[1:], "secondary ")
+        return (_axis_refusal(refs[:1], "primary ", saved, currency)
+                or _axis_refusal(refs[1:], "secondary ", saved, currency))
     if family not in _ONE_FORMAT_PER_AXIS_EXEMPT:
-        return _axis_refusal(refs, "")
+        return _axis_refusal(refs, "", saved, currency)
     return None
 
 
