@@ -27,15 +27,17 @@ def create_dashboard(request: dict[str, Any]) -> dict[str, Any]:
 
 
 @tool(name="claim_chart", class_permission_name="Chart", method_permission_name="write",
-      description="Make a chart a dashboard's: the dashboard's editors, a build marker and its saved query. "
+      description="Make a chart a dashboard's: the dashboard's editors (with ENABLE_VIEWERS and "
+                  "VIEWER_PROMISCUOUS_MODE on, the dataset rule instead), a build marker and its saved query. "
                   "request: {chart_id, dashboard_id, marker}.")
 def claim_chart(request: dict[str, Any]) -> dict[str, Any]:
     return writes.claim_chart(request)
 
 
 @tool(name="claim_dataset", class_permission_name="Dataset", method_permission_name="write",
-      description="Make a dataset a dashboard's: a build marker, and as editors the caller and the dashboard's users "
-                  "whose grants already reach it. request: {dataset_id, dashboard_id, marker}.")
+      description="Make a dataset a dashboard's: a build marker, and its existing editors kept, with the caller and "
+                  "only the dashboard's users who can already read it added. "
+                  "request: {dataset_id, dashboard_id, marker}.")
 def claim_dataset(request: dict[str, Any]) -> dict[str, Any]:
     return writes.claim_dataset(request)
 

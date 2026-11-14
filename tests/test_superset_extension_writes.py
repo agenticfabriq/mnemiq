@@ -836,6 +836,22 @@ def test_the_request_user_comes_back_when_a_check_fails(claiming):
     assert claiming.superset.ran == []
 
 
+def test_a_dashboard_user_subject_without_a_user_is_skipped(claiming):
+    """A user subject whose `user` is None (its account is gone) is neither judged nor made an editor."""
+    gone = SimpleNamespace(id=199, type=USER, label="Gone", user=None)
+    claiming.dashboard.editors.append(gone)
+    writes.claim_dataset({"dataset_id": 4, "dashboard_id": 3, "marker": format_marker(BUILD, "data", 3)})
+    assert 199 not in _sent_editors(claiming.superset, "UpdateDatasetCommand")
+
+
+def test_as_user_removes_the_user_it_set_when_the_request_had_none(superset):
+    """Where `g` had no user before, `_as_user` leaves it with none again, rather than the user it ran as."""
+    assert not hasattr(superset.g, "user")
+    with writes._as_user(SimpleNamespace(id=5)):
+        assert superset.g.user.id == 5
+    assert not hasattr(superset.g, "user")
+
+
 def _chart(claiming, editors) -> SimpleNamespace:
     form_data = {"viz_type": "funnel", "groupby": ["status"], "metric": "count", "datasource": "4__table"}
     return SimpleNamespace(id=9, description=None, datasource_type="table", datasource_id=4, viz_type="funnel",

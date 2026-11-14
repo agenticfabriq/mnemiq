@@ -79,17 +79,17 @@ from them what it already may do through Superset's own tools.
 
 In Superset 7.0.0rc2 an editor of a dataset may read its data: the access check admits a dataset's editors, and
 SQL Lab admits an editor of any dataset over a table to that table. Editors are users, roles and groups, and a role or
-a group made an editor makes every member one. So the tools choose editors so that being made one widens no one's
-access:
+a group made an editor makes every member one. So the tools choose editors with care: whether a user can already read a dataset is checked when the claim adds
+them, and the extension never changes a dataset's source.
 
-- **A dataset** `claim_dataset` makes a dashboard's keeps the editors it has (its creator among them: the claim removes
-  none), and adds the caller and each user among the dashboard's editors whose grants already reach both the dataset
-  and its table: datasource access to the dataset, or access to its database, to all databases or to all datasources.
-  These are the grants SQL Lab's strict check of a table admits. Schema or catalog access alone does not count: it
-  reads the dataset, but SQL Lab's strict check skips it, and there editorship of the dataset would reach the table.
-  Each user is judged as that user, and being an editor of the dataset does not count. A role or a group among the
+- A dataset that `claim_dataset` claims for a dashboard keeps its editors (the claim removes none) and adds the
+  caller and each user among the dashboard's editors whose grants already reach both the dataset and its table:
+  datasource access to the dataset, or access to its database, to all databases or to all datasources. These are
+  the grants SQL Lab's strict check of a table admits. Schema or catalog access alone does not count: it reads the
+  dataset, but SQL Lab's strict check skips it, and there editorship of the dataset would reach the table. Each user
+  is judged as that user, and being an editor of the dataset does not count. A role or a group among the
   dashboard's editors is never added.
-- **A chart** `claim_chart` or `create_chart` makes a dashboard's gets the dashboard's editors. When
+- A chart that `claim_chart` or `create_chart` makes a dashboard's gets the dashboard's editors. When
   `ENABLE_VIEWERS` is on and `VIEWER_PROMISCUOUS_MODE` is set, a chart's editors may read its dataset's data, so a
   chart's editors are then chosen as a dataset's are, against the chart's dataset.
 
