@@ -16,6 +16,7 @@ from mnemiq.generate.generator import LLMGenerator
 from mnemiq.llm.client import LLMClient
 from mnemiq.semantic.fit import PromptFitter, fitter_for
 from mnemiq.semantic.values import NoValueIndex, ValueIndex
+from mnemiq.superset.planner import LLMPlanner
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,9 @@ class Components:
     # Both doors fit the packet to the window with this one (M127), so the eval measures the
     # prompt the product sends.
     fitter: PromptFitter
+    # Superset mode's dashboard planner, on the profile's own client, so a build is planned by the
+    # model of the profile it was asked under. Nothing calls it outside a build.
+    planner: LLMPlanner
 
 
 def build_components(settings: Settings, adapter, con) -> Components:
@@ -45,4 +49,5 @@ def build_components(settings: Settings, adapter, con) -> Components:
     return Components(client=client, generator=generator, synthesizer=LLMSynthesizer(client, markdown=settings.answer_markdown),
                       corrector=LLMCorrector(client), values=ValueIndex(con),
                       selector=LLMSelector(client),
-                      fitter=fitter_for(settings, getattr(adapter, "dialect", "duckdb")))
+                      fitter=fitter_for(settings, getattr(adapter, "dialect", "duckdb")),
+                      planner=LLMPlanner(client))
