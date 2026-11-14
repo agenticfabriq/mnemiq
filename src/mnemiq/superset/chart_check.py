@@ -47,7 +47,7 @@ from mnemiq.sql.verdict import Refusal
 from mnemiq.superset.adapter import JINJA_DELIMITERS
 from mnemiq.superset.charts import Filter
 from mnemiq.superset.client import SupersetToolError, SupersetUnavailable
-from mnemiq.superset.display_format import CANNOT_TELL, Displayed, displayed, fits
+from mnemiq.superset.display_format import CANNOT_TELL, Displayed, displayed, fits, metric_label, shows_currency
 from mnemiq.superset.measures import Measure, MeasureKind, measure_statement, run_decided
 from mnemiq.superset.saved_metrics import SavedMetric
 
@@ -170,22 +170,6 @@ _UNREADABLE = "mnemiq could not read the chart's settings: "
 # ---------------------------------------------------------------- reading form_data
 
 
-def _label(item) -> str | None:
-    """The column Superset names a metric's values by (`get_metric_name` in `superset/utils/core.py`)."""
-    if isinstance(item, str):
-        return item
-    if not isinstance(item, dict):
-        return None
-    if isinstance(item.get("label"), str) and item["label"]:
-        return item["label"]
-    if item.get("expressionType") == "SQL" and isinstance(item.get("sqlExpression"), str):
-        return item["sqlExpression"]
-    column = (item.get("column") or {}).get("column_name") if isinstance(item.get("column"), dict) else None
-    if item.get("expressionType") == "SIMPLE" and column and item.get("aggregate"):
-        return f"{item['aggregate']}({column})"
-    return column
-
-
 def _metric_items(viz_type: str, form: dict) -> list:
     """The chart's metrics as `form_data` holds them, read as `resolve_metrics_and_groupby` does: a one-metric type's
     `metric` (else its first of `metrics`), any other type's `metrics` (else its `metric`), and a mixed chart's
@@ -209,7 +193,7 @@ def _metric(item, dataset: DatasetFacts) -> tuple[str, str] | NotCheckable:
         if item not in dataset.saved_metric_names:
             return NotCheckable(f"the chart names the saved metric {item!r}, which its dataset does not have")
         return item, item
-    label = _label(item)
+    label = metric_label(item)
     if not isinstance(item, dict) or not label:
         return NotCheckable("the chart holds a metric mnemiq cannot read")
     if item.get("expressionType") == "SQL":
@@ -776,7 +760,7 @@ def _describe(shown: Displayed) -> str:
     symbol = (shown.currency or {}).get("symbol")
     if not symbol:
         return f"{fmt}, with no currency"
-    if not re.fullmatch(r"[A-Z]{3}", str(symbol)):
+    if not shows_currency(symbol):
         return f"{fmt}, with the currency symbol {symbol!r}, which Superset's renderer does not show"
     return f"{fmt}, with the currency {symbol}"
 
@@ -786,7 +770,7 @@ def _format_problem(viz_type: str, form: dict, kinds: dict[str, MeasureKind], sa
     decides from what mnemiq cannot see (`CANNOT_TELL`), and a saved metric whose own record the caller did not pass,
     are not judged."""
     for item in _metric_items(viz_type, form):
-        label = _label(item)
+        label = metric_label(item)
         kind = kinds.get(label) if label else None
         if kind is None:
             continue

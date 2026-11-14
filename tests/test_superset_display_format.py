@@ -174,3 +174,53 @@ def test_pivot_actual_values_is_the_default_display_not_a_percent():
     form = {"valueFormat": ",d", "showValuesAs": "actual"}
     assert displayed("pivot_table_v2", form, ADHOC, None) == Displayed(",d", None)
     assert displayed("pivot_table_v2", {**form, "showValuesAs": "percent_total"}, ADHOC, None) is CANNOT_TELL
+
+
+@pytest.mark.parametrize("kind, shown, ok", [
+    (MeasureKind.COUNT, Displayed(",.0%", None), False),
+    (MeasureKind.COUNT, Displayed(",d", USD), False),
+    (MeasureKind.NUMBER, Displayed("$,.2f", None), False),
+    (MeasureKind.COUNT, Displayed(",d", None), True),
+    (MeasureKind.NUMBER, Displayed("SMART_NUMBER", None), True),
+], ids=["a count in percent", "a count in dollars", "a number in a $ format", "a count as ,d",
+        "a number in the default format"])
+def test_a_count_or_a_number_shows_neither_a_currency_nor_a_percent(kind, shown, ok):
+    assert fits(kind, shown) is ok
+
+
+def test_a_lower_case_code_shows_its_currency():
+    """rc2's `getCurrencySymbol` (`currency-format/CurrencyFormatter.ts`) hands the symbol to `Intl.NumberFormat`, which
+    takes a well-formed code in either case: `usd` shows `$`, and the percent beside it loses its `%`."""
+    assert not fits(MeasureKind.PERCENT, Displayed(",.1%", {"symbol": "usd"}))
+    assert fits(MeasureKind.CURRENCY, Displayed(",.2f", {"symbol": "usd"}))
+    assert not fits(MeasureKind.NUMBER, Displayed(",.2f", {"symbol": "Eur"}))
+    # what `Intl.NumberFormat` refuses shows no currency, and the percent keeps its `%`
+    assert not fits(MeasureKind.CURRENCY, Displayed(",.2f", {"symbol": "us"}))
+    assert fits(MeasureKind.PERCENT, Displayed(",.1%", {"symbol": "$"}))
+
+
+TIMESERIES = ["echarts_timeseries_line", "echarts_timeseries_bar", "echarts_area", "echarts_timeseries_scatter",
+              "echarts_timeseries_smooth", "echarts_timeseries_step", "echarts_timeseries"]
+
+
+@pytest.mark.parametrize("viz_type", TIMESERIES)
+def test_series_stacked_to_100_percent_cannot_tell_on_every_timeseries_type(viz_type):
+    """`Timeseries/transformProps.ts`, which every timeseries type renders through, forces a percent display for
+    `isAreaExpand = stack === StackControlsValue.Expand`, whatever the type."""
+    assert displayed(viz_type, {"stack": "Expand", "y_axis_format": ",.2f"}, ADHOC, None) is CANNOT_TELL
+    assert displayed(viz_type, {"stack": "Stack", "y_axis_format": ",.2f"}, ADHOC, None) == Displayed(",.2f", None)
+
+
+def test_an_unlabelled_metric_is_keyed_as_rc2_keys_it():
+    """`getMetricLabel` (`superset-ui-core/src/query/getMetricLabel.ts`): an ad hoc metric with no label is keyed by its
+    SQL, or a SIMPLE one by `AGGREGATE(column)`."""
+    sql = {"expressionType": "SQL", "sqlExpression": "SUM(amount)"}
+    simple = {"expressionType": "SIMPLE", "aggregate": "SUM", "column": {"column_name": "amount"}}
+    form = {"column_config": {"SUM(amount)": {"d3NumberFormat": ",d"}}}
+    assert displayed("table", form, sql, None) == Displayed(",d", None)
+    assert displayed("table", form, simple, None) == Displayed(",d", None)
+    # a mixed chart tells two unlabelled metrics apart by those keys too
+    orders = {"expressionType": "SQL", "sqlExpression": "COUNT(*)"}
+    mixed = {"metrics": [sql], "metrics_b": [orders], "y_axis_format": ",.2f", "y_axis_format_secondary": ",d"}
+    assert displayed("mixed_timeseries", mixed, sql, None) == Displayed(",.2f", None)
+    assert displayed("mixed_timeseries", mixed, orders, None) == Displayed(",d", None)

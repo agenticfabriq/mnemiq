@@ -251,6 +251,16 @@ def test_wrong_currency_is_format_wrong_even_when_values_match(fake, currency):
     assert check.chart_values == check.mnemiq_values == (("east", 1200),)
 
 
+def test_a_lower_case_currency_code_shows_as_rc2_shows_it(fake):
+    """`Intl.NumberFormat` takes `usd` as a code, so rc2 shows a currency there and drops a percent's `%`: a percent
+    measure shown beside it is in the wrong format, and the reason says the currency shows."""
+    _serve(fake, form_data=_bar(y_axis_format=",.1%", currency_format={"symbol": "usd", "symbolPosition": "prefix"}),
+           chart=_chart_data(["region", "Total premium"], ("east", 1200)), mnemiq=_result(("east", 1200)))
+    check = _check(fake, kinds={"Total premium": MeasureKind.PERCENT})
+    assert check.status is ChartStatus.FORMAT_WRONG, check.reason
+    assert "with the currency usd" in check.reason and "does not show" not in check.reason
+
+
 def test_a_metric_whose_kind_is_unknown_is_checked_for_its_values_only(fake):
     """A metric added by hand has no kind mnemiq gave it, so its format is not judged; its numbers still are."""
     _serve(fake, form_data=_bar(currency_format=None, y_axis_format=",d"),

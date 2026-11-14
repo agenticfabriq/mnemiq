@@ -18,10 +18,13 @@ from dataclasses import dataclass
 from mnemiq.superset.measures import MeasureKind
 from mnemiq.superset.saved_metrics import UNKNOWN, SavedMetric
 
-__all__ = ["CANNOT_TELL", "Displayed", "displayed", "fits"]
+__all__ = ["CANNOT_TELL", "Displayed", "displayed", "fits", "metric_label", "shows_currency"]
 
 AUTO = "AUTO"
-_ISO = re.compile(r"^[A-Z]{3}$")
+# A currency code `Intl.NumberFormat` takes (ECMA-402's IsWellFormedCurrencyCode): three ASCII letters, in either case.
+# rc2's `getCurrencySymbol` (`currency-format/CurrencyFormatter.ts`) hands the symbol to it as it is, so `usd` shows
+# `$`. A request mnemiq sends still carries the code in capitals.
+_CODE = re.compile(r"[A-Za-z]{3}")
 
 
 class _CannotTell:
@@ -40,7 +43,9 @@ class Displayed:
     currency: dict | None
 
 
-_TIMESERIES = {"echarts_timeseries_line", "echarts_timeseries_bar", "echarts_area", "echarts_timeseries_scatter"}
+# Every type rendered by `Timeseries/transformProps.ts` (each plugin's `index.ts` under `Timeseries/` imports it).
+_TIMESERIES = {"echarts_timeseries_line", "echarts_timeseries_bar", "echarts_area", "echarts_timeseries_scatter",
+               "echarts_timeseries_smooth", "echarts_timeseries_step", "echarts_timeseries"}
 _BIG_NUMBER = {"big_number_total", "big_number"}
 _CHART_WINS = {"pie", "gauge_chart", "funnel", "treemap_v2"}
 
@@ -50,13 +55,28 @@ def _saved_of(metric_key, saved: SavedMetric | None) -> SavedMetric | None:
     return saved if isinstance(metric_key, str) else None
 
 
-def _label(metric_key) -> str:
-    return metric_key if isinstance(metric_key, str) else str(metric_key.get("label", ""))
+def metric_label(item) -> str | None:
+    """The name Superset keys a metric's values by: a saved metric's name, else an ad hoc metric's label, its SQL, or
+    `AGGREGATE(column)` (`getMetricLabel` in `superset-ui-core/src/query/getMetricLabel.ts`, which the renderers key
+    their formats by; `get_metric_name` in `superset/utils/core.py` names the result's column the same way). None for
+    what is neither."""
+    if isinstance(item, str):
+        return item
+    if not isinstance(item, dict):
+        return None
+    if isinstance(item.get("label"), str) and item["label"]:
+        return item["label"]
+    if item.get("expressionType") == "SQL" and isinstance(item.get("sqlExpression"), str):
+        return item["sqlExpression"]
+    column = (item.get("column") or {}).get("column_name") if isinstance(item.get("column"), dict) else None
+    if item.get("expressionType") == "SIMPLE" and column and item.get("aggregate"):
+        return f"{item['aggregate']}({column})"
+    return column
 
 
 def _named(metric, key) -> bool:
-    return any(m == key or (isinstance(m, dict) and isinstance(key, dict) and m.get("label") == key.get("label"))
-               for m in (metric or []))
+    label = metric_label(key)
+    return label is not None and any(metric_label(m) == label for m in (metric or []))
 
 
 def _symbol(currency) -> str:
@@ -93,8 +113,9 @@ def displayed(viz_type: str, form_data: dict, metric_key, saved: SavedMetric | N
         # Timeseries/transformProps.ts, `buildCustomFormatters(..., yAxisFormat, ...)` and `forcePercentFormatter`. A saved
         # chart holds the control's own name, `rebase_percent_change` (Regular/Line/controlPanel.tsx), which the
         # renderer sees camel-cased; `contributionMode` and `stack` are saved under those same names.
+        # `isAreaExpand = stack === StackControlsValue.Expand` there, whatever the type.
         if form_data.get("contributionMode") or form_data.get("rebase_percent_change") \
-                or (viz_type == "echarts_area" and form_data.get("stack") == "Expand"):
+                or form_data.get("stack") == "Expand":
             return CANNOT_TELL
         d3 = form_data.get("y_axis_format")
         if d3 is None and saved is not None:
@@ -138,7 +159,7 @@ def displayed(viz_type: str, form_data: dict, metric_key, saved: SavedMetric | N
     if viz_type == "table":
         # plugin-chart-table/src/transformProps.ts, `processColumns`: `config.d3NumberFormat || savedFormat` and
         # `config.currencyFormat?.symbol ? config.currencyFormat : savedCurrency`, keyed by the result column name.
-        config = (form_data.get("column_config") or {}).get(_label(metric_key)) or {}
+        config = (form_data.get("column_config") or {}).get(metric_label(metric_key)) or {}
         if config.get("d3SmallNumberFormat"):
             return CANNOT_TELL
         d3 = config.get("d3NumberFormat") or (saved.d3format if saved is not None else None)
@@ -160,14 +181,20 @@ def displayed(viz_type: str, form_data: dict, metric_key, saved: SavedMetric | N
     return CANNOT_TELL
 
 
+def shows_currency(symbol) -> bool:
+    """Whether rc2's renderer shows `symbol` as a currency: `Intl.NumberFormat` takes it as a code (three ASCII letters,
+    either case), where it throws on anything else and `CurrencyFormatter.format` returns the bare number."""
+    return isinstance(symbol, str) and bool(_CODE.fullmatch(symbol))
+
+
 def _currency_shown(shown: Displayed) -> bool:
-    """A currency is on screen when the effective currency's symbol is an ISO code (`Intl.NumberFormat` throws on
-    anything else and `CurrencyFormatter.format` then returns the bare number), or, when no symbol is set, when the
-    d3 format itself starts with `$`. With a symbol set a `CurrencyFormatter` is built, and its
-    `getNormalizedD3Format` strips every `$`, so a `$` format beside a non-ISO symbol shows no currency."""
+    """A currency is on screen when the effective currency's symbol is a code `Intl.NumberFormat` takes
+    (`shows_currency`), or, when no symbol is set, when the d3 format itself starts with `$`. With a symbol set a
+    `CurrencyFormatter` is built, and its `getNormalizedD3Format` strips every `$`, so a `$` format beside a symbol that
+    is not a code shows no currency."""
     symbol = _symbol(shown.currency)
     if symbol:
-        return bool(_ISO.match(symbol))
+        return shows_currency(symbol)
     return (shown.d3format or "").startswith("$")
 
 
