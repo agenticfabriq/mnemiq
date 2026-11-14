@@ -15,8 +15,8 @@ Superset 7.0.0rc2 decide most of it:
   without post-processing. So a chart whose shown numbers come after the query (a rolling window, a time comparison, a
   contribution, a forecast, quartiles, bins) is not checked, whichever query its data tool runs.
 - Superset's rows are read as the chart's groups only on evidence in the answer itself. Each result used carries every
-  grouping column the chart's settings name, and none carries the `GROUPING()` markers of totals asked for as grouping
-  sets. Under a time grain every x-axis value sits on the grain: the rebuild puts a string x-axis among the query's
+  grouping column the chart's settings name, and none carries the `GROUPING()` markers of a grouping-sets query.
+  Under a time grain every x-axis value sits on the grain: the rebuild puts a string x-axis among the query's
   columns as it is, and `time_grain_sqla` reaches a query only through a `BASE_AXIS` column
   (`apply_time_grain_to_base_axis` in `superset/common/utils/time_grain_utils.py`; `adhoc_column_to_sqla` in
   `superset/connectors/sqla/models.py`), as the saved query context sends it. Rows that are not the chart's groups
@@ -110,7 +110,7 @@ _UNREADABLE = "mnemiq could not read the chart's settings: "
 _NO_GRAIN = ("Superset's data tool returned this chart's rows without its time grain, as it does for a chart with no "
              "saved query context, so the numbers the chart shows by its time grain were not compared")
 # The suffix of each `GROUPING()` marker column a grouping-sets query adds (`GROUPING_MARKER_SUFFIX` in
-# `superset/common/grouping_sets.py`), one per grouping column: its rows hold totals beside the cells.
+# `superset/common/grouping_sets.py`), one per grouping column, marking the level each row groups by.
 _GROUPING_MARKER = "__superset_grouping"
 # Where Postgres's `DATE_TRUNC` for each grain mnemiq reproduces puts a time (`_GRAINS`): which of its fields are zero
 # or first. `DATE_TRUNC('week', ...)` gives a Monday.
@@ -228,7 +228,10 @@ def _canonical(value):
 def _on_the_grain(value, grain: str) -> bool:
     """Whether a time Superset answered sits where Postgres's `DATE_TRUNC` for `grain` puts one, read as spelled: its
     wall clock, whatever offset it carries, since the database truncates in its own time zone. A null is a null
-    group's key. Anything that is not a time is not on a grain."""
+    group's key. Anything that is not a time is not on a grain, and no time is on a grain mnemiq does not know."""
+    on_grain = _ON_GRAIN.get(grain)
+    if on_grain is None:
+        return False
     if value is None:
         return True
     if isinstance(value, str):
@@ -241,7 +244,7 @@ def _on_the_grain(value, grain: str) -> bool:
     if not isinstance(value, date):
         return False
     moment = value if isinstance(value, datetime) else datetime(value.year, value.month, value.day)
-    return _ON_GRAIN[grain](moment)
+    return on_grain(moment)
 
 
 def _line_up(sets: list[tuple[list, list]], labels: list[str], dimensions: tuple[str, ...],
@@ -255,8 +258,8 @@ def _line_up(sets: list[tuple[list, list]], labels: list[str], dimensions: tuple
     largest = 0
     for columns, _ in sets:
         if any(isinstance(name, str) and name.endswith(_GROUPING_MARKER) for name in columns):
-            return NotCheckable("Superset's rows for this chart hold its totals beside its cells (grouping sets, which "
-                                "the chart's saved query context asks for), so they cannot be lined up with mnemiq's")
+            return NotCheckable("Superset's rows for this chart come from grouping sets, each row marked with the "
+                                "level it groups by, so they cannot be lined up with mnemiq's")
     for columns, rows in sets:
         present = [i for i, label in enumerate(labels) if label in columns]
         if not present or not all(name in columns for name in dimensions):

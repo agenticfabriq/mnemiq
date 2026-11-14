@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 import pytest
 
 import mnemiq.superset.chart_check as chart_check
+import mnemiq.superset.chart_form as chart_form
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Column, Snapshot
 from mnemiq.superset.adapter import SupersetSqlAdapter
@@ -1029,7 +1030,8 @@ NOT_ADDITIVE = ["COUNT(DISTINCT channel)", "SUM(DISTINCT premium)", "SUM(premium
                 "AVG(premium)", "MIN(premium)", "MAX(premium)", "SUM(premium) FILTER (WHERE premium > 0)",
                 "SUM(premium) OVER ()", "(SUM(premium))", "COALESCE(SUM(premium), 0)", "SUM(premium)::numeric",
                 "COUNT(id) + 0", "COUNT(1)", "COUNT(id, region)", "SUM(premium); SELECT 1", "SUM(",
-                "SUM(premium) * {{ rate }}"]
+                "SUM(premium) * {{ rate }}", "SUM({{ col }})", "SUM({{col}})", "SUM(premium * {{ rate }})",
+                "SUM(premium {# note #})", "SUM(premium) {# note #}"]
 
 
 @pytest.mark.parametrize("expression, additive", [(e, True) for e in ADDITIVE] + [(e, False) for e in NOT_ADDITIVE],
@@ -1038,8 +1040,9 @@ def test_an_sql_metric_is_a_sum_only_when_its_whole_expression_is_one(expression
     """mnemiq writes every measure as an SQL metric, so whether the totals a chart shows are the sums of the groups it
     checks is read from the metric's expression, parsed as Postgres: one top-level SUM, or one COUNT of a column or of
     every row, with nothing around it. A distinct count or sum, a ratio, an average, a minimum or a maximum, a filtered
-    or windowed aggregate, anything wrapped around the aggregate, and SQL that does not parse are not. The same reading
-    decides a waterfall's running totals, a pivot table's totals and a sankey's nodes."""
+    or windowed aggregate, anything wrapped around the aggregate, SQL that does not parse, and SQL holding a template
+    marker (`{{`, `{%`, `{#`, which Superset renders before running it and sqlglot reads as something else) are not. The
+    same reading decides a waterfall's running totals, a pivot table's totals and a sankey's nodes."""
     metric = PREMIUM | {"sqlExpression": expression}
     waterfall = expectation_from_form_data(_waterfall(metric=metric), dataset=PHYSICAL)
     pivot = expectation_from_form_data({"viz_type": "pivot_table_v2", "metrics": [metric], "groupbyRows": ["region"],
@@ -1247,6 +1250,15 @@ EXCLUDED = {
     "a sankey's nodes of a ratio": (_sankey(metric=copy.deepcopy(RATIO)),
                                     (["region", "channel", "Premium per policy"], BY_REGION, REGION_AND_CHANNEL),
                                     "sum"),
+    "a line's tooltip total of two metrics": (
+        _line(metrics=[copy.deepcopy(PREMIUM), copy.deepcopy(POLICIES)], showTooltipTotal=True,
+              adhoc_filters=[copy.deepcopy(NO_TIME_FILTER)]),
+        (["order_date", "Total premium", "Policies"], ((JAN, 30, 3), (FEB, 12, 1)),
+         (("order_date", "datetime64[ns]"), ("m0", "int64"), ("m1", "int64"))), "total"),
+    "a stack's total labels of an AVG": (
+        _over_time("echarts_timeseries_bar", metrics=[copy.deepcopy(AVERAGE)], stack="Stack", only_total=True,
+                   show_value=True),
+        (["order_date", "channel", "Average premium"], BY_MONTH, MONTH_AND_CHANNEL), "total"),
     "a pivot's cells as shares": (_pivot_table(showValuesAs="percent_row"),
                                   (["region", "channel", "Total premium"], BY_REGION, REGION_AND_CHANNEL), "share"),
     "a table's totals row": (_table(groupby=["channel"], adhoc_filters=[], show_totals=True), BY_CHANNEL_ROWS, "total"),
@@ -1326,3 +1338,94 @@ def test_rows_on_the_grain_it_was_not_applied_to_are_found_by_the_plain_read(fak
     assert check.status is ChartStatus.NOT_CHECKED and "time grain" in check.reason, check.reason
     grained, plain = _statements(fake)
     assert "DATE_TRUNC" in grained.upper() and "DATE_TRUNC" not in plain.upper()
+
+
+# --- a total across the series, summed by the renderer ----------------------------------------------------------------
+
+TWO_METRICS = [copy.deepcopy(PREMIUM), copy.deepcopy(POLICIES)]
+STACK_TOTALS = {"stack": "Stack", "only_total": True, "show_value": True}
+SERIES_TOTALS = [
+    ("an Explore-saved two-metric line with the tooltip total",
+     _line(metrics=TWO_METRICS, showTooltipTotal=True), "total"),
+    ("a two-metric line with the tooltip's percentages", _line(metrics=TWO_METRICS, showTooltipPercentage=True),
+     "total"),
+    ("two SUMs with the tooltip total", _line(metrics=[copy.deepcopy(PREMIUM), copy.deepcopy(SUM_PREMIUM)],
+                                              showTooltipTotal=True), "total"),
+    ("a line of an AVG grouped, with the tooltip total",
+     _over_time("echarts_timeseries_line", metrics=[copy.deepcopy(AVERAGE)], showTooltipTotal=True), "total"),
+    ("a bar of a ratio grouped, with the tooltip total",
+     _over_time("echarts_timeseries_bar", metrics=[copy.deepcopy(RATIO)], showTooltipTotal=True), "total"),
+    ("a smooth line of an AVG grouped, with the tooltip total",
+     _over_time("echarts_timeseries_smooth", metrics=[copy.deepcopy(AVERAGE)], showTooltipTotal=True), "total"),
+    ("a stacked bar of an AVG grouped, labelled with its totals",
+     _over_time("echarts_timeseries_bar", metrics=[copy.deepcopy(AVERAGE)], **STACK_TOTALS), "total"),
+    ("a stacked area of two metrics, labelled with its totals (camel-cased keys)",
+     _line(viz_type="echarts_area", metrics=TWO_METRICS, stack="Stack", onlyTotal=True, showValue=True), "total"),
+    ("a mixed chart's first side of an AVG, stacked and labelled with its totals",
+     MIXED | {"metrics": [copy.deepcopy(AVERAGE)], **STACK_TOTALS}, "total"),
+    ("a mixed chart's second side of an AVG, stacked and labelled with its totals",
+     MIXED | {"metrics_b": [copy.deepcopy(AVERAGE) | {"label": "Orders"}], "stackB": "Stack", "only_totalB": True,
+              "show_valueB": True}, "total"),
+    ("one SQL SUM grouped, with the tooltip total", _over_time("echarts_timeseries_line", showTooltipTotal=True), None),
+    ("one SQL COUNT(*) grouped, with the tooltip's percentages",
+     _over_time("echarts_timeseries_bar", metrics=[copy.deepcopy(POLICIES)], showTooltipPercentage=True), None),
+    ("two metrics, the tooltip total off", _line(metrics=TWO_METRICS, showTooltipTotal=False), None),
+    ("two metrics with no tooltip total saved, as MCP saves a chart", _line(metrics=TWO_METRICS), None),
+    ("two metrics with the tooltip total but the rich tooltip off",
+     _line(metrics=TWO_METRICS, showTooltipTotal=True, rich_tooltip=False), None),
+    ("one AVG ungrouped, one series, with the tooltip total",
+     _line(metrics=[copy.deepcopy(AVERAGE)], showTooltipTotal=True), None),
+    ("a stacked AVG grouped with no labels", _over_time("echarts_timeseries_bar", metrics=[copy.deepcopy(AVERAGE)],
+                                                        stack="Stack", only_total=True, show_value=False), None),
+    ("a stacked AVG grouped, each segment labelled",
+     _over_time("echarts_timeseries_bar", metrics=[copy.deepcopy(AVERAGE)], stack="Stack", show_value=True), None),
+    ("a mixed chart of a SUM and a COUNT(*), each side stacked and labelled with its totals",
+     MIXED | {**STACK_TOTALS, "stackB": "Stack", "only_totalB": True, "show_valueB": True}, None),
+    ("a mixed chart of an AVG with showTooltipTotal, which its renderer never reads",
+     MIXED | {"metrics": [copy.deepcopy(AVERAGE)], "showTooltipTotal": True}, None),
+]
+
+
+@pytest.mark.parametrize("form, said", [(form, said) for _, form, said in SERIES_TOTALS],
+                         ids=[name for name, _, _ in SERIES_TOTALS])
+def test_a_total_across_the_series_is_checked_only_for_one_measure_that_is_a_sum(form, said):
+    """rc2's time-series renderer sums across a chart's series and shows it. Its rich tooltip adds a "Total" row, and
+    shares of it, for a chart of several series (`allowTotal = Boolean(isMultiSeries) && richTooltip && !isForecast`,
+    `isMultiSeries = groupBy.length || metrics?.length > 1`, then `showTooltipTotal` and `showTooltipPercentage` in
+    `Timeseries/transformProps.ts`). A stacked chart labelled with `onlyTotal` shows each stack's total
+    (`totalStackedValues` in `Timeseries/transformers.ts`), as each side of a mixed chart does with its own keys.
+    That total is a measure's own number only when the series are the groups of one SUM or COUNT; two measures added
+    together never are. The Explore control defaults `showTooltipTotal` to true; a chart MCP saves carries no such key,
+    and the renderer's own defaults (`DEFAULT_FORM_DATA` in `Timeseries/constants.ts`) give none. The mixed chart's
+    tooltip shows no total."""
+    found = expectation_from_form_data(form, dataset=PHYSICAL)
+    if said is None:
+        assert isinstance(found, Expectation), found
+    else:
+        assert isinstance(found, NotCheckable) and said in found.reason, found
+
+
+# --- reading the grain, and grouping sets -----------------------------------------------------------------------------
+
+
+def test_the_grain_reading_covers_the_grains_mnemiq_reproduces_and_fails_closed_on_any_other():
+    """Where each grain puts a time (`_ON_GRAIN`) is known for exactly the grains mnemiq's statement reproduces
+    (`chart_form._GRAINS`). A grain outside them reads every time as off it, so the chart is not checked: it never
+    raises, and never passes."""
+    assert set(chart_check._ON_GRAIN) == set(chart_form._GRAINS)
+    assert chart_check._on_the_grain("2026-02-01T00:00:00", "P1M") is True
+    assert chart_check._on_the_grain("2026-02-01T00:00:00", "P2W") is False
+    assert chart_check._on_the_grain(None, "P2W") is False
+
+
+def test_a_grouping_sets_answer_is_named_as_such(fake):
+    """rc2 marks each row of a grouping-sets query with a `GROUPING()` column per grouping column; such an answer is
+    not lined up, and the reason says it came from grouping sets without claiming it holds totals, which a grouping
+    set of one level does not."""
+    one_level = _chart_data(["region", "channel", "Total premium", "region__superset_grouping",
+                             "channel__superset_grouping"], ("east", "web", 1200, 0, 0), ("west", "store", 800, 0, 0))
+    _serve(fake, form_data=_pivot_table(), chart=one_level, mnemiq=_result(*BY_REGION, columns=REGION_AND_CHANNEL))
+    check = _check(fake, kinds={})
+    assert check.status is ChartStatus.NOT_CHECKED, check.reason
+    assert "grouping sets" in check.reason and "total" not in check.reason, check.reason
+    assert _statements(fake) == []

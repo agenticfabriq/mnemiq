@@ -17,6 +17,7 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.errors import SqlglotError
 
+from mnemiq.superset.adapter import JINJA_DELIMITERS
 from mnemiq.superset.charts import Filter
 from mnemiq.superset.display_format import metric_label
 
@@ -61,6 +62,9 @@ class NotCheckable:
 _X_AXIS = frozenset({"echarts_timeseries_line", "echarts_timeseries_bar", "echarts_area", "echarts_timeseries_scatter",
                      "echarts_timeseries_smooth", "echarts_timeseries_step", "echarts_timeseries", "mixed_timeseries",
                      "waterfall"})
+# The types `Timeseries/transformProps.ts` renders (`Timeseries/index.ts`, `Regular/{Line,Bar,Scatter,SmoothLine}`,
+# `Area`, `Step`): not the waterfall, and not the mixed chart, which has a renderer of its own.
+_TIMESERIES = _X_AXIS - {"waterfall", "mixed_timeseries"}
 # One metric, grouped by `groupby`.
 _GROUPED_ONE_METRIC = frozenset({"pie", "gauge_chart", "treemap_v2", "funnel"})
 _ONE_METRIC = _GROUPED_ONE_METRIC | {"big_number_total", "waterfall", "sankey_v2", "big_number"}
@@ -245,8 +249,11 @@ def _one_sum_or_count(expression) -> bool:
     """Whether an SQL metric's whole expression, parsed as Postgres, is one SUM, or one COUNT of a column or of every
     row, and nothing more: no DISTINCT, no FILTER or OVER, nothing around the aggregate, no aggregate, window or query
     within the sum. mnemiq writes every measure as an SQL metric, so this is how a measure's totals are known to be the
-    sums of its groups. SQL that does not parse, or is not one expression, is not."""
+    sums of its groups. SQL that does not parse, or is not one expression, is not, and nor is SQL holding a template
+    marker: Superset renders it before running it, and sqlglot reads `{{ col }}` as something else (a struct)."""
     if not isinstance(expression, str) or not expression.strip():
+        return False
+    if any(marker in expression for marker in JINJA_DELIMITERS):
         return False
     try:
         node = sqlglot.parse_one(expression, read="postgres")
@@ -272,10 +279,58 @@ def _summable(item) -> bool:
     return item.get("expressionType") == "SQL" and _one_sum_or_count(item.get("sqlExpression"))
 
 
+def _several(metrics: list, groupby) -> bool:
+    """Whether a chart's metrics and grouping make several series, as `isMultiSeries = groupBy.length ||
+    metrics?.length > 1` reads them (`Timeseries/transformProps.ts`)."""
+    return bool(_as_list(groupby)) or len(metrics) > 1
+
+
+def _series_total(viz_type: str, form: dict) -> str | None:
+    """A total across the chart's series that its renderer sums and shows, which no query returns, or None. It is a
+    measure's own number only when the series are the groups of one SUM or COUNT; two measures added together never
+    are.
+
+    - The time series' rich tooltip (`Timeseries/transformProps.ts`) adds a "Total" row when `allowTotal &&
+      showTooltipTotal`, and shows each series as a share of it when `showTooltipPercentage`, where `allowTotal =
+      Boolean(isMultiSeries) && richTooltip && !isForecast`. The renderer reads the form over `DEFAULT_FORM_DATA`
+      (`Timeseries/constants.ts`), where `richTooltip` is true and there is no `showTooltipTotal`, while the Explore
+      control defaults it to true. A saved key is read in either spelling, since the renderer reads them camel-cased.
+      The mixed chart's tooltip shows no total.
+    - A stack labelled with its total (`stack`, `only_total` and `show_value`): the top series' label shows
+      `totalStackedValues` (`transformSeries` in `Timeseries/transformers.ts`). Each side of a mixed chart does so with
+      its own keys (`stackB`, `only_totalB`, `show_valueB`, read as `stackB`, `onlyTotalB`, `showValueB` in
+      `MixedTimeseries/transformProps.ts`)."""
+    if viz_type in _TIMESERIES:
+        rich_keys = [key for key in ("rich_tooltip", "richTooltip") if key in form]
+        rich = not rich_keys or _set(form, *rich_keys)
+        tooltip = rich and _set(form, "showTooltipTotal", "show_tooltip_total", "showTooltipPercentage",
+                                "show_tooltip_percentage")
+        sides = [("", _metric_items(viz_type, form), form.get("groupby"))]
+    elif viz_type == "mixed_timeseries":
+        tooltip = False
+        sides = [("", list(form.get("metrics") or []), form.get("groupby")),
+                 ("B", list(form.get("metrics_b") or []), form.get("groupby_b"))]
+    else:
+        return None
+    for suffix, metrics, groupby in sides:
+        if not _several(metrics, groupby) or (len(metrics) == 1 and _summable(metrics[0])):
+            continue
+        if tooltip:
+            return ("the chart's tooltip shows a total of its series, a sum its renderer computes across them, which "
+                    "is a measure's own number only for one measure that is a SUM or a COUNT")
+        if form.get(f"stack{suffix}") and _set(form, f"only_total{suffix}", f"onlyTotal{suffix}") \
+                and _set(form, f"show_value{suffix}", f"showValue{suffix}"):
+            return ("the chart labels each stack with the total of its series, a sum its renderer computes across "
+                    "them, which is a measure's own number only for one measure that is a SUM or a COUNT")
+    return None
+
+
 def _renderer_sum(viz_type: str, form: dict, dimensions: list[str]) -> str | None:
     """A number the chart shows that its renderer sums from the query's rows, which neither side's rows hold, or None.
     Each is a sum of numbers the check does compare, so it is the measure's own only for a SUM or a COUNT; a pie's
     Other slice also hides the slices it folds in."""
+    if (total := _series_total(viz_type, form)) is not None:
+        return total
     if viz_type == "pie" and _set(form, "threshold_for_other", "thresholdForOther"):
         # `Pie/transformProps.ts`: `if (thresholdForOther)` folds the slices under it into one, `otherSum`.
         return ("the pie folds its smallest slices into an Other slice its renderer sums, which mnemiq does not "
