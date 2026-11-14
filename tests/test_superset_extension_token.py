@@ -14,7 +14,7 @@ from tests.superset_extension_path import BACKEND_SRC, use_extension_source
 
 use_extension_source()
 
-ASK = {"db.read", "superset:sqllab:write", "superset:dataset:read"}  # sub-project 1's set
+ASK = {"db.read", "superset:sqllab:write", "superset:dataset:read"}  # what the Superset mode asks with
 BUILD = ASK | {"superset:chart:read", "superset:chart:write", "superset:dashboard:read",
                "superset:dashboard:write", "superset:dataset:write"}
 

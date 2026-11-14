@@ -63,7 +63,16 @@ MNEMIQ_TOKEN_KEY_FILE = str(_KEYS / "private.pem")
 MNEMIQ_TOKEN_KID = _IDENTITY_PROVIDER["kid"]
 MNEMIQ_TOKEN_ISSUER = _IDENTITY_PROVIDER["issuer"]
 MNEMIQ_TOKEN_AUDIENCE = _IDENTITY_PROVIDER["audience"]
-MNEMIQ_TOKEN_TENANT = _IDENTITY_PROVIDER["tenant"]
+# A keys directory made before tokens carried a tenant has none in `issuer.json`. Superset still starts, and the token
+# route answers 503 naming MNEMIQ_TOKEN_TENANT until `setup_superset.py keys` is run again.
+if _tenant := _IDENTITY_PROVIDER.get("tenant"):
+    MNEMIQ_TOKEN_TENANT = _tenant
+else:
+    import logging
+
+    logging.getLogger("superset_config").warning(
+        "%s has no tenant, so mnemiq's token route is not configured: run `setup_superset.py keys` again",
+        _KEYS / "issuer.json")
 
 # API keys on, so the service user enrichment reads through authenticates with an API key, as a deployment's would:
 # the MCP service accepts them beside tokens when this is on (`get_mcp_api_key_enabled`).
