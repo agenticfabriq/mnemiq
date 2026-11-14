@@ -90,8 +90,10 @@ def displayed(viz_type: str, form_data: dict, metric_key, saved: SavedMetric | N
     `CANNOT_TELL`. `saved` is the saved metric `metric_key` names, or None."""
     saved = _saved_of(metric_key, saved)
     if viz_type in _TIMESERIES:
-        # Timeseries/transformProps.ts, `buildCustomFormatters(..., yAxisFormat, ...)` and `forcePercentFormatter`.
-        if form_data.get("contributionMode") or form_data.get("rebasePercentChange") \
+        # Timeseries/transformProps.ts, `buildCustomFormatters(..., yAxisFormat, ...)` and `forcePercentFormatter`. A saved
+        # chart holds the control's own name, `rebase_percent_change` (Regular/Line/controlPanel.tsx), which the
+        # renderer sees camel-cased; `contributionMode` and `stack` are saved under those same names.
+        if form_data.get("contributionMode") or form_data.get("rebase_percent_change") \
                 or (viz_type == "echarts_area" and form_data.get("stack") == "Expand"):
             return CANNOT_TELL
         d3 = form_data.get("y_axis_format")
@@ -144,7 +146,8 @@ def displayed(viz_type: str, form_data: dict, metric_key, saved: SavedMetric | N
     if viz_type == "pivot_table_v2":
         # plugin-chart-pivot-table/src/PivotTableChart.tsx, `customFormatsArray`: `columnFormats[metric] || valueFormat`
         # and `currencyFormats[metric] || currencyFormat`: the saved metric wins both.
-        if form_data.get("showValuesAs") or form_data.get("show_values_as"):
+        # The control (`plugin/controlPanel.tsx`, name 'showValuesAs') defaults to 'actual', which a saved chart holds.
+        if (form_data.get("showValuesAs") or "actual") != "actual":
             return CANNOT_TELL
         d3 = (saved.d3format if saved is not None else None) or form_data.get("valueFormat")
         if saved is not None and saved.currency is UNKNOWN:

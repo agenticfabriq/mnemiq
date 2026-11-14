@@ -143,7 +143,7 @@ def test_saved_currency_unknown_cannot_tell_where_it_decides():
 
 def test_forced_percent_modes_cannot_tell():
     assert displayed("echarts_timeseries_line", {"contributionMode": "row"}, ADHOC, None) is CANNOT_TELL
-    assert displayed("pivot_table_v2", {"showValuesAs": ["percent_row"]}, ADHOC, None) is CANNOT_TELL
+    assert displayed("pivot_table_v2", {"showValuesAs": "percent_row"}, ADHOC, None) is CANNOT_TELL
 
 
 def test_mixed_secondary_axis_reads_its_own_keys():
@@ -162,3 +162,15 @@ def test_a_dollar_format_counts_only_when_no_currency_symbol_is_set():
     assert fits(MeasureKind.CURRENCY, Displayed("$,.2f", None))
     assert fits(MeasureKind.CURRENCY, Displayed("$,.2f", {"symbol": ""}))
     assert fits(MeasureKind.CURRENCY, Displayed("$,.2f", {"symbol": "USD"}))
+
+
+def test_a_saved_line_chart_reads_its_control_name_for_rebased_percent_change():
+    saved_form = {"rebase_percent_change": True, "y_axis_format": ",.2f"}
+    assert displayed("echarts_timeseries_line", saved_form, ADHOC, None) is CANNOT_TELL
+    assert displayed("echarts_timeseries_line", {"rebase_percent_change": False}, ADHOC, None) is not CANNOT_TELL
+
+
+def test_pivot_actual_values_is_the_default_display_not_a_percent():
+    form = {"valueFormat": ",d", "showValuesAs": "actual"}
+    assert displayed("pivot_table_v2", form, ADHOC, None) == Displayed(",d", None)
+    assert displayed("pivot_table_v2", {**form, "showValuesAs": "percent_total"}, ADHOC, None) is CANNOT_TELL
