@@ -744,11 +744,31 @@ def test_claim_refuses_another_builds_chart(live, extension, policy_id):
     assert stored_chart(chart_id)["description"] == build.marker("kpi")
 
 
+def test_simultaneous_claims_by_two_builds_leave_one(live, extension, policy_id):
+    """Two builds claim one chart for the same dashboard at once, each with its own build's marker, started together
+    while the test holds the chart's row lock and let go once both wait. One answers `{ok: true}` and the other exactly
+    `{claimed_by_another: true}`: the second waited for the first one's commit, then read its marker under the lock.
+    The chart's description is the winner's marker alone."""
+    client = as_user(live, BUILDER)
+    build = new_build(client, "claim race")
+    chart_id = mcp_chart(client, spec(Family.BIG_NUMBER, policy_id))
+    markers = [build.marker("kpi"), format_marker(str(uuid.uuid4()), "kpi", build.dashboard_id)]
+    answers = race("slices", chart_id, [
+        lambda marker=marker: call(as_user(live, BUILDER), "claim_chart", chart_id=chart_id,
+                                   dashboard_id=build.dashboard_id, marker=marker)
+        for marker in markers])
+    assert sorted(answers, key=lambda a: "claimed_by_another" in a) == [{"ok": True}, {"claimed_by_another": True}], (
+        answers)
+    assert stored_chart(chart_id)["description"] == markers[answers.index({"ok": True})]
+    observe("claim_race", answers=answers)
+
+
 def test_non_editor_gets_editor_labels_not_a_change(live, extension, policy_id):
     """West (Alpha, able to read analyst's chart and dataset, editor of neither) is answered
     `{not_editor: true, editors: [analyst's label]}` when patching analyst's claimed chart, adding a metric to
-    analyst's claimed dataset, and claiming analyst's chart for west's own dashboard; the chart and the dataset are as
-    they were."""
+    analyst's claimed dataset, claiming analyst's chart for west's own dashboard, and deleting analyst's dataset for
+    west's dashboard (whose id the dataset's marker does not name: not being an editor is answered first); the chart
+    and the dataset are as they were."""
     analyst = as_user(live, BUILDER)
     build = new_build(analyst, "editors")
     chart_id = mcp_chart(analyst, spec(Family.BIG_NUMBER, policy_id))
@@ -765,7 +785,9 @@ def test_non_editor_gets_editor_labels_not_a_change(live, extension, policy_id):
     west_build = new_build(west, "west's")
     assert call(west, "claim_chart", chart_id=chart_id, dashboard_id=west_build.dashboard_id,
                 marker=west_build.marker("kpi")) == refused
+    assert call(west, "delete_dataset", dataset_id=dataset_id, dashboard_id=west_build.dashboard_id) == refused
     assert stored_chart(chart_id) == chart_before and stored_metrics(dataset_id) == metrics_before
+    assert metadata("SELECT deleted_at FROM tables WHERE id = %s", (dataset_id,)) == [(None,)]
     observe("not_editor", editors=refused["editors"])
 
 

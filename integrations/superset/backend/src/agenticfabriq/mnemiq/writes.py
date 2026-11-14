@@ -11,8 +11,10 @@ Every tool keeps these rules:
   does a tool compare the `changed_on` its caller read, so of two racing writers the second waits, then sees the first
   one's `changed_on`, and answers `{"stale": true}`. `{"busy": true}` is for a lock-contention error alone
   (`superset/versioning/db_errors.py`, `is_lock_contention_error`), and the same request may be sent again.
-- Its answer is short and structured. Superset's own text never reaches it: a command's failure is logged here and
-  answered by its kind.
+- Its answer is short and structured. Superset's own text never reaches it: any of Superset's exceptions is logged
+  here and answered by its kind.
+- A caller who is not an editor of the object is told so before anything about the object's state (a stale
+  `changed_on`, another build's marker): no retry changes it, and the answer names whom to ask.
 - An object the caller may not read is answered as one that does not exist.
 - It takes no user id from the caller. The editors a tool sets are a dashboard's.
 
@@ -338,10 +340,11 @@ def _command_answer(tool: str, exc: Exception, *, kind: str, editable: Any = Non
 
 
 def _command_errors() -> tuple[type[Exception], ...]:
-    from superset.commands.exceptions import CommandException
-    from superset.exceptions import SupersetSecurityException
+    """What a command's failure may be: any of Superset's exceptions (`superset/exceptions.py`), a command's own
+    (`CommandException`) and a refused access (`SupersetSecurityException`) among them."""
+    from superset.exceptions import SupersetException
 
-    return CommandException, SupersetSecurityException
+    return (SupersetException,)
 
 
 def lock_row(model: type, entity_id: int) -> Any:
@@ -432,8 +435,7 @@ def _claim(found: dict, resource: Any, *, kind: str, extra: Callable[[Any], dict
            command: Callable[[int, dict], Any]) -> dict:
     """What `claim_chart` and `claim_dataset` share: under the resource's lock, refuse one the caller does not edit or
     whose dashboard the caller does not edit, then one another build's marker holds; then one command sets the
-    dashboard's editors and the marker (and `extra(resource)`'s properties). Not being an editor comes first, as in
-    every tool: no retry changes it, and its answer names whom to ask."""
+    dashboard's editors and the marker (and `extra(resource)`'s properties)."""
     readable = resource is not None and (_security().can_access_chart(resource) if kind == "chart"
                                          else _security().can_access_datasource(resource))
     if not readable:
@@ -444,6 +446,7 @@ def _claim(found: dict, resource: Any, *, kind: str, extra: Callable[[Any], dict
     for edited in (resource, dashboard):
         if not _security().is_editor(edited):
             return _not_editor(edited)
+    # Read under the lock: of two builds claiming one chart, the second reads the first one's marker.
     held = params.parse_marker(resource.description)
     if held is not None and held != claim_marker(found["marker"], found["dashboard_id"]):
         return CLAIMED_BY_ANOTHER
@@ -508,8 +511,7 @@ def _check_query(context: dict) -> dict | None:
     from sqlalchemy.exc import SQLAlchemyError
     from superset.charts.schemas import ChartDataQueryContextSchema
     from superset.commands.chart.data.get_data_command import ChartDataCommand
-    from superset.commands.exceptions import CommandException
-    from superset.exceptions import SupersetSecurityException
+    from superset.exceptions import SupersetException, SupersetSecurityException
     from superset.mcp_service.chart.query_result import query_result_failure
 
     probe = copy.deepcopy(context)
@@ -521,7 +523,9 @@ def _check_query(context: dict) -> dict | None:
         result = command.run()
     except SupersetSecurityException:
         return _not_found("dataset")
-    except (CommandException, ValidationError, SQLAlchemyError, ValueError, KeyError) as exc:
+    # Any other of Superset's exceptions (a command's, or one raised building the query object, such as
+    # `QueryObjectValidationError`), the schema's and the database's: the MCP service would pass its words on.
+    except (SupersetException, ValidationError, SQLAlchemyError, ValueError, KeyError) as exc:
         logger.warning("mnemiq extension: create_chart's query did not run", exc_info=exc)
         return {"refused": "query_failed"}
     if query_result_failure(result) is not None:
@@ -673,14 +677,14 @@ def _soft_deleted(dataset_id: int) -> bool:
 def _delete(found: dict, dataset: Any) -> dict:
     if dataset is None or not _security().can_access_datasource(dataset):
         return _not_found("dataset")
+    if not _security().is_editor(dataset):
+        return _not_editor(dataset)
     # A second guard: mnemiq asks only for a dataset its store recorded as made for the dashboard.
     marker = params.parse_marker(dataset.description)
     if marker is None:
         return {"refused": "no_marker"}
     if marker.dashboard_id != found["dashboard_id"]:
         return {"refused": "another_dashboard"}
-    if not _security().is_editor(dataset):
-        return _not_editor(dataset)
     if in_use := _live_chart_ids(dataset.id):
         return {"in_use": True, "chart_ids": in_use}
     dataset_id, dataset_uuid = dataset.id, str(dataset.uuid)

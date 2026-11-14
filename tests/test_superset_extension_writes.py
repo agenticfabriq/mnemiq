@@ -9,14 +9,17 @@ What the tools do inside Superset (the locks, the commands, the answers) is the 
 import ast
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
+from tests import superset_stubs as stubs
 
 from tests.superset_extension_path import use_extension_source
 
 use_extension_source()
 
-from agenticfabriq.mnemiq import writes  # noqa: E402
+from agenticfabriq.mnemiq import params, writes  # noqa: E402
 from agenticfabriq.mnemiq.params import format_marker  # noqa: E402
 
 BUILD = "0f8fad5b-d9cb-469f-a165-70867728950e"
@@ -240,7 +243,8 @@ def test_the_registration_check_flags_a_planted_defect(old, new, flagged):
 # ---------------------------------------------------------------- the lock
 
 WRITES_SOURCE = Path(writes.__file__)
-# Each locked tool, the model whose row it locks and the request field naming the row (the plan's lock table).
+# Each tool that writes an existing row: the model whose row it locks first, and the request field naming the row.
+# Creating a dashboard or a chart writes a new row and locks none.
 LOCKED = {"patch_chart": ("Slice", "chart_id"), "claim_chart": ("Slice", "chart_id"),
           "claim_dataset": ("SqlaTable", "dataset_id"), "add_saved_metric": ("SqlaTable", "dataset_id"),
           "delete_dataset": ("SqlaTable", "dataset_id"), "set_layout": ("Dashboard", "dashboard_id")}
@@ -298,6 +302,13 @@ def lock_problems(source: str) -> list[str]:
         others = [value for value in answers if value not in good and not isinstance(value, ast.Name)]
         if len(good) != 1 or others:
             problems.append(f"{tool} does not answer through _locked({model}, found[{field!r}], ...)")
+        # Before its lock a tool may only check its request (the marker's shape); any other call could read the row
+        # it is about to lock, and a decision made on that read is made without the lock.
+        in_lock = {id(call) for value in good for call in _calls(value)}
+        before = sorted({_callee(call) for statement in functions[tool].body for call in _calls(statement)
+                         if id(call) not in in_lock} - {"claim_marker"})
+        if before:
+            problems.append(f"{tool} reads before its lock: {', '.join(before)}")
     for tool in UNLOCKED:
         if {"_locked", "lock_row"} & {_callee(call) for call in _calls(functions[tool])}:
             problems.append(f"{tool} takes a lock the table does not give it")
@@ -328,8 +339,132 @@ def test_every_locked_write_locks_its_row_first():
      'return _patch(found, _session().get(Slice, found["chart_id"]))', "_patch compares changed_on outside a lock"),
     ('return _locked(Dashboard, found["dashboard_id"]', 'return _locked(Slice, found["dashboard_id"]',
      "set_layout does not answer through _locked(Dashboard, found['dashboard_id'], ...)"),
+    # A claim that compares markers on an unlocked read of the chart, before its lock.
+    ('    return _locked(Slice, found["chart_id"], lambda chart: _claim(\n',
+     '    from superset.daos.chart import ChartDAO\n'
+     '    held = params.parse_marker(ChartDAO.find_by_id(found["chart_id"]).description)\n'
+     '    if held is not None and held != claim_marker(found["marker"], found["dashboard_id"]):\n'
+     '        return CLAIMED_BY_ANOTHER\n'
+     '    return _locked(Slice, found["chart_id"], lambda chart: _claim(\n',
+     "claim_chart reads before its lock: find_by_id, parse_marker"),
+    ('    return _locked(SqlaTable, found["dataset_id"], lambda dataset: _delete(found, dataset))',
+     '    if _dataset(found["dataset_id"]) is None:\n        return _not_found("dataset")\n'
+     '    return _locked(SqlaTable, found["dataset_id"], lambda dataset: _delete(found, dataset))',
+     "delete_dataset reads before its lock: _dataset, _not_found"),
 ])
 def test_the_lock_check_flags_a_planted_defect(old, new, flagged):
     source = WRITES_SOURCE.read_text()
     assert source.count(old) == 1, old
     assert flagged in lock_problems(source.replace(old, new))
+
+
+# ---------------------------------------------------------------- inside Superset, stood in
+
+@pytest.fixture
+def superset(monkeypatch):
+    return stubs.install(monkeypatch)
+
+
+def _funnel_context() -> dict:
+    return params.query_context("funnel", {"viz_type": "funnel", "groupby": ["status"], "metric": "count"}, 7)
+
+
+@pytest.mark.parametrize(("raised", "answer"), [
+    # rc2 raises this while building a query object (`superset/exceptions.py`): not a command's exception.
+    (stubs.QueryObjectValidationError("Columns missing in dataset: ['no_such_column']"), {"refused": "query_failed"}),
+    (stubs.SupersetException("Superset's own words"), {"refused": "query_failed"}),
+    (stubs.CommandException("Error: relation does not exist"), {"refused": "query_failed"}),
+    (stubs.MarshmallowValidationError("Unknown field."), {"refused": "query_failed"}),
+    (stubs.SupersetSecurityException("You need access to the following tables: secret"), {"not_found": "dataset"}),
+])
+def test_a_query_superset_refuses_is_answered_without_its_text(superset, raised, answer):
+    """`create_chart` runs the chart's query before saving it. Whatever Superset raises is answered by its kind and
+    never carries Superset's words, which the MCP service would otherwise pass on as the tool's error."""
+    superset.chart_data = raised
+    assert writes._check_query(_funnel_context()) == answer
+
+
+def test_a_query_that_runs_is_checked_on_two_rows(superset):
+    context = _funnel_context()
+    assert writes._check_query(context) is None
+    (ran,) = superset.ran
+    assert [query["row_limit"] for query in ran[1]["queries"]] == [2]
+    assert context == _funnel_context()  # the context saved keeps its own row limit
+    superset.chart_data = {"queries": [{"error": "Superset's words", "status": "failed"}]}
+    assert writes._check_query(context) == {"refused": "query_failed"}
+
+
+MARKED = format_marker(BUILD, "data", 12)
+
+
+def _dataset(description: str | None) -> SimpleNamespace:
+    return SimpleNamespace(id=4, uuid="6b1d3c1e-0f63-4f5c-9a51-0c7f0b9f2a11", description=description,
+                           editors=[SimpleNamespace(label="analyst Live")])
+
+
+@pytest.fixture
+def deleting(monkeypatch, superset):
+    """`delete_dataset`'s work under the lock, with Superset stood in: the caller may read the dataset and edits it
+    unless a test says not; `charts` is what each count of the dataset's live charts answers, in turn; the delete is
+    soft unless a test says not."""
+    state = SimpleNamespace(editor=True, charts=[[], []], soft=True, superset=superset)
+    security = SimpleNamespace(can_access_datasource=lambda dataset: True, is_editor=lambda dataset: state.editor)
+    monkeypatch.setattr(writes, "_security", lambda: security)
+    monkeypatch.setattr(writes, "_live_chart_ids", lambda dataset_id: state.charts.pop(0))
+    monkeypatch.setattr(writes, "_soft_deleted", lambda dataset_id: state.soft)
+    return state
+
+
+def delete(dataset: SimpleNamespace, dashboard_id: int = 12) -> dict:
+    return writes._delete({"dataset_id": dataset.id, "dashboard_id": dashboard_id}, dataset)
+
+
+def test_delete_moves_an_unused_dataset_to_the_trash(deleting):
+    assert delete(_dataset(MARKED)) == {"ok": True, "soft_deleted": True}
+    assert deleting.superset.ran == [("DeleteDatasetCommand", [4])]
+    deleting.charts, deleting.soft = [[], []], False
+    assert delete(_dataset(MARKED)) == {"ok": True, "soft_deleted": False}
+
+
+def test_delete_refuses_while_a_chart_uses_the_dataset(deleting):
+    deleting.charts = [[31, 32]]
+    assert delete(_dataset(MARKED)) == {"in_use": True, "chart_ids": [31, 32]}
+    assert deleting.superset.ran == []
+
+
+def test_a_chart_made_while_the_dataset_is_deleted_brings_it_back(deleting):
+    """No lock keeps a chart from being made on a dataset meanwhile, so the charts are counted again once the delete
+    has committed: one found then restores the dataset, and the answer says it is in use."""
+    deleting.charts = [[], [31]]
+    dataset = _dataset(MARKED)
+    assert delete(dataset) == {"in_use": True, "chart_ids": [31], "restored": True}
+    assert deleting.superset.ran == [("DeleteDatasetCommand", [4]), ("RestoreDatasetCommand", dataset.uuid)]
+    # Gone rather than in the trash, it cannot be restored, and the answer says so.
+    deleting.superset.ran.clear()
+    deleting.charts, deleting.soft = [[], [31]], False
+    assert delete(dataset) == {"in_use": True, "chart_ids": [31], "restored": False}
+    assert deleting.superset.ran == [("DeleteDatasetCommand", [4])]
+    # A restore Superset refuses is answered as not restored, never with its words.
+    deleting.superset.ran.clear()
+    deleting.charts, deleting.soft = [[], [31]], True
+    deleting.superset.restore = stubs.DatasetRestoreFailedError("Superset's words")
+    assert delete(dataset) == {"in_use": True, "chart_ids": [31], "restored": False}
+
+
+def test_delete_asks_for_editorship_before_the_marker(deleting):
+    """Not being an editor comes first, as in every tool: no retry changes it, and its answer names whom to ask."""
+    deleting.editor = False
+    for description in (None, format_marker(BUILD, "data", 123), f"Made by hand.\n{MARKED}\nmore", MARKED):
+        assert delete(_dataset(description)) == {"not_editor": True, "editors": ["analyst Live"]}
+    assert deleting.superset.ran == []
+
+
+def test_a_command_failure_is_answered_by_its_kind(deleting):
+    """A command's failure, any of Superset's exceptions, is answered without Superset's words."""
+    for raised in (stubs.DeleteFailedError("Datasets could not be deleted."), stubs.SupersetException("words")):
+        deleting.charts = [[]]
+        deleting.superset.delete = raised
+        assert delete(_dataset(MARKED)) == {"failed": True}
+    deleting.charts = [[]]
+    deleting.superset.delete = stubs.ForbiddenError()
+    assert delete(_dataset(MARKED)) == {"not_editor": True, "editors": ["analyst Live"]}
