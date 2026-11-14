@@ -60,7 +60,11 @@ class Aggregation(Enum):
 
 @dataclass(frozen=True)
 class MeasureRefused:
+    """Why a measure is refused. `repairable` is False where no rewrite of the measure would pass: the deciders'
+    refusal is not one the model can act on (`Refusal.repairable`), such as Superset not answering the proof."""
+
     reason: str
+    repairable: bool = True
 
 
 _FORMATS = {
@@ -158,7 +162,7 @@ def check_measure(measure: Measure, *, source: str, dimension_names: tuple[str, 
     verdict = decide_statement(measure_statement(measure, source), adapter=adapter, snapshot=snapshot, grants=grants,
                                guard_fanout=guard_fanout)
     if isinstance(verdict, Refusal):
-        return MeasureRefused(f"{verdict.code.value}: {verdict.message}")
+        return MeasureRefused(f"{verdict.code.value}: {verdict.message}", repairable=verdict.repairable)
     return verdict
 
 

@@ -110,7 +110,10 @@ class FixedGrants:
 
 
 @dataclass(frozen=True)
-class _Dataset:
+class ListedDataset:
+    """A dataset as `list_datasets` lists it: its id, its table, schema and database, and its SQL, which only a
+    virtual dataset has."""
+
     id: int
     table_name: str
     schema: str | None
@@ -118,9 +121,9 @@ class _Dataset:
     sql: str | None
 
 
-class _Unreadable(Exception):
-    """The grants cannot be read: Superset did not answer, or answered with something mnemiq cannot read. Already
-    logged where it was found."""
+class UnreadableAnswer(Exception):
+    """What Superset was asked cannot be read: Superset did not answer, or answered with something mnemiq cannot read.
+    Already logged where it was found."""
 
 
 def resolve_grants(adapter: SupersetSqlAdapter, snapshot: Snapshot) -> GrantSet:
@@ -132,7 +135,7 @@ def resolve_grants(adapter: SupersetSqlAdapter, snapshot: Snapshot) -> GrantSet:
     refuses (`SupersetRefusedCaller`) and a denial it does not explain (`SupersetDenied`) propagate. Returns
     `UNAVAILABLE` when Superset does not answer, when any dry run reaches its time limit or is cancelled, and when the
     datasets cannot be read whole."""
-    tables = _tables(snapshot)
+    tables = table_bindings(snapshot)
     if not tables:
         return GrantSet(frozenset())
     clearance = classified_levels(snapshot)
@@ -140,10 +143,10 @@ def resolve_grants(adapter: SupersetSqlAdapter, snapshot: Snapshot) -> GrantSet:
         if _accepted(adapter, list(tables)):
             return GrantSet(frozenset(object_id for ids in tables.values() for object_id in ids),
                             pii_clearance=clearance)
-        datasets = _read_datasets(adapter)
+        datasets = read_datasets(adapter)
         candidates = _candidates(datasets, tables, adapter.database_id, adapter.schema)
         confirmed = _confirmed(adapter, candidates)
-    except _Unreadable:
+    except UnreadableAnswer:
         return UNAVAILABLE
     logger.info("granted %d of %d tables: those Superset confirmed of the %d its %d datasets for this user name",
                 len(confirmed), len(tables), len(candidates), len(datasets))
@@ -155,7 +158,7 @@ def _accepted(adapter: SupersetSqlAdapter, names: list[str]) -> bool:
     statement Superset cannot check (which says nothing about access either way), are both a no, logged.
 
     Raises `NotABuilder` for a role that does not permit `execute_sql`, `SupersetMisconfigured` for any other tool
-    error, and `_Unreadable` when Superset does not answer or the dry run reaches its time limit or is cancelled; a
+    error, and `UnreadableAnswer` when Superset does not answer or the dry run reaches its time limit or is cancelled; a
     refused credential and an unexplained denial propagate."""
     try:
         adapter.dry_run(_probe(names))
@@ -169,7 +172,7 @@ def _accepted(adapter: SupersetSqlAdapter, names: list[str]) -> bool:
     except (SupersetUnavailable, QueryTimedOut, QueryCancelled) as exc:
         logger.warning("a dry run naming %d tables got no answer from Superset (%s %s); granting nothing", len(names),
                        exc, getattr(exc, "detail", ""))
-        raise _Unreadable from exc
+        raise UnreadableAnswer from exc
     except SupersetPermissionDenied as exc:
         raise _not_a_builder(exc) from exc
     except SupersetToolError as exc:
@@ -191,13 +194,17 @@ def _confirmed(adapter: SupersetSqlAdapter, candidates: list[str]) -> list[str]:
     return confirmed
 
 
-def _tables(snapshot: Snapshot) -> dict[str, set[str]]:
+def table_bindings(snapshot: Snapshot) -> dict[str, set[str]]:
     """Each name the snapshot's tables are stored under, in the snapshot's order, with the object ids bound to it."""
     tables: dict[str, set[str]] = {}
     for binding in snapshot.source_bindings:
         if binding.binding_type == "table":
             tables.setdefault(binding.source_object, set()).add(binding.object_id)
     return tables
+
+
+# The name the live contract test reads it by (`tests/superset_live/test_contract.py`).
+_tables = table_bindings
 
 
 def _probe(names) -> str:
@@ -207,8 +214,8 @@ def _probe(names) -> str:
     return f"SELECT 1 FROM {tables} WHERE 1 = 0"
 
 
-def _read_datasets(adapter: SupersetSqlAdapter) -> list[_Dataset]:
-    """Every dataset Superset lists for the person in the configured schema, in id order. Raises `_Unreadable` when
+def read_datasets(adapter: SupersetSqlAdapter) -> list[ListedDataset]:
+    """Every dataset Superset lists for the person in the configured schema, in id order. Raises `UnreadableAnswer` when
     the list cannot be read whole: Superset does not answer, one dataset alone is too large for its response size, or a
     page does not read as one.
 
@@ -218,7 +225,7 @@ def _read_datasets(adapter: SupersetSqlAdapter) -> list[_Dataset]:
     read so far stay a whole number of pages and the next page starts right after them. Once the datasets of the page
     that was too large are read, the read goes back to that page's size: its window ends on a multiple of that size, so
     the next page is aligned too. Pages are read until one holds fewer datasets than it asked for."""
-    datasets: list[_Dataset] = []
+    datasets: list[ListedDataset] = []
     size = PAGE_SIZE
     # For each page that was too large and not yet read through, innermost last: its size, and how many datasets
     # will have been read once its window has.
@@ -238,14 +245,14 @@ def _read_datasets(adapter: SupersetSqlAdapter) -> list[_Dataset]:
             raise _misconfigured(exc) from exc
         except SupersetUnavailable as exc:
             logger.warning("list_datasets got no answer from Superset (%s: %s); granting nothing", exc, exc.detail)
-            raise _Unreadable from exc
+            raise UnreadableAnswer from exc
         else:
             cut = bool(payload.get("_response_truncated"))
         if cut:
             if size == 1:
                 logger.warning("list_datasets: dataset %d alone is too large for Superset's response size; granting "
                                "nothing", len(datasets) + 1)
-                raise _Unreadable
+                raise UnreadableAnswer
             windows.append((size, len(datasets) + size))
             size = _smaller(size)
             continue
@@ -253,7 +260,7 @@ def _read_datasets(adapter: SupersetSqlAdapter) -> list[_Dataset]:
         if found is None:
             logger.warning("list_datasets answered page %d of %d with no page of datasets mnemiq can read (keys %s, "
                            "error_type %s); granting nothing", page, size, sorted(payload), payload.get("error_type"))
-            raise _Unreadable
+            raise UnreadableAnswer
         datasets.extend(found)
         if len(found) < size:
             return datasets
@@ -283,14 +290,14 @@ def _smaller(size: int) -> int:
     return next(smaller for smaller in range(size // 2, 0, -1) if size % smaller == 0)
 
 
-def _page_datasets(payload: dict, size: int, after: int | None) -> list[_Dataset] | None:
+def _page_datasets(payload: dict, size: int, after: int | None) -> list[ListedDataset] | None:
     """The datasets a page carries; None unless it holds a list of at most `size` datasets, each with every field the
     fallback reads in the type Superset gives it, ids ascending past `after`, the last id already read. A dataset whose
     SQL is missing is unreadable, never taken for a physical one."""
     items = payload.get("datasets")
     if not isinstance(items, list) or len(items) > size:
         return None
-    datasets: list[_Dataset] = []
+    datasets: list[ListedDataset] = []
     for item in items:
         dataset = _dataset(item)
         if dataset is None or (after is not None and dataset.id <= after):
@@ -300,7 +307,7 @@ def _page_datasets(payload: dict, size: int, after: int | None) -> list[_Dataset
     return datasets
 
 
-def _dataset(item) -> _Dataset | None:
+def _dataset(item) -> ListedDataset | None:
     if not isinstance(item, dict) or any(name not in item for name in DATASET_FIELDS):
         return None
     dataset_id, table_name, schema, database_id, sql = (item[name] for name in DATASET_FIELDS)
@@ -309,10 +316,10 @@ def _dataset(item) -> _Dataset | None:
         return None
     if not (schema is None or isinstance(schema, str)) or not (sql is None or isinstance(sql, str)):
         return None
-    return _Dataset(dataset_id, table_name, schema, database_id, sql)
+    return ListedDataset(dataset_id, table_name, schema, database_id, sql)
 
 
-def _candidates(datasets: list[_Dataset], tables: dict[str, set[str]], database_id: int, schema: str) -> list[str]:
+def _candidates(datasets: list[ListedDataset], tables: dict[str, set[str]], database_id: int, schema: str) -> list[str]:
     """The stored names of the snapshot tables that the physical datasets on the configured database and schema name,
     in the snapshot's order: the tables to ask Superset to confirm, never a grant by themselves. The schema is compared
     as stored, as Superset compares it. Superset reads a dataset as virtual when its SQL is not empty (`SqlaTable.kind`
