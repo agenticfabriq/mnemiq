@@ -611,6 +611,32 @@ def test_the_row_lock_waits_at_most_the_lock_timeout(superset, monkeypatch):
         assert session.log[0] == ("query", Slice)
 
 
+def test_a_lock_timeout_at_or_past_the_call_deadline_is_not_used(superset, monkeypatch, caplog):
+    """`MNEMIQ_LOCK_TIMEOUT_S` is used only when it is a number of seconds above 0 and below mnemiq's deadline for a
+    call (45 seconds by default). At or past the deadline a write could land after mnemiq gave up on it; past
+    Postgres' largest `lock_timeout` (2147483647 ms) the `set_config` itself fails; and a value too large to be a
+    number of milliseconds (1e306 seconds) fails before it is sent. Each falls back to the default 30 seconds, with
+    a warning naming the setting. The controls: values just inside the bounds are used as they are, without one."""
+    session = _Session("postgresql")
+    monkeypatch.setattr(writes, "_session", lambda: session)
+    for configured in (45, 45.0, 60, 2_147_484, 10**400, 1e306, float("inf")):
+        session.log.clear()
+        caplog.clear()
+        superset.config["MNEMIQ_LOCK_TIMEOUT_S"] = configured
+        with caplog.at_level("WARNING", logger=writes.__name__):
+            writes.lock_row(Slice, 4)
+        assert session.log[0] == ("execute", LOCK_TIMEOUT, {"timeout": "30000ms"}), configured
+        assert ["MNEMIQ_LOCK_TIMEOUT_S" in record.getMessage() for record in caplog.records] == [True], configured
+    for configured, waits in ((44.9, "44900ms"), (0.001, "1ms"), (3, "3000ms")):
+        session.log.clear()
+        caplog.clear()
+        superset.config["MNEMIQ_LOCK_TIMEOUT_S"] = configured
+        with caplog.at_level("WARNING", logger=writes.__name__):
+            writes.lock_row(Slice, 4)
+        assert session.log[0] == ("execute", LOCK_TIMEOUT, {"timeout": waits}), configured
+        assert caplog.records == [], configured
+
+
 def test_a_contended_lock_answers_busy_and_ends_the_transaction(superset, monkeypatch):
     """A lock wait past the timeout (55P03), a deadlock (40P01) or a serialization failure (40001) on the lock answers
     `{busy}`: the same request may be sent again. Nothing is written and the transaction ends. Any other database

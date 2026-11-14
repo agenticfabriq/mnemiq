@@ -356,20 +356,24 @@ def _command_errors() -> tuple[type[Exception], ...]:
 
 
 # How long a write waits for a row another transaction holds, unless Superset's config sets `MNEMIQ_LOCK_TIMEOUT_S`:
-# well inside mnemiq's own deadline for a call (45 seconds by default), so a tool stuck behind a long transaction
-# answers `{"busy": true}` while mnemiq still waits for it, rather than writing after mnemiq gave up on the call.
+# well inside mnemiq's own deadline for a call, so a tool stuck behind a long transaction answers `{"busy": true}`
+# while mnemiq still waits for it, rather than writing after mnemiq gave up on the call.
 LOCK_TIMEOUT_S = 30
+# mnemiq's deadline for a call, in seconds (its default): a lock wait as long as this may end after mnemiq gave up.
+CALL_DEADLINE_S = 45
 
 
 def _lock_timeout() -> str:
-    """The `lock_timeout` to set, as Postgres reads it: `MNEMIQ_LOCK_TIMEOUT_S` seconds when that is a positive
-    number, else `LOCK_TIMEOUT_S`."""
+    """The `lock_timeout` to set, as Postgres reads it: `MNEMIQ_LOCK_TIMEOUT_S` seconds when that is a number above 0
+    and below `CALL_DEADLINE_S`, else `LOCK_TIMEOUT_S`, with a warning naming the setting. The bound also keeps the
+    value finite, a whole number of milliseconds once rounded, and under Postgres' largest `lock_timeout`
+    (2147483647 ms), which a larger value would make the write fail on."""
     from flask import current_app
 
     value = current_app.config.get("MNEMIQ_LOCK_TIMEOUT_S", LOCK_TIMEOUT_S)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value < float("inf"):
-        logger.warning("mnemiq extension: MNEMIQ_LOCK_TIMEOUT_S is not a positive number of seconds; waiting %s",
-                       LOCK_TIMEOUT_S)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value < CALL_DEADLINE_S:
+        logger.warning("mnemiq extension: MNEMIQ_LOCK_TIMEOUT_S must be a number of seconds above 0 and below %s "
+                       "(mnemiq's deadline for a call); waiting %s", CALL_DEADLINE_S, LOCK_TIMEOUT_S)
         value = LOCK_TIMEOUT_S
     return f"{max(1, round(value * 1000))}ms"
 
@@ -380,8 +384,9 @@ def lock_row(model: type, entity_id: int) -> Any:
     against every other writer that locks the row, rc2's own dataset `PUT` included.
 
     On Postgres the wait is bounded first: `SET LOCAL lock_timeout` (written `set_config(..., true)`, so the value is a
-    bound parameter) holds until the transaction ends, which is the command's commit or `_locked`'s rollback, so it
-    bounds the lock and every write of the command after it. A wait past it fails with SQLSTATE 55P03
+    bound parameter) holds until the transaction ends, which is the command's commit or `_locked`'s rollback. It
+    bounds each lock wait in that transaction on its own, this row's lock and any lock a write of the command waits
+    for after it, not the write as a whole. A wait past it fails with SQLSTATE 55P03
     (lock_not_available), which rc2's `is_lock_contention_error` counts as contention (`superset/versioning/
     db_errors.py`, `_PG_LOCK_CONTENTION`), so the tool answers `{"busy": true}`. SQLite takes no row locks, and MySQL
     has no lock timeout that ends with the transaction: there the database's own setting applies.

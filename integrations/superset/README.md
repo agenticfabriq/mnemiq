@@ -34,7 +34,7 @@ Run `superset init` after the first load so roles receive the route's permission
 | `MNEMIQ_TOKEN_AUDIENCE` | The `aud` claim. |
 | `MNEMIQ_TOKEN_TENANT` | The `tenant` claim. |
 | `MNEMIQ_TOKEN_LIFETIME_S` | Seconds a token lives. At most 300, which is also the default. |
-| `MNEMIQ_LOCK_TIMEOUT_S` | Seconds a write tool waits for a row another transaction holds before it answers `{"busy": true}`. Default 30: keep it under mnemiq's deadline for a call (45 seconds by default), or a write could land after mnemiq gave up on it. Applies on a Postgres metadata database; on MySQL the database's own lock wait applies. |
+| `MNEMIQ_LOCK_TIMEOUT_S` | Seconds a write tool waits for each lock another transaction holds before it answers `{"busy": true}`. Default 30. It must be above 0 and below 45, mnemiq's default deadline for a call, or a write could land after mnemiq gave up on it: any other value is not used, and the extension logs a warning naming the setting and waits 30. Applies on a Postgres metadata database; on MySQL the database's own lock wait applies. |
 
 All but the lifetime and the lock timeout are required; the route answers 503 naming the one that is missing.
 
