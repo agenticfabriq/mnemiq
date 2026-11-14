@@ -111,12 +111,14 @@ def display_format(kind: MeasureKind, currency: str | None) -> tuple[str, dict |
     return fmt, None
 
 
-def measure_statement(measure: Measure, source: str, dimensions: tuple[str, ...] = (),
+def measure_statement(measure: Measure | tuple[Measure, ...], source: str, dimensions: tuple[str, ...] = (),
                       filters: tuple[str, ...] = ()) -> str:
     """The statement that computes `measure` over `source` (a quoted table name or an unparenthesized join,
     `a JOIN b ON ...`: the deciders refuse a parenthesized one as an unmodelled source), grouped by
-    `dimensions` and narrowed by `filters`."""
-    select = ", ".join([*dimensions, f"{measure.expression} AS {measure.name}"])
+    `dimensions` and narrowed by `filters`. A tuple of measures computes each, in order, after the dimensions, as a
+    chart that plots several does."""
+    measures = measure if isinstance(measure, tuple) else (measure,)
+    select = ", ".join([*dimensions, *(f"{m.expression} AS {m.name}" for m in measures)])
     sql = f"SELECT {select} FROM {source}"
     if filters:
         sql += " WHERE " + " AND ".join(f"({f})" for f in filters)
