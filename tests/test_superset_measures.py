@@ -25,7 +25,9 @@ from mnemiq.superset.measures import (
     measure_statement,
     measure_value,
 )
-from mnemiq.sql.verdict import Approved
+from mnemiq.sql.verdict import Approved, Refusal
+from mnemiq.superset.history import run_decided, superset_history
+from tests import test_superset_history as history_tests
 from tests.superset_fake import FakeSuperset
 
 EMPTY = {"success": True, "columns": [], "rows": []}
@@ -197,3 +199,37 @@ def test_the_mcp_2x_workflow_runs_this_module():
     assert len(runs) == 1, f"expected one pytest line in {MCP_2X.name}, found {runs}"
     module = f"tests/{Path(__file__).name}"
     assert module in shlex.split(runs[0].split("run:", 1)[1]), f"{MCP_2X.name}'s pytest line does not run {module}"
+
+
+_FAN_JOIN = "SELECT SUM(c.paid) AS paid FROM fact_claim c JOIN fact_premium p ON c.policy_id = p.policy_id"
+_HISTORY_CASES = {
+    "runs": (history_tests.TOP_REGION, history_tests.SNAPSHOT, history_tests.GRANTS, False, None),
+    "table-not-granted": ("SELECT region, SUM(amount) AS total FROM claim GROUP BY region", history_tests.SNAPSHOT,
+                          history_tests.GRANTS, False, "unauthorized_table"),
+    "write": ("DELETE FROM policy", history_tests.SNAPSHOT, history_tests.GRANTS, False, None),
+    "fan-out": (_FAN_JOIN, SNAPSHOT, GRANTS, True, "fan_out"),
+}
+
+
+@pytest.mark.parametrize("sql, snapshot, grants, guard, code", _HISTORY_CASES.values(), ids=_HISTORY_CASES.keys())
+def test_run_decided_matches_history(sql, snapshot, grants, guard, code, caplog):
+    """`run_decided` is the one decide-then-run path: on the history tests' own adapter, snapshot and grants it keeps
+    exactly the rows `superset_history` keeps for a turn, and refuses exactly the statements history drops."""
+    reply = history_tests._result(("east", 16667))
+    with FakeSuperset() as fake:
+        history_tests._serve(fake, reply)
+        turn = history_tests._turn(sql, fingerprint=grants.fingerprint)
+        with caplog.at_level("WARNING", logger="mnemiq.superset.history"):
+            [kept] = superset_history([turn], grants=grants, snapshot=snapshot, adapter=history_tests._adapter(fake),
+                                      timeout_s=30.0, values=None, guard_fanout=guard)
+        decided = run_decided(sql, adapter=history_tests._adapter(fake), snapshot=snapshot, grants=grants,
+                              timeout_s=30.0, guard_fanout=guard)
+    if isinstance(decided, Refusal):
+        assert kept.rows == [] and kept.columns == []
+        if code is not None:
+            assert decided.code.value == code and f"({code}," in caplog.text
+    else:
+        assert kept.columns == decided.table.column_names
+        assert kept.rows == [list(row) for row in zip(*(c.to_pylist() for c in decided.table.columns))]
+        assert kept.rows == [["east", 16667]]
+    assert isinstance(decided, Refusal) is (sql != history_tests.TOP_REGION)
