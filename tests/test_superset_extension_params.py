@@ -586,6 +586,26 @@ def test_an_unreachable_tab_of_the_current_layout_is_not_required():
     assert check(layout([1, 2], tabs=("TAB-a", "TAB-b"))) == {"refused": "drops_tab", "tabs": ["TAB-z"]}
 
 
+def test_a_node_whose_type_is_not_text_is_malformed():
+    """Every layout rc2 writes types a node with text. A `type` that is a list or an object is no layout rc2 reads
+    one way, so the new layout is refused as malformed, never failed on (a list or an object cannot be looked up in
+    a set of types). A current layout holding such a node is read as `Dashboard.tabs` reads it, comparing the type
+    with `==`: the node is passed over without being entered."""
+    current = layout([1, 2], tabs=("TAB-a", "TAB-b"))
+
+    def check(positions):
+        return ext.check_positions(positions, current_positions=current, current_chart_ids=[1, 2])
+
+    for key in ("ROOT_ID", "GRID_ID", "TABS-1", "TAB-a", "ROW-1", "CHART-1"):
+        for bad in (["TABS"], {"type": "TAB"}):
+            positions = layout([1, 2], tabs=("TAB-a", "TAB-b"))
+            positions[key]["type"] = bad
+            assert check(positions) == {"refused": "malformed"}, (key, bad)
+    # The current tab group typed with a list: rc2 does not enter it, knows no tab under it, and none is required.
+    current["TABS-1"]["type"] = ["TABS"]
+    assert check(layout([1, 2])) is None
+
+
 def _deleted_native_filter_ids(current_metadata, new_metadata):
     """What rc2's `UpdateDashboardCommand.process_native_filter_diff` (`superset/commands/dashboard/update.py`)
     counts as deleted, and so deactivates every report on: the filter ids the new metadata no longer lists."""

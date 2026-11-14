@@ -687,13 +687,13 @@ def _is_id(value: Any) -> bool:
 def _layout_chart_ids(positions: Mapping) -> set[int] | None:
     """The charts a layout makes members, read as rc2's `DashboardDAO.set_dash_metadata` (`superset/daos/
     dashboard.py`) reads them: every node's `meta.chartId`. None for a layout it would fail on or misread: a node
-    without a type, a `meta` that is not an object, a chart node without a positive integer id, or a chart id on a
-    node that is not a chart."""
+    without a type or whose type is not text, a `meta` that is not an object, a chart node without a positive integer
+    id, or a chart id on a node that is not a chart."""
     found: set[int] = set()
     for node in positions.values():
         if not isinstance(node, Mapping):
             continue
-        if "type" not in node:
+        if not isinstance(node.get("type"), str):
             return None
         meta = node.get("meta", {})
         if not isinstance(meta, Mapping):
@@ -734,7 +734,9 @@ def _reachable_tabs(positions: Any) -> list[tuple[str, Mapping]]:
             if not isinstance(child, Mapping) or child_key in visited:
                 continue
             visited.add(child_key)
-            if node["type"] in _WALKED:
+            # Compared as rc2 compares it, with `==`: a type that is not text is no walked type, and never a lookup
+            # that fails on a list or an object.
+            if isinstance(node["type"], str) and node["type"] in _WALKED:
                 queue.append((child_key, child))
         if node["type"] == "TAB":
             found.append((key, node))
