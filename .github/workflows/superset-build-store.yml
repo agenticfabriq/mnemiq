@@ -15,6 +15,8 @@ jobs:
   # and finds no value kept there, and two connections racing to claim one step. They need a server to make their own
   # schemas on, and ci.yml's `unit` gives them none, so there they skip. Here they get a Postgres of their own, and
   # MNEMIQ_TEST_BUILD_STORE_REQUIRED turns a missing DSN into a failure, so this job cannot pass by skipping them.
+  # The builder's tests run here too: its builds on this store, beside the ones on the in-memory store, with the
+  # store's own gate.
   #
   # From the network it needs what `unit` needs (the actions, Python packages through uv) and the `postgres:16` image,
   # from Docker Hub.
@@ -41,12 +43,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
-      # `dev` alone, for pytest: the store and its tests import nothing else outside the core dependencies, which carry
-      # psycopg.
+      # `dev` alone, for pytest, and uvicorn, which serves the builder's tests their stand-in Superset: the store and
+      # both modules import nothing else outside the core dependencies, which carry psycopg, mcp and duckdb.
       - run: uv sync --extra dev
       # `-ra`, not `-rs`: an explicit `-r` replaces pytest's default `fE`, and a summary that lists skips but drops
       # failures and errors would hide the lines this job exists to show.
-      - run: uv run pytest -q -ra tests/test_superset_build_store.py
+      - run: uv run pytest -q -ra tests/test_superset_build_store.py tests/test_superset_builder.py
         # tests/test_superset_build_store.py reads these two lines, by the names its gate reads, and fails in `unit`
         # if either goes missing or is renamed on one side only.
         env:

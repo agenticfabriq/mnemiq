@@ -13,6 +13,7 @@ integration test is collected, and these tests need nothing of it.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import math
 import os
@@ -40,6 +41,7 @@ from mnemiq.superset.build_store import (
     BuildNotFound,
     BuildStore,
     BuildStoreMissing,
+    DashboardBusy,
     DashboardMeasure,
     LeaseLost,
     StepBusy,
@@ -47,7 +49,9 @@ from mnemiq.superset.build_store import (
     StoredBuild,
 )
 from mnemiq.superset.chart_check import ChartCheck, ChartStatus
+from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenRef
 from mnemiq.superset.measures import Measure, MeasureKind
+from mnemiq.superset.planner import BuildPlan, PlannedDataset, plan_from_json, plan_to_json
 
 DSN_VARIABLE = "MNEMIQ_TEST_BUILD_STORE_DSN"
 REQUIRED_VARIABLE = "MNEMIQ_TEST_BUILD_STORE_REQUIRED"
@@ -64,22 +68,38 @@ STEPS = [("dashboard", "dashboard"), ("policies", "dataset"), ("premium_by_regio
 # The kinds whose step makes an object, and so finishes `done` with its id.
 MAKES_AN_OBJECT = {"dashboard", "dataset", "chart"}
 
-PLAN = {
-    "measures": [{"name": "premium", "label": "Premium", "expression": "SUM(premium)", "kind": "currency",
-                  "dataset": "policies"}],
-    "charts": [
-        {"key": "premium_by_region", "family": "echarts_timeseries_bar", "title": "Premium by region",
-         "measures": ["premium"], "dimensions": ["region"], "grain": None},
-        {"key": "claims_trend", "family": "echarts_timeseries_line", "title": "Claims",
-         "measures": ["claims"], "dimensions": [], "grain": "P1M"},
-    ],
-    "reuse_candidates": [],
-}
-
 MEASURE = Measure(name="premium", label="Premium", expression="SUM(premium)", kind=MeasureKind.CURRENCY,
                   dataset_id=42, description="Written premium", asked_by=ANA, currency="USD")
 CLAIMS = Measure(name="claims", label="Claims", expression="COUNT(*)", kind=MeasureKind.COUNT, dataset_id=42,
                  description="Claims filed", asked_by=BO)
+
+
+def _spec(key: str, family: Family, title: str, measures: tuple, **more) -> ChartSpec:
+    fields = {"dataset_id": 42, "dimensions": (), "time_column": None, "time_grain": None, "filters": (),
+              "row_limit": None, "source": None, "target": None, **more}
+    return ChartSpec(key=key, family=family, title=title, measures=measures, **fields)
+
+
+# A plan as the build keeps it: what the planner's `plan_to_json` writes.
+PLAN = plan_to_json(BuildPlan(
+    charts=(_spec("premium_by_region", Family.BAR, "Premium by region", (WrittenRef(MEASURE),),
+                  dimensions=("region",)),
+            _spec("claims_trend", Family.LINE, "Claims", (WrittenRef(CLAIMS),), time_column="filed",
+                  time_grain="P1M")),
+    measures=(MEASURE, CLAIMS)))
+# A plan holding every part `plan_to_json` writes: a saved metric and a written one, filters with one operand, a list
+# and none, a dataset the build makes on a table and one on a join, and an offer to reuse a dashboard.
+FULL_PLAN = plan_to_json(BuildPlan(
+    charts=(_spec("premium_by_region", Family.BAR, "Premium by region",
+                  (SavedRef("total_premium", MeasureKind.CURRENCY), WrittenRef(MEASURE)), dimensions=("region",),
+                  filters=(Filter("region", "IN", ["west", "east"]), Filter("premium", ">", 0.25),
+                           Filter("region", "IS NOT NULL")), row_limit=100),
+            _spec("flow", Family.SANKEY, "Flow", (WrittenRef(CLAIMS),), dataset_id=-2, source="region",
+                  target="channel")),
+    measures=(MEASURE, dataclasses.replace(CLAIMS, dataset_id=-2)), reuse_candidates=(12,), reuse_reason="it fits",
+    datasets=(PlannedDataset(key="dataset_1", placeholder=-1, table="policy", table_name="policy"),
+              PlannedDataset(key="dataset_2", placeholder=-2, join="policy JOIN claim ON policy.id = claim.policy_id",
+                             sql="SELECT 1", name="mnemiq_policy_claim"))))
 
 # What a value, a row or a sample is kept under. The guard flags a column or a jsonb key at any depth whose name, folded
 # (`_fold`), is one of these. It keeps its own list rather than reading the store's: a guard that shared the store's list
@@ -280,6 +300,83 @@ def test_a_plan_holding_a_value_shaped_key_is_refused(plan):
     value. `test_the_json_the_store_writes_is_jsonb_postgres_reads` keeps a `row_limit`, which only contains a word."""
     with pytest.raises(ValueError):
         _offline_store().create_build(TENANT, ANA, GOAL, plan, STEPS)
+
+
+def _planted(path: tuple, key: str | None, item: object) -> dict:
+    """`FULL_PLAN` with `item` put under `key` in the object at `path`, or, with no key, in place of what is at
+    `path`."""
+    plan = copy.deepcopy(FULL_PLAN)
+    node = plan
+    for step in path if key is not None else path[:-1]:
+        node = node[step]
+    node[key if key is not None else path[-1]] = item
+    return plan
+
+
+SENTINEL = 987654.321
+# Where a value could hide in a kept plan, and what is planted there.
+PLANTED = {
+    "a key beside the plan's own": ((), "notes", SENTINEL),
+    "a key in a measure": (("measures", 0), "note", SENTINEL),
+    "a key in a chart": (("charts", 0), "colour", SENTINEL),
+    "a key in a chart's measure": (("charts", 0, "measures", 0), "label", SENTINEL),
+    "a key in a filter": (("charts", 0, "filters", 0), "comment", SENTINEL),
+    "a key in a planned dataset": (("datasets", 1), "rows_estimate", SENTINEL),
+    "a key in the reuse offer": (("reuse",), "score", SENTINEL),
+    "an object for a filter's operand": (("charts", 0, "filters", 1, "operand"), None, {"planted": SENTINEL}),
+    "an object in a filter's listed operand": (("charts", 0, "filters", 0, "operand", 0), None, {"planted": SENTINEL}),
+    "an object among a chart's dimensions": (("charts", 0, "dimensions", 0), None, {"planted": SENTINEL}),
+    "an object for the format": (("format",), None, {"planted": SENTINEL}),
+    "an object among the offered dashboards": (("reuse", "candidates", 0), None, {"planted": SENTINEL}),
+    "a list for a measure": (("measures", 0), None, [SENTINEL]),
+    "a list for a chart's title": (("charts", 0, "title"), None, [SENTINEL]),
+}
+
+
+def test_the_plan_check_admits_every_part_the_planner_writes():
+    """Known good: every key `plan_to_json` writes, at every depth, in a plan holding each kind of part, passes the
+    check, and reads back as the plan it was."""
+    kept = build_store._plan(FULL_PLAN)
+    assert kept == FULL_PLAN
+    assert plan_to_json(plan_from_json(kept)) == FULL_PLAN
+    assert build_store._plan(PLAN) == PLAN
+
+
+@pytest.mark.parametrize("case", list(PLANTED))
+def test_the_plan_check_is_an_allow_list_of_what_the_planner_writes(case):
+    """Planted: a key `plan_to_json` never writes, at any depth, or an object or a list where it writes a single
+    value, is refused before anything is sent, whatever the key is called. A value kept under any name has nowhere to
+    go."""
+    plan = _planted(*PLANTED[case])
+    with pytest.raises(ValueError):
+        build_store._plan(plan)
+    with pytest.raises(ValueError):
+        _offline_store().create_build(TENANT, ANA, GOAL, plan, STEPS)
+
+
+def test_the_allow_list_is_read_from_the_planners_own_writer(monkeypatch):
+    """The allowed keys are read from `plan_to_json`, their one source: a key the planner starts writing is admitted
+    with nothing in the store changed, and refused again once the planner no longer writes it."""
+    import mnemiq.superset.planner as planner
+
+    written = planner.plan_to_json
+
+    def writes_more(plan):
+        doc = written(plan)
+        doc["charts"] = [dict(chart, subtitle=None) for chart in doc["charts"]]
+        return doc
+
+    with_subtitle = copy.deepcopy(FULL_PLAN)
+    with_subtitle["charts"][0]["subtitle"] = "by region"
+    build_store._plan_shape.cache_clear()
+    monkeypatch.setattr(planner, "plan_to_json", writes_more)
+    try:
+        assert build_store._plan(with_subtitle) == with_subtitle
+    finally:
+        monkeypatch.undo()
+        build_store._plan_shape.cache_clear()
+    with pytest.raises(ValueError):
+        build_store._plan(with_subtitle)
 
 
 @pytest.mark.parametrize("plan", [{"charts": [object()]}, {1: "one"}, {"limit": math.nan}, ["not", "a", "mapping"]])
@@ -878,8 +975,8 @@ def test_a_store_reconnects_after_its_connection_drops(store_dsn):
 
 
 def test_the_json_the_store_writes_is_jsonb_postgres_reads(store, store_dsn):
-    """A plan's own types survive the round trip: a float stays a float, a nested list a list."""
-    plan = PLAN | {"row_limit": 100, "ratio": 0.25, "nested": [[1, "a"], {"k": None}]}
+    """A plan's own types survive the round trip: a float stays a float, a list a list, a null a null."""
+    plan = FULL_PLAN
     build = store.create_build(TENANT, ANA, GOAL, plan, STEPS)
     assert store.load_build(TENANT, build.build_id, ANA).plan == plan
     with psycopg.connect(store_dsn, autocommit=True) as con:
@@ -889,18 +986,19 @@ def test_the_json_the_store_writes_is_jsonb_postgres_reads(store, store_dsn):
 
 
 def test_a_store_is_safe_to_share_between_threads(store):
-    """The server shares one store across its request threads; each call holds the connection alone."""
+    """The server shares one store across its request threads; each call holds the connection alone. Each build makes
+    a dashboard of its own, since a dashboard has one build building at a time."""
     builds = [store.create_build(TENANT, ANA, GOAL, PLAN, STEPS) for _ in range(4)]
     errors: list[BaseException] = []
 
-    def work(build: StoredBuild) -> None:
+    def work(build: StoredBuild, made: int) -> None:
         try:
             for key, kind in STEPS[:3]:
-                _run_step(store, store.load_build(TENANT, build.build_id, ANA), key, kind, 90)
+                _run_step(store, store.load_build(TENANT, build.build_id, ANA), key, kind, made)
         except BaseException as exc:  # noqa: BLE001 -- re-raised below, in the test's own thread
             errors.append(exc)
 
-    threads = [threading.Thread(target=work, args=(build,)) for build in builds]
+    threads = [threading.Thread(target=work, args=(build, 90 + n)) for n, build in enumerate(builds)]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -984,3 +1082,63 @@ def test_a_held_row_makes_a_claim_fail_promptly_not_hang(store_dsn, monkeypatch,
         assert _raw_step(store_dsn, build.build_id, "dashboard")["lease_id"] is None
         assert isinstance(store.claim_next_step(TENANT, build.build_id, ANA, _intent("dashboard", "dashboard")),
                           StepState)
+
+
+# --- One live build per dashboard: a dashboard's measures are replaced by whichever build writes them last.
+
+def test_a_second_build_of_a_dashboard_is_refused_while_one_is_building(store):
+    """While a build of a dashboard is building, another of the same tenant and dashboard is refused; another
+    tenant's, another dashboard's, and one once the first has ended, are not. A new dashboard's build holds its
+    dashboard from when its dashboard step names it."""
+    first = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12)
+    with pytest.raises(DashboardBusy) as busy:
+        store.create_build(TENANT, BO, GOAL, PLAN, STEPS, dashboard_id=12)
+    assert first.build_id not in str(busy.value)
+    store.create_build(OTHER_TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12)
+    store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=13)
+    fresh = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS)
+    _run_step(store, fresh, "dashboard", "dashboard", 14)
+    with pytest.raises(DashboardBusy):
+        store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=14)
+    claimed = store.claim_next_step(TENANT, first.build_id, ANA, _intent("dashboard", "dashboard"))
+    store.finish_step(TENANT, first.build_id, "dashboard", "failed", None, lease_id=claimed.lease_id)
+    again = store.create_build(TENANT, BO, GOAL, PLAN, STEPS, dashboard_id=12)
+    assert again.status == "building"
+
+
+def test_two_builds_of_a_dashboard_started_at_once_leave_one(stores):
+    """Two stores create a build of one dashboard at once, from two threads: exactly one is made, the other refused
+    by Postgres itself (a unique index over the dashboards of builds still building), not by a read before the
+    write."""
+    barrier = threading.Barrier(2)
+    made, refused = [], []
+
+    def start(each: BuildStore) -> None:
+        barrier.wait()
+        try:
+            made.append(each.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12))
+        except DashboardBusy:
+            refused.append(True)
+
+    pair = [stores(), stores()]
+    for each in pair:
+        each.load_build(TENANT, str(uuid.uuid4()), ANA)  # connected, tables made
+    threads = [threading.Thread(target=start, args=(each,)) for each in pair]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert (len(made), len(refused)) == (1, 1)
+
+
+def test_the_live_dashboard_rule_is_postgres_own(store, store_dsn):
+    """The rule is a partial unique index Postgres holds (read from its catalogue): its columns are the tenant and
+    the dashboard, over builds still building with a dashboard."""
+    store.load_build(TENANT, str(uuid.uuid4()), ANA)
+    with psycopg.connect(store_dsn, autocommit=True) as con:
+        [(definition,)] = con.execute(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND tablename = %s "
+            "AND indexdef LIKE 'CREATE UNIQUE INDEX%%' AND indexname <> %s",
+            (BUILD_TABLE, f"{BUILD_TABLE}_pkey")).fetchall()
+    assert "(tenant_id, dashboard_id)" in definition
+    assert "status = 'building'" in definition and "dashboard_id IS NOT NULL" in definition

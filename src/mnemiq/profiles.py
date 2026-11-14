@@ -58,6 +58,7 @@ DEPLOYMENT_SETTINGS = frozenset({
     "store_path", "control_dsn", "embed_model", "embed_base_url", "embed_api_key", "enrich_facts", "enrich_examples",
     "dictionary_path", "ontology_records_path", "definition_index_max_concepts", "binding_suggestions_path",
     "superset_mcp_url", "superset_database_id", "superset_schema", "superset_currency",
+    "superset_timezone",
     # Secrets are never read from a file: a profile names a variable instead.
     "llm_api_key", "verify_api_key",
     # The deployment's own running.

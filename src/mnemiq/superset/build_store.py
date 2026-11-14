@@ -8,13 +8,16 @@ the charts that show it and of the datasets mnemiq made for it, and each chart's
 The guarantee is upstream, not here: the planner is given no value (it sees the schema, saved metrics' names and
 expressions, and dashboards' titles), a value check's numbers ride back in its response only, and a measure's value is
 computed through Superset as whoever asks, each time, and kept nowhere. The store's own checks are a backstop. An intent
-holds four named fields and a measure's row ids and statuses, so neither has room for a number. A plan, the one
-free-form document, is refused when any key at any depth reads, folded (NFKC, stripped, casefolded), as one a value, a
-row or a sample is kept under (`VALUE_SHAPED_KEYS`); that catches a value kept under its usual names, not one kept
-under any name.
+holds four named fields and a measure's row ids and statuses, so neither has room for a number. A plan is held to
+what the planner writes (`plan_to_json`): an allow-list of its keys at every depth, read from that writer, refuses any
+other key and an object or a list where it writes a single value, so a value has no key to be kept under. Beneath it,
+a key that reads, folded (NFKC, stripped, casefolded), as one a value, a row or a sample is kept under
+(`VALUE_SHAPED_KEYS`) is refused too.
 
 A build is read only by its tenant and the principal who started it. A dashboard's measures are the dashboard's: any
-principal of the tenant reads them, and Superset checks editorship on each action that changes the dashboard.
+principal of the tenant reads them, and Superset checks editorship on each action that changes the dashboard. A
+dashboard has one build building at a time (`DashboardBusy`), since its measures are kept as the last build to write
+them leaves them; Postgres holds that rule, as a unique index over the dashboards of builds still building.
 
 **Steps and leases.** A build runs one step at a time, in order: its dashboard (a new shell, or the read of an existing
 one), then its datasets, its charts, its layout and its checks. `claim_next_step` claims the first step not done before
@@ -33,6 +36,7 @@ a lease id of its own, so a worker whose step was taken from it can neither rene
 from __future__ import annotations
 
 import copy
+import functools
 import hashlib
 import math
 import threading
@@ -56,8 +60,8 @@ if TYPE_CHECKING:
 
 __all__ = ["BUILD_TABLE", "DEFAULT_LEASE_S", "LOCK_TIMEOUT_MS", "MEASURE_TABLE", "STATEMENT_TIMEOUT_MS", "STEP_KINDS",
            "STORE_MISSING", "VALUE_SHAPED_KEYS",
-           "BuildNotFound", "BuildStore", "BuildStoreMissing", "DashboardMeasure", "LeaseLost", "StepBusy",
-           "StepState", "StoredBuild"]
+           "BuildNotFound", "BuildStore", "BuildStoreMissing", "DashboardBusy", "DashboardMeasure", "LeaseLost",
+           "StepBusy", "StepState", "StoredBuild"]
 
 BUILD_TABLE = "mnemiq_superset_build"
 MEASURE_TABLE = "mnemiq_superset_measure"
@@ -128,6 +132,11 @@ CREATE TABLE IF NOT EXISTS {MEASURE_TABLE} (
     check_status jsonb NOT NULL DEFAULT '{{}}',
     updated_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, dashboard_id, name))"""
+# One build building per dashboard of a tenant, held by Postgres: a second insert, or a new dashboard's step naming a
+# dashboard another build is building, fails on it, however the two writes interleave.
+_LIVE_DASHBOARD = f"{BUILD_TABLE}_live_dashboard"
+_CREATE_LIVE_DASHBOARD = (f"CREATE UNIQUE INDEX IF NOT EXISTS {_LIVE_DASHBOARD} ON {BUILD_TABLE} "
+                          f"(tenant_id, dashboard_id) WHERE status = '{BUILDING}' AND dashboard_id IS NOT NULL")
 # Two servers starting at once would both run `CREATE TABLE IF NOT EXISTS`, and Postgres can fail the second with a
 # unique violation on its catalogue rather than find the table; the tables are made under this advisory lock instead.
 _DDL_LOCK = int.from_bytes(hashlib.sha256(b"mnemiq.superset.build_store").digest()[:8], "big", signed=True)
@@ -145,6 +154,15 @@ class BuildNotFound(LookupError):
 
     def __init__(self) -> None:
         super().__init__("no such build for this tenant and principal")
+
+
+class DashboardBusy(Exception):
+    """Another build of this dashboard, for this tenant, is still building. A dashboard's measures are kept as its
+    builds write them, the last write standing, so one build works on a dashboard at a time. The other build is not
+    named: it may be another principal's, and a build is read only by its own."""
+
+    def __init__(self) -> None:
+        super().__init__("another build of this dashboard is still building; it must finish or stop first")
 
 
 class LeaseLost(Exception):
@@ -254,7 +272,7 @@ class BuildStore:
         plan = _plan(plan)
         build_id = uuid.uuid4()
         step_list = _new_steps(str(build_id), steps)
-        with self._connection() as con:
+        with self._connection() as con, _live_dashboard():
             row = con.execute(
                 f"INSERT INTO {BUILD_TABLE} (tenant_id, build_id, principal_id, dashboard_id, goal, plan, steps, "
                 f"status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING {_BUILD_COLUMNS}, now()",
@@ -326,7 +344,8 @@ class BuildStore:
                     lease_id: str) -> StoredBuild:
         """Record step `key` as `done`, `failed` or `uncertain`, with the id of the object it made or read (required
         for a done dashboard, dataset or chart step), ending the claim `lease_id` holds on it. A done dashboard step's
-        id is the build's dashboard. LeaseLost when the claim is no longer `lease_id`'s; nothing is written then."""
+        id is the build's dashboard, refused with DashboardBusy while another build of that dashboard is building.
+        LeaseLost when the claim is no longer `lease_id`'s; nothing is written then."""
         tenant, key = _text(tenant, "tenant"), _text(key, "step key")
         if not isinstance(status, str) or status not in _FINISHED_AS:
             raise ValueError(f"a step finishes as one of {sorted(_FINISHED_AS)}")
@@ -410,11 +429,12 @@ class BuildStore:
                 new_steps, new_dashboard_id, result = change(copy.deepcopy(steps), dashboard_id, now)
                 if new_steps is None:
                     return result, None
-                written = con.execute(
-                    f"UPDATE {BUILD_TABLE} SET steps = %s, dashboard_id = %s, status = %s, updated_at = now() "
-                    f"WHERE tenant_id = %s AND build_id = %s AND steps = %s RETURNING {_BUILD_COLUMNS}, now()",
-                    (Jsonb(new_steps), new_dashboard_id, _build_status(new_steps), tenant, build, Jsonb(steps)),
-                ).fetchone()
+                with _live_dashboard():
+                    written = con.execute(
+                        f"UPDATE {BUILD_TABLE} SET steps = %s, dashboard_id = %s, status = %s, updated_at = now() "
+                        f"WHERE tenant_id = %s AND build_id = %s AND steps = %s RETURNING {_BUILD_COLUMNS}, now()",
+                        (Jsonb(new_steps), new_dashboard_id, _build_status(new_steps), tenant, build, Jsonb(steps)),
+                    ).fetchone()
                 if written is not None:
                     return result, _stored_build(written)
         return _CONTENDED, None
@@ -446,6 +466,18 @@ class BuildStore:
                 self._con = None
 
 
+@contextmanager
+def _live_dashboard() -> Iterator[None]:
+    """A write that would give a dashboard a second build building raises DashboardBusy instead of Postgres's unique
+    violation of `_LIVE_DASHBOARD`; any other violation is raised as it is."""
+    try:
+        yield
+    except psycopg.errors.UniqueViolation as exc:
+        if exc.diag.constraint_name != _LIVE_DASHBOARD:
+            raise
+        raise DashboardBusy() from None
+
+
 def _bound_waits(con: psycopg.Connection) -> None:
     """Bound how long the session's statements wait for a lock and run, read when the store connects."""
     con.execute("SELECT set_config('lock_timeout', %s, false), set_config('statement_timeout', %s, false)",
@@ -456,6 +488,7 @@ def _make_tables(con: psycopg.Connection) -> None:
     with con.transaction():
         con.execute("SELECT pg_advisory_xact_lock(%s)", (_DDL_LOCK,))
         con.execute(_CREATE_BUILD)
+        con.execute(_CREATE_LIVE_DASHBOARD)
         con.execute(_CREATE_MEASURE)
 
 
@@ -648,11 +681,89 @@ def _intent(intent: object) -> dict:
 
 
 def _plan(plan: object) -> dict:
-    """A plain JSON copy of the plan (tuples become lists), refused when it is not a mapping of JSON, or when a key at
-    any depth is one a value is kept under."""
+    """A plain JSON copy of the plan (tuples become lists), refused when it is not a mapping of JSON, when a key at any
+    depth is one a value is kept under, or when it is not shaped as the planner writes a plan (`_plan_shape`)."""
     if not isinstance(plan, Mapping):
         raise ValueError("a build's plan is a mapping")
-    return _plain_json(plan, "plan")
+    copied = _plain_json(plan, "plan")
+    _shaped(copied, _plan_shape(), "plan")
+    return copied
+
+
+@dataclass
+class _Shape:
+    """Where a kept plan may hold what: a single value (`leaf`), an object with these `keys`, a list of `items`, or
+    more than one of these where the planner writes each."""
+
+    leaf: bool = False
+    keys: dict[str, _Shape] | None = None
+    items: _Shape | None = None
+
+
+def _shape_of(doc: Any, shape: _Shape | None = None) -> _Shape:
+    """`shape` widened by `doc`: every key, list and single value `doc` holds, at every depth, admitted where it is. A
+    list `doc` leaves empty admits nothing inside it."""
+    shape = shape or _Shape()
+    if isinstance(doc, Mapping):
+        shape.keys = {} if shape.keys is None else shape.keys
+        for key, item in doc.items():
+            shape.keys[key] = _shape_of(item, shape.keys.get(key))
+    elif isinstance(doc, (list, tuple)):
+        shape.items = shape.items or _Shape()
+        for item in doc:
+            _shape_of(item, shape.items)
+    else:
+        shape.leaf = True
+    return shape
+
+
+def _exemplar_plan():
+    """A plan holding one of every part a plan has, so `plan_to_json` writes every key it ever writes: a saved metric
+    and a written measure on one chart, a filter with one operand, one with a list and one with none, a dataset the
+    build makes on a table and one on a join, and an offer of a dashboard. A part the planner gains needs a place
+    here: until it has one, a plan holding it is refused, never admitted unchecked."""
+    from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenRef
+    from mnemiq.superset.planner import BuildPlan, PlannedDataset
+
+    written = Measure(name="m", label="M", expression="COUNT(*)", kind=MeasureKind.COUNT, dataset_id=-2,
+                      description="d", asked_by="a", currency="USD")
+    chart = ChartSpec(key="c", family=Family.BAR, title="t", dataset_id=-2,
+                      measures=(SavedRef("s", MeasureKind.COUNT), WrittenRef(written)), dimensions=("x",),
+                      time_column="x", time_grain="P1M",
+                      filters=(Filter("x", "IN", ["y"]), Filter("x", "=", "y"), Filter("x", "IS NULL")),
+                      row_limit=1, source="x", target="x")
+    return BuildPlan(charts=(chart,), measures=(written,), reuse_candidates=(1,), reuse_reason="r",
+                     datasets=(PlannedDataset(key="dataset_1", placeholder=-1, table="t", table_name="t"),
+                               PlannedDataset(key="dataset_2", placeholder=-2, join="a JOIN b ON a.x = b.x",
+                                              sql="SELECT 1", name="n")))
+
+
+@functools.cache
+def _plan_shape() -> _Shape:
+    """The shape of a plan as the planner's `plan_to_json`, its one writer, writes one: read from what it writes for
+    `_exemplar_plan`, so the allow-list is the writer's own keys and never a second list of them."""
+    from mnemiq.superset import planner
+
+    return _shape_of(planner.plan_to_json(_exemplar_plan()))
+
+
+def _shaped(doc: Any, shape: _Shape, path: str) -> None:
+    """Refuse what `shape` does not admit, naming where by the keys admitted on the way, never a key or a value it was
+    given."""
+    if isinstance(doc, Mapping):
+        if shape.keys is None:
+            raise ValueError(f"{path} holds an object where the planner writes none")
+        for key, item in doc.items():
+            if key not in shape.keys:
+                raise ValueError(f"{path} holds a key the planner never writes there: a build keeps only its plan")
+            _shaped(item, shape.keys[key], f"{path}.{key}")
+    elif isinstance(doc, list):
+        if shape.items is None:
+            raise ValueError(f"{path} holds a list where the planner writes none")
+        for index, item in enumerate(doc):
+            _shaped(item, shape.items, f"{path}[{index}]")
+    elif not shape.leaf:
+        raise ValueError(f"{path} holds a single value where the planner writes an object or a list")
 
 
 def _plain_json(doc: object, path: str) -> Any:
