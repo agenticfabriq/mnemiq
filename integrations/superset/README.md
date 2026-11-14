@@ -54,8 +54,8 @@ whatever its guest token says, not a Superset sign-in, and the MCP service runs 
 Superset's MCP service must verify these tokens: set its `MCP_JWT_PUBLIC_KEY` (or `MCP_JWKS_URI`), `MCP_JWT_AUDIENCE`
 and `MCP_JWT_ISSUER` to match the key, audience and issuer above. If the MCP service also trusts an identity provider,
 `MCP_JWT_ISSUER` lists both issuers, and Superset then refuses to start its MCP service until `MCP_USER_RESOLVER` names
-a resolver: its default finds a user by name alone, so two issuers' tokens for one name would be one user. Give it a
-resolver that binds the token's issuer.
+a resolver: its default finds a user by the username or email a token names, whichever issuer signed it, so two
+issuers' tokens for one username would be one user. Give it a resolver that binds the token's issuer.
 
 ## The write tools
 

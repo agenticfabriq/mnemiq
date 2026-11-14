@@ -892,8 +892,9 @@ def set_layout(found: dict) -> dict:
     """Writes a dashboard's layout, which also sets its charts (`json_metadata.positions`, through
     `UpdateDashboardCommand`), under the dashboard's lock, once the `changed_on` the caller read is still the
     dashboard's. The layout must hold exactly the dashboard's charts plus those added minus those removed, keep every
-    tab rc2 knows reachable under its id (`params.check_positions`), and add only charts the caller may read. The dashboard's native filters and the settings rc2 would otherwise
-    reset are sent back as they are (`params.layout_metadata`), so no report on a filter is deactivated."""
+    tab rc2 knows reachable under its id (`params.check_positions`), and add only charts the caller may read. The
+    dashboard's native filters and the settings rc2 would otherwise reset are sent back as they are
+    (`params.layout_metadata`), so no report on a filter is deactivated."""
     from superset.models.dashboard import Dashboard
 
     return _locked(Dashboard, found["dashboard_id"], lambda dashboard: _layout(found, dashboard))

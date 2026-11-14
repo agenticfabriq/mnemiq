@@ -1,9 +1,10 @@
 """The token route: `POST /extensions/agenticfabriq/mnemiq/token/` with `{"purpose": "ask" | "build"}`.
 
 A thin Flask wrapper. What the route answers is `token.mint_for`, which takes the signed-in user from `g.user` and
-nothing from the body, and refuses (403) an embedded guest and anyone not signed in. Authentication is Superset's own (`@protect`: the session, or a FAB token), and a state-changing
-call needs the usual `X-CSRFToken`. The route is registered while the entrypoint is imported, which is when
-Superset's extension context is set; imported later it would land under `/api/v1`.
+nothing from the body, and refuses (403) an embedded guest and anyone not signed in. Authentication is Superset's own
+(`@protect`: the session, or a FAB token), and a state-changing call needs the usual `X-CSRFToken`. The route is
+registered while the entrypoint is imported, which is when Superset's extension context is set; imported later it
+would land under `/api/v1`.
 """
 
 from __future__ import annotations
