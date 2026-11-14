@@ -941,3 +941,31 @@ def test_a_pies_metric_the_data_tool_does_not_return_is_not_checked(fake):
            dataset=_dataset(metrics=[(M_SAVED, "SUM(premium)")]))
     check = _check(fake)
     assert check.status is ChartStatus.NOT_CHECKED and "columns" in check.reason, check.reason
+
+
+def _waterfall(**changes) -> dict:
+    """A waterfall's form_data as rc2's MCP `map_waterfall_config` saves it: `show_total` written, on by default."""
+    return {"viz_type": "waterfall", "x_axis": "region", "groupby": [], "metric": copy.deepcopy(PREMIUM),
+            "show_total": True, "adhoc_filters": [], "row_limit": 100, "y_axis_format": ",.2f"} | changes
+
+
+@pytest.mark.parametrize("form, checkable", [
+    (_waterfall(), False),
+    (_waterfall(show_total=False), False),
+    (_waterfall(groupby=["channel"]), False),
+    (_waterfall(metric=MIN_PREMIUM), False),
+    (_waterfall(metric=M_SAVED), False),
+    (_waterfall(metric=SUM_PREMIUM), True),
+    (_waterfall(metric=COUNT_PREMIUM, show_total=False), True),
+    (_waterfall(metric=SUM_PREMIUM, groupby=["channel"]), True),
+], ids=["total bar of a SQL metric", "running total of a SQL metric, no total bar", "per-period totals of a SQL metric",
+        "totals of a MIN", "totals of a saved metric", "totals of a SUM", "running total of a COUNT",
+        "per-period totals of a SUM"])
+def test_a_waterfalls_totals_are_checked_only_when_the_sum_is_the_measures_own(form, checkable):
+    """rc2's waterfall sums what it shows beyond each step (`Waterfall/transformProps.ts`): `transformer` adds a total
+    bar per period and one at the end when `showTotal`, and every bar's tooltip shows `totalSum`, the running sum of
+    the steps so far, whether or not a total bar shows. A sum of a SIMPLE SUM or COUNT is that measure's own."""
+    found = expectation_from_form_data(form, dataset=PHYSICAL)
+    assert isinstance(found, Expectation) is checkable, found
+    if not checkable:
+        assert "sum" in found.reason

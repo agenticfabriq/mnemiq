@@ -321,6 +321,11 @@ def _renderer_sum(viz_type: str, form: dict, dimensions: list[str]) -> str | Non
         # `treeBuilder` (`plugin-chart-echarts/src/utils/treeBuilder.ts`) sets each parent's value to the sum of its
         # children's, which `Treemap/transformProps.ts` labels and shows in `formatTooltip`.
         shown = "each of the treemap's parents"
+    elif viz_type == "waterfall":
+        # `Waterfall/transformProps.ts`: `formatTooltip` shows every bar's `totalSum`, the running sum of the steps so
+        # far, whatever `showTotal` says; with `showTotal` (the `show_total` control, which MCP's
+        # `map_waterfall_config` writes, True by default) `transformer` also adds total bars summed from the steps.
+        shown = "the waterfall's running totals"
     else:
         return None
     if all(_summable(item) for item in _metric_items(viz_type, form)):
