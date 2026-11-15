@@ -8,11 +8,19 @@ Runs against `FakeSuperset`, a real MCP server over streamable HTTP, through the
 
 from __future__ import annotations
 
+import __future__
+import collections
+import collections.abc
 import copy
+import dataclasses
+import decimal
+import enum
+import functools
 import inspect
 import logging
 import re
-from datetime import datetime, timedelta
+import types
+from datetime import date, datetime, time, timedelta
 
 import pytest
 
@@ -169,6 +177,224 @@ def _tools(fake) -> list[str]:
     return [call.tool for call in fake.calls]
 
 
+_PLAIN = (str, bytes, int, float, complex, bool, type(None), decimal.Decimal, datetime, date, time, timedelta,
+          enum.Enum)
+
+
+def _attributes(held) -> set[str]:
+    """The names an object keeps values under: its instance attributes, its slots under the name each declaring
+    class gives them (a private slot `__rows` of class `_C` is `_C__rows`), and its dataclass fields."""
+    names = set(getattr(held, "__dict__", {}))
+    for cls in type(held).__mro__:
+        slots = cls.__dict__.get("__slots__", ())
+        for slot in ((slots,) if isinstance(slots, str) else slots):
+            private = slot.startswith("__") and not slot.endswith("__")
+            names.add(f"_{cls.__name__.lstrip('_')}{slot}" if private else slot)
+    if dataclasses.is_dataclass(held):
+        names |= {field.name for field in dataclasses.fields(held)}
+    return names - {"__dict__", "__weakref__"}
+
+
+def _data_held(module) -> list[str]:
+    """The text of every data value a module holds, at any depth: inside its globals' containers (mappings,
+    sequences, sets, deques), and in every object's attributes, slots and dataclass fields, those kept out of the
+    repr too and a container's own attributes beside its elements, and in the module's own functions' defaults,
+    closures and attributes. Other functions, classes, modules and loggers are left out: what they print is code and memory
+    addresses, and a logger leads to every other logger's records, none of them this module's. A cached function of
+    the module fails the test, since its cache cannot be read. A holder of any other kind fails the test by name rather than being read through its repr,
+    which can hide what it holds and print an address."""
+    found: list[str] = []
+    seen: set[int] = set()
+
+    def walk(held, path: str) -> None:
+        if id(held) in seen:
+            return
+        if callable(held) and getattr(held, "__module__", None) == module.__name__:
+            # The module's own functions can keep values too: in a cache, a default, a closure's cell or an attribute.
+            if hasattr(held, "cache_info"):
+                raise AssertionError(f"{path} is a cached function, whose cache this walk cannot read")
+            if isinstance(held, types.FunctionType):
+                seen.add(id(held))
+                for index, default in enumerate((*(held.__defaults__ or ()), *(held.__kwdefaults__ or {}).values())):
+                    walk(default, f"{path}.<default {index}>")
+                for index, cell in enumerate(held.__closure__ or ()):
+                    walk(cell.cell_contents, f"{path}.<closure {index}>")
+                for name, value in vars(held).items():
+                    walk(value, f"{path}.{name}")
+            return
+        if callable(held) or isinstance(held, (types.ModuleType, logging.Logger, __future__._Feature)):
+            return
+        seen.add(id(held))
+        opened = False
+        if isinstance(held, _PLAIN):
+            found.append(str(held))
+            opened = True
+        elif isinstance(held, re.Pattern):
+            found.append(held.pattern)
+            opened = True
+        elif isinstance(held, collections.abc.Mapping):
+            for key, value in held.items():
+                walk(key, path)
+                walk(value, f"{path}[{key!r}]")
+            opened = True
+        elif isinstance(held, (collections.abc.Sequence, collections.abc.Set, collections.deque)):
+            for index, item in enumerate(held):
+                walk(item, f"{path}[{index}]")
+            opened = True
+        names = _attributes(held)
+        for name in sorted(names):
+            if hasattr(held, name):
+                walk(getattr(held, name), f"{path}.{name}")
+        if not opened and not names and not hasattr(held, "__dict__"):
+            raise AssertionError(f"{path} holds a {type(held).__name__}, which this walk has no reading for")
+
+    for name, held in vars(module).items():
+        if not name.startswith("__"):
+            walk(held, name)
+    return found
+
+
+class _AddressedCallable:
+    """A callable whose repr carries a memory address holding "801", as a function's repr can by chance."""
+
+    def __call__(self):
+        return None
+
+    def __repr__(self) -> str:
+        return "<function <lambda> at 0x7f801c0>"
+
+
+class _Holder:
+    """An object that keeps rows in an attribute, behind the default repr (which shows only an address)."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+
+class _Slotted:
+    __slots__ = ("rows",)
+
+    def __init__(self, rows):
+        self.rows = rows
+
+
+class _PrivateSlot:
+    __slots__ = ("__rows",)
+
+    def __init__(self, rows):
+        self.__rows = rows
+
+
+class _ListWithCache(list):
+    """A container whose elements are empty and whose rows sit in an attribute of its own."""
+
+    def __init__(self, rows):
+        super().__init__()
+        self.last_rows = rows
+
+
+class _DictWithCache(dict):
+    def __init__(self, rows):
+        super().__init__()
+        self.last_rows = rows
+
+
+@dataclasses.dataclass
+class _Hidden:
+    label: str
+    rows: tuple = dataclasses.field(repr=False, default=())
+
+
+class _Opaque:
+    """A holder the walk has no reading for: no attributes, no slots, not a container, not a plain value."""
+
+    __slots__ = ()
+
+
+def test_the_data_a_module_holds_is_its_values_not_its_functions_addresses():
+    """A module global that holds functions (a dict of lambdas, say) has a repr full of memory addresses, and an
+    address can hold any short run of hex digits, "801" or "1200" among them. Reading reprs for a value then fails
+    by chance; reading the data the module holds finds a planted value at any depth and never an address."""
+    addressed = types.ModuleType("addressed")
+    addressed.ON_EACH = {"P1D": _AddressedCallable()}
+    addressed.QUEUED = collections.deque([_AddressedCallable()])
+    addressed.HOLDER = _Holder(_AddressedCallable())
+    addressed.LOG = logging.getLogger("planted")
+    assert any("801" in repr(held) for held in vars(addressed).values() if not callable(held))
+    assert "801" not in " ".join(_data_held(addressed))
+
+
+@pytest.mark.parametrize("holder", [
+    [("north", 1200)],
+    {"kept": {"rows": (("north", 1200),)}},
+    collections.deque([("north", 1200)]),
+    _Holder([("north", 1200)]),
+    {"inside": _Holder((("north", 1200),))},
+    _Slotted([("north", 1200)]),
+    _PrivateSlot([("north", 1200)]),
+    _ListWithCache([("north", 1200)]),
+    _DictWithCache([("north", 1200)]),
+    _Hidden("chart", (("north", 1200),)),
+], ids=["a list", "a nested dict", "a deque", "an object's attribute", "an object in a dict", "a slot",
+        "a private slot", "a list's own attribute", "a dict's own attribute", "a dataclass field kept out of its repr"])
+def test_a_value_the_module_keeps_is_found_wherever_it_is_held(holder):
+    planted = types.ModuleType("planted")
+    planted.KEPT = holder
+    held = " ".join(_data_held(planted))
+    assert "north" in held and "1200" in held
+
+
+def _module_with_functions_holding(defaulted, closed) -> types.ModuleType:
+    """A module whose own functions keep rows: `defaulted` in a mutable default, `closed` in a closure's cell."""
+    planted = types.ModuleType("planted")
+
+    def remember(seen=[defaulted]):  # noqa: B006 - the mutable default is the point
+        return seen
+
+    def closing():
+        def inner():
+            return closed
+        return inner
+
+    planted.remember, planted.recall = remember, closing()
+    for function in (planted.remember, planted.recall):
+        function.__module__ = "planted"
+    return planted
+
+
+def test_a_value_the_modules_own_functions_keep_is_found():
+    held = " ".join(_data_held(_module_with_functions_holding([("north", 1200)], [("south", 801)])))
+    assert "north" in held and "1200" in held and "south" in held and "801" in held
+
+
+def test_a_value_kept_on_one_of_the_modules_functions_is_found():
+    planted = types.ModuleType("planted")
+
+    def check():
+        return None
+
+    check.__module__ = "planted"
+    check.last_rows = [("north", 1200)]
+    planted.check = check
+    held = " ".join(_data_held(planted))
+    assert "north" in held and "1200" in held
+
+
+def test_a_cached_function_of_the_module_fails_rather_than_passes():
+    planted = types.ModuleType("planted")
+    planted.looked_up = functools.lru_cache(maxsize=None)(lambda key: key)
+    planted.looked_up.__module__ = "planted"
+    with pytest.raises(AssertionError, match="cache"):
+        _data_held(planted)
+
+
+def test_a_holder_the_walk_cannot_read_fails_rather_than_passes():
+    planted = types.ModuleType("planted")
+    planted.KEPT = _Opaque()
+    with pytest.raises(AssertionError, match="_Opaque"):
+        _data_held(planted)
+
+
 # --- checked, and what is compared ------------------------------------------------------------------------------------
 
 
@@ -207,10 +433,10 @@ def test_one_group_off_is_a_mismatch(fake, caplog, chart_rows, mnemiq_rows):
     assert check.status is ChartStatus.MISMATCH, check.reason
     assert set(check.chart_values) == set(chart_rows) and set(check.mnemiq_values) == set(mnemiq_rows)
     logged = " ".join(record.getMessage() for record in caplog.records if record.name.startswith("mnemiq"))
+    held = " ".join(_data_held(chart_check))
     for value in ("1200", "801", "north"):
         assert value not in logged
-        assert not any(value in repr(held) for name, held in vars(chart_check).items()
-                       if not name.startswith("__") and not callable(held) and not isinstance(held, type(re)))
+        assert value not in held
     fake.reply("get_chart_data", lambda request, authorization: _chart_data(["region", "Total premium"], ("south", 3)))
     fake.reply("execute_sql", lambda request, authorization: EMPTY if request.get("force_refresh")
                or _PROBE.search(request["sql"]) else _result(("south", 3)))
