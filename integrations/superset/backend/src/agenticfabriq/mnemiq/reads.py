@@ -32,6 +32,7 @@ from agenticfabriq.mnemiq.writes import _Field
 
 MAX_DATASETS = 20
 MAX_CHARTS = 100
+MAX_DASHBOARDS = 20
 # An answer larger than this, in bytes of its JSON text, is not sent: well under the guard's 50,000.
 MAX_ANSWER_BYTES = 40_000
 MAX_LAYOUT_BYTES = MAX_ANSWER_BYTES
@@ -52,7 +53,8 @@ def _distinct_ids(limit: int):
 REQUESTS: dict[str, dict[str, _Field]] = {
     "dataset_metrics": {"dataset_ids": _Field(_distinct_ids(MAX_DATASETS))},
     "editors_of": {"chart_ids": _Field(_distinct_ids(MAX_CHARTS), False, []),
-                   "dataset_ids": _Field(_distinct_ids(MAX_DATASETS), False, [])},
+                   "dataset_ids": _Field(_distinct_ids(MAX_DATASETS), False, []),
+                   "dashboard_ids": _Field(_distinct_ids(MAX_DASHBOARDS), False, [])},
     "get_layout": {"dashboard_id": writes._DASHBOARD_ID},
 }
 
@@ -129,22 +131,30 @@ def _labels(resource: Any) -> list[str]:
     return sorted({subject.label for subject in resource.editors})
 
 
+_ID_FIELDS = {"charts": "chart_id", "datasets": "dataset_id", "dashboards": "dashboard_id"}
+
+
 @writes._answering("editors_of", REQUESTS)
 def editors_of(found: dict) -> dict:
     """The editors' labels of each chart and dataset the caller may read, for the person's panel (who to ask for
-    access). An object the caller may not read, or that does not exist, is left out."""
+    access), and of each dashboard asked for, with whether the caller edits it (`is_editor`), so a build that would
+    change it can refuse before it makes anything. An object the caller may not read, or that does not exist, is left
+    out. Asked for no dashboard, the answer holds none: as it was before dashboards were asked for."""
     entries = [("charts", {"chart_id": chart_id, "editors": _labels(chart)})
                for chart_id in found["chart_ids"] if (chart := _chart(chart_id)) is not None]
     entries += [("datasets", {"dataset_id": dataset_id, "editors": _labels(dataset)})
                 for dataset_id in found["dataset_ids"] if (dataset := writes._dataset(dataset_id)) is not None]
+    entries += [("dashboards", {"dashboard_id": dashboard_id, "is_editor": bool(writes._security().is_editor(board)),
+                                "editors": _labels(board)})
+                for dashboard_id in found["dashboard_ids"] if (board := writes._dashboard(dashboard_id)) is not None]
+    kinds = ("charts", "datasets", "dashboards") if found["dashboard_ids"] else ("charts", "datasets")
 
     def build(kept: list) -> dict:
-        return {key: [entry for kind, entry in kept if kind == key] for key in ("charts", "datasets")}
+        return {key: [entry for kind, entry in kept if kind == key] for key in kinds}
 
     def mark(pair: tuple) -> tuple:
         kind, entry = pair
-        field = "chart_id" if kind == "charts" else "dataset_id"
-        return kind, {field: entry[field], **TOO_LARGE}
+        return kind, {_ID_FIELDS[kind]: entry[_ID_FIELDS[kind]], **TOO_LARGE}
 
     return fit(entries, build, mark)
 

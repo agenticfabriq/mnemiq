@@ -14,7 +14,7 @@ from __future__ import annotations
 from mnemiq.superset.client import SupersetToolError
 
 __all__ = ["DATASET_METRICS_BATCH", "EXTENSION_TOOLS", "ExtensionMissing", "TOOL_PREFIX", "call_tool",
-           "dataset_metrics"]
+           "dashboard_editorship", "dataset_metrics"]
 
 TOOL_PREFIX = "extensions.agenticfabriq.mnemiq."
 
@@ -75,3 +75,15 @@ def dataset_metrics(client, dataset_ids: tuple[int, ...]) -> list[dict]:
         answer = call_tool(client, "dataset_metrics", {"dataset_ids": ids[start:start + DATASET_METRICS_BATCH]})
         found.extend(answer.get("datasets") or [])
     return found
+
+
+def dashboard_editorship(client, dashboard_id: int) -> dict | None:
+    """Whether the caller edits the dashboard, as the extension's `editors_of` answers it: `{dashboard_id, is_editor,
+    editors}` (the editors as labels, for the person's panel only), `{dashboard_id, too_large}` for an answer the
+    extension could not send whole, or None when the caller may not read the dashboard or it does not exist."""
+    answer = call_tool(client, "editors_of", {"dashboard_ids": [dashboard_id]})
+    entries = answer.get("dashboards") if isinstance(answer, dict) else None
+    if not isinstance(entries, list):
+        raise SupersetToolError("the extension's editors_of answered no list of dashboards", detail=str(answer)[:200])
+    return next((entry for entry in entries if isinstance(entry, dict) and entry.get("dashboard_id") == dashboard_id),
+                None)

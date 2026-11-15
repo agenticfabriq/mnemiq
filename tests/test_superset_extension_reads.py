@@ -49,8 +49,12 @@ def test_dataset_metrics_answers_an_empty_request_without_touching_superset(monk
 
 
 def test_editors_of_and_get_layout_requests():
-    assert reads.read("editors_of", {}) == {"chart_ids": [], "dataset_ids": []}
-    assert reads.read("editors_of", {"chart_ids": [2, 2], "dataset_ids": [5]}) == {"chart_ids": [2], "dataset_ids": [5]}
+    assert reads.read("editors_of", {}) == {"chart_ids": [], "dataset_ids": [], "dashboard_ids": []}
+    assert reads.read("editors_of", {"chart_ids": [2, 2], "dataset_ids": [5]}) == {"chart_ids": [2], "dataset_ids": [5],
+                                                                                   "dashboard_ids": []}
+    assert reads.read("editors_of", {"dashboard_ids": [4, 4, 7]})["dashboard_ids"] == [4, 7]
+    assert refusal("editors_of", {"dashboard_ids": list(range(1, 22))}) == {"refused": "request",
+                                                                            "field": "dashboard_ids"}
     assert refusal("editors_of", {"chart_ids": [0]}) == {"refused": "request", "field": "chart_ids"}
     assert refusal("editors_of", {"chart_ids": list(range(1, 102))}) == {"refused": "request", "field": "chart_ids"}
     assert refusal("editors_of", {"dataset_ids": list(range(1, 22))}) == {"refused": "request",
@@ -212,3 +216,32 @@ def test_the_marks_are_counted_in_the_cap_at_the_request_limits(monkeypatch):
         answer = reads.editors_of({"chart_ids": list(range(1, 101)), "dataset_ids": list(range(1, 21))})
         assert size(answer) <= reads.MAX_ANSWER_BYTES, (fat, size(answer))
         assert len(answer["charts"]) == 100 and len(answer["datasets"]) == 20
+
+
+def test_editors_of_answers_whether_the_caller_edits_each_readable_dashboard(monkeypatch):
+    """Asked for dashboards, `editors_of` answers each one the caller may read with whether the caller edits it and
+    its editors' labels, so a build refuses a non-editor before it makes anything. One the caller may not read, or
+    that does not exist, is left out. Not asked for dashboards, the answer is as it was."""
+    def subject(label):
+        return SimpleNamespace(label=label)
+
+    dashboards = {7: SimpleNamespace(editors=[subject("zed"), subject("amy")]),
+                  8: SimpleNamespace(editors=[subject("amy")])}
+    monkeypatch.setattr(writes, "_dashboard", lambda dashboard_id: dashboards.get(dashboard_id))
+    monkeypatch.setattr(writes, "_security", lambda: SimpleNamespace(is_editor=lambda d: d is dashboards[7]))
+    answer = reads.editors_of({"dashboard_ids": [9, 7, 8]})
+    assert answer == {"charts": [], "datasets": [], "dashboards": [
+        {"dashboard_id": 7, "is_editor": True, "editors": ["amy", "zed"]},
+        {"dashboard_id": 8, "is_editor": False, "editors": ["amy"]}]}
+    monkeypatch.setattr(reads, "_chart", lambda chart_id: None)
+    assert reads.editors_of({"chart_ids": [1]}) == {"charts": [], "datasets": []}
+
+
+def test_editors_of_marks_a_dashboard_that_does_not_fit(monkeypatch):
+    fat = "x" * 45_000
+    dashboards = {7: SimpleNamespace(editors=[SimpleNamespace(label=fat)])}
+    monkeypatch.setattr(writes, "_dashboard", lambda dashboard_id: dashboards.get(dashboard_id))
+    monkeypatch.setattr(writes, "_security", lambda: SimpleNamespace(is_editor=lambda d: True))
+    answer = reads.editors_of({"dashboard_ids": [7]})
+    assert answer["dashboards"] == [{"dashboard_id": 7, "too_large": True}]
+    assert size(answer) <= reads.MAX_ANSWER_BYTES
