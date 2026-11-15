@@ -44,7 +44,7 @@ from mnemiq.superset.adapter import JINJA_DELIMITERS
 from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenRef, plan_refusal
 from mnemiq.superset.grants import UnreadableAnswer, read_datasets, table_bindings
 from mnemiq.superset.marker import format_marker
-from mnemiq.superset.measures import Measure, MeasureKind, MeasureRefused, check_measure
+from mnemiq.superset.measures import Measure, MeasureKind, MeasureRefused, check_measure, superset_text_problem
 from mnemiq.superset.saved_metrics import SavedMetric, read_saved_metrics, reusable
 from mnemiq.superset.settings import SUPERSET_DIALECT
 
@@ -945,31 +945,6 @@ def _filter_problem(item: Filter) -> str | None:
     return None
 
 
-# What rc2's MCP does to every chart name (`sanitize_user_input`, run by `GenerateChartRequest.sanitize_chart_name`, in
-# `superset/mcp_service/utils/sanitization.py`): it removes zero-width, control and line-separator characters
-# (`_remove_dangerous_unicode`), unescapes entities and cleans out HTML with nh3, which escapes `<`, `>`, `&` and a
-# no-break space and restores only `&amp;` (`_strip_html_tags`), and refuses a script scheme or an event handler
-# (`_check_dangerous_patterns`). A name it changes is saved as other text, which a build then cannot find again by
-# name; one it refuses makes no chart. So a chart's title holds none of these.
-_RC2_CHANGED_CHARACTERS = frozenset("<>&\u00a0")
-_RC2_REMOVED = re.compile(r"[\u0000-\u001f\u007f-\u009f\u200b-\u200d\u2028\u2029\ufeff]")
-_RC2_REFUSED = (re.compile(r"\b(javascript|vbscript|data):", re.IGNORECASE), re.compile(r"on\w+\s*=", re.IGNORECASE))
-
-
-def _title_problem(title: str) -> str | None:
-    """Why rc2 would save a chart's title as other text, or refuse it; None when it keeps it as written."""
-    if any(character in _RC2_CHANGED_CHARACTERS for character in title):
-        return ("a chart's title holds <, >, & or a no-break space, which Superset saves as other text; write it "
-                "without them")
-    if _RC2_REMOVED.search(title):
-        return ("a chart's title holds a control, zero-width or line-separator character, which Superset removes; "
-                "write it with plain spaces")
-    if any(pattern.search(title) for pattern in _RC2_REFUSED):
-        return ("Superset refuses a chart's title that reads as a script scheme (javascript:, vbscript:, data:) or "
-                "an event handler (a word starting with on, then =); reword it")
-    return None
-
-
 def _chart_columns(chart: ChartSpec) -> list[str]:
     return [*chart.dimensions, *(c for c in (chart.time_column, chart.source, chart.target) if c)]
 
@@ -1118,7 +1093,7 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
         chart_keys.add(chart.key)
         if not chart.title.strip() or len(chart.title) > MAX_TITLE:
             refuse(part, f"a chart's title is 1 to {MAX_TITLE} characters")
-        elif (problem := _title_problem(chart.title)) is not None:
+        elif (problem := superset_text_problem(chart.title, "a chart's title")) is not None:
             refuse(part, problem)
         on = rows.get(chart.dataset_id)
         if on is None:

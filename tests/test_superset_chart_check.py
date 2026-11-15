@@ -152,10 +152,10 @@ def _adapter(fake) -> SupersetSqlAdapter:
     return SupersetSqlAdapter(SupersetMcp(fake.url, DelegatedToken(TOKEN)), database_id=DATABASE_ID, schema=SCHEMA)
 
 
-def _check(fake, *, kinds=None, saved=None, dataset_id: int = DATASET_ID):
+def _check(fake, *, kinds=None, saved=None, dataset_id: int = DATASET_ID, **more):
     return check_chart(_adapter(fake), chart_id=CHART_ID, dataset_id=dataset_id,
                        kinds=TOTAL["kinds"] if kinds is None else kinds, saved=saved or {}, snapshot=SNAPSHOT,
-                       grants=GRANTS, guard_fanout=False)
+                       grants=GRANTS, guard_fanout=False, **more)
 
 
 def _statements(fake) -> list[str]:
@@ -273,6 +273,22 @@ def test_a_metric_whose_kind_is_unknown_is_checked_for_its_values_only(fake):
     _serve(fake, form_data=_bar(currency_format=None, y_axis_format=",d"),
            chart=_chart_data(["region", "Total premium"], ("east", 1200)), mnemiq=_result(("east", 1200)))
     assert _check(fake, kinds={}).status is ChartStatus.CHECKED
+
+
+def test_a_metric_of_no_kind_the_builder_gave_is_not_checked_when_it_gave_every_kind(fake):
+    """The builder made the chart and knows the kind of every metric it made it with (`every_kind_known`). A metric
+    whose label is none of theirs, here one Superset saved under other text than mnemiq sent, has a format nobody
+    judged: the chart is not checked, saying so, its numbers kept. The control: the same chart, every kind not claimed
+    known (a metric added by hand), is checked for its numbers alone."""
+    escaped = PREMIUM | {"label": "Premium &lt; 1y"}
+    _serve(fake, form_data=_bar(metrics=[escaped]), chart=_chart_data(["region", "Premium &lt; 1y"], ("east", 1200)),
+           mnemiq=_result(("east", 1200)))
+    kinds = {"Premium < 1y": MeasureKind.CURRENCY}
+    check = _check(fake, kinds=kinds, every_kind_known=True)
+    assert check.status is ChartStatus.NOT_CHECKED, check.reason
+    assert "'Premium &lt; 1y'" in check.reason and "could not be judged" in check.reason
+    assert check.chart_values == check.mnemiq_values == (("east", 1200),)
+    assert _check(fake, kinds=kinds).status is ChartStatus.CHECKED
 
 
 def test_format_wrong_is_reported_where_the_numbers_are_not_checked(fake):

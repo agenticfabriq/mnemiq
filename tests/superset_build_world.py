@@ -17,8 +17,10 @@ Postgres store's compare-and-set makes it one write. Its clock is the control Po
 from __future__ import annotations
 
 import copy
+import html
 import itertools
 import json
+import re
 import threading
 import uuid
 from collections.abc import Callable
@@ -85,6 +87,33 @@ _OPERATORS = {"==": "=", "!=": "<>", ">": ">", "<": "<", ">=": ">=", "<=": "<=",
 _FILTER_OP = {"=": "==", "!=": "!=", ">": ">", "<": "<", ">=": ">=", "<=": "<=", "LIKE": "LIKE", "ILIKE": "ILIKE",
               "NOT LIKE": "NOT LIKE", "IN": "IN", "NOT IN": "NOT IN", "IS NULL": "IS NULL",
               "IS NOT NULL": "IS NOT NULL"}
+
+
+# What rc2's MCP removes from a chart name or a metric label before and after cleaning it (zero-width characters, C0
+# controls but for tab, newline and carriage return, and line and paragraph separators), and what it refuses: a script
+# scheme or an event handler (`sanitize_user_input` in `superset/mcp_service/utils/sanitization.py`).
+_RC2_REMOVED = re.compile("[" + "".join(chr(c) for c in (*range(0x00, 0x09), 0x0B, 0x0C, *range(0x0E, 0x20), 0x85,
+                                                         0x200B, 0x200C, 0x200D, 0x2028, 0x2029, 0xFEFF)) + "]")
+_RC2_REFUSED = (re.compile(r"\b(javascript|vbscript|data):", re.IGNORECASE), re.compile(r"on\w+\s*=", re.IGNORECASE))
+_TAG = re.compile(r"</?[A-Za-z][^>]*>")
+
+
+def rc2_saved(text: str) -> str | ValueError:
+    """What rc2's MCP saves of a chart name or an SQL metric's label (`GenerateChartRequest.sanitize_chart_name`,
+    `ColumnRef.sanitize_label`), for the texts a build sends: the ends stripped and the characters `_RC2_REMOVED`
+    names removed; every entity unescaped and the tags dropped, then the text written as HTML writes it (`&`, `<`, `>`
+    and a no-break space as entities) with `&amp;` back as `&`; and a script scheme or an event handler refused, as a
+    validation error (the `ValueError` returned, which the fake sends as the tool's error)."""
+    text = _RC2_REMOVED.sub("", text.strip())
+    while (unescaped := html.unescape(text)) != text:
+        text = unescaped
+    text = _TAG.sub("", text)
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\u00a0", "&nbsp;")
+    text = _RC2_REMOVED.sub("", text.replace("&amp;", "&"))
+    if any(pattern.search(text) for pattern in _RC2_REFUSED):
+        return ValueError("1 validation error for GenerateChartRequest: Value error, the text contains potentially "
+                          "malicious content")
+    return text
 
 
 class Clock:
@@ -482,11 +511,12 @@ class World:
     # --- making things, as MCP makes them
 
     def _metric(self, column: dict) -> Any:
-        """`create_metric_object` (`superset/mcp_service/chart/chart_utils.py`) for the two kinds a build sends."""
+        """`create_metric_object` (`superset/mcp_service/chart/chart_utils.py`) for the two kinds a build sends, an SQL
+        metric under its label as rc2 saves it (`rc2_saved`)."""
         if column.get("saved_metric"):
             return column["name"]
         return {"aggregate": None, "column": None, "expressionType": "SQL", "sqlExpression": column["sql_expression"],
-                "label": column["label"], "optionName": "metric_sql_0", "hasCustomLabel": True,
+                "label": rc2_saved(column["label"]), "optionName": "metric_sql_0", "hasCustomLabel": True,
                 "datasourceWarning": False}
 
     @staticmethod
@@ -552,6 +582,11 @@ class World:
     def _generate_chart(self, request: dict, user: str) -> dict:
         assert request.get("save_chart") is True and request.get("generate_preview") is False, request
         dataset_id = request["dataset_id"]
+        # The request's texts as rc2's validators leave them, before anything is made: one refused makes nothing.
+        name = rc2_saved(request["chart_name"])
+        labels = [rc2_saved(c["label"]) for c in _labelled_columns(request["config"])]
+        if refused := next((text for text in (name, *labels) if isinstance(text, ValueError)), None):
+            return refused
         if dataset_id not in self.datasets:
             return {"success": False, "error": {"error": "dataset not found", "error_type": "NotFound"}}
         form = self.form_data(dataset_id, request["config"])
@@ -559,11 +594,11 @@ class World:
         dataset = self.datasets[dataset_id]
         moment = self._stamp()
         self.charts[chart_id] = {
-            "id": chart_id, "slice_name": request["chart_name"], "viz_type": form["viz_type"], "params": form,
+            "id": chart_id, "slice_name": name, "viz_type": form["viz_type"], "params": form,
             "datasource_id": dataset_id, "datasource_name": f"{dataset['schema']}.{dataset['table_name']}",
             "description": None, "query_context": None, "created_by": user, "created_on": moment,
             "changed_on": moment, "editors": [user]}
-        return {"chart": {"id": chart_id, "slice_name": request["chart_name"], "viz_type": form["viz_type"]},
+        return {"chart": {"id": chart_id, "slice_name": name, "viz_type": form["viz_type"]},
                 "success": True, "form_data": form}
 
     def _create_dataset(self, request: dict, user: str) -> dict:
@@ -821,6 +856,16 @@ class World:
                                float(value) if types[i] == "float64" and value is not None else value)
                         for i, (name, value) in enumerate(zip(names, row))})
         return {"success": True, "columns": [{"name": n, "type": t} for n, t in zip(names, types)], "rows": out}
+
+
+def _labelled_columns(config: dict) -> list[dict]:
+    """Every `ColumnRef` of a `generate_chart` config that carries a label: the SQL metrics a build sends."""
+    found: list[dict] = []
+    for value in config.values():
+        for item in value if isinstance(value, list) else [value]:
+            if isinstance(item, dict) and isinstance(item.get("label"), str):
+                found.append(item)
+    return found
 
 
 def dataset_id_of(world: World, table_name: str) -> int:

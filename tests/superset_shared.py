@@ -1,8 +1,10 @@
 """What several Superset-mode test modules share: a deployment in Superset mode over a store holding one snapshot,
-Superset's own words and mnemiq's sentences the tests read answers by, and the one-chart build plan.
+Superset's own words and mnemiq's sentences the tests read answers by, the texts rc2's MCP saves as other text, and the
+one-chart build plan.
 
 Defined once here and imported by each module that uses them (`test_superset_runtime.py`, `test_superset_http.py`,
-`test_superset_builder.py`, `test_superset_build_http.py`), so no test module imports another.
+`test_superset_builder.py`, `test_superset_build_http.py`, `test_superset_planner.py`, `test_superset_measures.py`),
+so no test module imports another.
 """
 
 from __future__ import annotations
@@ -69,6 +71,28 @@ SNAPSHOT_REFUSED = ("This deployment's knowledge is not the one enriched for the
 # Superset's own text for a role that does not permit SQL, as its MCP service renders it (`superset/mcp_service/auth.py`
 # and `superset/mcp_service/middleware.py`, `GlobalErrorHandlerMiddleware`).
 ROLE_DENIAL = "Permission denied: can_execute_sql_query on SQLLab for user west (tool: execute_sql)"
+
+
+# --- what rc2's MCP does to a chart's name and to a SQL metric's label
+
+# rc2's MCP runs every chart name (`GenerateChartRequest.sanitize_chart_name`) and every SQL metric's label
+# (`ColumnRef.sanitize_label`, `superset/mcp_service/chart/schemas.py`) through `sanitize_user_input`
+# (`superset/mcp_service/utils/sanitization.py`): it strips the ends, removes zero-width, control and line-separator
+# characters, unescapes entities and cleans out HTML with nh3 (keeping only `&amp;` as `&`), and refuses a
+# `javascript:`, `vbscript:` or `data:` scheme and an `on...=` handler. A text it changes is stored as some other text,
+# which the build then cannot find again by its name, nor its value's format by its label; one it refuses makes no
+# chart.
+CHANGED_OR_REFUSED_BY_RC2 = {
+    "a tag": "Premium <b>by</b> region", "an angle bracket": "Premium > 100", "a less-than sign": "Premium < 1y",
+    "an ampersand": "Premium & claims", "an entity": "Premium &amp; claims",
+    "a zero-width space": "Premium\u200bby region", "a byte order mark": "Premium\ufeff",
+    "a control character": "Premium\x07 by region", "a tab": "Premium\tby region",
+    "a line separator": "Premium\u2028by region", "a no-break space": "Premium\u00a0by region",
+    "a script scheme": "javascript:alert", "a data scheme": "Data: by region", "an event handler": "monthly = target",
+    "an event handler, spaced": "Premium ONLOAD = 1", "a space at its end": "Premium by region ",
+}
+KEPT_BY_RC2 = ["Premium by region (USD)", "Claims — 2026", "Premium / policy", 'The "core" book', "50% share",
+               "Naïve café totals", "On target", "Premium, on time"]
 
 
 # --- a one-chart build plan, on the policy table's dataset of `tests/superset_build_world.py`

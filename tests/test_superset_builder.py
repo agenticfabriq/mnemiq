@@ -28,7 +28,7 @@ from mnemiq.superset.build_store import DashboardBusy, StepState
 from mnemiq.superset.builder import BuildBusy, BuildState, build_state, build_steps, next_step, start_build
 from mnemiq.superset.chart_check import ChartStatus
 from mnemiq.superset.charts import Family, SavedRef, WrittenRef, extension_chart_request
-from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetRefusedCaller
+from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetRefusedCaller, SupersetToolError
 from mnemiq.superset.marker import Marker, format_marker, parse_marker
 from mnemiq.superset.measures import Measure, MeasureKind
 from mnemiq.superset.planner import BuildPlan, PlannedDataset
@@ -301,6 +301,54 @@ def test_failed_check_is_reported_as_what_it_is(fake, world, store):
     assert "Premium by month" not in final.message
     kept = {m.measure.name: m for m in store.measures_for(TENANT, final.dashboard_id)}
     assert kept["policies"].check_status[ids["policies_by_region"]] is ChartStatus.MISMATCH
+
+
+# A written measure whose label rc2's MCP saves as other text (`ColumnRef.sanitize_label` escapes `<`), on a currency
+# table, whose per-column currency is set under the label mnemiq sent.
+YOUNG = Measure(name="young_premium", label="Premium < 1y", expression="SUM(premium)", kind=MeasureKind.CURRENCY,
+                dataset_id=POLICY_DATASET, description="", asked_by="", currency="USD")
+YOUNG_TABLE = _chart("young_by_region", Family.TABLE, "Young premium by region", POLICY_DATASET, (WrittenRef(YOUNG),),
+                     dimensions=("region",))
+
+
+def test_a_label_superset_saved_as_other_text_is_not_checked(fake, world, store):
+    """The plan check refuses a label rc2 would rewrite; past it, as with a plan made here by hand, rc2 saves
+    `Premium < 1y` as `Premium &lt; 1y` while the table's currency is set under `Premium < 1y`. The chart's numbers
+    match, but the format of the metric it shows was never judged, so it is not checked: never a false CHECKED."""
+    final = _run(store, _start(store, BuildPlan(charts=(YOUNG_TABLE,), measures=(YOUNG,))).build_id,
+                 _adapter(fake))[-1]
+    chart_id = _step(final, "young_by_region").object_id
+    params = world.charts[chart_id]["params"]
+    assert [metric["label"] for metric in params["metrics"]] == ["Premium &lt; 1y"]  # as rc2 saves it
+    assert list(params["column_config"]) == ["Premium < 1y"]
+    assert final.status == "done" and final.checks == {chart_id: ChartStatus.NOT_CHECKED}, final.message
+    assert "'Premium &lt; 1y'" in final.message and "could not be judged" in final.message
+
+
+@pytest.mark.parametrize("sent, saved", [
+    ("Premium < 1y", "Premium &lt; 1y"), ("Premium > 100", "Premium &gt; 100"), ("A &amp; B", "A & B"),
+    ("A & B", "A & B"), ("Premium <b>by</b> region", "Premium by region"), ("Premium\u00a0by", "Premium&nbsp;by"),
+    ("Pre\u200bmium", "Premium"), ("  Premium  ", "Premium"), ("Premium by region", "Premium by region"),
+])
+def test_the_world_saves_a_label_as_rc2_does(sent, saved):
+    from tests.superset_build_world import rc2_saved
+
+    assert rc2_saved(sent) == saved
+
+
+@pytest.mark.parametrize("sent", ["javascript:alert", "monthly = target"])
+def test_the_world_refuses_a_label_rc2_refuses(fake, world, store, sent):
+    """A chart name or label rc2's validators refuse makes no chart: the request is refused as a whole."""
+    from tests.superset_build_world import rc2_saved
+
+    assert isinstance(rc2_saved(sent), ValueError)
+    labelled = dataclasses.replace(YOUNG, label=sent)
+    chart = dataclasses.replace(YOUNG_TABLE, measures=(WrittenRef(labelled),))
+    build = _start(store, BuildPlan(charts=(chart,), measures=(labelled,))).build_id
+    _run_to(store, build, _adapter(fake), "young_by_region")
+    with pytest.raises(SupersetToolError):
+        _next(store, build, _adapter(fake))
+    assert world.charts == {} and len(world.calls("generate_chart")) == 1
 
 
 def test_no_dashboard_is_published(fake, world, store):

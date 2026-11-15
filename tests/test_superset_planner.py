@@ -39,6 +39,7 @@ from mnemiq.superset.planner import (
     plan_to_json,
     with_made_datasets,
 )
+from tests.superset_shared import CHANGED_OR_REFUSED_BY_RC2, KEPT_BY_RC2
 
 K = MeasureKind
 EMPTY = {"success": True, "columns": [], "rows": []}
@@ -1068,23 +1069,10 @@ def test_table_in_a_condition_is_refused_even_where_a_column_is_named_table():
     assert "never read in a condition" in _parts(refused)[f"the join {join!r}"]
 
 
-# ---------------------------------------------------------------- what rc2 does to a chart's name
+# ---------------------------------------------------------------- what rc2 does to a chart's name and a measure's label
 
-# rc2's MCP runs every chart name through `sanitize_user_input` (`GenerateChartRequest.sanitize_chart_name`,
-# `superset/mcp_service/utils/sanitization.py`): it strips the ends, removes zero-width, control and line-separator
-# characters, unescapes entities and cleans out HTML with nh3 (keeping only `&amp;` as `&`), and refuses a
-# `javascript:`, `vbscript:` or `data:` scheme and an `on...=` handler. A name it changes is stored as some other text,
-# which the build then cannot find again by its name; one it refuses makes no chart.
-CHANGED_OR_REFUSED_BY_RC2 = {
-    "a tag": "Premium <b>by</b> region", "an angle bracket": "Premium > 100", "an ampersand": "Premium & claims",
-    "an entity": "Premium &amp; claims", "a zero-width space": "Premium​by region",
-    "a byte order mark": "Premium﻿", "a control character": "Premium\x07 by region", "a tab": "Premium\tby region",
-    "a line separator": "Premium by region", "a no-break space": "Premium by region",
-    "a script scheme": "javascript:alert", "a data scheme": "Data: by region", "an event handler": "monthly = target",
-    "an event handler, spaced": "Premium ONLOAD = 1",
-}
-KEPT_BY_RC2 = ["Premium by region (USD)", "Claims — 2026", "Premium / policy", 'The "core" book', "50% share",
-               "Naïve café totals", "On target", "Premium, on time"]
+# `CHANGED_OR_REFUSED_BY_RC2` and `KEPT_BY_RC2` (`tests/superset_shared.py`): the texts rc2's MCP stores as other
+# text or refuses, and the ones it keeps as written.
 
 
 @pytest.mark.parametrize("case", list(CHANGED_OR_REFUSED_BY_RC2))
@@ -1104,14 +1092,49 @@ def test_a_chart_title_rc2_keeps_is_accepted(title):
     assert planned.charts[0].title == title
 
 
-def test_the_title_rule_is_rc2s_own_patterns():
+def test_the_text_rule_is_rc2s_own_patterns():
     """The patterns are rc2's, read from its source: `_DANGEROUS_URL_SCHEME_RE` and the handler check in
-    `_check_dangerous_patterns`."""
-    from mnemiq.superset import planner
+    `_check_dangerous_patterns`. One rule holds a chart's title and a measure's label."""
+    from mnemiq.superset import measures
 
-    assert planner._RC2_REFUSED[0].pattern == r"\b(javascript|vbscript|data):"
-    assert planner._RC2_REFUSED[1].pattern == r"on\w+\s*="
-    assert all(p.flags & re.IGNORECASE for p in planner._RC2_REFUSED)
+    assert measures._RC2_REFUSED[0].pattern == r"\b(javascript|vbscript|data):"
+    assert measures._RC2_REFUSED[1].pattern == r"on\w+\s*="
+    assert all(p.flags & re.IGNORECASE for p in measures._RC2_REFUSED)
+
+
+def _labelled(label: str, *, family: Family = Family.BAR, currency: str | None = None) -> BuildPlan:
+    measure = dataclasses.replace(PREMIUM, label=label, currency=currency)
+    return _valid_plan(charts=(_chart("premium_by_region", family, [WrittenRef(measure)], dims=["region"]),),
+                       measures=(measure,))
+
+
+@pytest.mark.parametrize("case", list(CHANGED_OR_REFUSED_BY_RC2))
+def test_a_measure_label_rc2_would_change_or_refuse_goes_back_for_repair(case):
+    """A written measure's label meets the rule a chart's title does: rc2 saves an SQL metric's label as other text, or
+    refuses it (`ColumnRef.sanitize_label`), and a table's per-column format and the value check find the measure by
+    the label mnemiq sent. Refused in mnemiq's words, which do not repeat the label, it goes back to the model once,
+    and the repaired plan passes."""
+    label = CHANGED_OR_REFUSED_BY_RC2[case]
+    planner = FakePlanner([_labelled(label), _labelled("Total premium")])
+    assert _plan(GOAL, planner, _tools()) == _labelled("Total premium")
+    [part] = planner.contexts[1].repair.refused
+    assert part.part == "measure 'total_premium'" and part.repairable, part
+    assert "label" in part.reason and label not in part.reason, part
+    refused = _plan(GOAL, FakePlanner(_labelled(label)), _tools())
+    assert isinstance(refused, PlanRefused) and "label" in _parts(refused)["measure 'total_premium'"]
+
+
+@pytest.mark.parametrize("label", KEPT_BY_RC2)
+def test_a_measure_label_rc2_keeps_is_accepted(label):
+    assert _plan(GOAL, FakePlanner(_labelled(label)), _tools()) == _labelled(label)
+
+
+def test_a_currency_tables_label_rc2_would_escape_is_refused_at_plan_time():
+    """`Premium < 1y` on a currency table: rc2 would save the label as `Premium &lt; 1y`, the table's per-column
+    currency would be set under `Premium < 1y`, and no format would be judged. The plan check refuses it."""
+    refused = _plan(GOAL, FakePlanner(_labelled("Premium < 1y", family=Family.TABLE, currency="USD")), _tools())
+    assert isinstance(refused, PlanRefused), refused
+    assert "label" in _parts(refused)["measure 'total_premium'"]
 
 
 # ---------------------------------------------------------------- the plan's JSON, declared beside its writer

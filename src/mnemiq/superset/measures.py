@@ -26,7 +26,7 @@ from mnemiq.superset.history import Decided, decide_statement, run_decided
 from mnemiq.sql.verdict import Approved, Refusal
 
 __all__ = ["Aggregation", "Decided", "Measure", "MeasureKind", "MeasureRefused", "aggregates", "check_measure",
-           "display_format", "measure_statement", "measure_value", "run_decided"]
+           "display_format", "measure_statement", "measure_value", "run_decided", "superset_text_problem"]
 
 _NAME = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _CURRENCY = re.compile(r"^[A-Z]{3}$")
@@ -135,6 +135,35 @@ def _marker(*texts: str) -> str | None:
     return next((d for text in texts for d in JINJA_DELIMITERS if d in text), None)
 
 
+# What rc2's MCP does to every chart name (`GenerateChartRequest.sanitize_chart_name`) and every SQL metric's label
+# (`ColumnRef.sanitize_label`, both in `superset/mcp_service/chart/schemas.py`): `sanitize_user_input`
+# (`superset/mcp_service/utils/sanitization.py`) strips the ends, removes zero-width, control and line-separator
+# characters (`_remove_dangerous_unicode`), unescapes entities and cleans out HTML with nh3, which escapes `<`, `>`, `&`
+# and a no-break space and restores only `&amp;` (`_strip_html_tags`), and refuses a script scheme or an event handler
+# (`_check_dangerous_patterns`). A text it changes is saved as other text: a chart a build then cannot find again by its
+# name, or a metric whose format a build set, and checks, under a label the chart does not show. One it refuses makes no
+# chart. So neither holds any of these.
+_RC2_CHANGED_CHARACTERS = frozenset("<>&\u00a0")
+_RC2_REMOVED = re.compile(r"[\u0000-\u001f\u007f-\u009f\u200b-\u200d\u2028\u2029\ufeff]")
+_RC2_REFUSED = (re.compile(r"\b(javascript|vbscript|data):", re.IGNORECASE), re.compile(r"on\w+\s*=", re.IGNORECASE))
+
+
+def superset_text_problem(text: str, what: str) -> str | None:
+    """Why rc2's MCP would save `text`, a chart's title or a measure's label (`what` names which, in the reason), as
+    other text, or refuse it; None when it keeps it as written. The reason is mnemiq's and does not repeat the text."""
+    if text != text.strip():
+        return f"{what} starts or ends with a space, which Superset removes; write it without one"
+    if any(character in _RC2_CHANGED_CHARACTERS for character in text):
+        return f"{what} holds <, >, & or a no-break space, which Superset saves as other text; write it without them"
+    if _RC2_REMOVED.search(text):
+        return (f"{what} holds a control, zero-width or line-separator character, which Superset removes; write it "
+                "with plain spaces")
+    if any(pattern.search(text) for pattern in _RC2_REFUSED):
+        return (f"Superset refuses {what} that reads as a script scheme (javascript:, vbscript:, data:) or an event "
+                "handler (a word starting with on, then =); reword it")
+    return None
+
+
 def check_measure(measure: Measure, *, source: str, dimension_names: tuple[str, ...] = (), adapter,
                   snapshot: Snapshot, grants: GrantSet, guard_fanout: bool | None) -> Approved | MeasureRefused:
     """The measure's statement, approved, or the reason it is refused. Nothing is sent to Superset except the
@@ -147,6 +176,8 @@ def check_measure(measure: Measure, *, source: str, dimension_names: tuple[str, 
     if (found := _marker(measure.label, measure.expression, measure.description)) is not None:
         return MeasureRefused(f"the measure holds {found}, which Superset reads as a template marker; write it "
                               f"without {found}")
+    if (problem := superset_text_problem(measure.label, "the measure's label")) is not None:
+        return MeasureRefused(problem)
     if measure.currency is not None and not _CURRENCY.match(measure.currency):
         return MeasureRefused(f"the currency {measure.currency!r} must be an ISO 4217 code such as USD, never a "
                               "symbol")

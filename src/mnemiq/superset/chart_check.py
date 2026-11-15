@@ -499,16 +499,23 @@ def _describe(shown: Displayed) -> str:
     return f"{fmt}, with the currency {symbol}"
 
 
-def _format_problem(viz_type: str, form: dict, kinds: dict[str, MeasureKind],
-                    saved: dict) -> tuple[str | None, str | None]:
+def _format_problem(viz_type: str, form: dict, kinds: dict[str, MeasureKind], saved: dict, *,
+                    every_kind_known: bool = False) -> tuple[str | None, str | None]:
     """Of the metrics mnemiq knows the kind of: why one is shown in a format that does not fit it, and why one's format
     could not be judged, each the first found, or None. A format the renderer decides from what mnemiq cannot see
-    (`CANNOT_TELL`), and a saved metric whose own record the caller did not pass, cannot be judged."""
+    (`CANNOT_TELL`), and a saved metric whose own record the caller did not pass, cannot be judged. With
+    `every_kind_known`, a metric whose label `kinds` does not hold cannot be judged either: the caller gave the kind of
+    every metric it made the chart with, so the chart shows one under a label mnemiq never sent."""
     unjudged = None
     for item in _metric_items(viz_type, form):
         label = metric_label(item)
         kind = kinds.get(label) if label else None
         if kind is None:
+            if every_kind_known:
+                unjudged = unjudged or (f"the format the chart shows {label!r} in could not be judged: no measure "
+                                        "mnemiq made the chart with is labelled so" if label else
+                                        "the format of a metric the chart shows could not be judged: mnemiq cannot "
+                                        "read its label")
             continue
         record: SavedMetric | None = None
         if isinstance(item, str):
@@ -610,7 +617,8 @@ class _BeforeEachCall:
 
 def check_chart(adapter, *, chart_id: int, dataset_id: int, kinds: dict[str, MeasureKind],
                 saved: dict[str, SavedMetric], snapshot: Snapshot, grants: GrantSet, guard_fanout: bool | None,
-                timeout_s: float = DEFAULT_TIMEOUT_S, before_call: Callable[[], None] | None = None) -> ChartCheck:
+                timeout_s: float = DEFAULT_TIMEOUT_S, before_call: Callable[[], None] | None = None,
+                every_kind_known: bool = False) -> ChartCheck:
     """Check chart `chart_id` as the caller `adapter` acts for, the builder: Superset is read through `adapter.client`
     and no other, and `adapter` runs mnemiq's own statement under `grants` and `snapshot`. `dataset_id` is the dataset
     mnemiq built the chart on, which a chart saved since in Explore overrides with its own. `kinds` gives the kind of
@@ -619,7 +627,9 @@ def check_chart(adapter, *, chart_id: int, dataset_id: int, kinds: dict[str, Mea
 
     A wrong format is reported whatever the numbers, unless they are a mismatch or the chart is empty. A chart is
     checked only when the format of every metric mnemiq knows the kind of was judged: numbers that match beside a
-    format mnemiq could not judge are not checked, their values kept. A refusal of the caller (`SupersetRefusal`) is
+    format mnemiq could not judge are not checked, their values kept. `every_kind_known` says `kinds` holds every
+    metric the caller made the chart with (the builder's check), so a metric of any other label is one whose format
+    was not judged: Superset saved it under other text than mnemiq sent, or someone added it since. A refusal of the caller (`SupersetRefusal`) is
     raised: it stays the same for every later call the request makes.
 
     `before_call`, when given, runs before each Superset call the check makes itself, and once before mnemiq's own
@@ -629,7 +639,7 @@ def check_chart(adapter, *, chart_id: int, dataset_id: int, kinds: dict[str, Mea
     if isinstance(read, NotCheckable):
         return _outcome(chart_id, ChartStatus.NOT_CHECKED, read.reason)
     viz_type, form = read
-    problem, unjudged = _format_problem(viz_type, form, kinds, saved)
+    problem, unjudged = _format_problem(viz_type, form, kinds, saved, every_kind_known=every_kind_known)
     found = _numbers(client, adapter, chart_id=chart_id, form=form, dataset_id=dataset_id, snapshot=snapshot,
                      before_call=before_call,
                      grants=grants, guard_fanout=guard_fanout, timeout_s=timeout_s)

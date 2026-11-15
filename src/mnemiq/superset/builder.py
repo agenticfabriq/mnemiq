@@ -924,9 +924,11 @@ def _run_check(run: _Run) -> _Outcome:
     off: list[str] = []
     for spec in run.plan.charts:
         chart_id = ids[spec.key]
+        # The build made the chart with these measures alone: a metric of any other label is one whose format
+        # nobody judged (Superset saved its label as other text, or someone added it since), never one to pass over.
         found = check_chart(run.adapter, chart_id=chart_id, dataset_id=spec.dataset_id, kinds=_kinds(spec),
                             saved=run.saved(spec.dataset_id), snapshot=run.snapshot, grants=run.grants,
-                            guard_fanout=run.settings.guard_fanout, before_call=run.renew)
+                            guard_fanout=run.settings.guard_fanout, before_call=run.renew, every_kind_known=True)
         statuses[chart_id] = found.status
         if found.status is not ChartStatus.CHECKED:
             off.append(f"{spec.title!r} ({found.status.value}: {found.reason})")
