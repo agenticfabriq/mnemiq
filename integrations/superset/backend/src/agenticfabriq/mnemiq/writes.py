@@ -564,8 +564,10 @@ def _find_or_create(model: type, marker: str, *, kind: str, create: Callable[[],
     """The object of `model` that `marker` names, or `create()`'s answer when there is none, under the marker's lock
     (`_marker_lock`): a create whose answer was lost, sent again, answers the object the first one made instead of
     making a second. One object found (`_marked`) is answered `{"<kind>_id": id}` when the caller may read it and
-    edits it, else as one that does not exist or with its editors (`_not_editor`); more than one, `{"candidates":
-    [ids]}`, for the build to name; a lock not taken, `{"busy": true}` or the refusal that says why.
+    edits it, else as one that does not exist or with its editors (`_not_editor`). More than one stops the create
+    with `{"candidates": [ids]}`, for the build to name: the ids of those the caller may read, the others answered as
+    objects that do not exist, so the list may be empty. A lock not taken answers `{"busy": true}` or the refusal that
+    says why.
 
     Only the lookup and the create run inside the lock. Every check that refuses the caller, and any of rc2's work
     that might end the session's transaction (a query check), runs before it, so the lock is held until the create's
@@ -573,13 +575,13 @@ def _find_or_create(model: type, marker: str, *, kind: str, create: Callable[[],
     try:
         with _marker_lock(marker):
             found = _marked(model, marker)
-            if len(found) > 1:
-                return {"candidates": [row.id for row in found]}
             if not found:
                 return create()
-            (row,) = found
             security = _security()
             readable = {"dashboard": security.can_access_dashboard, "chart": security.can_access_chart}[kind]
+            if len(found) > 1:
+                return {"candidates": [row.id for row in found if readable(row)]}
+            (row,) = found
             if not readable(row):
                 return _not_found(kind)
             if not security.is_editor(row):

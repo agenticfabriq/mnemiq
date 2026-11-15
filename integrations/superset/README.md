@@ -106,8 +106,9 @@ Superset's own error text never reaches them.
 A create carrying a build's marker (`create_dashboard`, `create_chart`) makes its object once, so a create whose
 answer was lost may be sent again. Under a lock keyed by the marker (a transaction's advisory lock on Postgres, a named
 lock on MySQL, each waited for at most `MNEMIQ_LOCK_TIMEOUT_S`, else `{"busy": true}`) it looks for an object out of
-the trash whose description's last line is that marker: it answers that one's id, `{"candidates": [...]}` when there
-are several, and creates the object when there is none. The lookup needs the metadata database's READ COMMITTED
+the trash whose description's last line is that marker: it answers that one's id; when there are several it creates
+nothing and answers `{"candidates": [...]}`, the ids of those the caller may read (the list may be empty); and it
+creates the object when there is none. The lookup needs the metadata database's READ COMMITTED
 isolation, Superset's default on Postgres and MySQL; under any other level a create answers `{"refused":
 "isolation"}`, and on any other metadata database `{"refused": "metadata_database"}`. A SQLite metadata database takes
 no marker lock, being Superset's single-person development default: there a create sent again while the first is still

@@ -1128,6 +1128,25 @@ def test_two_rows_with_one_marker_answer_candidates(creating):
     assert commands(creating.superset) == []
 
 
+def test_candidates_name_only_objects_the_caller_may_read(creating):
+    """An object the caller may not read is answered as one that does not exist, among candidates too: a copy of the
+    marker someone else holds is left out of the list, and the create still stops rather than making one more."""
+    theirs = _row(5, f"Copied by hand.\n{SHELL}")
+    creating.superset.rows["Dashboard"] += [_row(3, SHELL), theirs]
+    creating.unreadable.append(theirs)
+    assert make_dashboard() == {"candidates": [3]}
+    assert commands(creating.superset) == []
+
+
+def test_candidates_none_of_which_the_caller_may_read_still_stop_the_create(creating):
+    """Two marked objects, neither readable: the list is empty, and still nothing is made, as one unreadable marked
+    object answers as not found rather than being made again."""
+    creating.superset.rows["Dashboard"] += [_row(3, SHELL), _row(5, f"Copied by hand.\n{SHELL}")]
+    creating.unreadable.extend(creating.superset.rows["Dashboard"])
+    assert make_dashboard() == {"candidates": []}
+    assert commands(creating.superset) == []
+
+
 def test_a_found_object_is_answered_only_to_an_editor_who_may_read_it(creating):
     """The object a retry finds is answered as any other: unreadable, as one that does not exist; not edited by the
     caller, with its editors, whom to ask."""
