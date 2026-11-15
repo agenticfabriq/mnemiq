@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 from mnemiq.enrichment.prompts import sanitize
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.guard import MAX_ROWS
@@ -122,6 +124,50 @@ data -- the raw code is the correct answer."""
     return f"{base}\n{preamble}\n" if preamble else base
 
 
+# How much of each piece of certified meaning `meaning_sections` shows, in characters of the text as `sanitize`
+# leaves it (whitespace collapsed). A limit bounds what one record can add to every prompt it rides in; the window
+# fit then measures the prompt they make. A text past its limit is cut, and `cut_meaning` names it, because the cut
+# itself is silent: a definition lost its last sentences, the rules it ended on, with nothing in any log.
+NAME_LIMIT = 80  # a term, a label, an id, a source
+# Was 600, which cut the last sentence off a 707-character definition. 2,000 holds a rule with its exceptions.
+DEFINITION_LIMIT = 2000
+MEASURE_LIMIT = 600
+DIMENSION_LIMIT = 200
+
+
+def _cut_to(text: str, limit: int) -> int | None:
+    """The length of `text` as a prompt would show it whole, when `limit` shows less of it; None when it fits.
+
+    Compared through `sanitize` itself rather than by `len(text)`: the cut falls on the flattened text, so a text
+    long only in its whitespace is shown whole, and one the injection filter lengthens is measured as shown."""
+    whole = sanitize(text, limit=sys.maxsize)
+    return None if sanitize(text, limit=limit) == whole else len(whole)
+
+
+def cut_meaning(snapshot) -> list[str]:
+    """One sentence for each piece of certified meaning `meaning_sections` would show only in part.
+
+    Reads the snapshot's definitions, measures and dimensions at the limits the renderer uses, so the two cannot
+    disagree. Duck-typed, as `meaning_sections` is: a packet answers too, and an object carrying none of the three
+    has nothing cut. The code vocabulary's labels are not here: they come from the ontology index per question, not
+    from the snapshot."""
+    checks: list[tuple[str, str, int]] = []
+    for d in getattr(snapshot, "definitions", ()):
+        checks += [(f"the term of definition {d.id!r}", d.term, NAME_LIMIT),
+                   (f"definition {d.term!r}", d.definition, DEFINITION_LIMIT)]
+    for m in getattr(snapshot, "metrics", ()):
+        checks += [(f"measure {m.id!r}'s label", m.label, NAME_LIMIT), (f"measure {m.id!r}'s id", m.id, NAME_LIMIT),
+                   (f"measure {m.id!r}'s source", m.measure.source, NAME_LIMIT),
+                   (f"measure {m.id!r}'s expression", m.measure.expr, MEASURE_LIMIT)]
+    for d in getattr(snapshot, "dimensions", ()):
+        checks += [(f"dimension {d.id!r}'s label", d.label, NAME_LIMIT),
+                   (f"dimension {d.id!r}'s expression", d.expression(), DIMENSION_LIMIT),
+                   (f"dimension {d.id!r}'s source", d.source, NAME_LIMIT)]
+    return [f"{what} is {length:,} characters, and the prompt shows the first {limit:,} of them: the rest never "
+            "reaches the model"
+            for what, text, limit in checks if (length := _cut_to(text, limit)) is not None]
+
+
 def meaning_sections(packet: ContextPacket) -> list[str]:
     """The certified meaning a packet carries -- definitions, measures, dimensions, code vocabulary
     -- as prompt lines, each section led by a blank line; empty when the packet carries none.
@@ -135,7 +181,7 @@ def meaning_sections(packet: ContextPacket) -> list[str]:
     if packet.definitions:
         parts += ["", "DEFINITIONS (authoritative business meanings -- follow them exactly):"]
         parts += [
-            f"- {sanitize(d.term, limit=80)}: {sanitize(d.definition, limit=600)}"
+            f"- {sanitize(d.term, limit=NAME_LIMIT)}: {sanitize(d.definition, limit=DEFINITION_LIMIT)}"
             for d in packet.definitions
         ]
     if packet.metrics:
@@ -144,15 +190,16 @@ def meaning_sections(packet: ContextPacket) -> list[str]:
         # a schema cannot supply.
         parts += ["", "CERTIFIED MEASURES (the authoritative way to compute these -- follow the expression exactly):"]
         parts += [
-            f"- {sanitize(m.label, limit=80)} ({sanitize(m.id, limit=80)}) over {sanitize(m.measure.source, limit=80)}"
-            f": {sanitize(m.measure.expr, limit=600)}"
+            f"- {sanitize(m.label, limit=NAME_LIMIT)} ({sanitize(m.id, limit=NAME_LIMIT)})"
+            f" over {sanitize(m.measure.source, limit=NAME_LIMIT)}"
+            f": {sanitize(m.measure.expr, limit=MEASURE_LIMIT)}"
             for m in packet.metrics
         ]
     if packet.dimensions:
         parts += ["", "CERTIFIED DIMENSIONS (the agreed way to slice these tables):"]
         parts += [
-            f"- {sanitize(d.label, limit=80)} = {sanitize(d.expression(), limit=200)}"
-            f" on {sanitize(d.source, limit=80)}"
+            f"- {sanitize(d.label, limit=NAME_LIMIT)} = {sanitize(d.expression(), limit=DIMENSION_LIMIT)}"
+            f" on {sanitize(d.source, limit=NAME_LIMIT)}"
             for d in packet.dimensions
         ]
     if packet.concepts:
