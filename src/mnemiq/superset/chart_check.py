@@ -629,8 +629,8 @@ def check_chart(adapter, *, chart_id: int, dataset_id: int, kinds: dict[str, Mea
     checked only when the format of every metric mnemiq knows the kind of was judged: numbers that match beside a
     format mnemiq could not judge are not checked, their values kept. `every_kind_known` says `kinds` holds every
     metric the caller made the chart with (the builder's check), so a metric of any other label is one whose format
-    was not judged: Superset saved it under other text than mnemiq sent, or someone added it since. A refusal of the caller (`SupersetRefusal`) is
-    raised: it stays the same for every later call the request makes.
+    was not judged: Superset saved it under other text than mnemiq sent, or someone added it since. A refusal of the
+    caller (`SupersetRefusal`) is raised: it stays the same for every later call the request makes.
 
     `before_call`, when given, runs before each Superset call the check makes itself, and once before mnemiq's own
     decided statement (whose catalogue reads, probe and run the adapter makes); whatever it raises ends the check."""

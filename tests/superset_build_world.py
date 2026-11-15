@@ -2,7 +2,8 @@
 and a build store with the Postgres store's own rules over a dict, on a clock the test moves.
 
 `World` answers every tool a build calls as rc2 and mnemiq's extension do, as far as a build can tell: MCP's
-`generate_chart` saves a chart with the `form_data` its mappers write and no query context; the extension's claims
+`generate_chart` saves a chart with the `form_data` its mappers write and no query context, its name and its SQL
+metrics' labels as rc2's validators leave them (`rc2_saved`); the extension's claims
 write the editors, the marker and the query context (with the extension's own `params.query_context`, so the query is
 the one the extension saves); `get_chart_data` runs a chart's saved query context; `execute_sql` runs mnemiq's own
 statement. Both run on one DuckDB of fixed rows, by two separate paths, so a chart whose numbers are right is checked
@@ -90,8 +91,9 @@ _FILTER_OP = {"=": "==", "!=": "!=", ">": ">", "<": "<", ">=": ">=", "<=": "<=",
 
 
 # What rc2's MCP removes from a chart name or a metric label before and after cleaning it (zero-width characters, C0
-# controls but for tab, newline and carriage return, and line and paragraph separators), and what it refuses: a script
-# scheme or an event handler (`sanitize_user_input` in `superset/mcp_service/utils/sanitization.py`).
+# controls but for tab, newline and carriage return, the next-line character, and line and paragraph separators), and
+# what it refuses: a script scheme or an event handler (`sanitize_user_input` in
+# `superset/mcp_service/utils/sanitization.py`).
 _RC2_REMOVED = re.compile("[" + "".join(chr(c) for c in (*range(0x00, 0x09), 0x0B, 0x0C, *range(0x0E, 0x20), 0x85,
                                                          0x200B, 0x200C, 0x200D, 0x2028, 0x2029, 0xFEFF)) + "]")
 _RC2_REFUSED = (re.compile(r"\b(javascript|vbscript|data):", re.IGNORECASE), re.compile(r"on\w+\s*=", re.IGNORECASE))

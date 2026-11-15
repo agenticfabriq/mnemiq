@@ -7,11 +7,10 @@ request, and the build as it stands. Mounted only in Superset mode, and no other
   the dashboard is opening it, which needs no build. Asking again with its `dashboard_id` adds this goal's planned
   charts to it (a `dashboard_id` always does that, to the dashboard it names), and with `fresh: true` builds a new
   dashboard; asked either way, no dashboard is looked for. Otherwise the answer is the new build (201), or the plan's
-  refusal, which is an answer too. The build keeps the profile it was
-  asked under (`profile`, None for the deployment's default). Asked with a `dashboard_id`, the first thing asked of
-  Superset is whether the builder edits that dashboard (the extension's `editors_of`), before anything is planned or
-  kept: one they cannot read, or that does not exist, is a 404 that does not say which, and one they read but do not
-  edit a 403 naming its editors.
+  refusal, which is an answer too. The build keeps the profile it was asked under (`profile`, None for the
+  deployment's default). Asked with a `dashboard_id`, the first thing asked of Superset is whether the builder edits
+  that dashboard (the extension's `editors_of`), before anything is planned or kept: one they cannot read, or that
+  does not exist, is a 404 that does not say which, and one they read but do not edit a 403 naming its editors.
 - `GET /v1/superset/builds/{build_id}`: the build as it stands, read from the build store alone.
 - `POST /v1/superset/builds/{build_id}/next`: the build's next step, claimed, run and recorded (`builder.next_step`);
   409 while another request's step holds the build.
