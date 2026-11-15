@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -1065,3 +1066,109 @@ def test_table_in_a_condition_is_refused_even_where_a_column_is_named_table():
     assert isinstance(refused, PlanRefused), refused
     assert f"the join {join!r}" in _parts(refused)
     assert "never read in a condition" in _parts(refused)[f"the join {join!r}"]
+
+
+# ---------------------------------------------------------------- what rc2 does to a chart's name
+
+# rc2's MCP runs every chart name through `sanitize_user_input` (`GenerateChartRequest.sanitize_chart_name`,
+# `superset/mcp_service/utils/sanitization.py`): it strips the ends, removes zero-width, control and line-separator
+# characters, unescapes entities and cleans out HTML with nh3 (keeping only `&amp;` as `&`), and refuses a
+# `javascript:`, `vbscript:` or `data:` scheme and an `on...=` handler. A name it changes is stored as some other text,
+# which the build then cannot find again by its name; one it refuses makes no chart.
+CHANGED_OR_REFUSED_BY_RC2 = {
+    "a tag": "Premium <b>by</b> region", "an angle bracket": "Premium > 100", "an ampersand": "Premium & claims",
+    "an entity": "Premium &amp; claims", "a zero-width space": "Premium​by region",
+    "a byte order mark": "Premium﻿", "a control character": "Premium\x07 by region", "a tab": "Premium\tby region",
+    "a line separator": "Premium by region", "a no-break space": "Premium by region",
+    "a script scheme": "javascript:alert", "a data scheme": "Data: by region", "an event handler": "monthly = target",
+    "an event handler, spaced": "Premium ONLOAD = 1",
+}
+KEPT_BY_RC2 = ["Premium by region (USD)", "Claims — 2026", "Premium / policy", 'The "core" book', "50% share",
+               "Naïve café totals", "On target", "Premium, on time"]
+
+
+@pytest.mark.parametrize("case", list(CHANGED_OR_REFUSED_BY_RC2))
+def test_a_chart_title_rc2_would_change_or_refuse_is_refused(case):
+    title = CHANGED_OR_REFUSED_BY_RC2[case]
+    chart = dataclasses.replace(_chart("premium", Family.BAR, [WrittenRef(PREMIUM)], dims=["region"]), title=title)
+    refused = _plan(GOAL, FakePlanner(_valid_plan(charts=(chart,), measures=(PREMIUM,))), _tools())
+    assert isinstance(refused, PlanRefused), case
+    assert "title" in _parts(refused)["chart 'premium'"] and title not in refused.reason
+
+
+@pytest.mark.parametrize("title", KEPT_BY_RC2)
+def test_a_chart_title_rc2_keeps_is_accepted(title):
+    chart = dataclasses.replace(_chart("premium", Family.BAR, [WrittenRef(PREMIUM)], dims=["region"]), title=title)
+    planned = _plan(GOAL, FakePlanner(_valid_plan(charts=(chart,), measures=(PREMIUM,))), _tools())
+    assert isinstance(planned, BuildPlan), planned
+    assert planned.charts[0].title == title
+
+
+def test_the_title_rule_is_rc2s_own_patterns():
+    """The patterns are rc2's, read from its source: `_DANGEROUS_URL_SCHEME_RE` and the handler check in
+    `_check_dangerous_patterns`."""
+    from mnemiq.superset import planner
+
+    assert planner._RC2_REFUSED[0].pattern == r"\b(javascript|vbscript|data):"
+    assert planner._RC2_REFUSED[1].pattern == r"on\w+\s*="
+    assert all(p.flags & re.IGNORECASE for p in planner._RC2_REFUSED)
+
+
+# ---------------------------------------------------------------- the plan's JSON, declared beside its writer
+
+
+def _every_part_plan() -> BuildPlan:
+    planned = PlannedDataset(key="dataset_1", placeholder=-1, table="agent", table_name="agent")
+    joined = PlannedDataset(key="dataset_2", placeholder=-2, join=JOIN, sql="SELECT 1", name="mnemiq_dataset_2:x")
+    rows = _measure("agents", "Agents", "COUNT(DISTINCT agent_id)", K.COUNT, dataset_id=-1, currency="USD")
+    return _valid_plan(reuse_candidates=(12,), reuse_reason="covers it", datasets=(planned, joined),
+                       measures=(PREMIUM, CLAIMS, rows),
+                       charts=(*_valid_plan().charts,
+                               _chart("agents", Family.SANKEY, [WrittenRef(rows), SavedRef("count", K.COUNT)],
+                                      dataset_id=-1, dims=["office"], time_column="start_date", grain="P1M",
+                                      row_limit=10, source="office", target="office",
+                                      filters=[Filter("office", "=", "north"), Filter("office", "IS NOT NULL"),
+                                               Filter("office", "IN", ["a", "b"])])))
+
+
+def _declared_paths(shape, path="") -> set[str]:
+    from mnemiq.superset.planner import SCALAR
+
+    if isinstance(shape, dict):
+        found = set()
+        for key, item in shape.items():
+            found |= {f"{path}.{key}"} | _declared_paths(item, f"{path}.{key}")
+        return found
+    if isinstance(shape, list):
+        return _declared_paths(shape[0], f"{path}[]")
+    if isinstance(shape, tuple):
+        return set().union(*(_declared_paths(item, path) for item in shape))
+    assert shape is SCALAR
+    return set()
+
+
+def _written_paths(doc, path="") -> set[str]:
+    if isinstance(doc, dict):
+        found = set()
+        for key, item in doc.items():
+            found |= {f"{path}.{key}"} | _written_paths(item, f"{path}.{key}")
+        return found
+    if isinstance(doc, list):
+        return set().union(set(), *(_written_paths(item, f"{path}[]") for item in doc))
+    return set()
+
+
+@pytest.mark.parametrize("plan", [_valid_plan(), _every_part_plan(), _valid_plan(charts=(), measures=())],
+                         ids=["a plan", "every part", "nothing"])
+def test_what_plan_to_json_writes_stays_within_its_declared_shape(plan):
+    """The store keeps a plan only within `PLAN_JSON_SHAPE`, declared beside `plan_to_json`: whatever the writer
+    writes passes."""
+    doc = plan_to_json(plan)
+    assert build_store._plan(doc) == json.loads(json.dumps(doc))
+
+
+def test_every_key_the_shape_declares_is_one_the_writer_writes():
+    """Nothing declared goes unwritten: the shape is the writer's keys, no wider."""
+    from mnemiq.superset.planner import PLAN_JSON_SHAPE
+
+    assert _declared_paths(PLAN_JSON_SHAPE) == _written_paths(plan_to_json(_every_part_plan()))

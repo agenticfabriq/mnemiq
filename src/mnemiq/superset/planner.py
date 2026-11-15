@@ -48,7 +48,8 @@ from mnemiq.superset.measures import Measure, MeasureKind, MeasureRefused, check
 from mnemiq.superset.saved_metrics import SavedMetric, read_saved_metrics, reusable
 from mnemiq.superset.settings import SUPERSET_DIALECT
 
-__all__ = ["COUNT_METRIC", "FILTER_OPERATORS", "GRAINS", "PLANNER_MAX_TOKENS", "BuildPlan", "FakePlanner",
+__all__ = ["COUNT_METRIC", "FILTER_OPERATORS", "GRAINS", "PLANNER_MAX_TOKENS", "PLAN_JSON_SHAPE", "SCALAR",
+           "BuildPlan", "FakePlanner",
            "LLMPlanner", "PlanColumn", "PlanContext", "PlanDashboard", "PlanMetric", "PlanRefused", "PlanTable",
            "PlannedDataset", "Planner", "RefusedPart", "Repair", "choose_dashboard", "draft_of", "plan_build",
            "plan_from_draft", "plan_from_json", "plan_prompt", "plan_to_json", "with_made_datasets"]
@@ -944,6 +945,31 @@ def _filter_problem(item: Filter) -> str | None:
     return None
 
 
+# What rc2's MCP does to every chart name (`sanitize_user_input`, run by `GenerateChartRequest.sanitize_chart_name`, in
+# `superset/mcp_service/utils/sanitization.py`): it removes zero-width, control and line-separator characters
+# (`_remove_dangerous_unicode`), unescapes entities and cleans out HTML with nh3, which escapes `<`, `>`, `&` and a
+# no-break space and restores only `&amp;` (`_strip_html_tags`), and refuses a script scheme or an event handler
+# (`_check_dangerous_patterns`). A name it changes is saved as other text, which a build then cannot find again by
+# name; one it refuses makes no chart. So a chart's title holds none of these.
+_RC2_CHANGED_CHARACTERS = frozenset("<>&\u00a0")
+_RC2_REMOVED = re.compile(r"[\u0000-\u001f\u007f-\u009f\u200b-\u200d\u2028\u2029\ufeff]")
+_RC2_REFUSED = (re.compile(r"\b(javascript|vbscript|data):", re.IGNORECASE), re.compile(r"on\w+\s*=", re.IGNORECASE))
+
+
+def _title_problem(title: str) -> str | None:
+    """Why rc2 would save a chart's title as other text, or refuse it; None when it keeps it as written."""
+    if any(character in _RC2_CHANGED_CHARACTERS for character in title):
+        return ("a chart's title holds <, >, & or a no-break space, which Superset saves as other text; write it "
+                "without them")
+    if _RC2_REMOVED.search(title):
+        return ("a chart's title holds a control, zero-width or line-separator character, which Superset removes; "
+                "write it with plain spaces")
+    if any(pattern.search(title) for pattern in _RC2_REFUSED):
+        return ("Superset refuses a chart's title that reads as a script scheme (javascript:, vbscript:, data:) or "
+                "an event handler (a word starting with on, then =); reword it")
+    return None
+
+
 def _chart_columns(chart: ChartSpec) -> list[str]:
     return [*chart.dimensions, *(c for c in (chart.time_column, chart.source, chart.target) if c)]
 
@@ -1092,6 +1118,8 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
         chart_keys.add(chart.key)
         if not chart.title.strip() or len(chart.title) > MAX_TITLE:
             refuse(part, f"a chart's title is 1 to {MAX_TITLE} characters")
+        elif (problem := _title_problem(chart.title)) is not None:
+            refuse(part, problem)
         on = rows.get(chart.dataset_id)
         if on is None:
             refuse(part, "its rows are not a table this builder can read, or a join the plan makes")
@@ -1258,10 +1286,29 @@ def with_made_datasets(plan: BuildPlan, made: Mapping[str, int]) -> BuildPlan:
 # A stored plan's own version, read back by `plan_from_json`.
 _FORMAT = 1
 
+# One JSON value in `PLAN_JSON_SHAPE`: a string, a number, a bool or null.
+SCALAR = "scalar"
+_FILTER_JSON = {"column": SCALAR, "op": SCALAR, "operand": (SCALAR, [SCALAR])}
+# What `plan_to_json` writes, declared beside it, the build store's allow-list of a kept plan (`build_store._plan`):
+# an object is a dict of the keys it may hold, each with its value's shape; a list is a one-item list of its items'
+# shape; a tuple is any one of its shapes. The planner's tests hold the writer to it, both ways.
+PLAN_JSON_SHAPE: dict = {
+    "format": SCALAR,
+    "measures": [{"name": SCALAR, "label": SCALAR, "expression": SCALAR, "kind": SCALAR, "dataset_id": SCALAR,
+                  "description": SCALAR, "asked_by": SCALAR, "currency": SCALAR}],
+    "charts": [{"key": SCALAR, "family": SCALAR, "title": SCALAR, "dataset_id": SCALAR,
+                "measures": [({"saved": SCALAR, "kind": SCALAR}, {"written": SCALAR})], "dimensions": [SCALAR],
+                "time_column": SCALAR, "time_grain": SCALAR, "filters": [_FILTER_JSON], "row_limit": SCALAR,
+                "source": SCALAR, "target": SCALAR}],
+    "datasets": [{"key": SCALAR, "placeholder": SCALAR, "table": SCALAR, "join": SCALAR, "table_name": SCALAR,
+                  "sql": SCALAR, "name": SCALAR}],
+    "reuse": {"candidates": [SCALAR], "reason": SCALAR},
+}
+
 
 def plan_to_json(plan: BuildPlan) -> dict:
-    """The plan as the build store keeps it: plain JSON, and no key a value is kept under (`VALUE_SHAPED_KEYS`), so a
-    filter's operand is kept as `operand`. `plan_from_json` reads it back."""
+    """The plan as the build store keeps it: plain JSON in `PLAN_JSON_SHAPE`, and no key a value is kept under
+    (`VALUE_SHAPED_KEYS`), so a filter's operand is kept as `operand`. `plan_from_json` reads it back."""
     def filter_doc(item: Filter) -> dict:
         return {"column": item.column, "op": item.op, "operand": item.value}
 
