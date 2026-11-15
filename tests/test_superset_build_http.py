@@ -47,9 +47,15 @@ from tests.superset_build_world import SNAPSHOT as WORLD_SNAPSHOT
 from tests.superset_build_world import TABLES, Clock, Hook, MemoryBuildStore, World
 from tests.superset_fake import FakeSuperset
 from tests.sweep.stub_model import StubModel
-from tests.test_superset_builder import ONE_BAR
-from tests.test_superset_http import ROLE_DENIAL, SIGN_IN
-from tests.test_superset_runtime import PROFILES, SOURCE_ID, _source_job, superset_deployment
+from tests.superset_shared import (
+    ONE_BAR,
+    ROLE_DENIAL,
+    SIGN_IN,
+    SNAPSHOT_REFUSED,
+    SOURCE_ID,
+    _source_job,
+    superset_deployment,
+)
 
 GOAL = "Policies by region"
 # The sentences the build routes answer with, as the person reads them.
@@ -64,6 +70,17 @@ BUILD_SCOPES = (f"{ASK_SCOPES} superset:chart:read superset:chart:write superset
                 "superset:dashboard:write superset:dataset:write")
 # What a build route needs beside `db.read` (decision 6).
 WRITE_SCOPES = ("superset:chart:write", "superset:dashboard:write", "superset:dataset:write")
+# Two profiles, `a` the default; anyone may pick `b`.
+PROFILES = """
+default = "a"
+
+[profiles.a]
+llm_model = "model-a"
+
+[profiles.b]
+llm_model = "model-b"
+roles = ["*"]
+"""
 
 BUILD_ROUTES = {("POST", "/v1/superset/builds"), ("GET", "/v1/superset/builds/{build_id}"),
                 ("POST", "/v1/superset/builds/{build_id}/next")}
@@ -398,8 +415,6 @@ def test_missing_store_is_named(tmp_path, model, fake, world, jwks, monkeypatch,
 def test_a_snapshot_superset_mode_will_not_serve_refuses_building(served, fake, store, monkeypatch):
     """A newer snapshot Superset mode will not serve refuses a build as it refuses an answer: the snapshot is read
     again before anything is asked of Superset, so a plan and a check are never made from the snapshot it replaced."""
-    from tests.test_superset_http import SNAPSHOT_REFUSED
-
     client, runtime = served
     build = _stored(store, client)
     serving = runtime.snapshot
@@ -553,8 +568,10 @@ def test_a_refused_plan_is_an_answer(served, fake, store, refusal):
     assert set(r.json()) == {"refused"} and "draft-only" not in r.text
     told = r.json()["refused"]
     assert told["parts"] == [{"part": part.part, "reason": part.reason} for part in refusal.parts]
-    assert told["reason"] == refusal.reason if not refusal.parts else all(
-        part.part in told["reason"] for part in refusal.parts)
+    if refusal.parts:  # refused again after the repair: the plan step's own reason, naming each part
+        assert all(part.part in told["reason"] for part in refusal.parts)
+    else:  # the first reply could not be read: its reason as it is
+        assert told["reason"] == refusal.reason
     assert store._builds == {} and _writes(fake) == []
 
 

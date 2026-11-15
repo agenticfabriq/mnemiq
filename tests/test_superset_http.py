@@ -46,19 +46,16 @@ from mnemiq.superset.settings import SupersetConfigError, SupersetSnapshotRefuse
 from tests.auth_keys import AUDIENCE, ISSUER, claims, jwks_for, mint, owui_claims, hs256, public_pem, raw_token, rsa_key
 from tests.scripted_deployment import SQL, retrieve_the_one_table
 from tests.superset_fake import FakeSuperset
+from tests.superset_shared import ROLE_DENIAL, SIGN_IN, SNAPSHOT_REFUSED
 from tests.sweep.stub_model import StubModel
 from tests.test_superset_runtime import DATABASE_ID, SOURCE_ID, _PROBE, _answer_rows, _snapshot, superset_deployment
 
-SIGN_IN = "Superset did not accept this sign-in; sign in to Superset again."
 DENIED = "Superset refused this request and did not say why; its log records the reason."
 ACCESS_REFUSED = "Superset refused access to something this request reads."
 GRANTS_UNREADABLE = ("Superset's answer about what this user may read could not be read, so nothing was answered; "
                      "mnemiq's log records why.")
-SNAPSHOT_REFUSED = ("This deployment's knowledge is not the one enriched for the Superset database it answers from, so "
-                    "nothing is answered until an operator enriches it through Superset; mnemiq's log records why.")
 # Superset's own texts, as its MCP service renders them (`superset/mcp_service/auth.py` and
 # `superset/mcp_service/middleware.py`, `GlobalErrorHandlerMiddleware`).
-ROLE_DENIAL = "Permission denied: can_execute_sql_query on SQLLab for user west (tool: execute_sql)"
 GENERIC_DENIAL = "Permission denied for execute_sql: You don't have access to this resource."
 UNKNOWN_USER = ("Invalid parameter in execute_sql: JWT authenticated user not found in Superset database. "
                 "Ensure the user exists before granting MCP access.")

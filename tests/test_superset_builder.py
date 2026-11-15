@@ -27,7 +27,7 @@ from mnemiq.superset.adapter import SupersetSqlAdapter
 from mnemiq.superset.build_store import DashboardBusy, StepState
 from mnemiq.superset.builder import BuildBusy, BuildState, build_state, build_steps, next_step, start_build
 from mnemiq.superset.chart_check import ChartStatus
-from mnemiq.superset.charts import ChartSpec, Family, SavedRef, WrittenRef, extension_chart_request
+from mnemiq.superset.charts import Family, SavedRef, WrittenRef, extension_chart_request
 from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetRefusedCaller
 from mnemiq.superset.marker import Marker, format_marker, parse_marker
 from mnemiq.superset.measures import Measure, MeasureKind
@@ -47,6 +47,7 @@ from tests.superset_build_world import (
     dataset_id_of,
 )
 from tests.superset_fake import FakeSuperset
+from tests.superset_shared import BY_REGION, ONE_BAR, POLICIES, _chart
 
 TENANT = "tenant-a"
 PRINCIPAL = "superset:builder"
@@ -54,26 +55,15 @@ GOAL = "Premium and claims by region and month"
 SETTINGS = Settings(guard_fanout=False, superset_currency="USD")
 
 TOTAL = SavedRef("total_premium", MeasureKind.CURRENCY)
-POLICIES = Measure(name="policies", label="Policies", expression="COUNT(policy_id)", kind=MeasureKind.COUNT,
-                   dataset_id=POLICY_DATASET, description="Policies written", asked_by="")
 CLAIMED = Measure(name="claimed", label="Claimed", expression="SUM(amount)", kind=MeasureKind.CURRENCY, dataset_id=-1,
                   description="Amount claimed", asked_by="", currency="USD")
 CLAIM_DATASET = PlannedDataset(key="dataset_1", placeholder=-1, table="claim", table_name="claim")
-
-
-def _chart(key: str, family: Family, title: str, dataset_id: int, measures: tuple, *, dimensions: tuple = (),
-           time_column: str | None = None, time_grain: str | None = None) -> ChartSpec:
-    return ChartSpec(key=key, family=family, title=title, dataset_id=dataset_id, measures=measures,
-                     dimensions=dimensions, time_column=time_column, time_grain=time_grain, filters=(),
-                     row_limit=None, source=None, target=None)
 
 
 KPI_TOTAL = _chart("total_premium_kpi", Family.BIG_NUMBER, "Total premium", POLICY_DATASET, (TOTAL,))
 KPI_POLICIES = _chart("policies_kpi", Family.BIG_NUMBER, "Policies", POLICY_DATASET, (WrittenRef(POLICIES),))
 BY_MONTH = _chart("premium_by_month", Family.LINE, "Premium by month", POLICY_DATASET, (TOTAL,), time_column="issued",
                   time_grain="P1M")
-BY_REGION = _chart("policies_by_region", Family.BAR, "Policies by region", POLICY_DATASET, (WrittenRef(POLICIES),),
-                   dimensions=("region",))
 BY_CHANNEL = _chart("premium_by_channel", Family.PIE, "Premium by channel", POLICY_DATASET, (TOTAL,),
                     dimensions=("channel",))
 CLAIMS_TABLE = _chart("claimed_by_region", Family.TABLE, "Claimed by region", -1, (WrittenRef(CLAIMED),),
@@ -84,7 +74,6 @@ FUNNEL = _chart("policies_by_status", Family.FUNNEL, "Policies by status", POLIC
 # Six charts across five families, the planted saved metric reused on three, a dataset the build makes for the table.
 SIX = BuildPlan(charts=(BY_MONTH, KPI_TOTAL, BY_REGION, KPI_POLICIES, BY_CHANNEL, CLAIMS_TABLE),
                 measures=(POLICIES, CLAIMED), datasets=(CLAIM_DATASET,))
-ONE_BAR = BuildPlan(charts=(BY_REGION,), measures=(POLICIES,))
 ONE_FUNNEL = BuildPlan(charts=(FUNNEL,), measures=(POLICIES,))
 
 
