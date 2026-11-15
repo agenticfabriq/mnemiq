@@ -115,10 +115,13 @@ def caller_dependency(doors, door: str = "v1", *, delegated: bool = False):
 @dataclass(frozen=True)
 class _Asker:
     """Who a /v1 request asks as, and what the runtime is handed beside them: in Superset mode the token the door
-    verified, as `delegation`, which every call the request makes to Superset carries; nothing in direct mode."""
+    verified, as `delegation`, which every call the request makes to Superset carries; nothing in direct mode.
+    `scopes` are that token's verified scopes, which the build routes read (`server/superset_build.py`); none in direct
+    mode."""
 
     identity: IdentityContext
     handed: dict
+    scopes: frozenset[str] = frozenset()
 
 
 def _refused(exc: Exception, doors) -> HTTPException | None:
@@ -133,7 +136,8 @@ def _refused(exc: Exception, doors) -> HTTPException | None:
     if found.status == 401:
         return HTTPException(status_code=401, detail=found.detail, headers={"WWW-Authenticate": "Bearer"})
     if found.status == 403:
-        return _NotPermitted(found.detail, None, doors.end_session_url if doors is not None else None)
+        challenge = {"WWW-Authenticate": found.challenge} if found.challenge else None
+        return _NotPermitted(found.detail, challenge, doors.end_session_url if doors is not None else None)
     return HTTPException(status_code=found.status, detail=found.detail)
 
 
@@ -147,8 +151,11 @@ def build_app(
     the Bearer the door verified, as `delegation`, so Superset answers as the person it names, and each refusal from
     Superset reaches the person as `server/superset_refusals.py` says, never as a 500.
 
-    No route here writes: `Runtime.write` is reached from MCP's `db_write` and the CLI alone. A write route added
-    here would need the `db.write` scope too."""
+    No route here writes to the source database: `Runtime.write` is reached from MCP's `db_write` and the CLI alone,
+    and a route that wrote there would need the `db.write` scope too. In Superset mode the build routes
+    (`server/superset_build.py`) write Superset's own metadata, its dashboards, charts and datasets, never the source
+    database: they need the token's `db.read` and Superset's write scopes (`superset:chart:write
+    superset:dashboard:write superset:dataset:write`), and no mnemiq scope of their own."""
     lifespan = None
     if mcp_app is not None:
         @asynccontextmanager
@@ -182,7 +189,7 @@ def build_app(
         verified = caller_dependency(doors, "v1", delegated=True)
 
         def asker(found=Depends(verified)) -> _Asker:
-            return _Asker(found.identity, {"delegation": found.token})
+            return _Asker(found.identity, {"delegation": found.token}, found.scopes)
 
     @app.get("/healthz")
     def healthz() -> dict:
@@ -254,6 +261,11 @@ def build_app(
                 app.router.routes.append(Route(path, endpoint=mcp_app))
 
     mount_openai(app, runtime, doors, heartbeat_s=heartbeat_s)
+    if superset:
+        # Here, not at the top: the build routes' module reads this one's refusal mapping.
+        from mnemiq.server.superset_build import mount_superset_build
+
+        mount_superset_build(app, runtime, doors, asker)
 
     # Mounted last, so it can only claim paths no API route above already answered.
     built = static_dir if static_dir is not None else STATIC_DIR

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from mnemiq.superset.build_store import STORE_MISSING, BuildStoreMissing
 from mnemiq.superset.client import (
     SupersetPermissionDenied,
     SupersetRefusal,
@@ -25,6 +26,7 @@ from mnemiq.superset.client import (
     SupersetUnavailable,
 )
 from mnemiq.superset.executor import SupersetCredentialMissing, SupersetReadOnly
+from mnemiq.superset.extension import ExtensionMissing
 from mnemiq.superset.grants import GRANTS_UNREADABLE, NOT_A_BUILDER, GrantsUnreadable, NotABuilder, SupersetMisconfigured
 from mnemiq.superset.payload import SupersetAccessRefused
 from mnemiq.superset.settings import SNAPSHOT_REFUSED, SupersetSnapshotRefused
@@ -35,14 +37,29 @@ SIGN_IN_AGAIN = "Superset did not accept this sign-in; sign in to Superset again
 # again nor asking for roles is known to help, and neither is suggested.
 DENIED = "Superset refused this request and did not say why; its log records the reason."
 ACCESS_REFUSED = "Superset refused access to something this request reads."
+# A build asked of a Superset that does not offer the extension's tools, through which every build writes.
+EXTENSION_MISSING = "This Superset does not have the mnemiq extension installed."
+# A build route asked with a token minted for asking, which carries none of Superset's write scopes.
+NOT_FOR_BUILDING = "This sign-in was made for asking, not building; open the builder from Superset again."
+
+
+class NotForBuilding(Exception):
+    """A build route asked with a token that lacks a scope building needs: one Superset's mint route made for asking
+    (`purpose: "ask"`). `needed` is every scope the route needs, for the insufficient-scope challenge (RFC 6750)."""
+
+    def __init__(self, needed: tuple[str, ...]) -> None:
+        super().__init__(NOT_FOR_BUILDING)
+        self.needed = needed
 
 
 @dataclass(frozen=True)
 class Refused:
-    """The response a failure becomes: its HTTP status, and the sentence the person reads."""
+    """The response a failure becomes: its HTTP status, the sentence the person reads, and for a token that lacks a
+    scope the `WWW-Authenticate` challenge naming what it lacks."""
 
     status: int
     detail: str
+    challenge: str | None = None
 
 
 def superset_refusal(exc: BaseException) -> Refused | None:
@@ -69,4 +86,11 @@ def superset_refusal(exc: BaseException) -> Refused | None:
         return Refused(401, str(exc))
     if isinstance(exc, SupersetReadOnly):
         return Refused(403, str(exc))
+    if isinstance(exc, NotForBuilding):
+        return Refused(403, NOT_FOR_BUILDING,
+                       challenge=f'Bearer error="insufficient_scope", scope="{" ".join(exc.needed)}"')
+    if isinstance(exc, ExtensionMissing):  # which tool was asked for, and Superset's words, are in the log only
+        return Refused(503, EXTENSION_MISSING)
+    if isinstance(exc, BuildStoreMissing):
+        return Refused(503, STORE_MISSING)
     return None

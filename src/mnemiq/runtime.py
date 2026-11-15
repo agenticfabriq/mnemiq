@@ -103,6 +103,9 @@ class LoadedProfile:
     # The model clients this profile calls, each once: its writer's, which its corrector, selector and prose share, and
     # its judge's when the judge has a client of its own. What `Runtime.usage` sums.
     clients: tuple[LLMClient, ...] = ()
+    # Superset mode's dashboard planner, on this profile's writer client (`assembly.Components.planner`): a build asked
+    # under this profile is planned by its model. None: built by hand.
+    planner: Any = None
 
 
 @dataclass(frozen=True)
@@ -458,6 +461,23 @@ class Runtime:
             raise SupersetCredentialMissing(_NO_DELEGATION)
         self.reload_if_stale()
         return self._superset_grants(superset_executor(self.settings, delegation))
+
+    def build_planner(self, profile: str | None, identity: IdentityContext):
+        """The planner of the profile a build is asked under (the default when None), picked as `ask` picks a profile:
+        first, before any work, and refused alike whether unknown or not this identity's to pick."""
+        picked = self._picked(profile, identity)
+        if picked is None or picked.planner is None:
+            raise RuntimeError("this runtime was built with no profile planner, so it plans no build")
+        return picked.planner
+
+    def builder_grants(self, adapter) -> GrantSet:
+        """What the builder whose token `adapter` carries may read, as Superset says when asked as them: the grants a
+        build is planned and checked under, read once per request. The snapshot is reloaded first, as `ask` reloads it,
+        so a build and an answer read one snapshot, and a newer one Superset mode will not serve refuses both."""
+        if not self._superset_mode:
+            raise RuntimeError("only Superset mode builds dashboards")
+        self.reload_if_stale()
+        return self._superset_grants(adapter)
 
     def _superset_grants(self, adapter) -> GrantSet:
         """What Superset says the person whose token `adapter` carries may read. Raises `GrantsUnreadable` when that
@@ -1261,7 +1281,7 @@ def build_runtime(settings: Settings) -> Runtime:
             for name, mode in modes.items()
         }
         loaded[profile_name] = LoadedProfile(profile, profile_version(profile.settings, dialect), profile.settings, modes,
-                                             agents, kit.fitter, clients)
+                                             agents, kit.fitter, clients, planner=kit.planner)
     default = loaded[default_profile]
     commit = read_engine_commit(settings.engine_commit)
     answer_log = build_answer_log(settings)
