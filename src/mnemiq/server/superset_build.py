@@ -5,7 +5,8 @@ request, and the build as it stands. Mounted only in Superset mode, and no other
   `fresh`, the plan may offer a dashboard the builder can see that already covers the goal: the answer is then the
   offer, its id, title and reason, and nothing is kept. The builder answers by asking again, with that `dashboard_id`
   to build on it or with `fresh: true` for a new one; asked either way, no dashboard is looked for. Otherwise the
-  answer is the new build (201), or the plan's refusal, which is an answer too.
+  answer is the new build (201), or the plan's refusal, which is an answer too. The build keeps the profile it was
+  asked under (`profile`, None for the deployment's default).
 - `GET /v1/superset/builds/{build_id}`: the build as it stands, read from the build store alone.
 - `POST /v1/superset/builds/{build_id}/next`: the build's next step, claimed, run and recorded (`builder.next_step`);
   409 while another request's step holds the build.
@@ -16,12 +17,19 @@ carries and one it makes for asking does not (`NotForBuilding`, a 403). These ro
 through Superset as the builder, never the source database, so they need no mnemiq scope of their own.
 
 **As the builder.** A route that calls Superset builds its own adapter with `superset_executor(settings, delegation)`
-from the request's verified token, and the planner and the builder call Superset only through that adapter's client.
-What the builder may read is what Superset says when asked as them, read once per request. The `GET` calls nothing.
+from the deployment's settings, which name Superset, and the request's verified token; the planner and the builder
+call Superset only through that adapter's client. What the builder may read is what Superset says when asked as them,
+read once per request. The `GET` calls nothing.
 
-**What is answered.** A build as `_build` writes it: its id, status and dashboard, each step's key, kind, status, the
-id of what it made and when it began, and each chart's check status. Never a lease id, never a value. Every failure is
-a status and mnemiq's own sentence (`server/superset_refusals.py`, and `_refusal` here for the build's own).
+**Under its profile.** A build's plan, and each of its steps, run under the settings of the profile it was started
+under, picked again at every step as `/v1/ask` picks one: a profile gone or no longer offered to the builder refuses
+the step (422) before Superset is asked anything.
+
+**What is answered.** A build as `_build` writes it, and nothing else: `build_id`, `status` and `dashboard_id`; its
+`steps`, each `key`, `kind`, `status`, `object_id` (what the step made), `started_at` and `lease_until` (when a running
+step's lease passes); `checks`, each chart's check status by chart id; `ran`, the step this request ran, and `message`,
+mnemiq's own words on it. Never a lease id, a step's intent, or a value. Every failure is a status and mnemiq's own
+sentence (`server/superset_refusals.py`, and `_refusal` here for the build's own).
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, Strict
 
 from mnemiq.profiles import UnknownProfile
 from mnemiq.server.superset_refusals import NotForBuilding
+from mnemiq.server.v1_refusals import refused, unknown_profile
 from mnemiq.superset.build_store import MAX_ID, BuildNotFound, BuildStore, BuildStoreMissing, DashboardBusy
 from mnemiq.superset.builder import BuildBusy, BuildState, build_state, next_step, start_build
 from mnemiq.superset.executor import SupersetCredentialMissing, superset_executor
@@ -125,9 +134,9 @@ def _builder(asking, *, building: bool):
     return asking.identity, delegation
 
 
-def _refusal(exc: Exception, doors, refused) -> HTTPException | None:
-    """The response a failure of a build route becomes: the build's own here, Superset's and Superset mode's by
-    `refused` (`app._refused`). None for anything else, which stays a 500."""
+def _refusal(exc: Exception, doors) -> HTTPException | None:
+    """The response a failure of a build route becomes: the build's own here, Superset's and Superset mode's as every
+    `/v1` route answers them (`v1_refusals.refused`). None for anything else, which stays a 500."""
     if isinstance(exc, (BuildBusy, DashboardBusy)):
         return HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, BuildNotFound):
@@ -135,9 +144,8 @@ def _refusal(exc: Exception, doors, refused) -> HTTPException | None:
     if isinstance(exc, psycopg.OperationalError):
         logger.warning("the build store did not answer a build route: %s", exc)
         return HTTPException(status_code=503, detail=STORE_UNAVAILABLE)
-    if isinstance(exc, UnknownProfile):
-        # As `/v1/ask` composes it: what this caller may pick, never the name asked for.
-        return HTTPException(status_code=422, detail=f"unknown profile; you may pick: {exc.offered}")
+    if isinstance(exc, UnknownProfile):  # as `/v1/ask` answers it
+        return unknown_profile(exc)
     if isinstance(exc, ExtensionMissing):
         logger.warning("%s", exc)
     return refused(exc, doors)
@@ -146,8 +154,6 @@ def _refusal(exc: Exception, doors, refused) -> HTTPException | None:
 def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
     """Mount the three build routes on `app`, each behind `asker`, the `/v1` door's dependency. The build store is
     the deployment's control Postgres (`MNEMIQ_CONTROL_DSN`); without one, every build route answers 503 naming it."""
-    from mnemiq.server.app import _refused  # here: app.py imports this module
-
     # The deployment's settings name Superset (its MCP URL, database and schema), so every adapter is built from them;
     # a build's plan and steps run under the settings of the profile it was started under.
     deployment = runtime.settings
@@ -166,9 +172,9 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
         try:
             return work()
         except Exception as exc:
-            if (refused := _refusal(exc, doors, _refused)) is None:
+            if (answer := _refusal(exc, doors)) is None:
                 raise
-            raise refused from None
+            raise answer from None
 
     @app.post("/v1/superset/builds", status_code=201)
     def start(body: StartBody, response: Response, asking=Depends(asker)) -> dict:
@@ -210,6 +216,10 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
 
     @app.post("/v1/superset/builds/{build_id}/next")
     def step(build_id: str, asking=Depends(asker)) -> dict:
+        """The build's next step. The builder's grants are read before `next_step` claims the step, so a person
+        Superset refuses leaves no claimed step behind; those reads change nothing, and the claim still comes before
+        every write."""
+
         def work() -> dict:
             who, delegation = _builder(asking, building=True)
             builds = kept()

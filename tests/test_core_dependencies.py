@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = ROOT / "src" / "mnemiq"
 # A module that only an extra's install loads, and the extra that must declare what it imports at load time.
 EXTRA_MODULES = {"server/app.py": "server", "server/openai_compat.py": "server",
-                 "server/superset_build.py": "server"}
+                 "server/superset_build.py": "server", "server/v1_refusals.py": "server"}
 
 
 def _name(requirement: str) -> str:
