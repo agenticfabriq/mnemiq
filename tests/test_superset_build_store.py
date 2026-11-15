@@ -627,11 +627,12 @@ def test_store_holds_no_value_catches_a_planted_value(store, store_dsn, plant, c
 SENTINEL = 987654.321
 
 
-def test_sentinel_value_never_persisted(store, store_dsn):
-    """A fake build step whose Superset answer and value check both hold `987654.321` records all it may (the chart's
-    id, the step's state, the measure, its charts and the check's status), and no stored row's text holds the number,
-    nor its rounding to cents. Every door that takes free-form input refuses it as well. The probe is shown to read the rows:
-    it finds the step's chart id and the goal, and finds the number once it is planted past the store."""
+def test_sentinel_value_never_persisted_through_the_stores_doors(store, store_dsn):
+    """A build step driven by hand, whose Superset answer and value check both hold `987654.321`, records all it may
+    (the chart's id, the step's state, the measure, its charts and the check's status), and no stored row's text holds
+    the number, nor its rounding to cents. Every door that takes free-form input refuses it as well. The probe is shown
+    to read the rows: it finds the step's chart id and the goal, and finds the number once it is planted past the
+    store. `test_superset_builder.py` holds a whole build, its check step included, to the same."""
     build = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS)
     build = _run_step(store, build, "dashboard", "dashboard", 41)
     build = _run_step(store, build, "policies", "dataset", 42)

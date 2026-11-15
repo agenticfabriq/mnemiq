@@ -1370,24 +1370,33 @@ class _RealClock(Clock):
 
 
 @pytest.fixture
-def pg_store():
+def pg_dsn():
+    """A schema of its own in the store tests' database, as the DSN that makes it the search path."""
     from psycopg import sql
     from psycopg.conninfo import make_conninfo
 
-    from mnemiq.superset.build_store import BuildStore
     from tests.test_superset_build_store import _database_dsn
 
     database = _database_dsn()
     schema = f"builder_{uuid.uuid4().hex[:12]}"
     with psycopg.connect(database, autocommit=True) as admin:
         admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
-    store = BuildStore(make_conninfo(database, options=f"-c search_path={schema}"))
+    try:
+        yield make_conninfo(database, options=f"-c search_path={schema}")
+    finally:
+        with psycopg.connect(database, autocommit=True) as admin:
+            admin.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema)))
+
+
+@pytest.fixture
+def pg_store(pg_dsn):
+    from mnemiq.superset.build_store import BuildStore
+
+    store = BuildStore(pg_dsn)
     try:
         yield store
     finally:
         store.close()
-        with psycopg.connect(database, autocommit=True) as admin:
-            admin.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema)))
 
 
 def test_a_build_runs_on_the_postgres_store(fake, pg_store):
@@ -1410,6 +1419,70 @@ def test_a_build_runs_on_the_postgres_store(fake, pg_store):
     with pytest.raises(DashboardBusy):
         _start(pg_store, ONE_BAR, dashboard_id=final.dashboard_id)
     assert again.status == "building" and world.dashboards[final.dashboard_id]["published"] is False
+
+
+SENTINEL = 987654.321
+
+
+def _with_sentinel(rows_key: str):
+    """An `after` hook putting the sentinel in place of every number of the answer's rows, a column of whole numbers
+    then typed as a float column (`execute_sql` names each column's pandas dtype)."""
+    def after(request, answer, _world):
+        if not isinstance(answer, dict) or not answer.get(rows_key):
+            return answer
+        answer = {**answer, rows_key: [dict(row) for row in answer[rows_key]]}
+        for row in answer[rows_key]:
+            row.update({key: SENTINEL for key, value in row.items()
+                        if isinstance(value, (int, float)) and not isinstance(value, bool)})
+        if isinstance(answer.get("columns"), list):
+            answer["columns"] = [{**column, "type": "float64"} if column.get("type") == "int64" else column
+                                 for column in answer["columns"]]
+        return answer
+
+    return after
+
+
+def test_sentinel_value_never_persisted(fake, pg_store, pg_dsn, monkeypatch):
+    """After a full build on the Postgres store, its check step among its steps, with Superset answering both the
+    chart's data (`get_chart_data`) and mnemiq's own statement (`execute_sql`) with `987654.321`: the check compared
+    that number and the chart checked, and no stored row's text holds it, nor its rounding to cents. The probe is
+    shown to read the rows: it finds the goal and the chart's id, and the number once it is planted past the store."""
+    from psycopg import sql
+
+    import mnemiq.superset.builder as builder_module
+    from mnemiq.superset.build_store import BUILD_TABLE
+    from tests.test_superset_build_store import STORE_COLUMNS
+
+    world = World(fake, _RealClock())
+    world.hooks["get_chart_data"] = Hook(after=_with_sentinel("data"))
+    world.hooks["execute_sql"] = Hook(after=_with_sentinel("rows"))
+    compared: list = []
+    real = builder_module.check_chart
+
+    def check(*args, **kwargs):
+        found = real(*args, **kwargs)
+        compared.append((found.chart_values, found.mnemiq_values))
+        return found
+
+    monkeypatch.setattr(builder_module, "check_chart", check)
+    final = _run(pg_store, _start(pg_store, ONE_BAR).build_id, _adapter(fake))[-1]
+    chart_id = _step(final, "policies_by_region").object_id
+    assert final.status == "done" and final.checks == {chart_id: ChartStatus.CHECKED}, final.message
+    [(chart, mine)] = compared
+    assert chart == mine and all(row[-1] == SENTINEL for row in chart), chart  # the number reached the check
+
+    def stored_text(con) -> str:
+        return "\n".join(text for table in STORE_COLUMNS for (text,) in con.execute(
+            sql.SQL("SELECT row_to_json(t)::text FROM {} AS t").format(sql.Identifier(table))))
+
+    with psycopg.connect(pg_dsn) as con:
+        text = stored_text(con)
+        assert str(SENTINEL) not in text and "987654.32" not in text
+        assert GOAL in text and f'"object_id": {chart_id}' in text  # the probe reads what the build kept
+        con.execute(sql.SQL("UPDATE {} SET goal = goal || %s").format(sql.Identifier(BUILD_TABLE)),
+                    (str(SENTINEL),))
+        assert str(SENTINEL) in stored_text(con)  # and finds the number once it is there
+        con.rollback()
 
 
 def test_a_timed_out_create_is_reconciled_on_the_postgres_store(fake, pg_store):
