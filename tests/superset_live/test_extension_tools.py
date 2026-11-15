@@ -29,6 +29,10 @@ from pathlib import Path
 import jwt
 import pytest
 
+from mnemiq.authz.grants import GrantSet
+from mnemiq.contract import Column, Snapshot
+from mnemiq.superset.adapter import SupersetSqlAdapter
+from mnemiq.superset.chart_check import ChartStatus, check_chart
 from mnemiq.superset.charts import ChartSpec, Family, WrittenRef, extension_chart_request, generate_chart_request
 from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetPermissionDenied
 from mnemiq.superset.extension import TOOL_PREFIX
@@ -584,6 +588,71 @@ def test_saved_query_context_keeps_pivot_and_waterfall_grouping(live, extension,
             waterfall_before_rows=len(before["waterfall"].get("data") or []),
             waterfall_before_columns=sorted((before["waterfall"].get("data") or [{}])[0]),
             waterfall_after_rows=len(waterfall_rows))
+
+
+# The seeded `policy` table (`seed.sql`) as the snapshot mnemiq's own statement is decided against, and the builder's
+# grant of it: analyst reads `policy` with no row rule.
+POLICY = Snapshot(version="live", source_id="live", created_at="seed", columns=[
+    Column(id=f"policy.{name}", object_id="policy", name=name, data_type=data_type)
+    for name, data_type in (("id", "INTEGER"), ("region", "VARCHAR"), ("status", "VARCHAR"), ("premium", "DECIMAL"),
+                            ("issued", "DATE"))])
+BY_REGION_AND_STATUS_PREMIUM = "SELECT region, status, sum(premium) FROM policy GROUP BY 1, 2"
+
+
+def written(dataset_id: int, label: str, expression: str) -> WrittenRef:
+    return WrittenRef(Measure(name=label.replace(" ", "_"), label=label, expression=expression,
+                              kind=MeasureKind.CURRENCY, dataset_id=dataset_id, description=label, asked_by=BUILDER))
+
+
+def test_claimed_charts_read_checked_by_the_value_check(live, extension, policy_id, recorder):
+    """A monthly line chart, a pivot (rows region, columns status) and a waterfall (`issued` by month, by status), each
+    of the measure `SUM(premium)`, made by `generate_chart` from mnemiq's own `generate_chart_request` and claimed by
+    the extension, read CHECKED through `check_chart`, with mnemiq's real client and adapter as the builder. The pivot
+    keeps MCP's totals and the waterfall MCP's total bar, as mnemiq's request leaves them; both are sums of a SUM. The
+    check compares 12, 9 and 35 groups, and judges each chart's format. The pivot's numbers are the source's, read
+    directly. A pivot of the ratio `SUM(premium) / COUNT(*)` with its totals reads NOT_CHECKED, since its totals are
+    not the sums of its cells, and nothing is asked for its data."""
+    client = as_user(live, BUILDER)
+    build = new_build(client, "checked")
+    total = written(policy_id, "total premium", "SUM(premium)")
+    charts = {
+        "line": spec(Family.LINE, policy_id, measures=(total,), time_column="issued", time_grain="P1M"),
+        "pivot": spec(Family.PIVOT, policy_id, measures=(total,), dimensions=("region", "status")),
+        "waterfall": spec(Family.WATERFALL, policy_id, measures=(total,), time_column="issued", time_grain="P1M",
+                          dimensions=("status",)),
+        "ratio_pivot": spec(Family.PIVOT, policy_id, measures=(written(policy_id, "premium per policy",
+                                                                       "SUM(premium) / COUNT(*)"),),
+                            dimensions=("region", "status")),
+    }
+    ids = {}
+    for name, chart in charts.items():
+        ids[name] = mcp_chart(client, chart)
+        assert call(client, "claim_chart", chart_id=ids[name], dashboard_id=build.dashboard_id,
+                    marker=build.marker(name)) == {"ok": True}
+    stored = {name: stored_chart(chart_id)["params"] for name, chart_id in ids.items()}
+    assert (stored["pivot"]["rowTotals"], stored["pivot"]["colTotals"], stored["waterfall"]["show_total"]) == (
+        True, True, True)
+    adapter = SupersetSqlAdapter(client, database_id=live.database_id, schema="public")
+    kinds = {"total premium": MeasureKind.CURRENCY, "premium per policy": MeasureKind.CURRENCY}
+    recorder.calls.clear()
+    checks = {name: check_chart(adapter, chart_id=chart_id, dataset_id=policy_id, kinds=kinds, saved={},
+                                snapshot=POLICY, grants=GrantSet(frozenset({"policy"})), guard_fanout=False)
+              for name, chart_id in ids.items()}
+    observe("value check", **{name: (ids[name], check.status.value, check.reason,
+                                     len(check.chart_values or ()), (check.chart_values or (None,))[0])
+                              for name, check in checks.items()})
+    for name, groups in (("line", 12), ("pivot", 9), ("waterfall", 35)):
+        check = checks[name]
+        assert check.status is ChartStatus.CHECKED, (name, check.reason)
+        assert len(check.chart_values) == groups and check.chart_values == check.mnemiq_values, name
+    truth = sorted((region, status, float(total)) for region, status, total in ground_truth(
+        live, BY_REGION_AND_STATUS_PREMIUM))
+    assert sorted(checks["pivot"].chart_values) == truth
+    ratio = checks["ratio_pivot"]
+    assert ratio.status is ChartStatus.NOT_CHECKED and "totals" in ratio.reason, ratio.reason
+    assert ratio.chart_values is None and ratio.mnemiq_values is None
+    assert not [c for c in recorder.calls if c.tool == "get_chart_data"
+                and c.request.get("identifier") == ids["ratio_pivot"]]
 
 
 # --- patch_chart ----------------------------------------------------------------------------------------------------

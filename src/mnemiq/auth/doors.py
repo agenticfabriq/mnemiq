@@ -49,10 +49,12 @@ class DoorRefusal(Exception):
 
 @dataclass(frozen=True)
 class Delegation:
-    """A /v1 caller as the door verified them: who they are, and the Bearer that said so, to be handed on unchanged."""
+    """A /v1 caller as the door verified them: who they are, the Bearer that said so, to be handed on unchanged, and
+    the scopes that Bearer's verified claims carry, for a route that needs more than `db.read`."""
 
     identity: IdentityContext
     token: DelegatedToken
+    scopes: frozenset[str] = frozenset()
 
 
 class HttpDoors:
@@ -87,18 +89,19 @@ class HttpDoors:
 
     def v1_delegation(self, headers: Headers) -> Delegation:
         """The /v1 caller, verified exactly as `v1` verifies them, with the Bearer that verification read: the one
-        Authorization header's token, never another header's, and never a token the door did not check."""
-        identity, bearer = self._judge("/v1", headers)
+        Authorization header's token, never another header's, and never a token the door did not check; and the
+        scopes of the claims that verification read."""
+        identity, bearer, scopes = self._judge("/v1", headers)
         if bearer is None:  # /v1 takes a Bearer and no other credential, so a caller it accepts arrived with one
             raise DoorRefusal(401, "no credential")
-        return Delegation(identity, DelegatedToken(bearer))
+        return Delegation(identity, DelegatedToken(bearer), scopes)
 
     def openai(self, headers: Headers) -> IdentityContext:
         return self._judge("/openai/v1", headers)[0]
 
-    def _judge(self, door: str, headers: Headers) -> tuple[IdentityContext, str | None]:
-        """The caller at `door`, and the Bearer they were verified by, or None when it was Open WebUI's signed
-        header; or the door's refusal."""
+    def _judge(self, door: str, headers: Headers) -> tuple[IdentityContext, str | None, frozenset[str]]:
+        """The caller at `door`, the Bearer they were verified by (None when it was Open WebUI's signed header) and
+        its verified scopes (none for the signed header, which carries none); or the door's refusal."""
         try:
             return self._identity(door, headers)
         except DoorRefusal as exc:
@@ -110,7 +113,7 @@ class HttpDoors:
             log("refused on %s: %s (sub=%r jti=%r)", door, exc.reason, exc.sub, exc.jti)
             raise DoorRefusal(status, exc.reason) from None
 
-    def _identity(self, door: str, headers: Headers) -> tuple[IdentityContext, str | None]:
+    def _identity(self, door: str, headers: Headers) -> tuple[IdentityContext, str | None, frozenset[str]]:
         cfg = self._cfg
         bearer, signed = screen(cfg, door, headers)
         if door == "/openai/v1":
@@ -125,7 +128,7 @@ class HttpDoors:
             if signed:
                 if self._owui is None:
                     raise DoorRefusal(401, "the Open WebUI header is not enabled on this deployment")
-                return identity_from_openwebui(self._owui.claims(signed[0]), cfg), None
+                return identity_from_openwebui(self._owui.claims(signed[0]), cfg), None, frozenset()
 
         if bearer is not None:
             verifier = self._v1 if door == "/v1" else self._openai
@@ -138,10 +141,11 @@ class HttpDoors:
             # A 403, not a 401: the caller is known and not permitted, which signing in again would not change. On
             # both doors (the owner's decision, 2026-11-08). Open WebUI's signed header carries no scopes and has
             # returned above: what its users may read comes from their roles in the identity map alone.
-            if READ_SCOPE not in token_scopes(found):
+            scopes = frozenset(token_scopes(found))
+            if READ_SCOPE not in scopes:
                 raise DoorRefusal(403, f"insufficient scope: this token lacks {READ_SCOPE}",
                                   challenge=f'Bearer error="insufficient_scope", scope="{READ_SCOPE}"')
-            return identity, bearer
+            return identity, bearer, scopes
         raise DoorRefusal(401, "no credential")
 
 

@@ -85,8 +85,8 @@ def dataset_metrics(request: dict[str, Any]) -> dict[str, Any]:
 
 
 @tool(name="editors_of", class_permission_name="Chart", method_permission_name="read",
-      description="The editors' labels of the charts and datasets the caller may read. "
-                  "request: {chart_ids, dataset_ids}.")
+      description="The editors' labels of the charts, datasets and dashboards the caller may read, and whether the "
+                  "caller edits each dashboard. request: {chart_ids, dataset_ids, dashboard_ids}.")
 def editors_of(request: dict[str, Any]) -> dict[str, Any]:
     return reads.editors_of(request)
 

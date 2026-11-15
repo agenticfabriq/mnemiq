@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 import pytest
 
 import mnemiq.superset.chart_check as chart_check
+import mnemiq.superset.chart_form as chart_form
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Column, Snapshot
 from mnemiq.superset.adapter import SupersetSqlAdapter
@@ -63,6 +64,12 @@ NO_TIME_FILTER = {"clause": "WHERE", "expressionType": "SIMPLE", "subject": "ord
 WEB_ONLY = {"clause": "WHERE", "expressionType": "SIMPLE", "subject": "channel", "operator": "IN",
             "comparator": ["web"]}
 TOTAL = {"kinds": {"Total premium": MeasureKind.CURRENCY}}
+# Written measures as mnemiq writes every one, an ad hoc SQL metric. A sum or a count over groups is the same measure
+# over them all, and these are not.
+RATIO = PREMIUM | {"label": "Premium per policy", "sqlExpression": "SUM(premium) / COUNT(*)"}
+AVERAGE = PREMIUM | {"label": "Average premium", "sqlExpression": "AVG(premium)"}
+DISTINCT = PREMIUM | {"label": "Channels", "sqlExpression": "COUNT(DISTINCT channel)"}
+POLICIES = PREMIUM | {"label": "Policies", "sqlExpression": "COUNT(*)"}
 
 
 def _bar(**changes) -> dict:
@@ -145,10 +152,10 @@ def _adapter(fake) -> SupersetSqlAdapter:
     return SupersetSqlAdapter(SupersetMcp(fake.url, DelegatedToken(TOKEN)), database_id=DATABASE_ID, schema=SCHEMA)
 
 
-def _check(fake, *, kinds=None, saved=None, dataset_id: int = DATASET_ID):
+def _check(fake, *, kinds=None, saved=None, dataset_id: int = DATASET_ID, **more):
     return check_chart(_adapter(fake), chart_id=CHART_ID, dataset_id=dataset_id,
                        kinds=TOTAL["kinds"] if kinds is None else kinds, saved=saved or {}, snapshot=SNAPSHOT,
-                       grants=GRANTS, guard_fanout=False)
+                       grants=GRANTS, guard_fanout=False, **more)
 
 
 def _statements(fake) -> list[str]:
@@ -266,6 +273,22 @@ def test_a_metric_whose_kind_is_unknown_is_checked_for_its_values_only(fake):
     _serve(fake, form_data=_bar(currency_format=None, y_axis_format=",d"),
            chart=_chart_data(["region", "Total premium"], ("east", 1200)), mnemiq=_result(("east", 1200)))
     assert _check(fake, kinds={}).status is ChartStatus.CHECKED
+
+
+def test_a_metric_of_no_kind_the_builder_gave_is_not_checked_when_it_gave_every_kind(fake):
+    """The builder made the chart and knows the kind of every metric it made it with (`every_kind_known`). A metric
+    whose label is none of theirs, here one Superset saved under other text than mnemiq sent, has a format nobody
+    judged: the chart is not checked, saying so, its numbers kept. The control: the same chart, every kind not claimed
+    known (a metric added by hand), is checked for its numbers alone."""
+    escaped = PREMIUM | {"label": "Premium &lt; 1y"}
+    _serve(fake, form_data=_bar(metrics=[escaped]), chart=_chart_data(["region", "Premium &lt; 1y"], ("east", 1200)),
+           mnemiq=_result(("east", 1200)))
+    kinds = {"Premium < 1y": MeasureKind.CURRENCY}
+    check = _check(fake, kinds=kinds, every_kind_known=True)
+    assert check.status is ChartStatus.NOT_CHECKED, check.reason
+    assert "'Premium &lt; 1y'" in check.reason and "could not be judged" in check.reason
+    assert check.chart_values == check.mnemiq_values == (("east", 1200),)
+    assert _check(fake, kinds=kinds).status is ChartStatus.CHECKED
 
 
 def test_format_wrong_is_reported_where_the_numbers_are_not_checked(fake):
@@ -445,15 +468,14 @@ def test_time_grain_is_applied_to_the_x_axis(fake):
 
 def test_grain_superset_did_not_apply_is_not_checked(fake):
     """rc2's `get_chart_data` rebuilds a chart with no saved query context (every chart MCP made) from `form_data`, and
-    that rebuild never applies `time_grain_sqla` to a string x-axis. Its rows are then the ungrouped ones, which match
-    mnemiq's statement without the grain: the numbers the chart shows were not compared, and it says so rather than
-    calling it a mismatch."""
+    that rebuild never applies `time_grain_sqla` to a string x-axis. Its rows then hold times off the grain: the
+    numbers the chart shows by its grain are not among them, so nothing is compared and mnemiq sends no statement, and
+    it says so rather than calling it a mismatch."""
     _serve(fake, form_data=_line(), chart=_chart_data(["order_date", "Total premium"], *DAYS),
            mnemiq=lambda sql: _result(*(MONTHS if "DATE_TRUNC" in sql.upper() else DAYS), columns=TIME))
     check = _check(fake)
     assert check.status is ChartStatus.NOT_CHECKED and "time grain" in check.reason
-    grained, plain = _statements(fake)
-    assert "DATE_TRUNC" in grained.upper() and "DATE_TRUNC" not in plain.upper()
+    assert _statements(fake) == []
 
 
 def test_grain_superset_did_not_apply_is_not_checked_under_a_row_limit_too(fake):
@@ -694,19 +716,29 @@ def test_mixed_chart_reads_its_second_series_as_the_renderer_does(changes, check
     ({"showValuesAs": "percent_total"}, False, "share"),
     ({"showValuesAs": "actual"}, True, ""),
     ({}, True, ""),
-    ({"rowTotals": True}, False, "totals"),
-    ({"colSubTotals": True}, False, "totals"),
+    ({"rowTotals": True, "metrics": [copy.deepcopy(RATIO)]}, False, "totals"),
+    ({"colSubTotals": True, "metrics": [copy.deepcopy(AVERAGE)]}, False, "totals"),
+    ({"rowTotals": True, "colTotals": True, "metrics": [copy.deepcopy(DISTINCT)]}, False, "totals"),
+    ({"rowTotals": True, "colTotals": True, "metrics": [copy.deepcopy(PREMIUM) | {"sqlExpression": "MAX(premium)"}]},
+     False, "totals"),
+    ({"rowTotals": True, "colTotals": True}, True, ""),
+    ({"rowTotals": True, "colSubTotals": True, "metrics": [copy.deepcopy(POLICIES)]}, True, ""),
     ({"rowTotals": True, "colTotals": True, "metrics": [{"expressionType": "SIMPLE", "aggregate": "SUM",
                                                          "column": {"column_name": "premium"}, "label": "P"}]},
      True, ""),
+    ({"rowTotals": True, "metrics": [{"expressionType": "SIMPLE", "aggregate": "MIN",
+                                      "column": {"column_name": "premium"}, "label": "P"}]}, True, ""),
     ({"aggregateFunction": "Count"}, True, ""),
-], ids=["% of row", "% of grand total", "actual values", "no setting", "SQL metric with totals",
-        "SQL metric with subtotals", "additive metrics with totals", "an aggregateFunction rc2 never reads"])
+], ids=["% of row", "% of grand total", "actual values", "no setting", "a ratio with totals", "an AVG with subtotals",
+        "a COUNT(DISTINCT) with totals", "an SQL MAX with totals", "an SQL SUM with totals",
+        "an SQL COUNT(*) with subtotals", "SIMPLE SUM with totals", "SIMPLE MIN with totals",
+        "an aggregateFunction rc2 never reads"])
 def test_pivot_reads_its_values_and_totals_as_the_plugin_does(changes, checkable, said):
     """rc2's pivot shows a cell as a share of a total when `showValuesAs` asks (`plugin-chart-pivot-table`'s control
-    panel), with no post-processing, and with a metric that is not additive asks for its totals in the same query as
-    grouping sets (`buildQuery.ts`, `allMetricsAdditive`), whose total rows carry null keys. It never reads
-    `aggregateFunction`."""
+    panel), with no post-processing. It shows totals and subtotals the cells hold only for an additive metric: a SIMPLE
+    SUM or COUNT (summed) or MIN or MAX (reduced by `additiveReducerFor` in `plugin/utilities.ts`), or an SQL metric
+    whose whole expression is one SUM or one COUNT of a column or of every row, whose grouping-sets totals are the sums
+    of its cells. Any other metric's totals are not. It never reads `aggregateFunction`."""
     pivot = {"viz_type": "pivot_table_v2", "metrics": [copy.deepcopy(PREMIUM)], "groupbyRows": ["region"],
              "groupbyColumns": ["channel"], "adhoc_filters": [], "row_limit": 100} | changes
     found = expectation_from_form_data(pivot, dataset=PHYSICAL)
@@ -804,33 +836,60 @@ def _grouped(viz: str, **changes) -> dict:
             "row_limit": 100} | changes
 
 
+def _sankey(**changes) -> dict:
+    """A sankey's form_data as the extension's `create_chart` saves mnemiq's request: source, target and one metric."""
+    return {"viz_type": "sankey_v2", "source": "region", "target": "channel", "metric": copy.deepcopy(PREMIUM),
+            "adhoc_filters": [], "row_limit": 10000} | changes
+
+
 TWO = ["region", "channel"]
 
 
 @pytest.mark.parametrize("form, said", [
-    (_grouped("treemap_v2", groupby=TWO), "sum"),
+    (_grouped("treemap_v2", groupby=TWO, metric=RATIO), "sum"),
+    (_grouped("treemap_v2", groupby=TWO, metric=DISTINCT), "sum"),
     (_grouped("treemap_v2", groupby=TWO, metric=MIN_PREMIUM), "sum"),
     (_grouped("treemap_v2", groupby=TWO, metric=M_SAVED), "sum"),
+    (_grouped("treemap_v2", groupby=TWO), None),
     (_grouped("treemap_v2", groupby=TWO, metric=SUM_PREMIUM), None),
     (_grouped("treemap_v2", groupby=TWO, metric=COUNT_PREMIUM), None),
     (_grouped("treemap_v2"), None),
     (_grouped("pie", threshold_for_other=5, metric=SUM_PREMIUM), "Other"),
+    (_grouped("pie", threshold_for_other=5), "Other"),
     (_grouped("pie", threshold_for_other=0), None),
-    (_grouped("pie", show_total=True), "sum"),
+    (_grouped("pie", show_total=True, metric=AVERAGE), "sum"),
     (_grouped("pie", show_total=True, metric=MIN_PREMIUM), "sum"),
+    (_grouped("pie", show_total=True), None),
+    (_grouped("pie", show_total=True, metric=POLICIES), None),
     (_grouped("pie", show_total=True, metric=SUM_PREMIUM), None),
     (_grouped("pie", show_total=True, metric=COUNT_PREMIUM), None),
     (_grouped("pie", show_total=False), None),
-], ids=["treemap parents of a SQL metric", "treemap parents of a MIN", "treemap parents of a saved metric",
-        "treemap parents of a SUM", "treemap parents of a COUNT", "a treemap of one level",
-        "a pie's Other slice, even of a SUM", "a pie with no Other slice", "a pie's total of a SQL metric",
-        "a pie's total of a MIN", "a pie's total of a SUM", "a pie's total of a COUNT", "a pie with no total"])
+    (_sankey(metric=copy.deepcopy(AVERAGE)), "sum"),
+    (_sankey(metric=copy.deepcopy(RATIO)), "sum"),
+    (_sankey(metric=copy.deepcopy(DISTINCT)), "sum"),
+    (_sankey(metric=MIN_PREMIUM), "sum"),
+    (_sankey(metric=M_SAVED), "sum"),
+    (_sankey(), None),
+    (_sankey(metric=copy.deepcopy(POLICIES)), None),
+    (_sankey(metric=SUM_PREMIUM), None),
+    (_sankey(metric=COUNT_PREMIUM), None),
+], ids=["treemap parents of a ratio", "treemap parents of a COUNT(DISTINCT)", "treemap parents of a MIN",
+        "treemap parents of a saved metric", "treemap parents of an SQL SUM", "treemap parents of a SUM",
+        "treemap parents of a COUNT", "a treemap of one level", "a pie's Other slice, even of a SUM",
+        "a pie's Other slice of an SQL SUM", "a pie with no Other slice", "a pie's total of an AVG",
+        "a pie's total of a MIN", "a pie's total of an SQL SUM", "a pie's total of an SQL COUNT(*)",
+        "a pie's total of a SUM", "a pie's total of a COUNT", "a pie with no total", "a sankey's nodes of an AVG",
+        "a sankey's nodes of a ratio", "a sankey's nodes of a COUNT(DISTINCT)", "a sankey's nodes of a MIN",
+        "a sankey's nodes of a saved metric", "a sankey's nodes of an SQL SUM", "a sankey's nodes of an SQL COUNT(*)",
+        "a sankey's nodes of a SUM", "a sankey's nodes of a COUNT"])
 def test_a_number_the_renderer_sums_is_checked_only_when_the_sum_is_the_measures_own(form, said):
     """rc2's renderer sums some of what a chart shows from the query's rows, so the data tool's rows never hold it: a
     treemap's parent from its children (`treeBuilder` in `plugin-chart-echarts/src/utils/treeBuilder.ts`), a pie's
-    Other slice from the slices under its threshold and its total from every slice (`Pie/transformProps.ts`). A sum of
-    a SIMPLE SUM or COUNT is that measure over the groups summed; a sum of anything else is not, and the Other slice
-    hides the slices it folds in."""
+    Other slice from the slices under its threshold and its total from every slice (`Pie/transformProps.ts`), a
+    sankey's node from its links (`nodeValues` in `Sankey/transformProps.ts`). A sum of
+    a SUM or a COUNT, SIMPLE or an SQL metric that is one of them whole, is that measure over the groups summed, and so
+    is checked by the groups it sums; a sum of anything else is not, and the Other slice hides the slices it folds
+    in."""
     found = expectation_from_form_data(form, dataset=PHYSICAL)
     if said is None:
         assert isinstance(found, Expectation), found
@@ -839,9 +898,11 @@ def test_a_number_the_renderer_sums_is_checked_only_when_the_sum_is_the_measures
 
 
 def test_a_treemaps_parents_of_a_written_measure_are_not_checked(fake):
-    """Nothing is asked for the chart's data or computed: a parent's number is not in either side's rows."""
-    form = _grouped("treemap_v2", groupby=TWO, number_format=",.2f", currency_format=dict(USD))
-    _serve(fake, form_data=form, chart=_chart_data(["region", "channel", "Total premium"], ("east", "web", 1)),
+    """A written measure that is not a sum: nothing is asked for the chart's data or computed, since a parent's number
+    is not in either side's rows and is not the sum of its children's."""
+    form = _grouped("treemap_v2", groupby=TWO, metric=copy.deepcopy(RATIO), number_format=",.2f",
+                    currency_format=dict(USD))
+    _serve(fake, form_data=form, chart=_chart_data(["region", "channel", "Premium per policy"], ("east", "web", 1)),
            mnemiq=_result(("east", "web", 1), columns=(("region", "object"), ("channel", "object"), ("m0", "int64"))))
     check = _check(fake)
     assert check.status is ChartStatus.NOT_CHECKED and "sum" in check.reason
@@ -950,22 +1011,472 @@ def _waterfall(**changes) -> dict:
 
 
 @pytest.mark.parametrize("form, checkable", [
-    (_waterfall(), False),
-    (_waterfall(show_total=False), False),
-    (_waterfall(groupby=["channel"]), False),
+    (_waterfall(metric=RATIO), False),
+    (_waterfall(metric=RATIO, show_total=False), False),
+    (_waterfall(metric=AVERAGE, groupby=["channel"]), False),
+    (_waterfall(metric=DISTINCT), False),
     (_waterfall(metric=MIN_PREMIUM), False),
     (_waterfall(metric=M_SAVED), False),
+    (_waterfall(), True),
+    (_waterfall(metric=POLICIES, show_total=False), True),
+    (_waterfall(groupby=["channel"]), True),
     (_waterfall(metric=SUM_PREMIUM), True),
     (_waterfall(metric=COUNT_PREMIUM, show_total=False), True),
     (_waterfall(metric=SUM_PREMIUM, groupby=["channel"]), True),
-], ids=["total bar of a SQL metric", "running total of a SQL metric, no total bar", "per-period totals of a SQL metric",
-        "totals of a MIN", "totals of a saved metric", "totals of a SUM", "running total of a COUNT",
-        "per-period totals of a SUM"])
+], ids=["total bar of a ratio", "running total of a ratio, no total bar", "per-period totals of an AVG",
+        "totals of a COUNT(DISTINCT)", "totals of a MIN", "totals of a saved metric", "totals of an SQL SUM",
+        "running total of an SQL COUNT(*)", "per-period totals of an SQL SUM", "totals of a SUM",
+        "running total of a COUNT", "per-period totals of a SUM"])
 def test_a_waterfalls_totals_are_checked_only_when_the_sum_is_the_measures_own(form, checkable):
     """rc2's waterfall sums what it shows beyond each step (`Waterfall/transformProps.ts`): `transformer` adds a total
     bar per period and one at the end when `showTotal`, and every bar's tooltip shows `totalSum`, the running sum of
-    the steps so far, whether or not a total bar shows. A sum of a SIMPLE SUM or COUNT is that measure's own."""
+    the steps so far, whether or not a total bar shows. A sum of a SUM or a COUNT, SIMPLE or an SQL metric that is one
+    of them whole, is that measure's own."""
     found = expectation_from_form_data(form, dataset=PHYSICAL)
     assert isinstance(found, Expectation) is checkable, found
     if not checkable:
         assert "sum" in found.reason
+
+
+# --- a measure that is a sum, read from its expression ----------------------------------------------------------------
+
+ADDITIVE = ["SUM(premium)", "sum(premium)", 'SUM("premium" * 2)', "SUM(CASE WHEN channel = 'web' THEN premium END)",
+            "COUNT(*)", "COUNT(id)", 'COUNT("policy"."id")']
+NOT_ADDITIVE = ["COUNT(DISTINCT channel)", "SUM(DISTINCT premium)", "SUM(premium) / COUNT(*)", "SUM(premium) / SUM(id)",
+                "AVG(premium)", "MIN(premium)", "MAX(premium)", "SUM(premium) FILTER (WHERE premium > 0)",
+                "SUM(premium) OVER ()", "(SUM(premium))", "COALESCE(SUM(premium), 0)", "SUM(premium)::numeric",
+                "COUNT(id) + 0", "COUNT(1)", "COUNT(id, region)", "SUM(premium); SELECT 1", "SUM(",
+                "SUM(premium) * {{ rate }}", "SUM({{ col }})", "SUM({{col}})", "SUM(premium * {{ rate }})",
+                "SUM(premium {# note #})", "SUM(premium) {# note #}"]
+
+
+@pytest.mark.parametrize("expression, additive", [(e, True) for e in ADDITIVE] + [(e, False) for e in NOT_ADDITIVE],
+                         ids=ADDITIVE + NOT_ADDITIVE)
+def test_an_sql_metric_is_a_sum_only_when_its_whole_expression_is_one(expression, additive):
+    """mnemiq writes every measure as an SQL metric, so whether the totals a chart shows are the sums of the groups it
+    checks is read from the metric's expression, parsed as Postgres: one top-level SUM, or one COUNT of a column or of
+    every row, with nothing around it. A distinct count or sum, a ratio, an average, a minimum or a maximum, a filtered
+    or windowed aggregate, anything wrapped around the aggregate, SQL that does not parse, and SQL holding a template
+    marker (`{{`, `{%`, `{#`, which Superset renders before running it and sqlglot reads as something else) are not. The
+    same reading decides a waterfall's running totals, a pivot table's totals and a sankey's nodes."""
+    metric = PREMIUM | {"sqlExpression": expression}
+    waterfall = expectation_from_form_data(_waterfall(metric=metric), dataset=PHYSICAL)
+    pivot = expectation_from_form_data({"viz_type": "pivot_table_v2", "metrics": [metric], "groupbyRows": ["region"],
+                                        "groupbyColumns": ["channel"], "rowTotals": True, "colTotals": True,
+                                        "adhoc_filters": [], "row_limit": 10000}, dataset=PHYSICAL)
+    sankey = expectation_from_form_data(_sankey(metric=metric), dataset=PHYSICAL)
+    assert isinstance(waterfall, Expectation) is additive, waterfall
+    assert isinstance(pivot, Expectation) is additive, pivot
+    assert isinstance(sankey, Expectation) is additive, sankey
+    if not additive:
+        assert "sum" in waterfall.reason and "totals" in pivot.reason and "sankey" in sankey.reason
+
+
+# --- the saved query context mnemiq's extension writes ----------------------------------------------------------------
+#
+# What `get_chart_data` answers for a chart that carries the query context mnemiq's extension saves (`query_context` in
+# the extension's `params.py`): rc2 runs a saved query context as saved (`superset/mcp_service/chart/tool/
+# get_chart_data.py`), and these rows are the query's own, before any reshaping: one per group, keyed by the x-axis's
+# name with its grain applied, the grouping columns, and the metric labels.
+
+JAN, FEB = "2026-01-01T00:00:00", "2026-02-01T00:00:00"
+BY_MONTH = ((JAN, "web", 30), (JAN, "store", 5), (FEB, "web", 12))
+MONTH_AND_CHANNEL = (("order_date", "datetime64[ns]"), ("channel", "object"), ("m0", "int64"))
+BY_REGION = (("east", "web", 1200), ("west", "store", 800))
+REGION_AND_CHANNEL = (("region", "object"), ("channel", "object"), ("m0", "int64"))
+BY_CHANNEL = (("web", 1200), ("store", 800))
+CHANNEL = (("channel", "object"), ("m0", "int64"))
+
+
+def _over_time(viz: str, **changes) -> dict:
+    """A chart over `order_date` by month and grouped by channel, as MCP's `map_xy_config` saves mnemiq's spec."""
+    return _line(viz_type=viz, groupby=["channel"], adhoc_filters=[copy.deepcopy(NO_TIME_FILTER)]) | changes
+
+
+def _pivot_table(**changes) -> dict:
+    """A pivot as MCP's `map_pivot_table_config` saves mnemiq's spec, its totals on as `PivotTableChartConfig`
+    defaults them."""
+    return {"viz_type": "pivot_table_v2", "metrics": [copy.deepcopy(PREMIUM)], "groupbyRows": ["region"],
+            "groupbyColumns": ["channel"], "rowTotals": True, "colTotals": True, "aggregateFunction": "Sum",
+            "adhoc_filters": [], "row_limit": 10000, "valueFormat": ",.2f", "currency_format": dict(USD)} | changes
+
+
+SANKEY = {"viz_type": "sankey_v2", "source": "region", "target": "channel", "metric": copy.deepcopy(PREMIUM),
+          "adhoc_filters": [], "row_limit": 10000}
+OVER_TIME = ["order_date", "channel", "Total premium"]
+# Each family the builder makes, measured by an SQL SUM as mnemiq writes one: its form_data, the columns its saved query
+# context answers, those rows, and the columns of mnemiq's own statement answering the same rows.
+FAMILIES = {
+    "line": (_over_time("echarts_timeseries_line"), OVER_TIME, BY_MONTH, MONTH_AND_CHANNEL),
+    "bar": (_over_time("echarts_timeseries_bar"), OVER_TIME, BY_MONTH, MONTH_AND_CHANNEL),
+    "area": (_over_time("echarts_area"), OVER_TIME, BY_MONTH, MONTH_AND_CHANNEL),
+    "scatter": (_over_time("echarts_timeseries_scatter"), OVER_TIME, BY_MONTH, MONTH_AND_CHANNEL),
+    "aggregate table": (_table(groupby=["channel"], adhoc_filters=[]), ["channel", "Total premium"], BY_CHANNEL,
+                        CHANNEL),
+    "pie": (_grouped("pie", groupby=["channel"]), ["channel", "Total premium"], BY_CHANNEL, CHANNEL),
+    "big number": ({"viz_type": "big_number_total", "metric": copy.deepcopy(PREMIUM), "adhoc_filters": []},
+                   ["Total premium"], ((2000,),), (("m0", "int64"),)),
+    "gauge": (_grouped("gauge_chart", groupby=["channel"]), ["channel", "Total premium"], BY_CHANNEL, CHANNEL),
+    "pivot with its totals": (_pivot_table(), ["region", "channel", "Total premium"], BY_REGION, REGION_AND_CHANNEL),
+    "treemap with its parents": (_grouped("treemap_v2", groupby=TWO), ["region", "channel", "Total premium"],
+                                 BY_REGION, REGION_AND_CHANNEL),
+    "waterfall with its totals": (_waterfall(x_axis="order_date", time_grain_sqla="P1M", groupby=["channel"]),
+                                  OVER_TIME, BY_MONTH, MONTH_AND_CHANNEL),
+    "funnel": (_grouped("funnel", groupby=["channel"]), ["channel", "Total premium"], BY_CHANNEL, CHANNEL),
+    "sankey": (SANKEY, ["region", "channel", "Total premium"], BY_REGION, REGION_AND_CHANNEL),
+}
+
+
+@pytest.mark.parametrize("family", list(FAMILIES))
+def test_a_saved_query_contexts_rows_that_match_are_checked(fake, family):
+    """A chart of each family the builder makes, carrying mnemiq's saved query context: its rows carry every grouping
+    column and the grain, and match mnemiq's own, so it is checked. The pivot's totals, the treemap's parents and the
+    waterfall's totals are sums of an SQL SUM, so they are checked by the groups they sum."""
+    form, columns, rows, mine = FAMILIES[family]
+    _serve(fake, form_data=form, chart=_chart_data(columns, *rows), mnemiq=_result(*rows, columns=mine))
+    check = _check(fake, kinds={})
+    assert check.status is ChartStatus.CHECKED, check.reason
+    assert check.chart_values == check.mnemiq_values == rows
+
+
+@pytest.mark.parametrize("family", list(FAMILIES))
+def test_a_saved_query_context_with_a_group_off_is_a_mismatch(fake, family):
+    form, columns, rows, mine = FAMILIES[family]
+    off = ((*rows[0][:-1], rows[0][-1] + 1), *rows[1:])
+    _serve(fake, form_data=form, chart=_chart_data(columns, *off), mnemiq=_result(*rows, columns=mine))
+    check = _check(fake, kinds={})
+    assert check.status is ChartStatus.MISMATCH, check.reason
+    assert (check.chart_values, check.mnemiq_values) == (off, rows)
+
+
+def _two_queries(first_columns: list, first: tuple, second_columns: list, second: tuple) -> dict:
+    """`get_chart_data`'s answer for a chart of two queries: `query_results`, one per query (`_build_query_results`
+    in `superset/mcp_service/chart/tool/get_chart_data.py`), beside the first one's rows."""
+    results = [{"query_index": i, "columns": list(columns), "data": [dict(zip(columns, row)) for row in rows],
+                "row_count": len(rows), "total_rows": len(rows)}
+               for i, (columns, rows) in enumerate(((first_columns, first), (second_columns, second)))]
+    return _chart_data(first_columns, *first, query_results=results)
+
+
+MIXED = _mixed(groupby=["channel"], groupby_b=["channel"], adhoc_filters=[copy.deepcopy(NO_TIME_FILTER)])
+MIXED_FIRST = ((JAN, "web", 30), (FEB, "web", 12))
+MIXED_SECOND = ((JAN, "web", 4), (FEB, "web", 2))
+MIXED_MINE = _result(*((t, c, a, b) for (t, c, a), (_, _, b) in zip(MIXED_FIRST, MIXED_SECOND)),
+                     columns=(("order_date", "datetime64[ns]"), ("channel", "object"), ("m0", "int64"),
+                              ("m1", "int64")))
+
+
+@pytest.mark.parametrize("second, status", [(MIXED_SECOND, ChartStatus.CHECKED),
+                                            (((JAN, "web", 5), (FEB, "web", 2)), ChartStatus.MISMATCH)],
+                         ids=["both queries match", "the second query's group off"])
+def test_a_mixed_charts_saved_query_context_is_checked_query_by_query(fake, second, status):
+    """The mixed chart's saved query context holds one query per axis, each grouped by the x-axis and its own grouping
+    columns; each one's numbers are compared."""
+    _serve(fake, form_data=MIXED, chart=_two_queries(OVER_TIME, MIXED_FIRST, ["order_date", "channel", "Orders"],
+                                                     second), mnemiq=MIXED_MINE)
+    check = _check(fake, kinds={})
+    assert check.status is status, check.reason
+
+
+# rc2's frontend `buildQuery` for a time series pivots its rows by the grouping columns and flattens them
+# (`pivotOperator`, `renameOperator` and `flattenOperator` in `superset-ui-chart-controls/src/operators/`): a row per
+# x-axis value and a column per group, the grouping column gone. A chart saved from Explore carries that query context.
+PIVOTED = _chart_data(["order_date", "web", "store"], (JAN, 30.0, 5.0), (FEB, 12.0, None))
+PIVOTED_MIXED = _two_queries(["order_date", "web"], ((JAN, 30.0), (FEB, 12.0)), ["order_date", "web"],
+                             ((JAN, 4.0), (FEB, 2.0)))
+# A pivot saved from Explore with a metric rc2 does not count additive asks for its totals in its query as grouping sets
+# (`plugin-chart-pivot-table/src/plugin/buildQuery.ts`), and rc2 marks each row's level with a `GROUPING()` column per
+# grouping column (`grouping_marker_label` in `superset/common/grouping_sets.py`): the cells, then the totals with the
+# rolled-up columns null.
+GROUPING_SETS = _chart_data(["region", "channel", "Total premium", "region__superset_grouping",
+                             "channel__superset_grouping"],
+                            ("east", "web", 1200, 0, 0), ("west", "store", 800, 0, 0), ("east", None, 1200, 0, 1),
+                            ("west", None, 800, 0, 1), (None, "web", 1200, 1, 0), (None, "store", 800, 1, 0),
+                            (None, None, 2000, 1, 1))
+# What rc2's data tool rebuilds from `form_data` for a chart with no saved query context:
+# `build_query_dicts_from_form_data` (`superset/mcp_service/chart/chart_helpers.py`) reads no pivot rows or columns, no
+# waterfall x-axis, and no sankey source or target.
+ONE_TOTAL = _chart_data(["Total premium"], (2000,))
+RESHAPED = {
+    "line saved from Explore": (_over_time("echarts_timeseries_line"), PIVOTED, "columns"),
+    "bar saved from Explore": (_over_time("echarts_timeseries_bar"), PIVOTED, "columns"),
+    "area saved from Explore": (_over_time("echarts_area"), PIVOTED, "columns"),
+    "scatter saved from Explore": (_over_time("echarts_timeseries_scatter"), PIVOTED, "columns"),
+    "mixed saved from Explore": (MIXED, PIVOTED_MIXED, "columns"),
+    "pivot saved from Explore, its totals as grouping sets": (_pivot_table(), GROUPING_SETS, "grouping sets"),
+    "pivot rebuilt without a saved query context": (_pivot_table(), ONE_TOTAL, "columns"),
+    "waterfall rebuilt without a saved query context": (
+        _waterfall(x_axis="order_date", time_grain_sqla="P1M", groupby=["channel"]),
+        _chart_data(["channel", "Total premium"], ("web", 42), ("store", 5)), "columns"),
+    "sankey rebuilt without a saved query context": (SANKEY, ONE_TOTAL, "columns"),
+}
+
+
+@pytest.mark.parametrize("case", list(RESHAPED))
+def test_an_answer_that_is_not_the_saved_querys_long_rows_is_not_checked(fake, case):
+    """Rows that do not carry every grouping column, or that hold totals beside the cells, are not the chart's groups:
+    nothing is compared, mnemiq sends no statement, and the reason says what Superset's rows lack."""
+    form, answer, said = RESHAPED[case]
+    _serve(fake, form_data=form, chart=answer, mnemiq=_result(*BY_REGION, columns=REGION_AND_CHANNEL))
+    check = _check(fake, kinds={})
+    assert check.status is ChartStatus.NOT_CHECKED, check.reason
+    assert "Superset's rows" in check.reason and said in check.reason, check.reason
+    assert "get_chart_data" in _tools(fake) and _statements(fake) == []
+
+
+def test_a_pie_saved_from_explore_is_still_read_by_its_long_rows(fake):
+    """rc2's pie `buildQuery` adds each slice's share as a column of its own (the `contribution` operator,
+    `Pie/buildQuery.ts`, named by `getContributionLabel`); its rows are still one per slice with the slice's value,
+    which is what the pie shows, so it is checked."""
+    answer = _chart_data(["channel", "Total premium", "Total premium__contribution"],
+                         *((channel, value, value / 2000) for channel, value in BY_CHANNEL))
+    _serve(fake, form_data=_grouped("pie", groupby=["channel"]), chart=answer,
+           mnemiq=_result(*BY_CHANNEL, columns=CHANNEL))
+    check = _check(fake, kinds={})
+    assert check.status is ChartStatus.CHECKED, check.reason
+
+
+BY_CHANNEL_ROWS = (["channel", "Total premium"], BY_CHANNEL, CHANNEL)
+EXCLUDED = {
+    "a pie's Other slice": (_grouped("pie", groupby=["channel"], threshold_for_other=5), BY_CHANNEL_ROWS, "Other"),
+    "a pie's total of an AVG": (_grouped("pie", groupby=["channel"], metric=copy.deepcopy(AVERAGE), show_total=True),
+                                (["channel", "Average premium"], BY_CHANNEL, CHANNEL), "sum"),
+    "a treemap's parents of a ratio": (_grouped("treemap_v2", groupby=TWO, metric=copy.deepcopy(RATIO)),
+                                       (["region", "channel", "Premium per policy"], BY_REGION, REGION_AND_CHANNEL),
+                                       "sum"),
+    "a waterfall of a ratio": (_waterfall(x_axis="order_date", time_grain_sqla="P1M", groupby=["channel"],
+                                          metric=copy.deepcopy(RATIO)),
+                               (["order_date", "channel", "Premium per policy"], BY_MONTH, MONTH_AND_CHANNEL), "sum"),
+    "a waterfall of a COUNT(DISTINCT)": (_waterfall(x_axis="order_date", time_grain_sqla="P1M", groupby=["channel"],
+                                                    metric=copy.deepcopy(DISTINCT)),
+                                         (["order_date", "channel", "Channels"], BY_MONTH, MONTH_AND_CHANNEL), "sum"),
+    "a waterfall of an AVG": (_waterfall(x_axis="order_date", time_grain_sqla="P1M", groupby=["channel"],
+                                         metric=copy.deepcopy(AVERAGE)),
+                              (["order_date", "channel", "Average premium"], BY_MONTH, MONTH_AND_CHANNEL), "sum"),
+    "a pivot's totals of a ratio": (_pivot_table(metrics=[copy.deepcopy(RATIO)]),
+                                    (["region", "channel", "Premium per policy"], BY_REGION, REGION_AND_CHANNEL),
+                                    "totals"),
+    "a pivot's totals of an AVG": (_pivot_table(metrics=[copy.deepcopy(AVERAGE)]),
+                                   (["region", "channel", "Average premium"], BY_REGION, REGION_AND_CHANNEL), "totals"),
+    "a pivot's totals of a COUNT(DISTINCT)": (_pivot_table(metrics=[copy.deepcopy(DISTINCT)]),
+                                              (["region", "channel", "Channels"], BY_REGION, REGION_AND_CHANNEL),
+                                              "totals"),
+    "a sankey's nodes of an AVG": (_sankey(metric=copy.deepcopy(AVERAGE)),
+                                   (["region", "channel", "Average premium"], BY_REGION, REGION_AND_CHANNEL), "sum"),
+    "a sankey's nodes of a ratio": (_sankey(metric=copy.deepcopy(RATIO)),
+                                    (["region", "channel", "Premium per policy"], BY_REGION, REGION_AND_CHANNEL),
+                                    "sum"),
+    "a line's tooltip total of two metrics": (
+        _line(metrics=[copy.deepcopy(PREMIUM), copy.deepcopy(POLICIES)], showTooltipTotal=True,
+              adhoc_filters=[copy.deepcopy(NO_TIME_FILTER)]),
+        (["order_date", "Total premium", "Policies"], ((JAN, 30, 3), (FEB, 12, 1)),
+         (("order_date", "datetime64[ns]"), ("m0", "int64"), ("m1", "int64"))), "total"),
+    "a stack's total labels of an AVG": (
+        _over_time("echarts_timeseries_bar", metrics=[copy.deepcopy(AVERAGE)], stack="Stack", only_total=True,
+                   show_value=True),
+        (["order_date", "channel", "Average premium"], BY_MONTH, MONTH_AND_CHANNEL), "total"),
+    "a pivot's cells as shares": (_pivot_table(showValuesAs="percent_row"),
+                                  (["region", "channel", "Total premium"], BY_REGION, REGION_AND_CHANNEL), "share"),
+    "a table's totals row": (_table(groupby=["channel"], adhoc_filters=[], show_totals=True), BY_CHANNEL_ROWS, "total"),
+    "a rolling window": (_over_time("echarts_timeseries_line", rolling_type="cumsum"),
+                         (OVER_TIME, BY_MONTH, MONTH_AND_CHANNEL), "rolling"),
+    "a contribution": (_over_time("echarts_timeseries_bar", contributionMode="row"),
+                       (OVER_TIME, BY_MONTH, MONTH_AND_CHANNEL), "contribution"),
+    "a rebased line": (_over_time("echarts_timeseries_line", rebase_percent_change=True),
+                       (OVER_TIME, BY_MONTH, MONTH_AND_CHANNEL), "percent change"),
+    "series stacked to 100%": (_over_time("echarts_area", stack="Expand"), (OVER_TIME, BY_MONTH, MONTH_AND_CHANNEL),
+                               "100%"),
+}
+
+
+@pytest.mark.parametrize("case", list(EXCLUDED))
+def test_a_saved_query_context_does_not_lift_what_the_renderer_computes(fake, case):
+    """A number rc2's renderer computes after the query, or sums from the rows of a measure that is not a sum, is in no
+    query's rows, the saved query context's included. Here the data tool would answer the long rows, and mnemiq's own
+    statement the same ones; the chart is still not checked, and nothing is asked for its data."""
+    form, (columns, rows, mine), said = EXCLUDED[case]
+    _serve(fake, form_data=form, chart=_chart_data(columns, *rows), mnemiq=_result(*rows, columns=mine))
+    check = _check(fake, kinds={})
+    assert check.status is ChartStatus.NOT_CHECKED and said in check.reason, check.reason
+    assert "get_chart_data" not in _tools(fake) and _statements(fake) == []
+
+
+# --- on the grain -----------------------------------------------------------------------------------------------------
+
+# Each grain mnemiq reproduces, with a time where Postgres's `DATE_TRUNC` for it puts one (`_time_grain_expressions` in
+# `superset/db_engine_specs/postgres.py`) and a time it never does. 2026-02-02 is a Monday.
+GRAIN_TIMES = [
+    ("PT1S", "2026-02-03T05:30:15", "2026-02-03T05:30:15.500000"),
+    ("PT1M", "2026-02-03T05:30:00", "2026-02-03T05:30:15"),
+    ("PT1H", "2026-02-03T05:00:00", "2026-02-03T05:30:00"),
+    ("P1D", "2026-02-03T00:00:00", "2026-02-03T05:00:00"),
+    ("P1W", "2026-02-02T00:00:00", "2026-02-03T00:00:00"),
+    ("P1M", "2026-02-01T00:00:00", "2026-02-02T00:00:00"),
+    ("P3M", "2026-04-01T00:00:00", "2026-05-01T00:00:00"),
+    ("P1Y", "2026-01-01T00:00:00", "2026-02-01T00:00:00"),
+]
+GRAIN_CASES = ([(grain, on, on, True) for grain, on, _ in GRAIN_TIMES]
+               + [(grain, off, on, False) for grain, on, off in GRAIN_TIMES]
+               + [("P1M", "2026-02-01T00:00:00-08:00", "2026-02-01T00:00:00-08:00", True),
+                  ("P1M", "2026-02-01", "2026-02-01", True),
+                  ("P1M", None, None, True),
+                  ("P1M", "east", "2026-02-01T00:00:00", False),
+                  ("P1M", "2026-02-01T00:00:00.000001", "2026-02-01T00:00:00", False)])
+
+
+@pytest.mark.parametrize("grain, shown, grained, on", GRAIN_CASES,
+                         ids=[f"{grain} {'on' if on else 'off'} {shown}" for grain, shown, _, on in GRAIN_CASES])
+def test_the_charts_times_must_sit_on_its_grain_before_they_are_compared(fake, grain, shown, grained, on):
+    """A chart with a time grain has its rows read as grouped by that grain only on evidence in the rows themselves:
+    every x-axis value, read as spelled (its wall clock, whatever offset it carries), is where Postgres's `DATE_TRUNC`
+    puts one for that grain, or is null. Rows off the grain are what rc2's data tool rebuilds for a chart without a
+    saved query context: the numbers the chart shows by its grain are not among them, so the chart is not checked and
+    mnemiq sends no statement, rather than reporting a mismatch. mnemiq's own grained statement answers `grained`."""
+    _serve(fake, form_data=_line(time_grain_sqla=grain, adhoc_filters=[copy.deepcopy(NO_TIME_FILTER)]),
+           chart=_chart_data(["order_date", "Total premium"], (shown, 7)),
+           mnemiq=lambda sql: _result(*([(grained, 7)] if "DATE_TRUNC" in sql.upper() else []), columns=TIME))
+    check = _check(fake)
+    if on:
+        assert check.status is ChartStatus.CHECKED, check.reason
+    else:
+        assert check.status is ChartStatus.NOT_CHECKED, check.reason
+        assert "without its time grain" in check.reason and _statements(fake) == []
+
+
+def test_rows_on_the_grain_it_was_not_applied_to_are_found_by_the_plain_read(fake):
+    """Under a row limit, rows rc2 rebuilt without the grain can all sit on it (two first-of-month days), their values
+    the days' and not the months'. mnemiq's statement without the grain finds every one of them with its value, so the
+    grain is blamed on that evidence and the chart is not checked, rather than a mismatch."""
+    days = ((JAN, 10), ("2026-01-20T00:00:00", 20), (FEB, 12))
+    _serve(fake, form_data=_line(row_limit=2), chart=_chart_data(["order_date", "Total premium"], days[0], days[2]),
+           mnemiq=lambda sql: _result(*(MONTHS if "DATE_TRUNC" in sql.upper() else days), columns=TIME))
+    check = _check(fake)
+    assert check.status is ChartStatus.NOT_CHECKED and "time grain" in check.reason, check.reason
+    grained, plain = _statements(fake)
+    assert "DATE_TRUNC" in grained.upper() and "DATE_TRUNC" not in plain.upper()
+
+
+# --- a total across the series, summed by the renderer ----------------------------------------------------------------
+
+TWO_METRICS = [copy.deepcopy(PREMIUM), copy.deepcopy(POLICIES)]
+STACK_TOTALS = {"stack": "Stack", "only_total": True, "show_value": True}
+SERIES_TOTALS = [
+    ("an Explore-saved two-metric line with the tooltip total",
+     _line(metrics=TWO_METRICS, showTooltipTotal=True), "total"),
+    ("a two-metric line with the tooltip's percentages", _line(metrics=TWO_METRICS, showTooltipPercentage=True),
+     "total"),
+    ("two SUMs with the tooltip total", _line(metrics=[copy.deepcopy(PREMIUM), copy.deepcopy(SUM_PREMIUM)],
+                                              showTooltipTotal=True), "total"),
+    ("a line of an AVG grouped, with the tooltip total",
+     _over_time("echarts_timeseries_line", metrics=[copy.deepcopy(AVERAGE)], showTooltipTotal=True), "total"),
+    ("a bar of a ratio grouped, with the tooltip total",
+     _over_time("echarts_timeseries_bar", metrics=[copy.deepcopy(RATIO)], showTooltipTotal=True), "total"),
+    ("a smooth line of an AVG grouped, with the tooltip total",
+     _over_time("echarts_timeseries_smooth", metrics=[copy.deepcopy(AVERAGE)], showTooltipTotal=True), "total"),
+    ("a stacked bar of an AVG grouped, labelled with its totals",
+     _over_time("echarts_timeseries_bar", metrics=[copy.deepcopy(AVERAGE)], **STACK_TOTALS), "total"),
+    ("a stacked area of two metrics, labelled with its totals (camel-cased keys)",
+     _line(viz_type="echarts_area", metrics=TWO_METRICS, stack="Stack", onlyTotal=True, showValue=True), "total"),
+    ("a mixed chart's first side of an AVG, stacked and labelled with its totals",
+     MIXED | {"metrics": [copy.deepcopy(AVERAGE)], **STACK_TOTALS}, "total"),
+    ("a mixed chart's second side of an AVG, stacked and labelled with its totals",
+     MIXED | {"metrics_b": [copy.deepcopy(AVERAGE) | {"label": "Orders"}], "stackB": "Stack", "only_totalB": True,
+              "show_valueB": True}, "total"),
+    ("one SQL SUM grouped, with the tooltip total", _over_time("echarts_timeseries_line", showTooltipTotal=True), None),
+    ("one SQL COUNT(*) grouped, with the tooltip's percentages",
+     _over_time("echarts_timeseries_bar", metrics=[copy.deepcopy(POLICIES)], showTooltipPercentage=True), None),
+    ("two metrics, the tooltip total off", _line(metrics=TWO_METRICS, showTooltipTotal=False), None),
+    ("two metrics with no tooltip total saved, as MCP saves a chart", _line(metrics=TWO_METRICS), None),
+    ("two metrics with the tooltip total but the rich tooltip off",
+     _line(metrics=TWO_METRICS, showTooltipTotal=True, rich_tooltip=False), None),
+    ("one AVG ungrouped, one series, with the tooltip total",
+     _line(metrics=[copy.deepcopy(AVERAGE)], showTooltipTotal=True), None),
+    ("a stacked AVG grouped with no labels", _over_time("echarts_timeseries_bar", metrics=[copy.deepcopy(AVERAGE)],
+                                                        stack="Stack", only_total=True, show_value=False), None),
+    ("a stacked AVG grouped, each segment labelled",
+     _over_time("echarts_timeseries_bar", metrics=[copy.deepcopy(AVERAGE)], stack="Stack", show_value=True), None),
+    ("a mixed chart of a SUM and a COUNT(*), each side stacked and labelled with its totals",
+     MIXED | {**STACK_TOTALS, "stackB": "Stack", "only_totalB": True, "show_valueB": True}, None),
+    ("a mixed chart of an AVG with showTooltipTotal, which its renderer never reads",
+     MIXED | {"metrics": [copy.deepcopy(AVERAGE)], "showTooltipTotal": True}, None),
+]
+
+
+@pytest.mark.parametrize("form, said", [(form, said) for _, form, said in SERIES_TOTALS],
+                         ids=[name for name, _, _ in SERIES_TOTALS])
+def test_a_total_across_the_series_is_checked_only_for_one_measure_that_is_a_sum(form, said):
+    """rc2's time-series renderer sums across a chart's series and shows it. Its rich tooltip adds a "Total" row, and
+    shares of it, for a chart of several series (`allowTotal = Boolean(isMultiSeries) && richTooltip && !isForecast`,
+    `isMultiSeries = groupBy.length || metrics?.length > 1`, then `showTooltipTotal` and `showTooltipPercentage` in
+    `Timeseries/transformProps.ts`). A stacked chart labelled with `onlyTotal` shows each stack's total
+    (`totalStackedValues` in `Timeseries/transformers.ts`), as each side of a mixed chart does with its own keys.
+    That total is a measure's own number only when the series are the groups of one SUM or COUNT; two measures added
+    together never are. The Explore control defaults `showTooltipTotal` to true; a chart MCP saves carries no such key,
+    and the renderer's own defaults (`DEFAULT_FORM_DATA` in `Timeseries/constants.ts`) give none. The mixed chart's
+    tooltip shows no total."""
+    found = expectation_from_form_data(form, dataset=PHYSICAL)
+    if said is None:
+        assert isinstance(found, Expectation), found
+    else:
+        assert isinstance(found, NotCheckable) and said in found.reason, found
+
+
+# --- reading the grain, and grouping sets -----------------------------------------------------------------------------
+
+
+def test_the_grain_reading_covers_the_grains_mnemiq_reproduces_and_fails_closed_on_any_other():
+    """Where each grain puts a time (`_ON_GRAIN`) is known for exactly the grains mnemiq's statement reproduces
+    (`chart_form._GRAINS`). A grain outside them reads every time as off it, so the chart is not checked: it never
+    raises, and never passes."""
+    assert set(chart_check._ON_GRAIN) == set(chart_form._GRAINS)
+    assert chart_check._on_the_grain("2026-02-01T00:00:00", "P1M") is True
+    assert chart_check._on_the_grain("2026-02-01T00:00:00", "P2W") is False
+    assert chart_check._on_the_grain(None, "P2W") is False
+
+
+def test_a_grouping_sets_answer_is_named_as_such(fake):
+    """rc2 marks each row of a grouping-sets query with a `GROUPING()` column per grouping column; such an answer is
+    not lined up, and the reason says it came from grouping sets without claiming it holds totals, which a grouping
+    set of one level does not."""
+    one_level = _chart_data(["region", "channel", "Total premium", "region__superset_grouping",
+                             "channel__superset_grouping"], ("east", "web", 1200, 0, 0), ("west", "store", 800, 0, 0))
+    _serve(fake, form_data=_pivot_table(), chart=one_level, mnemiq=_result(*BY_REGION, columns=REGION_AND_CHANNEL))
+    check = _check(fake, kinds={})
+    assert check.status is ChartStatus.NOT_CHECKED, check.reason
+    assert "grouping sets" in check.reason and "total" not in check.reason, check.reason
+    assert _statements(fake) == []
+
+
+# --- a hook before each of the check's calls, so a caller can renew a lease or stop
+
+
+def test_before_call_runs_before_each_call_the_check_makes(fake):
+    """`before_call` runs before every Superset call the check makes itself, and once before mnemiq's own decided
+    statement (whose catalogue reads and probe run under it): each run comes before the call it precedes."""
+    _serve(fake, form_data=_bar(), chart=_chart_data(["region", "Total premium"], ("east", 1200), ("west", 800)),
+           mnemiq=_result(("east", 1200), ("west", 800)))
+    seen: list[int] = []
+    check = check_chart(_adapter(fake), chart_id=CHART_ID, dataset_id=DATASET_ID, kinds=TOTAL["kinds"], saved={},
+                        snapshot=SNAPSHOT, grants=GRANTS, guard_fanout=False,
+                        before_call=lambda: seen.append(len(fake.calls)))
+    assert check.status is ChartStatus.CHECKED, check.reason
+    assert seen == [0, 1, 2, 3], seen
+    assert [call.tool for call in fake.calls[:3]] == ["get_chart_info", "get_dataset_info", "get_chart_data"]
+    assert len(fake.calls) > 3 and {call.tool for call in fake.calls[3:]} == {"execute_sql"}
+
+
+def test_a_before_call_that_raises_stops_the_check_before_its_next_call(fake):
+    _serve(fake, form_data=_bar(), chart=_chart_data(["region", "Total premium"], ("east", 1200)),
+           mnemiq=_result(("east", 1200)))
+
+    class Stop(Exception):
+        pass
+
+    def second_stops():
+        if len(fake.calls) == 1:
+            raise Stop()
+
+    with pytest.raises(Stop):
+        check_chart(_adapter(fake), chart_id=CHART_ID, dataset_id=DATASET_ID, kinds=TOTAL["kinds"], saved={},
+                    snapshot=SNAPSHOT, grants=GRANTS, guard_fanout=False, before_call=second_stops)
+    assert [call.tool for call in fake.calls] == ["get_chart_info"]

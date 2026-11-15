@@ -249,6 +249,50 @@ published; its log says why, and `mnemiq refresh` enriches it again.
 without `--http`) name `mnemiq serve --http` instead, and `mnemiq write` says Superset mode is read-only. Anything else
 that would open mnemiq's own connection to the source, `mnemiq eval` among them, refuses too.
 
+## Building
+
+With the mnemiq extension installed in Superset ([`integrations/superset`](../integrations/superset/README.md)), a
+builder can turn a goal into a dashboard. mnemiq plans the charts on named measures, makes them in Superset as that
+builder, lays them out, and checks each chart it can against its own SQL, run as the same builder. A fuller guide is
+still to come. In short:
+
+- **Three routes, mounted only in Superset mode.**
+  - `POST /v1/superset/builds` takes `{goal, dashboard_id?, fresh?, profile?}`. It starts a build. With neither
+    `dashboard_id` nor `fresh`, it may instead answer an offer: a dashboard the builder can see that already covers
+    the goal. An offer builds and keeps nothing.
+    - To reuse the dashboard offered, open it: that needs no build.
+    - To add this goal's charts to it anyway, ask again with its `dashboard_id`. A `dashboard_id` always means that:
+      the goal's planned charts are added to the dashboard it names, beside the ones it has.
+    - For a new dashboard, ask again with `"fresh": true`.
+  - Before anything is planned, mnemiq asks Superset whether the person may build at all; one who may not is
+    refused with a 403 as a non-builder, and nothing about a dashboard they named is read. Then, with a
+    `dashboard_id`, it asks whether they edit that dashboard. One they cannot read, or one that does not exist, is a
+    404 that does not say which. One they can read but not edit is a 403 naming its editors.
+  - A model that does not answer the planning prompt is a 503 saying to try again: an outage, told apart from a goal
+    that cannot be planned by its status. A model server that refuses or cuts the planning prompt as longer than its
+    context window gives a refused plan (a 200): the goal and what the builder can see are too large to plan in one
+    prompt. The planning prompt holds every table, column and saved metric the builder can see, so a large schema
+    needs a large window.
+  - `POST /v1/superset/builds/{id}/next` runs the build's next step.
+  - `GET /v1/superset/builds/{id}` reads the build as it stands.
+- **A token made for building.** Besides `db.read`, the two `POST`s need Superset's `superset:chart:write`,
+  `superset:dashboard:write` and `superset:dataset:write` scopes. The extension's token route puts those in a token
+  asked for with `{"purpose": "build"}`. A token made for asking is refused with a 403.
+- **One step per request.** Each `/next` claims one step, runs it as the builder and records what it made, so a build
+  survives a restart and two requests never run the same step.
+  - If a create times out, Superset may still be finishing it, so mnemiq does not repeat the step until its lease has
+    passed. The lease is ten minutes, longer than mnemiq waits for any one call, and after it mnemiq looks for what
+    the step made before it makes anything again.
+  - That way nothing is made twice, as long as Superset finishes a call's work within those ten minutes. A Superset
+    still working on a call after that could finish it after mnemiq has looked, and the object would then be made
+    twice.
+- **One build of a dashboard at a time.** While a build of a dashboard is building, starting another build of it is
+  refused with a 409. A build left untouched for 20 minutes (twice the lease), with no step running, no longer holds
+  its dashboard: the next build of that dashboard stops it, as abandoned, and takes the dashboard over.
+- **Builds are kept in the control Postgres (`MNEMIQ_CONTROL_DSN`).** It holds plans, measure definitions, Superset
+  ids and statuses, never a value or a row. Without it the build routes answer 503.
+- **Without the extension, the build routes answer 503** with a sentence that names it, before anything is planned.
+
 ## What each refusal returns
 
 A request Superset refuses, or that Superset mode cannot serve, is answered with a status and one sentence saying what
@@ -303,4 +347,6 @@ the builder can do about it, or that nothing they can do is known to help. None 
 - **No asking with access to datasets alone** (see [Roles in Superset](#roles-in-superset)).
 - **A row rule attached only to a virtual dataset** applies through that dataset, not to the tables beneath it (see
   [Row rules](#row-rules)).
-- **No writes, no `deep` mode, no MCP door and no Open WebUI endpoint.**
+- **No writes to the source database.** Asking writes nothing at all. A build writes only Superset's own charts,
+  datasets and dashboards, through the extension, as the builder (see [Building](#building)).
+- **No `deep` mode, no MCP door and no Open WebUI endpoint.**

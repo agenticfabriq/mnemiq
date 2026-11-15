@@ -162,6 +162,30 @@ def test_a_missing_extension_is_told_from_a_failing_one():
         assert [c.tool for c in fake.calls] == [TOOL_PREFIX + "editors_of"]
 
 
+def test_require_extension_asks_once():
+    """Whether Superset offers the extension, settled by one call of the probe: the installed extension answers it with
+    an empty list; a Superset without the extension answers rc2's masked error, which reads as the extension missing;
+    any other failure is raised as it is. Never a second call."""
+    from mnemiq.superset.client import SupersetToolError
+    from mnemiq.superset.extension import require_extension
+
+    with FakeSuperset() as fake:
+        fake.reply(DATASET_METRICS, lambda request, authorization: {"datasets": []})
+        assert require_extension(_client(fake)) is None
+        assert [(c.tool, c.request) for c in fake.calls] == [(DATASET_METRICS, {"dataset_ids": []})]
+    with FakeSuperset(extension=False) as fake:
+        with pytest.raises(ExtensionMissing) as caught:
+            require_extension(_client(fake))
+        assert "Error ID" not in str(caught.value) and "Error ID" in caught.value.detail
+        assert [c.tool for c in fake.calls] == [DATASET_METRICS]
+    with FakeSuperset() as fake:
+        fake.reply(DATASET_METRICS, lambda request, authorization: RuntimeError("boom"))
+        with pytest.raises(SupersetToolError) as caught:
+            require_extension(_client(fake))
+        assert not isinstance(caught.value, ExtensionMissing)
+        assert [c.tool for c in fake.calls] == [DATASET_METRICS]
+
+
 def test_equivalent_saved_metric_is_reused():
     saved = [_saved("total_amount", "SUM(amount)"), _saved("other", "SUM(amount)", dataset_id=2, certified_by="x")]
     assert normalized("sum( amount )") == normalized("SUM(amount)")

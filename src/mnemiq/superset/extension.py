@@ -5,16 +5,18 @@ have the extension installed does not say so: rc2's MCP service masks the not-fo
 `Internal error in <tool>: An unexpected error occurred. Error ID: <id>. ...`
 (`GlobalErrorHandlerMiddleware._handle_error` in `superset/mcp_service/middleware.py`), the same text an unexpected
 exception inside an installed tool produces. Superset's default tool search hides tools from `tools/list`, so the list
-cannot settle it either. `call_tool` settles it by one probe: `dataset_metrics` with no datasets, which the installed
-extension answers with an empty list and never fails on.
+cannot settle it either. `require_extension` settles it by one call of a probe: `dataset_metrics` with no datasets, which
+the installed extension answers with an empty list and never fails on. `call_tool` asks it once a call fails that way.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from mnemiq.superset.client import SupersetToolError
 
 __all__ = ["DATASET_METRICS_BATCH", "EXTENSION_TOOLS", "ExtensionMissing", "TOOL_PREFIX", "call_tool",
-           "dataset_metrics"]
+           "dashboard_editorship", "dataset_metrics", "require_extension"]
 
 TOOL_PREFIX = "extensions.agenticfabriq.mnemiq."
 
@@ -26,7 +28,8 @@ EXTENSION_TOOLS = ("create_dashboard", "claim_chart", "claim_dataset", "create_c
 # (`reads.MAX_DATASETS` in the extension).
 DATASET_METRICS_BATCH = 20
 
-_PROBE = "dataset_metrics"
+# The probe, which the installed extension answers with an empty list and never fails on.
+_PROBE = ("dataset_metrics", {"dataset_ids": []})
 _MASKED = "An unexpected error occurred"
 
 
@@ -46,22 +49,39 @@ def _is_not_offered(tool: str, failure: SupersetToolError) -> bool:
     return message.startswith(f"Internal error in {tool}: {_MASKED}") or "unknown tool" in message.lower()
 
 
-def call_tool(client, base: str, request: dict) -> dict:
+def require_extension(client) -> None:
+    """Return when Superset offers the extension's tools, as the client's caller sees them; raise `ExtensionMissing`
+    when it does not. One call, of the probe. Any other failure is raised as the client raised it."""
+    probe, request = TOOL_PREFIX + _PROBE[0], _PROBE[1]
+    try:
+        client.call(probe, dict(request))
+    except SupersetToolError as failure:
+        if _is_not_offered(probe, failure):
+            raise ExtensionMissing(probe, detail=failure.detail) from None
+        raise
+
+
+def call_tool(client, base: str, request: dict, *, before_call: Callable[[], None] | None = None) -> dict:
     """Call the extension's tool `base` as the client's caller. Raises `ExtensionMissing` when Superset does not offer
-    it; any other failure is raised as the client raised it."""
+    it; any other failure is raised as the client raised it. `before_call` runs before the call, and again before the
+    probe that may follow it (a build renews its lease there)."""
     tool = TOOL_PREFIX + base
+    if before_call is not None:
+        before_call()
     try:
         return client.call(tool, request)
     except SupersetToolError as failure:
         if not _is_not_offered(tool, failure):
             raise
         original = failure
-    probe = TOOL_PREFIX + _PROBE
+    if before_call is not None:
+        before_call()
     try:
-        client.call(probe, {"dataset_ids": []})
-    except SupersetToolError as failure:
-        if _is_not_offered(probe, failure):
-            raise ExtensionMissing(tool, detail=original.detail) from None
+        require_extension(client)
+    except ExtensionMissing:
+        raise ExtensionMissing(tool, detail=original.detail) from None
+    except SupersetToolError:
+        pass  # the probe failed for its own reason: the tool's failure is what is raised
     raise original
 
 
@@ -75,3 +95,16 @@ def dataset_metrics(client, dataset_ids: tuple[int, ...]) -> list[dict]:
         answer = call_tool(client, "dataset_metrics", {"dataset_ids": ids[start:start + DATASET_METRICS_BATCH]})
         found.extend(answer.get("datasets") or [])
     return found
+
+
+def dashboard_editorship(client, dashboard_id: int, *, before_call: Callable[[], None] | None = None) -> dict | None:
+    """Whether the caller edits the dashboard, as the extension's `editors_of` answers it: `{dashboard_id, is_editor,
+    editors}` (the editors as labels, for the person's panel only), `{dashboard_id, is_editor, too_large}` when the
+    labels were too many to send, or None when the caller may not read the dashboard or it does not exist.
+    `before_call` is `call_tool`'s."""
+    answer = call_tool(client, "editors_of", {"dashboard_ids": [dashboard_id]}, before_call=before_call)
+    entries = answer.get("dashboards") if isinstance(answer, dict) else None
+    if not isinstance(entries, list):
+        raise SupersetToolError("the extension's editors_of answered no list of dashboards", detail=str(answer)[:200])
+    return next((entry for entry in entries if isinstance(entry, dict) and entry.get("dashboard_id") == dashboard_id),
+                None)

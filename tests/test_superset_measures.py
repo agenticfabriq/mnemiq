@@ -29,6 +29,7 @@ from mnemiq.sql.verdict import Approved, Refusal
 from mnemiq.superset.history import run_decided, superset_history
 from tests import test_superset_history as history_tests
 from tests.superset_fake import FakeSuperset
+from tests.superset_shared import CHANGED_OR_REFUSED_BY_RC2, KEPT_BY_RC2
 
 EMPTY = {"success": True, "columns": [], "rows": []}
 _PROBE = re.compile(r"AS mnemiq_probe WHERE 1 = 0$")
@@ -121,6 +122,20 @@ def test_expression_with_jinja_is_refused(adapter):
 
 def test_description_with_jinja_is_refused(adapter):
     assert isinstance(_check(adapter, _measure(description="{% if %}")), MeasureRefused)
+
+
+@pytest.mark.parametrize("case", list(CHANGED_OR_REFUSED_BY_RC2))
+def test_a_label_rc2_would_change_or_refuse_is_refused(adapter, case):
+    """rc2 saves an SQL metric's label as other text, or refuses it (`ColumnRef.sanitize_label`), and the chart's
+    format is then keyed by a label Superset does not show: refused, with a reason the model can act on."""
+    refused = _check(adapter, _measure(label=CHANGED_OR_REFUSED_BY_RC2[case]))
+    assert isinstance(refused, MeasureRefused), case
+    assert "label" in refused.reason and refused.repairable
+
+
+@pytest.mark.parametrize("label", KEPT_BY_RC2)
+def test_a_label_rc2_keeps_is_approved(adapter, label):
+    assert isinstance(_check(adapter, _measure(label=label)), Approved)
 
 
 def test_label_colliding_with_a_dimension_is_refused(adapter):

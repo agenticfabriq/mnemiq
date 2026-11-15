@@ -22,7 +22,8 @@ from mnemiq.contract import HistoryTurn, IdentityContext
 from mnemiq.server.openai_compat import mount_openai
 from mnemiq.server.serialize import answer_payload
 from mnemiq.server.sse import chat_stream
-from mnemiq.server.superset_refusals import superset_refusal
+from mnemiq.server.superset_build import mount_superset_build
+from mnemiq.server.v1_refusals import NotPermitted, refused, unknown_profile
 
 logger = logging.getLogger(__name__)
 
@@ -70,17 +71,6 @@ class _Workbench(StaticFiles):
         return response
 
 
-class _NotPermitted(HTTPException):
-    """A 403 on /v1: a caller the door has verified but who is not permitted, by the door (another tenant, no
-    `db.read`) or, in Superset mode, by Superset (`_refused`). Its body carries where Sign out ends at the identity
-    provider, beside the unchanged `detail`, so the workbench can offer a Sign out that switches accounts. Not a leak:
-    the caller is known, and the URL is the provider's public page. A 401 never carries it."""
-
-    def __init__(self, detail: str, headers: dict | None, end_session_url: str | None) -> None:
-        super().__init__(status_code=403, detail=detail, headers=headers)
-        self.end_session_url = end_session_url
-
-
 def caller_dependency(doors, door: str = "v1", *, delegated: bool = False):
     """The FastAPI dependency that turns a request into its verified caller at `door` ("v1" or "openai"), or into
     the door's refusal: 401 with `WWW-Authenticate: Bearer`, 403 for another tenant or a token without the
@@ -106,7 +96,7 @@ def caller_dependency(doors, door: str = "v1", *, delegated: bool = False):
             challenge = exc.challenge or ("Bearer" if exc.status == 401 else None)
             headers = {"WWW-Authenticate": challenge} if challenge else None
             if exc.status == 403 and door == "v1":
-                raise _NotPermitted(exc.reason, headers, doors.end_session_url) from None
+                raise NotPermitted(exc.reason, headers, doors.end_session_url) from None
             raise HTTPException(status_code=exc.status, detail=exc.reason, headers=headers) from None
 
     return caller
@@ -115,26 +105,13 @@ def caller_dependency(doors, door: str = "v1", *, delegated: bool = False):
 @dataclass(frozen=True)
 class _Asker:
     """Who a /v1 request asks as, and what the runtime is handed beside them: in Superset mode the token the door
-    verified, as `delegation`, which every call the request makes to Superset carries; nothing in direct mode."""
+    verified, as `delegation`, which every call the request makes to Superset carries; nothing in direct mode.
+    `scopes` are that token's verified scopes, which the build routes read (`server/superset_build.py`); none in direct
+    mode."""
 
     identity: IdentityContext
     handed: dict
-
-
-def _refused(exc: Exception, doors) -> HTTPException | None:
-    """The response a Superset refusal, or a failure Superset mode answers itself, becomes on /v1, or None for any
-    other exception. A 401 asks for the Bearer again, as the door's own does, and a 403 carries where Sign out ends, as
-    every /v1 403 does."""
-    found = superset_refusal(exc)
-    if found is None:
-        return None
-    log = logger.warning if found.status >= 500 else logger.info
-    log("/v1 answered %d for %s: %s", found.status, type(exc).__name__, found.detail)
-    if found.status == 401:
-        return HTTPException(status_code=401, detail=found.detail, headers={"WWW-Authenticate": "Bearer"})
-    if found.status == 403:
-        return _NotPermitted(found.detail, None, doors.end_session_url if doors is not None else None)
-    return HTTPException(status_code=found.status, detail=found.detail)
+    scopes: frozenset[str] = frozenset()
 
 
 def build_app(
@@ -147,8 +124,11 @@ def build_app(
     the Bearer the door verified, as `delegation`, so Superset answers as the person it names, and each refusal from
     Superset reaches the person as `server/superset_refusals.py` says, never as a 500.
 
-    No route here writes: `Runtime.write` is reached from MCP's `db_write` and the CLI alone. A write route added
-    here would need the `db.write` scope too."""
+    No route here writes to the source database: `Runtime.write` is reached from MCP's `db_write` and the CLI alone,
+    and a route that wrote there would need the `db.write` scope too. In Superset mode the build routes
+    (`server/superset_build.py`) write Superset's own metadata, its dashboards, charts and datasets, never the source
+    database: they need the token's `db.read` and Superset's write scopes (`superset:chart:write
+    superset:dashboard:write superset:dataset:write`), and no mnemiq scope of their own."""
     lifespan = None
     if mcp_app is not None:
         @asynccontextmanager
@@ -159,8 +139,8 @@ def build_app(
 
     app = FastAPI(title="mnemiq", version="v1", lifespan=lifespan)
 
-    @app.exception_handler(_NotPermitted)
-    async def not_permitted(request: Request, exc: _NotPermitted) -> JSONResponse:
+    @app.exception_handler(NotPermitted)
+    async def not_permitted(request: Request, exc: NotPermitted) -> JSONResponse:
         return JSONResponse({"detail": exc.detail, "end_session_url": exc.end_session_url},
                             status_code=exc.status_code, headers=exc.headers)
 
@@ -182,7 +162,7 @@ def build_app(
         verified = caller_dependency(doors, "v1", delegated=True)
 
         def asker(found=Depends(verified)) -> _Asker:
-            return _Asker(found.identity, {"delegation": found.token})
+            return _Asker(found.identity, {"delegation": found.token}, found.scopes)
 
     @app.get("/healthz")
     def healthz() -> dict:
@@ -206,7 +186,7 @@ def build_app(
             )
         except UnknownProfile as exc:
             # Composed from what this caller may pick. Unknown and forbidden read alike, and neither repeats the name.
-            raise HTTPException(status_code=422, detail=f"unknown profile; you may pick: {exc.offered}") from exc
+            raise unknown_profile(exc) from exc
         except UnknownMode as exc:
             # Built from the modes this runtime offers, not from `str(exc)`. The text this
             # particular exception carries happens to be safe -- the caller's own override and a
@@ -219,9 +199,9 @@ def build_app(
                 detail=f"unknown mode; this deployment offers: {offered_modes(getattr(runtime, 'router', None))}",
             ) from exc
         except Exception as exc:
-            if (refused := _refused(exc, doors)) is None:
+            if (answer := refused(exc, doors)) is None:
                 raise
-            raise refused from None
+            raise answer from None
 
     @app.post("/v1/chat")
     def chat(body: AskBody, asking: _Asker = Depends(asker)) -> StreamingResponse:
@@ -240,9 +220,9 @@ def build_app(
         try:
             return runtime.scope(asking.identity, **asking.handed)
         except Exception as exc:
-            if (refused := _refused(exc, doors)) is None:
+            if (answer := refused(exc, doors)) is None:
                 raise
-            raise refused from None
+            raise answer from None
 
     if mcp_app is not None:
         from starlette.routing import Route
@@ -254,6 +234,8 @@ def build_app(
                 app.router.routes.append(Route(path, endpoint=mcp_app))
 
     mount_openai(app, runtime, doors, heartbeat_s=heartbeat_s)
+    if superset:
+        mount_superset_build(app, runtime, doors, asker)
 
     # Mounted last, so it can only claim paths no API route above already answered.
     built = static_dir if static_dir is not None else STATIC_DIR
