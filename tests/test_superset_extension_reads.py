@@ -243,5 +243,19 @@ def test_editors_of_marks_a_dashboard_that_does_not_fit(monkeypatch):
     monkeypatch.setattr(writes, "_dashboard", lambda dashboard_id: dashboards.get(dashboard_id))
     monkeypatch.setattr(writes, "_security", lambda: SimpleNamespace(is_editor=lambda d: True))
     answer = reads.editors_of({"dashboard_ids": [7]})
-    assert answer["dashboards"] == [{"dashboard_id": 7, "too_large": True}]
+    assert answer["dashboards"] == [{"dashboard_id": 7, "is_editor": True, "too_large": True}]
+    assert size(answer) <= reads.MAX_ANSWER_BYTES
+
+
+def test_a_dashboard_cut_for_size_still_says_whether_the_caller_edits_it(monkeypatch):
+    """Only the labels are cut: `is_editor`, one bool, stays in the mark, so a build reads an editor whose dashboard
+    has too many editors to send as an editor, and a non-editor as one."""
+    fat = "x" * 45_000
+    dashboards = {7: SimpleNamespace(editors=[SimpleNamespace(label=fat)]),
+                  8: SimpleNamespace(editors=[SimpleNamespace(label=fat)])}
+    monkeypatch.setattr(writes, "_dashboard", lambda dashboard_id: dashboards.get(dashboard_id))
+    monkeypatch.setattr(writes, "_security", lambda: SimpleNamespace(is_editor=lambda d: d is dashboards[7]))
+    answer = reads.editors_of({"dashboard_ids": [7, 8]})
+    assert answer["dashboards"] == [{"dashboard_id": 7, "is_editor": True, "too_large": True},
+                                    {"dashboard_id": 8, "is_editor": False, "too_large": True}]
     assert size(answer) <= reads.MAX_ANSWER_BYTES

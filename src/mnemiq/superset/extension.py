@@ -11,6 +11,8 @@ the installed extension answers with an empty list and never fails on. `call_too
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from mnemiq.superset.client import SupersetToolError
 
 __all__ = ["DATASET_METRICS_BATCH", "EXTENSION_TOOLS", "ExtensionMissing", "TOOL_PREFIX", "call_tool",
@@ -59,16 +61,21 @@ def require_extension(client) -> None:
         raise
 
 
-def call_tool(client, base: str, request: dict) -> dict:
+def call_tool(client, base: str, request: dict, *, before_call: Callable[[], None] | None = None) -> dict:
     """Call the extension's tool `base` as the client's caller. Raises `ExtensionMissing` when Superset does not offer
-    it; any other failure is raised as the client raised it."""
+    it; any other failure is raised as the client raised it. `before_call` runs before the call, and again before the
+    probe that may follow it (a build renews its lease there)."""
     tool = TOOL_PREFIX + base
+    if before_call is not None:
+        before_call()
     try:
         return client.call(tool, request)
     except SupersetToolError as failure:
         if not _is_not_offered(tool, failure):
             raise
         original = failure
+    if before_call is not None:
+        before_call()
     try:
         require_extension(client)
     except ExtensionMissing:
@@ -90,11 +97,12 @@ def dataset_metrics(client, dataset_ids: tuple[int, ...]) -> list[dict]:
     return found
 
 
-def dashboard_editorship(client, dashboard_id: int) -> dict | None:
+def dashboard_editorship(client, dashboard_id: int, *, before_call: Callable[[], None] | None = None) -> dict | None:
     """Whether the caller edits the dashboard, as the extension's `editors_of` answers it: `{dashboard_id, is_editor,
-    editors}` (the editors as labels, for the person's panel only), `{dashboard_id, too_large}` for an answer the
-    extension could not send whole, or None when the caller may not read the dashboard or it does not exist."""
-    answer = call_tool(client, "editors_of", {"dashboard_ids": [dashboard_id]})
+    editors}` (the editors as labels, for the person's panel only), `{dashboard_id, is_editor, too_large}` when the
+    labels were too many to send, or None when the caller may not read the dashboard or it does not exist.
+    `before_call` is `call_tool`'s."""
+    answer = call_tool(client, "editors_of", {"dashboard_ids": [dashboard_id]}, before_call=before_call)
     entries = answer.get("dashboards") if isinstance(answer, dict) else None
     if not isinstance(entries, list):
         raise SupersetToolError("the extension's editors_of answered no list of dashboards", detail=str(answer)[:200])

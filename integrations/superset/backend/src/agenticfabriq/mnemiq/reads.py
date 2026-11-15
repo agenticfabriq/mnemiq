@@ -154,7 +154,9 @@ def editors_of(found: dict) -> dict:
 
     def mark(pair: tuple) -> tuple:
         kind, entry = pair
-        return kind, {_ID_FIELDS[kind]: entry[_ID_FIELDS[kind]], **TOO_LARGE}
+        # A dashboard cut for size keeps whether the caller edits it, one bool: only its labels are left out.
+        kept = {"is_editor": entry["is_editor"]} if kind == "dashboards" else {}
+        return kind, {_ID_FIELDS[kind]: entry[_ID_FIELDS[kind]], **kept, **TOO_LARGE}
 
     return fit(entries, build, mark)
 
