@@ -15,6 +15,7 @@ import copy
 import dataclasses
 import decimal
 import enum
+import functools
 import inspect
 import logging
 import re
@@ -180,40 +181,69 @@ _PLAIN = (str, bytes, int, float, complex, bool, type(None), decimal.Decimal, da
           enum.Enum)
 
 
+def _attributes(held) -> set[str]:
+    """The names an object keeps values under: its instance attributes, its slots under the name each declaring
+    class gives them (a private slot `__rows` of class `_C` is `_C__rows`), and its dataclass fields."""
+    names = set(getattr(held, "__dict__", {}))
+    for cls in type(held).__mro__:
+        slots = cls.__dict__.get("__slots__", ())
+        for slot in ((slots,) if isinstance(slots, str) else slots):
+            private = slot.startswith("__") and not slot.endswith("__")
+            names.add(f"_{cls.__name__.lstrip('_')}{slot}" if private else slot)
+    if dataclasses.is_dataclass(held):
+        names |= {field.name for field in dataclasses.fields(held)}
+    return names - {"__dict__", "__weakref__"}
+
+
 def _data_held(module) -> list[str]:
     """The text of every data value a module holds, at any depth: inside its globals' containers (mappings,
-    sequences, sets, deques), objects' attributes and slots, and dataclass fields, those kept out of the repr too.
-    Functions, classes, modules and loggers are left out: what they print is code and memory addresses, and a
-    logger leads to every other logger's records, none of them this module's. A holder of any other kind fails the
-    test by name rather than being read through its repr, which can hide what it holds and print an address."""
+    sequences, sets, deques), and in every object's attributes, slots and dataclass fields, those kept out of the
+    repr too and a container's own attributes beside its elements, and in the module's own functions' defaults and
+    closures. Other functions, classes, modules and loggers are left out: what they print is code and memory
+    addresses, and a logger leads to every other logger's records, none of them this module's. A cached function of
+    the module fails the test, since its cache cannot be read. A holder of any other kind fails the test by name rather than being read through its repr,
+    which can hide what it holds and print an address."""
     found: list[str] = []
     seen: set[int] = set()
 
     def walk(held, path: str) -> None:
-        if (callable(held) or isinstance(held, (types.ModuleType, logging.Logger, __future__._Feature))
-                or id(held) in seen):
+        if id(held) in seen:
+            return
+        if callable(held) and getattr(held, "__module__", None) == module.__name__:
+            # The module's own functions can keep values too: in a cache, a default or a closure's cell.
+            if hasattr(held, "cache_info"):
+                raise AssertionError(f"{path} is a cached function, whose cache this walk cannot read")
+            if isinstance(held, types.FunctionType):
+                seen.add(id(held))
+                for index, default in enumerate((*(held.__defaults__ or ()), *(held.__kwdefaults__ or {}).values())):
+                    walk(default, f"{path}.<default {index}>")
+                for index, cell in enumerate(held.__closure__ or ()):
+                    walk(cell.cell_contents, f"{path}.<closure {index}>")
+            return
+        if callable(held) or isinstance(held, (types.ModuleType, logging.Logger, __future__._Feature)):
             return
         seen.add(id(held))
+        opened = False
         if isinstance(held, _PLAIN):
             found.append(str(held))
+            opened = True
         elif isinstance(held, re.Pattern):
             found.append(held.pattern)
+            opened = True
         elif isinstance(held, collections.abc.Mapping):
             for key, value in held.items():
                 walk(key, path)
                 walk(value, f"{path}[{key!r}]")
+            opened = True
         elif isinstance(held, (collections.abc.Sequence, collections.abc.Set, collections.deque)):
             for index, item in enumerate(held):
                 walk(item, f"{path}[{index}]")
-        elif dataclasses.is_dataclass(held) or hasattr(held, "__dict__") or getattr(held, "__slots__", ()):
-            fields = {field.name for field in dataclasses.fields(held)} if dataclasses.is_dataclass(held) else set()
-            fields |= set(getattr(held, "__dict__", {}))
-            for slots in (getattr(cls, "__slots__", ()) for cls in type(held).__mro__):
-                fields |= {slots} if isinstance(slots, str) else set(slots)
-            for field in sorted(fields):
-                if hasattr(held, field):
-                    walk(getattr(held, field), f"{path}.{field}")
-        else:
+            opened = True
+        names = _attributes(held)
+        for name in sorted(names):
+            if hasattr(held, name):
+                walk(getattr(held, name), f"{path}.{name}")
+        if not opened and not names and not hasattr(held, "__dict__"):
             raise AssertionError(f"{path} holds a {type(held).__name__}, which this walk has no reading for")
 
     for name, held in vars(module).items():
@@ -244,6 +274,27 @@ class _Slotted:
 
     def __init__(self, rows):
         self.rows = rows
+
+
+class _PrivateSlot:
+    __slots__ = ("__rows",)
+
+    def __init__(self, rows):
+        self.__rows = rows
+
+
+class _ListWithCache(list):
+    """A container whose elements are empty and whose rows sit in an attribute of its own."""
+
+    def __init__(self, rows):
+        super().__init__()
+        self.last_rows = rows
+
+
+class _DictWithCache(dict):
+    def __init__(self, rows):
+        super().__init__()
+        self.last_rows = rows
 
 
 @dataclasses.dataclass
@@ -278,14 +329,48 @@ def test_the_data_a_module_holds_is_its_values_not_its_functions_addresses():
     _Holder([("north", 1200)]),
     {"inside": _Holder((("north", 1200),))},
     _Slotted([("north", 1200)]),
+    _PrivateSlot([("north", 1200)]),
+    _ListWithCache([("north", 1200)]),
+    _DictWithCache([("north", 1200)]),
     _Hidden("chart", (("north", 1200),)),
 ], ids=["a list", "a nested dict", "a deque", "an object's attribute", "an object in a dict", "a slot",
-        "a dataclass field kept out of its repr"])
+        "a private slot", "a list's own attribute", "a dict's own attribute", "a dataclass field kept out of its repr"])
 def test_a_value_the_module_keeps_is_found_wherever_it_is_held(holder):
     planted = types.ModuleType("planted")
     planted.KEPT = holder
     held = " ".join(_data_held(planted))
     assert "north" in held and "1200" in held
+
+
+def _module_with_functions_holding(defaulted, closed) -> types.ModuleType:
+    """A module whose own functions keep rows: `defaulted` in a mutable default, `closed` in a closure's cell."""
+    planted = types.ModuleType("planted")
+
+    def remember(seen=[defaulted]):  # noqa: B006 - the mutable default is the point
+        return seen
+
+    def closing():
+        def inner():
+            return closed
+        return inner
+
+    planted.remember, planted.recall = remember, closing()
+    for function in (planted.remember, planted.recall):
+        function.__module__ = "planted"
+    return planted
+
+
+def test_a_value_the_modules_own_functions_keep_is_found():
+    held = " ".join(_data_held(_module_with_functions_holding([("north", 1200)], [("south", 801)])))
+    assert "north" in held and "1200" in held and "south" in held and "801" in held
+
+
+def test_a_cached_function_of_the_module_fails_rather_than_passes():
+    planted = types.ModuleType("planted")
+    planted.looked_up = functools.lru_cache(maxsize=None)(lambda key: key)
+    planted.looked_up.__module__ = "planted"
+    with pytest.raises(AssertionError, match="cache"):
+        _data_held(planted)
 
 
 def test_a_holder_the_walk_cannot_read_fails_rather_than_passes():
