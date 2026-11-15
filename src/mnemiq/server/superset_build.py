@@ -38,7 +38,7 @@ from mnemiq.server.superset_refusals import NotForBuilding
 from mnemiq.superset.build_store import MAX_ID, BuildNotFound, BuildStore, BuildStoreMissing, DashboardBusy
 from mnemiq.superset.builder import BuildBusy, BuildState, build_state, next_step, start_build
 from mnemiq.superset.executor import SupersetCredentialMissing, superset_executor
-from mnemiq.superset.extension import ExtensionMissing, call_tool
+from mnemiq.superset.extension import ExtensionMissing, require_extension
 from mnemiq.superset.planner import MAX_GOAL, BuildPlan, PlanContext, PlanRefused, plan_build
 
 __all__ = ["WRITE_SCOPES", "mount_superset_build"]
@@ -52,9 +52,6 @@ _NEEDED = ("db.read", *WRITE_SCOPES)
 NO_DELEGATION = ("Superset mode builds as the person whose verified token each request carries, and this request "
                  "carries none")
 STORE_UNAVAILABLE = "mnemiq's control Postgres, where builds are kept, did not answer; try this request again."
-
-# The extension's read that answers an empty list wherever the extension is installed (`extension.call_tool`).
-_EXTENSION_PROBE = ("dataset_metrics", {"dataset_ids": []})
 
 
 class StartBody(BaseModel):
@@ -180,7 +177,7 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
             adapter = superset_executor(settings, delegation)
             grants = runtime.builder_grants(adapter)
             # Before anything is planned or kept: every write of a build goes through the extension.
-            call_tool(adapter.client, *_EXTENSION_PROBE)
+            require_extension(adapter.client)
             plan = plan_build(body.goal, planner=planner, client=adapter.client, adapter=adapter,
                               snapshot=runtime.snapshot, grants=grants, settings=settings,
                               offer_reuse=body.dashboard_id is None and not body.fresh)

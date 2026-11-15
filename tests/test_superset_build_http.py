@@ -450,6 +450,9 @@ def test_missing_extension_is_named(served, fake, world, store):
     assert "Error ID" not in r.text and "unexpected" not in r.text
     assert store._builds == {} and _writes(fake) == []
     assert runtime.profiles[runtime.default_profile].planner.goals == []
+    # Settled by one call of the extension's probe, not the probe asked twice.
+    assert [call.tool for call in fake.calls if call.tool.startswith("extensions.")] == [
+        TOOL_PREFIX + "dataset_metrics"]
 
 
 def test_an_extension_gone_mid_build_is_named(served, fake, world, store):
