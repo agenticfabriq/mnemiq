@@ -8,6 +8,7 @@ what `agenticfabriq.mnemiq.writes` reads from it; the exceptions keep rc2's hier
 
 from __future__ import annotations
 
+import copy
 import sys
 import types
 from types import SimpleNamespace
@@ -135,6 +136,9 @@ def install(monkeypatch) -> SimpleNamespace:
     command adds the row it makes; `create`: an exception a create command raises instead) and what the tools did
     (`ran`: each command run, in order, with its arguments)."""
     state = SimpleNamespace(chart_data={"queries": [{"data": [], "status": "success"}]}, delete=None, restore=None,
+                            config_valid=True, mapped={"viz_type": "big_number_total", "metric": "count",
+                                                       "_mcp_warnings": ["a sample warning"]},
+                            compiled=SimpleNamespace(success=True),
                             update=None, create=None, ran=[], config={}, features=set(), g=SimpleNamespace(),
                             user_subjects={}, charts={}, dashboards={}, datasets={}, session=None,
                             rows={"Dashboard": [], "Slice": []}, next_id=500)
@@ -214,6 +218,23 @@ def install(monkeypatch) -> SimpleNamespace:
         Command.__name__ = name
         return Command
 
+    class ValidationPipeline:
+        @staticmethod
+        def validate_request_with_warnings(request_data: dict) -> SimpleNamespace:
+            state.ran.append(("validate", request_data))
+            if not state.config_valid:
+                return SimpleNamespace(is_valid=False, request=None, error=SimpleNamespace(), warnings=None)
+            return SimpleNamespace(is_valid=True, request=SimpleNamespace(config=request_data["config"]),
+                                   warnings=None)
+
+    def map_config_to_form_data(config: dict, dataset_id=None) -> dict:
+        state.ran.append(("map", config, dataset_id))
+        return copy.deepcopy(state.mapped)
+
+    def _compile_chart(form_data: dict, dataset_id: int) -> SimpleNamespace:
+        state.ran.append(("compile", form_data, dataset_id))
+        return state.compiled
+
     def get_user_id():
         return getattr(getattr(state.g, "user", None), "id", None)
 
@@ -249,6 +270,9 @@ def install(monkeypatch) -> SimpleNamespace:
         "superset.commands.dataset.exceptions": {"DatasetNotFoundError": DatasetNotFoundError},
         "superset.charts.schemas": {"ChartDataQueryContextSchema": ChartDataQueryContextSchema},
         "superset.commands.chart.data.get_data_command": {"ChartDataCommand": ChartDataCommand},
+        "superset.mcp_service.chart.validation": {"ValidationPipeline": ValidationPipeline},
+        "superset.mcp_service.chart.chart_utils": {"map_config_to_form_data": map_config_to_form_data},
+        "superset.mcp_service.chart.compile": {"_compile_chart": _compile_chart},
         "superset.mcp_service.chart.query_result": {"query_result_failure": query_result_failure},
         "superset.commands.dataset.delete": {"DeleteDatasetCommand": command("DeleteDatasetCommand", "delete")},
         "superset.commands.dataset.restore": {"RestoreDatasetCommand": command("RestoreDatasetCommand", "restore")},

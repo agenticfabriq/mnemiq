@@ -1292,3 +1292,98 @@ def test_another_metadata_database_is_refused(creating):
     creating.on("mssql")
     assert make_dashboard() == {"refused": "metadata_database"}
     assert "lookup" not in _kinds(creating.superset) and commands(creating.superset) == []
+
+
+# ---------------------------------------------------------------- create_chart from MCP's own chart config
+
+CONFIG = {"chart_type": "big_number", "metric": {"name": "premium", "aggregate": "SUM"}}
+
+
+def make_from_config(marker: str = STEP, **more) -> dict:
+    return writes.create_chart({"dataset_id": 7, "slice_name": "Premium", "dashboard_id": 12, "marker": marker,
+                                "config": CONFIG, **more})
+
+
+def test_create_chart_from_a_config_saves_the_mapped_params(creating):
+    """The params saved are what MCP's mapping makes of the config, without its warnings key; the query context is
+    built from them; the marker is the description; the editors are a created chart's."""
+    made = make_from_config()
+    assert set(made) == {"chart_id"}, made
+    ((_, properties),) = commands(creating.superset)
+    saved = {"viz_type": "big_number_total", "metric": "count"}
+    assert json.loads(properties["params"]) == saved
+    assert json.loads(properties["query_context"]) == params.query_context("big_number_total", saved, 7)
+    assert properties["viz_type"] == "big_number_total" and properties["slice_name"] == "Premium"
+    assert (properties["datasource_id"], properties["datasource_type"]) == (7, "table")
+    assert properties["description"] == STEP and properties["editors"] == [101]
+    assert ("validate", {"dataset_id": 7, "config": CONFIG, "chart_name": "Premium", "save_chart": True}) in (
+        creating.superset.ran)
+    assert ("map", CONFIG, 7) in creating.superset.ran
+    assert make_from_config() == made
+    assert len(commands(creating.superset)) == 1
+
+
+def test_owed_format_params_are_saved_with_the_chart(creating):
+    """`set` is merged into the mapped params before the query context is built, so the format keys are saved with
+    the chart and are in the query context's source params."""
+    made = make_from_config(set={"number_format": ",.2f"})
+    assert set(made) == {"chart_id"}, made
+    ((_, properties),) = commands(creating.superset)
+    saved = {"viz_type": "big_number_total", "metric": "count", "number_format": ",.2f"}
+    assert json.loads(properties["params"]) == saved
+    assert json.loads(properties["query_context"]) == params.query_context("big_number_total", saved, 7)
+    assert json.loads(properties["query_context"])["form_data"]["number_format"] == ",.2f"
+
+
+@pytest.mark.parametrize("extra", [
+    {},  # neither shape
+    {"viz_type": "funnel", "params": {"groupby": ["status"]}, "config": CONFIG},  # both
+    {"viz_type": "funnel", "params": {}, "config": CONFIG, "set": {}},
+    {"viz_type": "funnel", "config": CONFIG},  # half of one and the other
+    {"params": {"groupby": ["status"]}, "config": CONFIG},
+    {"viz_type": "funnel"},  # half of one
+    {"params": {"groupby": ["status"]}},
+    {"set": {"number_format": ","}},  # a set without a config
+    {"viz_type": "funnel", "params": {"groupby": ["status"]}, "set": {"number_format": ","}},
+])
+def test_create_chart_takes_one_shape_only(creating, extra):
+    request = {"dataset_id": 7, "slice_name": "Premium", "dashboard_id": 12, "marker": STEP, **extra}
+    assert writes.create_chart(request) == {"refused": "request"}
+    assert commands(creating.superset) == [] and _kinds(creating.superset) == []
+
+
+def test_each_shape_alone_is_read(creating):
+    assert set(make_funnel()) == {"chart_id"}
+    assert set(make_from_config(format_marker(BUILD, "chart_2", 12))) == {"chart_id"}
+    assert set(make_from_config(format_marker(BUILD, "chart_3", 12), set={})) == {"chart_id"}
+
+
+def test_a_config_rc2_rejects_is_refused_as_config(creating):
+    creating.superset.config_valid = False
+    assert make_from_config() == {"refused": "config"}
+    assert commands(creating.superset) == []
+    assert {"execute", "connect", "lookup", "compile"} & set(_kinds(creating.superset)) == set()
+
+
+def test_a_config_whose_query_fails_saves_nothing(creating):
+    creating.superset.compiled = SimpleNamespace(success=False)
+    assert make_from_config() == {"refused": "query_failed"}
+    assert commands(creating.superset) == []
+    assert {"execute", "connect", "lookup"} & set(_kinds(creating.superset)) == set()
+
+
+def test_a_config_is_checked_for_the_dataset_and_dashboard_before_it_is_validated(creating):
+    creating.not_edited.append(creating.dashboard)
+    assert make_from_config() == {"not_editor": True, "editors": ["analyst Live"]}
+    assert _kinds(creating.superset) == []
+
+
+def test_the_config_path_validates_and_compiles_before_the_lock(creating):
+    """Validation, mapping and the compile check run before the marker's lock: inside it run only the lookup and the
+    create, so nothing ends the transaction before the create's own commit."""
+    make_from_config()
+    kinds = _kinds(creating.superset)
+    lock = creating.superset.ran.index(("execute", ADVISORY_LOCK, {"marker": STEP}))
+    assert kinds[:lock].count("validate") == kinds[:lock].count("map") == kinds[:lock].count("compile") == 1
+    assert kinds[:lock].index("validate") < kinds[:lock].index("map") < kinds[:lock].index("compile")
+    assert kinds[lock + 1:] == ["lookup", "CreateChartCommand", "commit", "rollback"]

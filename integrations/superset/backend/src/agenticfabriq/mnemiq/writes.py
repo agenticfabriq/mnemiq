@@ -195,9 +195,11 @@ REQUESTS: dict[str, dict[str, _Field]] = {
     "create_dashboard": {"title": _Field(_text(500)), "marker": _MARKER},
     "claim_chart": {"chart_id": _Field(_an_id), "dashboard_id": _DASHBOARD_ID, "marker": _MARKER},
     "claim_dataset": {"dataset_id": _Field(_an_id), "dashboard_id": _DASHBOARD_ID, "marker": _MARKER},
-    "create_chart": {"dataset_id": _Field(_an_id), "viz_type": _Field(_one_of(EXTENSION_MADE)),
-                     "slice_name": _Field(_text(250)), "params": _Field(_an_object), "dashboard_id": _DASHBOARD_ID,
-                     "marker": _MARKER},
+    # Exactly one shape, which `create_chart` checks: `{viz_type, params}`, or `{config, set?}`.
+    "create_chart": {"dataset_id": _Field(_an_id), "viz_type": _Field(_one_of(EXTENSION_MADE), False),
+                     "slice_name": _Field(_text(250)), "params": _Field(_an_object, False),
+                     "config": _Field(_an_object, False), "set": _Field(_an_object, False),
+                     "dashboard_id": _DASHBOARD_ID, "marker": _MARKER},
     "patch_chart": {"chart_id": _Field(_an_id), "set": _Field(_an_object, False, {}),
                     "unset": _Field(_names, False, []), "expect_changed_on": _EXPECT_CHANGED_ON},
     "add_saved_metric": {"dataset_id": _Field(_an_id), "metric": _Field(_a_metric),
@@ -836,15 +838,9 @@ def _check_query(context: dict) -> dict | None:
     return None
 
 
-@_answering("create_chart")
-def create_chart(found: dict) -> dict:
-    """A funnel or a sankey on the dataset, for the dashboard: its query is run first and the chart saved only if it
-    runs; then `CreateChartCommand` saves its params, its query context, the editors `_chart_editors` chooses and the
-    build's marker, once for the marker: sent again, it answers the chart the first one made (`_find_or_create`). The
-    editors are read in the create's own transaction. The chart joins the dashboard when a layout places it
-    (`set_layout`)."""
-    if claim_marker(found["marker"], found["dashboard_id"]) is None:
-        return BAD_MARKER
+def _funnel_form(found: dict) -> tuple[str, dict, dict] | dict:
+    """The request's own `viz_type` and `params` read for the dataset: (viz_type, form data, query context), or the
+    refusal."""
     dataset_id, viz_type, form_data = found["dataset_id"], found["viz_type"], found["params"]
     # The params name the chart's own dataset and type, or nothing: the row's binding is the request's.
     if form_data.setdefault("viz_type", viz_type) != viz_type:
@@ -857,6 +853,61 @@ def create_chart(found: dict) -> dict:
         context = params.query_context(viz_type, form_data, dataset_id)
     except ValueError:
         return {"refused": "params"}
+    return viz_type, form_data, context
+
+
+def _config_form(found: dict, dataset: Any) -> tuple[str, dict, dict | None] | dict:
+    """MCP's chart config made into a chart as its `generate_chart` saves one: the config validated
+    (`ValidationPipeline`), mapped to form data (`map_config_to_form_data`, whose warnings key is dropped), the
+    request's `set` merged over it, and the query run (`_compile_chart`), so a chart whose query fails is never saved.
+    (viz_type, form data, query context), or the refusal. Runs before the marker's lock, whatever it commits."""
+    from superset.mcp_service.chart.chart_utils import map_config_to_form_data
+    from superset.mcp_service.chart.compile import _compile_chart
+    from superset.mcp_service.chart.validation import ValidationPipeline
+
+    dataset_id = found["dataset_id"]
+    validated = ValidationPipeline.validate_request_with_warnings({
+        "dataset_id": dataset_id, "config": found["config"], "chart_name": found["slice_name"], "save_chart": True})
+    if not validated.is_valid or validated.request is None:
+        return {"refused": "config"}
+    form_data = map_config_to_form_data(validated.request.config, dataset_id=dataset_id)
+    form_data.pop("_mcp_warnings", None)
+    form_data.update(found["set"])
+    viz_type = form_data.get("viz_type")
+    if not isinstance(viz_type, str) or not viz_type:
+        return {"refused": "config"}
+    try:
+        context = params.query_context(viz_type, form_data, dataset_id)
+    except ValueError:
+        return {"refused": "config"}
+    if not _compile_chart(form_data, dataset.id).success:
+        logger.warning("mnemiq extension: create_chart's query failed")
+        return {"refused": "query_failed"}
+    return viz_type, form_data, context
+
+
+@_answering("create_chart")
+def create_chart(found: dict) -> dict:
+    """A chart on the dataset, for the dashboard, in one of two shapes: a funnel or a sankey as `{viz_type, params}`,
+    or any family as MCP's own chart config, `{config}` with the format keys `set` to merge into its params. Its query
+    is run first and the chart saved only if it runs; then `CreateChartCommand` saves its params, its query context,
+    the editors `_chart_editors` chooses and the build's marker, once for the marker: sent again, it answers the chart
+    the first one made (`_find_or_create`). The editors are read in the create's own transaction. The chart joins the
+    dashboard when a layout places it (`set_layout`)."""
+    if claim_marker(found["marker"], found["dashboard_id"]) is None:
+        return BAD_MARKER
+    from_config = found["config"] is not None
+    own = not from_config
+    if from_config:
+        shaped = found["viz_type"] is None and found["params"] is None
+    else:
+        shaped = found["viz_type"] is not None and found["params"] is not None and found["set"] is None
+    if not shaped:
+        return {"refused": "request"}
+    dataset_id = found["dataset_id"]
+    prepared = _funnel_form(found) if own else None
+    if isinstance(prepared, dict):
+        return prepared
     dataset = _dataset(dataset_id)
     if dataset is None:
         return _not_found("dataset")
@@ -865,8 +916,14 @@ def create_chart(found: dict) -> dict:
         return _not_found("dashboard")
     if not _security().is_editor(dashboard):
         return _not_editor(dashboard)
-    if (failure := _check_query(context)) is not None:
+    if prepared is None:
+        found["set"] = found["set"] or {}
+        prepared = _config_form(found, dataset)
+        if isinstance(prepared, dict):
+            return prepared
+    elif (failure := _check_query(prepared[2])) is not None:
         return failure
+    viz_type, form_data, context = prepared
     editors = _chart_editors(dataset, dashboard, ())
     from superset.commands.chart.create import CreateChartCommand
     from superset.models.slice import Slice
@@ -875,7 +932,8 @@ def create_chart(found: dict) -> dict:
         try:
             chart = CreateChartCommand({
                 "slice_name": found["slice_name"], "viz_type": viz_type, "datasource_id": dataset_id,
-                "datasource_type": "table", "params": json.dumps(form_data), "query_context": json.dumps(context),
+                "datasource_type": "table", "params": json.dumps(form_data),
+                "query_context": json.dumps(context) if context is not None else None,
                 "editors": editors, "description": found["marker"]}).run()
         except _command_errors() as exc:
             return _command_answer("create_chart", exc, kind="dataset")

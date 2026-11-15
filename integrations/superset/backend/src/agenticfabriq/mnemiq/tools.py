@@ -43,8 +43,9 @@ def claim_dataset(request: dict[str, Any]) -> dict[str, Any]:
 
 
 @tool(name="create_chart", class_permission_name="Chart", method_permission_name="write",
-      description="Create a funnel or sankey chart for a dashboard, after checking its query runs. "
-                  "request: {dataset_id, viz_type, slice_name, params, dashboard_id, marker}.")
+      description="Create a chart for a dashboard, after checking its query runs, in one of two shapes. "
+                  "request: {dataset_id, slice_name, dashboard_id, marker} and either {viz_type, params} "
+                  "(a funnel or sankey) or {config, set?} (MCP's chart config, and format keys to merge).")
 def create_chart(request: dict[str, Any]) -> dict[str, Any]:
     return writes.create_chart(request)
 
