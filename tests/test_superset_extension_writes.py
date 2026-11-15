@@ -7,11 +7,15 @@ What the tools do inside Superset (the locks, the commands, the answers) is the 
 """
 
 import ast
+import contextlib
+import hashlib
 import json
 import re
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import ANY
 
 import pytest
 
@@ -315,7 +319,7 @@ def test_the_readme_check_flags_a_planted_defect(old, new, flagged):
 
 WRITES_SOURCE = Path(writes.__file__)
 # Each tool that writes an existing row: the model whose row it locks first, and the request field naming the row.
-# Creating a dashboard or a chart writes a new row and locks none.
+# Creating a dashboard or a chart writes a new row and locks no row, only its marker (`_find_or_create`).
 LOCKED = {"patch_chart": ("Slice", "chart_id"), "claim_chart": ("Slice", "chart_id"),
           "claim_dataset": ("SqlaTable", "dataset_id"), "add_saved_metric": ("SqlaTable", "dataset_id"),
           "delete_dataset": ("SqlaTable", "dataset_id"), "set_layout": ("Dashboard", "dashboard_id")}
@@ -667,6 +671,116 @@ def test_a_command_that_loses_a_lock_race_answers_busy(deleting):
         assert delete(_dataset(MARKED)) == answer, sqlstate
 
 
+# ---------------------------------------------------------------- the metadata database, stood in
+
+def _holds(predicate: tuple, row: SimpleNamespace) -> bool:
+    """Whether `row` passes a filter a stood-in column made (`stubs.Column`), a `LIKE` decided by SQLite's own."""
+    kind, column, *operands = predicate
+    value = getattr(row, column)
+    if kind == "is":
+        return value is operands[0]
+    pattern, escape = operands
+    with contextlib.closing(sqlite3.connect(":memory:")) as database:
+        if escape is None:
+            return database.execute("SELECT ? LIKE ?", (value, pattern)).fetchone()[0] == 1
+        return database.execute("SELECT ? LIKE ? ESCAPE ?", (value, pattern, escape)).fetchone()[0] == 1
+
+
+class _Lookup:
+    """A query of one model, stood in: its filters applied to the model's rows, in the order it asks for."""
+
+    def __init__(self, metadata: "Metadata", model: type) -> None:
+        self.metadata, self.model, self.predicates, self.ordered = metadata, model, [], []
+
+    def filter(self, *predicates):
+        self.predicates.extend(predicates)
+        return self
+
+    def order_by(self, *columns):
+        self.ordered.extend(column.name for column in columns)
+        return self
+
+    def __iter__(self):
+        self.metadata.log.append(("lookup", self.model.__name__))
+        rows = [row for row in self.metadata.superset.rows[self.model.__name__]
+                if all(_holds(predicate, row) for predicate in self.predicates)]
+        return iter(sorted(rows, key=lambda row: [getattr(row, name) for name in self.ordered]))
+
+    def all(self) -> list:
+        return list(self)
+
+
+class _Connection:
+    """A connection of its own, as `engine.connect()` hands one out: `GET_LOCK` answers the metadata's `got_lock`."""
+
+    def __init__(self, metadata: "Metadata", number: int) -> None:
+        self.metadata, self.number = metadata, number
+        metadata.log.append(("connect", number))
+
+    def execute(self, statement, parameters=None) -> SimpleNamespace:
+        self.metadata.log.append(("on", self.number, statement, parameters))
+        answer = self.metadata.got_lock if "GET_LOCK" in statement else 1
+        return SimpleNamespace(scalar=lambda: answer)
+
+    def close(self) -> None:
+        self.metadata.log.append(("close", self.number))
+
+
+class Metadata:
+    """Superset's metadata database on `dialect`, with its session (`db.session`), stood in. Its rows are the
+    stand-ins' `rows`, and what it does goes to the stand-ins' `ran`, in order with the commands run there:
+    `("isolation",)` when the session's connection's isolation level is read, `("execute", statement, parameters)`
+    for each statement the session executes, `("lookup", model)` when a query is read, `("commit",)` and
+    `("rollback",)`; and, on a connection of its own (`engine.connect()`), `("connect", n)`, `("on", n, statement,
+    parameters)` and `("close", n)`. A test may set `isolation` (what the session's connection reports), `contended`
+    (a text whose statement waits past the lock timeout, SQLSTATE 55P03), `got_lock` (what `GET_LOCK` answers) and
+    `pool_exhausted` (`engine.connect()` times out)."""
+
+    def __init__(self, superset: SimpleNamespace, dialect: str) -> None:
+        self.superset, self.connections = superset, 0
+        self.isolation, self.contended, self.got_lock, self.pool_exhausted = "READ COMMITTED", None, 1, False
+        self.engine = SimpleNamespace(dialect=SimpleNamespace(name=dialect), connect=self._connect)
+
+    @property
+    def log(self) -> list:
+        return self.superset.ran
+
+    def get_bind(self) -> SimpleNamespace:
+        return self.engine
+
+    def connection(self) -> SimpleNamespace:
+        return SimpleNamespace(get_isolation_level=self._isolation)
+
+    def _isolation(self) -> str:
+        self.log.append(("isolation",))
+        return self.isolation
+
+    def _connect(self) -> _Connection:
+        if self.pool_exhausted:
+            raise stubs.PoolTimeoutError("QueuePool limit of size 5 overflow 10 reached")
+        self.connections += 1
+        return _Connection(self, self.connections)
+
+    def execute(self, statement, parameters=None) -> None:
+        self.log.append(("execute", statement, parameters))
+        if self.contended is not None and self.contended in statement:
+            raise stubs.database_error("55P03")
+
+    def query(self, model: type) -> _Lookup:
+        return _Lookup(self, model)
+
+    def commit(self) -> None:
+        self.log.append(("commit",))
+
+    def rollback(self) -> None:
+        self.log.append(("rollback",))
+
+
+def commands(superset: SimpleNamespace, *names: str) -> list:
+    """The commands run, each with its arguments: those `names` names, or every one."""
+    return [entry for entry in superset.ran if entry[0].endswith("Command") and (not names or entry[0] in names)]
+
+
 # ---------------------------------------------------------------- set_layout's access check
 
 def _one_chart_layout(chart_id: int) -> dict:
@@ -793,7 +907,7 @@ def claiming(monkeypatch, superset):
     superset.dashboards, superset.datasets = {3: dashboard}, {4: dataset}
     security = Security(superset.g)
     monkeypatch.setattr(writes, "_security", lambda: security)
-    monkeypatch.setattr(writes, "_session", lambda: SimpleNamespace(rollback=lambda: None))
+    superset.session = Metadata(superset, "sqlite")
     locked = {"SqlaTable": dataset}
     monkeypatch.setattr(writes, "lock_row", lambda model, entity_id: locked[model.__name__])
     return SimpleNamespace(superset=superset, security=security, people=people, dashboard=dashboard,
@@ -802,8 +916,8 @@ def claiming(monkeypatch, superset):
 
 def _sent_editors(superset, command: str) -> list[int]:
     """The editors the one `command` run sent: an update command takes `(id, properties)`, a create `properties`."""
-    (properties,) = [arguments if isinstance(arguments, dict) else arguments[-1] for name, arguments in superset.ran
-                     if name == command]
+    (properties,) = [arguments if isinstance(arguments, dict) else arguments[-1]
+                     for _, arguments in commands(superset, command)]
     return properties["editors"]
 
 
@@ -822,7 +936,7 @@ def test_a_claimed_dataset_gets_only_editors_who_could_already_read_it(claiming)
         ids["creator"], ids["builder"], 302, ids["reader"], ids["database_reader"]]
     assert {"reader", "schema_reader", "outsider", "member", "database_reader"} <= set(claiming.security.judged)
     assert claiming.superset.g.user is claiming.people["builder"]
-    (properties,) = [arguments[1] for name, arguments in claiming.superset.ran if name == "UpdateDatasetCommand"]
+    ((_, (_, properties)),) = commands(claiming.superset, "UpdateDatasetCommand")
     assert properties["description"] == format_marker(BUILD, "data", 3)
 
 
@@ -833,7 +947,7 @@ def test_the_request_user_comes_back_when_a_check_fails(claiming):
     with pytest.raises(RuntimeError):
         writes.claim_dataset({"dataset_id": 4, "dashboard_id": 3, "marker": format_marker(BUILD, "data", 3)})
     assert claiming.superset.g.user is claiming.people["builder"]
-    assert claiming.superset.ran == []
+    assert commands(claiming.superset) == []
 
 
 def test_a_dashboard_user_subject_without_a_user_is_skipped(claiming):
@@ -897,3 +1011,265 @@ def test_a_chart_whose_editors_read_its_data_gets_the_dataset_rule(claiming):
     assert _sent_editors(claiming.superset, "CreateChartCommand") == [ids["builder"], ids["reader"],
                                                                        ids["database_reader"]]
     assert claiming.superset.g.user is claiming.people["builder"]
+
+
+# ---------------------------------------------------------------- a create carrying a build's marker
+
+SHELL = format_marker(BUILD, "dashboard", None)
+STEP = format_marker(BUILD, "chart_1", 12)
+ADVISORY_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended(:marker, 0))"
+GET_LOCK = "SELECT GET_LOCK(:name, :seconds)"
+RELEASE_LOCK = "SELECT RELEASE_LOCK(:name)"
+
+
+@pytest.fixture
+def creating(monkeypatch, superset):
+    """Creates with Superset stood in, on a Postgres metadata database (`metadata`; `on(dialect)` makes it another):
+    dashboard 12, edited by `analyst Live`, and dataset 7 are there; the caller reads every object but those in
+    `unreadable` and edits every one but those in `not_edited`."""
+    state = SimpleNamespace(superset=superset, unreadable=[], not_edited=[],
+                            dashboard=SimpleNamespace(id=12, editors=[SimpleNamespace(id=101, label="analyst Live")]))
+
+    def readable(resource) -> bool:
+        return not any(resource is hidden for hidden in state.unreadable)
+
+    security = SimpleNamespace(can_access_dashboard=readable, can_access_chart=readable,
+                               can_access_datasource=readable,
+                               is_editor=lambda resource: not any(resource is kept for kept in state.not_edited))
+    monkeypatch.setattr(writes, "_security", lambda: security)
+    superset.dashboards, superset.datasets = {12: state.dashboard}, {7: SimpleNamespace(id=7)}
+
+    def on(dialect: str) -> Metadata:
+        state.metadata = superset.session = Metadata(superset, dialect)
+        return state.metadata
+
+    state.on = on
+    on("postgresql")
+    return state
+
+
+def make_dashboard(marker: str = SHELL) -> dict:
+    return writes.create_dashboard({"title": "Policies", "marker": marker})
+
+
+def make_funnel(marker: str = STEP) -> dict:
+    return writes.create_chart({"dataset_id": 7, "viz_type": "funnel", "slice_name": "Stages",
+                                "params": {"groupby": ["status"], "metric": "count"}, "dashboard_id": 12,
+                                "marker": marker})
+
+
+def _row(row_id: int, description: str, deleted_at: datetime | None = None) -> SimpleNamespace:
+    return SimpleNamespace(id=row_id, description=description, deleted_at=deleted_at, editors=[])
+
+
+def _kinds(superset: SimpleNamespace) -> list[str]:
+    return [entry[0] for entry in superset.ran]
+
+
+def test_create_dashboard_twice_with_one_marker_makes_one(creating):
+    """A create whose answer was lost is sent again with the same marker: the second finds the dashboard the first
+    made, by its marker, and answers it; the command ran once."""
+    first = make_dashboard()
+    assert set(first) == {"dashboard_id"}, first
+    assert make_dashboard() == first
+    assert commands(creating.superset) == [("CreateDashboardCommand", {
+        "dashboard_title": "Policies", "published": False, "description": SHELL})]
+
+
+def test_create_chart_twice_with_one_marker_makes_one(creating):
+    first = make_funnel()
+    assert set(first) == {"chart_id"}, first
+    assert make_funnel() == first
+    ((_, properties),) = commands(creating.superset)
+    assert properties["description"] == STEP and properties["editors"] == [101]
+
+
+def test_the_sql_filter_reads_an_underscore_literally():
+    """Every step key may hold `_`, which `LIKE` reads as any one character: the filter escapes it, and `%` and the
+    escape character itself, so a marker matches only itself. Run by SQLite's own `LIKE`."""
+    step, twin = format_marker(BUILD, "chart_1", 7), format_marker(BUILD, "chartx1", 7)
+
+    def selected(suffix: str, descriptions: list[str]) -> list[str]:
+        with contextlib.closing(sqlite3.connect(":memory:")) as database:
+            database.execute("CREATE TABLE slices (description TEXT)")
+            database.executemany("INSERT INTO slices VALUES (?)", [(text,) for text in descriptions])
+            return [found for (found,) in database.execute(
+                "SELECT description FROM slices WHERE description LIKE ? ESCAPE '\\' ORDER BY rowid",
+                (writes._like_suffix(suffix),))]
+
+    assert selected(step, [f"Revenue\n{twin}", f"Revenue\n{step}"]) == [f"Revenue\n{step}"]
+    assert selected("a%b_c\\d", ["x a%b_c\\d", "x aZbYc\\d", "x a%b_c\\\\d"]) == ["x a%b_c\\d"]
+
+
+def test_a_marker_not_alone_on_the_last_line_is_not_found(creating):
+    """A person typed before the marker on its line: the database's filter passes the row (its description ends with
+    the marker), and Python's, which keeps only a last line that is the marker alone, does not. The retry makes a new
+    dashboard."""
+    typed = _row(3, "prose" + SHELL)
+    creating.superset.rows["Dashboard"].append(typed)
+    assert _holds(("like", "description", writes._like_suffix(SHELL), "\\"), typed)
+    made = make_dashboard()
+    assert set(made) == {"dashboard_id"} and made["dashboard_id"] != 3, made
+    assert len(commands(creating.superset, "CreateDashboardCommand")) == 1
+
+
+def test_an_object_in_the_trash_is_not_found(creating):
+    creating.superset.rows["Dashboard"].append(_row(3, SHELL, deleted_at=datetime(2026, 11, 15)))
+    made = make_dashboard()
+    assert set(made) == {"dashboard_id"} and made["dashboard_id"] != 3, made
+    assert len(commands(creating.superset, "CreateDashboardCommand")) == 1
+
+
+def test_two_rows_with_one_marker_answer_candidates(creating):
+    """More than one object carries the marker: the build cannot tell which is its own, so both are named, by id,
+    and nothing is made."""
+    creating.superset.rows["Dashboard"] += [_row(5, SHELL), _row(3, f"Copied by hand.\n{SHELL}")]
+    assert make_dashboard() == {"candidates": [3, 5]}
+    assert commands(creating.superset) == []
+
+
+def test_a_found_object_is_answered_only_to_an_editor_who_may_read_it(creating):
+    """The object a retry finds is answered as any other: unreadable, as one that does not exist; not edited by the
+    caller, with its editors, whom to ask."""
+    made = make_dashboard()
+    (row,) = creating.superset.rows["Dashboard"]
+    row.editors = [SimpleNamespace(id=102, label="owner Live")]
+    creating.not_edited.append(row)
+    assert make_dashboard() == {"not_editor": True, "editors": ["owner Live"]}
+    creating.unreadable.append(row)
+    assert make_dashboard() == {"not_found": "dashboard"}
+    creating.unreadable.clear()
+    creating.not_edited.clear()
+    assert make_dashboard() == made
+    assert len(commands(creating.superset)) == 1
+
+
+def test_the_marker_lock_is_taken_before_the_lookup(creating):
+    """On Postgres: the session's isolation is checked, the wait bounded (`lock_timeout`, as `lock_row` bounds it),
+    then the transaction's advisory lock keyed by the marker taken, and only then the lookup and the create, whose
+    commit releases the lock. A found object ends the transaction by a rollback, which releases it."""
+    make_dashboard()
+    assert creating.superset.ran == [
+        ("isolation",), ("execute", LOCK_TIMEOUT, {"timeout": "30000ms"}), ("execute", ADVISORY_LOCK, {"marker": SHELL}),
+        ("lookup", "Dashboard"), ("CreateDashboardCommand", ANY), ("commit",), ("rollback",)]
+    creating.superset.ran.clear()
+    make_dashboard()
+    assert creating.superset.ran == [
+        ("isolation",), ("execute", LOCK_TIMEOUT, {"timeout": "30000ms"}), ("execute", ADVISORY_LOCK, {"marker": SHELL}),
+        ("lookup", "Dashboard"), ("rollback",)]
+
+
+def test_the_marker_lock_is_held_until_the_create_commits(creating):
+    """Inside the lock run only the lookup and the create, so nothing ends the transaction before the create's own
+    commit; the query check, which runs Superset's chart data command and may end a transaction of its own, runs
+    before the lock. (The last rollback ends the transaction the commit left, which holds nothing.)"""
+    make_funnel()
+    kinds = _kinds(creating.superset)
+    lock = creating.superset.ran.index(("execute", ADVISORY_LOCK, {"marker": STEP}))
+    assert "chart_data" in kinds[:lock]
+    assert kinds[lock + 1:] == ["lookup", "CreateChartCommand", "commit", "rollback"]
+
+
+def test_a_contended_marker_lock_answers_busy(creating):
+    """Another create holding the marker's lock past the lock timeout (55P03): busy, nothing looked up or made, and
+    the transaction the error aborted ends."""
+    creating.metadata.contended = "pg_advisory_xact_lock"
+    assert make_dashboard() == {"busy": True}
+    assert make_funnel() == {"busy": True}
+    kinds = _kinds(creating.superset)
+    assert "lookup" not in kinds and commands(creating.superset) == []
+    assert kinds[-1] == "rollback"
+
+
+@pytest.mark.parametrize("dialect", ["mysql", "mariadb"])
+def test_mysql_takes_and_releases_a_named_lock(creating, dialect):
+    """A MySQL named lock belongs to a connection, not a transaction, so it is taken and released on a connection of
+    its own, never the session's, held from before the lookup until after the create's commit, and released also when
+    the create raises. Its name is built in Python from the marker: 63 characters, inside MySQL's 64."""
+    creating.on(dialect)
+    name = "mnemiq:" + hashlib.sha256(SHELL.encode()).hexdigest()[:56]
+    assert len(name) == 63
+    made = make_dashboard()
+    assert set(made) == {"dashboard_id"}, made
+    assert creating.superset.ran == [
+        ("isolation",), ("connect", 1), ("on", 1, GET_LOCK, {"name": name, "seconds": 30}), ("lookup", "Dashboard"),
+        ("CreateDashboardCommand", ANY), ("commit",), ("on", 1, RELEASE_LOCK, {"name": name}), ("close", 1),
+        ("rollback",)]
+    creating.superset.ran.clear()
+    creating.superset.rows["Dashboard"].clear()
+    creating.superset.create = RuntimeError("the metadata database went away")
+    with pytest.raises(RuntimeError):
+        make_dashboard()
+    assert creating.superset.ran == [
+        ("isolation",), ("connect", 2), ("on", 2, GET_LOCK, {"name": name, "seconds": 30}), ("lookup", "Dashboard"),
+        ("CreateDashboardCommand", ANY), ("rollback",), ("on", 2, RELEASE_LOCK, {"name": name}), ("close", 2),
+        ("rollback",)]
+
+
+@pytest.mark.parametrize(("configured", "seconds"), [(2.5, 2), (0.5, 1), (44.9, 44)])
+def test_mysql_waits_whole_seconds_inside_the_lock_timeout(creating, configured, seconds):
+    """`GET_LOCK` waits `MNEMIQ_LOCK_TIMEOUT_S` in whole seconds, rounded down so the wait stays inside the setting's
+    bound, and at least one."""
+    creating.on("mysql")
+    creating.superset.config["MNEMIQ_LOCK_TIMEOUT_S"] = configured
+    make_dashboard()
+    (asked,) = [entry for entry in creating.superset.ran if entry[:3] == ("on", 1, GET_LOCK)]
+    assert asked[3]["seconds"] == seconds
+
+
+@pytest.mark.parametrize("got", [0, None])
+def test_a_mysql_lock_timeout_answers_busy(creating, got):
+    """`GET_LOCK` answers 0 when its wait times out and NULL on an error: busy, with no lookup and no create."""
+    creating.on("mysql").got_lock = got
+    assert make_dashboard() == {"busy": True}
+    assert creating.superset.ran == [("isolation",), ("connect", 1), ("on", 1, GET_LOCK, ANY), ("close", 1),
+                                     ("rollback",)]
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+@pytest.mark.parametrize("level", ["REPEATABLE READ", "SERIALIZABLE", "READ UNCOMMITTED"])
+def test_a_create_under_another_isolation_level_is_refused(creating, dialect, level):
+    """The lookup must see an object the moment another create commits it, which READ COMMITTED gives; under a
+    snapshot fixed earlier in the transaction it would not. Refused before any lock, lookup or create."""
+    creating.on(dialect).isolation = level
+    assert make_dashboard() == {"refused": "isolation"}
+    assert make_funnel() == {"refused": "isolation"}
+    assert {"execute", "connect", "lookup"} & set(_kinds(creating.superset)) == set()
+    assert commands(creating.superset) == []
+    # The control: READ COMMITTED, however SQLAlchemy spells it, creates.
+    creating.metadata.isolation = "read committed"
+    assert set(make_dashboard()) == {"dashboard_id"}
+
+
+def test_an_exhausted_pool_answers_busy(creating):
+    """No connection comes free for MySQL's named lock within the pool's timeout: busy, nothing looked up or made."""
+    creating.on("mysql").pool_exhausted = True
+    assert make_dashboard() == {"busy": True}
+    assert "lookup" not in _kinds(creating.superset) and commands(creating.superset) == []
+
+
+def test_a_retry_by_a_caller_no_longer_an_editor_is_refused_first(creating):
+    """A caller who stopped editing the dashboard between the lost answer and the retry is told so, naming its
+    editors, before anything else: no lock, no lookup, no query check."""
+    make_funnel()
+    creating.not_edited.append(creating.dashboard)
+    creating.superset.ran.clear()
+    assert make_funnel() == {"not_editor": True, "editors": ["analyst Live"]}
+    assert creating.superset.ran == []
+
+
+def test_sqlite_takes_no_marker_lock(creating):
+    """SQLite, Superset's single-person development default: no lock and no isolation check, and a retry still finds
+    the object its marker names."""
+    creating.on("sqlite")
+    first = make_dashboard()
+    assert make_dashboard() == first
+    assert {"isolation", "execute", "connect"} & set(_kinds(creating.superset)) == set()
+    assert len(commands(creating.superset)) == 1
+
+
+def test_another_metadata_database_is_refused(creating):
+    """A metadata database the marker's lock is not written for is refused, rather than created on without a lock."""
+    creating.on("mssql")
+    assert make_dashboard() == {"refused": "metadata_database"}
+    assert "lookup" not in _kinds(creating.superset) and commands(creating.superset) == []

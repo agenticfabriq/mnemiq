@@ -70,6 +70,10 @@ class DBAPIError(SQLAlchemyError):
     pass
 
 
+class PoolTimeoutError(SQLAlchemyError):
+    """SQLAlchemy's `TimeoutError`: no connection came free in the pool within its timeout."""
+
+
 class MarshmallowValidationError(Exception):
     pass
 
@@ -92,6 +96,25 @@ def database_error(sqlstate: str) -> DBAPIError:
     return error
 
 
+class Column:
+    """A model's column, stood in: a filter on it answers what it asks, for a session stand-in to apply."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def like(self, pattern: str, escape: str | None = None) -> tuple:
+        return ("like", self.name, pattern, escape)
+
+    def is_(self, value) -> tuple:
+        return ("is", self.name, value)
+
+
+def model(name: str) -> type:
+    """A model stood in: the columns a lookup by marker reads."""
+    return type(name, (), {"id": Column("id"), "description": Column("description"),
+                           "deleted_at": Column("deleted_at")})
+
+
 class SubjectType:
     """rc2's `SubjectType` (`superset/subjects/types.py`): what an editor subject stands for."""
 
@@ -106,11 +129,43 @@ def install(monkeypatch) -> SimpleNamespace:
     exception; `update`: what `UpdateDashboardCommand.run` does; `config`: Superset's config, as
     `flask.current_app.config`; `features`: the feature flags `is_feature_enabled` answers on; `g`: `flask.g`, whose
     `user` is the request's user; `user_subjects`: each user's own subject, by user id, as `get_user_subject` finds it;
-    `charts`, `dashboards`, `datasets`: what `ChartDAO`, `DashboardDAO` and `DatasetDAO` find, by id) and what the
-    tools did (`ran`: each command run, in order, with its arguments)."""
+    `charts`, `dashboards`, `datasets`: what `ChartDAO`, `DashboardDAO` and `DatasetDAO` find, by id; `session`:
+    `db.session`, which each command commits when its `run` returns and rolls back when it raises, as rc2's
+    `@transaction` does; `rows`: the metadata database's dashboards and charts, by model name, to which each create
+    command adds the row it makes; `create`: an exception a create command raises instead) and what the tools did
+    (`ran`: each command run, in order, with its arguments)."""
     state = SimpleNamespace(chart_data={"queries": [{"data": [], "status": "success"}]}, delete=None, restore=None,
-                            update=None, ran=[], config={}, features=set(), g=SimpleNamespace(), user_subjects={},
-                            charts={}, dashboards={}, datasets={}, next_chart_id=500)
+                            update=None, create=None, ran=[], config={}, features=set(), g=SimpleNamespace(),
+                            user_subjects={}, charts={}, dashboards={}, datasets={}, session=None,
+                            rows={"Dashboard": [], "Slice": []}, next_id=500)
+
+    class Db:
+        @property
+        def session(self):
+            return state.session
+
+    def transaction(work):
+        """What rc2's `@transaction` (`superset/utils/decorators.py`) does around a command's `run`: the session is
+        committed when `work` returns and rolled back when it raises."""
+        try:
+            result = work()
+        except Exception:
+            if state.session is not None:
+                state.session.rollback()
+            raise
+        if state.session is not None:
+            state.session.commit()
+        return result
+
+    def created(model_name: str, command_name: str, properties: dict) -> SimpleNamespace:
+        state.ran.append((command_name, properties))
+        if state.create is not None:
+            raise state.create
+        state.next_id += 1
+        row = SimpleNamespace(id=state.next_id, description=properties.get("description"), deleted_at=None,
+                              editors=[])
+        state.rows[model_name].append(row)
+        return row
 
     class ChartDataQueryContextSchema:
         def load(self, context: dict) -> dict:
@@ -138,43 +193,52 @@ def install(monkeypatch) -> SimpleNamespace:
                 self.argument = arguments[0] if len(arguments) == 1 else arguments
 
             def run(self) -> None:
-                state.ran.append((name, self.argument))
-                if (raised := getattr(state, outcome)) is not None:
-                    raise raised
+                def work() -> None:
+                    state.ran.append((name, self.argument))
+                    if (raised := getattr(state, outcome)) is not None:
+                        raise raised
+
+                transaction(work)
 
         Command.__name__ = name
         return Command
 
-    class CreateChartCommand:
-        def __init__(self, properties: dict) -> None:
-            self.properties = properties
+    def create_command(model_name: str, name: str):
+        class Command:
+            def __init__(self, properties: dict) -> None:
+                self.properties = properties
 
-        def run(self) -> SimpleNamespace:
-            state.ran.append(("CreateChartCommand", self.properties))
-            state.next_chart_id += 1
-            return SimpleNamespace(id=state.next_chart_id)
+            def run(self) -> SimpleNamespace:
+                return transaction(lambda: created(model_name, name, self.properties))
+
+        Command.__name__ = name
+        return Command
 
     def get_user_id():
         return getattr(getattr(state.g, "user", None), "id", None)
 
     modules = {
         "flask": {"current_app": SimpleNamespace(config=state.config), "g": state.g},
-        "superset": {"is_feature_enabled": lambda name: name in state.features},
+        "superset": {"is_feature_enabled": lambda name: name in state.features, "db": Db()},
         "superset.utils.core": {"get_user_id": get_user_id},
         "superset.subjects.types": {"SubjectType": SubjectType},
         "superset.subjects.utils": {"get_user_subject": lambda user_id: state.user_subjects.get(user_id)},
-        "superset.models.slice": {"Slice": type("Slice", (), {"id": "slices.id"})},
-        "superset.connectors.sqla.models": {"SqlaTable": type("SqlaTable", (), {"id": "tables.id"})},
+        "superset.models.slice": {"Slice": model("Slice")},
+        "superset.models.dashboard": {"Dashboard": model("Dashboard")},
+        "superset.connectors.sqla.models": {"SqlaTable": model("SqlaTable")},
         "superset.daos.dashboard": {"DashboardDAO": SimpleNamespace(
             find_by_id=lambda dashboard_id: state.dashboards.get(dashboard_id))},
         "superset.daos.dataset": {"DatasetDAO": SimpleNamespace(
             find_by_id=lambda dataset_id: state.datasets.get(dataset_id))},
         "superset.commands.chart.update": {"UpdateChartCommand": command("UpdateChartCommand", "update")},
-        "superset.commands.chart.create": {"CreateChartCommand": CreateChartCommand},
+        "superset.commands.chart.create": {"CreateChartCommand": create_command("Slice", "CreateChartCommand")},
+        "superset.commands.dashboard.create": {
+            "CreateDashboardCommand": create_command("Dashboard", "CreateDashboardCommand")},
         "superset.commands.dataset.update": {"UpdateDatasetCommand": command("UpdateDatasetCommand", "update")},
         "marshmallow": {"ValidationError": MarshmallowValidationError},
         "sqlalchemy": {"text": lambda sql: sql},
-        "sqlalchemy.exc": {"SQLAlchemyError": SQLAlchemyError, "DBAPIError": DBAPIError},
+        "sqlalchemy.exc": {"SQLAlchemyError": SQLAlchemyError, "DBAPIError": DBAPIError,
+                           "TimeoutError": PoolTimeoutError},
         "superset.exceptions": {"SupersetException": SupersetException,
                                 "SupersetSecurityException": SupersetSecurityException,
                                 "QueryObjectValidationError": QueryObjectValidationError},

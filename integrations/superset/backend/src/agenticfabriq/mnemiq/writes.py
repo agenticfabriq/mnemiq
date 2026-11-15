@@ -12,6 +12,11 @@ Every tool keeps these rules:
   one's `changed_on`, and answers `{"stale": true}`. `{"busy": true}` is for a lock-contention error alone
   (`superset/versioning/db_errors.py`, `is_lock_contention_error`), a wait past the lock timeout among them
   (`lock_row`), and the same request may be sent again.
+- A create carrying a build's marker makes its object once (`_find_or_create`): under a lock keyed by the marker it
+  answers the object whose description's last line is that marker, and creates one only when there is none, so a
+  create whose answer was lost may be sent again. Every check that refuses the caller runs before the lock, and only
+  the lookup and the create inside it, whose commit releases it. A marker's lock not taken in time answers
+  `{"busy": true}` too.
 - Its answer is short and structured. Superset's own text never reaches it: any of Superset's exceptions is logged
   here and answered by its kind.
 - A caller who is not an editor of the object is told so before anything about the object's state (a stale
@@ -31,6 +36,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import functools
+import hashlib
 import json
 import logging
 import re
@@ -363,11 +369,11 @@ LOCK_TIMEOUT_S = 30
 CALL_DEADLINE_S = 45
 
 
-def _lock_timeout() -> str:
-    """The `lock_timeout` to set, as Postgres reads it: `MNEMIQ_LOCK_TIMEOUT_S` seconds when that is a number above 0
-    and below `CALL_DEADLINE_S`, else `LOCK_TIMEOUT_S`, with a warning naming the setting. The bound also keeps the
-    value finite, a whole number of milliseconds once rounded, and under Postgres' largest `lock_timeout`
-    (2147483647 ms), which a larger value would make the write fail on."""
+def _lock_timeout_s() -> float:
+    """How long a write waits for a lock another transaction holds, in seconds: `MNEMIQ_LOCK_TIMEOUT_S` when that is
+    a number above 0 and below `CALL_DEADLINE_S`, else `LOCK_TIMEOUT_S`, with a warning naming the setting. The bound
+    also keeps the value finite, a whole number of milliseconds once rounded, and under Postgres' largest
+    `lock_timeout` (2147483647 ms), which a larger value would make the write fail on."""
     from flask import current_app
 
     value = current_app.config.get("MNEMIQ_LOCK_TIMEOUT_S", LOCK_TIMEOUT_S)
@@ -375,7 +381,22 @@ def _lock_timeout() -> str:
         logger.warning("mnemiq extension: MNEMIQ_LOCK_TIMEOUT_S must be a number of seconds above 0 and below %s "
                        "(mnemiq's deadline for a call); waiting %s", CALL_DEADLINE_S, LOCK_TIMEOUT_S)
         value = LOCK_TIMEOUT_S
-    return f"{max(1, round(value * 1000))}ms"
+    return value
+
+
+def _lock_timeout() -> str:
+    """The `lock_timeout` to set, as Postgres reads it: `_lock_timeout_s()` in milliseconds."""
+    return f"{max(1, round(_lock_timeout_s() * 1000))}ms"
+
+
+def _bound_lock_waits(session: Any) -> None:
+    """On a Postgres metadata database, bounds each lock wait for the rest of `session`'s transaction:
+    `SET LOCAL lock_timeout`, written `set_config(..., true)` so the value is a bound parameter. A wait past it fails
+    with SQLSTATE 55P03 (lock_not_available), which rc2's `is_lock_contention_error` counts as contention
+    (`superset/versioning/db_errors.py`, `_PG_LOCK_CONTENTION`)."""
+    from sqlalchemy import text
+
+    session.execute(text("SELECT set_config('lock_timeout', :timeout, true)"), {"timeout": _lock_timeout()})
 
 
 def lock_row(model: type, entity_id: int) -> Any:
@@ -383,13 +404,11 @@ def lock_row(model: type, entity_id: int) -> Any:
     visible (a row in the trash is not). A blocking `SELECT ... FOR UPDATE` of the primary-key row, so it serialises
     against every other writer that locks the row, rc2's own dataset `PUT` included.
 
-    On Postgres the wait is bounded first: `SET LOCAL lock_timeout` (written `set_config(..., true)`, so the value is a
-    bound parameter) holds until the transaction ends, which is the command's commit or `_locked`'s rollback. It
-    bounds each lock wait in that transaction on its own, this row's lock and any lock a write of the command waits
-    for after it, not the write as a whole. A wait past it fails with SQLSTATE 55P03
-    (lock_not_available), which rc2's `is_lock_contention_error` counts as contention (`superset/versioning/
-    db_errors.py`, `_PG_LOCK_CONTENTION`), so the tool answers `{"busy": true}`. SQLite takes no row locks, and MySQL
-    has no lock timeout that ends with the transaction: there the database's own setting applies.
+    On Postgres the wait is bounded first (`_bound_lock_waits`), until the transaction ends, which is the command's
+    commit or `_locked`'s rollback. It bounds each lock wait in that transaction on its own, this row's lock and any
+    lock a write of the command waits for after it, not the write as a whole. A wait past it fails with SQLSTATE 55P03,
+    so the tool answers `{"busy": true}`. SQLite takes no row locks, and MySQL has no lock timeout that ends with the
+    transaction: there the database's own setting applies.
 
     This is rc2's `lock_entity_for_update` (`superset/versioning/api_helpers.py`) with eager loads off, as rc2 reads a
     row it locks for a version restore (`superset/commands/version_restore.py`). `lock_entity_for_update` cannot lock
@@ -397,11 +416,9 @@ def lock_row(model: type, entity_id: int) -> Any:
     FOR UPDATE`, and Postgres rejects `FOR UPDATE` with `DISTINCT`. With eager loads off only the row itself is read;
     its relationships (editors, metrics, charts) load when first read, in the same locked transaction. Every locked
     tool takes its lock here, so the rule is one rule."""
-    from sqlalchemy import text
-
     session = _session()
     if session.get_bind().dialect.name == "postgresql":
-        session.execute(text("SELECT set_config('lock_timeout', :timeout, true)"), {"timeout": _lock_timeout()})
+        _bound_lock_waits(session)
     return (session.query(model).populate_existing().enable_eagerloads(False)
             .filter(model.id == entity_id).with_for_update().one_or_none())
 
@@ -423,6 +440,153 @@ def _locked(model: type, entity_id: int, write: Callable[[Any], dict]) -> dict:
             logger.info("mnemiq extension: the lock on %s %s is contended", model.__name__, entity_id)
             return BUSY
         return write(entity)
+    finally:
+        _session().rollback()
+
+
+# ---------------------------------------------------------------- a create carrying a build's marker
+
+class _NotLocked(Exception):
+    """The marker's lock was not taken; `answer` is what the create answers instead."""
+
+    def __init__(self, answer: dict) -> None:
+        super().__init__(answer)
+        self.answer = answer
+
+
+# SQLAlchemy's names for a MySQL metadata database: MariaDB's dialect is MySQL's, named apart by a `mariadb://` URI.
+_MYSQL = ("mysql", "mariadb")
+
+
+def _like_suffix(marker: str) -> str:
+    """A `LIKE` pattern, escaped with a backslash, for a text that ends with `marker`: `%`, then the marker with the
+    backslash, `%` and `_` each escaped, so the marker is read literally (a step key's `_` is not any one character)."""
+    return "%" + marker.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _marked(model: type, marker: str) -> list[Any]:
+    """The rows of `model`, out of the trash, whose description's last line is exactly `marker`, by id. Two filters:
+    the database's keeps a description that ends with the marker (`LIKE`, `_like_suffix`; SQLAlchemy writes the
+    escape character as each dialect reads it, where a hand-written `ESCAPE '\\'` is an unterminated string to MySQL's
+    default mode); Python's then keeps a row only when its last line is the marker alone, so a marker with text typed
+    before it on its line is not found, as one with text after it or under it is not."""
+    rows = (_session().query(model)
+            .filter(model.description.like(_like_suffix(marker), escape="\\"), model.deleted_at.is_(None))
+            .order_by(model.id))
+    return [row for row in rows if (row.description or "").splitlines()[-1:] == [marker]]
+
+
+@contextlib.contextmanager
+def _named_lock(engine: Any, marker: str) -> Iterator[None]:
+    """MySQL's named lock for `marker`, held over the block. A named lock belongs to a connection, not a transaction,
+    so it is taken and released on a connection of its own (`engine.connect()`), never the session's, on which the
+    create commits: open from before the lookup until after the create's commit, released also when the block raises,
+    and closed after the release. The name is `mnemiq:` and the marker's SHA-256, cut to 63 characters (MySQL allows
+    64). The wait is `_lock_timeout_s()` in whole seconds, rounded down so it stays inside the setting's bound, and
+    at least one. `GET_LOCK` answering anything but 1 (0 when the wait timed out, NULL on an error) raises
+    `_NotLocked` with `{"busy": true}`, and so does no connection coming free in the pool in time (SQLAlchemy's
+    `TimeoutError`)."""
+    from sqlalchemy import text
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+    name = "mnemiq:" + hashlib.sha256(marker.encode()).hexdigest()[:56]
+    try:
+        connection = engine.connect()
+    except PoolTimeoutError:
+        logger.info("mnemiq extension: no connection came free to take a marker's lock on")
+        raise _NotLocked(BUSY) from None
+    try:
+        held = connection.execute(text("SELECT GET_LOCK(:name, :seconds)"),
+                                  {"name": name, "seconds": max(1, int(_lock_timeout_s()))}).scalar()
+        if held != 1:
+            logger.info("mnemiq extension: the lock on a marker is contended")
+            raise _NotLocked(BUSY)
+        try:
+            yield
+        finally:
+            connection.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": name})
+    finally:
+        connection.close()
+
+
+@contextlib.contextmanager
+def _marker_lock(marker: str) -> Iterator[None]:
+    """Holds the lock keyed by `marker` over the block, so that of two creates carrying one marker the second looks
+    for the object only once the first has committed it or given up. Raises `_NotLocked` when the lock is not taken.
+
+    The lookup must see an object the moment another create commits it, which READ COMMITTED gives: rc2 sets it on
+    Postgres and MySQL unless `SQLALCHEMY_ENGINE_OPTIONS` names another level (`SupersetAppInitializer.
+    set_db_default_isolation`). Under a level whose snapshot is fixed at the transaction's first read, before the
+    lock, a create could miss the object another one made, so the session's own level is read first and any other
+    level is refused (`{"refused": "isolation"}`).
+
+    - Postgres: the transaction's advisory lock on the marker's hash, its wait bounded as `lock_row`'s is
+      (`_bound_lock_waits`), so a wait past the lock timeout (55P03) answers `{"busy": true}`. The transaction's end
+      releases it: the create command's commit, or `_find_or_create`'s rollback.
+    - MySQL: a named lock on a connection of its own (`_named_lock`).
+    - SQLite: no lock and no isolation check. A SQLite metadata database is Superset's single-person development
+      default, where a create sent again while its own lost first one still runs does not happen in practice.
+    - Any other metadata database: refused (`{"refused": "metadata_database"}`), rather than created on unlocked."""
+    from sqlalchemy import text
+    from sqlalchemy.exc import DBAPIError
+    from superset.versioning.db_errors import is_lock_contention_error
+
+    session = _session()
+    dialect = session.get_bind().dialect.name
+    if dialect == "sqlite":
+        yield
+        return
+    if dialect != "postgresql" and dialect not in _MYSQL:
+        logger.warning("mnemiq extension: a create carrying a marker takes no lock on a %s metadata database",
+                       dialect)
+        raise _NotLocked({"refused": "metadata_database"})
+    level = session.connection().get_isolation_level()
+    if not isinstance(level, str) or level.upper() != "READ COMMITTED":
+        logger.warning("mnemiq extension: a create carrying a marker needs the metadata database's READ COMMITTED "
+                       "isolation, not %s", level)
+        raise _NotLocked({"refused": "isolation"})
+    if dialect in _MYSQL:
+        with _named_lock(session.get_bind(), marker):
+            yield
+        return
+    _bound_lock_waits(session)
+    try:
+        session.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:marker, 0))"), {"marker": marker})
+    except DBAPIError as exc:
+        if not is_lock_contention_error(exc):
+            raise
+        logger.info("mnemiq extension: the lock on a marker is contended")
+        raise _NotLocked(BUSY) from exc
+    yield
+
+
+def _find_or_create(model: type, marker: str, *, kind: str, create: Callable[[], dict]) -> dict:
+    """The object of `model` that `marker` names, or `create()`'s answer when there is none, under the marker's lock
+    (`_marker_lock`): a create whose answer was lost, sent again, answers the object the first one made instead of
+    making a second. One object found (`_marked`) is answered `{"<kind>_id": id}` when the caller may read it and
+    edits it, else as one that does not exist or with its editors (`_not_editor`); more than one, `{"candidates":
+    [ids]}`, for the build to name; a lock not taken, `{"busy": true}` or the refusal that says why.
+
+    Only the lookup and the create run inside the lock. Every check that refuses the caller, and any of rc2's work
+    that might end the session's transaction (a query check), runs before it, so the lock is held until the create's
+    own commit. Whatever is answered, the session's transaction ends here, so a found object releases the lock too."""
+    try:
+        with _marker_lock(marker):
+            found = _marked(model, marker)
+            if len(found) > 1:
+                return {"candidates": [row.id for row in found]}
+            if not found:
+                return create()
+            (row,) = found
+            security = _security()
+            readable = {"dashboard": security.can_access_dashboard, "chart": security.can_access_chart}[kind]
+            if not readable(row):
+                return _not_found(kind)
+            if not security.is_editor(row):
+                return _not_editor(row)
+            return {f"{kind}_id": row.id}
+    except _NotLocked as not_locked:
+        return not_locked.answer
     finally:
         _session().rollback()
 
@@ -544,17 +708,22 @@ def _claimed_dataset_editors(dataset: Any, dashboard: Any) -> list[int]:
 @_answering("create_dashboard")
 def create_dashboard(found: dict) -> dict:
     """An unpublished dashboard with an empty layout, the caller as its editor, and the build's marker as its
-    description. The marker is the shell's own (`new`): the dashboard has no id until this returns."""
+    description, made once for the marker: sent again, it answers the dashboard the first one made
+    (`_find_or_create`). The marker is the shell's own (`new`): the dashboard has no id until this returns."""
     if claim_marker(found["marker"], None) is None:
         return BAD_MARKER
     from superset.commands.dashboard.create import CreateDashboardCommand
+    from superset.models.dashboard import Dashboard
 
-    try:
-        dashboard = CreateDashboardCommand({"dashboard_title": found["title"], "published": False,
-                                            "description": found["marker"]}).run()
-    except _command_errors() as exc:
-        return _command_answer("create_dashboard", exc, kind="dashboard")
-    return {"dashboard_id": dashboard.id}
+    def create() -> dict:
+        try:
+            dashboard = CreateDashboardCommand({"dashboard_title": found["title"], "published": False,
+                                                "description": found["marker"]}).run()
+        except _command_errors() as exc:
+            return _command_answer("create_dashboard", exc, kind="dashboard")
+        return {"dashboard_id": dashboard.id}
+
+    return _find_or_create(Dashboard, found["marker"], kind="dashboard", create=create)
 
 
 def _claim(found: dict, resource: Any, *, kind: str, extra: Callable[[Any], dict | Mapping],
@@ -669,8 +838,9 @@ def _check_query(context: dict) -> dict | None:
 def create_chart(found: dict) -> dict:
     """A funnel or a sankey on the dataset, for the dashboard: its query is run first and the chart saved only if it
     runs; then `CreateChartCommand` saves its params, its query context, the editors `_chart_editors` chooses and the
-    build's marker. The editors are read in the create's own transaction. The chart joins the dashboard when a layout
-    places it (`set_layout`)."""
+    build's marker, once for the marker: sent again, it answers the chart the first one made (`_find_or_create`). The
+    editors are read in the create's own transaction. The chart joins the dashboard when a layout places it
+    (`set_layout`)."""
     if claim_marker(found["marker"], found["dashboard_id"]) is None:
         return BAD_MARKER
     dataset_id, viz_type, form_data = found["dataset_id"], found["viz_type"], found["params"]
@@ -695,16 +865,21 @@ def create_chart(found: dict) -> dict:
         return _not_editor(dashboard)
     if (failure := _check_query(context)) is not None:
         return failure
+    editors = _chart_editors(dataset, dashboard, ())
     from superset.commands.chart.create import CreateChartCommand
+    from superset.models.slice import Slice
 
-    try:
-        chart = CreateChartCommand({
-            "slice_name": found["slice_name"], "viz_type": viz_type, "datasource_id": dataset_id,
-            "datasource_type": "table", "params": json.dumps(form_data), "query_context": json.dumps(context),
-            "editors": _chart_editors(dataset, dashboard, ()), "description": found["marker"]}).run()
-    except _command_errors() as exc:
-        return _command_answer("create_chart", exc, kind="dataset")
-    return {"chart_id": chart.id}
+    def create() -> dict:
+        try:
+            chart = CreateChartCommand({
+                "slice_name": found["slice_name"], "viz_type": viz_type, "datasource_id": dataset_id,
+                "datasource_type": "table", "params": json.dumps(form_data), "query_context": json.dumps(context),
+                "editors": editors, "description": found["marker"]}).run()
+        except _command_errors() as exc:
+            return _command_answer("create_chart", exc, kind="dataset")
+        return {"chart_id": chart.id}
+
+    return _find_or_create(Slice, found["marker"], kind="chart", create=create)
 
 
 def _patch(found: dict, chart: Any) -> dict:

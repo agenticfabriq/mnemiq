@@ -34,7 +34,7 @@ Run `superset init` after the first load so roles receive the route's permission
 | `MNEMIQ_TOKEN_AUDIENCE` | The `aud` claim. |
 | `MNEMIQ_TOKEN_TENANT` | The `tenant` claim. |
 | `MNEMIQ_TOKEN_LIFETIME_S` | Seconds a token lives. At most 300, which is also the default. |
-| `MNEMIQ_LOCK_TIMEOUT_S` | Seconds a write tool waits for each lock another transaction holds before it answers `{"busy": true}`. Default 30. It must be above 0 and below 45, mnemiq's default deadline for a call, or a write could land after mnemiq gave up on it: any other value is not used, and the extension logs a warning naming the setting and waits 30. Applies on a Postgres metadata database; on MySQL the database's own lock wait applies. |
+| `MNEMIQ_LOCK_TIMEOUT_S` | Seconds a write tool waits for each lock another transaction holds before it answers `{"busy": true}`. Default 30. It must be above 0 and below 45, mnemiq's default deadline for a call, or a write could land after mnemiq gave up on it: any other value is not used, and the extension logs a warning naming the setting and waits 30. On a Postgres metadata database it bounds every lock wait; on MySQL it bounds a create's wait for its marker's lock (in whole seconds), and a row's lock waits as long as the database's own setting says. |
 
 All but the lifetime and the lock timeout are required; the route answers 503 naming the one that is missing.
 
@@ -102,6 +102,16 @@ Every write to an existing row first locks that row and compares the `changed_on
 writers the second answers `{"stale": true}`. A write that waits for the row longer than `MNEMIQ_LOCK_TIMEOUT_S`
 answers `{"busy": true}` and changes nothing; the same request may be sent again. Answers are short structured objects;
 Superset's own error text never reaches them.
+
+A create carrying a build's marker (`create_dashboard`, `create_chart`) makes its object once, so a create whose
+answer was lost may be sent again. Under a lock keyed by the marker (a transaction's advisory lock on Postgres, a named
+lock on MySQL, each waited for at most `MNEMIQ_LOCK_TIMEOUT_S`, else `{"busy": true}`) it looks for an object out of
+the trash whose description's last line is that marker: it answers that one's id, `{"candidates": [...]}` when there
+are several, and creates the object when there is none. The lookup needs the metadata database's READ COMMITTED
+isolation, Superset's default on Postgres and MySQL; under any other level a create answers `{"refused":
+"isolation"}`, and on any other metadata database `{"refused": "metadata_database"}`. A SQLite metadata database takes
+no marker lock, being Superset's single-person development default: there a create sent again while the first is still
+running could make a second object.
 
 ## The read tools
 
