@@ -1429,3 +1429,38 @@ def test_a_grouping_sets_answer_is_named_as_such(fake):
     assert check.status is ChartStatus.NOT_CHECKED, check.reason
     assert "grouping sets" in check.reason and "total" not in check.reason, check.reason
     assert _statements(fake) == []
+
+
+# --- a hook before each of the check's calls, so a caller can renew a lease or stop
+
+
+def test_before_call_runs_before_each_call_the_check_makes(fake):
+    """`before_call` runs before every Superset call the check makes itself, and once before mnemiq's own decided
+    statement (whose catalogue reads and probe run under it): each run comes before the call it precedes."""
+    _serve(fake, form_data=_bar(), chart=_chart_data(["region", "Total premium"], ("east", 1200), ("west", 800)),
+           mnemiq=_result(("east", 1200), ("west", 800)))
+    seen: list[int] = []
+    check = check_chart(_adapter(fake), chart_id=CHART_ID, dataset_id=DATASET_ID, kinds=TOTAL["kinds"], saved={},
+                        snapshot=SNAPSHOT, grants=GRANTS, guard_fanout=False,
+                        before_call=lambda: seen.append(len(fake.calls)))
+    assert check.status is ChartStatus.CHECKED, check.reason
+    assert seen == [0, 1, 2, 3], seen
+    assert [call.tool for call in fake.calls[:3]] == ["get_chart_info", "get_dataset_info", "get_chart_data"]
+    assert len(fake.calls) > 3 and {call.tool for call in fake.calls[3:]} == {"execute_sql"}
+
+
+def test_a_before_call_that_raises_stops_the_check_before_its_next_call(fake):
+    _serve(fake, form_data=_bar(), chart=_chart_data(["region", "Total premium"], ("east", 1200)),
+           mnemiq=_result(("east", 1200)))
+
+    class Stop(Exception):
+        pass
+
+    def second_stops():
+        if len(fake.calls) == 1:
+            raise Stop()
+
+    with pytest.raises(Stop):
+        check_chart(_adapter(fake), chart_id=CHART_ID, dataset_id=DATASET_ID, kinds=TOTAL["kinds"], saved={},
+                    snapshot=SNAPSHOT, grants=GRANTS, guard_fanout=False, before_call=second_stops)
+    assert [call.tool for call in fake.calls] == ["get_chart_info"]

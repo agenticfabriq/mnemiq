@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
@@ -357,7 +358,10 @@ def _raise_terminal(adapter) -> None:
 
 
 def _own_rows(sql: str, expectation: Expectation, *, chart_id: int, adapter, snapshot: Snapshot, grants: GrantSet,
-              timeout_s: float, guard_fanout: bool | None) -> _Rows | NotCheckable:
+              timeout_s: float, guard_fanout: bool | None, before_call: Callable[[], None] | None = None,
+              ) -> _Rows | NotCheckable:
+    if before_call is not None:
+        before_call()  # once for the decided statement: its catalogue reads, its probe and its run
     try:
         decided = run_decided(sql, adapter=adapter, snapshot=snapshot, grants=grants, timeout_s=timeout_s,
                               guard_fanout=guard_fanout)
@@ -526,7 +530,7 @@ def _format_problem(viz_type: str, form: dict, kinds: dict[str, MeasureKind],
 
 
 def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, snapshot: Snapshot, grants: GrantSet,
-             guard_fanout: bool | None, timeout_s: float) -> ChartCheck:
+             guard_fanout: bool | None, timeout_s: float, before_call: Callable[[], None] | None = None) -> ChartCheck:
     """The chart's numbers against mnemiq's own: any status but `FORMAT_WRONG`."""
     def not_checked(reason: str) -> ChartCheck:
         return _outcome(chart_id, ChartStatus.NOT_CHECKED, reason)
@@ -575,14 +579,14 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
         mine, source = _dataset_rows(client, expectation, dataset), _QUERY_DATASET
     else:
         mine, source = _own_rows(sql, expectation, chart_id=chart_id, adapter=adapter, snapshot=snapshot, grants=grants,
-                                 timeout_s=timeout_s, guard_fanout=guard_fanout), _OWN_SQL
+                                 timeout_s=timeout_s, guard_fanout=guard_fanout, before_call=before_call), _OWN_SQL
     if isinstance(mine, NotCheckable):
         return not_checked(mine.reason)
     found = _compare(chart_id, chart, mine, _row_limit(form), source=source)
     if found.status is ChartStatus.MISMATCH and expectation.time_grain and source is _OWN_SQL:
         plain = _own_rows(_statement(expectation, dataset, grained=False), expectation, chart_id=chart_id,
                           adapter=adapter, snapshot=snapshot, grants=grants, timeout_s=timeout_s,
-                          guard_fanout=guard_fanout)
+                          guard_fanout=guard_fanout, before_call=before_call)
         # The chart's rows sit on the grain (`_line_up`), yet rows rebuilt without it can too, under a row limit that
         # keeps only first-of-month days. Only on positive evidence: every one of the chart's rows found among mnemiq's
         # ungrouped ones, with equal values. An ungrouped read at its row cap, or an empty chart, proves nothing, and
@@ -592,9 +596,21 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
     return found
 
 
+class _BeforeEachCall:
+    """The adapter's own client, `before` run before each of its calls: how a caller renews a lease, or stops, before
+    each call the check makes. The calls are the client's, carrying its caller's token."""
+
+    def __init__(self, client, before: Callable[[], None]) -> None:
+        self._client, self._before = client, before
+
+    def call(self, tool: str, request: dict, **more):
+        self._before()
+        return self._client.call(tool, request, **more)
+
+
 def check_chart(adapter, *, chart_id: int, dataset_id: int, kinds: dict[str, MeasureKind],
                 saved: dict[str, SavedMetric], snapshot: Snapshot, grants: GrantSet, guard_fanout: bool | None,
-                timeout_s: float = DEFAULT_TIMEOUT_S) -> ChartCheck:
+                timeout_s: float = DEFAULT_TIMEOUT_S, before_call: Callable[[], None] | None = None) -> ChartCheck:
     """Check chart `chart_id` as the caller `adapter` acts for, the builder: Superset is read through `adapter.client`
     and no other, and `adapter` runs mnemiq's own statement under `grants` and `snapshot`. `dataset_id` is the dataset
     mnemiq built the chart on, which a chart saved since in Explore overrides with its own. `kinds` gives the kind of
@@ -604,14 +620,18 @@ def check_chart(adapter, *, chart_id: int, dataset_id: int, kinds: dict[str, Mea
     A wrong format is reported whatever the numbers, unless they are a mismatch or the chart is empty. A chart is
     checked only when the format of every metric mnemiq knows the kind of was judged: numbers that match beside a
     format mnemiq could not judge are not checked, their values kept. A refusal of the caller (`SupersetRefusal`) is
-    raised: it stays the same for every later call the request makes."""
-    client = adapter.client
+    raised: it stays the same for every later call the request makes.
+
+    `before_call`, when given, runs before each Superset call the check makes itself, and once before mnemiq's own
+    decided statement (whose catalogue reads, probe and run the adapter makes); whatever it raises ends the check."""
+    client = adapter.client if before_call is None else _BeforeEachCall(adapter.client, before_call)
     read = _read_chart(client, chart_id)
     if isinstance(read, NotCheckable):
         return _outcome(chart_id, ChartStatus.NOT_CHECKED, read.reason)
     viz_type, form = read
     problem, unjudged = _format_problem(viz_type, form, kinds, saved)
     found = _numbers(client, adapter, chart_id=chart_id, form=form, dataset_id=dataset_id, snapshot=snapshot,
+                     before_call=before_call,
                      grants=grants, guard_fanout=guard_fanout, timeout_s=timeout_s)
     if problem is None and unjudged is not None and found.status is ChartStatus.CHECKED:
         return _outcome(chart_id, ChartStatus.NOT_CHECKED, f"{found.reason}, but {unjudged}", found.chart_values,
