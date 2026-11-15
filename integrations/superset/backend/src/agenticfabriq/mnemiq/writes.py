@@ -904,6 +904,9 @@ def create_chart(found: dict) -> dict:
         shaped = found["viz_type"] is not None and found["params"] is not None and found["set"] is None
     if not shaped:
         return {"refused": "request"}
+    # `set` carries format keys: the dataset is the request's and the type the config's, as a chart's patch leaves them.
+    if from_config and not (params._BINDING_KEYS | {"viz_type"}).isdisjoint(found["set"] or ()):
+        return {"refused": "set"}
     dataset_id = found["dataset_id"]
     prepared = _funnel_form(found) if own else None
     if isinstance(prepared, dict):

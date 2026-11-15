@@ -1387,3 +1387,11 @@ def test_the_config_path_validates_and_compiles_before_the_lock(creating):
     assert kinds[:lock].count("validate") == kinds[:lock].count("map") == kinds[:lock].count("compile") == 1
     assert kinds[:lock].index("validate") < kinds[:lock].index("map") < kinds[:lock].index("compile")
     assert kinds[lock + 1:] == ["lookup", "CreateChartCommand", "commit", "rollback"]
+
+
+@pytest.mark.parametrize("key", ["datasource", "datasource_id", "datasource_type", "viz_type"])
+def test_set_may_not_rebind_a_charts_dataset_or_type(creating, key):
+    """`set` carries format keys only: the dataset binding is the request's and the type is the config's, as a chart's
+    patch leaves them. Refused before anything is validated, mapped, run, locked or created."""
+    assert make_from_config(set={key: "funnel" if key == "viz_type" else 8}) == {"refused": "set"}
+    assert _kinds(creating.superset) == [] and commands(creating.superset) == []
