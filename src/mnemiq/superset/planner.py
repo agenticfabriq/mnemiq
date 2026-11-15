@@ -38,7 +38,7 @@ from sqlglot.errors import SqlglotError
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Snapshot
-from mnemiq.llm.client import ContextTooLong, ModelUnavailable, PromptCut
+from mnemiq.llm.client import ContextTooLong, PromptCut
 from mnemiq.sql.identifiers import resolve_identifier
 from mnemiq.sql.schema import column_types, visible_schema
 from mnemiq.superset.adapter import JINJA_DELIMITERS
@@ -108,17 +108,17 @@ PLANNER_MAX_TOKENS = 4000
 DATASETS_UNREADABLE = ("Superset's list of this builder's datasets could not be read, so no plan was made; mnemiq's "
                        "log records why.")
 NOTHING_VISIBLE = "This builder can read no table here, so there is nothing to plan a dashboard on."
-# A model that fails while planning, in mnemiq's words: a plan refused, as `/v1/ask` answers the same failures with a
-# stated failure inside a 200. The provider's own words go to the log only.
-MODEL_SILENT = ("The model did not respond, so no plan was made. This is an outage, not a judgement about the goal; "
-                "try again.")
-PLAN_TOO_LONG = ("The model server refused the planning prompt as longer than its context window: what this builder "
-                 "can see (the tables, their columns and saved metrics) does not fit one prompt beside the plan's "
-                 "room. This is a configuration problem, not a judgement about the goal: raise the server's window "
-                 "(vLLM: --max-model-len) up to the model's own limit.")
-PLAN_CUT = ("The model server cut the planning prompt to fit its context window, so the model never saw all of what "
-            "this builder can see, and no plan was made from it. This is a configuration problem, not a judgement "
-            "about the goal: raise the server's window (vLLM: --max-model-len) up to the model's own limit.")
+# A planning prompt the model's server refuses, or cuts, as longer than its window: the goal and the schema it is
+# planned on are too large for one prompt, so the plan is refused, in mnemiq's words. The provider's own words go to
+# the log only. A model that does not answer at all is an outage, which the plan step leaves to its caller.
+PLAN_TOO_LONG = ("No plan was made: the goal and what this builder can see (the tables, their columns and saved "
+                 "metrics) are too large to plan in one prompt, and the model server refused the planning prompt as "
+                 "longer than its context window. Raising the server's window (vLLM: --max-model-len) up to the "
+                 "model's own limit lets it plan on a schema this large.")
+PLAN_CUT = ("No plan was made: the goal and what this builder can see (the tables, their columns and saved metrics) "
+            "are too large to plan in one prompt, and the model server cut the planning prompt to fit its context "
+            "window, so the model never saw all of it. Raising the server's window (vLLM: --max-model-len) up to the "
+            "model's own limit lets it plan on a schema this large.")
 
 
 # ---------------------------------------------------------------- the plan
@@ -1198,9 +1198,10 @@ def plan_build(goal: str, *, planner: Planner, client, adapter, snapshot: Snapsh
     With `offer_reuse` False (a build asked for on a dashboard of its own), no dashboard is looked for, and a plan that
     names one to reuse is refused.
 
-    A model that fails (`ModelUnavailable`: no answer, or a server that refuses or cuts the prompt as longer than its
-    window) ends the plan as a refusal in mnemiq's words, never an error, on the first plan or its repair. The prompt
-    holds everything the builder can see and is not fitted to the window: one that does not fit is refused so."""
+    A planning prompt the model's server refuses or cuts as longer than its window (`ContextTooLong`, `PromptCut`)
+    refuses the plan in mnemiq's words, on the first plan or its repair: the goal and what the builder can see are too
+    large for one prompt, which is not fitted to the window. A model that does not answer (`ModelUnavailable`) is an
+    outage, not a plan refused: it is raised as it is, for the caller to answer."""
     if client is not getattr(adapter, "client", None):
         raise ValueError("the planner calls Superset only through the client of the request's adapter")
     goal = (goal or "").strip()
@@ -1217,8 +1218,8 @@ def plan_build(goal: str, *, planner: Planner, client, adapter, snapshot: Snapsh
     for attempt in range(2):
         try:
             answer = planner.plan(goal, context)
-        except ModelUnavailable as exc:
-            return _model_failed(exc)
+        except (ContextTooLong, PromptCut) as exc:
+            return _too_large(exc)
         if isinstance(answer, PlanRefused):
             if not answer.parts and attempt == 0:
                 return answer
@@ -1244,13 +1245,9 @@ def plan_build(goal: str, *, planner: Planner, client, adapter, snapshot: Snapsh
     return PlanRefused(_naming(parts), parts)
 
 
-def _model_failed(exc: ModelUnavailable) -> PlanRefused:
-    logger.warning("the model failed while a build was planned (%s): %s", exc.kind, exc)
-    if isinstance(exc, PromptCut):
-        return PlanRefused(PLAN_CUT)
-    if isinstance(exc, ContextTooLong):
-        return PlanRefused(PLAN_TOO_LONG)
-    return PlanRefused(MODEL_SILENT)
+def _too_large(exc: ContextTooLong | PromptCut) -> PlanRefused:
+    logger.warning("the model's server took a build's planning prompt as too long (%s): %s", exc.kind, exc)
+    return PlanRefused(PLAN_CUT if isinstance(exc, PromptCut) else PLAN_TOO_LONG)
 
 
 # ---------------------------------------------------------------- after the plan

@@ -8,9 +8,13 @@ request, and the build as it stands. Mounted only in Superset mode, and no other
   charts to it (a `dashboard_id` always does that, to the dashboard it names), and with `fresh: true` builds a new
   dashboard; asked either way, no dashboard is looked for. Otherwise the answer is the new build (201), or the plan's
   refusal, which is an answer too. The build keeps the profile it was asked under (`profile`, None for the
-  deployment's default). Asked with a `dashboard_id`, the first thing asked of Superset is whether the builder edits
-  that dashboard (the extension's `editors_of`), before anything is planned or kept: one they cannot read, or that
-  does not exist, is a 404 that does not say which, and one they read but do not edit a 403 naming its editors.
+  deployment's default). Before anything is planned or kept, Superset is asked whether the person may build (the
+  grants; a non-builder is refused as one, `NOT_A_BUILDER`, and nothing about a dashboard they named is read), then
+  whether the extension is there, then, for a `dashboard_id`, whether they edit that dashboard (the extension's
+  `editors_of`): one they cannot read, or that does not exist, is a 404 that does not say which, and one they read
+  but do not edit a 403 naming its editors. A model that does not answer the planning prompt is a 503 saying to try
+  again; a prompt its server refuses or cuts as too long is a refused plan, since the goal and the schema are too
+  large to plan in one prompt.
 - `GET /v1/superset/builds/{build_id}`: the build as it stands, read from the build store alone.
 - `POST /v1/superset/builds/{build_id}/next`: the build's next step, claimed, run and recorded (`builder.next_step`);
   409 while another request's step holds the build.
@@ -45,6 +49,7 @@ import psycopg
 from fastapi import Depends, FastAPI, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, model_validator
 
+from mnemiq.llm.client import ModelUnavailable
 from mnemiq.profiles import UnknownProfile
 from mnemiq.server.superset_refusals import NotForBuilding
 from mnemiq.server.v1_refusals import NotPermitted, refused, unknown_profile
@@ -69,6 +74,10 @@ NO_DELEGATION = ("Superset mode builds as the person whose verified token each r
 STORE_UNAVAILABLE = "mnemiq's control Postgres, where builds are kept, did not answer; try this request again."
 # A dashboard id that names none this builder can read: whether it exists is not said.
 NO_SUCH_DASHBOARD = "This builder can read no dashboard of that id, so nothing was planned."
+# The model did not answer the planning prompt: an outage, answered as the store's and the extension's are, so a client
+# tells it from a goal that cannot be planned (a refused plan) by its status alone.
+MODEL_UNAVAILABLE = ("The model did not answer, so no plan was made and nothing was kept; this is an outage, not a "
+                     "judgement about the goal, so try this request again.")
 
 
 class DashboardUnreadable(Exception):
@@ -86,8 +95,9 @@ class NotAnEditor(Exception):
 def _held_to_its_editors(client, dashboard_id: int) -> None:
     """Return when the builder edits the dashboard, as the extension's `editors_of` answers it (the read the build's
     first step makes again, since its editors can change between steps); raise when they cannot read it or do not
-    edit it. Asked before anything is planned or kept, so an id no dashboard has yet, or one the builder may not
-    change, takes no dashboard's one live build, and the answer says nothing of a build running on it."""
+    edit it. Asked once Superset has said the person may build, and before anything is planned or kept, so an id no
+    dashboard has yet, or one the builder may not change, takes no dashboard's one live build, and the answer says
+    nothing of a build running on it."""
     entry = dashboard_editorship(client, dashboard_id)
     if entry is None:
         raise DashboardUnreadable()
@@ -191,6 +201,9 @@ def _refusal(exc: Exception, doors) -> HTTPException | None:
     if isinstance(exc, psycopg.OperationalError):
         logger.warning("the build store did not answer a build route: %s", exc)
         return HTTPException(status_code=503, detail=STORE_UNAVAILABLE)
+    if isinstance(exc, ModelUnavailable):  # a prompt too long to plan is a refused plan: only an outage reaches here
+        logger.warning("the model did not answer a build's planning prompt (%s): %s", exc.kind, exc)
+        return HTTPException(status_code=503, detail=MODEL_UNAVAILABLE)
     if isinstance(exc, UnknownProfile):  # as `/v1/ask` answers it
         return unknown_profile(exc)
     if isinstance(exc, ExtensionMissing):
@@ -231,11 +244,13 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
             profile = runtime.build_profile(body.profile, who)
             planner = _Offering(profile.planner)
             adapter = superset_executor(deployment, delegation)
-            if body.dashboard_id is not None:
-                _held_to_its_editors(adapter.client, body.dashboard_id)
+            # Whether Superset lets this person build at all, first: a non-builder is refused as one (NOT_A_BUILDER)
+            # and learns nothing of a dashboard they named, its editors included.
             grants = runtime.builder_grants(adapter)
             # Before anything is planned or kept: every write of a build goes through the extension.
             require_extension(adapter.client)
+            if body.dashboard_id is not None:
+                _held_to_its_editors(adapter.client, body.dashboard_id)
             plan = plan_build(body.goal, planner=planner, client=adapter.client, adapter=adapter,
                               snapshot=runtime.snapshot, grants=grants, settings=profile.settings,
                               offer_reuse=body.dashboard_id is None and not body.fresh)

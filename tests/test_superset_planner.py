@@ -857,18 +857,36 @@ class _FailsOnTheRepair(FakePlanner):
         return super().plan(goal, context)
 
 
-def test_a_model_that_fails_on_the_repair_ends_the_plan_in_mnemiqs_words():
-    """The model fails on the repair, not the first plan: the plan ends there, in mnemiq's sentence for the failure,
-    and the provider's words are not in it."""
-    from mnemiq.llm.client import ModelUnavailable
-
+def _repaired_plan_meets(failure: Exception):
     bad = _valid_plan(measures=(_measure(expression="SUM(premium) OVER ()"),), charts=(
         _chart("premium_by_region", Family.BAR, [WrittenRef(_measure(expression="SUM(premium) OVER ()"))],
                dims=["region"]),))
-    planner = _FailsOnTheRepair(bad, ModelUnavailable("model-host.internal timed out", kind="connect"))
-    refused = _plan(GOAL, planner, _tools())
+    planner = _FailsOnTheRepair(bad, failure)
+    return planner, (lambda: _plan(GOAL, planner, _tools()))
+
+
+def test_a_prompt_too_large_on_the_repair_ends_the_plan_in_mnemiqs_words():
+    """The model's server refuses the repair's prompt as longer than its window (the repair carries the plan back, so
+    it is the longer prompt): the plan is refused there, saying the goal and what the builder can see are too large
+    for one prompt, and the provider's words are not in it."""
+    from mnemiq.llm.client import ContextTooLong
+
+    planner, plan = _repaired_plan_meets(ContextTooLong("model-host.internal: maximum context length is 32768"))
+    refused = plan()
     assert isinstance(refused, PlanRefused), refused
-    assert len(planner.contexts) == 2 and "did not respond" in refused.reason and "model-host" not in refused.reason
+    assert len(planner.contexts) == 2 and "the goal and what this builder can see" in refused.reason
+    assert "model-host" not in refused.reason
+
+
+def test_a_model_that_does_not_answer_the_repair_is_raised_for_the_route_to_answer():
+    """An outage is not a plan refused: the model's `ModelUnavailable` leaves the plan step as it is, on the repair
+    as on the first plan, for the route to answer as an outage."""
+    from mnemiq.llm.client import ModelUnavailable
+
+    planner, plan = _repaired_plan_meets(ModelUnavailable("model-host.internal timed out", kind="connect"))
+    with pytest.raises(ModelUnavailable):
+        plan()
+    assert len(planner.contexts) == 2
 
 
 def test_a_refusal_the_model_cannot_repair_stops_the_plan():

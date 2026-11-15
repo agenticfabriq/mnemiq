@@ -65,6 +65,8 @@ EXTENSION_MISSING = "This Superset does not have the mnemiq extension installed.
 STEP_RUNNING = "a step of this build is already running"
 DASHBOARD_BUSY = "another build of this dashboard is still building; it must finish or stop first"
 NO_SUCH_DASHBOARD = "This builder can read no dashboard of that id, so nothing was planned."
+MODEL_UNAVAILABLE = ("The model did not answer, so no plan was made and nothing was kept; this is an outage, not a "
+                     "judgement about the goal, so try this request again.")
 
 # What a token minted for asking carries, and what one minted for building adds: Superset's mint route makes each
 # for its purpose, and the build routes need what the second adds.
@@ -584,10 +586,21 @@ def test_the_largest_dashboard_id_the_store_keeps_is_built_on(served, fake, worl
     assert r.json()["build"]["dashboard_id"] == 2**31 - 1
 
 
-def _asked_only_whether_the_builder_edits(fake, dashboard_id: int) -> None:
-    """The one call Superset was asked: the extension's read of whether the builder edits the dashboard."""
-    assert [(call.tool, call.request) for call in fake.calls] == [
-        (TOOL_PREFIX + "editors_of", {"dashboard_ids": [dashboard_id]})]
+# What planning asks Superset: the builder's datasets, their saved metrics (MCP's and the extension's, by id), the
+# dashboards a goal's words find.
+PLANNING = {"list_datasets", "list_metrics", "list_dashboards"}
+
+
+def _asked_only_who_may_build_and_whether_they_edit(fake, dashboard_id: int) -> None:
+    """What Superset was asked, in order, and nothing else: the grants' dry run (whether the builder may build), the
+    extension's probe (`dataset_metrics` of no dataset), and its read of whether the builder edits the dashboard. No
+    planning call and no create."""
+    assert [call.tool for call in fake.calls] == ["execute_sql", TOOL_PREFIX + "dataset_metrics",
+                                                  TOOL_PREFIX + "editors_of"], [call.tool for call in fake.calls]
+    grants, probe, editors = fake.calls
+    assert grants.request.get("dry_run") is True and probe.request == {"dataset_ids": []}
+    assert editors.request == {"dashboard_ids": [dashboard_id]}
+    assert not {call.tool for call in fake.calls} & (PLANNING | WRITES)
 
 
 def test_a_dashboard_the_builder_cannot_read_is_not_found_before_anything_is_planned(served, fake, world, store):
@@ -600,7 +613,7 @@ def test_a_dashboard_the_builder_cannot_read_is_not_found_before_anything_is_pla
     r = _start(client, dashboard_id=900)
     assert r.status_code == 404, r.text
     assert r.json()["detail"] == NO_SUCH_DASHBOARD and "900" not in r.text
-    _asked_only_whether_the_builder_edits(fake, 900)
+    _asked_only_who_may_build_and_whether_they_edit(fake, 900)
     assert list(store._builds) == [(running.tenant_id, running.build_id)]
     assert runtime.profiles[runtime.default_profile].planner.goals == []
 
@@ -614,7 +627,22 @@ def test_a_dashboard_the_builder_does_not_edit_is_refused_naming_its_editors(ser
     assert r.status_code == 403, r.text
     assert r.json() == {"detail": "This builder is not an editor of dashboard 900; its editors are analyst, colleague.",
                         "end_session_url": None}
-    _asked_only_whether_the_builder_edits(fake, 900)
+    _asked_only_who_may_build_and_whether_they_edit(fake, 900)
+    assert store._builds == {} and runtime.profiles[runtime.default_profile].planner.goals == []
+
+
+def test_a_non_builder_naming_a_dashboard_is_refused_as_a_non_builder_before_it_is_read(served, fake, world, store):
+    """A person Superset's roles do not let build, naming a dashboard they read but do not edit, is told the roles and
+    nothing about the dashboard: the grants refuse them before the dashboard is read, so no editorship call is made,
+    and no editor's name reaches them."""
+    client, runtime = served
+    _dashboard(world, 900, editors=("colleague", "analyst"))
+    _denying_queries(world)
+    r = _start(client, dashboard_id=900)
+    assert r.status_code == 403, r.text
+    assert r.json() == {"detail": NOT_A_BUILDER, "end_session_url": None}
+    assert TOOL_PREFIX + "editors_of" not in {call.tool for call in fake.calls}
+    assert "colleague" not in r.text and "analyst" not in r.text
     assert store._builds == {} and runtime.profiles[runtime.default_profile].planner.goals == []
 
 
@@ -651,31 +679,48 @@ class _FailingModel:
         raise self.failure
 
 
-# Each failure, with the provider's own words in it (which no answer may carry), and a phrase of mnemiq's sentence.
-MODEL_FAILURES = {
-    "an outage": (ModelUnavailable("Connection refused by model-host.internal:8000", kind="connect"),
-                  "did not respond"),
+# A model whose server refuses, or cuts, the planning prompt as longer than its window, with the provider's own words
+# in it (which no answer may carry), and a phrase of mnemiq's sentence: the goal and the schema it is planned on are
+# too large for one prompt.
+TOO_LARGE = {
     "a context too long": (ContextTooLong("model-host.internal: maximum context length is 32768 tokens"),
-                           "longer than its context window"),
+                           "refused the planning prompt"),
     "a cut prompt": (PromptCut("model-host.internal read 8000 of 41000 prompt tokens"), "cut the planning prompt"),
 }
 
 
-@pytest.mark.parametrize("case", list(MODEL_FAILURES))
-def test_a_model_that_fails_to_plan_is_an_answer_in_mnemiqs_words(served, fake, store, case):
-    """The profile's model, asked for the plan, does not answer, refuses the prompt as longer than its window, or
-    cuts the prompt to fit it. Each is an answer, never a 500, as `/v1/ask` answers the same failures inside a 200:
-    the plan is refused with mnemiq's own sentence, the provider's words go to the log only, the model is asked once,
-    and nothing is kept or written."""
+@pytest.mark.parametrize("case", list(TOO_LARGE))
+def test_a_goal_too_large_to_plan_in_one_prompt_is_a_refused_plan(served, fake, store, case):
+    """The model's server refuses the planning prompt as longer than its window, or cuts it to fit: the goal and
+    what the builder can see are too large to plan in one prompt. That is about the goal and the schema, so it is a
+    refused plan (200), saying so in mnemiq's words; the provider's words go to the log only, the model is asked
+    once, and nothing is kept or written."""
     client, runtime = served
-    failure, said = MODEL_FAILURES[case]
+    failure, said = TOO_LARGE[case]
     model = _FailingModel(failure)
     _planned(runtime, LLMPlanner(model))
     r = _start(client)
     assert r.status_code == 200, r.text
     told = r.json()["refused"]
     assert said in told["reason"] and told["parts"] == [], told
+    assert "the goal and what this builder can see" in told["reason"], told
     assert "model-host" not in r.text
+    assert model.calls == 1
+    assert store._builds == {} and _writes(fake) == []
+
+
+def test_a_model_that_does_not_answer_is_503_saying_to_try_again(served, fake, store):
+    """The model does not answer the planning prompt: an outage, temporary, and nothing about the goal. A 503 in
+    mnemiq's words that says to try again, as a control Postgres or an extension that does not answer is on these
+    routes, so a client tells it from a goal that cannot be planned by its status alone: no `refused` key, nothing
+    kept or written, and the provider's words in the log only."""
+    client, runtime = served
+    model = _FailingModel(ModelUnavailable("Connection refused by model-host.internal:8000", kind="connect"))
+    _planned(runtime, LLMPlanner(model))
+    r = _start(client)
+    assert r.status_code == 503, r.text
+    assert r.json() == {"detail": MODEL_UNAVAILABLE}
+    assert "refused" not in r.json() and "model-host" not in r.text
     assert model.calls == 1
     assert store._builds == {} and _writes(fake) == []
 

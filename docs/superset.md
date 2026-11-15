@@ -264,13 +264,15 @@ still to come. In short:
     - To add this goal's charts to it anyway, ask again with its `dashboard_id`. A `dashboard_id` always means that:
       the goal's planned charts are added to the dashboard it names, beside the ones it has.
     - For a new dashboard, ask again with `"fresh": true`.
-  - With a `dashboard_id`, mnemiq first asks Superset whether the builder edits that dashboard, before anything is
-    planned. One they cannot read, or one that does not exist, is a 404 that does not say which. One they can read
-    but not edit is a 403 naming its editors.
-  - A model that does not answer, or whose server refuses or cuts the planning prompt as longer than its context
-    window, is a refused plan (a 200) with a sentence saying which, as `/v1/ask` answers the same failures. The
-    planning prompt holds every table, column and saved metric the builder can see, so a large schema needs a large
-    window.
+  - Before anything is planned, mnemiq asks Superset whether the person may build at all; one who may not is
+    refused with a 403 as a non-builder, and nothing about a dashboard they named is read. Then, with a
+    `dashboard_id`, it asks whether they edit that dashboard. One they cannot read, or one that does not exist, is a
+    404 that does not say which. One they can read but not edit is a 403 naming its editors.
+  - A model that does not answer the planning prompt is a 503 saying to try again: an outage, told apart from a goal
+    that cannot be planned by its status. A model server that refuses or cuts the planning prompt as longer than its
+    context window gives a refused plan (a 200): the goal and what the builder can see are too large to plan in one
+    prompt. The planning prompt holds every table, column and saved metric the builder can see, so a large schema
+    needs a large window.
   - `POST /v1/superset/builds/{id}/next` runs the build's next step.
   - `GET /v1/superset/builds/{id}` reads the build as it stands.
 - **A token made for building.** Besides `db.read`, the two `POST`s need Superset's `superset:chart:write`,
