@@ -53,13 +53,13 @@ from agenticfabriq.mnemiq.token import BUILD_SCOPES  # noqa: E402
 pytestmark = pytest.mark.integration
 
 BUILD = " ".join(BUILD_SCOPES)
-# The builder of B2 and B6: Alpha and sql_lab, narrowed by no row rule.
+# The builder of the six-chart build and the funnel: Alpha and sql_lab, narrowed by no row rule.
 BUILDER = "analyst"
 GOAL = "sales by region and month"
 # The build store's own database on the live Postgres, made by this module and dropped after it.
 STORE_DATABASE = "mnemiq_build_store_live"
-# The saved metric planted on the `policy` dataset before B2, and removed after the module: what B2's `sales` measure
-# says, so the plan check reuses it.
+# The saved metric planted on the `policy` dataset before the six-chart build, and removed after the module: what
+# that build's `sales` measure says, so the plan check reuses it.
 PLANTED = ("total_sales", "SUM(premium)")
 RECORD_DIR = "MNEMIQ_TEST_SUPERSET_RECORD_DIR"
 # What a build answer's step may hold (`superset_build._build`).
@@ -459,7 +459,7 @@ def assert_ran_to_the_end(run: BuildRun) -> None:
 
 # --- the numbers, read from the source -----------------------------------------------------------------------------
 
-# What B2's charts show, read from the source directly: every one a sum of `premium`, which has cents.
+# What the six-chart build's charts show, read from the source directly: every one a sum of `premium`, which has cents.
 SALES_TRUTH = (
     "SELECT sum(premium) FROM policy",
     "SELECT region, sum(premium) FROM policy GROUP BY 1",
@@ -470,7 +470,8 @@ SALES_TRUTH = (
 
 
 def sales_values(live) -> list[Decimal]:
-    """Every sum B2's charts show that has a fractional part: a number of the data no id, count or time spells."""
+    """Every sum the six-chart build's charts show that has a fractional part: a number of the data no id, count or
+    time spells."""
     found = {row[-1] for sql in SALES_TRUTH for row in ground_truth(live, sql)}
     return sorted(value for value in found if isinstance(value, Decimal) and value != value.to_integral_value())
 
@@ -499,10 +500,10 @@ def numbers_outside_ids(doc, path: str = "") -> list[str]:
     return []
 
 
-# --- B2: six charts, the planted saved metric reused, every chart checked ------------------------------------------
+# --- six charts, the planted saved metric reused, every chart checked ----------------------------------------------
 
 
-def b2_plan(policy_id: int) -> BuildPlan:
+def six_chart_plan(policy_id: int) -> BuildPlan:
     """Six charts across five families on the `policy` dataset: two KPI tiles, a monthly line, a bar by region, a pie
     by status and a table by region and status. `sales` is written as the planted metric's own expression, so the plan
     check replaces it with `total_sales`; `policies` is a measure of mnemiq's own. No family of `_NOT_CHECKED_TYPES`."""
@@ -532,7 +533,7 @@ KPI_KEYS = ("total_sales", "policies_written")
 
 
 @dataclass
-class B2:
+class SixCharts:
     run: BuildRun
     plan: BuildPlan
     metrics_after_planting: dict[str, str]
@@ -544,23 +545,24 @@ class B2:
 
 
 @pytest.fixture(scope="module")
-def b2(live, served, model, policy_id, planted) -> B2:
-    """B2's build, once, for every test that reads it: the goal "sales by region and month", run to its end as
+def six_charts(live, served, model, policy_id, planted) -> SixCharts:
+    """The six-chart build, once, for every test that reads it: the goal "sales by region and month", run to its end as
     `analyst`, and its record."""
-    plan = b2_plan(policy_id)
+    plan = six_chart_plan(policy_id)
     floors_before = {"dashboards": highest(BUILDER, "dashboards"), "slices": highest(BUILDER, "slices")}
     metrics_after_planting = saved_metrics(policy_id)
-    run = run_build(live, served, model, plan, "b2-sales-by-region-and-month")
+    run = run_build(live, served, model, plan, "sales-by-region-and-month")
     found = summary(run, served, plan) if run.build_id else {"stopped": run.stopped,
                                                              "requests": [(r.label, r.status_code) for r in run.requests]}
-    record("b2-sales-by-region-and-month", found)
+    record("sales-by-region-and-month", found)
     kept_plan = served.raw_plan(run.build_id) if run.build_id else {}
     raw_steps = served.raw_steps(run.build_id) if run.build_id else []
-    return B2(run, plan, metrics_after_planting, saved_metrics(policy_id), floors_before, kept_plan, raw_steps, found)
+    return SixCharts(run, plan, metrics_after_planting, saved_metrics(policy_id), floors_before, kept_plan, raw_steps,
+                     found)
 
 
-def test_b2_six_charts_reuse_the_planted_metric_and_every_one_checks(live, b2, policy_id, planted):
-    """B2. The goal "sales by region and month", planned by the stub as six charts across five families (two KPI
+def test_six_charts_reuse_the_planted_metric_and_every_one_checks(live, six_charts, policy_id, planted):
+    """The goal "sales by region and month", planned by the stub as six charts across five families (two KPI
     tiles, a monthly line, a bar, a pie, a table), none of a type mnemiq does not check by rule. Expected:
     - the start answers 201 and each `/next` runs the next step (dashboard, six charts, layout, check) to `done`;
     - the plan kept holds `total_sales` (the planted saved metric) where the plan wrote `sales`, and no written
@@ -571,7 +573,7 @@ def test_b2_six_charts_reuse_the_planted_metric_and_every_one_checks(live, b2, p
     - the bar, the pie and the total show the source's sums, read as the builder through `get_chart_data`;
     - no answer holds a lease id, a field beyond the build's own, or a number outside an id field, and none holds
       any of the sums the charts show; no model client is made or called."""
-    run, plan = b2.run, b2.plan
+    run, plan = six_charts.run, six_charts.plan
     assert {chart.family.value for chart in plan.charts}.isdisjoint(_NOT_CHECKED_TYPES)
     assert len(plan.charts) >= 6 and len({chart.family for chart in plan.charts}) >= 4
     assert_ran_to_the_end(run)
@@ -584,7 +586,7 @@ def test_b2_six_charts_reuse_the_planted_metric_and_every_one_checks(live, b2, p
     dashboard_id = final["dashboard_id"]
 
     # The planted saved metric is the one the charts use.
-    kept = b2.kept_plan
+    kept = six_charts.kept_plan
     for chart in kept["charts"]:
         refs = chart["measures"]
         shows_sales = chart["key"] != "policies_written"
@@ -594,8 +596,9 @@ def test_b2_six_charts_reuse_the_planted_metric_and_every_one_checks(live, b2, p
     for key, chart_id in ids.items():
         metrics = chart_metrics(stored_chart(chart_id)["params"])
         assert (planted in metrics) == (key != "policies_written"), (key, metrics)
-    assert b2.metrics_after_build == b2.metrics_after_planting
-    assert [n for n, e in b2.metrics_after_build.items() if normalized(e) == normalized(PLANTED[1])] == [planted]
+    assert six_charts.metrics_after_build == six_charts.metrics_after_planting
+    assert [n for n, e in six_charts.metrics_after_build.items()
+            if normalized(e) == normalized(PLANTED[1])] == [planted]
 
     # Every chart checked; a chart that is not is named with its type, status and mnemiq's reason.
     not_checked = [(key, stored_chart(chart_id)["viz_type"], final["checks"].get(str(chart_id)))
@@ -640,26 +643,27 @@ def test_b2_six_charts_reuse_the_planted_metric_and_every_one_checks(live, b2, p
         assert numbers_outside_ids(request.body) == [], numbers_outside_ids(request.body)
         assert found_values(request.text, values) == 0, request.label
     assert_no_model_call(run)
-    observe("B2", charts={key: (chart_id, final["checks"][str(chart_id)]) for key, chart_id in ids.items()},
+    observe("six charts", charts={key: (chart_id, final["checks"][str(chart_id)]) for key, chart_id in ids.items()},
             layout=placed, message=run.last_step["message"])
 
 
-def test_b2_every_made_id_is_above_its_floor(b2):
+def test_every_made_id_is_above_its_floor(six_charts):
     """The id floor, live. Before each create, the step reads the highest id among the builder's objects of that kind
     (`created_by_me`, ordered by id, descending, one item) and records it in its intent. Expected: every create step
     (the dashboard, each chart) records a floor, its list call was ordered by id and descending, and the id it made
     is above its floor; the dashboard's floor is analyst's highest dashboard id before the build, the first chart's
     analyst's highest chart id before it, and each later chart's the chart made just before it."""
-    run = b2.run
+    run = six_charts.run
     assert_ran_to_the_end(run)
-    made = [step for step in b2.raw_steps if step["kind"] in ("dashboard", "chart")]
+    made = [step for step in six_charts.raw_steps if step["kind"] in ("dashboard", "chart")]
     floors = [(step["key"], (step.get("intent") or {}).get("id_floor"), step["object_id"]) for step in made]
     assert all(type(floor) is int and type(made_id) is int and made_id > floor for _, floor, made_id in floors), floors
     by_key = {key: (floor, made_id) for key, floor, made_id in floors}
-    assert by_key["dashboard"][0] == b2.floors_before["dashboards"], (by_key["dashboard"], b2.floors_before)
+    before = six_charts.floors_before
+    assert by_key["dashboard"][0] == before["dashboards"], (by_key["dashboard"], before)
     charts = [key for key, _, _ in floors if key != "dashboard"]
-    expected = [b2.floors_before["slices"], *(by_key[key][1] for key in charts[:-1])]
-    assert [by_key[key][0] for key in charts] == expected, (floors, b2.floors_before)
+    expected = [before["slices"], *(by_key[key][1] for key in charts[:-1])]
+    assert [by_key[key][0] for key in charts] == expected, (floors, before)
     for request in run.requests:
         if request.label != "next" or request.build.get("ran") not in by_key:
             continue
@@ -667,15 +671,15 @@ def test_b2_every_made_id_is_above_its_floor(b2):
         listed = [call.request for call in request.calls if call.tool == FLOOR_TOOLS[kind]]
         assert listed and listed[0] == {"created_by_me": True, "select_columns": ["id"], "order_column": "id",
                                         "order_direction": "desc", "page": 1, "page_size": 1}, listed
-    observe("B2 floors", floors=floors)
+    observe("floors", floors=floors)
 
 
-def test_b8_every_superset_call_of_a_build_carries_its_requests_token(b2):
-    """B8, the build half: across the whole of B2, each request carries a token minted for it alone, and every
+def test_every_superset_call_of_a_build_carries_its_requests_token(six_charts):
+    """Across the whole six-chart build, each request carries a token minted for it alone, and every
     Superset call the request made carries that request's token and no other's (the Recorder's fingerprint of the
     client's credential, call by call). Every request but a read asks Superset something, and the read asks
     nothing."""
-    run = b2.run
+    run = six_charts.run
     assert_ran_to_the_end(run)
     tokens = [request.token for request in run.requests]
     assert len(set(tokens)) == len(tokens)
@@ -685,19 +689,20 @@ def test_b8_every_superset_call_of_a_build_carries_its_requests_token(b2):
             assert held == set(), held
         else:
             assert held == {f"DelegatedToken:{fingerprint_of(request.token)}"}, (request.label, held)
-    observe("B8 tokens", requests=len(run.requests), calls=sum(len(r.calls) for r in run.requests))
+    observe("tokens", requests=len(run.requests), calls=sum(len(r.calls) for r in run.requests))
 
 
-def test_b8_the_live_build_store_holds_no_value(live, b2, served):
-    """B8, the build half: after B2, Task 9's guard (`value_shaped_names`) read over the live store finds no column and
-    no jsonb key at any depth named as a value, a row or a sample is kept, having read every column of both tables and
-    every key of their jsonb documents; and no stored row's text holds any sum B2's charts show, read from the source.
+def test_the_live_build_store_holds_no_value(live, six_charts, served):
+    """After the six-chart build, the store's no-value guard (`value_shaped_names`) read over the live store finds no
+    column and no jsonb key at any depth named as a value, a row or a sample is kept, having read every column of both
+    tables and every key of their jsonb documents; and no stored row's text holds any sum those charts show, read from
+    the source.
     The controls, each in a transaction rolled back: a value-shaped key planted in a stored check status is flagged,
     and one of those sums planted in a stored goal is found."""
     import psycopg
     from psycopg import sql
 
-    assert_ran_to_the_end(b2.run)
+    assert_ran_to_the_end(six_charts.run)
     values = sales_values(live)
 
     def stored_text(con) -> str:
@@ -710,7 +715,7 @@ def test_b8_the_live_build_store_holds_no_value(live, b2, served):
         assert flagged == [], flagged
         assert read == STORE_COLUMNS, read
         assert keys > 100, keys
-        assert b2.run.build_id in text and GOAL in text  # the probe reads what the build kept
+        assert six_charts.run.build_id in text and GOAL in text  # the probe reads what the build kept
         assert found_values(text, values) == 0
         con.execute(sql.SQL("UPDATE {} SET check_status = check_status || '{{\"1\": {{\"value\": 1}}}}'").format(
             sql.Identifier(MEASURE_TABLE)))
@@ -722,7 +727,7 @@ def test_b8_the_live_build_store_holds_no_value(live, b2, served):
         assert value_shaped_names(con)[0] == [] and found_values(stored_text(con), values) == 0
     assert any(flag.startswith(f"{MEASURE_TABLE}.check_status.1.value") for flag in planted_flags), planted_flags
     assert planted_found == 1, planted_found
-    observe("B8 store", keys_read=keys, sums_looked_for=len(values), columns=read)
+    observe("store", keys_read=keys, sums_looked_for=len(values), columns=read)
 
 
 def _expired(live, token: str) -> str:
@@ -748,8 +753,8 @@ def one_bar(policy_id: int) -> BuildPlan:
                                        target=None),), measures=(policies,))
 
 
-def test_b8_an_expired_minted_token_is_refused_at_mnemiqs_door(live, served, policy_id, recorder):
-    """B8, the build half: a token Superset's mint route made for building starts a build (201: the control); the
+def test_an_expired_minted_token_is_refused_at_mnemiqs_door(live, served, policy_id, recorder):
+    """A token Superset's mint route made for building starts a build (201: the control); the
     same token expired is refused at mnemiq's door, 401 with a Bearer challenge, on `POST /v1/superset/builds` and on
     that build's `/next`, and neither asks Superset anything: no call, no step claimed, no second build."""
     served.plan_with(one_bar(policy_id))
@@ -769,11 +774,11 @@ def test_b8_an_expired_minted_token_is_refused_at_mnemiqs_door(live, served, pol
     assert recorder.since(mark) == []
     assert served.raw_steps(build_id) == before
     assert all(step["status"] == "pending" and step["lease_id"] is None for step in before)
-    observe("B8 expired", **{route: (a.status_code, a.json().get("detail")) for route, a in refused.items()})
+    observe("expired token", **{route: (a.status_code, a.json().get("detail")) for route, a in refused.items()})
 
 
-def test_b8_an_unknown_users_token_is_refused_by_superset_in_mnemiqs_words(live, served, policy_id, recorder):
-    """B8, the build half: a token the identity provider validly signed, with a build token's scopes, for `nobody`, a
+def test_an_unknown_users_token_is_refused_by_superset_in_mnemiqs_words(live, served, policy_id, recorder):
+    """A token the identity provider validly signed, with a build token's scopes, for `nobody`, a
     user Superset has no account for, passes mnemiq's door and is refused by Superset. Expected, on
     `POST /v1/superset/builds` and on `/next` of a build kept for nobody's principal: 401, mnemiq's sign-in sentence
     (`SIGN_IN_AGAIN`) and a Bearer challenge, and none of Superset's text. The client read Superset's answer as
@@ -800,15 +805,15 @@ def test_b8_an_unknown_users_token_is_refused_by_superset_in_mnemiqs_words(live,
         assert "nobody" not in answer.text
     assert not [call.tool for call in calls if call.tool in WRITES]
     assert served.raw_steps(kept.build_id) == before
-    observe("B8 unknown user", status={route: a.status_code for route, a in answers.items()},
+    observe("unknown user", status={route: a.status_code for route, a in answers.items()},
             detail=SIGN_IN_AGAIN, superset_said=sorted(said), calls=[c.tool for c in calls])
 
 
-# --- B6: a funnel, made through the extension ----------------------------------------------------------------------
+# --- a funnel, made through the extension --------------------------------------------------------------------------
 
 
-def test_b6_a_funnel_is_made_through_the_extension_and_its_data_read(live, served, model, policy_id):
-    """B6. A funnel by chat: the stub's plan holds one funnel (`COUNT(id)` of policies by status). Expected: the build
+def test_a_funnel_is_made_through_the_extension_and_its_data_read(live, served, model, policy_id):
+    """A funnel by chat: the stub's plan holds one funnel (`COUNT(id)` of policies by status). Expected: the build
     runs to `done` (dashboard, funnel, layout, check); the funnel was made by the extension's `create_chart`, never
     MCP's `generate_chart`, and needed no claim; Superset holds it as a `funnel` chart created by analyst, analyst
     among its editors and its editors the dashboard's, its description ending in this build's marker; Superset's
@@ -820,9 +825,9 @@ def test_b6_a_funnel_is_made_through_the_extension_and_its_data_read(live, serve
                        dataset_id=policy_id, measures=(WrittenRef(policies),), dimensions=("status",),
                        time_column=None, time_grain=None, filters=(), row_limit=None, source=None, target=None)
     plan = BuildPlan(charts=(funnel,), measures=(policies,))
-    run = run_build(live, served, model, plan, "b6-funnel", goal="policies by status as a funnel")
+    run = run_build(live, served, model, plan, "funnel", goal="policies by status as a funnel")
     found = summary(run, served, plan) if run.build_id else {"stopped": run.stopped}
-    record("b6-funnel", found)
+    record("funnel", found)
     assert_ran_to_the_end(run)
     final = run.final
     [chart_id] = [step["object_id"] for step in final["steps"] if step["key"] == funnel.key]
@@ -846,7 +851,7 @@ def test_b6_a_funnel_is_made_through_the_extension_and_its_data_read(live, serve
     same = shown == truth
     assert len(rows) == 3 and same, (len(rows), same, sorted(rows[0]) if rows else None)
     assert_no_model_call(run)
-    observe("B6", chart_id=chart_id, dashboard_id=dashboard_id, rows=len(rows),
+    observe("funnel", chart_id=chart_id, dashboard_id=dashboard_id, rows=len(rows),
             check=final["checks"].get(str(chart_id)), message=run.last_step.get("message"))
 
 

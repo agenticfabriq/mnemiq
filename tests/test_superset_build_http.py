@@ -66,11 +66,12 @@ STEP_RUNNING = "a step of this build is already running"
 DASHBOARD_BUSY = "another build of this dashboard is still building; it must finish or stop first"
 NO_SUCH_DASHBOARD = "This builder can read no dashboard of that id, so nothing was planned."
 
-# What a token minted for asking carries, and what one minted for building adds (decision 7).
+# What a token minted for asking carries, and what one minted for building adds: Superset's mint route makes each
+# for its purpose, and the build routes need what the second adds.
 ASK_SCOPES = "db.read superset:sqllab:write superset:dataset:read"
 BUILD_SCOPES = (f"{ASK_SCOPES} superset:chart:read superset:chart:write superset:dashboard:read "
                 "superset:dashboard:write superset:dataset:write")
-# What a build route needs beside `db.read` (decision 6).
+# What a build route needs beside `db.read`: Superset's write scopes, for the Superset metadata a build writes.
 WRITE_SCOPES = ("superset:chart:write", "superset:dashboard:write", "superset:dataset:write")
 # Two profiles, `a` the default; anyone may pick `b`, which guards fan-out where the deployment does not.
 PROFILES = """
@@ -252,7 +253,7 @@ def _call(client, method: str, path: str, token: str | None):
 # --- the routes there are, and where
 
 
-def test_only_build_routes_exist_after_pr_c(served):
+def test_only_the_build_routes_exist(served):
     client, _ = served
     assert _routes(client.app) == BUILD_ROUTES
 

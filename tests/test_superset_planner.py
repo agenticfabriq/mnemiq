@@ -178,7 +178,7 @@ def _parts(refused: PlanRefused) -> dict[str, str]:
     return {part.part: part.reason for part in refused.parts}
 
 
-# ---------------------------------------------------------------- the brief's tests
+# ---------------------------------------------------------------- a plan, checked, repaired, and offering a dashboard
 
 def test_valid_plan_passes():
     tools = _tools()
@@ -740,13 +740,13 @@ def test_the_planner_is_built_on_the_profiles_client():
     assert kit.planner._client is kit.client and kit.client._model == "profile-model"
 
 
-# ---------------------------------------------------------------- fix round 1
+# ---------------------------------------------------------------- what each part of a plan is held to
 
 COUNTS = {1: [_metric(1, "count", "COUNT(*)")], 2: [_metric(2, "count", "COUNT(*)")]}
 
 
 def test_a_saved_metric_has_a_handle_of_its_own_in_the_plan():
-    """I1: `count` on two tables. A saved measure's plan-local name is its handle; the metric's own name beside it."""
+    """`count` on two tables. A saved measure's plan-local name is its handle; the metric's own name beside it."""
     from mnemiq.superset.planner import draft_of, plan_from_draft
 
     draft = {"measures": [{"name": "policies", "saved_metric": "count", "kind": "count", "table": "policy"},
@@ -776,7 +776,7 @@ def test_a_saved_metric_has_a_handle_of_its_own_in_the_plan():
     "policy JOIN (WITH c AS (SELECT * FROM claim) SELECT * FROM c) AS claim ON claim.policy_id = policy.policy_id",
 ])
 def test_a_join_holds_tables_and_conditions_only(join):
-    """I2: the only tables are the FROM's and each JOIN's, and the only SELECT is the join's own."""
+    """The only tables are the FROM's and each JOIN's, and the only SELECT is the join's own."""
     paid = _measure("paid", "Paid", "SUM(amount)", K.NUMBER, dataset_id=-1)
     plan = BuildPlan(charts=(_chart("paid", Family.BAR, [WrittenRef(paid)], dataset_id=-1, dims=["region"]),),
                      measures=(paid,), reuse_candidates=(),
@@ -804,7 +804,7 @@ def test_a_join_of_two_or_three_tables_is_planned(join, dims):
 
 
 def test_a_dataset_is_a_tables_only_when_named_exactly_as_stored():
-    """I3: rc2 reads a physical dataset FROM `table(self.table_name, schema=self.schema)`
+    """rc2 reads a physical dataset FROM `table(self.table_name, schema=self.schema)`
     (`SqlaTable.get_sqla_table` in `superset/connectors/sqla/models.py`), which SQLAlchemy quotes for a mixed-case
     name: a dataset named `Agent` reads `"Agent"`, never the stored `agent`."""
     recorder = FakePlanner(_valid_plan())
@@ -814,7 +814,7 @@ def test_a_dataset_is_a_tables_only_when_named_exactly_as_stored():
 
 
 def test_a_shared_column_is_a_charts_under_its_tables_name():
-    """I4: both tables carry created_at; the chart groups by claim's, as the joined dataset names it."""
+    """Both tables carry created_at; the chart groups by claim's, as the joined dataset names it."""
     paid = _measure("paid", "Paid", "SUM(amount)", K.CURRENCY, dataset_id=-1)
     plan = BuildPlan(charts=(_chart("paid_by_month", Family.LINE, [WrittenRef(paid)], dataset_id=-1,
                                     dims=["region"], time_column="claim_created_at", grain="P1M",
@@ -832,7 +832,7 @@ def test_a_shared_column_is_a_charts_under_its_tables_name():
 
 
 def test_reuse_is_not_offered_when_the_build_asks_for_none():
-    """I5: with `offer_reuse=False` no dashboard is listed, and a candidate the model names is refused."""
+    """With `offer_reuse=False` no dashboard is listed, and a candidate the model names is refused."""
     tools = _tools(dashboards=[{"id": 12, "dashboard_title": "Premium by region"}])
     recorder = FakePlanner(_valid_plan())
     assert _plan(GOAL, recorder, tools, offer_reuse=False) == _valid_plan()
@@ -872,7 +872,7 @@ def test_a_model_that_fails_on_the_repair_ends_the_plan_in_mnemiqs_words():
 
 
 def test_a_refusal_the_model_cannot_repair_stops_the_plan():
-    """M1: Superset not answering a measure's proof (`source_unavailable`) is nobody's statement to repair."""
+    """Superset not answering a measure's proof (`source_unavailable`) is nobody's statement to repair."""
     from mnemiq.superset.client import SupersetUnavailable
     from mnemiq.superset.measures import MeasureRefused, check_measure
 
@@ -895,7 +895,8 @@ def test_a_refusal_the_model_cannot_repair_stops_the_plan():
 
 
 def test_a_time_column_is_a_date_or_a_timestamp():
-    """M2: by the type the snapshot records; a time of day or an unknown type is not one."""
+    """A time column is a date or a timestamp by the type the snapshot records; a time of day or an unknown type
+    is not one."""
     from mnemiq.superset.planner import _temporal
 
     assert [_temporal(t) for t in ("DATE", "timestamp without time zone", "timestamp with time zone", "TIMESTAMPTZ")] \
@@ -909,7 +910,7 @@ def test_a_time_column_is_a_date_or_a_timestamp():
 
 
 def test_a_virtual_datasets_name_carries_its_key():
-    """M3: unique within a build by its key, and never longer than rc2's 250."""
+    """Unique within a build by its key, and never longer than rc2's 250."""
     from mnemiq.superset.planner import _virtual_name
 
     assert _virtual_name("dataset_1", ["policy", "claim"]) == "mnemiq_dataset_1:policy_claim"
@@ -933,7 +934,7 @@ def test_two_joins_get_two_names():
 
 
 def test_a_checked_dataset_holds_only_what_the_check_wrote():
-    """M4: a planner's own sql, name or table_name never reaches the build."""
+    """A planner's own sql, name or table_name never reaches the build."""
     rows = _measure("agents", "Agents", "COUNT(DISTINCT agent_id)", K.COUNT, dataset_id=-1)
     paid = _measure("paid", "Paid", "SUM(amount)", K.NUMBER, dataset_id=-2)
     plan = BuildPlan(charts=(_chart("agents", Family.BAR, [WrittenRef(rows)], dataset_id=-1, dims=["office"]),
@@ -951,7 +952,8 @@ def test_a_checked_dataset_holds_only_what_the_check_wrote():
 
 
 def test_a_join_read_from_one_table_is_refused():
-    """M5: decision 12 makes a virtual dataset only where a join is needed."""
+    """A virtual dataset is made only where a join is needed: a join whose measures and charts read one of its
+    tables alone is refused."""
     total = _measure("total", "Total", "SUM(premium)", K.NUMBER, dataset_id=-1)
     plan = BuildPlan(charts=(_chart("total", Family.BAR, [WrittenRef(total)], dataset_id=-1, dims=["region"]),),
                      measures=(total,), reuse_candidates=(),
@@ -962,7 +964,7 @@ def test_a_join_read_from_one_table_is_refused():
 
 
 def test_the_planner_imports_no_private_name():
-    """M6: what the planner reads of another module is that module's public interface. Parsed with `ast`."""
+    """What the planner reads of another module is that module's public interface. Parsed with `ast`."""
     import ast
     import inspect
 
@@ -979,7 +981,7 @@ def test_the_planner_imports_no_private_name():
 
 
 def test_two_planned_datasets_on_one_table_are_refused():
-    """M7."""
+    """Two planned datasets on one table are refused: a table gets one dataset, which both charts plan on."""
     one = _measure("agents", "Agents", "COUNT(DISTINCT agent_id)", K.COUNT, dataset_id=-1)
     two = _measure("offices", "Offices", "COUNT(DISTINCT office)", K.COUNT, dataset_id=-2)
     plan = BuildPlan(charts=(_chart("agents", Family.BAR, [WrittenRef(one)], dataset_id=-1, dims=["office"]),
@@ -995,7 +997,7 @@ def test_two_planned_datasets_on_one_table_are_refused():
 @pytest.mark.parametrize("item", [Filter("premium", ">", float("nan")), Filter("premium", "<", float("inf")),
                                   Filter("premium", "IN", [1.0, float("-inf")])])
 def test_an_operand_json_cannot_carry_is_refused(item):
-    """M8: NaN and Infinity."""
+    """An operand is a finite number: JSON carries no NaN or Infinity."""
     plan = _valid_plan(charts=(_chart("by_region", Family.BAR, [WrittenRef(PREMIUM)], dims=["region"],
                                       filters=[item]),), measures=(PREMIUM,))
     refused = _plan(GOAL, FakePlanner(plan), _tools())
@@ -1004,7 +1006,7 @@ def test_an_operand_json_cannot_carry_is_refused(item):
 
 
 def test_a_measures_description_is_bounded():
-    """M8: at most 500 characters."""
+    """A measure's description is at most 500 characters."""
     long = dataclasses.replace(PREMIUM, description="d" * 501)
     plan = _valid_plan(charts=(_chart("by_region", Family.BAR, [WrittenRef(long)], dims=["region"]),),
                        measures=(long,))
@@ -1017,7 +1019,7 @@ def test_a_measures_description_is_bounded():
     assert _plan(GOAL, FakePlanner(plan), _tools()) == plan
 
 
-# ---------------------------------------------------------------- fix round 2
+# ---------------------------------------------------------------- what a join is held to
 
 def _joined_plan(join: str) -> BuildPlan:
     paid = _measure("paid", "Paid", "SUM(amount)", K.NUMBER, dataset_id=-1)
@@ -1044,7 +1046,9 @@ def _joined_plan(join: str) -> BuildPlan:
     ("policy CROSS JOIN claim ON claim.policy_id = policy.policy_id", "LEFT JOIN"),
 ])
 def test_a_joined_table_is_named_alone_and_joined_on_its_columns(join, why):
-    """Fix round 2: what the allow-list still let through. TABLESAMPLE would have made the dataset a sample."""
+    """Each table is named alone, with an alias at most, and joined ON conditions on the joined tables' columns:
+    a column list, a function, NATURAL, ONLY, TABLESAMPLE (which would make the dataset a sample), TABLE, a column
+    of no joined table, and SEMI, ANTI and CROSS joins are refused."""
     refused = _plan(GOAL, FakePlanner(_joined_plan(join)), _tools())
     assert isinstance(refused, PlanRefused), refused
     assert f"the join {join!r}" in _parts(refused)
@@ -1057,7 +1061,7 @@ def test_a_joined_table_is_named_alone_and_joined_on_its_columns(join, why):
      "policy AS p LEFT JOIN claim AS c ON c.policy_id = p.policy_id"),
 ])
 def test_a_virtual_dataset_runs_the_join_as_it_was_decided(written, rendered):
-    """Fix round 2: the dataset's SQL is the parsed join's rendering, the text the dry run decided, not the raw
+    """The dataset's SQL is the parsed join's rendering, the text the dry run decided, not the raw
     text."""
     tools = _tools()
     checked = _plan(GOAL, FakePlanner(_joined_plan(written)), tools)
@@ -1069,7 +1073,7 @@ def test_a_virtual_dataset_runs_the_join_as_it_was_decided(written, rendered):
 
 
 def test_virtual_dataset_names_cannot_meet():
-    """Fix round 2: a key holds no `:`, so the name's key part is the key and nothing else."""
+    """A key holds no `:`, so the name's key part is the key and nothing else."""
     from mnemiq.superset.planner import _virtual_name
 
     assert _virtual_name("a", ["b", "c_d"]) != _virtual_name("a_b", ["c", "d"])

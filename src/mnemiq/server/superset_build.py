@@ -60,7 +60,8 @@ __all__ = ["WRITE_SCOPES", "mount_superset_build"]
 
 logger = logging.getLogger(__name__)
 
-# What a build route needs beside `db.read` (decision 6): Superset's own scopes for the writes a build makes.
+# What a build route needs beside `db.read`: Superset's own scopes for the writes a build makes, which are
+# Superset's metadata, never the source database, so no mnemiq scope of their own.
 WRITE_SCOPES = ("superset:chart:write", "superset:dashboard:write", "superset:dataset:write")
 _NEEDED = ("db.read", *WRITE_SCOPES)
 

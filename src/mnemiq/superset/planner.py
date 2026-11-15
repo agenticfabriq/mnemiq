@@ -1040,7 +1040,7 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
     kept: list[Measure] = []
     columns_of: dict[str, set[str]] = {}
     # The joined tables each planned join's measures and charts read, so a join only one of them is read from is
-    # refused (decision 12: a virtual dataset only where a join is needed).
+    # refused: a virtual dataset is made only where a join is needed.
     reads: dict[int, set[str]] = {}
     for chart in plan.charts:
         for ref in chart.measures:
