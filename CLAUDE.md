@@ -11,7 +11,7 @@ Branch from `main`, push the branch, open a pull request, and merge on GitHub. `
 a pull request is required (administrators included), and force-pushes and rebase merges are
 blocked.
 
-- **Required checks:** `unit`, `workbench`, `guard` and `mcp-2x`.
+- **Required checks:** `unit`, `workbench`, `guard`, `mcp-2x`, `postgres-keys` and `superset-build-store`.
 - **CodeQL (GitHub's default setup) runs on every pull request without being required.** Let it finish green too. An alert
   needs a decision, a fix or a dismissal with a reason, which no setting can make.
 - These are GitHub settings, not files in this repository, so they can drift without a commit. Confirm
