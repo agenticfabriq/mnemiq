@@ -63,6 +63,7 @@ NOT_FOR_BUILDING = "This sign-in was made for asking, not building; open the bui
 EXTENSION_MISSING = "This Superset does not have the mnemiq extension installed."
 STEP_RUNNING = "a step of this build is already running"
 DASHBOARD_BUSY = "another build of this dashboard is still building; it must finish or stop first"
+NO_SUCH_DASHBOARD = "This builder can read no dashboard of that id, so nothing was planned."
 
 # What a token minted for asking carries, and what one minted for building adds (decision 7).
 ASK_SCOPES = "db.read superset:sqllab:write superset:dataset:read"
@@ -559,12 +560,56 @@ def test_a_body_the_route_cannot_read_is_422(served, fake, store, body):
     assert runtime.profiles[runtime.default_profile].planner.goals == []
 
 
-def test_the_largest_dashboard_id_the_store_keeps_is_built_on(served, fake, store):
+def _dashboard(world, dashboard_id: int, *, editors=("someone",), title: str = "Sales") -> int:
+    """A dashboard made by hand. The person each test's token names is `someone` to the World."""
+    world.dashboards[dashboard_id] = {"id": dashboard_id, "dashboard_title": title, "published": True,
+                                      "description": None, "position_json": None, "json_metadata": "{}",
+                                      "editors": list(editors), "members": [], "created_by": "analyst",
+                                      "created_on": world.superset_now(), "changed_on": world.superset_now()}
+    return dashboard_id
+
+
+def test_the_largest_dashboard_id_the_store_keeps_is_built_on(served, fake, world, store):
     """The control for the bound: Postgres's largest `integer` is read, planned and kept."""
     client, _ = served
+    _dashboard(world, 2**31 - 1)
     r = _start(client, dashboard_id=2**31 - 1)
     assert r.status_code == 201, r.text
     assert r.json()["build"]["dashboard_id"] == 2**31 - 1
+
+
+def _asked_only_whether_the_builder_edits(fake, dashboard_id: int) -> None:
+    """The one call Superset was asked: the extension's read of whether the builder edits the dashboard."""
+    assert [(call.tool, call.request) for call in fake.calls] == [
+        (TOOL_PREFIX + "editors_of", {"dashboard_ids": [dashboard_id]})]
+
+
+def test_a_dashboard_the_builder_cannot_read_is_not_found_before_anything_is_planned(served, fake, world, store):
+    """A dashboard id Superset has no dashboard of that the builder can read, whether none exists yet (the id it will
+    give the next dashboard made) or they may not read it, is refused before anything is planned or kept, in words
+    that do not say which. So it takes no dashboard's one live build, and says nothing of a build running on it."""
+    client, runtime = served
+    running = _stored(store, client, dashboard_id=900)  # someone who can read it is building on dashboard 900
+    fake.calls.clear()
+    r = _start(client, dashboard_id=900)
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"] == NO_SUCH_DASHBOARD and "900" not in r.text
+    _asked_only_whether_the_builder_edits(fake, 900)
+    assert list(store._builds) == [(running.tenant_id, running.build_id)]
+    assert runtime.profiles[runtime.default_profile].planner.goals == []
+
+
+def test_a_dashboard_the_builder_does_not_edit_is_refused_naming_its_editors(served, fake, world, store):
+    """One the builder reads but does not edit is a 403 naming its editors, in the HTTP answer only, with where Sign out
+    ends as every `/v1` 403 carries it; nothing is planned or kept."""
+    client, runtime = served
+    _dashboard(world, 900, editors=("colleague", "analyst"))
+    r = _start(client, dashboard_id=900)
+    assert r.status_code == 403, r.text
+    assert r.json() == {"detail": "This builder is not an editor of dashboard 900; its editors are analyst, colleague.",
+                        "end_session_url": None}
+    _asked_only_whether_the_builder_edits(fake, 900)
+    assert store._builds == {} and runtime.profiles[runtime.default_profile].planner.goals == []
 
 
 @pytest.mark.parametrize("refusal", [

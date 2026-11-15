@@ -20,7 +20,8 @@ principal of the tenant reads them, and Superset checks editorship on each actio
 dashboard has one build building at a time (`DashboardBusy`), since its measures are kept as the last build to write
 them leaves them; Postgres holds that rule, as a unique index over the dashboards of builds still building. A build
 left untouched for `ABANDONED_AFTER_S`, no claim of it holding, does not keep its dashboard: the next build of the
-dashboard fails its next step as `abandoned`, in the transaction that creates the new one.
+dashboard fails its next step as `abandoned`, in the transaction that creates the new one, and so does a new
+dashboard's step that Superset gave the id the old build holds, before it finishes once more.
 
 **Steps and leases.** A build runs one step at a time, in order: its dashboard (a new shell, or the read of an existing
 one), then its datasets, its charts, its layout and its checks. `claim_next_step` claims the first step not done before
@@ -391,9 +392,11 @@ class BuildStore:
                     lease_id: str, reason: str | None = None) -> StoredBuild:
         """Record step `key` as `done`, `failed` or `uncertain`, with the id of the object it made or read (required
         for a done dashboard, dataset or chart step), ending the claim `lease_id` holds on it. A done dashboard step's
-        id is the build's dashboard, refused with DashboardBusy while another build of that dashboard is building.
-        LeaseLost when the claim is no longer `lease_id`'s; nothing is written then. `reason` is one of `REASONS`, why
-        the step failed or is left uncertain."""
+        id is the build's dashboard, refused with DashboardBusy while another build of that dashboard is building; a
+        build of it left untouched for `ABANDONED_AFTER_S` is released first, as `create_build` releases one, so a
+        build that named the id before Superset gave it to this dashboard cannot hold it for good. LeaseLost when the
+        claim is no longer `lease_id`'s; nothing is written then. `reason` is one of `REASONS`, why the step failed or
+        is left uncertain."""
         tenant, key = _text(tenant, "tenant"), _text(key, "step key")
         if not isinstance(status, str) or status not in _FINISHED_AS:
             raise ValueError(f"a step finishes as one of {sorted(_FINISHED_AS)}")
@@ -407,7 +410,16 @@ class BuildStore:
         def finish(steps: list[dict], dashboard_id: int | None, now: datetime):
             return (*_finish(steps, dashboard_id, key, lease_id, status, object_id, reason), True)
 
-        outcome, stored = self._change(tenant, build, None, finish)
+        try:
+            outcome, stored = self._change(tenant, build, None, finish)
+        except DashboardBusy:
+            # Only a done dashboard step gives a build its dashboard, so the dashboard another build holds is this
+            # one: a holder left untouched is released, and the finish is tried once more.
+            if status != DONE or object_id is None:
+                raise
+            with self._connection() as con, con.transaction():
+                _release_abandoned(con, tenant, object_id)
+            outcome, stored = self._change(tenant, build, None, finish)
         if outcome is _CONTENDED:
             raise LeaseLost()
         return stored
@@ -530,9 +542,10 @@ def _live_dashboard() -> Iterator[None]:
 
 
 def _release_abandoned(con: psycopg.Connection, tenant: str, dashboard_id: int) -> None:
-    """In the creating transaction: each build of the dashboard still building, untouched for `ABANDONED_AFTER_S` with
-    no claim of it holding, has its next step failed as abandoned, so it no longer holds the dashboard. Its row is held
-    `FOR UPDATE` while it is decided."""
+    """In the transaction that creates a build of the dashboard, or before a new dashboard's step is finished once
+    more: each build of the dashboard still building, untouched for `ABANDONED_AFTER_S` with no claim of it holding,
+    has its next step failed as abandoned, so it no longer holds the dashboard. Its row is held `FOR UPDATE` while it
+    is decided."""
     rows = con.execute(f"SELECT build_id, steps, updated_at, now() FROM {BUILD_TABLE} WHERE tenant_id = %s AND "
                        "dashboard_id = %s AND status = %s FOR UPDATE", (tenant, dashboard_id, BUILDING)).fetchall()
     for build, steps, updated_at, now in rows:

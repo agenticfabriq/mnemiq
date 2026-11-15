@@ -416,6 +416,44 @@ def test_an_existing_dashboard_the_builder_does_not_edit_is_refused_before_anyth
     assert "not an editor" in later.message and "colleague" not in later.message
 
 
+def _tabbed(chart_id: int) -> dict:
+    """A layout whose charts sit in top-level tabs, as Superset's dashboard keeps one: the root holds the tabs, not
+    the grid, which stays empty."""
+    return {"DASHBOARD_VERSION_KEY": "v2",
+            "ROOT_ID": {"type": "ROOT", "id": "ROOT_ID", "children": ["TABS-a"]},
+            "GRID_ID": {"type": "GRID", "id": "GRID_ID", "children": [], "parents": ["ROOT_ID"]},
+            "TABS-a": {"type": "TABS", "id": "TABS-a", "children": ["TAB-a"], "parents": ["ROOT_ID"]},
+            "TAB-a": {"type": "TAB", "id": "TAB-a", "children": ["ROW-x"], "parents": ["ROOT_ID", "TABS-a"],
+                      "meta": {"text": "Overview"}},
+            "ROW-x": {"type": "ROW", "id": "ROW-x", "children": ["CHART-x"], "meta": {},
+                      "parents": ["ROOT_ID", "TABS-a", "TAB-a"]},
+            "CHART-x": {"type": "CHART", "id": "CHART-x", "children": [], "meta": {"chartId": chart_id, "width": 12,
+                                                                                 "height": 50},
+                        "parents": ["ROOT_ID", "TABS-a", "TAB-a", "ROW-x"]}}
+
+
+_MAKES = ("generate_chart", "create_dataset", "create_virtual_dataset", "create_chart", "claim_chart",
+          "claim_dataset", "patch_chart", "set_layout", "create_dashboard", "add_saved_metric")
+
+
+@pytest.mark.parametrize("layout", ["tabs", "a node that is not an object", "not an object"])
+def test_a_layout_no_chart_can_be_added_to_stops_the_build_at_its_first_step(fake, world, store, layout):
+    """A dashboard whose layout mnemiq cannot add rows to (its charts in top-level tabs, or a layout that is not one
+    it reads) is refused at the first step, which reads it, before any dataset or chart is made: never at the layout
+    step, with every chart made and none placed."""
+    dashboard, existing = _existing_dashboard(world)
+    grid = json.loads(world.dashboards[dashboard]["position_json"])
+    positions = {"tabs": _tabbed(existing), "a node that is not an object": {**grid, "ROW-x": []},
+                 "not an object": [grid]}[layout]
+    world.dashboards[dashboard]["position_json"] = json.dumps(positions)
+    build = _start(store, SIX, dashboard_id=dashboard).build_id
+    stopped = _next(store, build, _adapter(fake))
+    assert stopped.status == "failed" and _step(stopped, "dashboard").reason == "layout_unreadable", stopped.message
+    assert f"dashboard {dashboard}" in stopped.message and "add charts to" in stopped.message
+    assert not set(_tools(fake)) & set(_MAKES), _tools(fake)
+    assert _run(store, build, _adapter(fake))[-1].status == "failed" and not set(_tools(fake)) & set(_MAKES)
+
+
 def test_a_layout_raced_by_a_hand_edit_is_recomputed_once(fake, world, store):
     """The dashboard changed after the layout step read it: `set_layout` answers stale, and the layout is read and
     computed again once, from what the dashboard now holds."""
@@ -1058,6 +1096,32 @@ def test_an_abandoned_build_releases_its_dashboard(fake, world, store, clock):
     assert "untouched" in stale.message
 
 
+def test_a_build_holding_a_dashboard_id_before_it_exists_stalls_a_new_dashboard_only_until_it_is_abandoned(
+        fake, world, store, clock):
+    """A build started on the id Superset will give the next dashboard made (the start route refuses that id, which
+    no dashboard has yet; the store takes it from anyone) holds that id's one live build. Another person's new
+    dashboard then gets the id, and its step meets the holder: refused while the holder may still be live. Once the
+    holder has been left untouched for twice the lease, the step releases it, as starting a build of that dashboard
+    would, and finishes. One dashboard is made throughout."""
+    squatter = start_build(store, tenant=TENANT, principal="superset:squatter", goal=GOAL, plan=ONE_BAR,
+                           dashboard_id=300).build_id
+    assert not world.dashboards  # 300 is the id the World gives the next dashboard
+    build = _start(store, ONE_BAR).build_id
+    outcomes = []
+    for _ in range(3):
+        try:
+            outcomes.append(_step(_next(store, build, _adapter(fake)), "dashboard").status)
+        except DashboardBusy:
+            outcomes.append("busy")
+        clock.advance(601)
+    assert outcomes == ["busy", "busy", "done"]
+    assert sorted(world.dashboards) == [300]
+    assert store.load_build(TENANT, build, PRINCIPAL).dashboard_id == 300
+    stale = store.load_build(TENANT, squatter, "superset:squatter")
+    assert stale.status == "failed" and stale.step("dashboard").reason == "abandoned"
+    assert _run(store, build, _adapter(fake))[-1].status == "done"
+
+
 # --- a token that expires between steps
 
 
@@ -1153,18 +1217,36 @@ def _kept_measure(store, dashboard: int, measure: Measure, chart_ids: tuple) -> 
                       chart_ids=chart_ids, check_status={chart_ids[0]: ChartStatus.CHECKED})
 
 
-def test_a_measure_the_dashboard_holds_with_another_definition_stops_its_chart(fake, world, store):
-    """On a dashboard that already keeps a measure of the planned name with another definition, the chart is not
-    made: the step stops with its reason, and the measure kept is unchanged."""
+def test_a_measure_the_dashboard_holds_with_another_definition_stops_the_build_at_its_first_step(fake, world,
+                                                                                               store):
+    """On a dashboard that already keeps a measure of a planned name with another definition, the build stops at its
+    first step, which checks every measure the plan writes, before anything is made: here the conflict is the last
+    chart's, after five that conflict with nothing, and the dataset the plan makes for it is not made either. The
+    measure kept is unchanged."""
     dashboard, existing = _existing_dashboard(world)
-    _kept_measure(store, dashboard, dataclasses.replace(POLICIES, expression="COUNT(DISTINCT region)"), (existing,))
+    other = dataclasses.replace(CLAIMED, dataset_id=POLICY_DATASET, expression="SUM(premium)")
+    _kept_measure(store, dashboard, other, (existing,))
+    assert [chart.key for chart in SIX.charts][-1] == "claimed_by_region"
+    build = _start(store, SIX, dashboard_id=dashboard).build_id
+    stopped = _next(store, build, _adapter(fake))
+    assert stopped.status == "failed" and _step(stopped, "dashboard").reason == "measure_conflict", stopped.message
+    assert "'claimed'" in stopped.message and "nothing" in stopped.message
+    assert not set(_tools(fake)) & set(_MAKES), _tools(fake)
+    [kept] = store.measures_for(TENANT, dashboard)
+    assert kept.measure.expression == "SUM(premium)" and kept.chart_ids == (existing,)
+
+
+def test_a_measure_kept_with_another_definition_after_the_first_step_still_stops_its_chart(fake, world, store):
+    """A measure the dashboard comes to keep under a planned name after the first step (Superset mode keeps one build
+    of a dashboard at a time, but a dashboard's measures can be changed apart from builds) still stops the chart that
+    would show it, before the chart is made."""
+    dashboard, existing = _existing_dashboard(world)
     build = _start(store, ONE_BAR, dashboard_id=dashboard).build_id
-    _next(store, build, _adapter(fake))
+    assert _step(_next(store, build, _adapter(fake)), "dashboard").status == "done"
+    _kept_measure(store, dashboard, dataclasses.replace(POLICIES, expression="COUNT(DISTINCT region)"), (existing,))
     stopped = _next(store, build, _adapter(fake))
     assert stopped.status == "failed" and _step(stopped, "policies_by_region").reason == "measure_conflict"
     assert "generate_chart" not in _tools(fake) and "'policies'" in stopped.message
-    [kept] = store.measures_for(TENANT, dashboard)
-    assert kept.measure.expression == "COUNT(DISTINCT region)" and kept.chart_ids == (existing,)
 
 
 def test_the_same_definition_merges_its_charts(fake, world, store):

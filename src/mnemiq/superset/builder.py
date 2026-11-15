@@ -50,7 +50,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
@@ -639,7 +639,9 @@ def _run_dashboard(run: _Run) -> _Outcome:
 def _existing_dashboard(run: _Run, dashboard_id: int) -> _Outcome:
     """An existing dashboard: whether the builder edits it, its layout and its `changed_on`, read now, before anything
     is made, and nothing held across steps; each later write takes the dashboard's row lock itself, and the layout step
-    reads it afresh."""
+    reads it afresh. What this read alone can refuse is refused here, so no dataset or chart is made that the build
+    then cannot place or keep: a layout mnemiq cannot add rows to (one whose charts sit in top-level tabs among them),
+    and a measure the plan writes that the dashboard keeps under its name with another definition."""
     what = f"dashboard {dashboard_id}"
     entry = dashboard_editorship(run.client, dashboard_id, before_call=run.renew)
     if entry is None:
@@ -652,7 +654,21 @@ def _existing_dashboard(run: _Run, dashboard_id: int) -> _Outcome:
     answer = run.extension("get_layout", {"dashboard_id": dashboard_id})
     if answer.get("dashboard_id") != dashboard_id or not isinstance(answer.get("changed_on"), str):
         raise _read_refusal(answer, f"the layout of {what}")
+    try:
+        layout_positions([], onto=_layout_of(answer))
+    except ValueError as exc:
+        raise _Stop("layout_unreadable", f"the layout of {what} is not one mnemiq can add charts to ({exc})") from None
+    _held_to_the_dashboards_measures(run, run.plan.charts, stops="nothing of this build is made")
     return _Outcome(DONE, dashboard_id)
+
+
+def _layout_of(answer: Mapping) -> dict:
+    """The layout `get_layout` answered, as an object (an empty one for a dashboard that has none); ValueError when
+    it is not one."""
+    current = json.loads(answer["position_json"]) if answer.get("position_json") else {}
+    if not isinstance(current, dict):
+        raise ValueError("not an object")
+    return current
 
 
 def _run_dataset(run: _Run) -> _Outcome:
@@ -728,7 +744,7 @@ def _run_chart(run: _Run) -> _Outcome:
     saved = run.saved(spec.dataset_id) if any(isinstance(ref, SavedRef) for ref in spec.measures) else {}
     currency = run.settings.superset_currency
     by_extension = spec.family in EXTENSION_FAMILIES
-    _held_to_the_dashboards_measures(run, spec)
+    _held_to_the_dashboards_measures(run, (spec,), stops=f"the chart {spec.title!r} is not made")
     chart_id, marked = None, False
     if run.uncertain:
         chart_id, marked = _reconciled_chart(run, spec, ours, by_extension)
@@ -829,17 +845,21 @@ def _same_definition(kept: Measure, planned: Measure) -> bool:
         return kept.expression.strip() == planned.expression.strip()
 
 
-def _held_to_the_dashboards_measures(run: _Run, spec: ChartSpec) -> None:
-    """Before the chart is made: a measure it writes that the dashboard already keeps under its name with another
-    definition stops the step, since one name would then mean two measures on one dashboard."""
+def _held_to_the_dashboards_measures(run: _Run, specs: Sequence[ChartSpec], *, stops: str) -> None:
+    """Before what `stops` names is made (every chart, at the first step; one chart, at its own): a measure the charts
+    write that the dashboard already keeps under its name with another definition stops the step, since one name
+    would then mean two measures on one dashboard. At the first step a measure on a dataset the build has yet to make
+    carries the dataset's placeholder id, which is no kept measure's dataset; nor will the dataset's id be, once it is
+    made, since Superset gives a new dataset an id no dataset had before."""
     build = run.build
     kept = {row.measure.name: row for row in run.store.measures_for(build.tenant_id, build.dashboard_id)}
-    for ref in spec.measures:
-        if isinstance(ref, WrittenRef) and (before := kept.get(ref.measure.name)) is not None \
-                and not _same_definition(before.measure, ref.measure):
-            raise _Stop("measure_conflict", f"the dashboard keeps a measure {ref.measure.name!r} with another "
-                                            f"definition, so the chart {spec.title!r} is not made; give the planned "
-                                            "measure another name, or change the one the dashboard keeps")
+    for spec in specs:
+        for ref in spec.measures:
+            if isinstance(ref, WrittenRef) and (before := kept.get(ref.measure.name)) is not None \
+                    and not _same_definition(before.measure, ref.measure):
+                raise _Stop("measure_conflict", f"the dashboard keeps a measure {ref.measure.name!r} with another "
+                                                f"definition, so {stops}; give the planned measure another name, or "
+                                                "change the one the dashboard keeps")
 
 
 def _saved_measure(ref: SavedRef, metric: SavedMetric, dataset_id: int, principal: str) -> Measure:
@@ -889,9 +909,7 @@ def _run_layout(run: _Run) -> _Outcome:
         if answer.get("dashboard_id") != dashboard_id or not isinstance(answer.get("changed_on"), str):
             raise _read_refusal(answer, what)
         try:
-            current = json.loads(answer["position_json"]) if answer.get("position_json") else {}
-            if not isinstance(current, dict):
-                raise ValueError("not an object")
+            current = _layout_of(answer)
             to_add = [(chart_id, family) for chart_id, family in charts if chart_id not in layout_chart_ids(current)]
             if not to_add:
                 return _Outcome(DONE, None)

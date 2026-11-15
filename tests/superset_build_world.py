@@ -165,11 +165,7 @@ class MemoryBuildStore:
         with self._lock:
             now = self._now()
             if dashboard_id is not None:
-                for row in self._builds.values():
-                    if (row["tenant_id"], row["dashboard_id"], row["status"]) == (tenant, dashboard_id, bs.BUILDING):
-                        released = bs._released(copy.deepcopy(row["steps"]), now, row["updated_at"])
-                        if released is not None:
-                            self._write(row, released, row["dashboard_id"])
+                self._release_abandoned(tenant, dashboard_id)
             if dashboard_id is not None and self._live_on(tenant, dashboard_id):
                 raise bs.DashboardBusy()
             row = {"tenant_id": tenant, "build_id": build_id, "principal_id": principal, "dashboard_id": dashboard_id,
@@ -177,6 +173,15 @@ class MemoryBuildStore:
                    "created_at": now, "updated_at": now}
             self._builds[(tenant, build_id)] = row
             return self._stored(row)
+
+    def _release_abandoned(self, tenant: str, dashboard_id: int) -> None:
+        """`build_store._release_abandoned`: each build of the dashboard still building, untouched for
+        `ABANDONED_AFTER_S` with no claim of it holding, has its next step failed as abandoned."""
+        for row in self._builds.values():
+            if (row["tenant_id"], row["dashboard_id"], row["status"]) == (tenant, dashboard_id, bs.BUILDING):
+                released = bs._released(copy.deepcopy(row["steps"]), self._now(), row["updated_at"])
+                if released is not None:
+                    self._write(row, released, row["dashboard_id"])
 
     def load_build(self, tenant, build_id, principal) -> StoredBuild | None:
         tenant, principal = bs._text(tenant, "tenant"), bs._text(principal, "principal")
@@ -234,7 +239,10 @@ class MemoryBuildStore:
                                              object_id, reason)
             if dashboard_id is not None and dashboard_id != row["dashboard_id"] \
                     and self._live_on(tenant, dashboard_id, other_than=row["build_id"]):
-                raise bs.DashboardBusy()
+                # As the Postgres store: a holder left untouched is released, and the finish is tried once more.
+                self._release_abandoned(tenant, dashboard_id)
+                if self._live_on(tenant, dashboard_id, other_than=row["build_id"]):
+                    raise bs.DashboardBusy()
             self._write(row, steps, dashboard_id)
             return self._stored(row)
 

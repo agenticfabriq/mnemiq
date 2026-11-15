@@ -6,7 +6,10 @@ request, and the build as it stands. Mounted only in Superset mode, and no other
   offer, its id, title and reason, and nothing is kept. The builder answers by asking again, with that `dashboard_id`
   to build on it or with `fresh: true` for a new one; asked either way, no dashboard is looked for. Otherwise the
   answer is the new build (201), or the plan's refusal, which is an answer too. The build keeps the profile it was
-  asked under (`profile`, None for the deployment's default).
+  asked under (`profile`, None for the deployment's default). Asked with a `dashboard_id`, the first thing asked of
+  Superset is whether the builder edits that dashboard (the extension's `editors_of`), before anything is planned or
+  kept: one they cannot read, or that does not exist, is a 404 that does not say which, and one they read but do not
+  edit a 403 naming its editors.
 - `GET /v1/superset/builds/{build_id}`: the build as it stands, read from the build store alone.
 - `POST /v1/superset/builds/{build_id}/next`: the build's next step, claimed, run and recorded (`builder.next_step`);
   409 while another request's step holds the build.
@@ -43,11 +46,12 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, Strict
 
 from mnemiq.profiles import UnknownProfile
 from mnemiq.server.superset_refusals import NotForBuilding
-from mnemiq.server.v1_refusals import refused, unknown_profile
+from mnemiq.server.v1_refusals import NotPermitted, refused, unknown_profile
 from mnemiq.superset.build_store import MAX_ID, BuildNotFound, BuildStore, BuildStoreMissing, DashboardBusy
 from mnemiq.superset.builder import BuildBusy, BuildState, build_state, next_step, start_build
+from mnemiq.superset.client import SupersetToolError
 from mnemiq.superset.executor import SupersetCredentialMissing, superset_executor
-from mnemiq.superset.extension import ExtensionMissing, require_extension
+from mnemiq.superset.extension import ExtensionMissing, dashboard_editorship, require_extension
 from mnemiq.superset.planner import MAX_GOAL, BuildPlan, PlanContext, PlanRefused, plan_build
 
 __all__ = ["WRITE_SCOPES", "mount_superset_build"]
@@ -61,6 +65,36 @@ _NEEDED = ("db.read", *WRITE_SCOPES)
 NO_DELEGATION = ("Superset mode builds as the person whose verified token each request carries, and this request "
                  "carries none")
 STORE_UNAVAILABLE = "mnemiq's control Postgres, where builds are kept, did not answer; try this request again."
+# A dashboard id that names none this builder can read: whether it exists is not said.
+NO_SUCH_DASHBOARD = "This builder can read no dashboard of that id, so nothing was planned."
+
+
+class DashboardUnreadable(Exception):
+    """`dashboard_id` names no dashboard the builder can read: none of that id, or one they may not read."""
+
+
+class NotAnEditor(Exception):
+    """The builder reads the dashboard but does not edit it. `editors` are their labels, for the HTTP answer only."""
+
+    def __init__(self, dashboard_id: int, editors: list) -> None:
+        named = f"; its editors are {', '.join(str(label) for label in editors)}" if editors else ""
+        super().__init__(f"This builder is not an editor of dashboard {dashboard_id}{named}.")
+
+
+def _held_to_its_editors(client, dashboard_id: int) -> None:
+    """Return when the builder edits the dashboard, as the extension's `editors_of` answers it (the read the build's
+    first step makes again, since its editors can change between steps); raise when they cannot read it or do not
+    edit it. Asked before anything is planned or kept, so an id no dashboard has yet, or one the builder may not
+    change, takes no dashboard's one live build, and the answer says nothing of a build running on it."""
+    entry = dashboard_editorship(client, dashboard_id)
+    if entry is None:
+        raise DashboardUnreadable()
+    if entry.get("is_editor") is True:
+        return
+    if entry.get("is_editor") is False:
+        raise NotAnEditor(dashboard_id, entry.get("editors") or [])
+    raise SupersetToolError("the extension's editors_of did not say whether this builder edits the dashboard",
+                            detail=str(entry)[:200])
 
 
 class StartBody(BaseModel):
@@ -141,6 +175,10 @@ def _refusal(exc: Exception, doors) -> HTTPException | None:
         return HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, BuildNotFound):
         return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, DashboardUnreadable):
+        return HTTPException(status_code=404, detail=NO_SUCH_DASHBOARD)
+    if isinstance(exc, NotAnEditor):  # Superset's answer, in mnemiq's words: a 403 like every `/v1` one
+        return NotPermitted(str(exc), None, doors.end_session_url if doors is not None else None)
     if isinstance(exc, psycopg.OperationalError):
         logger.warning("the build store did not answer a build route: %s", exc)
         return HTTPException(status_code=503, detail=STORE_UNAVAILABLE)
@@ -184,6 +222,8 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
             profile = runtime.build_profile(body.profile, who)
             planner = _Offering(profile.planner)
             adapter = superset_executor(deployment, delegation)
+            if body.dashboard_id is not None:
+                _held_to_its_editors(adapter.client, body.dashboard_id)
             grants = runtime.builder_grants(adapter)
             # Before anything is planned or kept: every write of a build goes through the extension.
             require_extension(adapter.client)

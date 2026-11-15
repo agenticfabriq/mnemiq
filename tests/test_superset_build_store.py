@@ -1264,3 +1264,23 @@ def test_a_build_left_untouched_releases_its_dashboard(store, store_dsn):
     _untouched_for(store_dsn, held.build_id, 2 * build_store.DEFAULT_LEASE_S + 30)
     with pytest.raises(DashboardBusy):
         store.create_build(TENANT, BO, GOAL, PLAN, STEPS, dashboard_id=13)
+
+
+def test_a_new_dashboard_step_takes_its_dashboard_from_a_build_left_untouched(store, store_dsn):
+    """A build can hold a dashboard id no dashboard has yet; a new dashboard that Superset then gives that id is
+    another build's to finish. While the holder was touched within twice the lease, the finish is DashboardBusy and
+    writes nothing; once it has been left untouched for longer, with no claim of it holding, the finish fails the
+    holder's next step as abandoned, as starting a build of that dashboard does, and finishes."""
+    holder = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12)
+    fresh = store.create_build(TENANT, BO, GOAL, PLAN, STEPS)
+    claimed = store.claim_next_step(TENANT, fresh.build_id, BO, _intent("dashboard", "dashboard"))
+    _untouched_for(store_dsn, holder.build_id, 2 * build_store.DEFAULT_LEASE_S - 30)
+    with pytest.raises(DashboardBusy):
+        store.finish_step(TENANT, fresh.build_id, "dashboard", "done", 12, lease_id=claimed.lease_id)
+    assert store.load_build(TENANT, holder.build_id, ANA).status == "building"
+    assert store.load_build(TENANT, fresh.build_id, BO).step("dashboard").lease_id == claimed.lease_id
+    _untouched_for(store_dsn, holder.build_id, 2 * build_store.DEFAULT_LEASE_S + 30)
+    done = store.finish_step(TENANT, fresh.build_id, "dashboard", "done", 12, lease_id=claimed.lease_id)
+    assert done.dashboard_id == 12 and done.step("dashboard").status == "done"
+    stale = store.load_build(TENANT, holder.build_id, ANA)
+    assert stale.status == "failed" and stale.step("dashboard").reason == "abandoned"
