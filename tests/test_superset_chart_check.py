@@ -8,12 +8,18 @@ Runs against `FakeSuperset`, a real MCP server over streamable HTTP, through the
 
 from __future__ import annotations
 
+import __future__
+import collections
+import collections.abc
 import copy
+import dataclasses
+import decimal
+import enum
 import inspect
 import logging
 import re
 import types
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 
 import pytest
 
@@ -170,29 +176,49 @@ def _tools(fake) -> list[str]:
     return [call.tool for call in fake.calls]
 
 
+_PLAIN = (str, bytes, int, float, complex, bool, type(None), decimal.Decimal, datetime, date, time, timedelta,
+          enum.Enum)
+
+
 def _data_held(module) -> list[str]:
-    """The text of every data value a module holds at any depth of its globals' containers. Functions, classes,
-    modules and other callables are left out: what they print is code and memory addresses, never data."""
+    """The text of every data value a module holds, at any depth: inside its globals' containers (mappings,
+    sequences, sets, deques), objects' attributes and slots, and dataclass fields, those kept out of the repr too.
+    Functions, classes, modules and loggers are left out: what they print is code and memory addresses, and a
+    logger leads to every other logger's records, none of them this module's. A holder of any other kind fails the
+    test by name rather than being read through its repr, which can hide what it holds and print an address."""
     found: list[str] = []
     seen: set[int] = set()
 
-    def walk(held) -> None:
-        if callable(held) or isinstance(held, types.ModuleType) or id(held) in seen:
+    def walk(held, path: str) -> None:
+        if (callable(held) or isinstance(held, (types.ModuleType, logging.Logger, __future__._Feature))
+                or id(held) in seen):
             return
         seen.add(id(held))
-        if isinstance(held, dict):
-            for key, value in held.items():
-                walk(key)
-                walk(value)
-        elif isinstance(held, (list, tuple, set, frozenset)):
-            for item in held:
-                walk(item)
-        else:
+        if isinstance(held, _PLAIN):
             found.append(str(held))
+        elif isinstance(held, re.Pattern):
+            found.append(held.pattern)
+        elif isinstance(held, collections.abc.Mapping):
+            for key, value in held.items():
+                walk(key, path)
+                walk(value, f"{path}[{key!r}]")
+        elif isinstance(held, (collections.abc.Sequence, collections.abc.Set, collections.deque)):
+            for index, item in enumerate(held):
+                walk(item, f"{path}[{index}]")
+        elif dataclasses.is_dataclass(held) or hasattr(held, "__dict__") or getattr(held, "__slots__", ()):
+            fields = {field.name for field in dataclasses.fields(held)} if dataclasses.is_dataclass(held) else set()
+            fields |= set(getattr(held, "__dict__", {}))
+            for slots in (getattr(cls, "__slots__", ()) for cls in type(held).__mro__):
+                fields |= {slots} if isinstance(slots, str) else set(slots)
+            for field in sorted(fields):
+                if hasattr(held, field):
+                    walk(getattr(held, field), f"{path}.{field}")
+        else:
+            raise AssertionError(f"{path} holds a {type(held).__name__}, which this walk has no reading for")
 
     for name, held in vars(module).items():
         if not name.startswith("__"):
-            walk(held)
+            walk(held, name)
     return found
 
 
@@ -206,17 +232,67 @@ class _AddressedCallable:
         return "<function <lambda> at 0x7f801c0>"
 
 
+class _Holder:
+    """An object that keeps rows in an attribute, behind the default repr (which shows only an address)."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+
+class _Slotted:
+    __slots__ = ("rows",)
+
+    def __init__(self, rows):
+        self.rows = rows
+
+
+@dataclasses.dataclass
+class _Hidden:
+    label: str
+    rows: tuple = dataclasses.field(repr=False, default=())
+
+
+class _Opaque:
+    """A holder the walk has no reading for: no attributes, no slots, not a container, not a plain value."""
+
+    __slots__ = ()
+
+
 def test_the_data_a_module_holds_is_its_values_not_its_functions_addresses():
     """A module global that holds functions (a dict of lambdas, say) has a repr full of memory addresses, and an
     address can hold any short run of hex digits, "801" or "1200" among them. Reading reprs for a value then fails
     by chance; reading the data the module holds finds a planted value at any depth and never an address."""
+    addressed = types.ModuleType("addressed")
+    addressed.ON_EACH = {"P1D": _AddressedCallable()}
+    addressed.QUEUED = collections.deque([_AddressedCallable()])
+    addressed.HOLDER = _Holder(_AddressedCallable())
+    addressed.LOG = logging.getLogger("planted")
+    assert any("801" in repr(held) for held in vars(addressed).values() if not callable(held))
+    assert "801" not in " ".join(_data_held(addressed))
+
+
+@pytest.mark.parametrize("holder", [
+    [("north", 1200)],
+    {"kept": {"rows": (("north", 1200),)}},
+    collections.deque([("north", 1200)]),
+    _Holder([("north", 1200)]),
+    {"inside": _Holder((("north", 1200),))},
+    _Slotted([("north", 1200)]),
+    _Hidden("chart", (("north", 1200),)),
+], ids=["a list", "a nested dict", "a deque", "an object's attribute", "an object in a dict", "a slot",
+        "a dataclass field kept out of its repr"])
+def test_a_value_the_module_keeps_is_found_wherever_it_is_held(holder):
     planted = types.ModuleType("planted")
-    planted.ON_EACH = {"P1D": _AddressedCallable()}
-    planted.KEPT = [("north", 1200)]
-    assert any("801" in repr(held) for held in vars(planted).values() if not callable(held))
+    planted.KEPT = holder
     held = " ".join(_data_held(planted))
-    assert "801" not in held
     assert "north" in held and "1200" in held
+
+
+def test_a_holder_the_walk_cannot_read_fails_rather_than_passes():
+    planted = types.ModuleType("planted")
+    planted.KEPT = _Opaque()
+    with pytest.raises(AssertionError, match="_Opaque"):
+        _data_held(planted)
 
 
 # --- checked, and what is compared ------------------------------------------------------------------------------------
