@@ -3,9 +3,11 @@ request, and the build as it stands. Mounted only in Superset mode, and no other
 
 - `POST /v1/superset/builds` takes `{goal, dashboard_id?, fresh?, profile?}`. Asked with neither `dashboard_id` nor
   `fresh`, the plan may offer a dashboard the builder can see that already covers the goal: the answer is then the
-  offer, its id, title and reason, and nothing is kept. The builder answers by asking again, with that `dashboard_id`
-  to build on it or with `fresh: true` for a new one; asked either way, no dashboard is looked for. Otherwise the
-  answer is the new build (201), or the plan's refusal, which is an answer too. The build keeps the profile it was
+  offer, its id, title and reason, with mnemiq's words on each answer to it, and nothing is built or kept. Reusing
+  the dashboard is opening it, which needs no build. Asking again with its `dashboard_id` adds this goal's planned
+  charts to it (a `dashboard_id` always does that, to the dashboard it names), and with `fresh: true` builds a new
+  dashboard; asked either way, no dashboard is looked for. Otherwise the answer is the new build (201), or the plan's
+  refusal, which is an answer too. The build keeps the profile it was
   asked under (`profile`, None for the deployment's default). Asked with a `dashboard_id`, the first thing asked of
   Superset is whether the builder edits that dashboard (the extension's `editors_of`), before anything is planned or
   kept: one they cannot read, or that does not exist, is a 404 that does not say which, and one they read but do not
@@ -101,16 +103,17 @@ class StartBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     goal: Annotated[StrictStr, Field(min_length=1, max_length=MAX_GOAL)]
-    # The dashboard to build on: the one a plan offered, or another the builder names; an id the store can keep.
+    # The dashboard to add this goal's planned charts to (the one a plan offered, or another the builder names); an id
+    # the store can keep.
     dashboard_id: Annotated[StrictInt, Field(gt=0, le=MAX_ID)] | None = None
-    # A new dashboard, the answer to an offer declined.
+    # A new dashboard, whatever a plan would offer.
     fresh: StrictBool = False
     profile: StrictStr | None = None  # None: the deployment's default
 
     @model_validator(mode="after")
     def _one_answer(self) -> StartBody:
         if self.fresh and self.dashboard_id is not None:
-            raise ValueError("name a dashboard to build on, or ask for a fresh one, not both")
+            raise ValueError("name a dashboard to add charts to, or ask for a fresh one, not both")
         return self
 
 
@@ -147,8 +150,14 @@ def _build(state: BuildState) -> dict:
 
 
 def _offer(plan: BuildPlan, titles: dict[int, str]) -> dict:
+    """The offer of a dashboard that already covers the goal, and mnemiq's words on each answer to it: reusing it is
+    opening it, which builds nothing; `dashboard_id` adds this goal's charts to it; `fresh` builds a new one."""
     [dashboard_id] = plan.reuse_candidates  # the plan check holds an offer to one dashboard, one the planner was shown
-    return {"offer": {"dashboard_id": dashboard_id, "title": titles.get(dashboard_id), "reason": plan.reuse_reason}}
+    message = (f"Dashboard {dashboard_id} already covers this goal, so nothing was built: to reuse it, open it. To add "
+               f"this goal's charts to it anyway, ask again with dashboard_id {dashboard_id}; for a new dashboard, ask "
+               "again with fresh true.")
+    return {"offer": {"dashboard_id": dashboard_id, "title": titles.get(dashboard_id), "reason": plan.reuse_reason,
+                      "message": message}}
 
 
 def _refused_plan(plan: PlanRefused) -> dict:

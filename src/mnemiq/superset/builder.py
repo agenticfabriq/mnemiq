@@ -18,10 +18,12 @@ the create makes has a higher id, whatever existed before does not, so no clock 
 without a floor recorded, so a step with none made nothing.
 
 **A create Superset may still be running is left to its lease.** A create whose call ends without an answer
-(`SupersetUnavailable`, a timeout among them) is not finished: its claim runs out (the renewal just before the call
-put the lease's end at least `DEFAULT_LEASE_S` after it began, past the longest a call runs), so by then Superset has
-made the object or never will. A claim, a patch or a layout save is made under the object's row lock and answers the
-same when made twice, so one that timed out leaves its step uncertain at once.
+(`SupersetUnavailable`, a timeout among them) is not finished: its claim runs out first (the renewal just before the
+call put the lease's end `DEFAULT_LEASE_S`, ten minutes, after it began, longer than mnemiq lets any one call run), and
+only then is what it made looked for. That rests on Superset finishing a call's work within the lease: a Superset that
+keeps working on a call after mnemiq stopped waiting for it, past the lease, could still make the object after the step
+was reconciled, and the step would then have made it again. A claim, a patch or a layout save is made under the
+object's row lock and answers the same when made twice, so one that timed out leaves its step uncertain at once.
 
 **A step whose outcome is uncertain is reconciled before anything else**, never making a second object and never
 taking another build's:

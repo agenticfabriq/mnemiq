@@ -519,9 +519,10 @@ def test_a_build_runs_through_the_routes_and_no_answer_holds_a_lease(served, fak
 
 
 def test_a_dashboard_is_offered_before_anything_is_built(served, fake, world, store):
-    """The planner offers a dashboard the builder can see: the answer is the offer, its id, title and reason, and no
-    build. The builder answers by asking again, on that dashboard or for a new one; asked that way, no dashboard is
-    looked for, and the build starts."""
+    """The planner offers a dashboard the builder can see: the answer is the offer, its id, title and reason, and
+    mnemiq's words on what each answer to it does, and no build. Reusing it is opening it, which builds nothing.
+    Asking again with its `dashboard_id` adds this goal's charts to it, and with `fresh` builds a new dashboard;
+    asked either way, no dashboard is looked for, and the build starts."""
     client, runtime = served
     world.dashboards[900] = {"id": 900, "dashboard_title": "Policies at a glance", "published": True,
                              "description": None, "position_json": None, "json_metadata": "{}",
@@ -531,8 +532,11 @@ def test_a_dashboard_is_offered_before_anything_is_built(served, fake, world, st
     planner = _planned(runtime, FakePlanner([offer, ONE_BAR, ONE_BAR]))
     r = _start(client)
     assert r.status_code == 200, r.text
-    assert r.json() == {"offer": {"dashboard_id": 900, "title": "Policies at a glance",
-                                  "reason": "It already shows policies."}}
+    assert r.json() == {"offer": {
+        "dashboard_id": 900, "title": "Policies at a glance", "reason": "It already shows policies.",
+        "message": ("Dashboard 900 already covers this goal, so nothing was built: to reuse it, open it. To add this "
+                    "goal's charts to it anyway, ask again with dashboard_id 900; for a new dashboard, ask again with "
+                    "fresh true.")}}
     assert store._builds == {} and _writes(fake) == []
     assert [d.id for d in planner.contexts[0].dashboards] == [900]
 

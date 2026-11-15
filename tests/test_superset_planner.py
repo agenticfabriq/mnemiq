@@ -33,7 +33,6 @@ from mnemiq.superset.planner import (
     LLMPlanner,
     PlannedDataset,
     PlanRefused,
-    choose_dashboard,
     plan_build,
     plan_from_json,
     plan_to_json,
@@ -251,17 +250,8 @@ def test_existing_dashboard_is_offered_not_taken():
     assert {request["search"] for request in searched} == {"premium", "region", "month"}
     assert all(request["select_columns"] == ["id", "dashboard_title"] for request in searched)
     assert plan.reuse_candidates == (12,) and plan.awaiting_choice
-    assert not set(tools.tools()) & set(WRITES), "nothing is built while the choice is open"
-    # The choice survives the store, and only the next request's answer settles it.
+    assert not set(tools.tools()) & set(WRITES), "nothing is built from a plan that offers a dashboard"
     assert plan_from_json(json.loads(json.dumps(plan_to_json(plan)))) == plan
-    reused, dashboard = choose_dashboard(plan, "reuse")
-    assert dashboard == 12 and not reused.awaiting_choice and reused.charts == plan.charts
-    fresh, dashboard = choose_dashboard(plan, "fresh")
-    assert dashboard is None and not fresh.awaiting_choice
-    with pytest.raises(ValueError):
-        choose_dashboard(plan, "maybe")
-    with pytest.raises(ValueError):
-        choose_dashboard(fresh, "reuse")
 
 
 class ScriptedModel:

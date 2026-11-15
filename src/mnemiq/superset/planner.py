@@ -52,7 +52,7 @@ from mnemiq.superset.settings import SUPERSET_DIALECT
 __all__ = ["COUNT_METRIC", "FILTER_OPERATORS", "GRAINS", "PLANNER_MAX_TOKENS", "PLAN_JSON_SHAPE", "SCALAR",
            "BuildPlan", "FakePlanner",
            "LLMPlanner", "PlanColumn", "PlanContext", "PlanDashboard", "PlanMetric", "PlanRefused", "PlanTable",
-           "PlannedDataset", "Planner", "RefusedPart", "Repair", "choose_dashboard", "draft_of", "plan_build",
+           "PlannedDataset", "Planner", "RefusedPart", "Repair", "draft_of", "plan_build",
            "plan_from_draft", "plan_from_json", "plan_prompt", "plan_to_json", "with_made_datasets"]
 
 logger = logging.getLogger(__name__)
@@ -145,8 +145,10 @@ class PlannedDataset:
 @dataclass(frozen=True)
 class BuildPlan:
     """A plan: its charts, the measures mnemiq writes for them (never a saved metric reused, never Superset's `count`),
-    the dashboards offered for reuse, and the datasets the build makes. While `reuse_candidates` holds a dashboard, the
-    build waits for the builder's answer (`choose_dashboard`)."""
+    the dashboard offered for reuse, and the datasets the build makes. A plan that offers a dashboard is never built:
+    the offer says the dashboard already covers the goal, so reusing it is opening it. Asked again with that
+    dashboard's id, the build adds this goal's planned charts to it, and asked for a fresh one, it makes a new
+    dashboard; either way the plan is made again, with no dashboard offered."""
 
     charts: tuple[ChartSpec, ...]
     measures: tuple[Measure, ...]
@@ -156,7 +158,8 @@ class BuildPlan:
 
     @property
     def awaiting_choice(self) -> bool:
-        """Whether nothing may be built until the builder says to reuse the dashboard offered, or to start fresh."""
+        """Whether the plan offers a dashboard that already covers the goal, so nothing is built from it: the builder
+        opens that dashboard, or asks again (on it, or for a fresh one)."""
         return bool(self.reuse_candidates)
 
 
@@ -1251,19 +1254,6 @@ def _model_failed(exc: ModelUnavailable) -> PlanRefused:
 
 
 # ---------------------------------------------------------------- after the plan
-
-def choose_dashboard(plan: BuildPlan, answer: str) -> tuple[BuildPlan, int | None]:
-    """The builder's answer to the dashboard offered: `reuse` builds on it, `fresh` builds a new one. The plan comes
-    back with no offer open, beside the dashboard to build on (None: a new one)."""
-    if not plan.reuse_candidates:
-        raise ValueError("this plan offers no dashboard to reuse")
-    settled = replace(plan, reuse_candidates=(), reuse_reason=None)
-    if answer == "reuse":
-        return settled, plan.reuse_candidates[0]
-    if answer == "fresh":
-        return settled, None
-    raise ValueError("the answer to a dashboard offered is reuse or fresh")
-
 
 def with_made_datasets(plan: BuildPlan, made: Mapping[str, int]) -> BuildPlan:
     """`plan` with each made dataset's id, by its key, in place of its placeholder in the measures and charts."""
