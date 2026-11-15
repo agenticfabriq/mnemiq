@@ -122,8 +122,10 @@ STORE_COLUMNS = {
 
 
 def _intent(key: str, kind: str, name: str | None = None, dataset_id: int | None = None) -> dict:
-    """The intent a builder records when it claims a step: the step, its kind, the planned name and dataset."""
-    return {"key": key, "kind": kind, "name": name or key.replace("_", " "), "dataset_id": dataset_id}
+    """The intent a builder records when it claims a step: the step, its kind, the planned name and dataset, and no
+    floor yet (the step records it before its create, `record_floor`)."""
+    return {"key": key, "kind": kind, "name": name or key.replace("_", " "), "dataset_id": dataset_id,
+            "id_floor": None}
 
 
 def _offline_store() -> BuildStore:
@@ -354,27 +356,20 @@ def test_the_plan_check_is_an_allow_list_of_what_the_planner_writes(case):
         _offline_store().create_build(TENANT, ANA, GOAL, plan, STEPS)
 
 
-def test_the_allow_list_is_read_from_the_planners_own_writer(monkeypatch):
-    """The allowed keys are read from `plan_to_json`, their one source: a key the planner starts writing is admitted
-    with nothing in the store changed, and refused again once the planner no longer writes it."""
+def test_the_store_holds_a_plan_to_the_shape_the_planner_declares(monkeypatch):
+    """The allowed shape is the planner's own declaration beside its writer (`planner.PLAN_JSON_SHAPE`): a key the
+    planner declares is admitted, with nothing in the store changed, and refused again once it no longer does."""
     import mnemiq.superset.planner as planner
-
-    written = planner.plan_to_json
-
-    def writes_more(plan):
-        doc = written(plan)
-        doc["charts"] = [dict(chart, subtitle=None) for chart in doc["charts"]]
-        return doc
 
     with_subtitle = copy.deepcopy(FULL_PLAN)
     with_subtitle["charts"][0]["subtitle"] = "by region"
-    build_store._plan_shape.cache_clear()
-    monkeypatch.setattr(planner, "plan_to_json", writes_more)
-    try:
-        assert build_store._plan(with_subtitle) == with_subtitle
-    finally:
-        monkeypatch.undo()
-        build_store._plan_shape.cache_clear()
+    with pytest.raises(ValueError):
+        build_store._plan(with_subtitle)
+    widened = copy.deepcopy(planner.PLAN_JSON_SHAPE)
+    widened["charts"][0]["subtitle"] = planner.SCALAR
+    monkeypatch.setattr(planner, "PLAN_JSON_SHAPE", widened)
+    assert build_store._plan(with_subtitle) == with_subtitle
+    monkeypatch.undo()
     with pytest.raises(ValueError):
         build_store._plan(with_subtitle)
 
@@ -395,6 +390,9 @@ def test_a_plan_that_is_not_json_is_refused(plan):
     {"key": "dashboard", "kind": "dashboard", "dataset_id": 987654.321},
     {"key": "dashboard", "kind": "dashboard", "dataset_id": True},
     {"key": "dashboard", "kind": "picture"},
+    {"key": "dashboard", "kind": "dashboard", "id_floor": -1},
+    {"key": "dashboard", "kind": "dashboard", "id_floor": 4.5},
+    {"key": "dashboard", "kind": "dashboard", "id_floor": True},
 ])
 def test_an_intent_holds_the_step_its_kind_its_name_and_its_dataset_only(intent):
     """The intent a claim records: the step, its kind, the planned name, the dataset. `started_at` is the store's own, read
@@ -417,6 +415,28 @@ def test_a_step_finishes_done_failed_or_uncertain_with_an_id(status, object_id):
     with pytest.raises(ValueError):
         _offline_store().finish_step(TENANT, str(uuid.uuid4()), "dashboard", status, object_id,
                                      lease_id=str(uuid.uuid4()))
+
+
+@pytest.mark.parametrize("reason", ["the dataset vanished", "NOT_EDITOR", 3, "", "superset said: no"])
+def test_a_step_keeps_only_a_reason_code_of_the_stores(reason):
+    """A step's reason is one of the store's codes (`REASONS`), never free text, so Superset's words cannot be kept
+    there."""
+    assert "not_editor" in build_store.REASONS and "abandoned" in build_store.REASONS
+    with pytest.raises(ValueError):
+        _offline_store().finish_step(TENANT, str(uuid.uuid4()), "dashboard", "failed", None,
+                                     lease_id=str(uuid.uuid4()), reason=reason)
+
+
+@pytest.mark.parametrize("id_floor", [-1, 1.5, True, "41", None])
+def test_a_floor_is_an_id_or_zero(id_floor):
+    with pytest.raises(ValueError):
+        _offline_store().record_floor(TENANT, str(uuid.uuid4()), "dashboard", str(uuid.uuid4()), id_floor)
+
+
+@pytest.mark.parametrize("saved_metric", [3, "", ["total_premium"]])
+def test_a_measure_names_its_saved_metric_as_text(saved_metric):
+    with pytest.raises(ValueError):
+        _offline_store().put_measure(TENANT, 7, MEASURE, saved_metric=saved_metric)
 
 
 @pytest.mark.parametrize("change", [
@@ -1142,3 +1162,83 @@ def test_the_live_dashboard_rule_is_postgres_own(store, store_dsn):
             (BUILD_TABLE, f"{BUILD_TABLE}_pkey")).fetchall()
     assert "(tenant_id, dashboard_id)" in definition
     assert "status = 'building'" in definition and "dashboard_id IS NOT NULL" in definition
+
+
+# --- A step's floor, its reason, a reused saved metric's row, and a build left untouched.
+
+def test_a_floor_is_recorded_once_under_the_claim(store):
+    """The highest id of the builder's objects before a create is kept in the step's intent once, under the claim
+    that read it: a second floor leaves the first, another claim records none, and a reconciling claim keeps it."""
+    build = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS)
+    claimed = store.claim_next_step(TENANT, build.build_id, ANA, _intent("dashboard", "dashboard"), lease_s=1)
+    assert claimed.intent["id_floor"] is None
+    assert store.record_floor(TENANT, build.build_id, "dashboard", str(uuid.uuid4()), 41) is False
+    assert store.record_floor(TENANT, build.build_id, "dashboard", claimed.lease_id, 41) is True
+    assert store.record_floor(TENANT, build.build_id, "dashboard", claimed.lease_id, 99) is True
+    assert store.load_build(TENANT, build.build_id, ANA).step("dashboard").intent["id_floor"] == 41
+    time.sleep(1.2)
+    assert store.record_floor(TENANT, build.build_id, "dashboard", claimed.lease_id, 50) is False  # its lease passed
+    again = store.claim_next_step(TENANT, build.build_id, ANA, _intent("dashboard", "dashboard"))
+    assert again.status == "uncertain" and again.intent["id_floor"] == 41
+
+
+def test_a_step_keeps_its_reason(store):
+    """A failed step's reason code is kept and read back; an uncertain step's too, through its reconciling claim; a
+    done step has none."""
+    build = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS)
+    claimed = store.claim_next_step(TENANT, build.build_id, ANA, _intent("dashboard", "dashboard"))
+    store.finish_step(TENANT, build.build_id, "dashboard", "uncertain", None, lease_id=claimed.lease_id,
+                      reason="tool_error")
+    again = store.claim_next_step(TENANT, build.build_id, ANA, _intent("dashboard", "dashboard"))
+    assert again.status == "uncertain" and again.reason == "tool_error"
+    stopped = store.finish_step(TENANT, build.build_id, "dashboard", "failed", None, lease_id=again.lease_id,
+                                reason="not_editor")
+    assert stopped.step("dashboard").reason == "not_editor" and stopped.status == "failed"
+    assert store.load_build(TENANT, build.build_id, ANA).step("dashboard").reason == "not_editor"
+    done = _run_step(store, store.create_build(TENANT, ANA, GOAL, PLAN, STEPS), "dashboard", "dashboard", 41)
+    assert done.step("dashboard").reason is None
+
+
+def test_a_reused_saved_metric_is_kept_as_a_measure_naming_it(store, store_dsn):
+    """A reused saved metric keeps a measure row, its definition the seven keys and the metric's name."""
+    saved = dataclasses.replace(MEASURE, name="total_premium@42", label="Total premium")
+    kept = store.put_measure(TENANT, 7, saved, chart_ids=(43,), saved_metric="total_premium",
+                             check_status={43: ChartStatus.CHECKED})
+    assert kept.saved_metric == "total_premium" and kept.measure == saved
+    [read] = store.measures_for(TENANT, 7)
+    assert read == kept
+    with psycopg.connect(store_dsn, autocommit=True) as con:
+        [(definition,)] = con.execute(sql.SQL("SELECT definition FROM {}").format(sql.Identifier(MEASURE_TABLE)))
+    assert set(definition) == {"expression", "label", "kind", "currency", "description", "asked_by", "dataset_id",
+                               "saved_metric"}
+    written = store.put_measure(TENANT, 7, MEASURE, chart_ids=(44,))
+    assert written.saved_metric is None
+
+
+def _untouched_for(store_dsn: str, build_id: str, seconds: int) -> None:
+    """The build's row as if nothing had written it for `seconds`, planted past the store."""
+    with psycopg.connect(store_dsn, autocommit=True) as con:
+        con.execute(sql.SQL("UPDATE {} SET updated_at = now() - make_interval(secs => %s) WHERE build_id = %s")
+                    .format(sql.Identifier(BUILD_TABLE)), (seconds, build_id))
+
+
+def test_a_build_left_untouched_releases_its_dashboard(store, store_dsn):
+    """A build of a dashboard untouched for more than twice the lease, its claims all passed, no longer holds the
+    dashboard: the next build's creation fails its next step as abandoned in the same transaction. One touched more
+    recently, or one whose claim still holds, keeps the dashboard."""
+    old = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12)
+    _run_step(store, old, "dashboard", "dashboard", 12)
+    _untouched_for(store_dsn, old.build_id, 2 * build_store.DEFAULT_LEASE_S - 30)
+    with pytest.raises(DashboardBusy):
+        store.create_build(TENANT, BO, GOAL, PLAN, STEPS, dashboard_id=12)
+    _untouched_for(store_dsn, old.build_id, 2 * build_store.DEFAULT_LEASE_S + 30)
+    fresh = store.create_build(TENANT, BO, GOAL, PLAN, STEPS, dashboard_id=12)
+    stale = store.load_build(TENANT, old.build_id, ANA)
+    assert stale.status == "failed" and stale.step("policies").status == "failed"
+    assert stale.step("policies").reason == "abandoned" and stale.step("dashboard").status == "done"
+    assert fresh.status == "building"
+    held = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=13)
+    store.claim_next_step(TENANT, held.build_id, ANA, _intent("dashboard", "dashboard"), lease_s=86_400)
+    _untouched_for(store_dsn, held.build_id, 2 * build_store.DEFAULT_LEASE_S + 30)
+    with pytest.raises(DashboardBusy):
+        store.create_build(TENANT, BO, GOAL, PLAN, STEPS, dashboard_id=13)

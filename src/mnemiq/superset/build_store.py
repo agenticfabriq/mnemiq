@@ -8,16 +8,19 @@ the charts that show it and of the datasets mnemiq made for it, and each chart's
 The guarantee is upstream, not here: the planner is given no value (it sees the schema, saved metrics' names and
 expressions, and dashboards' titles), a value check's numbers ride back in its response only, and a measure's value is
 computed through Superset as whoever asks, each time, and kept nowhere. The store's own checks are a backstop. An intent
-holds four named fields and a measure's row ids and statuses, so neither has room for a number. A plan is held to
-what the planner writes (`plan_to_json`): an allow-list of its keys at every depth, read from that writer, refuses any
-other key and an object or a list where it writes a single value, so a value has no key to be kept under. Beneath it,
+holds five named fields and a measure's row ids and statuses, so neither has room for a number; a step's reason is
+one of `REASONS`, never text it was given. A plan is held to the shape the planner declares beside its writer
+(`planner.PLAN_JSON_SHAPE`): an allow-list of its keys at every depth refuses any other key and an object or a list
+where the writer writes a single value, so a value has no key to be kept under. Beneath it,
 a key that reads, folded (NFKC, stripped, casefolded), as one a value, a row or a sample is kept under
 (`VALUE_SHAPED_KEYS`) is refused too.
 
 A build is read only by its tenant and the principal who started it. A dashboard's measures are the dashboard's: any
 principal of the tenant reads them, and Superset checks editorship on each action that changes the dashboard. A
 dashboard has one build building at a time (`DashboardBusy`), since its measures are kept as the last build to write
-them leaves them; Postgres holds that rule, as a unique index over the dashboards of builds still building.
+them leaves them; Postgres holds that rule, as a unique index over the dashboards of builds still building. A build
+left untouched for `ABANDONED_AFTER_S`, no claim of it holding, does not keep its dashboard: the next build of the
+dashboard fails its next step as `abandoned`, in the transaction that creates the new one.
 
 **Steps and leases.** A build runs one step at a time, in order: its dashboard (a new shell, or the read of an existing
 one), then its datasets, its charts, its layout and its checks. `claim_next_step` claims the first step not done before
@@ -36,7 +39,6 @@ a lease id of its own, so a worker whose step was taken from it can neither rene
 from __future__ import annotations
 
 import copy
-import functools
 import hashlib
 import math
 import threading
@@ -58,8 +60,8 @@ from mnemiq.superset.measures import Measure, MeasureKind
 if TYPE_CHECKING:
     from mnemiq.config import Settings
 
-__all__ = ["BUILD_TABLE", "DEFAULT_LEASE_S", "LOCK_TIMEOUT_MS", "MEASURE_TABLE", "STATEMENT_TIMEOUT_MS", "STEP_KINDS",
-           "STORE_MISSING", "VALUE_SHAPED_KEYS",
+__all__ = ["ABANDONED_AFTER_S", "BUILD_TABLE", "DEFAULT_LEASE_S", "LOCK_TIMEOUT_MS", "MEASURE_TABLE", "REASONS",
+           "STATEMENT_TIMEOUT_MS", "STEP_KINDS", "STORE_MISSING", "VALUE_SHAPED_KEYS",
            "BuildNotFound", "BuildStore", "BuildStoreMissing", "DashboardBusy", "DashboardMeasure", "LeaseLost",
            "StepBusy", "StepState", "StoredBuild"]
 
@@ -84,9 +86,18 @@ BUILDING = "building"
 # The names a value, a row, a result or a sample is kept under. No key of a stored plan reads, folded (`_folded`), as
 # one of them.
 VALUE_SHAPED_KEYS = frozenset({"value", "values", "row", "rows", "data", "result", "results", "sample", "samples"})
-_INTENT_KEYS = ("key", "kind", "name", "dataset_id")
+_INTENT_KEYS = ("key", "kind", "name", "dataset_id", "id_floor")
+
+# Why a step failed, or was left uncertain, as a code: what a later read of the build says, never Superset's words.
+REASONS = frozenset({"not_editor", "not_found", "claimed_by_another", "extension_refused", "not_saved", "too_large",
+                     "candidates", "not_made", "dataset_exists", "layout_unreadable", "kept_changing",
+                     "measure_conflict", "tool_error", "abandoned", "unreadable", "busy", "superset_silent",
+                     "lease_passed"})
 
 DEFAULT_LEASE_S = 600  # longer than any one Superset call's deadline
+# How long a build may go untouched (every claim, renewal and finish touches it), no claim of it holding, before
+# another build of its dashboard takes the dashboard over.
+ABANDONED_AFTER_S = 2 * DEFAULT_LEASE_S
 _MAX_LEASE_S = 86_400
 # Postgres's `integer`, which every id column is.
 _MAX_ID = 2**31 - 1
@@ -176,9 +187,10 @@ class LeaseLost(Exception):
 @dataclass(frozen=True)
 class StepState:
     """One step of a build. `status` is `pending`, `done`, `uncertain` or `failed`; a step whose lease has passed reads
-    `uncertain`. `intent` is what the claim recorded (`key`, `kind`, `name`, `dataset_id`), `started_at` when, both
-    kept from the first claim while the step is reconciled. `lease_id` names the claim holding the step, if any, and
-    `lease_until` when its lease passes. Times are ISO 8601 in UTC, on Postgres's clock."""
+    `uncertain`. `intent` is what the claim recorded (`key`, `kind`, `name`, `dataset_id`, and the `id_floor` the step
+    read before its create), `started_at` when, both kept from the first claim while the step is reconciled.
+    `lease_id` names the claim holding the step, if any, and `lease_until` when its lease passes. `reason` is why it
+    failed or was left uncertain, one of `REASONS`. Times are ISO 8601 in UTC, on Postgres's clock."""
 
     key: str
     kind: str
@@ -188,6 +200,7 @@ class StepState:
     intent: dict | None = None
     lease_id: str | None = None
     lease_until: str | None = None
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -220,14 +233,15 @@ class StoredBuild:
 
 @dataclass(frozen=True)
 class DashboardMeasure:
-    """One of a dashboard's measures: its definition, the charts that show it, the datasets mnemiq made for it, and
-    each chart's check status."""
+    """One of a dashboard's measures: its definition, the charts that show it, the datasets mnemiq made for it, each
+    chart's check status, and, for a saved metric a chart reuses, that metric's name."""
 
     measure: Measure
     chart_ids: tuple[int, ...]
     made_dataset_ids: tuple[int, ...]
     check_status: dict[int, ChartStatus]
     updated_at: str
+    saved_metric: str | None = None
 
 
 class BuildStore:
@@ -272,7 +286,9 @@ class BuildStore:
         plan = _plan(plan)
         build_id = uuid.uuid4()
         step_list = _new_steps(str(build_id), steps)
-        with self._connection() as con, _live_dashboard():
+        with self._connection() as con, _live_dashboard(), con.transaction():
+            if dashboard_id is not None:
+                _release_abandoned(con, tenant, dashboard_id)
             row = con.execute(
                 f"INSERT INTO {BUILD_TABLE} (tenant_id, build_id, principal_id, dashboard_id, goal, plan, steps, "
                 f"status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING {_BUILD_COLUMNS}, now()",
@@ -340,23 +356,46 @@ class BuildStore:
             return False
         return renewed is True
 
+    def record_floor(self, tenant: str, build_id: str, key: str, lease_id: str, id_floor: int) -> bool:
+        """Keep `id_floor`, the highest id of the builder's objects of the step's kind read before its create, in the
+        intent of step `key`, if the claim `lease_id` still holds it and its lease has not passed; a floor already
+        kept stays, the first claim's. True when the step's intent then holds a floor; False otherwise: the worker
+        sends no create."""
+        tenant, key, lease_id = _text(tenant, "tenant"), _text(key, "step key"), _text(lease_id, "lease id")
+        id_floor = _floor_id(id_floor)
+        build = _build_uuid(build_id)
+        if build is None:
+            return False
+
+        def record(steps: list[dict], dashboard_id: int | None, now: datetime):
+            changed, held = _record_floor(steps, key, lease_id, id_floor, now)
+            return changed, dashboard_id, held
+
+        try:
+            held, _ = self._change(tenant, build, None, record)
+        except BuildNotFound:
+            return False
+        return held is True
+
     def finish_step(self, tenant: str, build_id: str, key: str, status: str, object_id: int | None, *,
-                    lease_id: str) -> StoredBuild:
+                    lease_id: str, reason: str | None = None) -> StoredBuild:
         """Record step `key` as `done`, `failed` or `uncertain`, with the id of the object it made or read (required
         for a done dashboard, dataset or chart step), ending the claim `lease_id` holds on it. A done dashboard step's
         id is the build's dashboard, refused with DashboardBusy while another build of that dashboard is building.
-        LeaseLost when the claim is no longer `lease_id`'s; nothing is written then."""
+        LeaseLost when the claim is no longer `lease_id`'s; nothing is written then. `reason` is one of `REASONS`, why
+        the step failed or is left uncertain."""
         tenant, key = _text(tenant, "tenant"), _text(key, "step key")
         if not isinstance(status, str) or status not in _FINISHED_AS:
             raise ValueError(f"a step finishes as one of {sorted(_FINISHED_AS)}")
         object_id = _id(object_id, "a step's object id", optional=True)
+        reason = _reason(reason)
         lease_id = _text(lease_id, "lease id")
         build = _build_uuid(build_id)
         if build is None:
             raise BuildNotFound()
 
         def finish(steps: list[dict], dashboard_id: int | None, now: datetime):
-            return (*_finish(steps, dashboard_id, key, lease_id, status, object_id), True)
+            return (*_finish(steps, dashboard_id, key, lease_id, status, object_id, reason), True)
 
         outcome, stored = self._change(tenant, build, None, finish)
         if outcome is _CONTENDED:
@@ -379,12 +418,14 @@ class BuildStore:
 
     def put_measure(self, tenant: str, dashboard_id: int, measure: Measure, *, chart_ids: Iterable[int] = (),
                     made_dataset_ids: Iterable[int] = (),
-                    check_status: Mapping[int, ChartStatus | str] | None = None) -> DashboardMeasure:
+                    check_status: Mapping[int, ChartStatus | str] | None = None,
+                    saved_metric: str | None = None) -> DashboardMeasure:
         """Keep `measure` on the dashboard, replacing one of its name: its definition, the charts that show it, the
-        datasets mnemiq made for it, and each chart's check status, a chart id to a `ChartStatus`."""
+        datasets mnemiq made for it, and each chart's check status, a chart id to a `ChartStatus`. `saved_metric`
+        names the saved metric a measure is, for one a chart reuses rather than writes."""
         tenant = _text(tenant, "tenant")
         dashboard_id = _id(dashboard_id, "a dashboard id")
-        definition = _definition(measure)
+        definition = _definition(measure, saved_metric)
         charts = _ids(chart_ids, "chart_ids")
         made = _ids(made_dataset_ids, "made_dataset_ids")
         statuses = _check_status({} if check_status is None else check_status)
@@ -478,6 +519,20 @@ def _live_dashboard() -> Iterator[None]:
         raise DashboardBusy() from None
 
 
+def _release_abandoned(con: psycopg.Connection, tenant: str, dashboard_id: int) -> None:
+    """In the creating transaction: each build of the dashboard still building, untouched for `ABANDONED_AFTER_S` with
+    no claim of it holding, has its next step failed as abandoned, so it no longer holds the dashboard. Its row is held
+    `FOR UPDATE` while it is decided."""
+    rows = con.execute(f"SELECT build_id, steps, updated_at, now() FROM {BUILD_TABLE} WHERE tenant_id = %s AND "
+                       "dashboard_id = %s AND status = %s FOR UPDATE", (tenant, dashboard_id, BUILDING)).fetchall()
+    for build, steps, updated_at, now in rows:
+        released = _released(steps, now, updated_at)
+        if released is not None:
+            con.execute(f"UPDATE {BUILD_TABLE} SET steps = %s, status = %s, updated_at = now() "
+                        "WHERE tenant_id = %s AND build_id = %s",
+                        (Jsonb(released), _build_status(released), tenant, build))
+
+
 def _bound_waits(con: psycopg.Connection) -> None:
     """Bound how long the session's statements wait for a lock and run, read when the store connects."""
     con.execute("SELECT set_config('lock_timeout', %s, false), set_config('statement_timeout', %s, false)",
@@ -527,8 +582,31 @@ def _renew(steps: list[dict], key: str, lease_id: str, now: datetime,
     return steps, True
 
 
+def _record_floor(steps: list[dict], key: str, lease_id: str, id_floor: int,
+                  now: datetime) -> tuple[list[dict] | None, bool]:
+    step = next((step for step in steps if step["key"] == key), None)
+    if step is None or step["lease_id"] != lease_id or not _holds(step, now) or step["intent"] is None:
+        return None, False
+    if step["intent"].get("id_floor") is not None:
+        return None, True
+    step["intent"]["id_floor"] = id_floor
+    return steps, True
+
+
+def _released(steps: list[dict], now: datetime, updated_at: datetime) -> list[dict] | None:
+    """`steps` with the next step not done failed as abandoned, when the build was last touched `ABANDONED_AFTER_S`
+    or more before `now` and no claim of it holds; None when it still holds its dashboard."""
+    if updated_at > now - timedelta(seconds=ABANDONED_AFTER_S) or any(_holds(step, now) for step in steps):
+        return None
+    target = next((step for step in steps if step["status"] != DONE), None)
+    if target is None:
+        return None
+    target.update(status=FAILED, reason="abandoned", lease_id=None, lease_until=None)
+    return steps
+
+
 def _finish(steps: list[dict], dashboard_id: int | None, key: str, lease_id: str, status: str,
-            object_id: int | None) -> tuple[list[dict], int | None]:
+            object_id: int | None, reason: str | None = None) -> tuple[list[dict], int | None]:
     step = next((step for step in steps if step["key"] == key), None)
     if step is None:
         raise ValueError(f"this build has no step {key!r}")
@@ -540,7 +618,7 @@ def _finish(steps: list[dict], dashboard_id: int | None, key: str, lease_id: str
         if dashboard_id is not None and dashboard_id != object_id:
             raise ValueError("this build's dashboard step finishes with the build's own dashboard")
         dashboard_id = object_id
-    step.update(status=status, object_id=object_id, lease_id=None, lease_until=None)
+    step.update(status=status, object_id=object_id, lease_id=None, lease_until=None, reason=reason)
     return steps, dashboard_id
 
 
@@ -570,7 +648,7 @@ def _step_state(step: dict, now: datetime) -> StepState:
     return StepState(key=step["key"], kind=step["kind"], status=UNCERTAIN if _passed(step, now) else step["status"],
                      object_id=step["object_id"], started_at=step["started_at"],
                      intent=None if step["intent"] is None else dict(step["intent"]), lease_id=step["lease_id"],
-                     lease_until=step["lease_until"])
+                     lease_until=step["lease_until"], reason=step.get("reason"))
 
 
 def _stored_build(row: tuple) -> StoredBuild:
@@ -588,7 +666,7 @@ def _dashboard_measure(row: tuple) -> DashboardMeasure:
                       currency=definition["currency"])
     return DashboardMeasure(measure=measure, chart_ids=tuple(chart_ids), made_dataset_ids=tuple(made_dataset_ids),
                             check_status={int(chart): ChartStatus(status) for chart, status in check_status.items()},
-                            updated_at=_iso(updated_at))
+                            updated_at=_iso(updated_at), saved_metric=definition.get("saved_metric"))
 
 
 # --- What is checked before anything is sent. No message repeats a value it was given.
@@ -614,6 +692,18 @@ def _ids(values: Iterable[int], what: str) -> list[int]:
     if len(set(ids)) != len(ids):
         raise ValueError(f"{what} names an id twice")
     return ids
+
+
+def _floor_id(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= _MAX_ID:
+        raise ValueError("a step's floor is the id it read, 0 when there was none")
+    return value
+
+
+def _reason(value: object) -> str | None:
+    if value is not None and value not in REASONS:
+        raise ValueError(f"a step's reason is one of {sorted(REASONS)}")
+    return value
 
 
 def _lease(lease_s: object) -> int:
@@ -655,15 +745,16 @@ def _new_steps(build_id: str, steps: Sequence[tuple[str, str]]) -> list[dict]:
             raise ValueError(f"step {key!r} is a {kind} step after a {made[-1]['kind']} step; a build runs "
                              f"{', '.join(STEP_KINDS)}, in that order")
         made.append({"key": key, "kind": kind, "status": PENDING, "object_id": None, "started_at": None,
-                     "intent": None, "lease_id": None, "lease_until": None})
+                     "intent": None, "lease_id": None, "lease_until": None, "reason": None})
     if not made:
         raise ValueError("a build has at least one step, its dashboard")
     return made
 
 
 def _intent(intent: object) -> dict:
-    """The intent, refused unless it holds the step's `key` and `kind`, and at most its planned `name` (a string) and
-    `dataset_id` (an id); with all four keys, absent ones None. `started_at` is the store's own."""
+    """The intent, refused unless it holds the step's `key` and `kind`, and at most its planned `name` (a string),
+    `dataset_id` (an id) and `id_floor` (an id, or 0); with all five keys, absent ones None. `started_at` is the
+    store's own."""
     if not isinstance(intent, Mapping):
         raise ValueError("an intent is a mapping")
     other = [str(name) for name in intent if name not in _INTENT_KEYS]
@@ -677,7 +768,8 @@ def _intent(intent: object) -> dict:
     if name is not None and not isinstance(name, str):
         raise ValueError("an intent's name is a string")
     dataset_id = _id(intent.get("dataset_id"), "an intent's dataset id", optional=True)
-    return {"key": key, "kind": kind, "name": name, "dataset_id": dataset_id}
+    id_floor = None if intent.get("id_floor") is None else _floor_id(intent.get("id_floor"))
+    return {"key": key, "kind": kind, "name": name, "dataset_id": dataset_id, "id_floor": id_floor}
 
 
 def _plan(plan: object) -> dict:
@@ -690,80 +782,43 @@ def _plan(plan: object) -> dict:
     return copied
 
 
-@dataclass
-class _Shape:
-    """Where a kept plan may hold what: a single value (`leaf`), an object with these `keys`, a list of `items`, or
-    more than one of these where the planner writes each."""
-
-    leaf: bool = False
-    keys: dict[str, _Shape] | None = None
-    items: _Shape | None = None
-
-
-def _shape_of(doc: Any, shape: _Shape | None = None) -> _Shape:
-    """`shape` widened by `doc`: every key, list and single value `doc` holds, at every depth, admitted where it is. A
-    list `doc` leaves empty admits nothing inside it."""
-    shape = shape or _Shape()
-    if isinstance(doc, Mapping):
-        shape.keys = {} if shape.keys is None else shape.keys
-        for key, item in doc.items():
-            shape.keys[key] = _shape_of(item, shape.keys.get(key))
-    elif isinstance(doc, (list, tuple)):
-        shape.items = shape.items or _Shape()
-        for item in doc:
-            _shape_of(item, shape.items)
-    else:
-        shape.leaf = True
-    return shape
-
-
-def _exemplar_plan():
-    """A plan holding one of every part a plan has, so `plan_to_json` writes every key it ever writes: a saved metric
-    and a written measure on one chart, a filter with one operand, one with a list and one with none, a dataset the
-    build makes on a table and one on a join, and an offer of a dashboard. A part the planner gains needs a place
-    here: until it has one, a plan holding it is refused, never admitted unchecked."""
-    from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenRef
-    from mnemiq.superset.planner import BuildPlan, PlannedDataset
-
-    written = Measure(name="m", label="M", expression="COUNT(*)", kind=MeasureKind.COUNT, dataset_id=-2,
-                      description="d", asked_by="a", currency="USD")
-    chart = ChartSpec(key="c", family=Family.BAR, title="t", dataset_id=-2,
-                      measures=(SavedRef("s", MeasureKind.COUNT), WrittenRef(written)), dimensions=("x",),
-                      time_column="x", time_grain="P1M",
-                      filters=(Filter("x", "IN", ["y"]), Filter("x", "=", "y"), Filter("x", "IS NULL")),
-                      row_limit=1, source="x", target="x")
-    return BuildPlan(charts=(chart,), measures=(written,), reuse_candidates=(1,), reuse_reason="r",
-                     datasets=(PlannedDataset(key="dataset_1", placeholder=-1, table="t", table_name="t"),
-                               PlannedDataset(key="dataset_2", placeholder=-2, join="a JOIN b ON a.x = b.x",
-                                              sql="SELECT 1", name="n")))
-
-
-@functools.cache
-def _plan_shape() -> _Shape:
-    """The shape of a plan as the planner's `plan_to_json`, its one writer, writes one: read from what it writes for
-    `_exemplar_plan`, so the allow-list is the writer's own keys and never a second list of them."""
+def _plan_shape() -> Any:
+    """The shape the planner declares beside its writer (`planner.PLAN_JSON_SHAPE`), read when a plan is checked."""
     from mnemiq.superset import planner
 
-    return _shape_of(planner.plan_to_json(_exemplar_plan()))
+    return planner.PLAN_JSON_SHAPE
 
 
-def _shaped(doc: Any, shape: _Shape, path: str) -> None:
-    """Refuse what `shape` does not admit, naming where by the keys admitted on the way, never a key or a value it was
-    given."""
-    if isinstance(doc, Mapping):
-        if shape.keys is None:
-            raise ValueError(f"{path} holds an object where the planner writes none")
+def _shaped(doc: Any, shape: Any, path: str) -> None:
+    """Refuse what `shape` (`planner.PLAN_JSON_SHAPE`'s form) does not admit, naming where by the keys admitted on
+    the way, never a key or a value it was given."""
+    from mnemiq.superset.planner import SCALAR
+
+    if isinstance(shape, tuple):
+        refusals = []
+        for each in shape:
+            try:
+                return _shaped(doc, each, path)
+            except ValueError as refused:
+                refusals.append(refused)
+        raise refusals[0]
+    if isinstance(shape, dict):
+        if not isinstance(doc, Mapping):
+            raise ValueError(f"{path} holds something else where the planner writes an object")
         for key, item in doc.items():
-            if key not in shape.keys:
+            if key not in shape:
                 raise ValueError(f"{path} holds a key the planner never writes there: a build keeps only its plan")
-            _shaped(item, shape.keys[key], f"{path}.{key}")
-    elif isinstance(doc, list):
-        if shape.items is None:
-            raise ValueError(f"{path} holds a list where the planner writes none")
+            _shaped(item, shape[key], f"{path}.{key}")
+    elif isinstance(shape, list):
+        if not isinstance(doc, list):
+            raise ValueError(f"{path} holds something else where the planner writes a list")
         for index, item in enumerate(doc):
-            _shaped(item, shape.items, f"{path}[{index}]")
-    elif not shape.leaf:
-        raise ValueError(f"{path} holds a single value where the planner writes an object or a list")
+            _shaped(item, shape[0], f"{path}[{index}]")
+    elif shape == SCALAR:
+        if isinstance(doc, (Mapping, list)):
+            raise ValueError(f"{path} holds an object or a list where the planner writes a single value")
+    else:
+        raise ValueError(f"{path}: the planner's declared shape is not one the store reads")
 
 
 def _plain_json(doc: object, path: str) -> Any:
@@ -791,8 +846,9 @@ def _folded(key: str) -> str:
     return unicodedata.normalize("NFKC", key).strip().casefold()
 
 
-def _definition(measure: object) -> dict:
-    """A measure's definition under its seven keys. The name is the row's own key."""
+def _definition(measure: object, saved_metric: object = None) -> dict:
+    """A measure's definition under its seven keys, and an eighth, `saved_metric`, for a saved metric a chart reuses.
+    The name is the row's own key."""
     if not isinstance(measure, Measure):
         raise ValueError("a dashboard's measure is a Measure")
     _text(measure.name, "measure name")
@@ -807,9 +863,12 @@ def _definition(measure: object) -> dict:
         kind = MeasureKind(measure.kind)
     except ValueError:
         raise ValueError(f"a measure's kind is one of {[kind.value for kind in MeasureKind]}") from None
-    return {"expression": measure.expression, "label": measure.label, "kind": kind.value,
-            "currency": measure.currency, "description": measure.description, "asked_by": measure.asked_by,
-            "dataset_id": _id(measure.dataset_id, "a measure's dataset id")}
+    definition = {"expression": measure.expression, "label": measure.label, "kind": kind.value,
+                  "currency": measure.currency, "description": measure.description, "asked_by": measure.asked_by,
+                  "dataset_id": _id(measure.dataset_id, "a measure's dataset id")}
+    if saved_metric is not None:
+        definition["saved_metric"] = _text(saved_metric, "saved metric's name")
+    return definition
 
 
 def _check_status(statuses: object) -> dict[str, str]:

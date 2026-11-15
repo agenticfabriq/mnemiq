@@ -18,13 +18,11 @@ import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import psycopg
 import pytest
 
 from mnemiq.config import Settings
-from mnemiq.superset import builder
 from mnemiq.superset.adapter import SupersetSqlAdapter
 from mnemiq.superset.build_store import DashboardBusy, StepState
 from mnemiq.superset.builder import BuildBusy, BuildState, build_state, build_steps, next_step, start_build
@@ -157,13 +155,15 @@ def _raw_step(store, build_id: str, key: str) -> dict:
 
 
 def _once(hook):
-    """A hook that acts the first time only."""
+    """A hook that acts the first time only, passing on what it returns (an `after` hook's answer in place of the
+    tool's)."""
     done = []
 
     def run(*args):
         if not done:
             done.append(True)
-            hook(*args)
+            return hook(*args)
+        return None
 
     return run
 
@@ -227,7 +227,7 @@ def test_the_made_dataset_is_the_one_its_charts_and_measures_use(fake, world, st
     assert world.charts[ids["claimed_by_region"]]["datasource_id"] == made
     checked = [c.request["identifier"] for c in world.calls("get_dataset_info")]
     assert made in checked and all(isinstance(i, int) and i > 0 for i in checked)
-    kept = {m.measure.name: m for m in store.measures_for(TENANT, final.dashboard_id)}
+    kept = {m.measure.name: m for m in store.measures_for(TENANT, final.dashboard_id) if m.saved_metric is None}
     assert set(kept) == {"policies", "claimed"}
     assert kept["claimed"].measure == dataclasses.replace(CLAIMED, dataset_id=made, asked_by=PRINCIPAL)
     assert kept["claimed"].chart_ids == (ids["claimed_by_region"],) and kept["claimed"].made_dataset_ids == (made,)
@@ -327,11 +327,9 @@ def test_no_dashboard_is_published(fake, world, store):
     assert world.dashboards[final.dashboard_id]["published"] is False
 
 
-def test_an_existing_dashboard_is_read_then_added_to(fake, world, store):
-    """For an existing dashboard, the first step reads its layout and `changed_on` and holds nothing; the charts are
-    added to the layout it has, which is kept, tabs and all."""
-    existing = world.plant_chart(title="By hand", dataset_id=POLICY_DATASET, viz_type="table")
-    dashboard = 900
+def _existing_dashboard(world, *, editors=("builder",), dashboard: int = 900) -> tuple[int, int]:
+    """A dashboard made by hand, with one chart on it and a layout holding it: its id and the chart's."""
+    existing = world.plant_chart(title="By hand", dataset_id=POLICY_DATASET, viz_type="table", user="analyst")
     world.dashboards[dashboard] = {
         "id": dashboard, "dashboard_title": "Sales", "published": True, "description": "Made by hand",
         "position_json": json.dumps({
@@ -341,12 +339,21 @@ def test_an_existing_dashboard_is_read_then_added_to(fake, world, store):
                       "meta": {}},
             "CHART-x": {"type": "CHART", "id": "CHART-x", "children": [], "parents": ["ROOT_ID", "GRID_ID", "ROW-x"],
                         "meta": {"chartId": existing, "width": 12, "height": 50}}}),
-        "json_metadata": "{}", "editors": ["builder"], "members": [existing], "created_by": "analyst",
+        "json_metadata": "{}", "editors": list(editors), "members": [existing], "created_by": "analyst",
         "created_on": world.superset_now(), "changed_on": world.superset_now()}
+    return dashboard, existing
+
+
+def test_an_existing_dashboard_is_read_then_added_to(fake, world, store):
+    """For an existing dashboard, the first step reads whether the builder edits it, its layout and `changed_on`, and
+    holds nothing; the charts are added to the layout it has, which is kept."""
+    dashboard, existing = _existing_dashboard(world)
     state = _start(store, ONE_BAR, dashboard_id=dashboard)
     first = _next(store, state.build_id, _adapter(fake))
     assert first.ran == "dashboard" and _step(first, "dashboard").object_id == dashboard
-    assert [c.tool.rsplit(".", 1)[-1] for c in fake.calls] == ["get_layout"]
+    assert sorted(_tools(fake)) == ["editors_of", "get_layout"]
+    [asked] = world.calls("editors_of")
+    assert asked.request == {"dashboard_ids": [dashboard]}
     final = _run(store, state.build_id, _adapter(fake))[-1]
     assert final.status == "done" and final.dashboard_id == dashboard
     assert "create_dashboard" not in _tools(fake)
@@ -355,6 +362,21 @@ def test_an_existing_dashboard_is_read_then_added_to(fake, world, store):
     chart = _step(final, "policies_by_region").object_id
     assert sorted(world.dashboards[dashboard]["members"]) == sorted([existing, chart])
     assert world.dashboards[dashboard]["published"] is True  # the build changes no dashboard's publication
+
+
+def test_an_existing_dashboard_the_builder_does_not_edit_is_refused_before_anything_is_made(fake, world, store):
+    """The extension answers whether the builder edits the dashboard (`editors_of` with `dashboard_ids`): one who
+    does not is refused at the first step, told its editors, and nothing is made."""
+    dashboard, _ = _existing_dashboard(world, editors=("colleague", "analyst"))
+    charts = set(world.charts)
+    state = _start(store, ONE_BAR, dashboard_id=dashboard)
+    stopped = _next(store, state.build_id, _adapter(fake))
+    assert stopped.status == "failed" and _step(stopped, "dashboard").status == "failed"
+    assert _step(stopped, "dashboard").reason == "not_editor"
+    assert "not an editor" in stopped.message and "analyst, colleague" in stopped.message
+    assert set(world.charts) == charts and not any(t.startswith(("generate", "create", "claim")) for t in _tools(fake))
+    later = build_state(store, store.load_build(TENANT, state.build_id, PRINCIPAL))
+    assert "not an editor" in later.message and "colleague" not in later.message
 
 
 def test_a_layout_raced_by_a_hand_edit_is_recomputed_once(fake, world, store):
@@ -371,6 +393,17 @@ def test_a_layout_raced_by_a_hand_edit_is_recomputed_once(fake, world, store):
     state = _next(store, build, _adapter(fake))
     assert state.ran == "layout" and _step(state, "layout").status == "done", state
     assert len(world.calls("set_layout")) == 2 and len(world.calls("get_layout")) == 2
+
+
+def test_an_unreadable_layout_answer_is_a_failed_read(fake, world, store):
+    """`get_layout` answering something that is not a layout reads as a layout that could not be read, never as a
+    save that failed."""
+    build = _start(store, ONE_BAR).build_id
+    _run_to(store, build, _adapter(fake), "layout")
+    world.hooks["get_layout"] = Hook(instead=lambda request, _w: {"layout": "elsewhere"})
+    stopped = _next(store, build, _adapter(fake))
+    assert stopped.status == "failed" and _step(stopped, "layout").reason == "layout_unreadable"
+    assert "could not be read" in stopped.message and "could not save" not in stopped.message
 
 
 # --- the one-step rule, the claim and the lease
@@ -396,7 +429,7 @@ def test_concurrent_next_runs_one_step(fake, world, store):
     release.set()
     worker.join(10)
     assert first and first[0].ran == "dashboard" and _step(first[0], "dashboard").status == "done"
-    assert [c.authorization for c in fake.calls] == [f"Bearer {TOKEN}"]
+    assert {c.authorization for c in fake.calls} == {f"Bearer {TOKEN}"}
     assert len(world.dashboards) == 1
 
 
@@ -427,45 +460,108 @@ def test_lease_is_renewed_between_calls(fake, world, store, clock):
     state = _next(store, build, _adapter(fake))
     assert len(meanwhile) == 1 and meanwhile[0].key == "policies_by_region"
     assert _step(state, "policies_by_region").status == "done"
-    assert "list_charts" not in _tools(fake) and len(world.calls("generate_chart")) == 1
+    # The one listing is the floor read before the create: nothing was reconciled.
+    assert len(world.calls("list_charts")) == 1 and len(world.calls("generate_chart")) == 1
     assert not any(c.authorization == f"Bearer {FRESH_TOKEN}" for c in fake.calls)
 
 
 def test_worker_past_its_lease_does_not_start_another_call(fake, world, store, clock):
-    """A worker whose lease passed during a call starts no further call: the claim is left undone, and the next
-    request reconciles the step, finds the chart by its window, and claims it once."""
+    """A worker whose lease passed during a call starts no further call: the claim is left undone, the step is left
+    uncertain with the id the create answered, and the next request reads that chart back by its id and claims it
+    once."""
     build = _start(store, ONE_BAR).build_id
     _run_to(store, build, _adapter(fake), "policies_by_region")
     world.hooks["generate_chart"] = Hook(after=_once(lambda request, answer, _w: clock.advance(601)))
     stalled = _next(store, build, _adapter(fake))
     assert "claim_chart" not in _tools(fake)
+    [made] = [c for c in world.charts.values() if c["slice_name"] == "Policies by region"]
     assert _step(stalled, "policies_by_region").status == "uncertain"
+    assert _step(stalled, "policies_by_region").object_id == made["id"]
     reconciled = _next(store, build, _adapter(fake))
     assert reconciled.ran == "policies_by_region" and _step(reconciled, "policies_by_region").status == "done"
-    [made] = [c for c in world.charts.values() if c["slice_name"] == "Policies by region"]
     assert [c.request["chart_id"] for c in world.calls("claim_chart")] == [made["id"]]
     assert len(world.calls("generate_chart")) == 1
+    assert [c.request["identifier"] for c in world.calls("get_chart_info")][:1] == [made["id"]]
+
+
+def test_a_lease_that_passes_during_the_checks_stops_them(fake, world, store, clock):
+    """The check step renews its lease before each of its Superset calls, inside each chart's check too: once the
+    lease has passed, no further call is started, and the next request checks again."""
+    build = _start(store, BuildPlan(charts=(BY_REGION, KPI_POLICIES), measures=(POLICIES,))).build_id
+    _run_to(store, build, _adapter(fake), "check")
+    world.hooks["get_chart_data"] = Hook(after=_once(lambda request, answer, _w: clock.advance(601)))
+    stalled = _next(store, build, _adapter(fake))
+    assert _step(stalled, "check").status == "uncertain"
+    assert len(world.calls("get_chart_data")) == 1 and "execute_sql" not in _tools(fake)
+    final = _next(store, build, _adapter(fake))
+    assert final.status == "done" and set(final.checks.values()) == {ChartStatus.CHECKED}
 
 
 # --- reconciling a step whose outcome is uncertain
 
 
-def test_timed_out_create_is_reconciled_not_repeated(fake, world, store):
-    """Superset made the chart and the call timed out before it answered: the step is `uncertain`, and the next
-    request finds the one unmarked chart made in the step's window and claims it. No second chart is made."""
+def _made_once(world) -> dict:
+    [made] = [c for c in world.charts.values() if c["slice_name"] == "Policies by region"]
+    return made
+
+
+def test_timed_out_create_is_reconciled_not_repeated(fake, world, store, clock):
+    """Superset made the chart and the call timed out before it answered: Superset may still be working, so the
+    step is not finished and its claim runs out. Meanwhile `/next` is refused; once the lease has passed, the step
+    finds the one unmarked chart made since its floor and claims it. No second chart is made."""
     build = _start(store, ONE_BAR).build_id
     _run_to(store, build, _adapter(fake, timeout_s=1), "policies_by_region")
     world.hooks["generate_chart"] = Hook(after=_once(lambda request, answer, _w: time.sleep(2)))
     timed_out = _next(store, build, _adapter(fake, timeout_s=1))
-    assert _step(timed_out, "policies_by_region").status == "uncertain", timed_out
-    assert timed_out.status == "building" and "claim_chart" not in _tools(fake)
+    step = _step(timed_out, "policies_by_region")
+    assert step.status == "pending" and step.lease_until is not None, timed_out
+    assert "may still be making" in timed_out.message and "claim_chart" not in _tools(fake)
+    with pytest.raises(BuildBusy):
+        _next(store, build, _adapter(fake))
+    clock.advance(601)
     final = _run(store, build, _adapter(fake))[-1]
     assert final.status == "done", final
-    [made] = [c for c in world.charts.values() if c["slice_name"] == "Policies by region"]
+    made = _made_once(world)
     assert len(world.calls("generate_chart")) == 1
     assert [c.request["chart_id"] for c in world.calls("claim_chart")] == [made["id"]]
     assert _step(final, "policies_by_region").object_id == made["id"]
     assert parse_marker(made["description"]) == Marker(build, "policies_by_region", final.dashboard_id)
+
+
+def test_a_create_superset_commits_after_the_deadline_is_made_once(fake, world, store, clock):
+    """The probe that found the defect: the client gives up while Superset is still running `generate_chart`, which
+    commits the chart afterwards. Because the step is left to its lease, the immediate next request is refused, and
+    after the lease the one chart is found and claimed; Superset never makes a second."""
+    build = _start(store, ONE_BAR).build_id
+    _run_to(store, build, _adapter(fake, timeout_s=1), "policies_by_region")
+    committed = threading.Event()
+    world.hooks["generate_chart"] = Hook(before=_once(lambda request, _w: time.sleep(2.5)),
+                                         after=lambda request, answer, _w: committed.set())
+    _next(store, build, _adapter(fake, timeout_s=1))
+    with pytest.raises(BuildBusy):
+        _next(store, build, _adapter(fake))
+    assert committed.wait(10)
+    clock.advance(601)
+    final = _run(store, build, _adapter(fake))[-1]
+    assert final.status == "done", final
+    made = _made_once(world)
+    assert len(world.calls("generate_chart")) == 1
+    assert [c.request["chart_id"] for c in world.calls("claim_chart")] == [made["id"]]
+
+
+def test_a_timed_out_claim_is_reconciled_at_once(fake, world, store):
+    """A claim is made under the chart's row lock and answers the same when made twice, so one that timed out leaves
+    the step uncertain at once, and the next request reads the chart back by its id: it carries the step's marker,
+    so it is adopted without a second claim."""
+    build = _start(store, ONE_BAR).build_id
+    _run_to(store, build, _adapter(fake, timeout_s=1), "policies_by_region")
+    world.hooks["claim_chart"] = Hook(after=_once(lambda request, answer, _w: time.sleep(2)))
+    timed_out = _next(store, build, _adapter(fake, timeout_s=1))
+    made = _made_once(world)
+    assert _step(timed_out, "policies_by_region").status == "uncertain"
+    assert _step(timed_out, "policies_by_region").object_id == made["id"]
+    final = _run(store, build, _adapter(fake))[-1]
+    assert final.status == "done" and len(world.calls("claim_chart")) == 1 and len(world.calls("generate_chart")) == 1
 
 
 class _Died(BaseException):
@@ -507,20 +603,21 @@ def _times_out_making_nothing(request, _world):
 
 
 def _uncertain_with_nothing_made(fake, world, store, plan: BuildPlan = ONE_BAR) -> str:
-    """A build whose chart step timed out before Superset made anything: the step is `uncertain`."""
+    """A build whose chart step timed out before Superset made anything, its lease since passed: the next request
+    reconciles it."""
     build = _start(store, plan).build_id
     _run_to(store, build, _adapter(fake, timeout_s=1), "policies_by_region")
     world.hooks["generate_chart"] = Hook(before=_once(_times_out_making_nothing))
     charts = set(world.charts)
-    state = _next(store, build, _adapter(fake, timeout_s=1))
-    assert _step(state, "policies_by_region").status == "uncertain", state
+    _next(store, build, _adapter(fake, timeout_s=1))
     assert set(world.charts) == charts
+    world.clock.advance(601)
     return build
 
 
 @pytest.mark.parametrize("whose", ["another build", "another step of this build", "another dashboard"])
 def test_another_builds_chart_is_never_adopted(fake, world, store, whose):
-    """A chart of the planned name, on the planned dataset, made by the builder in the step's window, carrying a
+    """A chart of the planned name, on the planned dataset, made by the builder since the step's floor, carrying a
     marker that is not this step's (compared field by field): never adopted, claimed or patched. The create is
     repeated, and the build's own chart is the one claimed."""
     build = _uncertain_with_nothing_made(fake, world, store)
@@ -541,9 +638,9 @@ def test_another_builds_chart_is_never_adopted(fake, world, store, whose):
     assert [c.request["chart_id"] for c in world.calls("claim_chart")] == [ours]
 
 
-def test_two_unmarked_candidates_stop_the_build(fake, world, store):
-    """Superset made the chart and timed out, and another unmarked chart of the same name was made in the window: the
-    build cannot tell which is its own, so it stops and names both, and claims neither."""
+def test_two_unmarked_candidates_stop_the_build(fake, world, store, clock):
+    """Superset made the chart and timed out, and another unmarked chart of the same name was made since the floor:
+    the build cannot tell which is its own, so it stops and names both, and claims neither; a later read says why."""
     build = _start(store, ONE_BAR).build_id
     _run_to(store, build, _adapter(fake, timeout_s=1), "policies_by_region")
 
@@ -553,6 +650,7 @@ def test_two_unmarked_candidates_stop_the_build(fake, world, store):
 
     world.hooks["generate_chart"] = Hook(after=_once(twin))
     _next(store, build, _adapter(fake, timeout_s=1))
+    clock.advance(601)
     stopped = _next(store, build, _adapter(fake))
     assert stopped.status == "failed" and _step(stopped, "policies_by_region").status == "failed"
     named = sorted(c["id"] for c in world.charts.values() if c["slice_name"] == "Policies by region")
@@ -560,56 +658,69 @@ def test_two_unmarked_candidates_stop_the_build(fake, world, store):
     assert "claim_chart" not in _tools(fake) and len(world.calls("generate_chart")) == 1
     again = _next(store, build, _adapter(fake))
     assert again.status == "failed" and again.ran is None
+    assert _step(again, "policies_by_region").reason == "candidates" and "cannot tell" in again.message
 
 
-def test_a_chart_older_than_the_window_is_not_a_candidate(fake, world, store):
-    """An unmarked chart of the planned name made before the step began (by hand, earlier) is not the step's: the
-    create is repeated, and that chart is left alone."""
-    old = world.plant_chart(title="Policies by region", dataset_id=POLICY_DATASET, viz_type="echarts_timeseries_bar",
-                            created_on=world.superset_now() - timedelta(hours=3))
-    build = _uncertain_with_nothing_made(fake, world, store)
-    final = _run(store, build, _adapter(fake))[-1]
-    assert final.status == "done" and _step(final, "policies_by_region").object_id != old
-    assert world.charts[old]["description"] is None and len(world.calls("generate_chart")) == 2
-
-
-@pytest.mark.parametrize(("before_start_s", "claimed"), [(120, True), (121, False)],
-                         ids=["at the margin", "past the margin"])
-def test_the_window_opens_the_margin_before_the_step_began(fake, world, store, before_start_s, claimed):
-    """`created_on` is Superset's clock and `started_at` the control Postgres's, so the window opens
-    `RECONCILE_MARGIN_S` (120 s) before the step began: a candidate made 120 s before is the step's, one made 121 s
-    before is not, and the create is repeated."""
-    assert builder.RECONCILE_MARGIN_S == 120
-    build = _uncertain_with_nothing_made(fake, world, store)
-    started = datetime.fromisoformat(_raw_step(store, build, "policies_by_region")["started_at"])
-    made = started.astimezone(world.zone).replace(tzinfo=None) - timedelta(seconds=before_start_s)
-    candidate = world.plant_chart(title="Policies by region", dataset_id=POLICY_DATASET,
-                                  viz_type="echarts_timeseries_bar", created_on=made)
+@pytest.mark.parametrize("made", ["before the floor was read", "after it"])
+def test_the_floor_is_the_window(fake, world, store, made):
+    """Before its create, a step records the highest id of the builder's charts as its floor (`id_floor`, read by
+    id, descending). An unmarked chart of the planned name at or below the floor is never the step's, whatever its
+    clock says; one above it is, when the step made nothing else."""
+    if made == "before the floor was read":
+        candidate = world.plant_chart(title="Policies by region", dataset_id=POLICY_DATASET,
+                                      viz_type="echarts_timeseries_bar")
+        build = _uncertain_with_nothing_made(fake, world, store)
+    else:
+        build = _uncertain_with_nothing_made(fake, world, store)
+        candidate = world.plant_chart(title="Policies by region", dataset_id=POLICY_DATASET,
+                                      viz_type="echarts_timeseries_bar")
+    floor = _raw_step(store, build, "policies_by_region")["intent"]["id_floor"]
+    assert (candidate <= floor) is (made == "before the floor was read")
+    [read] = [c.request for c in world.calls("list_charts")][:1]
+    assert read["created_by_me"] is True and (read["order_column"], read["order_direction"]) == ("id", "desc")
     final = _run(store, build, _adapter(fake))[-1]
     assert final.status == "done", final
-    assert (_step(final, "policies_by_region").object_id == candidate) is claimed
-    assert len(world.calls("generate_chart")) == (1 if claimed else 2)
+    adopted = _step(final, "policies_by_region").object_id == candidate
+    assert adopted is (made == "after it")
+    assert len(world.calls("generate_chart")) == (1 if adopted else 2)
 
 
-@pytest.mark.parametrize(("setting", "claimed"), [("America/Los_Angeles", True), ("UTC", False)])
-def test_supersets_wall_clock_is_read_in_its_zone(fake, clock, store, setting, claimed):
-    """Superset writes `created_on` as its app server's wall clock, with no zone: read in `superset_timezone`, a
-    chart made in the window by a Superset in Los Angeles is the step's; read as UTC, the same text is eight hours
-    earlier than the step, so it is not."""
-    world = World(fake, clock, zone=ZoneInfo("America/Los_Angeles"))
-    settings = Settings(guard_fanout=False, superset_currency="USD", superset_timezone=setting)
+def test_the_floor_is_recorded_before_the_create(fake, world, store):
+    """The floor is read and kept in the step's intent before the create is sent, so a create is never sent without
+    one, and a step with none made nothing."""
+    world.plant_chart(title="Something else", dataset_id=POLICY_DATASET, viz_type="table")
+    highest = max(world.charts)
     build = _start(store, ONE_BAR).build_id
     _run_to(store, build, _adapter(fake), "policies_by_region")
-    world.hooks["generate_chart"] = Hook(before=_once(_times_out_making_nothing))
-    assert _step(_next(store, build, _adapter(fake, timeout_s=1), settings), "policies_by_region").status == "uncertain"
-    candidate = world.plant_chart(title="Policies by region", dataset_id=POLICY_DATASET,
-                                  viz_type="echarts_timeseries_bar")
-    final = _run(store, build, _adapter(fake), settings)[-1]
-    assert (_step(final, "policies_by_region").object_id == candidate) is claimed
+    seen: list = []
+    world.hooks["generate_chart"] = Hook(before=lambda request, _w: seen.append(
+        _raw_step(store, build, "policies_by_region")["intent"]["id_floor"]))
+    _next(store, build, _adapter(fake))
+    assert seen == [highest]
+
+
+def test_reconciliation_reads_back_to_the_floor(fake, world, store, clock):
+    """The builder made many charts since the floor (another build's, at once): reconciliation reads the builder's
+    charts newest first, page after page, until it reaches the floor, and finds the step's own on a later page."""
+    build = _start(store, ONE_BAR).build_id
+    _run_to(store, build, _adapter(fake, timeout_s=1), "policies_by_region")
+
+    def busy_builder(request, answer, _world):
+        for n in range(130):
+            world.plant_chart(title=f"Other {n}", dataset_id=POLICY_DATASET, viz_type="table")
+        time.sleep(2)
+
+    world.hooks["generate_chart"] = Hook(after=_once(busy_builder))
+    _next(store, build, _adapter(fake, timeout_s=1))
+    clock.advance(601)
+    final = _run(store, build, _adapter(fake))[-1]
+    assert final.status == "done" and len(world.calls("generate_chart")) == 1
+    pages = [c.request["page"] for c in world.calls("list_charts") if c.request["page_size"] > 1]
+    assert pages == [1, 2], pages
 
 
 def test_a_chart_on_another_dataset_is_not_a_candidate(fake, world, store):
-    """An unmarked chart of the planned name made in the window, but on another dataset, is not the step's."""
+    """An unmarked chart of the planned name made since the floor, but on another dataset, is not the step's."""
     build = _uncertain_with_nothing_made(fake, world, store)
     other = world.plant_chart(title="Policies by region", dataset_id=POLICY_DATASET,
                               viz_type="echarts_timeseries_bar")
@@ -618,13 +729,14 @@ def test_a_chart_on_another_dataset_is_not_a_candidate(fake, world, store):
     assert _step(final, "policies_by_region").object_id != other and len(world.calls("generate_chart")) == 2
 
 
-def test_a_dataset_whose_create_timed_out_is_reconciled(fake, world, store):
-    """A physical dataset is made by `create_dataset` and marked by its claim: made and timed out, it is found in the
-    window by its table name and claimed; no second is made."""
+def test_a_dataset_whose_create_timed_out_is_reconciled(fake, world, store, clock):
+    """A physical dataset is made by `create_dataset` and marked by its claim: made and timed out, its lease is left
+    to run out, and then it is found above the floor by its table name and claimed; no second is made."""
     build = _start(store).build_id
     _run_to(store, build, _adapter(fake, timeout_s=1), "dataset_1")
     world.hooks["create_dataset"] = Hook(after=_once(lambda request, answer, _w: time.sleep(2)))
-    assert _step(_next(store, build, _adapter(fake, timeout_s=1)), "dataset_1").status == "uncertain"
+    assert _step(_next(store, build, _adapter(fake, timeout_s=1)), "dataset_1").status == "pending"
+    clock.advance(601)
     state = _next(store, build, _adapter(fake))
     assert state.ran == "dataset_1" and _step(state, "dataset_1").status == "done"
     assert len(world.calls("create_dataset")) == 1
@@ -633,15 +745,141 @@ def test_a_dataset_whose_create_timed_out_is_reconciled(fake, world, store):
     assert _step(state, "dataset_1").object_id == made
 
 
-def test_a_dashboard_shell_whose_create_timed_out_is_adopted_by_its_marker(fake, world, store):
-    """The shell carries its marker from its create: made and timed out, it is found by that marker and adopted."""
+@pytest.mark.parametrize("renamed", [False, True], ids=["as made", "renamed by hand"])
+def test_a_dashboard_shell_whose_create_timed_out_is_adopted_by_its_marker(fake, world, store, clock, renamed):
+    """The shell carries its marker from its create: made and timed out, it is found by that marker among the
+    builder's dashboards made since the floor, whatever it is called by then, and adopted."""
     build = _start(store, ONE_BAR).build_id
-    world.hooks["create_dashboard"] = Hook(after=_once(lambda request, answer, _w: time.sleep(2)))
-    assert _step(_next(store, build, _adapter(fake, timeout_s=1)), "dashboard").status == "uncertain"
+
+    def late(request, answer, _world):
+        if renamed:
+            world.dashboards[answer["dashboard_id"]]["dashboard_title"] = "Renamed by hand"
+        time.sleep(2)
+
+    world.hooks["create_dashboard"] = Hook(after=_once(late))
+    assert _step(_next(store, build, _adapter(fake, timeout_s=1)), "dashboard").status == "pending"
+    clock.advance(601)
     state = _next(store, build, _adapter(fake))
     assert _step(state, "dashboard").status == "done" and len(world.dashboards) == 1
     [shell] = world.dashboards.values()
     assert state.dashboard_id == shell["id"] and len(world.calls("create_dashboard")) == 1
+
+
+def test_a_funnel_renamed_before_it_is_reconciled_is_adopted_by_its_marker(fake, world, store, clock):
+    """A funnel carries its marker from its create: renamed by hand before the step is reconciled, it is still found
+    by the marker among the builder's charts since the floor, and no second funnel is made."""
+    build = _start(store, ONE_FUNNEL).build_id
+    _run_to(store, build, _adapter(fake, timeout_s=1), "policies_by_status")
+
+    def renamed(request, answer, _world):
+        world.charts[answer["chart_id"]]["slice_name"] = "Renamed by hand"
+        time.sleep(2)
+
+    world.hooks["create_chart"] = Hook(after=_once(renamed))
+    _next(store, build, _adapter(fake, timeout_s=1))
+    clock.advance(601)
+    final = _run(store, build, _adapter(fake))[-1]
+    assert final.status == "done" and len(world.calls("create_chart")) == 1 and len(world.charts) == 1
+
+
+def test_a_claimed_chart_renamed_before_it_is_reconciled_is_adopted_by_its_marker(fake, world, store, clock,
+                                                                                  monkeypatch):
+    """The worker dies after the claim marked the chart and before it recorded the step; a person renames the chart.
+    Once the lease has passed the chart is still found by its marker, and nothing is made or claimed again."""
+    build = _start(store, ONE_BAR).build_id
+    _run_to(store, build, _adapter(fake), "policies_by_region")
+    finish = store.finish_step
+
+    def dies_before_it_records(tenant, build_id, key, *args, **kwargs):
+        if key == "policies_by_region" and not getattr(dies_before_it_records, "died", False):
+            dies_before_it_records.died = True
+            [claim] = world.calls("claim_chart")
+            world.charts[claim.request["chart_id"]]["slice_name"] = "Renamed by hand"
+            raise _Died()
+        return finish(tenant, build_id, key, *args, **kwargs)
+
+    monkeypatch.setattr(store, "finish_step", dies_before_it_records)
+    with pytest.raises(_Died):
+        _next(store, build, _adapter(fake))
+    clock.advance(601)
+    final = _run(store, build, _adapter(fake))[-1]
+    assert final.status == "done" and len(world.calls("generate_chart")) == 1 and len(world.calls("claim_chart")) == 1
+    [claim] = world.calls("claim_chart")
+    assert _step(final, "policies_by_region").object_id == claim.request["chart_id"]
+
+
+# --- a create that answers failure, and one that keeps failing
+
+
+@pytest.mark.parametrize("tool", ["generate_chart", "create_dataset"])
+def test_a_create_that_answers_failure_after_it_committed_is_claimed(fake, world, store, tool):
+    """rc2's `generate_chart` can answer `success: false` after `CreateChartCommand` committed, and `create_dataset`
+    "created but could not be serialized": a failure answer from a create is reconciled before it is believed, so
+    the object Superset made is found and claimed, not left behind."""
+    plan = SIX if tool == "create_dataset" else ONE_BAR
+    build = _start(store, plan).build_id
+    key = "dataset_1" if tool == "create_dataset" else "policies_by_region"
+    _run_to(store, build, _adapter(fake), key)
+    failure = ({"success": False, "error": {"error": "the preview failed", "error_type": "PreviewError"}}
+               if tool == "generate_chart" else
+               {"error": "Dataset was created but could not be serialized", "error_type": "SerializationError"})
+    world.hooks[tool] = Hook(after=_once(lambda request, answer, _w: failure))
+    state = _next(store, build, _adapter(fake))
+    assert _step(state, key).status == "done", state
+    made = _step(state, key).object_id
+    assert len(world.calls(tool)) == 1
+    claims = world.calls("claim_dataset" if tool == "create_dataset" else "claim_chart")
+    assert [c.request["dataset_id" if tool == "create_dataset" else "chart_id"] for c in claims] == [made]
+
+
+def test_a_create_that_answers_failure_and_made_nothing_fails(fake, world, store):
+    build = _start(store, ONE_BAR).build_id
+    _run_to(store, build, _adapter(fake), "policies_by_region")
+    world.hooks["generate_chart"] = Hook(instead=lambda request, _w: {"success": False, "error": {
+        "error": "the dataset has no such column", "error_type": "ValidationError"}})
+    stopped = _next(store, build, _adapter(fake))
+    assert stopped.status == "failed" and _step(stopped, "policies_by_region").reason == "not_made"
+    assert "no such column" not in stopped.message
+
+
+def test_a_create_whose_tool_keeps_failing_stops_after_two(fake, world, store):
+    """A create whose tool fails is left uncertain and raised; reconciled, it finds nothing made and is tried once
+    more; failing the same way again, the step fails with its reason, so the build does not retry forever."""
+    from mnemiq.superset.client import SupersetToolError
+
+    build = _start(store, ONE_BAR).build_id
+    _run_to(store, build, _adapter(fake), "policies_by_region")
+
+    def fails(request, _world):
+        raise RuntimeError("Superset's chart tool broke")
+
+    world.hooks["generate_chart"] = Hook(before=fails)
+    with pytest.raises(SupersetToolError):
+        _next(store, build, _adapter(fake))
+    first = build_state(store, store.load_build(TENANT, build, PRINCIPAL))
+    assert _step(first, "policies_by_region").status == "uncertain"
+    assert _step(first, "policies_by_region").reason == "tool_error"
+    stopped = _next(store, build, _adapter(fake))
+    assert stopped.status == "failed" and _step(stopped, "policies_by_region").reason == "tool_error"
+    assert len(world.calls("generate_chart")) == 2 and "broke" not in stopped.message
+
+
+def test_an_abandoned_build_releases_its_dashboard(fake, world, store, clock):
+    """A build left untouched for twice its lease no longer holds its dashboard: the next build of it fails the old
+    build's next step as abandoned, in the same write as its own creation, and a later read of the old one says
+    why. A build touched more recently than that still holds it."""
+    dashboard, _ = _existing_dashboard(world)
+    old = _start(store, ONE_BAR, dashboard_id=dashboard).build_id
+    _next(store, old, _adapter(fake))
+    clock.advance(2 * 600 - 1)
+    with pytest.raises(DashboardBusy):
+        _start(store, ONE_BAR, dashboard_id=dashboard)
+    clock.advance(2)
+    fresh = _start(store, ONE_BAR, dashboard_id=dashboard)
+    assert fresh.status == "building"
+    stale = build_state(store, store.load_build(TENANT, old, PRINCIPAL))
+    assert stale.status == "failed" and _step(stale, "policies_by_region").reason == "abandoned"
+    assert "untouched" in stale.message
 
 
 # --- a token that expires between steps
@@ -676,7 +914,7 @@ def test_expired_token_between_steps_resumes(fake, world, store, monkeypatch, wh
     kept = build_state(store, store.load_build(TENANT, build, PRINCIPAL))
     assert [step.status for step in kept.steps] == ["done", "uncertain", "pending", "pending"]
     assert kept.status == "building"
-    [made] = [c for c in world.charts.values() if c["slice_name"] == "Policies by region"]
+    made = _made_once(world)
     # Between the calls, the step knew what it made and kept it; during the create, it did not.
     assert _step(kept, "policies_by_region").object_id == (made["id"] if when == "between" else None)
     final = _run(store, build, _adapter(fake, FRESH_TOKEN))[-1]
@@ -716,11 +954,62 @@ def _once_answer(answer: dict):
     return instead
 
 
+# --- the dashboard's measures
+
+
+def test_a_chart_of_a_reused_saved_metric_keeps_its_check_status(fake, world, store):
+    """A reused saved metric is kept as a measure of the dashboard too, naming the metric, so its charts' check
+    statuses survive a later read and the dashboard's measure list holds it."""
+    final = _run(store, _start(store).build_id, _adapter(fake))[-1]
+    ids = _chart_ids(final)
+    reread = build_state(store, store.load_build(TENANT, final.build_id, PRINCIPAL))
+    assert reread.checks == final.checks and set(reread.checks) == set(ids.values())
+    [saved] = [m for m in store.measures_for(TENANT, final.dashboard_id) if m.saved_metric]
+    assert saved.saved_metric == "total_premium" and saved.measure.expression == "SUM(premium)"
+    assert saved.measure.kind is MeasureKind.CURRENCY and saved.measure.dataset_id == POLICY_DATASET
+    assert sorted(saved.chart_ids) == sorted(ids[k] for k in ("total_premium_kpi", "premium_by_month",
+                                                              "premium_by_channel"))
+    assert saved.measure.asked_by == PRINCIPAL and saved.made_dataset_ids == ()
+
+
+def _kept_measure(store, dashboard: int, measure: Measure, chart_ids: tuple) -> None:
+    store.put_measure(TENANT, dashboard, dataclasses.replace(measure, asked_by="superset:someone"),
+                      chart_ids=chart_ids, check_status={chart_ids[0]: ChartStatus.CHECKED})
+
+
+def test_a_measure_the_dashboard_holds_with_another_definition_stops_its_chart(fake, world, store):
+    """On a dashboard that already keeps a measure of the planned name with another definition, the chart is not
+    made: the step stops with its reason, and the measure kept is unchanged."""
+    dashboard, existing = _existing_dashboard(world)
+    _kept_measure(store, dashboard, dataclasses.replace(POLICIES, expression="COUNT(DISTINCT region)"), (existing,))
+    build = _start(store, ONE_BAR, dashboard_id=dashboard).build_id
+    _next(store, build, _adapter(fake))
+    stopped = _next(store, build, _adapter(fake))
+    assert stopped.status == "failed" and _step(stopped, "policies_by_region").reason == "measure_conflict"
+    assert "generate_chart" not in _tools(fake) and "'policies'" in stopped.message
+    [kept] = store.measures_for(TENANT, dashboard)
+    assert kept.measure.expression == "COUNT(DISTINCT region)" and kept.chart_ids == (existing,)
+
+
+def test_the_same_definition_merges_its_charts(fake, world, store):
+    """The same measure (its expression equal once normalized, its kind and dataset the same) gains the new chart
+    beside those it had, and keeps their statuses."""
+    dashboard, existing = _existing_dashboard(world)
+    _kept_measure(store, dashboard, dataclasses.replace(POLICIES, expression="count( policy_id )"), (existing,))
+    final = _run(store, _start(store, ONE_BAR, dashboard_id=dashboard).build_id, _adapter(fake))[-1]
+    assert final.status == "done", final
+    [kept] = store.measures_for(TENANT, dashboard)
+    chart = _step(final, "policies_by_region").object_id
+    assert kept.chart_ids == (existing, chart)
+    assert kept.check_status == {existing: ChartStatus.CHECKED, chart: ChartStatus.CHECKED}
+
+
 # --- what a build's state carries, and what it keeps
 
 
 def test_a_build_state_never_carries_a_lease_id(fake, world, store):
-    """The build routes answer with a `BuildState`: no lease id is in one, while a step runs or after."""
+    """The build routes answer with a `BuildState`: no lease id is in one, while a step runs or after. (A
+    `not_editor` message names editors: it is for the HTTP answer only, never a model-visible field.)"""
     build = _start(store, ONE_BAR).build_id
     seen: list[str] = []
 
@@ -745,15 +1034,15 @@ def test_a_finish_whose_answer_was_lost_is_read_back(fake, world, store, monkeyp
     finish = store.finish_step
     dropped: list[str] = []
 
-    def drops(tenant, build_id, key, status, object_id, *, lease_id):
+    def drops(tenant, build_id, key, status, object_id, **kept):
         if key == "dashboard" and not dropped:
             dropped.append("after")
-            finish(tenant, build_id, key, status, object_id, lease_id=lease_id)
+            finish(tenant, build_id, key, status, object_id, **kept)
             raise psycopg.OperationalError("the connection dropped after the commit")
         if key == "policies_by_region" and len(dropped) == 1:
             dropped.append("before")
             raise psycopg.OperationalError("the connection dropped before the commit")
-        return finish(tenant, build_id, key, status, object_id, lease_id=lease_id)
+        return finish(tenant, build_id, key, status, object_id, **kept)
 
     monkeypatch.setattr(store, "finish_step", drops)
     final = _run(store, _start(store, ONE_BAR).build_id, _adapter(fake))[-1]
@@ -853,13 +1142,12 @@ def test_a_build_runs_on_the_postgres_store(fake, pg_store):
     assert [state.ran for state in states] == [step.key for step in started.steps]
     assert final.status == "done" and set(final.checks.values()) == {ChartStatus.CHECKED}, final.message
     kept = {m.measure.name: m for m in pg_store.measures_for(TENANT, final.dashboard_id)}
-    assert set(kept) == {"policies", "claimed"} and kept["claimed"].measure.asked_by == PRINCIPAL
-    # A later read has each status kept with a written measure's row: a chart that plots only a reused saved metric
-    # has no row, so its status rides in the check step's answer alone.
-    ids = _chart_ids(final)
-    written = {ids[c.key] for c in SIX.charts if any(isinstance(ref, WrittenRef) for ref in c.measures)}
+    assert {m.saved_metric for m in kept.values()} == {None, "total_premium"}
+    assert kept["claimed"].measure.asked_by == PRINCIPAL
+    # A later read has every chart's status, a chart of a reused saved metric's too: each is kept with a measure row.
     reread = build_state(pg_store, pg_store.load_build(TENANT, final.build_id, PRINCIPAL))
-    assert reread.checks == {chart_id: ChartStatus.CHECKED for chart_id in written} and reread.ran is None
+    assert reread.checks == final.checks and set(reread.checks) == set(_chart_ids(final).values())
+    assert reread.ran is None
     again = _start(pg_store, ONE_BAR, dashboard_id=final.dashboard_id)
     with pytest.raises(DashboardBusy):
         _start(pg_store, ONE_BAR, dashboard_id=final.dashboard_id)
@@ -867,13 +1155,18 @@ def test_a_build_runs_on_the_postgres_store(fake, pg_store):
 
 
 def test_a_timed_out_create_is_reconciled_on_the_postgres_store(fake, pg_store):
-    """A chart made and timed out, on the Postgres store: the step is uncertain with Postgres's `started_at`, and the
-    next request finds the chart in the window by Superset's own clock, and claims it; no second is made."""
+    """A chart made and timed out, on the Postgres store, its lease a short one: the claim is left to run out (a
+    `/next` meanwhile is refused by Postgres's own clock), and then the chart is found above the step's floor and
+    claimed; no second is made."""
     world = World(fake, _RealClock())
     build = _start(pg_store, ONE_BAR).build_id
     _run_to(pg_store, build, _adapter(fake), "policies_by_region")
     world.hooks["generate_chart"] = Hook(after=_once(lambda request, answer, _w: time.sleep(2)))
-    assert _step(_next(pg_store, build, _adapter(fake, timeout_s=1)), "policies_by_region").status == "uncertain"
+    left = _next(pg_store, build, _adapter(fake, timeout_s=1), lease_s=3)
+    assert _step(left, "policies_by_region").status == "pending"
+    with pytest.raises(BuildBusy):
+        _next(pg_store, build, _adapter(fake))
+    time.sleep(3.5)
     final = _run(pg_store, build, _adapter(fake))[-1]
     assert final.status == "done", final
     assert len(world.calls("generate_chart")) == 1 and len(world.calls("claim_chart")) == 1

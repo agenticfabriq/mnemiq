@@ -133,9 +133,15 @@ class MemoryBuildStore:
         build_id = str(uuid.uuid4())
         step_list = bs._new_steps(build_id, steps)
         with self._lock:
+            now = self._now()
+            if dashboard_id is not None:
+                for row in self._builds.values():
+                    if (row["tenant_id"], row["dashboard_id"], row["status"]) == (tenant, dashboard_id, bs.BUILDING):
+                        released = bs._released(copy.deepcopy(row["steps"]), now, row["updated_at"])
+                        if released is not None:
+                            self._write(row, released, row["dashboard_id"])
             if dashboard_id is not None and self._live_on(tenant, dashboard_id):
                 raise bs.DashboardBusy()
-            now = self._now()
             row = {"tenant_id": tenant, "build_id": build_id, "principal_id": principal, "dashboard_id": dashboard_id,
                    "goal": goal, "plan": plan, "steps": step_list, "status": bs.BUILDING, "created_at": now,
                    "updated_at": now}
@@ -175,14 +181,27 @@ class MemoryBuildStore:
                 self._write(row, changed, row["dashboard_id"])
             return renewed is True
 
-    def finish_step(self, tenant, build_id, key, status, object_id, *, lease_id) -> StoredBuild:
+    def record_floor(self, tenant, build_id, key, lease_id, id_floor) -> bool:
+        id_floor = bs._floor_id(id_floor)
+        with self._lock:
+            try:
+                row = self._row(tenant, build_id, None)
+            except BuildNotFound:
+                return False
+            changed, held = bs._record_floor(copy.deepcopy(row["steps"]), key, lease_id, id_floor, self._now())
+            if changed is not None:
+                self._write(row, changed, row["dashboard_id"])
+            return held
+
+    def finish_step(self, tenant, build_id, key, status, object_id, *, lease_id, reason=None) -> StoredBuild:
         if status not in bs._FINISHED_AS:
             raise ValueError("a step finishes done, failed or uncertain")
         object_id = bs._id(object_id, "a step's object id", optional=True)
+        reason = bs._reason(reason)
         with self._lock:
             row = self._row(tenant, build_id, None)
             steps, dashboard_id = bs._finish(copy.deepcopy(row["steps"]), row["dashboard_id"], key, lease_id, status,
-                                             object_id)
+                                             object_id, reason)
             if dashboard_id is not None and dashboard_id != row["dashboard_id"] \
                     and self._live_on(tenant, dashboard_id, other_than=row["build_id"]):
                 raise bs.DashboardBusy()
@@ -194,10 +213,12 @@ class MemoryBuildStore:
             rows = [row for (t, d, _), row in self._measures.items() if t == tenant and d == dashboard_id]
             return [self._measure(row) for row in sorted(rows, key=lambda r: r["name"])]
 
-    def put_measure(self, tenant, dashboard_id, measure, *, chart_ids=(), made_dataset_ids=(), check_status=None):
+    def put_measure(self, tenant, dashboard_id, measure, *, chart_ids=(), made_dataset_ids=(), check_status=None,
+                    saved_metric=None):
         tenant = bs._text(tenant, "tenant")
         dashboard_id = bs._id(dashboard_id, "a dashboard id")
-        row = {"name": measure.name, "definition": bs._definition(measure), "chart_ids": bs._ids(chart_ids, "c"),
+        row = {"name": measure.name, "definition": bs._definition(measure, saved_metric),
+               "chart_ids": bs._ids(chart_ids, "c"),
                "made_dataset_ids": bs._ids(made_dataset_ids, "m"),
                "check_status": bs._check_status({} if check_status is None else check_status)}
         with self._lock:
@@ -246,6 +267,7 @@ class Hook:
     clock). Each gets the request, the answer (after) and the world."""
 
     before: Callable | None = None
+    # Run once the tool's work is committed; an answer it returns is sent in place of the tool's own.
     after: Callable | None = None
     # Answers in the tool's place, doing nothing, when it returns an answer rather than None.
     instead: Callable | None = None
@@ -343,7 +365,9 @@ class World:
                 except extension_writes.Refused as refused:  # what the extension answers a request it refuses
                     found = refused.answer
             if hook is not None and hook.after is not None:
-                hook.after(request, found, self)
+                replaced = hook.after(request, found, self)
+                if isinstance(replaced, dict):
+                    return replaced
             return found
 
         return answer
@@ -359,7 +383,7 @@ class World:
                      "claim_dataset": self._claim_dataset, "create_chart": self._create_chart,
                      "patch_chart": self._patch_chart, "add_saved_metric": self._add_saved_metric,
                      "set_layout": self._set_layout, "dataset_metrics": self._dataset_metrics,
-                     "get_layout": self._get_layout}
+                     "get_layout": self._get_layout, "editors_of": self._editors_of}
         return {**plain, **{TOOL_PREFIX + name: handler for name, handler in extension.items()}}
 
     # --- listing, as `ModelListCore` lists: filters, `created_by_me`, the columns asked for, a page
@@ -373,7 +397,10 @@ class World:
         return True
 
     def _page(self, rows: list[dict], request: dict, user: str, kind: str, shown: Callable[[dict], dict]) -> dict:
-        found = [row for row in sorted(rows, key=lambda r: r["id"]) if self._matches(row, request.get("filters", []))
+        order = request.get("order_column") or "id"
+        assert order == "id", f"the world orders only by id, not {order}"
+        found = [row for row in sorted(rows, key=lambda r: r["id"], reverse=request.get("order_direction") == "desc")
+                 if self._matches(row, request.get("filters", []))
                  and (not request.get("created_by_me") or row["created_by"] == user)]
         size, page = request.get("page_size", 10), request.get("page", 1)
         columns = request.get("select_columns") or ["id"]
@@ -655,6 +682,18 @@ class World:
             return {"not_found": "dashboard"}
         return {"dashboard_id": dashboard["id"], "position_json": dashboard["position_json"],
                 "changed_on": self._iso(dashboard["changed_on"])}
+
+    def _editors_of(self, request: dict, user: str) -> dict:
+        found = extension_reads.read("editors_of", request)
+        answer = {"charts": [{"chart_id": i, "editors": sorted(self.charts[i]["editors"])}
+                             for i in found["chart_ids"] if i in self.charts],
+                  "datasets": [{"dataset_id": i, "editors": sorted(self.datasets[i]["editors"])}
+                               for i in found["dataset_ids"] if i in self.datasets]}
+        if found["dashboard_ids"]:
+            answer["dashboards"] = [{"dashboard_id": i, "is_editor": user in self.dashboards[i]["editors"],
+                                     "editors": sorted(self.dashboards[i]["editors"])}
+                                    for i in found["dashboard_ids"] if i in self.dashboards]
+        return answer
 
     def _set_layout(self, request: dict, user: str) -> dict:
         found = extension_writes.read("set_layout", request)

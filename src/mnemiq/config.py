@@ -373,7 +373,6 @@ class Settings(BaseSettings):
     superset_database_id: int | None = Field(default=None, ge=1, description="Superset mode: the id of the Superset database mnemiq answers from, as Superset numbers it; required with MNEMIQ_SUPERSET_MCP_URL")
     superset_schema: str = Field(default="public", description="Superset mode: the schema mnemiq reads in that database, its name spelled as Postgres stores it, case included; a plain identifier of letters, digits and _, not starting with a digit")
     superset_currency: str = Field(default="USD", pattern=r"^[A-Z]{3}$", description="Superset mode: the ISO 4217 code (USD, EUR) a currency measure is shown in, never a symbol, since Superset's renderer drops a symbol that is not a code")
-    superset_timezone: str = Field(default="UTC", description="Superset mode: the time zone Superset's app server runs in, an IANA name (UTC, America/Los_Angeles); Superset records when it made each object as that server's wall clock, with no zone, and a dashboard build reads it so to find what a step it lost track of made")
     # --- verifier ---
     answer_log_path: str | None = Field(default=None, description="where each answer's record goes: which profile, version, model and engine commit produced it, as one JSON line each, with no question text, SQL or rows; unset keeps it beside the store as <store_path>.answers.jsonl, `off` writes none. Not rotated")
     answer_log_text: bool = Field(default=False, description="opt-in: the answer log also holds the question and the SQL as asked, which carry literals from the question and values from the database; rows are never logged")
@@ -604,21 +603,6 @@ class Settings(BaseSettings):
                                tables=_manifest_tables(d)) for d in raw]
         return [SourceSpec(id=self.source_id or "acme", kind="postgres",
                            target=self.pg_dsn or "", catalog="src", schema="public")]
-
-    @field_validator("superset_timezone")
-    @classmethod
-    def _a_zone_python_knows(cls, value: str) -> str:
-        # Read when the setting is, so a deployment naming no zone fails at start, not at a build's first
-        # reconciliation. UTC needs no zone database.
-        if value != "UTC":
-            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
-            try:
-                ZoneInfo(value)
-            except (ZoneInfoNotFoundError, ValueError):
-                raise ValueError("superset_timezone must be an IANA time zone name, such as UTC or "
-                                 "America/Los_Angeles") from None
-        return value
 
     @field_validator("guard_fanout", mode="before")
     @classmethod
