@@ -462,13 +462,15 @@ class Runtime:
         self.reload_if_stale()
         return self._superset_grants(superset_executor(self.settings, delegation))
 
-    def build_planner(self, profile: str | None, identity: IdentityContext):
-        """The planner of the profile a build is asked under (the default when None), picked as `ask` picks a profile:
-        first, before any work, and refused alike whether unknown or not this identity's to pick."""
+    def build_profile(self, profile: str | None, identity: IdentityContext) -> LoadedProfile:
+        """The profile a build runs under (the default when None): its planner plans the build, and its settings
+        decide the plan and every step. Picked as `ask` picks a profile, first, before any work, at the start and at
+        each step again, so a profile no longer offered to this identity, or gone, refuses the step as `ask` refuses
+        it (`UnknownProfile`)."""
         picked = self._picked(profile, identity)
         if picked is None or picked.planner is None:
             raise RuntimeError("this runtime was built with no profile planner, so it plans no build")
-        return picked.planner
+        return picked
 
     def builder_grants(self, adapter) -> GrantSet:
         """What the builder whose token `adapter` carries may read, as Superset says when asked as them: the grants a

@@ -114,7 +114,7 @@ def _fold(name: str) -> str:
 
 # The store's tables and their columns, each in its order.
 STORE_COLUMNS = {
-    BUILD_TABLE: ["tenant_id", "build_id", "principal_id", "dashboard_id", "goal", "plan", "steps", "status",
+    BUILD_TABLE: ["tenant_id", "build_id", "principal_id", "dashboard_id", "goal", "profile", "plan", "steps", "status",
                   "created_at", "updated_at"],
     MEASURE_TABLE: ["tenant_id", "dashboard_id", "name", "definition", "chart_ids", "made_dataset_ids",
                     "check_status", "updated_at"],
@@ -722,6 +722,28 @@ def test_another_tenant_cannot_load(store, store_dsn):
     assert store.measures_for(OTHER_TENANT, 41) == []
     assert store.delete_measure(OTHER_TENANT, 41, MEASURE.name) is False
     assert [kept.measure for kept in store.measures_for(TENANT, 41)] == [MEASURE]
+
+
+def test_a_build_keeps_the_profile_it_was_started_under(store, store_dsn):
+    """The profile a build was started under is kept on its row and read back with it, by every read and write that
+    returns the build; a build started under none keeps none (the deployment's default). A profile is a name: empty or
+    not text, it is refused before anything is written."""
+    named = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, profile="b")
+    plain = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS)
+    assert (named.profile, plain.profile) == ("b", None)
+    assert store.load_build(TENANT, named.build_id, ANA).profile == "b"
+    assert store.load_build(TENANT, plain.build_id, ANA).profile is None
+    claimed = store.claim_next_step(TENANT, named.build_id, ANA, _intent("dashboard", "dashboard"))
+    finished = store.finish_step(TENANT, named.build_id, "dashboard", "done", 300, lease_id=claimed.lease_id)
+    assert finished.profile == "b"
+    with psycopg.connect(store_dsn, autocommit=True) as con:
+        kept = dict(con.execute(sql.SQL("SELECT build_id::text, profile FROM {}").format(sql.Identifier(BUILD_TABLE)))
+                    .fetchall())
+    assert kept == {named.build_id: "b", plain.build_id: None}
+    for bad in ("", "   ", 7):
+        with pytest.raises(ValueError):
+            store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, profile=bad)
+    assert len(kept) == 2
 
 
 def test_another_principal_cannot_load_a_build(store, store_dsn):

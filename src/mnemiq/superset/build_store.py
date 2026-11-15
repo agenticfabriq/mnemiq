@@ -116,7 +116,7 @@ STATEMENT_TIMEOUT_MS = 30_000
 STORE_MISSING = ("Building a dashboard needs mnemiq's control Postgres, where each build keeps its plan and its steps; "
                  "set MNEMIQ_CONTROL_DSN.")
 
-_BUILD_COLUMNS = ("tenant_id, build_id, principal_id, dashboard_id, goal, plan, steps, status, created_at, "
+_BUILD_COLUMNS = ("tenant_id, build_id, principal_id, dashboard_id, goal, profile, plan, steps, status, created_at, "
                   "updated_at")
 _MEASURE_COLUMNS = "name, definition, chart_ids, made_dataset_ids, check_status, updated_at"
 
@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS {BUILD_TABLE} (
     principal_id text NOT NULL,
     dashboard_id integer,
     goal text NOT NULL,
+    profile text,
     plan jsonb NOT NULL,
     steps jsonb NOT NULL,
     status text NOT NULL,
@@ -224,6 +225,9 @@ class StoredBuild:
     status: str
     created_at: str
     updated_at: str
+    # The profile the build was started under, whose settings each of its steps runs under; None: the deployment's
+    # default.
+    profile: str | None = None
 
     def step(self, key: str) -> StepState:
         for step in self.steps:
@@ -278,11 +282,14 @@ class BuildStore:
     # --- builds
 
     def create_build(self, tenant: str, principal: str, goal: str, plan: Mapping[str, Any],
-                     steps: Sequence[tuple[str, str]], *, dashboard_id: int | None = None) -> StoredBuild:
+                     steps: Sequence[tuple[str, str]], *, dashboard_id: int | None = None,
+                     profile: str | None = None) -> StoredBuild:
         """A new build of `steps`, each a `(key, kind)` pair, every one pending. `dashboard_id` is the existing
-        dashboard a build works on; a new dashboard's id is the build's once its dashboard step is done."""
+        dashboard a build works on; a new dashboard's id is the build's once its dashboard step is done. `profile` is
+        the profile it was started under, None for the deployment's default."""
         tenant, principal = _text(tenant, "tenant"), _text(principal, "principal")
         goal = _text(goal, "goal")
+        profile = None if profile is None else _text(profile, "profile")
         dashboard_id = _id(dashboard_id, "a build's dashboard id", optional=True)
         plan = _plan(plan)
         build_id = uuid.uuid4()
@@ -291,9 +298,9 @@ class BuildStore:
             if dashboard_id is not None:
                 _release_abandoned(con, tenant, dashboard_id)
             row = con.execute(
-                f"INSERT INTO {BUILD_TABLE} (tenant_id, build_id, principal_id, dashboard_id, goal, plan, steps, "
-                f"status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING {_BUILD_COLUMNS}, now()",
-                (tenant, build_id, principal, dashboard_id, goal, Jsonb(plan), Jsonb(step_list), BUILDING),
+                f"INSERT INTO {BUILD_TABLE} (tenant_id, build_id, principal_id, dashboard_id, goal, profile, plan, "
+                f"steps, status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING {_BUILD_COLUMNS}, now()",
+                (tenant, build_id, principal, dashboard_id, goal, profile, Jsonb(plan), Jsonb(step_list), BUILDING),
             ).fetchone()
         return _stored_build(row)
 
@@ -653,10 +660,10 @@ def _step_state(step: dict, now: datetime) -> StepState:
 
 
 def _stored_build(row: tuple) -> StoredBuild:
-    tenant, build, principal, dashboard_id, goal, plan, steps, status, created_at, updated_at, now = row
+    tenant, build, principal, dashboard_id, goal, profile, plan, steps, status, created_at, updated_at, now = row
     return StoredBuild(tenant_id=tenant, build_id=str(build), principal_id=principal, dashboard_id=dashboard_id,
                        goal=goal, plan=plan, steps=tuple(_step_state(step, now) for step in steps), status=status,
-                       created_at=_iso(created_at), updated_at=_iso(updated_at))
+                       created_at=_iso(created_at), updated_at=_iso(updated_at), profile=profile)
 
 
 def _dashboard_measure(row: tuple) -> DashboardMeasure:

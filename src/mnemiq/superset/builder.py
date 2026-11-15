@@ -165,14 +165,15 @@ def build_steps(plan: BuildPlan) -> list[tuple[str, str]]:
 
 
 def start_build(store, *, tenant: str, principal: str, goal: str, plan: BuildPlan,
-                dashboard_id: int | None = None) -> BuildState:
-    """A new build of `plan`, on the existing dashboard `dashboard_id` or a new one. Refused (ValueError) while the
-    plan still offers a dashboard to reuse, which the builder answers first; `DashboardBusy` while another build of the
-    dashboard is building and has been touched within `build_store.ABANDONED_AFTER_S`."""
+                dashboard_id: int | None = None, profile: str | None = None) -> BuildState:
+    """A new build of `plan`, on the existing dashboard `dashboard_id` or a new one, kept with the profile it was
+    started under (None: the deployment's default). Refused (ValueError) while the plan still offers a dashboard to
+    reuse, which the builder answers first; `DashboardBusy` while another build of the dashboard is building and has
+    been touched within `build_store.ABANDONED_AFTER_S`."""
     if plan.awaiting_choice:
         raise ValueError("this plan offers a dashboard to reuse: answer reuse or fresh before it is built")
     stored = store.create_build(tenant, principal, goal, plan_to_json(plan), build_steps(plan),
-                                dashboard_id=dashboard_id)
+                                dashboard_id=dashboard_id, profile=profile)
     return build_state(store, stored)
 
 

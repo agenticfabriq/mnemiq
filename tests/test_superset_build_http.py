@@ -70,7 +70,7 @@ BUILD_SCOPES = (f"{ASK_SCOPES} superset:chart:read superset:chart:write superset
                 "superset:dashboard:write superset:dataset:write")
 # What a build route needs beside `db.read` (decision 6).
 WRITE_SCOPES = ("superset:chart:write", "superset:dashboard:write", "superset:dataset:write")
-# Two profiles, `a` the default; anyone may pick `b`.
+# Two profiles, `a` the default; anyone may pick `b`, which guards fan-out where the deployment does not.
 PROFILES = """
 default = "a"
 
@@ -80,6 +80,7 @@ llm_model = "model-a"
 [profiles.b]
 llm_model = "model-b"
 roles = ["*"]
+guard_fanout = true
 """
 
 BUILD_ROUTES = {("POST", "/v1/superset/builds"), ("GET", "/v1/superset/builds/{build_id}"),
@@ -605,6 +606,106 @@ def test_a_build_is_planned_by_the_profile_it_was_asked_under(tmp_path, model, f
     fake.calls.clear()
     r = _start(client, profile="nope")
     assert r.status_code == 422 and "nope" not in r.text
+    assert fake.calls == []
+
+
+# --- a build keeps its profile
+
+
+@pytest.fixture
+def profiled(tmp_path, model, fake, world, store, jwks, monkeypatch, no_direct_source):
+    """A deployment of two profiles, each planning `ONE_BAR`."""
+    client, runtime = _serve(_settings(tmp_path, model, fake, jwks, profiles=PROFILES), monkeypatch, store)
+    for name in ("a", "b"):
+        _planned(runtime, FakePlanner(ONE_BAR), name)
+    return client, runtime
+
+
+def _settings_each_call_receives(monkeypatch) -> dict[str, list]:
+    """The settings the plan, each step and each adapter were given, call by call, through the routes' own names for
+    them."""
+    module = _build_module()
+    seen: dict[str, list] = {"plan": [], "step": [], "adapter": []}
+    real_plan, real_step, real_executor = module.plan_build, module.next_step, module.superset_executor
+
+    def plan(*args, **kwargs):
+        seen["plan"].append(kwargs["settings"])
+        return real_plan(*args, **kwargs)
+
+    def step(*args, **kwargs):
+        seen["step"].append(kwargs["settings"])
+        return real_step(*args, **kwargs)
+
+    def executor(settings, delegation):
+        seen["adapter"].append(settings)
+        return real_executor(settings, delegation)
+
+    monkeypatch.setattr(module, "plan_build", plan)
+    monkeypatch.setattr(module, "next_step", step)
+    monkeypatch.setattr(module, "superset_executor", executor)
+    return seen
+
+
+def _run_to_the_end(client, build_id: str) -> list:
+    answers = []
+    for _ in range(10):
+        answers.append(_next(client, build_id))
+        assert answers[-1].status_code == 200, answers[-1].text
+        if answers[-1].json()["build"]["status"] != "building":
+            return answers
+    raise AssertionError("the build did not end")
+
+
+def test_a_build_keeps_the_profile_it_started_with(profiled, fake, world, store, monkeypatch):
+    """Started under profile `b`, whose `guard_fanout` is not the deployment's, the build keeps `b` on its row: its plan
+    and every one of its steps, the check included, run under `b`'s settings, while every adapter is built from the
+    deployment's, which name Superset."""
+    client, runtime = profiled
+    seen = _settings_each_call_receives(monkeypatch)
+    b = runtime.profiles["b"].settings
+    assert b.guard_fanout is True and runtime.settings.guard_fanout is False
+    started = _start(client, profile="b")
+    assert started.status_code == 201, started.text
+    build_id = started.json()["build"]["build_id"]
+    [row] = [row for (_, kept), row in store._builds.items() if kept == build_id]
+    assert row["profile"] == "b"
+    answers = _run_to_the_end(client, build_id)
+    assert [a.json()["build"]["ran"] for a in answers] == ["dashboard", "policies_by_region", "layout", "check"]
+    assert seen["plan"] == [b] and seen["plan"][0] is b
+    assert len(seen["step"]) == 4 and all(settings is b for settings in seen["step"])
+    assert len(seen["adapter"]) == 5 and all(settings is runtime.settings for settings in seen["adapter"])
+
+
+def test_a_build_started_under_no_profile_runs_under_the_deployments(served, fake, world, store, monkeypatch):
+    client, runtime = served
+    seen = _settings_each_call_receives(monkeypatch)
+    started = _start(client)
+    assert started.status_code == 201, started.text
+    build_id = started.json()["build"]["build_id"]
+    [row] = [row for (_, kept), row in store._builds.items() if kept == build_id]
+    assert row["profile"] is None
+    _run_to_the_end(client, build_id)
+    assert seen["plan"] and seen["step"] and seen["adapter"]
+    assert all(settings is runtime.settings for settings in seen["plan"] + seen["step"] + seen["adapter"])
+
+
+def test_a_profile_gone_at_a_later_step_refuses_the_step(profiled, fake, world, store, monkeypatch):
+    """The profile a build was started under no longer offered: its next step is refused with the sentence the start
+    and `/v1/ask` give an unknown profile, before Superset is asked anything or a step is claimed."""
+    client, runtime = profiled
+    started = _start(client, profile="b")
+    assert started.status_code == 201, started.text
+    monkeypatch.delitem(runtime.profiles, "b")
+    fake.calls.clear()
+    claims = list(store.claims)
+    r = _next(client, started.json()["build"]["build_id"])
+    assert r.status_code == 422, r.text
+    assert fake.calls == [] and store.claims == claims
+    asked = client.post("/v1/ask", json={"question": "q", "profile": "b"}, headers=_bearer(_token()))
+    again = _start(client, profile="b")
+    assert asked.status_code == again.status_code == 422
+    assert r.json()["detail"] == asked.json()["detail"] == again.json()["detail"]
+    assert r.json()["detail"].startswith("unknown profile; you may pick:") and "'a'" in r.json()["detail"]
     assert fake.calls == []
 
 

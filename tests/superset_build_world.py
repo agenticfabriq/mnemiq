@@ -125,9 +125,10 @@ class MemoryBuildStore:
         return any(row["tenant_id"] == tenant and row["dashboard_id"] == dashboard_id and row["status"] == bs.BUILDING
                    and row["build_id"] != other_than for row in self._builds.values())
 
-    def create_build(self, tenant, principal, goal, plan, steps, *, dashboard_id=None) -> StoredBuild:
+    def create_build(self, tenant, principal, goal, plan, steps, *, dashboard_id=None, profile=None) -> StoredBuild:
         tenant, principal = bs._text(tenant, "tenant"), bs._text(principal, "principal")
         goal = bs._text(goal, "goal")
+        profile = None if profile is None else bs._text(profile, "profile")
         dashboard_id = bs._id(dashboard_id, "a build's dashboard id", optional=True)
         plan = bs._plan(plan)
         build_id = str(uuid.uuid4())
@@ -143,8 +144,8 @@ class MemoryBuildStore:
             if dashboard_id is not None and self._live_on(tenant, dashboard_id):
                 raise bs.DashboardBusy()
             row = {"tenant_id": tenant, "build_id": build_id, "principal_id": principal, "dashboard_id": dashboard_id,
-                   "goal": goal, "plan": plan, "steps": step_list, "status": bs.BUILDING, "created_at": now,
-                   "updated_at": now}
+                   "goal": goal, "profile": profile, "plan": plan, "steps": step_list, "status": bs.BUILDING,
+                   "created_at": now, "updated_at": now}
             self._builds[(tenant, build_id)] = row
             return self._stored(row)
 
@@ -249,7 +250,8 @@ class MemoryBuildStore:
         return StoredBuild(tenant_id=row["tenant_id"], build_id=row["build_id"], principal_id=row["principal_id"],
                            dashboard_id=row["dashboard_id"], goal=row["goal"], plan=copy.deepcopy(row["plan"]),
                            steps=tuple(bs._step_state(step, now) for step in row["steps"]), status=row["status"],
-                           created_at=bs._iso(row["created_at"]), updated_at=bs._iso(row["updated_at"]))
+                           created_at=bs._iso(row["created_at"]), updated_at=bs._iso(row["updated_at"]),
+                           profile=row["profile"])
 
     def _measure(self, row: dict) -> bs.DashboardMeasure:
         return bs._dashboard_measure((row["name"], copy.deepcopy(row["definition"]), list(row["chart_ids"]),

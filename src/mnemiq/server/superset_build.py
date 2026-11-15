@@ -148,9 +148,11 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
     the deployment's control Postgres (`MNEMIQ_CONTROL_DSN`); without one, every build route answers 503 naming it."""
     from mnemiq.server.app import _refused  # here: app.py imports this module
 
-    settings = runtime.settings
+    # The deployment's settings name Superset (its MCP URL, database and schema), so every adapter is built from them;
+    # a build's plan and steps run under the settings of the profile it was started under.
+    deployment = runtime.settings
     try:
-        store = _open_store(settings)
+        store = _open_store(deployment)
     except BuildStoreMissing:
         logger.warning("MNEMIQ_CONTROL_DSN is not set, so every build route answers that building needs it")
         store = None
@@ -173,13 +175,14 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
         def work() -> dict:
             who, delegation = _builder(asking, building=True)
             builds = kept()
-            planner = _Offering(runtime.build_planner(body.profile, who))
-            adapter = superset_executor(settings, delegation)
+            profile = runtime.build_profile(body.profile, who)
+            planner = _Offering(profile.planner)
+            adapter = superset_executor(deployment, delegation)
             grants = runtime.builder_grants(adapter)
             # Before anything is planned or kept: every write of a build goes through the extension.
             require_extension(adapter.client)
             plan = plan_build(body.goal, planner=planner, client=adapter.client, adapter=adapter,
-                              snapshot=runtime.snapshot, grants=grants, settings=settings,
+                              snapshot=runtime.snapshot, grants=grants, settings=profile.settings,
                               offer_reuse=body.dashboard_id is None and not body.fresh)
             if isinstance(plan, PlanRefused):
                 response.status_code = 200
@@ -188,7 +191,8 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
                 response.status_code = 200
                 return _offer(plan, planner.titles)
             return {"build": _build(start_build(builds, tenant=who.tenant_id, principal=who.principal_id,
-                                                goal=body.goal, plan=plan, dashboard_id=body.dashboard_id))}
+                                                goal=body.goal, plan=plan, dashboard_id=body.dashboard_id,
+                                                profile=body.profile))}
 
         return answered(work)
 
@@ -212,9 +216,10 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
             build = builds.load_build(who.tenant_id, build_id, who.principal_id)
             if build is None:
                 raise BuildNotFound()
-            adapter = superset_executor(settings, delegation)
+            profile = runtime.build_profile(build.profile, who)
+            adapter = superset_executor(deployment, delegation)
             grants = runtime.builder_grants(adapter)
             return {"build": _build(next_step(build, client=adapter.client, adapter=adapter, store=builds,
-                                              snapshot=runtime.snapshot, grants=grants, settings=settings))}
+                                              snapshot=runtime.snapshot, grants=grants, settings=profile.settings))}
 
         return answered(work)
