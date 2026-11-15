@@ -8,6 +8,10 @@ is made or called while a build runs, and the stub model is asked nothing. Every
 own: the plan check (a written measure a saved metric says the same as is replaced by it), the build's steps, the id
 floor each create is judged by, the layout and the value check.
 
+The module makes a table of its own in the live source database, of a name no run has used, before it enriches: so
+the snapshot holds a table no Superset dataset exists for, which a build makes one for. The module removes what that
+build made, and the table, once it is done.
+
 Each test states its expectation in its docstring. A build's record (each request's step, its key, kind and status,
 the Superset calls it made and its latency; each create's floor and the id it made; each chart's id, type and check
 status) is printed as an `OBSERVED` line, which `pytest -rA` shows for passing tests too, and written as JSON to the
@@ -40,10 +44,20 @@ from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetRefusedC
 from mnemiq.superset.extension import TOOL_PREFIX
 from mnemiq.superset.marker import Marker, format_marker, parse_marker
 from mnemiq.superset.measures import Measure, MeasureKind
-from mnemiq.superset.planner import BuildPlan, FakePlanner
+from mnemiq.superset.planner import BuildPlan, FakePlanner, PlannedDataset
 from mnemiq.superset.saved_metrics import normalized
 from tests.superset_extension_path import use_extension_source
-from tests.superset_live.live import Call, Recorder, fingerprint_of, ground_truth, metadata, record_calls, run_setup
+from tests.superset_live.live import (
+    Call,
+    Recorder,
+    enrich_and_build,
+    fingerprint_of,
+    ground_truth,
+    metadata,
+    record_calls,
+    run_setup,
+    superset_settings,
+)
 from tests.test_superset_build_store import STORE_COLUMNS, value_shaped_names
 
 use_extension_source()
@@ -186,6 +200,15 @@ class Served:
             (plan,) = con.execute(f"SELECT plan FROM {BUILD_TABLE} WHERE build_id = %s", (build_id,)).fetchone()
         return plan
 
+    def builds(self) -> set[str]:
+        """The ids of every build the store keeps: none before the store first connects and makes its tables."""
+        import psycopg
+
+        with psycopg.connect(self.store_dsn, autocommit=True, connect_timeout=10) as con:
+            if con.execute("SELECT to_regclass(%s)", (BUILD_TABLE,)).fetchone()[0] is None:
+                return set()
+            return {str(row[0]) for row in con.execute(f"SELECT build_id FROM {BUILD_TABLE}")}
+
 
 @pytest.fixture(scope="module")
 def store_dsn(live) -> Iterator[str]:
@@ -205,6 +228,61 @@ def store_dsn(live) -> Iterator[str]:
         yield make_conninfo(live.pg_dsn, dbname=STORE_DATABASE)
     finally:
         admin(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(name))
+
+
+@dataclass
+class SalesTable:
+    """The module's own table in the live source database, and what a build made on it, which teardown removes."""
+
+    name: str
+    dataset_id: int | None = None
+    dashboard_id: int | None = None
+    chart_ids: list[int] = field(default_factory=list)
+
+
+@pytest.fixture(scope="module")
+def sales_table(live) -> Iterator[SalesTable]:
+    """A table of a name no run has used (`live_sales_<random>`) in the live source database's `public` schema: twelve
+    synthetic sales, each a region and an amount with cents. Made before the module enriches, so its snapshot holds
+    it, and no Superset dataset exists for it. Once the module is done, what a build made on it is removed as its
+    builder removes it (each chart through MCP's `delete_chart`, then the dataset through the extension's
+    `delete_dataset`, which moves it to Superset's trash), and the table is dropped."""
+    import psycopg
+    from psycopg import sql
+
+    table = SalesTable(f"live_sales_{uuid.uuid4().hex[:8]}")
+    name = sql.Identifier("public", table.name)
+    with psycopg.connect(live.pg_dsn, autocommit=True, connect_timeout=10) as con:
+        con.execute(sql.SQL("CREATE TABLE {} (id integer PRIMARY KEY, region text NOT NULL, "
+                            "amount numeric(10, 2) NOT NULL)").format(name))
+        con.execute(sql.SQL("INSERT INTO {} (id, region, amount) SELECT g, (ARRAY['west', 'east', 'central'])"
+                            "[1 + g % 3], round(12.5 + g * 7.31, 2) FROM generate_series(1, 12) AS g").format(name))
+        con.execute(sql.SQL("ANALYZE {}").format(name))
+    problems: list = []
+    try:
+        yield table
+    finally:
+        builder = as_user(live, BUILDER)
+        for chart_id in table.chart_ids:
+            removed = builder.call("delete_chart", {"identifier": chart_id})
+            if removed.get("success") is False:
+                problems.append(("delete_chart", chart_id, removed.get("error_type")))
+        if table.dataset_id is not None:
+            answer = builder.call(TOOL_PREFIX + "delete_dataset", {"dataset_id": table.dataset_id,
+                                                                   "dashboard_id": table.dashboard_id})
+            if answer != {"ok": True, "soft_deleted": True}:
+                problems.append(("delete_dataset", table.dataset_id, answer))
+        with psycopg.connect(live.pg_dsn, autocommit=True, connect_timeout=10) as con:
+            con.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(name))
+        assert not problems, problems
+
+
+@pytest.fixture(scope="module")
+def enriched(live, model, tmp_path_factory, sales_table):
+    """The suite's `enriched` (`conftest.py`), with the module's own table made first, so the snapshot holds it: the
+    store every test here answers from, enriched through Superset as the service user and built."""
+    settings = superset_settings(live, model, tmp_path_factory.mktemp("superset-store") / "store.duckdb")
+    return settings, enrich_and_build(settings, live.service_key_file)
 
 
 @pytest.fixture(scope="module")
@@ -299,6 +377,7 @@ class BuildRun:
     llm_asked: int = 0
     # Every lease id a step held while the build ran, as its claim answered it and as each renewal named it.
     leases: set[str] = field(default_factory=set)
+    planner: FakePlanner | None = None
 
     @property
     def final(self) -> dict:
@@ -336,14 +415,15 @@ def _send(served: Served, recorder: Recorder, run: BuildRun, label: str, method:
 
 
 def run_build(live, served: Served, model, plan: BuildPlan, name: str, *, builder: str = BUILDER, goal: str = GOAL,
-              stop_after: int | None = None, **body) -> BuildRun:
+              stop_after: int | None = None, before_next=None, **body) -> BuildRun:
     """The build of `plan` started and run one step per `/next` until it ends (or `stop_after` steps), each request
-    with a token minted for it, every Superset call recorded, and the model's clients counted. Bounded: one `/next`
-    per step and three more; a step left to its lease (409 on the next request) stops the loop and says so."""
+    with a token minted for it, every Superset call recorded, and the model's clients counted. `before_next`, when
+    given, runs once the start has answered 201 and before the first `/next`. Bounded: one `/next` per step and three
+    more; a step left to its lease (409 on the next request) stops the loop and says so."""
     from mnemiq.llm.client import LLMClient
 
-    served.plan_with(plan)
     run = BuildRun(name=name, started=datetime.now(UTC).isoformat(timespec="seconds"))
+    run.planner = served.plan_with(plan)
     run.model_before = (model.calls, model.embedding_calls, served.runtime.usage().calls)
     made, asked = [], []
     with pytest.MonkeyPatch.context() as patch:
@@ -379,6 +459,8 @@ def run_build(live, served: Served, model, plan: BuildPlan, name: str, *, builde
                       {"goal": goal, **body})
         if start.status_code == 201:
             build_id = start.build["build_id"]
+            if before_next is not None:
+                before_next()
             limit = len(start.build["steps"]) + 3 if stop_after is None else stop_after
             for _ in range(limit):
                 step = _send(served, recorder, run, "next", "POST", f"/v1/superset/builds/{build_id}/next",
@@ -421,6 +503,7 @@ def summary(run: BuildRun, served: Served, plan: BuildPlan | None = None) -> dic
             "superset_seconds": round(sum(call.seconds for call in request.calls), 3),
             "tools": dict(sorted(Counter(short(call.tool) for call in request.calls).items())),
             **({"detail": request.body["detail"]} if "detail" in request.body else {}),
+            **({"refused": request.body["refused"]} if "refused" in request.body else {}),
         })
     steps = [{"key": key, "kind": step["kind"], "status": step["status"], "object_id": step["object_id"],
               "id_floor": (step.get("intent") or {}).get("id_floor"), "reason": step.get("reason")}
@@ -434,7 +517,7 @@ def summary(run: BuildRun, served: Served, plan: BuildPlan | None = None) -> dic
                            "type": stored_chart(chart_id)["viz_type"],
                            "check": final.get("checks", {}).get(str(chart_id))})
     return {"build_id": run.build_id, "dashboard_id": final.get("dashboard_id"), "status": final.get("status"),
-            "started": run.started, "ended": run.ended, "stopped": run.stopped,
+            "planner_asked": len(run.planner.goals) if run.planner else None, "started": run.started, "ended": run.ended, "stopped": run.stopped,
             "message": run.last_step.get("message"), "leases_held": len(run.leases),
             "requests": requests, "steps": steps, "charts": charts,
             "model_calls": {"chat": run.model_after[0] - run.model_before[0],
@@ -855,7 +938,7 @@ def test_a_funnel_is_made_through_the_extension_and_its_data_read(live, served, 
             check=final["checks"].get(str(chart_id)), message=run.last_step.get("message"))
 
 
-# --- step 1: an existing dashboard, for its editors only ------------------------------------------------------------
+# --- an existing dashboard, for its editors only -------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -875,38 +958,71 @@ def readable_dashboard(live) -> int:
     return dashboard_id
 
 
-def test_step_one_refuses_a_reader_who_does_not_edit_and_passes_an_editor(live, served, model, policy_id,
-                                                                          readable_dashboard):
-    """The step-1 editor check (the extension's `editors_of` with `dashboard_ids`). `west` (Alpha) can read analyst's
-    published dashboard and does not edit it, as `editors_of` itself answers west. Expected: west's build on it starts
-    (201), and its first `/next` is refused at the dashboard step: the build `failed`, its dashboard step `failed`,
-    and mnemiq's sentence naming the editors ("this builder is not an editor of dashboard N; its editors are ...");
-    nothing is made in Superset (west's dashboards, charts and datasets are the same ids before and after, and no
-    write call was made). analyst, its editor, then builds on the same dashboard: the first `/next` passes step 1,
-    the dashboard step `done` with the dashboard's id. No model client is made or called."""
+def set_editors(live, dashboard_id: int, usernames: list[str]) -> None:
+    """As analyst, signed in, the dashboard's editors set to `usernames` through Superset's own REST API
+    (`PUT /api/v1/dashboard/<id>`), as a person sets them in Superset."""
+    with live.signed_in(BUILDER) as (client, headers):
+        csrf = live.csrf_token(client, headers)
+        answer = client.put(f"/api/v1/dashboard/{dashboard_id}",
+                            json={"editors": [user_subject(name) for name in usernames]},
+                            headers={**headers, "X-CSRFToken": csrf})
+    assert answer.status_code == 200, answer.status_code
+    assert editor_ids("dashboard_editors", "dashboard_id", dashboard_id) == sorted(user_subject(n) for n in usernames)
+
+
+def test_a_dashboard_is_built_on_by_its_editors_only(live, served, model, policy_id, readable_dashboard):
+    """Who may build on an existing dashboard (`dashboard_id`), asked of the extension's `editors_of` at the start,
+    before anything is planned, and again at the build's first step. `west` (Alpha) reads analyst's published
+    dashboard and does not edit it, as `editors_of` itself answers west. Expected:
+    - west's start is refused, 403, with mnemiq's sentence naming the editors ("This builder is not an editor of
+      dashboard N; its editors are ..."): the planner is not asked, no build is kept, the only Superset calls are the
+      grants read, the extension's probe and `editors_of`, and west has made nothing in Superset;
+    - analyst makes west an editor too, through Superset's API: west's start is then 201; analyst takes west off the
+      editors before west's first `/next`, which is refused at the dashboard step (the build `failed`, its dashboard
+      step `failed` as `not_editor`, the sentence naming analyst); west has still made nothing and no write call was
+      made;
+    - analyst, its editor, builds on the same dashboard: the start is 201 and the first `/next` passes the dashboard
+      step, `done` with the dashboard's id.
+    No model client is made or called."""
     dashboard_id = readable_dashboard
     west_reads = as_user(live, "west").call(TOOL_PREFIX + "editors_of", {"dashboard_ids": [dashboard_id]})
     assert west_reads["dashboards"] == [{"dashboard_id": dashboard_id, "is_editor": False,
                                          "editors": [label_of(BUILDER)]}], west_reads
-    before = made_by("west")
-    refused = run_build(live, served, model, one_bar(policy_id), "step1-reader", builder="west", goal="policies",
-                        stop_after=1, dashboard_id=dashboard_id)
-    record("step1-reader", summary(refused, served) if refused.build_id else {"stopped": refused.stopped})
-    assert [r.status_code for r in refused.requests] == [201, 200, 200], [(r.label, r.status_code)
-                                                                        for r in refused.requests]
-    stopped = refused.requests[1].build
-    assert stopped["ran"] == "dashboard" and stopped["status"] == "failed"
-    assert stopped["steps"][0]["status"] == "failed" and stopped["steps"][0]["object_id"] is None
-    assert stopped["message"] == (f"this builder is not an editor of dashboard {dashboard_id}; its editors are "
-                                  f"{label_of(BUILDER)}"), stopped["message"]
-    assert made_by("west") == before
-    assert not [call.tool for r in refused.requests for call in r.calls if call.tool in WRITES]
-    assert [step["reason"] for step in served.raw_steps(refused.build_id)][0] == "not_editor"
+    before, builds_before = made_by("west"), served.builds()
+
+    refused = run_build(live, served, model, one_bar(policy_id), "reader-refused-at-start", builder="west",
+                        goal="policies", stop_after=1, dashboard_id=dashboard_id)
+    record("reader-refused-at-start", summary(refused, served))
+    [start] = refused.requests
+    assert start.status_code == 403, (start.status_code, start.body)
+    assert start.body["detail"] == (f"This builder is not an editor of dashboard {dashboard_id}; its editors are "
+                                    f"{label_of(BUILDER)}."), start.body
+    assert refused.planner.goals == []
+    tools = {short(call.tool) for call in start.calls}
+    assert "ext.editors_of" in tools and tools <= {"execute_sql", "ext.dataset_metrics", "ext.editors_of"}, tools
+    assert served.builds() == builds_before and made_by("west") == before
     assert_no_model_call(refused)
 
-    passed = run_build(live, served, model, one_bar(policy_id), "step1-editor", builder=BUILDER, goal="policies",
-                       stop_after=1, dashboard_id=dashboard_id)
-    record("step1-editor", summary(passed, served) if passed.build_id else {"stopped": passed.stopped})
+    set_editors(live, dashboard_id, [BUILDER, "west"])
+    stopped = run_build(live, served, model, one_bar(policy_id), "reader-refused-at-step-one", builder="west",
+                        goal="policies", stop_after=1, dashboard_id=dashboard_id,
+                        before_next=lambda: set_editors(live, dashboard_id, [BUILDER]))
+    record("reader-refused-at-step-one", summary(stopped, served))
+    assert [r.status_code for r in stopped.requests] == [201, 200, 200], [(r.label, r.status_code)
+                                                                        for r in stopped.requests]
+    failed = stopped.requests[1].build
+    assert failed["ran"] == "dashboard" and failed["status"] == "failed"
+    assert failed["steps"][0]["status"] == "failed" and failed["steps"][0]["object_id"] is None
+    assert failed["message"] == (f"this builder is not an editor of dashboard {dashboard_id}; its editors are "
+                                 f"{label_of(BUILDER)}"), failed["message"]
+    assert served.raw_steps(stopped.build_id)[0]["reason"] == "not_editor"
+    assert made_by("west") == before
+    assert not [call.tool for r in stopped.requests for call in r.calls if call.tool in WRITES]
+    assert_no_model_call(stopped)
+
+    passed = run_build(live, served, model, one_bar(policy_id), "editor-passes-step-one", builder=BUILDER,
+                       goal="policies", stop_after=1, dashboard_id=dashboard_id)
+    record("editor-passes-step-one", summary(passed, served))
     assert [r.status_code for r in passed.requests] == [201, 200, 200]
     first = passed.requests[1].build
     assert first["ran"] == "dashboard" and first["status"] == "building"
@@ -915,4 +1031,110 @@ def test_step_one_refuses_a_reader_who_does_not_edit_and_passes_an_editor(live, 
     assert {"ext.editors_of", "ext.get_layout"} <= set(tools), tools
     assert not [call.tool for call in passed.requests[1].calls if call.tool in WRITES], tools
     assert_no_model_call(passed)
-    observe("step 1", dashboard_id=dashboard_id, reader=stopped["message"], editor=first["steps"][0]["status"])
+    observe("editors only", dashboard_id=dashboard_id, at_start=start.body["detail"], at_step_one=failed["message"],
+            editor=first["steps"][0]["status"])
+
+
+# --- a label Superset would save as other text ----------------------------------------------------------------------
+
+
+def test_a_measure_label_superset_would_rewrite_is_refused_before_anything_is_made(live, served, model, policy_id):
+    """The label rule, live. The stub's plan holds one bar chart of a currency measure labelled "Premium < 1y", which
+    rc2's MCP would save as other text (nh3 escapes `<`). Expected: the start answers 200 with the refused plan and
+    nothing else: its one part is the measure, with mnemiq's reason ("the measure's label holds <, >, & or a no-break
+    space, which Superset saves as other text; write it without them"), and the plan's reason names that part. The
+    planner was asked twice (the plan and its one repair, the same plan again). No build is kept, no write call is made,
+    and analyst has made nothing new in Superset. No model client is made or called."""
+    recent = Measure(name="recent_premium", label="Premium < 1y", expression="AVG(premium)",
+                     kind=MeasureKind.CURRENCY, dataset_id=policy_id, description="Premium of the last year",
+                     asked_by="")
+    chart = ChartSpec(key="recent_premium_by_region", family=Family.BAR, title="Recent premium by region",
+                      dataset_id=policy_id, measures=(WrittenRef(recent),), dimensions=("region",), time_column=None,
+                      time_grain=None, filters=(), row_limit=None, source=None, target=None)
+    before, builds_before = made_by(BUILDER), served.builds()
+    run = run_build(live, served, model, BuildPlan(charts=(chart,), measures=(recent,)), "label-refused",
+                    goal="recent premium by region")
+    record("label-refused", summary(run, served))
+    [start] = run.requests
+    reason = ("the measure's label holds <, >, & or a no-break space, which Superset saves as other text; write it "
+              "without them")
+    assert start.status_code == 200, (start.status_code, start.body)
+    assert start.body == {"refused": {
+        "reason": f"mnemiq could not plan this dashboard: measure 'recent_premium': {reason}",
+        "parts": [{"part": "measure 'recent_premium'", "reason": reason}]}}, start.body
+    assert run.planner.goals == ["recent premium by region"] * 2
+    assert not [call.tool for call in start.calls if call.tool in WRITES]
+    assert served.builds() == builds_before and made_by(BUILDER) == before
+    assert_no_model_call(run)
+    observe("label refused", status=start.status_code, parts=start.body["refused"]["parts"],
+            calls=dict(Counter(short(call.tool) for call in start.calls)))
+
+
+# --- a dataset the build makes ---------------------------------------------------------------------------------------
+
+
+def test_a_dataset_the_build_makes_is_above_its_floor_and_its_chart_checks(live, served, model, sales_table):
+    """The dataset step, live. The module's own table is in the snapshot, and Superset has no dataset for it. The
+    stub's plan makes one (a physical dataset on the table) and puts one bar chart on it: `SUM(amount)` by region, a
+    currency measure. Expected:
+    - the build runs to `done`: dashboard, the dataset, the chart, layout, check;
+    - the dataset step read its floor from `list_datasets` (`created_by_me`, by id, descending, one item), recorded
+      it, made the dataset with MCP's `create_dataset` and claimed it with the extension's `claim_dataset`; the id it
+      made is above the floor, and the floor is analyst's highest dataset id before the build;
+    - Superset holds the dataset on the table, physical, created by analyst, its description ending in this build's
+      marker; the chart reads it, and its check status is `CHECKED`;
+    - `get_chart_data`, asked as analyst with a minted token, shows the table's sums by region, the source's;
+    - no model client is made or called.
+    Teardown removes the chart and the dataset as analyst removes them, and drops the table."""
+    name = sales_table.name
+    assert name in {column.object_id for column in served.runtime.snapshot.columns}
+    assert metadata("SELECT id FROM tables WHERE table_name = %s", (name,)) == []
+    amount = Measure(name="amount_sold", label="Amount sold", expression="SUM(amount)", kind=MeasureKind.CURRENCY,
+                     dataset_id=-1, description="Amount sold", asked_by="")
+    chart = ChartSpec(key="amount_by_region", family=Family.BAR, title="Amount sold by region", dataset_id=-1,
+                      measures=(WrittenRef(amount),), dimensions=("region",), time_column=None, time_grain=None,
+                      filters=(), row_limit=None, source=None, target=None)
+    plan = BuildPlan(charts=(chart,), measures=(amount,),
+                     datasets=(PlannedDataset(key="dataset_1", placeholder=-1, table=name),))
+    floor_before = highest(BUILDER, "tables")
+    run = run_build(live, served, model, plan, "dataset-step", goal="amount sold by region")
+    record("dataset-step", summary(run, served, plan))
+    raw = {step["key"]: step for step in served.raw_steps(run.build_id)} if run.build_id else {}
+    # What the build made, for the table's teardown, before anything is asserted.
+    sales_table.dashboard_id = run.final.get("dashboard_id")
+    sales_table.dataset_id = (raw.get("dataset_1") or {}).get("object_id")
+    sales_table.chart_ids = [made for made in [(raw.get(chart.key) or {}).get("object_id")] if made is not None]
+    assert_ran_to_the_end(run)
+    assert [step["key"] for step in run.final["steps"]] == ["dashboard", "dataset_1", chart.key, "layout", "check"]
+
+    [made] = [r for r in run.requests if r.build.get("ran") == "dataset_1"]
+    tools = [call.tool for call in made.calls]
+    assert "create_dataset" in tools and TOOL_PREFIX + "claim_dataset" in tools, tools
+    assert "create_virtual_dataset" not in tools
+    listed = [call.request for call in made.calls if call.tool == FLOOR_TOOLS["dataset"]]
+    assert listed and listed[0] == {"created_by_me": True, "select_columns": ["id"], "order_column": "id",
+                                    "order_direction": "desc", "page": 1, "page_size": 1}, listed
+    floor, dataset_id = (raw["dataset_1"].get("intent") or {}).get("id_floor"), raw["dataset_1"]["object_id"]
+    assert type(floor) is int and type(dataset_id) is int and dataset_id > floor, (floor, dataset_id)
+    assert floor == floor_before, (floor, floor_before)
+
+    (row,) = metadata("SELECT table_name, schema, sql, created_by_fk, deleted_at, description FROM tables "
+                      "WHERE id = %s", (dataset_id,))
+    assert row[:5] == (name, "public", None, user_id(BUILDER), None), row[:5]
+    dashboard_id = run.final["dashboard_id"]
+    assert parse_marker(row[5]) == Marker(run.build_id, "dataset_1", dashboard_id)
+    chart_id = raw[chart.key]["object_id"]
+    (on,) = metadata("SELECT datasource_id, datasource_type FROM slices WHERE id = %s", (chart_id,))
+    assert on == (dataset_id, "table"), on
+    assert run.final["checks"] == {str(chart_id): "checked"}, (run.final["checks"], run.last_step.get("message"))
+
+    data = SupersetMcp(live.mcp_url, DelegatedToken(live.minted(BUILDER, "build")), timeout_s=90).call(
+        "get_chart_data", {"identifier": chart_id}).get("data") or []
+    shown = sorted((row.get("region"), round(float(row["Amount sold"]), 2)) for row in data)
+    truth = sorted((region, round(float(total), 2)) for region, total in ground_truth(
+        live, f"SELECT region, sum(amount) FROM public.{name} GROUP BY 1"))
+    same = shown == truth
+    assert len(data) == 3 and same, (len(data), same)
+    assert_no_model_call(run)
+    observe("dataset step", dataset_id=dataset_id, floor=floor, chart_id=chart_id, check=run.final["checks"],
+            message=run.last_step.get("message"))
