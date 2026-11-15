@@ -271,8 +271,8 @@ class _Run:
         return self.client.call(tool, request)
 
     def extension(self, base: str, request: dict) -> dict:
-        self.renew()
-        return call_tool(self.client, base, request)
+        """An extension tool's call, the lease renewed before it and before the probe that may follow it."""
+        return call_tool(self.client, base, request, before_call=self.renew)
 
     def saved(self, dataset_id: int) -> dict[str, SavedMetric]:
         """The dataset's saved metrics, as the builder reads them, by name; read once per step."""
@@ -288,12 +288,12 @@ class _Run:
             return self.floor
         answer = self.call(tool, {"created_by_me": True, "select_columns": ["id"], "order_column": "id",
                                   "order_direction": "desc", "page": 1, "page_size": 1})
-        items = answer.get(kind) if isinstance(answer, Mapping) else None
-        if not isinstance(items, list):
+        ids = _ids_listed(answer, kind)
+        if ids is None:
             raise _Unsure("unreadable", f"Superset's list of the builder's {kind} could not be read, so no create was "
                                         "sent; the next request tries again")
-        floor = max((item["id"] for item in items if isinstance(item, Mapping) and type(item.get("id")) is int),
-                    default=0)
+        # An empty list, and only that, is a builder who has made none: a floor of 0.
+        floor = max(ids, default=0)
         if not self.store.record_floor(self.build.tenant_id, self.build.build_id, self.key, self.claimed.lease_id,
                                        floor):
             raise _LeaseGone()
@@ -541,6 +541,19 @@ def _info(run: _Run, tool: str, object_id: int, columns: list[str]) -> dict | No
     return dict(answer)
 
 
+def _ids_listed(answer: Any, kind: str) -> list[int] | None:
+    """The ids of the objects a list tool answered, or None when it cannot be told: no list, or an item without an
+    integer id. An item whose id is missing is not an id of 0 or an item to pass over, either of which could take
+    what the builder made before for what this step made."""
+    items = answer.get(kind) if isinstance(answer, Mapping) else None
+    if not isinstance(items, list):
+        return None
+    ids = [item.get("id") for item in items if isinstance(item, Mapping)]
+    if len(ids) != len(items) or not all(type(item_id) is int for item_id in ids):
+        return None
+    return ids
+
+
 def _recent(run: _Run, tool: str, kind: str, columns: list[str]) -> list[dict]:
     """The builder's objects of this kind above the step's floor, newest first: pages by id, descending, read until
     one reaches the floor. Superset's ids only grow, so these are what was made since the floor was read."""
@@ -549,13 +562,12 @@ def _recent(run: _Run, tool: str, kind: str, columns: list[str]) -> list[dict]:
     for page in range(1, _MAX_PAGES + 1):
         answer = run.call(tool, {"created_by_me": True, "select_columns": columns, "order_column": "id",
                                  "order_direction": "desc", "page": page, "page_size": _CANDIDATE_PAGE})
-        items = answer.get(kind) if isinstance(answer, Mapping) else None
-        if not isinstance(items, list):
-            raise _Unsure("unreadable", f"Superset's list of the builder's {kind} could not be read, so what this step "
-                                        "made cannot be told yet")
-        ids = [item["id"] for item in items if isinstance(item, Mapping) and type(item.get("id")) is int]
-        found.update({item["id"]: dict(item) for item in items
-                      if isinstance(item, Mapping) and type(item.get("id")) is int and item["id"] > floor})
+        ids = _ids_listed(answer, kind)
+        if ids is None:
+            raise _Unsure("unreadable", f"Superset's list of the builder's {kind} could not be read whole, so what "
+                                        "this step made cannot be told yet")
+        items = answer[kind]
+        found.update({item["id"]: dict(item) for item in items if item["id"] > floor})
         if len(items) < _CANDIDATE_PAGE or not ids or min(ids) <= floor:
             return sorted(found.values(), key=lambda item: -item["id"])
     raise _Unsure("unreadable", f"the builder made more {kind} since this step began than mnemiq reads back, so what "
@@ -585,10 +597,12 @@ def _settle(found: list[dict], *, ours: Marker, matches: Callable[[Mapping], boo
     return None, False
 
 
-def _the_one_made(item: Mapping | None, ours: Marker, what: str) -> tuple[int | None, bool]:
+def _the_one_made(run: _Run, item: Mapping | None, ours: Marker, what: str) -> tuple[int | None, bool]:
     """The object the step's own create answered with, read again: `(id, marked)`, or `(None, False)` when it is gone
-    and is made again. One carrying another marker since stops the build."""
+    and is made again. Gone, it is forgotten (`run.made`), so what the step makes next is reconciled by the builder's
+    objects above the floor, never by the gone id read again. One carrying another marker since stops the build."""
     if item is None or type(item.get("id")) is not int:
+        run.made = None
         return None, False
     marker = parse_marker(item.get("description"))
     if marker is None:
@@ -627,13 +641,13 @@ def _existing_dashboard(run: _Run, dashboard_id: int) -> _Outcome:
     is made, and nothing held across steps; each later write takes the dashboard's row lock itself, and the layout step
     reads it afresh."""
     what = f"dashboard {dashboard_id}"
-    run.renew()
-    entry = dashboard_editorship(run.client, dashboard_id)
+    entry = dashboard_editorship(run.client, dashboard_id, before_call=run.renew)
     if entry is None:
         raise _Stop("not_found", f"{what}: Superset has no such dashboard that this builder can read")
-    if entry.get("too_large"):
-        raise _Stop("too_large", f"the editors of {what} are more than the extension sends")
+    # `is_editor` is kept when only the editors' labels were too many to send.
     if entry.get("is_editor") is not True:
+        if entry.get("is_editor") is not False:
+            raise _Stop("too_large", f"whether this builder edits {what} was not answered whole")
         raise _refused({"not_editor": True, "editors": entry.get("editors")}, what)
     answer = run.extension("get_layout", {"dashboard_id": dashboard_id})
     if answer.get("dashboard_id") != dashboard_id or not isinstance(answer.get("changed_on"), str):
@@ -663,7 +677,7 @@ _DATASET_COLUMNS = ["id", "table_name", "schema", "database_id", "sql", "descrip
 
 def _reconciled_dataset(run: _Run, planned: PlannedDataset, name: str, ours: Marker) -> tuple[int | None, bool]:
     if run.made is not None:
-        return _the_one_made(_info(run, "get_dataset_info", run.made, _DATASET_COLUMNS), ours, "dataset")
+        return _the_one_made(run, _info(run, "get_dataset_info", run.made, _DATASET_COLUMNS), ours, "dataset")
     if run.floor is None:
         return None, False  # no create is sent before a floor is recorded: nothing was made
     adapter = run.adapter
@@ -764,7 +778,7 @@ def _generated_chart(run: _Run, spec: ChartSpec, ours: Marker, request: dict) ->
 
 def _reconciled_chart(run: _Run, spec: ChartSpec, ours: Marker, by_extension: bool) -> tuple[int | None, bool]:
     if run.made is not None:
-        return _the_one_made(_info(run, "get_chart_info", run.made, ["id", "slice_name", "description"]), ours,
+        return _the_one_made(run, _info(run, "get_chart_info", run.made, ["id", "slice_name", "description"]), ours,
                              "chart")
     if run.floor is None:
         return None, False  # no create is sent before a floor is recorded: nothing was made

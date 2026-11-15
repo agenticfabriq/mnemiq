@@ -6,8 +6,8 @@ and a build store with the Postgres store's own rules over a dict, on a clock th
 write the editors, the marker and the query context (with the extension's own `params.query_context`, so the query is
 the one the extension saves); `get_chart_data` runs a chart's saved query context; `execute_sql` runs mnemiq's own
 statement. Both run on one DuckDB of fixed rows, by two separate paths, so a chart whose numbers are right is checked
-and one the test skews is not. Superset's clock is the test's clock, read in Superset's own time zone with no zone in
-what it writes, as rc2's `datetime.now` default writes `created_on`.
+and one the test skews is not. Superset's clock is the test's clock, written with no zone as rc2's `datetime.now`
+default writes `created_on`.
 
 `MemoryBuildStore` keeps builds and measures as `BuildStore` does, through the store module's own transitions and
 checks (`_claim`, `_renew`, `_finish`, `_plan`, `_intent`, ...), each change made whole under one lock, as the
@@ -23,7 +23,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta, tzinfo
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import duckdb
@@ -276,11 +276,11 @@ class Hook:
 
 
 class World:
-    """Superset, as a build reads and writes it. `world.datasets`, `world.charts` and `world.dashboards` are its rows;
-    `world.zone` the zone its app server's wall clock runs in; `world.skew_s` how far that clock is off the store's."""
+    """Superset, as a build reads and writes it. `world.datasets`, `world.charts` and `world.dashboards` are its rows,
+    and its clock is the test's."""
 
-    def __init__(self, fake, clock: Clock, *, zone: tzinfo = UTC, skew_s: float = 0.0) -> None:
-        self.fake, self.clock, self.zone, self.skew_s = fake, clock, zone, skew_s
+    def __init__(self, fake, clock: Clock) -> None:
+        self.fake, self.clock = fake, clock
         self.lock = threading.RLock()
         self.datasets: dict[int, dict] = {}
         self.charts: dict[int, dict] = {}
@@ -307,8 +307,8 @@ class World:
     # --- the clock and the rows
 
     def superset_now(self) -> datetime:
-        """Superset's app server's `datetime.now()`: the wall clock in its zone, with no zone written."""
-        return (self.clock.now() + timedelta(seconds=self.skew_s)).astimezone(self.zone).replace(tzinfo=None)
+        """Superset's app server's `datetime.now()`: the test's clock, with no zone written."""
+        return self.clock.now().replace(tzinfo=None)
 
     def _stamp(self) -> datetime:
         # Two writes in one test instant still get distinct `changed_on`s, as two real writes would.

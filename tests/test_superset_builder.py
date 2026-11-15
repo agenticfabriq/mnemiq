@@ -797,6 +797,145 @@ def test_a_claimed_chart_renamed_before_it_is_reconciled_is_adopted_by_its_marke
     assert _step(final, "policies_by_region").object_id == claim.request["chart_id"]
 
 
+def _floor_reads(world) -> list[dict]:
+    """The floor reads among the listings: one item, by id, descending."""
+    return [c.request for c in world.calls("list_charts") if c.request.get("page_size") == 1]
+
+
+def test_a_floor_read_whose_items_carry_no_id_cannot_tell(fake, world, store):
+    """A floor read whose items carry no id is not a floor of 0, which would make everything the builder ever made a
+    candidate: the step cannot tell, sends no create, and is left uncertain; the next request reads the floor again."""
+    world.plant_chart(title="Something else", dataset_id=POLICY_DATASET, viz_type="table")
+    build = _start(store, ONE_BAR).build_id
+    _run_to(store, build, _adapter(fake), "policies_by_region")
+
+    def idless(request, _world):
+        if request.get("page_size") == 1 and not getattr(idless, "sent", False):
+            idless.sent = True
+            return {"charts": [{"slice_name": "Something else"}], "count": 1, "total_count": 1}
+        return None
+
+    world.hooks["list_charts"] = Hook(instead=idless)
+    held = _next(store, build, _adapter(fake))
+    assert _step(held, "policies_by_region").status == "uncertain"
+    assert _step(held, "policies_by_region").reason == "unreadable" and "generate_chart" not in _tools(fake)
+    assert _raw_step(store, build, "policies_by_region")["intent"]["id_floor"] is None
+    final = _run(store, build, _adapter(fake))[-1]
+    assert final.status == "done" and len(world.calls("generate_chart")) == 1
+    assert _raw_step(store, build, "policies_by_region")["intent"]["id_floor"] == max(
+        c for c in world.charts if world.charts[c]["slice_name"] == "Something else")
+
+
+def test_an_empty_floor_read_is_a_floor_of_zero(fake, world, store):
+    """Only a builder who has made nothing of the kind reads an empty list: its floor is 0."""
+    build = _start(store, ONE_BAR).build_id
+    _run_to(store, build, _adapter(fake), "policies_by_region")
+    _next(store, build, _adapter(fake))
+    assert len(_floor_reads(world)) == 1
+    assert _raw_step(store, build, "policies_by_region")["intent"]["id_floor"] == 0
+
+
+def test_a_listing_whose_items_carry_no_id_cannot_tell(fake, world, store):
+    """Reconciliation reading the builder's charts above the floor meets items with no id: what the step made cannot
+    be told, so the step stays uncertain and nothing is made."""
+    build = _uncertain_with_nothing_made(fake, world, store)
+
+    def idless(request, _world):
+        if request.get("page_size", 0) > 1 and not getattr(idless, "sent", False):
+            idless.sent = True
+            return {"charts": [{"slice_name": "Policies by region", "description": None}], "count": 1}
+        return None
+
+    world.hooks["list_charts"] = Hook(instead=idless)
+    held = _next(store, build, _adapter(fake))
+    assert _step(held, "policies_by_region").status == "uncertain"
+    assert _step(held, "policies_by_region").reason == "unreadable" and len(world.calls("generate_chart")) == 1
+
+
+def _recorded_then_gone(fake, world, store, clock, plan, key: str, tool: str) -> str:
+    """A step whose create answered, whose lease then passed so the id was recorded with it uncertain, and whose
+    object has since been deleted in Superset."""
+    build = _start(store, plan).build_id
+    _run_to(store, build, _adapter(fake), key)
+    world.hooks[tool] = Hook(after=_once(lambda request, answer, _w: clock.advance(601)))
+    stalled = _next(store, build, _adapter(fake))
+    gone = _step(stalled, key).object_id
+    assert _step(stalled, key).status == "uncertain" and gone is not None
+    (world.datasets if tool == "create_dataset" else world.charts).pop(gone)
+    return build
+
+
+@pytest.mark.parametrize("tool", ["generate_chart", "create_dataset"])
+def test_a_gone_object_does_not_hide_a_failure_after_commit(fake, world, store, clock, tool):
+    """The object a step recorded is gone, so the step makes it again; that create commits and then answers failure.
+    The failure is reconciled by the builder's objects above the floor, not by the gone id read again, so the new
+    object is found and claimed, never orphaned."""
+    plan, key = (SIX, "dataset_1") if tool == "create_dataset" else (ONE_BAR, "policies_by_region")
+    build = _recorded_then_gone(fake, world, store, clock, plan, key, tool)
+    failure = ({"success": False, "error": {"error": "the preview failed", "error_type": "PreviewError"}}
+               if tool == "generate_chart" else
+               {"error": "Dataset was created but could not be serialized", "error_type": "SerializationError"})
+    world.hooks[tool] = Hook(after=_once(lambda request, answer, _w: failure))
+    state = _next(store, build, _adapter(fake))
+    assert _step(state, key).status == "done", state
+    made = _step(state, key).object_id
+    assert made in (world.datasets if tool == "create_dataset" else world.charts)
+    claims = world.calls("claim_dataset" if tool == "create_dataset" else "claim_chart")
+    assert [c.request["dataset_id" if tool == "create_dataset" else "chart_id"] for c in claims] == [made]
+    assert len(world.calls(tool)) == 2
+
+
+def _too_many_editors(world, dashboard: int, *, is_editor: bool):
+    """`editors_of` as the extension answers a dashboard whose editors' labels are more than it sends."""
+    world.hooks["editors_of"] = Hook(instead=lambda request, _w: {"charts": [], "datasets": [], "dashboards": [
+        {"dashboard_id": dashboard, "is_editor": is_editor, "too_large": True}]})
+
+
+def test_an_editor_whose_dashboard_has_too_many_editors_to_send_is_an_editor(fake, world, store):
+    """The extension cut the labels but kept `is_editor`: the builder edits the dashboard, so the build goes on."""
+    dashboard, _ = _existing_dashboard(world)
+    _too_many_editors(world, dashboard, is_editor=True)
+    final = _run(store, _start(store, ONE_BAR, dashboard_id=dashboard).build_id, _adapter(fake))[-1]
+    assert final.status == "done", final
+
+
+def test_a_non_editor_of_a_dashboard_with_too_many_editors_is_refused(fake, world, store):
+    dashboard, _ = _existing_dashboard(world, editors=("colleague",))
+    _too_many_editors(world, dashboard, is_editor=False)
+    stopped = _next(store, _start(store, ONE_BAR, dashboard_id=dashboard).build_id, _adapter(fake))
+    assert stopped.status == "failed" and _step(stopped, "dashboard").reason == "not_editor"
+    assert "not an editor" in stopped.message
+
+
+def test_the_lease_is_renewed_before_the_extensions_probe(fake, world, store, monkeypatch):
+    """An extension call failing as a missing tool is followed by the probe that tells a missing extension from a
+    failing tool: the probe is a call of the step too, so the lease is renewed before it."""
+    from mnemiq.superset.client import SupersetToolError
+    from mnemiq.superset.extension import TOOL_PREFIX
+
+    build = _start(store, ONE_BAR).build_id
+    _run_to(store, build, _adapter(fake), "policies_by_region")
+    renewals: list[int] = []
+    renew = store.renew_lease
+
+    def counted(*args, **kwargs):
+        renewals.append(len(fake.calls))
+        return renew(*args, **kwargs)
+
+    monkeypatch.setattr(store, "renew_lease", counted)
+
+    # What rc2's MCP answers for a tool it does not have, and for an unexpected error in one it has: the fake sends an
+    # exception a handler returns as Superset's error result.
+    masked = RuntimeError(f"Internal error in {TOOL_PREFIX}claim_chart: An unexpected error occurred. Error ID: 1a.")
+    world.hooks["claim_chart"] = Hook(instead=lambda request, _w: masked)
+    with pytest.raises(SupersetToolError):
+        _next(store, build, _adapter(fake))
+    probe = next(i for i, c in enumerate(fake.calls) if c.tool == TOOL_PREFIX + "dataset_metrics"
+                 and c.request == {"dataset_ids": []})
+    claim = next(i for i, c in enumerate(fake.calls) if c.tool == TOOL_PREFIX + "claim_chart")
+    assert claim < probe and probe in renewals, (claim, probe, renewals)
+
+
 # --- a create that answers failure, and one that keeps failing
 
 

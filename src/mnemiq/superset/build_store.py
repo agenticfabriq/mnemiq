@@ -32,8 +32,10 @@ different machines agree on when a lease passes.
 A worker renews its lease before each of its calls (`renew_lease`), and starts no call once that fails. A lease that
 has passed turns its step `uncertain`, and the next claim takes that step to reconcile it, keeping the first claim's
 intent and `started_at`: reconciliation looks for what the first worker may have made from when it began. A worker
-whose call timed out finishes its step `uncertain` itself, so the next claim need not wait for the lease. Each claim has
-a lease id of its own, so a worker whose step was taken from it can neither renew nor finish it (`LeaseLost`).
+whose row-locked or repeatable call (a claim, a patch, a layout save) timed out finishes its step `uncertain` itself,
+so the next claim need not wait for the lease; one whose create timed out leaves the claim to run out, since Superset
+may still be making the object. Each claim has a lease id of its own, so a worker whose step was taken from it can
+neither renew nor finish it (`LeaseLost`).
 """
 
 from __future__ import annotations
