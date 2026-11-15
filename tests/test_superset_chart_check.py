@@ -12,6 +12,7 @@ import copy
 import inspect
 import logging
 import re
+import types
 from datetime import datetime, timedelta
 
 import pytest
@@ -169,6 +170,55 @@ def _tools(fake) -> list[str]:
     return [call.tool for call in fake.calls]
 
 
+def _data_held(module) -> list[str]:
+    """The text of every data value a module holds at any depth of its globals' containers. Functions, classes,
+    modules and other callables are left out: what they print is code and memory addresses, never data."""
+    found: list[str] = []
+    seen: set[int] = set()
+
+    def walk(held) -> None:
+        if callable(held) or isinstance(held, types.ModuleType) or id(held) in seen:
+            return
+        seen.add(id(held))
+        if isinstance(held, dict):
+            for key, value in held.items():
+                walk(key)
+                walk(value)
+        elif isinstance(held, (list, tuple, set, frozenset)):
+            for item in held:
+                walk(item)
+        else:
+            found.append(str(held))
+
+    for name, held in vars(module).items():
+        if not name.startswith("__"):
+            walk(held)
+    return found
+
+
+class _AddressedCallable:
+    """A callable whose repr carries a memory address holding "801", as a function's repr can by chance."""
+
+    def __call__(self):
+        return None
+
+    def __repr__(self) -> str:
+        return "<function <lambda> at 0x7f801c0>"
+
+
+def test_the_data_a_module_holds_is_its_values_not_its_functions_addresses():
+    """A module global that holds functions (a dict of lambdas, say) has a repr full of memory addresses, and an
+    address can hold any short run of hex digits, "801" or "1200" among them. Reading reprs for a value then fails
+    by chance; reading the data the module holds finds a planted value at any depth and never an address."""
+    planted = types.ModuleType("planted")
+    planted.ON_EACH = {"P1D": _AddressedCallable()}
+    planted.KEPT = [("north", 1200)]
+    assert any("801" in repr(held) for held in vars(planted).values() if not callable(held))
+    held = " ".join(_data_held(planted))
+    assert "801" not in held
+    assert "north" in held and "1200" in held
+
+
 # --- checked, and what is compared ------------------------------------------------------------------------------------
 
 
@@ -207,10 +257,10 @@ def test_one_group_off_is_a_mismatch(fake, caplog, chart_rows, mnemiq_rows):
     assert check.status is ChartStatus.MISMATCH, check.reason
     assert set(check.chart_values) == set(chart_rows) and set(check.mnemiq_values) == set(mnemiq_rows)
     logged = " ".join(record.getMessage() for record in caplog.records if record.name.startswith("mnemiq"))
+    held = " ".join(_data_held(chart_check))
     for value in ("1200", "801", "north"):
         assert value not in logged
-        assert not any(value in repr(held) for name, held in vars(chart_check).items()
-                       if not name.startswith("__") and not callable(held) and not isinstance(held, type(re)))
+        assert value not in held
     fake.reply("get_chart_data", lambda request, authorization: _chart_data(["region", "Total premium"], ("south", 3)))
     fake.reply("execute_sql", lambda request, authorization: EMPTY if request.get("force_refresh")
                or _PROBE.search(request["sql"]) else _result(("south", 3)))
