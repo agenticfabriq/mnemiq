@@ -107,7 +107,7 @@ def test_nothing_cut_reports_nothing():
     assert cut_meaning(packet) == []
 
 
-def _boot(tmp_path, snapshot: Snapshot) -> Settings:
+def _boot(tmp_path, snapshot: Snapshot, *, window_check: bool = False) -> Settings:
     """A store holding `snapshot`, a source and a policy, as `build_runtime` reads them."""
     from mnemiq.store.bootstrap import init_store
     from mnemiq.store.snapshot_store import save_snapshot
@@ -124,7 +124,7 @@ def _boot(tmp_path, snapshot: Snapshot) -> Settings:
     authz = tmp_path / "authz.json"
     authz.write_text(json.dumps({"roles": {"analyst": ["lots"]}}))
     return Settings(llm_base_url="http://127.0.0.1:9/v1", llm_api_key="k", llm_model="m",
-                    llm_window_check=False, sources_path=str(manifest), store_path=str(store),
+                    llm_window_check=window_check, sources_path=str(manifest), store_path=str(store),
                     authz_path=str(authz))
 
 
@@ -173,3 +173,29 @@ def test_a_hot_swapped_snapshot_is_checked_again(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING):
         rt.reload_if_stale()
     assert "'swapped in'" in caplog.text
+
+
+def test_many_long_definitions_on_one_table_reach_the_window_check_whole(tmp_path, caplog, monkeypatch):
+    """Twenty definitions of nearly 2,000 characters, all bound to one table. None is cut, so `cut_meaning` says
+    nothing, and the boot window check measures the prompt they make, every one whole, and says it does not fit.
+    The per-record limit is not what bounds a prompt; the window check is, and it names the shortfall."""
+    from mnemiq.llm import window
+    from mnemiq.runtime import build_runtime
+
+    # A fixed 1,998, not one sized from the limit, so a lower limit fails the test rather than shrinking it.
+    texts = [(f"rule {i}: " + _words(1_986))[:1_998] for i in range(20)]
+    definitions = [Definition(id=f"d:{i}", term=f"rule {i}", domain="plant", definition=t, bound_objects=["lots"])
+                   for i, t in enumerate(texts)]
+    measured: list[str] = []
+
+    def server(base_url, model, system, user, http=None, api_key=None):
+        measured.append(user)
+        return (len(system + user) // 4, 8_192)
+
+    monkeypatch.setattr(window, "count_on_server", server)
+    settings = _boot(tmp_path, _snapshot(definitions), window_check=True)
+    with caplog.at_level(logging.WARNING):
+        build_runtime(settings)
+    assert measured and all(t in measured[0] for t in texts), "every definition measured whole"
+    assert "prompt window TOO SMALL" in caplog.text
+    assert "the prompt shows the first" not in caplog.text
