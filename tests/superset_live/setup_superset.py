@@ -15,6 +15,9 @@ it reads):
     python setup_superset.py widen west    puts it back to all of west's policies
     python setup_superset.py filter-and-report DASHBOARD USER
                                            as USER, a native filter on the dashboard and an active report that names it
+    python setup_superset.py drop-metric DATASET NAME
+                                           as admin, the dataset's saved metric NAME removed, when it has one; prints
+                                           how many it removed
 
 Everything is made through Superset's commands and its security manager, never by writing a model, wherever Superset
 has one: a dataset built from the model directly carries no catalog, and the access check then matches it to nothing.
@@ -315,6 +318,26 @@ def filter_and_report(dashboard_id: int, username: str) -> None:
         print(json.dumps({"filter_id": filter_id, "report_id": report.id}))
 
 
+def drop_metric(dataset_id: int, name: str) -> None:
+    """As admin, the dataset's saved metric `name` removed through Superset's own command
+    (`DeleteDatasetMetricCommand`), which a live test planted and leaves no trace of; prints how many it removed, 0
+    when the dataset has none of that name."""
+    from superset import db, security_manager
+    from superset.app import create_app
+
+    app = create_app()
+    with app.app_context(), app.test_request_context():
+        from superset.commands.dataset.metrics.delete import DeleteDatasetMetricCommand
+        from superset.connectors.sqla.models import SqlMetric
+        from superset.utils.core import override_user
+
+        found = db.session.query(SqlMetric).filter_by(table_id=dataset_id, metric_name=name).one_or_none()
+        if found is not None:
+            with override_user(security_manager.find_user(username="admin")):
+                DeleteDatasetMetricCommand(dataset_id, found.id).run()
+        print(f"dropped {0 if found is None else 1}")
+
+
 def _report(database, policy) -> None:
     from superset import db, security_manager
     from superset.connectors.sqla.models import RowLevelSecurityFilter
@@ -336,6 +359,8 @@ def main(argv: list[str]) -> None:
         extension()
     elif len(argv) == 3 and argv[0] == "filter-and-report":
         filter_and_report(int(argv[1]), argv[2])
+    elif len(argv) == 3 and argv[0] == "drop-metric":
+        drop_metric(int(argv[1]), argv[2])
     elif not argv:
         provision()
     elif len(argv) == 2 and argv[0] in ("narrow", "widen"):
