@@ -198,8 +198,8 @@ def _attributes(held) -> set[str]:
 def _data_held(module) -> list[str]:
     """The text of every data value a module holds, at any depth: inside its globals' containers (mappings,
     sequences, sets, deques), and in every object's attributes, slots and dataclass fields, those kept out of the
-    repr too and a container's own attributes beside its elements, and in the module's own functions' defaults and
-    closures. Other functions, classes, modules and loggers are left out: what they print is code and memory
+    repr too and a container's own attributes beside its elements, and in the module's own functions' defaults,
+    closures and attributes. Other functions, classes, modules and loggers are left out: what they print is code and memory
     addresses, and a logger leads to every other logger's records, none of them this module's. A cached function of
     the module fails the test, since its cache cannot be read. A holder of any other kind fails the test by name rather than being read through its repr,
     which can hide what it holds and print an address."""
@@ -210,7 +210,7 @@ def _data_held(module) -> list[str]:
         if id(held) in seen:
             return
         if callable(held) and getattr(held, "__module__", None) == module.__name__:
-            # The module's own functions can keep values too: in a cache, a default or a closure's cell.
+            # The module's own functions can keep values too: in a cache, a default, a closure's cell or an attribute.
             if hasattr(held, "cache_info"):
                 raise AssertionError(f"{path} is a cached function, whose cache this walk cannot read")
             if isinstance(held, types.FunctionType):
@@ -219,6 +219,8 @@ def _data_held(module) -> list[str]:
                     walk(default, f"{path}.<default {index}>")
                 for index, cell in enumerate(held.__closure__ or ()):
                     walk(cell.cell_contents, f"{path}.<closure {index}>")
+                for name, value in vars(held).items():
+                    walk(value, f"{path}.{name}")
             return
         if callable(held) or isinstance(held, (types.ModuleType, logging.Logger, __future__._Feature)):
             return
@@ -363,6 +365,19 @@ def _module_with_functions_holding(defaulted, closed) -> types.ModuleType:
 def test_a_value_the_modules_own_functions_keep_is_found():
     held = " ".join(_data_held(_module_with_functions_holding([("north", 1200)], [("south", 801)])))
     assert "north" in held and "1200" in held and "south" in held and "801" in held
+
+
+def test_a_value_kept_on_one_of_the_modules_functions_is_found():
+    planted = types.ModuleType("planted")
+
+    def check():
+        return None
+
+    check.__module__ = "planted"
+    check.last_rows = [("north", 1200)]
+    planted.check = check
+    held = " ".join(_data_held(planted))
+    assert "north" in held and "1200" in held
 
 
 def test_a_cached_function_of_the_module_fails_rather_than_passes():
