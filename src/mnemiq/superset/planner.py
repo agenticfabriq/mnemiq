@@ -38,6 +38,7 @@ from sqlglot.errors import SqlglotError
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Snapshot
+from mnemiq.llm.client import ContextTooLong, ModelUnavailable, PromptCut
 from mnemiq.sql.identifiers import resolve_identifier
 from mnemiq.sql.schema import column_types, visible_schema
 from mnemiq.superset.adapter import JINJA_DELIMITERS
@@ -107,6 +108,17 @@ PLANNER_MAX_TOKENS = 4000
 DATASETS_UNREADABLE = ("Superset's list of this builder's datasets could not be read, so no plan was made; mnemiq's "
                        "log records why.")
 NOTHING_VISIBLE = "This builder can read no table here, so there is nothing to plan a dashboard on."
+# A model that fails while planning, in mnemiq's words: a plan refused, as `/v1/ask` answers the same failures with a
+# stated failure inside a 200. The provider's own words go to the log only.
+MODEL_SILENT = ("The model did not respond, so no plan was made. This is an outage, not a judgement about the goal; "
+                "try again.")
+PLAN_TOO_LONG = ("The model server refused the planning prompt as longer than its context window: what this builder "
+                 "can see (the tables, their columns and saved metrics) does not fit one prompt beside the plan's "
+                 "room. This is a configuration problem, not a judgement about the goal: raise the server's window "
+                 "(vLLM: --max-model-len) up to the model's own limit.")
+PLAN_CUT = ("The model server cut the planning prompt to fit its context window, so the model never saw all of what "
+            "this builder can see, and no plan was made from it. This is a configuration problem, not a judgement "
+            "about the goal: raise the server's window (vLLM: --max-model-len) up to the model's own limit.")
 
 
 # ---------------------------------------------------------------- the plan
@@ -1181,7 +1193,11 @@ def plan_build(goal: str, *, planner: Planner, client, adapter, snapshot: Snapsh
     its reason naming each part. A part no rewrite could pass (`RefusedPart.repairable`) refuses the plan at once.
 
     With `offer_reuse` False (a build asked for on a dashboard of its own), no dashboard is looked for, and a plan that
-    names one to reuse is refused."""
+    names one to reuse is refused.
+
+    A model that fails (`ModelUnavailable`: no answer, or a server that refuses or cuts the prompt as longer than its
+    window) ends the plan as a refusal in mnemiq's words, never an error, on the first plan or its repair. The prompt
+    holds everything the builder can see and is not fitted to the window: one that does not fit is refused so."""
     if client is not getattr(adapter, "client", None):
         raise ValueError("the planner calls Superset only through the client of the request's adapter")
     goal = (goal or "").strip()
@@ -1196,7 +1212,10 @@ def plan_build(goal: str, *, planner: Planner, client, adapter, snapshot: Snapsh
     context = _context(catalogue, _dashboards(client, goal) if offer_reuse else (), families)
     parts: tuple[RefusedPart, ...] = ()
     for attempt in range(2):
-        answer = planner.plan(goal, context)
+        try:
+            answer = planner.plan(goal, context)
+        except ModelUnavailable as exc:
+            return _model_failed(exc)
         if isinstance(answer, PlanRefused):
             if not answer.parts and attempt == 0:
                 return answer
@@ -1220,6 +1239,15 @@ def plan_build(goal: str, *, planner: Planner, client, adapter, snapshot: Snapsh
         if attempt == 0:
             context = replace(context, repair=Repair(previous=previous, refused=parts))
     return PlanRefused(_naming(parts), parts)
+
+
+def _model_failed(exc: ModelUnavailable) -> PlanRefused:
+    logger.warning("the model failed while a build was planned (%s): %s", exc.kind, exc)
+    if isinstance(exc, PromptCut):
+        return PlanRefused(PLAN_CUT)
+    if isinstance(exc, ContextTooLong):
+        return PlanRefused(PLAN_TOO_LONG)
+    return PlanRefused(MODEL_SILENT)
 
 
 # ---------------------------------------------------------------- after the plan

@@ -33,6 +33,7 @@ import mnemiq.adapters.resolve as resolve_module
 import mnemiq.runtime as runtime_module
 import mnemiq.server.app as app_module
 from mnemiq.config import Settings
+from mnemiq.llm.client import ContextTooLong, ModelUnavailable, PromptCut
 from mnemiq.contract import Snapshot, SourceBinding
 from mnemiq.store.bootstrap import init_store
 from mnemiq.store.snapshot_store import save_snapshot
@@ -631,6 +632,46 @@ def test_a_refused_plan_is_an_answer(served, fake, store, refusal):
         assert all(part.part in told["reason"] for part in refusal.parts)
     else:  # the first reply could not be read: its reason as it is
         assert told["reason"] == refusal.reason
+    assert store._builds == {} and _writes(fake) == []
+
+
+class _FailingModel:
+    """The profile's model client, failing every call as `LLMClient` raises a provider's failure."""
+
+    def __init__(self, failure: Exception) -> None:
+        self.failure, self.calls = failure, 0
+
+    def complete(self, system: str, user: str, **kwargs) -> str:
+        self.calls += 1
+        raise self.failure
+
+
+# Each failure, with the provider's own words in it (which no answer may carry), and a phrase of mnemiq's sentence.
+MODEL_FAILURES = {
+    "an outage": (ModelUnavailable("Connection refused by model-host.internal:8000", kind="connect"),
+                  "did not respond"),
+    "a context too long": (ContextTooLong("model-host.internal: maximum context length is 32768 tokens"),
+                           "longer than its context window"),
+    "a cut prompt": (PromptCut("model-host.internal read 8000 of 41000 prompt tokens"), "cut the planning prompt"),
+}
+
+
+@pytest.mark.parametrize("case", list(MODEL_FAILURES))
+def test_a_model_that_fails_to_plan_is_an_answer_in_mnemiqs_words(served, fake, store, case):
+    """The profile's model, asked for the plan, does not answer, refuses the prompt as longer than its window, or
+    cuts the prompt to fit it. Each is an answer, never a 500, as `/v1/ask` answers the same failures inside a 200:
+    the plan is refused with mnemiq's own sentence, the provider's words go to the log only, the model is asked once,
+    and nothing is kept or written."""
+    client, runtime = served
+    failure, said = MODEL_FAILURES[case]
+    model = _FailingModel(failure)
+    _planned(runtime, LLMPlanner(model))
+    r = _start(client)
+    assert r.status_code == 200, r.text
+    told = r.json()["refused"]
+    assert said in told["reason"] and told["parts"] == [], told
+    assert "model-host" not in r.text
+    assert model.calls == 1
     assert store._builds == {} and _writes(fake) == []
 
 

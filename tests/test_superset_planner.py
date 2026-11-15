@@ -853,6 +853,34 @@ def test_reuse_is_not_offered_when_the_build_asks_for_none():
     assert "list_dashboards" not in tools.tools()
 
 
+class _FailsOnTheRepair(FakePlanner):
+    """Answers with its plan first, then fails as the model's client fails: the outage comes on the repair."""
+
+    def __init__(self, plan: BuildPlan, failure: Exception) -> None:
+        super().__init__(plan)
+        self.failure = failure
+
+    def plan(self, goal, context):
+        if self.contexts:
+            self.contexts.append(context)
+            raise self.failure
+        return super().plan(goal, context)
+
+
+def test_a_model_that_fails_on_the_repair_ends_the_plan_in_mnemiqs_words():
+    """The model fails on the repair, not the first plan: the plan ends there, in mnemiq's sentence for the failure,
+    and the provider's words are not in it."""
+    from mnemiq.llm.client import ModelUnavailable
+
+    bad = _valid_plan(measures=(_measure(expression="SUM(premium) OVER ()"),), charts=(
+        _chart("premium_by_region", Family.BAR, [WrittenRef(_measure(expression="SUM(premium) OVER ()"))],
+               dims=["region"]),))
+    planner = _FailsOnTheRepair(bad, ModelUnavailable("model-host.internal timed out", kind="connect"))
+    refused = _plan(GOAL, planner, _tools())
+    assert isinstance(refused, PlanRefused), refused
+    assert len(planner.contexts) == 2 and "did not respond" in refused.reason and "model-host" not in refused.reason
+
+
 def test_a_refusal_the_model_cannot_repair_stops_the_plan():
     """M1: Superset not answering a measure's proof (`source_unavailable`) is nobody's statement to repair."""
     from mnemiq.superset.client import SupersetUnavailable
