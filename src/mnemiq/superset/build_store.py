@@ -60,7 +60,7 @@ from mnemiq.superset.measures import Measure, MeasureKind
 if TYPE_CHECKING:
     from mnemiq.config import Settings
 
-__all__ = ["ABANDONED_AFTER_S", "BUILD_TABLE", "DEFAULT_LEASE_S", "LOCK_TIMEOUT_MS", "MEASURE_TABLE", "REASONS",
+__all__ = ["ABANDONED_AFTER_S", "BUILD_TABLE", "DEFAULT_LEASE_S", "LOCK_TIMEOUT_MS", "MAX_ID", "MEASURE_TABLE", "REASONS",
            "STATEMENT_TIMEOUT_MS", "STEP_KINDS", "STORE_MISSING", "VALUE_SHAPED_KEYS",
            "BuildNotFound", "BuildStore", "BuildStoreMissing", "DashboardBusy", "DashboardMeasure", "LeaseLost",
            "StepBusy", "StepState", "StoredBuild"]
@@ -99,8 +99,9 @@ DEFAULT_LEASE_S = 600  # longer than any one Superset call's deadline
 # another build of its dashboard takes the dashboard over.
 ABANDONED_AFTER_S = 2 * DEFAULT_LEASE_S
 _MAX_LEASE_S = 86_400
-# Postgres's `integer`, which every id column is.
-_MAX_ID = 2**31 - 1
+# The largest id the store keeps: Postgres's `integer`, which every id column is. A caller that takes an id from a
+# request bounds it by this before any work.
+MAX_ID = 2**31 - 1
 # How many times a write decided on a row that changed under it reads the row again. Only a lease's holder writes a
 # build while the lease holds, so a second attempt is the most that is ever needed.
 _ATTEMPTS = 3
@@ -680,7 +681,7 @@ def _text(value: object, what: str) -> str:
 def _id(value: object, what: str, *, optional: bool = False) -> int | None:
     if value is None and optional:
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= _MAX_ID:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= MAX_ID:
         raise ValueError(f"{what} is a positive integer id")
     return value
 
@@ -695,7 +696,7 @@ def _ids(values: Iterable[int], what: str) -> list[int]:
 
 
 def _floor_id(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= _MAX_ID:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_ID:
         raise ValueError("a step's floor is the id it read, 0 when there was none")
     return value
 

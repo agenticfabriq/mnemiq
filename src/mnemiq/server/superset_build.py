@@ -35,7 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, Strict
 
 from mnemiq.profiles import UnknownProfile
 from mnemiq.server.superset_refusals import NotForBuilding
-from mnemiq.superset.build_store import BuildNotFound, BuildStore, BuildStoreMissing, DashboardBusy
+from mnemiq.superset.build_store import MAX_ID, BuildNotFound, BuildStore, BuildStoreMissing, DashboardBusy
 from mnemiq.superset.builder import BuildBusy, BuildState, build_state, next_step, start_build
 from mnemiq.superset.executor import SupersetCredentialMissing, superset_executor
 from mnemiq.superset.extension import ExtensionMissing, call_tool
@@ -61,8 +61,8 @@ class StartBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     goal: Annotated[StrictStr, Field(min_length=1, max_length=MAX_GOAL)]
-    # The dashboard to build on: the one a plan offered, or another the builder names.
-    dashboard_id: Annotated[StrictInt, Field(gt=0)] | None = None
+    # The dashboard to build on: the one a plan offered, or another the builder names; an id the store can keep.
+    dashboard_id: Annotated[StrictInt, Field(gt=0, le=MAX_ID)] | None = None
     # A new dashboard, the answer to an offer declined.
     fresh: StrictBool = False
     profile: StrictStr | None = None  # None: the deployment's default

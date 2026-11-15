@@ -543,14 +543,24 @@ def test_a_dashboard_is_offered_before_anything_is_built(served, fake, world, st
 
 
 @pytest.mark.parametrize("body", [{"dashboard_id": 900, "fresh": True}, {"dashboard_id": 0}, {"dashboard_id": "900"},
-                                  {"fresh": "yes"}, {"goal": 7}, {"surprise": 1}],
-                         ids=["both", "zero", "text-id", "text-fresh", "goal-not-text", "unknown-key"])
+                                  {"dashboard_id": 2**31}, {"fresh": "yes"}, {"goal": 7}, {"surprise": 1}],
+                         ids=["both", "zero", "text-id", "past-the-store", "text-fresh", "goal-not-text",
+                              "unknown-key"])
 def test_a_body_the_route_cannot_read_is_422(served, fake, store, body):
+    """Refused before anything is planned or asked of Superset, an id the store could not keep included."""
     client, runtime = served
     r = client.post("/v1/superset/builds", json={"goal": GOAL, **body}, headers=_bearer(_token()))
     assert r.status_code == 422, r.text
     assert fake.calls == [] and store._builds == {}
     assert runtime.profiles[runtime.default_profile].planner.goals == []
+
+
+def test_the_largest_dashboard_id_the_store_keeps_is_built_on(served, fake, store):
+    """The control for the bound: Postgres's largest `integer` is read, planned and kept."""
+    client, _ = served
+    r = _start(client, dashboard_id=2**31 - 1)
+    assert r.status_code == 201, r.text
+    assert r.json()["build"]["dashboard_id"] == 2**31 - 1
 
 
 @pytest.mark.parametrize("refusal", [
