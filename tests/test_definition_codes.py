@@ -373,7 +373,8 @@ def test_the_warning_reads_the_policy_once(tmp_path, monkeypatch, caplog):
 
 def test_the_row_filter_list_agrees_with_each_roles_grants(tmp_path):
     """Two places read a policy's row filters: `grants_for`, which the engine applies, and `row_filtered_objects`, which
-    decides what this warning may quote. Pinned together, so a filter `grants_for` learns to read cannot be missed here."""
+    decides what this warning may quote. Pinned together: a filter `grants_for` learns to read is caught here once this
+    fixture holds it."""
     from mnemiq.authz.grants import FileAuthzProvider
     from mnemiq.contract import IdentityContext
 
@@ -389,3 +390,16 @@ def test_the_row_filter_list_agrees_with_each_roles_grants(tmp_path):
         grants = policy.grants_for(IdentityContext(tenant_id="t", principal_id="p", roles=[role]))
         per_role |= {table.lower() for table in grants.row_filters}
     assert {table.lower() for table in policy.row_filtered_objects()} == per_role == {"orders", "returns"}
+
+
+def test_an_exclusion_covers_its_whole_list_and_only_its_own_predicate():
+    held = _index({("shipments", "SHIP_MODE"): ["R"]})
+
+    def stale(text):
+        return [f.codes for f in stale_codes(_snapshot([("ship mode", text)], [("shipments", "SHIP_MODE")]), held)]
+
+    assert stale("Rows with SHIP_MODE 'X' and 'Y' are excluded.") == []
+    assert stale("Exclude rows with SHIP_MODE = 'X' or 'Y'.") == []
+    assert stale("Do not exclude SHIP_MODE = 'X'.") == [("X",)]
+    assert stale("Exclude SHIP_MODE = 'X' and include SHIP_MODE = 'Y'.") == [("Y",)]
+    assert stale("Count SHIP_MODE 'X', 'Y', and 'Z' rows.") == [("X", "Y", "Z")]

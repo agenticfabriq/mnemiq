@@ -20,7 +20,7 @@ What counts, kept narrow so prose is not read as codes:
   `NOT IN ('X')`, "is not 'X'", "other than", "except", "excluding", "exclude ... = 'X'", "'X' ... are excluded") is
   filtered out by a query that follows the definition, which keeps every row whether or not the data holds it, so a
   definition that only excludes is never reported. A nearby negation that still selects ("not only 'X' but also",
-  "do not omit ... 'X'") is not an exclusion.
+  "do not omit ... 'X'", "do not exclude ... 'X'") is not an exclusion, and "exclude" reaches only its own predicate.
 - A code counts for a column only when it has the shape of one of the column's values: capitals, small letters and
   digits in the same places. `'from May to June'` is never a code for a column of `AB12`s.
 - A column is judged only when every column of that name in the snapshot is indexed: a code may be in the one whose
@@ -44,10 +44,14 @@ _CLAUSE_END = re.compile(r"[.;:?\n]|!(?!=)")
 # An explicit exclusion just before the code, in its clause...
 _EXCLUDED_BEFORE = re.compile(
     r"(?:<>|!=|\bnot\s+in\s*\((?:[^()]*,)?|\b(?:is|are|was|were)\s+(?:not|never)|\bnot\s+equals?(?:\s+to)?|\bother\s+than"
-    r"|\bexcept(?:\s+for)?|\bexcluding|\bbut\s+not|\bexclud\w*\b[^.;:?\n]*?=)\s*$", re.IGNORECASE)
-# ...or just after it.
+    r"|\bexcept(?:\s+for)?|\bexcluding|\bbut\s+not"
+    # "exclude ... =", not negated, and reaching back over no other quoted code: its own predicate only.
+    r"|(?<!\bnot )(?<!\bnever )(?<!n't )\bexclud\w*\b[^.;:?\n'\"]*?=)\s*$", re.IGNORECASE)
+# ...or just after it. Both read a coordinated list ("'X', 'Y' and 'Z'") as one mention.
 _EXCLUDED_AFTER = re.compile(
     r"^\s*\)?\s*(?:rows?\s+)?(?:are|is)\s+(?:excluded|ignored|dropped|removed|left\s+out|filtered\s+out)\b", re.IGNORECASE)
+# What may stand between two codes of one list: a comma, "and", "or", or both.
+_LIST_GAP = re.compile(r"\s*(?:,\s*)?(?:(?:and|or)\s+)?", re.IGNORECASE)
 _BARE = re.compile(r"(?<![\w'\"-])[A-Z0-9][A-Z0-9_-]*(?![\w'\"-])")
 NEAREST = 8  # real values quoted, as many as the value check quotes
 
@@ -83,12 +87,21 @@ def _excluded(text: str, start: int, end: int) -> bool:
 
 
 def _codes(text: str, names: set[str]) -> list[str]:
-    """The codes the text selects on: each quoted or bare code with at least one mention outside an exclusion."""
+    """The codes the text selects on: each quoted or bare code with at least one mention outside an exclusion.
+
+    Consecutive mentions joined only by a comma, "and" or "or" are one list, read as one mention: "'X' and 'Y' are
+    excluded" excludes both, and "exclude ... = 'X' or 'Y'" both."""
     quoted = [(m.group(1) or m.group(2), m.start(), m.end()) for m in _QUOTED.finditer(text)]
     bare = [(m.group(0), m.start(), m.end()) for m in _BARE.finditer(text)
             if m.group(0).lower() not in names and any(c.isalpha() for c in m.group(0))
             and any(c.isdigit() for c in m.group(0))]
-    return [code for code, start, end in quoted + bare if not _excluded(text, start, end)]
+    lists: list[list[tuple[str, int, int]]] = []
+    for mention in sorted(quoted + bare, key=lambda m: m[1]):
+        if lists and _LIST_GAP.fullmatch(text[lists[-1][-1][2]:mention[1]]):
+            lists[-1].append(mention)
+        else:
+            lists.append([mention])
+    return [code for group in lists if not _excluded(text, group[0][1], group[-1][2]) for code, _, _ in group]
 
 
 def stale_codes(snapshot: Snapshot, values) -> list[StaleCodes]:
