@@ -39,6 +39,7 @@ from mnemiq.superset.chart_check import ChartStatus, check_chart
 from mnemiq.superset.charts import (
     ChartSpec,
     Family,
+    Filter,
     WrittenRef,
     config_chart_request,
     extension_chart_request,
@@ -1263,14 +1264,14 @@ def test_create_dataset_physical_and_virtual_carry_the_marker(live, extension, m
     observe("create_dataset", **ids)
 
 
-# The families neither MCP's `generate_chart` nor the extension's `create_chart` saves in rc2, each run through MCP's
-# own checks first:
-# - the histogram: `_compile_chart` builds its query with `build_query_dicts_from_form_data`, which reads a chart's
-#   metrics and groupby, and a histogram's form data names its column under `column` alone (read by the histogram's
-#   post-processing), so the query selects nothing and the database answers "Empty query?";
-# - the interactive pivot: not among this rc2's enabled chart types (its plugin is not in rc2), which the config's
-#   validation refuses, as mnemiq's plan check refuses it before a build where it is not offered.
-BOTH_REFUSE = {"histogram", "interactive_pivot"}
+# The family neither MCP's `generate_chart` nor the extension's `create_chart` saves in rc2, each run through MCP's own
+# checks first: the interactive pivot, not among this rc2's enabled chart types (its plugin is not in rc2), which the
+# config's validation refuses, as mnemiq's plan check refuses it before a build where it is not offered.
+# A histogram with no grouping column is saved by the extension alone: rc2's `generate_chart` cannot save one, because
+# its compile check builds the query from a chart's metrics and groupby, which a histogram's form data (its column
+# under `column` alone) does not carry, so the database answers "Empty query?"; the extension checks it with its own
+# query instead.
+BOTH_REFUSE = {"interactive_pivot"}
 
 
 def test_a_config_chart_saves_what_generate_chart_saves(live, extension, policy_id, made):
@@ -1299,6 +1300,8 @@ def test_a_config_chart_saves_what_generate_chart_saves(live, extension, policy_
         "big_number": spec(Family.BIG_NUMBER, policy_id, measures=(total,)),
         "gauge": spec(Family.GAUGE, policy_id),
         "histogram": spec(Family.HISTOGRAM, policy_id, measures=(), dimensions=("premium",)),
+        "histogram_grouped": spec(Family.HISTOGRAM, policy_id, measures=(), dimensions=("premium", "region"),
+                                  filters=(Filter("status", "=", "active"),), row_limit=500),
         "box_plot": spec(Family.BOX_PLOT, policy_id, dimensions=("region",)),
         "pivot": spec(Family.PIVOT, policy_id, measures=(total,), dimensions=("region", "status")),
         "interactive_pivot": spec(Family.INTERACTIVE_PIVOT, policy_id, measures=(total,),
@@ -1316,6 +1319,17 @@ def test_a_config_chart_saves_what_generate_chart_saves(live, extension, policy_
         mcp_id = (answer.get("chart") or {}).get("id")
         made.chart({"chart_id": mcp_id})
         own = made.chart(config_chart(build, chart, name))
+        if name == "histogram":
+            assert not answer.get("success") and mcp_id is None, answer
+            assert set(own) == {"chart_id"}, own
+            saved = stored_chart(own["chart_id"])
+            params = saved["params"]
+            observe("histogram_saved", params=params, query_context=saved["query_context"])
+            assert params["viz_type"] == saved["viz_type"] == "histogram_v2", params
+            assert params["column"] == "premium" and params["groupby"] == [], params
+            assert {"bins", "normalize", "cumulative", "row_limit"} <= set(params), params
+            assert saved["query_context"] is None
+            continue
         if not answer.get("success"):
             refused[name] = {"generate_chart": (answer.get("error") or {}).get("details"), "create_chart": own}
             assert mcp_id is None and "chart_id" not in own and "refused" in own, (name, own)
@@ -1329,6 +1343,15 @@ def test_a_config_chart_saves_what_generate_chart_saves(live, extension, policy_
                                  if key not in expected or key not in ours["params"]
                                  or expected[key] != ours["params"][key])
         contexts[name] = ours["query_context"] is not None
+        if name == "histogram_grouped":
+            grouped = ours["params"]
+            assert grouped["viz_type"] == "histogram_v2" and grouped["column"] == "premium", grouped
+            assert grouped["groupby"] == ["region"] and grouped["row_limit"] == 500, grouped
+            assert {"bins", "normalize", "cumulative"} <= set(grouped), grouped
+            # rc2's mapping adds its own no-op time-range filter on the dataset's time column beside the chart's.
+            assert ("status", "==", "active") in [(f["subject"], f["operator"], f["comparator"])
+                                                   for f in grouped["adhoc_filters"]], grouped
+            assert ours["query_context"] is None
         assert metadata(identity, (mcp_id,)) == metadata(identity, (own["chart_id"],)), name
         assert (theirs["description"], ours["description"]) == (None, build.marker(name)), name
         assert theirs["query_context"] is None, name
