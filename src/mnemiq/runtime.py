@@ -17,6 +17,7 @@ from mnemiq.cache.store import L1Cache, NullCache, TwoTierCache
 from mnemiq.config import DEFAULT_RETRIEVAL_K, Settings
 from mnemiq.contract import HistoryTurn, IdentityContext, Snapshot
 from mnemiq.execute.runner import DEFAULT_TIMEOUT_S
+from mnemiq.generate.prompts import cut_meaning
 from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import Embedder, LLMEmbedder
 from mnemiq.observability.answer_log import AnswerLog, build_answer_log
@@ -238,6 +239,7 @@ class Runtime:
             # that fronts the same tools in-process alongside the HTTP app would be, and that
             # is a deployment property this repo cannot see.
             _warn_view_inventory(snapshot, _acknowledged(self.settings))
+            _warn_cut_meaning(snapshot)
             for settings, profile in ([(lp.settings, lp.profile) for lp in self.profiles.values()] if self.profiles
                                       else [(self.settings, None)]):
                 _warn_prompt_window(settings, self.con, snapshot, getattr(self, "adapter", None),
@@ -765,6 +767,17 @@ def _warn_prompt_window(settings: Settings, con, snapshot, adapter, authz,
         "TOO SMALL" if report.certain else "MAY BE TOO SMALL", report.sentence(),
         "can" if report.certain else "may")
     _ack_did_not_apply(acknowledged, verdict, prefix="window:")
+
+
+def _warn_cut_meaning(snapshot: Snapshot | None) -> None:
+    """Say, at load, each piece of certified meaning the prompt shows only in part (`cut_meaning`).
+
+    At boot and on a snapshot swap, beside the view advisory, because the snapshot is its subject. Not acknowledgeable:
+    the operator's remedy is to shorten the text, and until then every answer that uses it reads a text cut short."""
+    if snapshot is None:
+        return
+    for sentence in cut_meaning(snapshot):
+        logger.warning("%s. Shorten it, or split it in two", sentence)
 
 
 def _warn_view_inventory(snapshot, acknowledged: frozenset[str]) -> None:
@@ -1310,6 +1323,7 @@ def build_runtime(settings: Settings) -> Runtime:
     # calling this from inside the function advisory ran it only when that one found
     # nothing to report, which is every deployment except a schema with no helpers.
     _warn_view_inventory(snapshot, _acknowledged(settings))
+    _warn_cut_meaning(snapshot)
     for profile_name, profile in profiles.items():
         if len(profiles) > 1:
             logger.info("the prompt window of profile %s:", profile_name)
