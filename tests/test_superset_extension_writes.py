@@ -8,6 +8,7 @@ What the tools do inside Superset (the locks, the commands, the answers) is the 
 
 import ast
 import contextlib
+import copy
 import hashlib
 import itertools
 import json
@@ -2412,3 +2413,68 @@ def test_the_extension_offers_exactly_the_ten_tools():
         "create_dashboard", "create_dataset", "create_chart", "patch_chart", "add_saved_metric", "delete_dataset",
         "set_layout", "dataset_metrics", "editors_of", "get_layout")
     assert registered(TOOLS_SOURCE.read_text()).keys() == set(EXTENSION_TOOLS)
+
+
+# ---------------------------------------------------------------- a histogram, checked by the extension's own query
+
+HISTOGRAM_FORM = {"viz_type": "histogram_v2", "column": "amount", "groupby": ["region"], "bins": 10,
+                  "normalize": False, "cumulative": False, "row_limit": 10000,
+                  "adhoc_filters": [{"clause": "WHERE", "expressionType": "SIMPLE", "subject": "region",
+                                     "operator": "==", "comparator": "West"}]}
+
+
+def test_a_histogram_from_a_config_is_saved(creating):
+    """rc2's mapping makes the form data and `set` is merged over it; the saved params are those; the query context is
+    none (the histogram is not checked by the value check); the marker and the editors are a created chart's."""
+    creating.superset.mapped = copy.deepcopy(HISTOGRAM_FORM)
+    made = make_from_config(set={"color_scheme": "supersetColors"})
+    assert set(made) == {"chart_id"}, made
+    ((_, properties),) = commands(creating.superset)
+    assert json.loads(properties["params"]) == {**HISTOGRAM_FORM, "color_scheme": "supersetColors"}
+    assert properties["query_context"] is None
+    assert properties["viz_type"] == "histogram_v2" and properties["description"] == STEP
+    assert properties["editors"] == [101]
+
+
+def test_a_histogram_without_a_column_is_refused_as_config(creating):
+    """Refused under the marker's lock, after the look, as a params error is; nothing is made."""
+    creating.superset.mapped = {key: value for key, value in HISTOGRAM_FORM.items() if key != "column"}
+    assert make_from_config() == {"refused": "config"}
+    ran = creating.superset.ran
+    assert ran[:8] == [*taken("postgresql", STEP), *looked("postgresql", "Slice")]
+    assert ran[-3:] == [("rollback",), *let_go("postgresql", STEP)]
+    assert commands(creating.superset) == [] and "chart_data" not in _kinds(creating.superset)
+
+
+def test_a_histograms_check_selects_its_column_its_groups_under_its_filters(creating):
+    creating.superset.mapped = copy.deepcopy(HISTOGRAM_FORM)
+    assert set(make_from_config()) == {"chart_id"}
+    ((_, context),) = [entry for entry in creating.superset.ran if entry[0] == "chart_data"]
+    (query,) = context["queries"]
+    assert query["columns"] == ["region", "amount"] and query["metrics"] == []
+    assert query["filters"] == [{"col": "region", "op": "==", "val": "West"}]
+    assert query["row_limit"] == writes._CHART_ROW_LIMIT_PROBE
+    assert context["result_type"] == "full"
+
+
+def test_a_histogram_whose_check_fails_is_refused_and_nothing_is_made(creating):
+    """A column the dataset lacks, or a query the database fails: refused as `query_failed`, the look under the lock
+    having run first; nothing is made."""
+    creating.superset.mapped = copy.deepcopy(HISTOGRAM_FORM)
+    creating.superset.chart_data = {"queries": [{"error": "no such column", "status": "failed"}]}
+    assert make_from_config() == {"refused": "query_failed"}
+    ran = creating.superset.ran
+    assert ran[:8] == [*taken("postgresql", STEP), *looked("postgresql", "Slice")]
+    assert _after(creating.superset, "chart_data") == ["rollback", "on", "close"]
+    assert commands(creating.superset) == []
+
+
+def test_only_a_histogram_bypasses_rc2s_compile_check(creating):
+    """A line chart is still checked by rc2's `_compile_chart`; a histogram never is."""
+    creating.superset.mapped = {"viz_type": "echarts_timeseries_line", "x_axis": "day", "metrics": ["count"]}
+    assert set(make_from_config()) == {"chart_id"}
+    assert "compile" in _kinds(creating.superset) and "chart_data" not in _kinds(creating.superset)
+    creating.superset.ran.clear()
+    creating.superset.mapped = copy.deepcopy(HISTOGRAM_FORM)
+    assert set(make_from_config(format_marker(BUILD, "chart_2", 12))) == {"chart_id"}
+    assert "compile" not in _kinds(creating.superset) and "chart_data" in _kinds(creating.superset)

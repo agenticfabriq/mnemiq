@@ -113,7 +113,8 @@ database connection of its own (a session's advisory lock on Postgres, a named l
 object is made and committed. Under it, the create looks for an object not in the trash whose description's last line is
 that marker: it answers that one's id; when there are several it creates nothing and answers `{"candidates": [...]}`,
 the ids of those the caller may read (the list may be empty); and when there is none, it runs Superset's own checks (a
-chart's config validation and its query, a dataset's table) and creates the object, a dataset's editors included. So a
+chart's config validation and its query, a dataset's table; a histogram's query is the extension's own, because Superset
+7.0.0rc2's compile check builds none for it) and creates the object, a dataset's editors included. So a
 chart already made is answered without running its query again, and a create sent again while the first is still running
 waits for the first and answers what it made. On Postgres a second lock guards the create itself: just before its
 command, in the command's own transaction, the create takes a transaction's lock on another key of the marker and looks

@@ -719,3 +719,45 @@ def test_metric_stub_list_keeps_every_existing_id():
     with pytest.raises(ValueError):
         ext.metric_stub_list([{"metric_name": "no id"}], new)
     assert ext.metric_stub_list([], new) == [new]
+
+
+# ---------------------------------------------------------------- a histogram's own check query
+
+HISTOGRAM = {"viz_type": "histogram_v2", "column": "amount", "groupby": ["region"], "bins": 10, "normalize": False,
+             "cumulative": False, "row_limit": 10000, "adhoc_filters": [WEST]}
+
+
+def test_histogram_check_context_selects_the_groups_then_the_column():
+    """The observations and their grouping columns: the form data's `groupby`, then its `column`; no metrics and no
+    post-processing; the form data's filters, read as the other families' builders read them."""
+    context = ext.histogram_check_context(HISTOGRAM, DATASET)
+    assert context["datasource"] == {"id": DATASET, "type": "table"}
+    assert context["result_type"] == "full" and context["force"] is False
+    (query,) = context["queries"]
+    assert query["columns"] == ["region", "amount"]
+    assert query["metrics"] == []
+    assert query["filters"] == [WEST_Q]
+    assert "post_processing" not in query
+    assert json.loads(json.dumps(context)) == context
+
+
+def test_histogram_check_context_selects_the_column_alone_without_groups():
+    (query,) = ext.histogram_check_context({"viz_type": "histogram_v2", "column": "amount"}, DATASET)["queries"]
+    assert query["columns"] == ["amount"] and query["metrics"] == [] and query["filters"] == []
+
+
+def test_histogram_check_context_does_not_change_its_form_data():
+    before = copy.deepcopy(HISTOGRAM)
+    ext.histogram_check_context(HISTOGRAM, DATASET)
+    assert HISTOGRAM == before
+
+
+@pytest.mark.parametrize("form", [{"viz_type": "histogram_v2"}, {"column": None}, {"column": ""}, {"column": []}])
+def test_histogram_check_context_needs_a_column(form):
+    with pytest.raises(ValueError):
+        ext.histogram_check_context({"groupby": ["region"], **form}, DATASET)
+
+
+def test_histogram_check_context_needs_a_dataset():
+    with pytest.raises(ValueError):
+        ext.histogram_check_context(HISTOGRAM, 0)

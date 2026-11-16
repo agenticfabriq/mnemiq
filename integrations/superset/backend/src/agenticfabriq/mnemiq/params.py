@@ -614,6 +614,33 @@ def query_context(viz_type: str, params: Mapping, datasource_id: int) -> dict | 
     return json.loads(json.dumps(context))
 
 
+def histogram_check_context(form_data: Mapping, datasource_id: int) -> dict:
+    """The query context the extension runs to check a histogram (`histogram_v2`) before it is saved: the observations
+    and their grouping columns, the form data's `groupby` then its `column`, no metrics and no post-processing, under
+    the form data's filters, read as the other families' queries read them. rc2's own compile check builds a histogram's
+    query from metrics and groupby and so finds nothing to select, because the histogram names its column under
+    `column` alone. Not a chart's saved query context. Raises ValueError for a bad `datasource_id`, for form data
+    that is not a mapping, and for form data without a `column`."""
+    if isinstance(datasource_id, bool) or not isinstance(datasource_id, int) or datasource_id < 1:
+        raise ValueError("datasource_id must be a positive integer")
+    if not isinstance(form_data, Mapping):
+        raise ValueError("params must be a mapping")
+    column = form_data.get("column")
+    if not (isinstance(column, str) and column) and not _is_adhoc_column(column):
+        raise ValueError("a histogram's params name no column")
+    filters, extras = _filters_and_extras(form_data)
+    groups = [c for c in _ensure_list(form_data.get("groupby")) if c != ""]
+    context = {
+        "datasource": {"id": datasource_id, "type": "table"},
+        "force": False,
+        "queries": [{"columns": _dedupe([*groups, column], _column_label), "metrics": [], "filters": filters,
+                     "extras": extras}],
+        "result_format": "json",
+        "result_type": "full",
+    }
+    return json.loads(json.dumps(context))
+
+
 # ---------------------------------------------------------------- the patch
 
 class PatchRefused(ValueError):

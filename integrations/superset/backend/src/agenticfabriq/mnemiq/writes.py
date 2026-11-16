@@ -1122,7 +1122,8 @@ def _funnel_form(found: dict) -> tuple[str, dict, dict] | dict:
 def _config_form(found: dict, dataset: Any) -> tuple[str, dict, dict | None] | dict:
     """MCP's chart config made into a chart as its `generate_chart` saves one: the config validated
     (`ValidationPipeline`), mapped to form data (`map_config_to_form_data`, whose warnings key is dropped), the
-    request's `set` merged over it, and the query run (`_compile_chart`), so a chart whose query fails is never saved.
+    request's `set` merged over it, and the query run (`_compile_chart`; a histogram's by the extension's own
+    `_check_query`, as rc2's compile finds nothing to select in it), so a chart whose query fails is never saved.
     (viz_type, form data, query context), or the refusal. Runs under the marker's lock, which is held on a connection
     of its own, so whatever rc2 commits or rolls back here keeps it held."""
     from superset.mcp_service.chart.chart_utils import map_config_to_form_data
@@ -1142,9 +1143,15 @@ def _config_form(found: dict, dataset: Any) -> tuple[str, dict, dict | None] | d
         return {"refused": "config"}
     try:
         context = params.query_context(viz_type, form_data, dataset_id)
+        check = params.histogram_check_context(form_data, dataset_id) if viz_type == "histogram_v2" else None
     except ValueError:
         return {"refused": "config"}
-    if not _compile_chart(form_data, dataset.id).success:
+    if check is not None:
+        # rc2's `_compile_chart` finds no column to select in a histogram's form data (it names its column under
+        # `column` alone), so the extension's own check runs a query that selects it.
+        if (refused := _check_query(check)) is not None:
+            return refused
+    elif not _compile_chart(form_data, dataset.id).success:
         logger.warning("mnemiq extension: create_chart's query failed")
         return {"refused": "query_failed"}
     return viz_type, form_data, context
