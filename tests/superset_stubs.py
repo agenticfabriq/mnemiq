@@ -8,8 +8,10 @@ what `agenticfabriq.mnemiq.writes` reads from it; the exceptions keep rc2's hier
 
 from __future__ import annotations
 
+import copy
 import sys
 import types
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 
@@ -23,6 +25,10 @@ class SupersetErrorException(SupersetException):
 
 class SupersetSecurityException(SupersetErrorException):
     pass
+
+
+class SupersetParseError(SupersetErrorException):
+    """rc2's error for SQL it cannot parse."""
 
 
 class QueryObjectValidationError(SupersetException):
@@ -58,6 +64,21 @@ class DatasetNotFoundError(CommandException):
     pass
 
 
+class DatasetInvalidError(CommandInvalidError):
+    """rc2's `DatasetInvalidError`: `get_list_classnames` names the validation errors it holds."""
+
+    def __init__(self, classnames=()) -> None:
+        super().__init__("Dataset parameters are invalid.")
+        self.classnames = sorted(classnames)
+
+    def get_list_classnames(self) -> list[str]:
+        return self.classnames
+
+
+class DatasetSoftDeletedTwinExistsError(CommandException):
+    pass
+
+
 class DatasetRestoreFailedError(CommandException):
     pass
 
@@ -67,7 +88,14 @@ class SQLAlchemyError(Exception):
 
 
 class DBAPIError(SQLAlchemyError):
-    pass
+    """SQLAlchemy's wrapper of a driver's error; `connection_invalidated` is set when SQLAlchemy found the connection
+    lost and invalidated it."""
+
+    connection_invalidated = False
+
+
+class PoolTimeoutError(SQLAlchemyError):
+    """SQLAlchemy's `TimeoutError`: no connection came free in the pool within its timeout."""
 
 
 class MarshmallowValidationError(Exception):
@@ -85,11 +113,41 @@ def is_lock_contention_error(exc) -> bool:
     return getattr(getattr(exc, "orig", None), "pgcode", None) in PG_LOCK_CONTENTION
 
 
-def database_error(sqlstate: str) -> DBAPIError:
-    """A database error as SQLAlchemy wraps a psycopg2 one, its SQLSTATE on the driver error (`orig.pgcode`)."""
+def database_error(sqlstate: str, invalidated: bool = False) -> DBAPIError:
+    """A database error as SQLAlchemy wraps a psycopg2 one, its SQLSTATE on the driver error (`orig.pgcode`), with the
+    connection marked invalidated when `invalidated` (SQLAlchemy found it lost)."""
     error = DBAPIError(f"(psycopg2.errors) SQLSTATE {sqlstate}")
     error.orig = SimpleNamespace(pgcode=sqlstate)
+    error.connection_invalidated = invalidated
     return error
+
+
+class Column:
+    """A model's column, stood in: a filter on it answers what it asks, for a session stand-in to apply."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def like(self, pattern: str, escape: str | None = None) -> tuple:
+        return ("like", self.name, pattern, escape)
+
+    def is_(self, value) -> tuple:
+        return ("is", self.name, value)
+
+
+def model(name: str) -> type:
+    """A model stood in: the columns a lookup by marker reads."""
+    return type(name, (), {"id": Column("id"), "description": Column("description"),
+                           "deleted_at": Column("deleted_at")})
+
+
+@dataclass(frozen=True)
+class Table:
+    """rc2's `Table` (`superset/sql/parse.py`): a table, with its schema and catalog when known."""
+
+    table: str
+    schema: str | None = None
+    catalog: str | None = None
 
 
 class SubjectType:
@@ -106,11 +164,57 @@ def install(monkeypatch) -> SimpleNamespace:
     exception; `update`: what `UpdateDashboardCommand.run` does; `config`: Superset's config, as
     `flask.current_app.config`; `features`: the feature flags `is_feature_enabled` answers on; `g`: `flask.g`, whose
     `user` is the request's user; `user_subjects`: each user's own subject, by user id, as `get_user_subject` finds it;
-    `charts`, `dashboards`, `datasets`: what `ChartDAO`, `DashboardDAO` and `DatasetDAO` find, by id) and what the
-    tools did (`ran`: each command run, in order, with its arguments)."""
+    `charts`, `dashboards`, `datasets`: what `ChartDAO`, `DashboardDAO` and `DatasetDAO` find, by id; `session`:
+    `db.session`, which each command commits when its `run` returns and rolls back when it raises, as rc2's
+    `@transaction` does; `rows`: the metadata database's dashboards and charts, by model name, to which each create
+    command adds the row it makes; `create`: an exception a create command raises instead; `dataset_database`: the
+    database a dataset's create reads from its id; `twin`: whether a dataset in the trash holds the table a dataset's
+    create names; `security`: rc2's security manager as a dataset's create asks it, or None to ask nothing) and what
+    the tools did (`ran`: each command run, in order, with its arguments)."""
     state = SimpleNamespace(chart_data={"queries": [{"data": [], "status": "success"}]}, delete=None, restore=None,
-                            update=None, ran=[], config={}, features=set(), g=SimpleNamespace(), user_subjects={},
-                            charts={}, dashboards={}, datasets={}, next_chart_id=500)
+                            config_valid=True, mapped={"viz_type": "big_number_total", "metric": "count",
+                                                       "_mcp_warnings": ["a sample warning"]},
+                            compiled=SimpleNamespace(success=True),
+                            update=None, create=None, ran=[], config={}, features=set(), g=SimpleNamespace(),
+                            user_subjects={}, charts={}, dashboards={}, datasets={}, session=None,
+                            rows={"Dashboard": [], "Slice": [], "SqlaTable": []}, next_id=500,
+                            dataset_database=SimpleNamespace(perm=None, get_default_catalog=lambda: None),
+                            twin=False, security=None)
+
+    class Db:
+        @property
+        def session(self):
+            return state.session
+
+    def transaction(work):
+        """What rc2's `@transaction` (`superset/utils/decorators.py`) does around a command's `run`: the session is
+        committed when `work` returns and rolled back when it raises."""
+        try:
+            result = work()
+        except Exception:
+            if state.session is not None:
+                state.session.rollback()
+            raise
+        if state.session is not None:
+            state.session.commit()
+        return result
+
+    def created(model_name: str, command_name: str, properties: dict, validate=None) -> SimpleNamespace:
+        state.ran.append((command_name, properties))
+        if validate is not None:
+            validate()
+        if state.create is not None:
+            raise state.create
+        state.next_id += 1
+        row = SimpleNamespace(id=state.next_id, description=properties.get("description"), deleted_at=None,
+                              editors=[])
+        if model_name == "SqlaTable":
+            row.perm, row.schema_perm, row.database = None, None, state.dataset_database
+            # rc2's create makes its creator an editor of the dataset.
+            creator = getattr(getattr(state.g, "user", None), "subject", None)
+            row.editors = [creator] if creator is not None else []
+        state.rows[model_name].append(row)
+        return row
 
     class ChartDataQueryContextSchema:
         def load(self, context: dict) -> dict:
@@ -138,53 +242,122 @@ def install(monkeypatch) -> SimpleNamespace:
                 self.argument = arguments[0] if len(arguments) == 1 else arguments
 
             def run(self) -> None:
-                state.ran.append((name, self.argument))
-                if (raised := getattr(state, outcome)) is not None:
-                    raise raised
+                def work() -> None:
+                    state.ran.append((name, self.argument))
+                    if (raised := getattr(state, outcome)) is not None:
+                        raise raised
+
+                transaction(work)
 
         Command.__name__ = name
         return Command
 
-    class CreateChartCommand:
+    def create_command(model_name: str, name: str):
+        class Command:
+            def __init__(self, properties: dict) -> None:
+                self.properties = properties
+
+            def run(self) -> SimpleNamespace:
+                return transaction(lambda: created(model_name, name, self.properties))
+
+        Command.__name__ = name
+        return Command
+
+    class CreateDatasetCommand:
+        """rc2's `CreateDatasetCommand` (`superset/commands/dataset/create.py`), as far as the tools read it. Its
+        `validate` reads the database from its id into the command's own copy of the properties (`_properties`), with
+        the database's default catalog when none is given; refuses a table a dataset in the trash holds (`twin`) with
+        `DatasetSoftDeletedTwinExistsError`; and asks `security.raise_for_access`, as the caller and with the
+        arguments rc2 passes (the table, or `sql` with its catalog and schema), listing a refusal as
+        `DatasetDataAccessIsNotAllowed` and SQL it cannot parse as a `ValidationError`. Then the dataset is made as
+        every create command makes its row (`created`)."""
+
         def __init__(self, properties: dict) -> None:
-            self.properties = properties
+            self.properties, self._properties = properties, properties.copy()
 
         def run(self) -> SimpleNamespace:
-            state.ran.append(("CreateChartCommand", self.properties))
-            state.next_chart_id += 1
-            return SimpleNamespace(id=state.next_chart_id)
+            return transaction(lambda: created("SqlaTable", "CreateDatasetCommand", self.properties, self.validate))
+
+        def validate(self) -> None:
+            database = self._properties["database"] = state.dataset_database
+            catalog = self._properties.get("catalog")
+            if not catalog:
+                catalog = self._properties["catalog"] = database.get_default_catalog()
+            schema, table_name, sql = (self._properties.get(key) for key in ("schema", "table_name", "sql"))
+            if state.twin:
+                raise DatasetSoftDeletedTwinExistsError()
+            if state.security is None:
+                return
+            try:
+                if sql:
+                    state.security.raise_for_access(database=database, sql=sql, catalog=catalog, schema=schema)
+                else:
+                    state.security.raise_for_access(database=database, table=Table(table_name, schema, catalog))
+            except SupersetSecurityException:
+                raise DatasetInvalidError({"DatasetDataAccessIsNotAllowed"}) from None
+            except SupersetParseError:
+                raise DatasetInvalidError({"ValidationError"}) from None
+
+    class ValidationPipeline:
+        @staticmethod
+        def validate_request_with_warnings(request_data: dict) -> SimpleNamespace:
+            state.ran.append(("validate", request_data))
+            if not state.config_valid:
+                return SimpleNamespace(is_valid=False, request=None, error=SimpleNamespace(), warnings=None)
+            return SimpleNamespace(is_valid=True, request=SimpleNamespace(config=request_data["config"]),
+                                   warnings=None)
+
+    def map_config_to_form_data(config: dict, dataset_id=None) -> dict:
+        state.ran.append(("map", config, dataset_id))
+        return copy.deepcopy(state.mapped)
+
+    def _compile_chart(form_data: dict, dataset_id: int) -> SimpleNamespace:
+        state.ran.append(("compile", form_data, dataset_id))
+        return state.compiled
 
     def get_user_id():
         return getattr(getattr(state.g, "user", None), "id", None)
 
     modules = {
         "flask": {"current_app": SimpleNamespace(config=state.config), "g": state.g},
-        "superset": {"is_feature_enabled": lambda name: name in state.features},
+        "superset": {"is_feature_enabled": lambda name: name in state.features, "db": Db()},
         "superset.utils.core": {"get_user_id": get_user_id},
         "superset.subjects.types": {"SubjectType": SubjectType},
         "superset.subjects.utils": {"get_user_subject": lambda user_id: state.user_subjects.get(user_id)},
-        "superset.models.slice": {"Slice": type("Slice", (), {"id": "slices.id"})},
-        "superset.connectors.sqla.models": {"SqlaTable": type("SqlaTable", (), {"id": "tables.id"})},
+        "superset.models.slice": {"Slice": model("Slice")},
+        "superset.models.dashboard": {"Dashboard": model("Dashboard")},
+        "superset.connectors.sqla.models": {"SqlaTable": model("SqlaTable")},
         "superset.daos.dashboard": {"DashboardDAO": SimpleNamespace(
             find_by_id=lambda dashboard_id: state.dashboards.get(dashboard_id))},
         "superset.daos.dataset": {"DatasetDAO": SimpleNamespace(
             find_by_id=lambda dataset_id: state.datasets.get(dataset_id))},
         "superset.commands.chart.update": {"UpdateChartCommand": command("UpdateChartCommand", "update")},
-        "superset.commands.chart.create": {"CreateChartCommand": CreateChartCommand},
+        "superset.commands.chart.create": {"CreateChartCommand": create_command("Slice", "CreateChartCommand")},
+        "superset.commands.dashboard.create": {
+            "CreateDashboardCommand": create_command("Dashboard", "CreateDashboardCommand")},
+        "superset.commands.dataset.create": {"CreateDatasetCommand": CreateDatasetCommand},
+        "superset.sql.parse": {"Table": Table},
         "superset.commands.dataset.update": {"UpdateDatasetCommand": command("UpdateDatasetCommand", "update")},
         "marshmallow": {"ValidationError": MarshmallowValidationError},
         "sqlalchemy": {"text": lambda sql: sql},
-        "sqlalchemy.exc": {"SQLAlchemyError": SQLAlchemyError, "DBAPIError": DBAPIError},
+        "sqlalchemy.exc": {"SQLAlchemyError": SQLAlchemyError, "DBAPIError": DBAPIError,
+                           "TimeoutError": PoolTimeoutError},
         "superset.exceptions": {"SupersetException": SupersetException,
                                 "SupersetSecurityException": SupersetSecurityException,
+                                "SupersetParseError": SupersetParseError,
                                 "QueryObjectValidationError": QueryObjectValidationError},
         "superset.commands.exceptions": {"CommandException": CommandException,
                                          "CommandInvalidError": CommandInvalidError,
                                          "ObjectNotFoundError": ObjectNotFoundError, "ForbiddenError": ForbiddenError},
         "superset.commands.chart.exceptions": {"ChartNotFoundError": ChartNotFoundError},
-        "superset.commands.dataset.exceptions": {"DatasetNotFoundError": DatasetNotFoundError},
+        "superset.commands.dataset.exceptions": {
+            "DatasetNotFoundError": DatasetNotFoundError, "DatasetInvalidError": DatasetInvalidError,
+            "DatasetSoftDeletedTwinExistsError": DatasetSoftDeletedTwinExistsError},
         "superset.charts.schemas": {"ChartDataQueryContextSchema": ChartDataQueryContextSchema},
         "superset.commands.chart.data.get_data_command": {"ChartDataCommand": ChartDataCommand},
+        "superset.mcp_service.chart.validation": {"ValidationPipeline": ValidationPipeline},
+        "superset.mcp_service.chart.chart_utils": {"map_config_to_form_data": map_config_to_form_data},
+        "superset.mcp_service.chart.compile": {"_compile_chart": _compile_chart},
         "superset.mcp_service.chart.query_result": {"query_result_failure": query_result_failure},
         "superset.commands.dataset.delete": {"DeleteDatasetCommand": command("DeleteDatasetCommand", "delete")},
         "superset.commands.dataset.restore": {"RestoreDatasetCommand": command("RestoreDatasetCommand", "restore")},

@@ -279,19 +279,26 @@ still to come. In short:
   `superset:dashboard:write` and `superset:dataset:write` scopes. The extension's token route puts those in a token
   asked for with `{"purpose": "build"}`. A token made for asking is refused with a 403.
 - **One step per request.** Each `/next` claims one step, runs it as the builder and records what it made, so a build
-  survives a restart and two requests never run the same step.
-  - If a create times out, Superset may still be finishing it, so mnemiq does not repeat the step until its lease has
-    passed. The lease is ten minutes, longer than mnemiq waits for any one call, and after it mnemiq looks for what
-    the step made before it makes anything again.
-  - That way nothing is made twice, as long as Superset finishes a call's work within those ten minutes. A Superset
-    still working on a call after that could finish it after mnemiq has looked, and the object would then be made
-    twice.
+  survives a restart. A step holds a ten-minute lease while it runs, so two requests never run the same step: a
+  second `/next` meanwhile is refused with a 409.
+  - Every dashboard, dataset and chart a build makes is made by the extension, with the build's marker in its
+    description, saved in the same transaction as the object. Sent again with the same marker, a create answers with
+    the object the first one made instead of making another.
+  - So if a create times out, the next `/next` sends it again at once. If Superset made the object, mnemiq gets its
+    id back; if not, it is made now. If Superset is still running the first create, the second waits for it to finish
+    and answers with what it made; if it waits too long, or Superset's metadata database does not answer, the next
+    `/next` asks again.
+  - Only an object that carries the step's marker is ever taken as the step's own. A chart someone makes by hand with
+    the planned name is left alone. If two objects carry the same marker, the build stops and names those the
+    builder can read.
 - **One build of a dashboard at a time.** While a build of a dashboard is building, starting another build of it is
   refused with a 409. A build left untouched for 20 minutes (twice the lease), with no step running, no longer holds
   its dashboard: the next build of that dashboard stops it, as abandoned, and takes the dashboard over.
 - **Builds are kept in the control Postgres (`MNEMIQ_CONTROL_DSN`).** It holds plans, measure definitions, Superset
   ids and statuses, never a value or a row. Without it the build routes answer 503.
-- **Without the extension, the build routes answer 503** with a sentence that names it, before anything is planned.
+- **Without the extension, the build routes answer 503** with a sentence that names it, before anything is planned. An
+  extension older than mnemiq, without the creates a build sends, is answered 503 too, with a sentence saying to
+  update it.
 
 ## What each refusal returns
 

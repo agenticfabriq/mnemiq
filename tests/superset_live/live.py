@@ -177,6 +177,16 @@ def metadata(sql: str, params: tuple = ()) -> list[tuple]:
         return [tuple(row) for row in con.execute(sql, params).fetchall()]
 
 
+def carrying(table: str, marker: str) -> list[tuple[int, object]]:
+    """Every row of the metadata database's `table` (`slices`, `tables` or `dashboards`), in the trash or not, whose
+    description's last line is exactly `marker`, as `(id, deleted_at)` by id: what a create's lookup for the marker
+    finds, the trash included. `strpos` reads the marker as text, where a `LIKE` would read a step key's `_` as any
+    one character."""
+    rows = metadata(f"SELECT id, description, deleted_at FROM {table} WHERE strpos(description, %s) > 0 ORDER BY id",
+                    (marker,))
+    return [(row[0], row[2]) for row in rows if (row[1] or "").splitlines()[-1:] == [marker]]
+
+
 def fingerprint_of(value: str) -> str:
     """A short digest of a credential, so a test can tell two apart without keeping either."""
     return hashlib.sha256(value.encode()).hexdigest()[:12]

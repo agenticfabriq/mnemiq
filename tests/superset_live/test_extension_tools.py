@@ -2,11 +2,14 @@
 service, in the suite's Superset 7.0.0rc2 with the extension loaded (`setup_superset.py extension`).
 
 Every tool is called over MCP as a person whose token Superset verifies, with the scopes a build token carries, and
-every chart is made as mnemiq makes it: MCP's `generate_chart` with mnemiq's own `generate_chart_request`, or the
-extension's `create_chart` with `extension_chart_request`. Each test makes the dashboards, datasets and charts it
-needs on the seeded `policy` table, so none depends on another. What a tool wrote is read back from Superset's
-metadata database directly (`metadata`), and every number a chart answers with is held to the source read directly
-(`ground_truth`).
+every chart and dataset a build would make is made as mnemiq makes it, carrying a build's marker: by the extension's
+`create_chart`, from mnemiq's own `config_chart_request` (`extension_chart_request` for a funnel or a sankey), and by
+its `create_dataset`. MCP's own `generate_chart` and `create_virtual_dataset` are called only where a test compares
+with what MCP saves, stands for an object a person made by hand, or needs a dataset with saved metrics of its own,
+which the extension's create does not take. Each test makes the dashboards, datasets and charts it needs on the seeded
+`policy` table, so none depends on another; the tests of a create carrying a marker remove what they made (`made`).
+What a tool wrote is read back from Superset's metadata database directly (`metadata`), and every number a chart
+answers with is held to the source read directly (`ground_truth`).
 
 Each test states its expectation in its docstring. Observations a run should keep are printed as `OBSERVED` lines,
 which `pytest -rA` shows for passing tests too.
@@ -23,7 +26,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import jwt
@@ -33,15 +36,24 @@ from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Column, Snapshot
 from mnemiq.superset.adapter import SupersetSqlAdapter
 from mnemiq.superset.chart_check import ChartStatus, check_chart
-from mnemiq.superset.charts import ChartSpec, Family, WrittenRef, extension_chart_request, generate_chart_request
+from mnemiq.superset.charts import (
+    ChartSpec,
+    Family,
+    WrittenRef,
+    config_chart_request,
+    extension_chart_request,
+    generate_chart_request,
+    owed_format_params,
+)
 from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetPermissionDenied
 from mnemiq.superset.extension import TOOL_PREFIX
-from mnemiq.superset.marker import format_marker
+from mnemiq.superset.marker import Marker, format_marker, parse_marker
 from mnemiq.superset.measures import Measure, MeasureKind
 from tests.superset_extension_path import use_extension_source
 from tests.superset_live.live import (
     TENANT,
     TOKEN_ROUTE,
+    carrying,
     fingerprint_of,
     ground_truth,
     metadata,
@@ -52,12 +64,13 @@ from tests.superset_live.live import (
 use_extension_source()
 
 from agenticfabriq.mnemiq.token import ASK_SCOPES, BUILD_SCOPES  # noqa: E402
+from agenticfabriq.mnemiq.writes import LOCK_TIMEOUT_S  # noqa: E402
 
 pytestmark = pytest.mark.integration
 
 BUILD = " ".join(BUILD_SCOPES)
 ASK = " ".join(ASK_SCOPES)
-WRITE_TOOLS = ("create_dashboard", "claim_chart", "claim_dataset", "create_chart", "patch_chart", "add_saved_metric",
+WRITE_TOOLS = ("create_dashboard", "create_dataset", "create_chart", "patch_chart", "add_saved_metric",
                "delete_dataset", "set_layout")
 READ_TOOLS = ("dataset_metrics", "editors_of", "get_layout")
 # The builder in most tests: Alpha and sql_lab, narrowed by no row rule.
@@ -154,7 +167,8 @@ def spec(family: Family, dataset_id: int, **over) -> ChartSpec:
 
 
 def mcp_chart(client: SupersetMcp, chart: ChartSpec) -> int:
-    """A chart MCP's `generate_chart` saves from mnemiq's own request, as a build makes one."""
+    """A chart MCP's `generate_chart` saves from mnemiq's own `generate_chart_request`: what MCP itself saves for the
+    chart config a build sends the extension, for a test to compare with. A build no longer makes a chart this way."""
     answer = client.call("generate_chart", generate_chart_request(chart, {}, {}, currency="USD"))
     assert answer.get("success") and (answer.get("chart") or {}).get("id"), {k: answer.get(k) for k in
                                                                            ("success", "error")}
@@ -167,8 +181,96 @@ def extension_chart(build: Build, chart: ChartSpec, step: str = "chart") -> dict
     return call(build.client, "create_chart", **request, dashboard_id=build.dashboard_id, marker=build.marker(step))
 
 
+def config_request(build: Build, chart: ChartSpec, marker: str) -> dict:
+    """The extension's `create_chart` request a build sends for `chart`, of one of MCP's chart types: mnemiq's own
+    `config_chart_request`, with the build's dashboard and `marker`."""
+    return {**config_chart_request(chart, {}, {}, currency="USD"), "dashboard_id": build.dashboard_id,
+            "marker": marker}
+
+
+def config_chart(build: Build, chart: ChartSpec, step: str = "chart") -> dict:
+    """The extension's `create_chart` answer for `chart` made as a build makes it (`config_request`), for `step`."""
+    return call(build.client, "create_chart", **config_request(build, chart, build.marker(step)))
+
+
+def made_chart(build: Build, chart: ChartSpec, step: str = "chart") -> int:
+    """The id of `chart`, made by the extension as a build makes it."""
+    answer = extension_chart(build, chart, step) if chart.family in (Family.FUNNEL, Family.SANKEY) else config_chart(
+        build, chart, step)
+    assert set(answer) == {"chart_id"}, answer
+    return answer["chart_id"]
+
+
+@dataclass
+class Made:
+    """What a test made, removed when it ends as analyst removes what it made: each chart through MCP's
+    `delete_chart`, each dataset through the extension's `delete_dataset` (into Superset's trash), each dashboard
+    through MCP's `delete_dashboard`, then each table the test made in the source database dropped. An id is recorded
+    the moment an answer names it, before anything about it is asserted."""
+
+    live: object
+    charts: list[int] = field(default_factory=list)
+    datasets: list[tuple[int, int]] = field(default_factory=list)
+    dashboards: list[int] = field(default_factory=list)
+    tables: list[str] = field(default_factory=list)
+
+    def build(self, client: SupersetMcp, title: str) -> Build:
+        build = new_build(client, title)
+        self.dashboards.append(build.dashboard_id)
+        return build
+
+    def chart(self, answer: dict) -> dict:
+        found = answer.get("chart_id") if isinstance(answer, dict) else None
+        if type(found) is int and found not in self.charts:
+            self.charts.append(found)
+        return answer
+
+    def dataset(self, answer: dict, dashboard_id: int) -> dict:
+        found = answer.get("dataset_id") if isinstance(answer, dict) else None
+        if type(found) is int and (found, dashboard_id) not in self.datasets:
+            self.datasets.append((found, dashboard_id))
+        return answer
+
+    def remove(self) -> list:
+        """Remove everything recorded; what could not be removed, by kind and id."""
+        import psycopg
+        from psycopg import sql
+
+        problems: list = []
+        client = as_user(self.live, BUILDER)
+        for kind, ids, remove in (
+                ("chart", self.charts, lambda i: client.call("delete_chart", {"identifier": i})),
+                ("dataset", self.datasets, lambda pair: call(client, "delete_dataset", dataset_id=pair[0],
+                                                             dashboard_id=pair[1])),
+                ("dashboard", self.dashboards, lambda i: client.call("delete_dashboard", {"identifier": i}))):
+            for item in ids:
+                try:
+                    answer = remove(item)
+                except Exception as exc:  # noqa: BLE001 (reported, so the rest is still removed)
+                    problems.append((kind, item, type(exc).__name__))
+                    continue
+                if answer.get("success") is False or (kind == "dataset" and answer != {"ok": True,
+                                                                                         "soft_deleted": True}):
+                    problems.append((kind, item, answer.get("error_type") or answer))
+        for name in self.tables:
+            with psycopg.connect(self.live.pg_dsn, autocommit=True, connect_timeout=10) as con:
+                con.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier("public", name)))
+        return problems
+
+
+@pytest.fixture
+def made(live):
+    """What the test makes, removed when it ends (`Made`); a removal that fails fails the test's teardown."""
+    found = Made(live)
+    yield found
+    problems = found.remove()
+    assert not problems, problems
+
+
 def virtual_dataset(live, client: SupersetMcp, description: str | None, **more) -> int:
-    """A virtual dataset over `policy` made with MCP's `create_virtual_dataset`, as a build makes one."""
+    """A virtual dataset over `policy` made with MCP's `create_virtual_dataset`, with `description` as it is given and
+    any saved metrics of its own (`metrics`): a dataset a person or another tool made, its creator its one editor. A
+    build makes its datasets with the extension's `create_dataset` (`marked_dataset`)."""
     request = {"database_id": live.database_id, "sql": POLICY_COLUMNS, "schema_name": "public",
                "dataset_name": f"mnemiq_live_{uuid.uuid4().hex[:10]}", **more}
     if description is not None:
@@ -176,6 +278,18 @@ def virtual_dataset(live, client: SupersetMcp, description: str | None, **more) 
     answer = client.call("create_virtual_dataset", request)
     assert answer.get("id"), answer.get("error")
     return answer["id"]
+
+
+def marked_dataset(live, build: Build, step: str) -> int:
+    """A virtual dataset over `policy` made for the build's dashboard by the extension's `create_dataset`, as a build
+    makes one: its prose and the step's marker as its description, and as editors the caller and the dashboard's
+    users whose grants already reach it."""
+    answer = call(build.client, "create_dataset", database_id=live.database_id, schema="public",
+                  table_name=f"mnemiq_live_{uuid.uuid4().hex[:10]}", sql=POLICY_COLUMNS,
+                  description=f"Made by mnemiq for dashboard {build.dashboard_id}.", dashboard_id=build.dashboard_id,
+                  marker=build.marker(step))
+    assert set(answer) == {"dataset_id"}, answer
+    return answer["dataset_id"]
 
 
 def changed_on(client: SupersetMcp, kind: str, object_id: int) -> str:
@@ -265,6 +379,25 @@ def _waiting_on(table: str) -> int:
     return metadata("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
                     "AND wait_event_type = 'Lock' AND query ILIKE %s AND pid <> pg_backend_pid()",
                     (f"SELECT {table}.%",))[0][0]
+
+
+def _hold_marker(marker: str):
+    """A connection of the test's own to Superset's metadata database, inside a transaction that holds an advisory lock
+    on the key a create carrying `marker` takes its lock on (`hashtextextended(marker, 0)`) until it is rolled back.
+    Postgres's advisory locks of a transaction and of a session share their keys, so the create's own lock on that
+    key (`pg_advisory_lock`) waits for this one."""
+    import psycopg
+
+    con = psycopg.connect(required("MNEMIQ_TEST_SUPERSET_METADATA_URI")["MNEMIQ_TEST_SUPERSET_METADATA_URI"],
+                          connect_timeout=10)
+    con.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (marker,))
+    return con
+
+
+def _waiting_on_advisory_locks() -> int:
+    """How many other sessions of the metadata database wait for an advisory lock: a create waiting for its marker's."""
+    return metadata("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                    "AND wait_event_type = 'Lock' AND wait_event = 'advisory' AND pid <> pg_backend_pid()")[0][0]
 
 
 def race(table: str, row_id: int, writers: list[Callable[[], dict]]) -> list[dict]:
@@ -529,22 +662,22 @@ def test_minted_token_passes_mcp_and_mnemiqs_door(live, extension, model, enrich
 
 
 def test_saved_query_context_applies_the_grain(live, extension, policy_id):
-    """A monthly line chart made by `generate_chart` (COUNT(*) by `issued`, grain P1M) and claimed by the extension
-    answers `get_chart_data` with one row per month: 12 rows, each month's count the source's. The claim also gives
-    the chart the dashboard's editors and the build's marker as its description. The control: before the claim the
-    chart has no saved query context, and rc2 rebuilds its query from `form_data` without the grain, so it does not
-    answer the twelve months."""
+    """A monthly line chart (COUNT(*) by `issued`, grain P1M) made by the extension's `create_chart` as a build makes
+    it is saved with a query context whose time axis carries the grain, the dashboard's editors and the build's marker
+    as its description, and answers `get_chart_data` with one row per month: 12 rows, each month's count the source's.
+    The control: the same chart saved by MCP's `generate_chart` has no saved query context, and rc2 rebuilds its query
+    from `form_data` without the grain, so it does not answer the twelve months."""
     client = as_user(live, BUILDER)
     build = new_build(client, "grain")
-    chart_id = mcp_chart(client, spec(Family.LINE, policy_id, time_column="issued", time_grain="P1M"))
+    line = spec(Family.LINE, policy_id, time_column="issued", time_grain="P1M")
     truth = [count for _, count in ground_truth(live, MONTHLY)]
     assert len(truth) == 12
-    before = chart_data(client, chart_id)
+    control = mcp_chart(client, line)
+    before = chart_data(client, control)
     before_counts = [row.get("policies") for row in sorted(before.get("data") or [], key=lambda r: r["issued"])]
-    assert stored_chart(chart_id)["query_context"] is None
+    assert stored_chart(control)["query_context"] is None
     assert before_counts != truth
-    assert call(client, "claim_chart", chart_id=chart_id, dashboard_id=build.dashboard_id,
-                marker=build.marker("by_month")) == {"ok": True}
+    chart_id = made_chart(build, line, "by_month")
     stored = stored_chart(chart_id)
     (axis,) = [c for c in stored["query_context"]["queries"][0]["columns"] if isinstance(c, dict)]
     assert axis["timeGrain"] == "P1M" and axis["columnType"] == "BASE_AXIS"
@@ -559,26 +692,25 @@ def test_saved_query_context_applies_the_grain(live, extension, policy_id):
 
 
 def test_saved_query_context_keeps_pivot_and_waterfall_grouping(live, extension, policy_id):
-    """A pivot (rows region, columns status, COUNT(*)) made by `generate_chart` and claimed answers `get_chart_data`
-    with one row per region and status, nine in all, each count the source's, and no totals row. A waterfall
-    (x-axis `issued` by month, broken down by status) answers one row per month and status, each count the source's:
-    its x-axis kept and its grain applied. The control: before the claim, neither answers as many rows as the
-    source's grouping has (rc2's rebuild from `form_data` reads neither the pivot's rows and columns nor the
-    waterfall's x-axis); what each answered is observed."""
+    """A pivot (rows region, columns status, COUNT(*)) made by the extension's `create_chart` as a build makes it
+    answers `get_chart_data` with one row per region and status, nine in all, each count the source's, and no totals
+    row. A waterfall (x-axis `issued` by month, broken down by status) answers one row per month and status, each
+    count the source's: its x-axis kept and its grain applied. The control: the same two saved by MCP's
+    `generate_chart`, with no query context, answer fewer rows than the source's grouping has (rc2's rebuild from
+    `form_data` reads neither the pivot's rows and columns nor the waterfall's x-axis); what each answered is
+    observed."""
     client = as_user(live, BUILDER)
     build = new_build(client, "grouping")
-    pivot = mcp_chart(client, spec(Family.PIVOT, policy_id, dimensions=("region", "status")))
-    waterfall = mcp_chart(client, spec(Family.WATERFALL, policy_id, time_column="issued", time_grain="P1M",
-                                       dimensions=("status",)))
+    charts = {"pivot": spec(Family.PIVOT, policy_id, dimensions=("region", "status")),
+              "waterfall": spec(Family.WATERFALL, policy_id, time_column="issued", time_grain="P1M",
+                                dimensions=("status",))}
     pivot_truth = sorted(ground_truth(live, BY_REGION_AND_STATUS))
     waterfall_truth = ground_truth(live, MONTHLY_BY_STATUS)
     assert len(pivot_truth) == 9
-    before = {name: chart_data(client, chart_id) for name, chart_id in (("pivot", pivot), ("waterfall", waterfall))}
+    before = {name: chart_data(client, mcp_chart(client, chart)) for name, chart in charts.items()}
     assert len(before["pivot"].get("data") or []) != len(pivot_truth)
     assert len(before["waterfall"].get("data") or []) != len(waterfall_truth)
-    for name, chart_id in (("pivot", pivot), ("waterfall", waterfall)):
-        assert call(client, "claim_chart", chart_id=chart_id, dashboard_id=build.dashboard_id,
-                    marker=build.marker(name)) == {"ok": True}
+    pivot, waterfall = (made_chart(build, chart, name) for name, chart in charts.items())
     pivot_rows = sorted((r["region"], r["status"], r["policies"]) for r in chart_data(client, pivot)["data"])
     assert pivot_rows == pivot_truth
     waterfall_rows = [(r["issued"], r["status"], r["policies"]) for r in chart_data(client, waterfall)["data"]]
@@ -604,10 +736,10 @@ def written(dataset_id: int, label: str, expression: str) -> WrittenRef:
                               kind=MeasureKind.CURRENCY, dataset_id=dataset_id, description=label, asked_by=BUILDER))
 
 
-def test_claimed_charts_read_checked_by_the_value_check(live, extension, policy_id, recorder):
+def test_charts_made_by_the_extension_read_checked_by_the_value_check(live, extension, policy_id, recorder):
     """A monthly line chart, a pivot (rows region, columns status) and a waterfall (`issued` by month, by status), each
-    of the measure `SUM(premium)`, made by `generate_chart` from mnemiq's own `generate_chart_request` and claimed by
-    the extension, read CHECKED through `check_chart`, with mnemiq's real client and adapter as the builder. The pivot
+    of the measure `SUM(premium)`, made by the extension's `create_chart` from mnemiq's own `config_chart_request`,
+    read CHECKED through `check_chart`, with mnemiq's real client and adapter as the builder. The pivot
     keeps MCP's totals and the waterfall MCP's total bar, as mnemiq's request leaves them; both are sums of a SUM. The
     check compares 12, 9 and 35 groups, and judges each chart's format. The pivot's numbers are the source's, read
     directly. A pivot of the ratio `SUM(premium) / COUNT(*)` with its totals reads NOT_CHECKED, since its totals are
@@ -624,11 +756,7 @@ def test_claimed_charts_read_checked_by_the_value_check(live, extension, policy_
                                                                        "SUM(premium) / COUNT(*)"),),
                             dimensions=("region", "status")),
     }
-    ids = {}
-    for name, chart in charts.items():
-        ids[name] = mcp_chart(client, chart)
-        assert call(client, "claim_chart", chart_id=ids[name], dashboard_id=build.dashboard_id,
-                    marker=build.marker(name)) == {"ok": True}
+    ids = {name: made_chart(build, chart, name) for name, chart in charts.items()}
     stored = {name: stored_chart(chart_id)["params"] for name, chart_id in ids.items()}
     assert (stored["pivot"]["rowTotals"], stored["pivot"]["colTotals"], stored["waterfall"]["show_total"]) == (
         True, True, True)
@@ -658,37 +786,34 @@ def test_claimed_charts_read_checked_by_the_value_check(live, extension, policy_
 # --- patch_chart ----------------------------------------------------------------------------------------------------
 
 
-def _claimed_line(live, client: SupersetMcp, policy_id: int, title: str) -> tuple[Build, int]:
+def _made_line(live, client: SupersetMcp, policy_id: int, title: str) -> tuple[Build, int]:
+    """A build's dashboard and a monthly line chart the extension made for it, as a build makes one."""
     build = new_build(client, title)
-    chart_id = mcp_chart(client, spec(Family.LINE, policy_id, time_column="issued", time_grain="P1M"))
-    assert call(client, "claim_chart", chart_id=chart_id, dashboard_id=build.dashboard_id,
-                marker=build.marker("line")) == {"ok": True}
-    return build, chart_id
+    return build, made_chart(build, spec(Family.LINE, policy_id, time_column="issued", time_grain="P1M"), "line")
 
 
 def test_patch_with_stale_changed_on_is_refused(live, extension, policy_id):
-    """A patch that sends the `changed_on` `get_chart_info` answered before the claim (since replaced) answers
-    exactly `{stale: true}` and changes nothing: the chart's params, query context and `changed_on` are as they were.
-    The same patch with the `changed_on` read after the claim answers `{ok: true}` and sets only `row_limit`, every
+    """A patch that sends a `changed_on` `get_chart_info` answered before another patch replaced it answers exactly
+    `{stale: true}` and changes nothing: the chart's params, query context and `changed_on` are as the other patch left
+    them. The same patch with the `changed_on` read after that answers `{ok: true}` and sets only `row_limit`, every
     other params key as it was, and the query context follows (`row_limit` 77)."""
     client = as_user(live, BUILDER)
-    build = new_build(client, "stale")
-    chart_id = mcp_chart(client, spec(Family.LINE, policy_id, time_column="issued", time_grain="P1M"))
+    _, chart_id = _made_line(live, client, policy_id, "stale")
     old = changed_on(client, "chart", chart_id)
-    assert call(client, "claim_chart", chart_id=chart_id, dashboard_id=build.dashboard_id,
-                marker=build.marker("line")) == {"ok": True}
-    claimed = stored_chart(chart_id)
+    assert call(client, "patch_chart", chart_id=chart_id, set={"color_scheme": "bnbColors"},
+                expect_changed_on=old) == {"ok": True}
+    other = stored_chart(chart_id)
     assert call(client, "patch_chart", chart_id=chart_id, set={"row_limit": 77}, expect_changed_on=old) == {
         "stale": True}
-    assert stored_chart(chart_id) == claimed
+    assert stored_chart(chart_id) == other
     fresh = changed_on(client, "chart", chart_id)
     assert fresh != old
     assert call(client, "patch_chart", chart_id=chart_id, set={"row_limit": 77}, expect_changed_on=fresh) == {
         "ok": True}
     patched = stored_chart(chart_id)
-    assert patched["params"] == {**claimed["params"], "row_limit": 77}
+    assert patched["params"] == {**other["params"], "row_limit": 77}
     assert patched["query_context"]["queries"][0]["row_limit"] == 77
-    observe("stale", before_claim=old, after_claim=fresh)
+    observe("stale", first_read=old, after_other_patch=fresh)
 
 
 def test_simultaneous_patches_lose_nothing(live, extension, policy_id):
@@ -697,7 +822,7 @@ def test_simultaneous_patches_lose_nothing(live, extension, policy_id):
     `{ok: true}` and the other exactly `{stale: true}`: the second waited for the first one's commit, then saw its
     `changed_on`. The winner's key is set and the loser's is not, and every other params key is as it was."""
     client = as_user(live, BUILDER)
-    _, chart_id = _claimed_line(live, client, policy_id, "race")
+    _, chart_id = _made_line(live, client, policy_id, "race")
     before = stored_chart(chart_id)["params"]
     seen = changed_on(client, "chart", chart_id)
     keys = {"row_limit": 321, "color_scheme": "bnbColors"}
@@ -725,7 +850,7 @@ def test_a_write_held_up_past_the_lock_timeout_answers_busy(live, extension, pol
     holds it 20 seconds at most), and changes nothing. The control: once the row is let go, the same request answers
     `{ok}` and sets the key."""
     client = as_user(live, BUILDER)
-    _, chart_id = _claimed_line(live, client, policy_id, "busy")
+    _, chart_id = _made_line(live, client, policy_id, "busy")
     request = {"chart_id": chart_id, "set": {"row_limit": 77}, "unset": [],
                "expect_changed_on": changed_on(client, "chart", chart_id)}
     port = 15011
@@ -764,11 +889,11 @@ def test_a_write_held_up_past_the_lock_timeout_answers_busy(live, extension, pol
     assert stored_chart(chart_id)["params"]["row_limit"] == 77
 
 
-def _claimed_dataset(live, build: Build, step: str, **more) -> int:
-    dataset_id = virtual_dataset(live, build.client, build.marker(step), **more)
-    assert call(build.client, "claim_dataset", dataset_id=dataset_id, dashboard_id=build.dashboard_id,
-                marker=build.marker(step)) == {"ok": True}
-    return dataset_id
+def _seeded_dataset(live, build: Build, step: str, metrics: list[dict]) -> int:
+    """A dataset with saved metrics of its own, the step's marker its description: made by MCP's
+    `create_virtual_dataset`, since the extension's `create_dataset` takes no metrics (a build adds its own through
+    `add_saved_metric`, which sets no warning text). Its creator, analyst, is its one editor."""
+    return virtual_dataset(live, build.client, build.marker(step), metrics=metrics)
 
 
 def _metric(name: str, expression: str = "AVG(premium)", **more) -> dict:
@@ -781,8 +906,8 @@ def test_simultaneous_metric_saves_keep_both_or_refuse_one(live, extension):
     metric is lost: every metric the dataset had is there unchanged, the winner's is there, and the loser's is not."""
     client = as_user(live, BUILDER)
     build = new_build(client, "metric race")
-    dataset_id = _claimed_dataset(live, build, "metrics",
-                                  metrics=[{"metric_name": "total_premium", "expression": "SUM(premium)"}])
+    dataset_id = _seeded_dataset(live, build, "metrics",
+                                 [{"metric_name": "total_premium", "expression": "SUM(premium)"}])
     before = stored_metrics(dataset_id)
     seen = changed_on(client, "dataset", dataset_id)
     names = ("avg_premium", "max_premium")
@@ -807,7 +932,7 @@ def test_add_saved_metric_keeps_existing_metrics(live, extension):
     `{exists: true}` and changes nothing."""
     client = as_user(live, BUILDER)
     build = new_build(client, "metrics")
-    dataset_id = _claimed_dataset(live, build, "metrics", metrics=[{
+    dataset_id = _seeded_dataset(live, build, "metrics", [{
         "metric_name": "total_premium", "expression": "SUM(premium)", "verbose_name": "Total premium",
         "d3format": ",.2f", "warning_text": "kept as it was"}])
     before = stored_metrics(dataset_id)
@@ -838,7 +963,7 @@ def test_add_saved_metric_refuses_a_row_level_expression(live, extension):
     are as they were. The control: `SUM(premium)` on the same dataset answers `{ok: true}`."""
     client = as_user(live, BUILDER)
     build = new_build(client, "row level")
-    dataset_id = _claimed_dataset(live, build, "metrics")
+    dataset_id = marked_dataset(live, build, "metrics")
     before, seen = stored_metrics(dataset_id), changed_on(client, "dataset", dataset_id)
     for expression in ("premium", "SUM(premium) OVER ()"):
         assert call(client, "add_saved_metric", dataset_id=dataset_id, metric=_metric("row_level", expression),
@@ -866,7 +991,7 @@ def test_set_layout_moves_membership_with_positions(live, extension, policy_id):
     (`{refused: "chart_access", chart_ids: [...]}`), and one sent with a `changed_on` since replaced (`{stale}`)."""
     client = as_user(live, BUILDER)
     build = new_build(client, "layout")
-    one, two, three = (mcp_chart(client, spec(Family.BIG_NUMBER, policy_id)) for _ in range(3))
+    one, two, three = (made_chart(build, spec(Family.BIG_NUMBER, policy_id), f"kpi_{i}") for i in range(3))
     first = changed_on(client, "dashboard", build.dashboard_id)
     assert _layout(build, [one, two], add=[one, two]) == {"ok": True}
     assert members(build.dashboard_id) == sorted([one, two])
@@ -891,7 +1016,7 @@ def test_simultaneous_layout_saves(live, extension, policy_id):
     the other exactly `{stale: true}`, and the dashboard's charts are the winner's alone."""
     client = as_user(live, BUILDER)
     build = new_build(client, "layout race")
-    charts = [mcp_chart(client, spec(Family.BIG_NUMBER, policy_id)) for _ in range(2)]
+    charts = [made_chart(build, spec(Family.BIG_NUMBER, policy_id), f"kpi_{i}") for i in range(2)]
     seen = changed_on(client, "dashboard", build.dashboard_id)
     answers = race("dashboards", build.dashboard_id, [
         lambda chart=chart: call(as_user(live, BUILDER), "set_layout", dashboard_id=build.dashboard_id,
@@ -908,7 +1033,7 @@ def test_layout_save_keeps_filters_and_reports(live, extension, policy_id):
     dashboard still has the filter, and the report is still active."""
     client = as_user(live, BUILDER)
     build = new_build(client, "filters")
-    one, two = (mcp_chart(client, spec(Family.BIG_NUMBER, policy_id)) for _ in range(2))
+    one, two = (made_chart(build, spec(Family.BIG_NUMBER, policy_id), f"kpi_{i}") for i in range(2))
     assert _layout(build, [one], add=[one]) == {"ok": True}
     made = json.loads(run_setup("filter-and-report", str(build.dashboard_id), BUILDER))
 
@@ -974,58 +1099,261 @@ def test_funnel_params_and_query_context(live, extension, policy_id):
     assert metadata("SELECT count(*) FROM slices WHERE slice_name = %s", (broken.title,)) == [(0,)]
 
 
-# --- claims, editors and deletes ------------------------------------------------------------------------------------
+# --- a create carrying a build's marker -----------------------------------------------------------------------------
 
 
-def test_claim_refuses_another_builds_chart(live, extension, policy_id):
-    """A chart build A claimed for its dashboard, claimed again with build B's marker for the same dashboard, answers
-    `{claimed_by_another: true}` and keeps build A's marker. Claimed again with build A's own marker it answers
-    `{ok: true}`, and its description is still one marker line, A's."""
+def test_create_chart_twice_with_one_marker_makes_one_chart(live, extension, policy_id, made):
+    """A monthly line chart made by the extension's `create_chart` from mnemiq's own request (`config_chart_request`)
+    answers `{chart_id}`, and its description is the build's marker alone. The same request sent again, as a build
+    sends a create whose answer was lost, answers the same `{chart_id}` and changes nothing: the chart's row is as it
+    was, and Superset holds one chart carrying the marker and one of that name. The control: the same request with
+    another build's marker for the same step and dashboard makes a chart of its own, and the first chart still carries
+    its own build's marker: a create finds a chart by its marker, never by its name, dataset or dashboard."""
     client = as_user(live, BUILDER)
-    build = new_build(client, "claims")
-    chart_id = mcp_chart(client, spec(Family.BIG_NUMBER, policy_id))
-    assert call(client, "claim_chart", chart_id=chart_id, dashboard_id=build.dashboard_id,
-                marker=build.marker("kpi")) == {"ok": True}
-    other = format_marker(str(uuid.uuid4()), "kpi", build.dashboard_id)
-    assert call(client, "claim_chart", chart_id=chart_id, dashboard_id=build.dashboard_id, marker=other) == {
-        "claimed_by_another": True}
-    assert stored_chart(chart_id)["description"] == build.marker("kpi")
-    assert call(client, "claim_chart", chart_id=chart_id, dashboard_id=build.dashboard_id,
-                marker=build.marker("kpi")) == {"ok": True}
-    assert stored_chart(chart_id)["description"] == build.marker("kpi")
+    build = made.build(client, "once")
+    chart = spec(Family.LINE, policy_id, time_column="issued", time_grain="P1M")
+    marker = build.marker("by_month")
+    first = made.chart(call(client, "create_chart", **config_request(build, chart, marker)))
+    assert set(first) == {"chart_id"}, first
+    chart_id = first["chart_id"]
+    stored = stored_chart(chart_id)
+    assert stored["description"] == marker
+    assert parse_marker(stored["description"]) == Marker(build.build_id, "by_month", build.dashboard_id)
+    again = made.chart(call(client, "create_chart", **config_request(build, chart, marker)))
+    assert again == first
+    assert stored_chart(chart_id) == stored
+    assert carrying("slices", marker) == [(chart_id, None)]
+    named = "SELECT id FROM slices WHERE slice_name = %s ORDER BY id"
+    assert metadata(named, (chart.title,)) == [(chart_id,)]
+    other = format_marker(str(uuid.uuid4()), "by_month", build.dashboard_id)
+    theirs = made.chart(call(client, "create_chart", **config_request(build, chart, other)))
+    assert set(theirs) == {"chart_id"} and theirs["chart_id"] != chart_id, theirs
+    assert stored_chart(chart_id) == stored
+    assert carrying("slices", other) == [(theirs["chart_id"], None)]
+    assert metadata(named, (chart.title,)) == [(chart_id,), (theirs["chart_id"],)]
+    observe("create_twice", chart_id=chart_id, other_build=theirs["chart_id"])
 
 
-def test_simultaneous_claims_by_two_builds_leave_one(live, extension, policy_id):
-    """Two builds claim one chart for the same dashboard at once, each with its own build's marker, started together
-    while the test holds the chart's row lock and let go once both wait. One answers `{ok: true}` and the other exactly
-    `{claimed_by_another: true}`: the second waited for the first one's commit, then read its marker under the lock.
-    The chart's description is the winner's marker alone."""
+def test_concurrent_creates_with_one_marker_make_one_chart(live, extension, policy_id, made):
+    """Two clients send one create (a bar chart by region, one marker) at once. The test holds the marker's lock from
+    a connection of its own until both creates wait for it, so both have passed the caller's checks, which run before
+    the lock, and neither has looked for the chart or checked its query yet; then it lets the lock go well inside the
+    lock timeout. The first to take it looks, checks the chart's query and makes the chart, holding the lock through
+    the commit; the other waits for it, then finds that chart. Both answer the same `{chart_id}`, and Superset holds
+    one chart carrying the marker and one of that name."""
     client = as_user(live, BUILDER)
-    build = new_build(client, "claim race")
-    chart_id = mcp_chart(client, spec(Family.BIG_NUMBER, policy_id))
-    markers = [build.marker("kpi"), format_marker(str(uuid.uuid4()), "kpi", build.dashboard_id)]
-    answers = race("slices", chart_id, [
-        lambda marker=marker: call(as_user(live, BUILDER), "claim_chart", chart_id=chart_id,
-                                   dashboard_id=build.dashboard_id, marker=marker)
-        for marker in markers])
-    assert sorted(answers, key=lambda a: "claimed_by_another" in a) == [{"ok": True}, {"claimed_by_another": True}], (
-        answers)
-    assert stored_chart(chart_id)["description"] == markers[answers.index({"ok": True})]
-    observe("claim_race", answers=answers)
+    build = made.build(client, "concurrent")
+    chart = spec(Family.BAR, policy_id, dimensions=("region",))
+    marker = build.marker("by_region")
+    request = config_request(build, chart, marker)
+    answers: list = [None, None]
+    errors: list[BaseException] = []
+
+    def send(index: int) -> None:
+        try:
+            answers[index] = call(as_user(live, BUILDER), "create_chart", **request)
+        except BaseException as exc:  # noqa: BLE001 (reported below)
+            errors.append(exc)
+
+    threads = [threading.Thread(target=send, args=(index,)) for index in range(2)]
+    held = _hold_marker(marker)
+    started = time.monotonic()
+    try:
+        for thread in threads:
+            thread.start()
+        while _waiting_on_advisory_locks() < 2:
+            assert time.monotonic() - started < LOCK_TIMEOUT_S - 5, "the creates never both waited for the lock"
+            assert not errors, errors
+            time.sleep(0.1)
+        both_waiting = time.monotonic() - started
+    finally:
+        held.rollback()
+        held.close()
+        for thread in threads:
+            thread.join(90)
+        for answer in answers:
+            made.chart(answer or {})
+    observe("concurrent_creates", answers=answers, both_waiting_after_s=round(both_waiting, 1))
+    assert not errors, errors
+    assert set(answers[0]) == {"chart_id"} and answers[1] == answers[0], answers
+    assert carrying("slices", marker) == [(answers[0]["chart_id"], None)]
+    assert metadata("SELECT count(*) FROM slices WHERE slice_name = %s", (chart.title,)) == [(1,)]
+
+
+def test_a_create_behind_a_held_marker_lock_answers_busy(live, extension, policy_id, made):
+    """While a connection of the test's own holds the marker's lock inside a transaction (as a create carrying that
+    marker holds it from its look until after its commit), a create carrying the marker (a pie by status) waits for it
+    the lock timeout (30 seconds, the extension's default, which the suite's Superset keeps) and answers exactly
+    `{busy: true}`, within 40 seconds of the call, having made nothing: no chart carries the marker or the chart's
+    name. Let go, the same request makes the chart: `{chart_id}`, the one chart carrying the marker."""
+    client = as_user(live, BUILDER)
+    build = made.build(client, "held lock")
+    chart = spec(Family.PIE, policy_id, dimensions=("status",))
+    marker = build.marker("by_status")
+    request = config_request(build, chart, marker)
+    named = "SELECT count(*) FROM slices WHERE slice_name = %s"
+    held = _hold_marker(marker)
+    try:
+        started = time.monotonic()
+        answer = made.chart(call(client, "create_chart", **request))
+        waited = time.monotonic() - started
+        while_held = (carrying("slices", marker), metadata(named, (chart.title,)))
+    finally:
+        held.rollback()
+        held.close()
+    observe("held_marker_lock", answer=answer, waited_s=round(waited, 1))
+    assert answer == {"busy": True}
+    assert LOCK_TIMEOUT_S <= waited < 40, waited
+    assert while_held == ([], [(0,)])
+    after = made.chart(call(client, "create_chart", **request))
+    assert set(after) == {"chart_id"}, after
+    assert carrying("slices", marker) == [(after["chart_id"], None)]
+    assert metadata(named, (chart.title,)) == [(1,)]
+
+
+def test_create_dataset_physical_and_virtual_carry_the_marker(live, extension, made):
+    """For a build's dashboard, as a build makes them, each by the extension's `create_dataset`: a physical dataset
+    over a table of the test's own (made in the source database, so no dataset exists on it), and a virtual one over a
+    statement of `policy`. Each answers `{dataset_id}`; Superset holds it on that table with no SQL, or with that SQL;
+    its description's last line is the build's marker for its step (the virtual one's prose before it); and analyst,
+    the dashboard's one editor, is its one editor. Each request sent again answers the same id and leaves its table,
+    SQL, description and editors as they were, the physical one found by its marker before rc2's check that a table
+    holds one dataset; Superset holds one dataset carrying each marker. The control: the same table asked for with
+    another build's marker answers `{exists: true}` and makes nothing."""
+    import psycopg
+    from psycopg import sql
+
+    client = as_user(live, BUILDER)
+    build = made.build(client, "datasets")
+    table = f"live_marked_{uuid.uuid4().hex[:8]}"
+    made.tables.append(table)
+    with psycopg.connect(live.pg_dsn, autocommit=True, connect_timeout=10) as con:
+        con.execute(sql.SQL("CREATE TABLE {} (id integer PRIMARY KEY, region text NOT NULL)").format(
+            sql.Identifier("public", table)))
+    base = {"database_id": live.database_id, "schema": "public", "dashboard_id": build.dashboard_id}
+    requests = {
+        "physical": {**base, "table_name": table, "marker": build.marker("physical")},
+        "virtual": {**base, "table_name": f"mnemiq_live_{uuid.uuid4().hex[:10]}", "sql": POLICY_COLUMNS,
+                    "description": f"Made by mnemiq for dashboard {build.dashboard_id}.",
+                    "marker": build.marker("virtual")}}
+    ids = {}
+    for step, request in requests.items():
+        answer = made.dataset(call(client, "create_dataset", **request), build.dashboard_id)
+        assert set(answer) == {"dataset_id"}, (step, answer)
+        ids[step] = answer["dataset_id"]
+    columns = "SELECT table_name, schema, sql, description, created_by_fk, deleted_at FROM tables WHERE id = %s"
+    rows = {step: metadata(columns, (dataset_id,))[0] for step, dataset_id in ids.items()}
+    assert rows["physical"][:4] == (table, "public", None, requests["physical"]["marker"]), rows["physical"]
+    assert rows["virtual"][:4] == (requests["virtual"]["table_name"], "public", POLICY_COLUMNS,
+                                   f"{requests['virtual']['description']}\n{requests['virtual']['marker']}")
+    for step, dataset_id in ids.items():
+        assert parse_marker(rows[step][3]) == Marker(build.build_id, step, build.dashboard_id)
+        assert rows[step][5] is None
+        assert editor_ids("sqlatable_editors", "table_id", dataset_id) == [subject_of(username=BUILDER)]
+    for step, request in requests.items():
+        again = made.dataset(call(client, "create_dataset", **request), build.dashboard_id)
+        assert again == {"dataset_id": ids[step]}, (step, again)
+        assert metadata(columns, (ids[step],))[0] == rows[step]
+        assert editor_ids("sqlatable_editors", "table_id", ids[step]) == [subject_of(username=BUILDER)]
+        assert carrying("tables", request["marker"]) == [(ids[step], None)]
+    other = {**requests["physical"], "marker": format_marker(str(uuid.uuid4()), "physical", build.dashboard_id)}
+    assert made.dataset(call(client, "create_dataset", **other), build.dashboard_id) == {"exists": True}
+    assert carrying("tables", other["marker"]) == []
+    assert metadata("SELECT count(*) FROM tables WHERE table_name = %s", (table,)) == [(1,)]
+    observe("create_dataset", **ids)
+
+
+# The families neither MCP's `generate_chart` nor the extension's `create_chart` saves in rc2, each run through MCP's
+# own checks first:
+# - the histogram: `_compile_chart` builds its query with `build_query_dicts_from_form_data`, which reads a chart's
+#   metrics and groupby, and a histogram's form data names its column under `column` alone (read by the histogram's
+#   post-processing), so the query selects nothing and the database answers "Empty query?";
+# - the interactive pivot: not among this rc2's enabled chart types (its plugin is not in rc2), which the config's
+#   validation refuses, as mnemiq's plan check refuses it before a build where it is not offered.
+BOTH_REFUSE = {"histogram", "interactive_pivot"}
+
+
+def test_a_config_chart_saves_what_generate_chart_saves(live, extension, policy_id, made):
+    """For every one of MCP's chart families, one chart spec sent both ways, each request built by mnemiq: to MCP's
+    `generate_chart` (`generate_chart_request`) and to the extension's `create_chart` (`config_chart_request`). The
+    two saved charts' params are equal key by key, once the format keys the extension's request carries under `set`
+    (`owed_format_params`: a table's column currencies, a treemap's number format), which MCP's chart config cannot
+    carry, are merged into MCP's; their name, viz type and dataset are equal. What differs is what the extension adds:
+    its description is the build's marker, where MCP's chart has none, and MCP's saves no query context.
+
+    Where MCP saves nothing, the extension saves nothing either: it answers a refusal and no chart of the name
+    exists. Those are the histogram and the interactive pivot alone (`BOTH_REFUSE`), so a family that starts failing
+    both ways fails here."""
+    client = as_user(live, BUILDER)
+    build = made.build(client, "same params")
+    count = WrittenRef(policies(policy_id))
+    total = written(policy_id, "total premium", "SUM(premium)")
+    monthly = {"time_column": "issued", "time_grain": "P1M"}
+    charts = {
+        "line": spec(Family.LINE, policy_id, measures=(total,), **monthly),
+        "bar": spec(Family.BAR, policy_id, dimensions=("region",)),
+        "area": spec(Family.AREA, policy_id, measures=(total,), dimensions=("status",), **monthly),
+        "scatter": spec(Family.SCATTER, policy_id, **monthly),
+        "table": spec(Family.TABLE, policy_id, measures=(total, count), dimensions=("region", "status")),
+        "pie": spec(Family.PIE, policy_id, measures=(total,), dimensions=("status",)),
+        "big_number": spec(Family.BIG_NUMBER, policy_id, measures=(total,)),
+        "gauge": spec(Family.GAUGE, policy_id),
+        "histogram": spec(Family.HISTOGRAM, policy_id, measures=(), dimensions=("premium",)),
+        "box_plot": spec(Family.BOX_PLOT, policy_id, dimensions=("region",)),
+        "pivot": spec(Family.PIVOT, policy_id, measures=(total,), dimensions=("region", "status")),
+        "interactive_pivot": spec(Family.INTERACTIVE_PIVOT, policy_id, measures=(total,),
+                                  dimensions=("region", "status")),
+        "treemap": spec(Family.TREEMAP, policy_id, measures=(total,), dimensions=("region", "status")),
+        "waterfall": spec(Family.WATERFALL, policy_id, measures=(total,), dimensions=("status",), **monthly),
+        "mixed": spec(Family.MIXED, policy_id, measures=(total, count), **monthly),
+        "handlebars": spec(Family.HANDLEBARS, policy_id, dimensions=("region",)),
+    }
+    assert {chart.family for chart in charts.values()} == set(Family) - {Family.FUNNEL, Family.SANKEY}
+    identity = "SELECT slice_name, viz_type, datasource_id, datasource_type FROM slices WHERE id = %s"
+    differing, contexts, refused = {}, {}, {}
+    for name, chart in charts.items():
+        answer = client.call("generate_chart", generate_chart_request(chart, {}, {}, currency="USD"))
+        mcp_id = (answer.get("chart") or {}).get("id")
+        made.chart({"chart_id": mcp_id})
+        own = made.chart(config_chart(build, chart, name))
+        if not answer.get("success"):
+            refused[name] = {"generate_chart": (answer.get("error") or {}).get("details"), "create_chart": own}
+            assert mcp_id is None and "chart_id" not in own and "refused" in own, (name, own)
+            assert metadata("SELECT count(*) FROM slices WHERE slice_name = %s", (chart.title,)) == [(0,)], name
+            continue
+        assert type(mcp_id) is int, name
+        assert set(own) == {"chart_id"}, (name, own)
+        theirs, ours = stored_chart(mcp_id), stored_chart(own["chart_id"])
+        expected = {**theirs["params"], **owed_format_params(chart, {}, {}, currency="USD")}
+        differing[name] = sorted(key for key in set(expected) | set(ours["params"])
+                                 if key not in expected or key not in ours["params"]
+                                 or expected[key] != ours["params"][key])
+        contexts[name] = ours["query_context"] is not None
+        assert metadata(identity, (mcp_id,)) == metadata(identity, (own["chart_id"],)), name
+        assert (theirs["description"], ours["description"]) == (None, build.marker(name)), name
+        assert theirs["query_context"] is None, name
+    observe("same_params", differing=differing, query_context=contexts, both_refused=refused)
+    assert not any(differing.values()), differing
+    assert set(refused) == BOTH_REFUSE, refused
+
+
+# --- editors and deletes ----------------------------------------------------------------------------------------------
 
 
 def test_non_editor_gets_editor_labels_not_a_change(live, extension, policy_id):
     """West (Alpha, able to read analyst's chart and dataset, editor of neither) is answered
-    `{not_editor: true, editors: [analyst's label]}` when patching analyst's claimed chart, adding a metric to
-    analyst's claimed dataset, claiming analyst's chart for west's own dashboard, and deleting analyst's dataset for
-    west's dashboard (whose id the dataset's marker does not name: not being an editor is answered first); the chart
-    and the dataset are as they were."""
+    `{not_editor: true, editors: [analyst's label]}` when patching analyst's chart, adding a metric to analyst's
+    dataset, sending again the very create that made analyst's chart (its marker, analyst's dashboard, published so
+    west may read it), as a retry by a caller who does not edit the dashboard, and deleting analyst's dataset for
+    west's dashboard (whose id the dataset's marker does not name: not being an editor is answered first). The chart
+    and the dataset are as they were, and the chart is still the one chart carrying its marker."""
     analyst = as_user(live, BUILDER)
     build = new_build(analyst, "editors")
-    chart_id = mcp_chart(analyst, spec(Family.BIG_NUMBER, policy_id))
-    assert call(analyst, "claim_chart", chart_id=chart_id, dashboard_id=build.dashboard_id,
-                marker=build.marker("kpi")) == {"ok": True}
-    dataset_id = _claimed_dataset(live, build, "data")
+    kpi = spec(Family.BIG_NUMBER, policy_id)
+    chart_id = made_chart(build, kpi, "kpi")
+    dataset_id = marked_dataset(live, build, "data")
+    published = analyst.call("update_dashboard", {"identifier": build.dashboard_id, "published": True})
+    assert published.get("success") is not False, published.get("error")
     chart_before, metrics_before = stored_chart(chart_id), stored_metrics(dataset_id)
     west = as_user(live, "west")
     refused = {"not_editor": True, "editors": [label_of(BUILDER)]}
@@ -1033,11 +1361,11 @@ def test_non_editor_gets_editor_labels_not_a_change(live, extension, policy_id):
                 expect_changed_on=changed_on(west, "chart", chart_id)) == refused
     assert call(west, "add_saved_metric", dataset_id=dataset_id, metric=_metric("west_metric"),
                 expect_changed_on=changed_on(west, "dataset", dataset_id)) == refused
+    assert call(west, "create_chart", **config_request(build, kpi, build.marker("kpi"))) == refused
     west_build = new_build(west, "west's")
-    assert call(west, "claim_chart", chart_id=chart_id, dashboard_id=west_build.dashboard_id,
-                marker=west_build.marker("kpi")) == refused
     assert call(west, "delete_dataset", dataset_id=dataset_id, dashboard_id=west_build.dashboard_id) == refused
     assert stored_chart(chart_id) == chart_before and stored_metrics(dataset_id) == metrics_before
+    assert carrying("slices", build.marker("kpi")) == [(chart_id, None)]
     assert metadata("SELECT deleted_at FROM tables WHERE id = %s", (dataset_id,)) == [(None,)]
     observe("not_editor", editors=refused["editors"])
 
@@ -1080,14 +1408,15 @@ def dataset_rows_as(live, username: str, dataset_id: int):
         return client.post("/api/v1/chart/data", json=body, headers={**headers, "X-CSRFToken": csrf})
 
 
-def test_a_claimed_dataset_gets_only_editors_who_could_already_read_it(live, extension):
+def test_a_created_dataset_gets_only_editors_who_could_already_read_it(live, extension):
     """In rc2 a dataset's editors may read its data (`raise_for_access` admits them), and a role made an editor makes
-    every member one, so `claim_dataset` adds as editors the caller and only those of the dashboard's users whose
+    every member one, so `create_dataset` makes as editors the caller and only those of the dashboard's users whose
     grants already reach the dataset and its table, never a role.
 
     analyst's dashboard is edited, through Superset's own API, by analyst, `west` (Alpha: may read every dataset),
     `gamma_only` (Gamma: may not read the dataset), `policy_only` (granted the `policy` dataset alone, not this one),
-    and the roles Gamma and Alpha. analyst makes a virtual dataset over `policy` and claims it for the dashboard:
+    and the roles Gamma and Alpha. analyst makes a virtual dataset over `policy` for the dashboard, as a build makes
+    one (`create_dataset`):
     - the dataset's editors are then exactly analyst and west;
     - `gamma_only` still may not read the dataset: Superset's chart data API answers its request 403, where
       analyst's same request answers each region's count, the source's;
@@ -1100,7 +1429,7 @@ def test_a_claimed_dataset_gets_only_editors_who_could_already_read_it(live, ext
                + [subject_of(role=name) for name in ("Gamma", "Alpha")])
     set_dashboard_editors(live, BUILDER, build.dashboard_id, editors)
     assert editor_ids("dashboard_editors", "dashboard_id", build.dashboard_id) == sorted(editors)
-    dataset_id = _claimed_dataset(live, build, "data")
+    dataset_id = marked_dataset(live, build, "data")
     after = editor_ids("sqlatable_editors", "table_id", dataset_id)
     refused_data = dataset_rows_as(live, "gamma_only", dataset_id)
     observe("dataset_editors", dashboard=labels_of(editors), dataset=labels_of(after),
@@ -1121,13 +1450,13 @@ def test_a_claimed_dataset_gets_only_editors_who_could_already_read_it(live, ext
 
 
 def test_delete_dataset_refuses_while_a_chart_uses_it(live, extension):
-    """A dataset the build made and claimed for its dashboard, with a funnel on it: `delete_dataset` answers
+    """A dataset the build made for its dashboard (`create_dataset`), with a funnel on it: `delete_dataset` answers
     `{in_use: true, chart_ids: [the funnel]}` and the dataset stays. Once the funnel is deleted (MCP's
     `delete_chart`), `delete_dataset` answers `{ok: true, soft_deleted: true}` and the dataset is in Superset's
     trash (`deleted_at` set); asked again, it answers `{not_found: "dataset"}`."""
     client = as_user(live, BUILDER)
     build = new_build(client, "delete")
-    dataset_id = _claimed_dataset(live, build, "data")
+    dataset_id = marked_dataset(live, build, "data")
     made = extension_chart(build, spec(Family.FUNNEL, dataset_id, dimensions=("status",)), "stages")
     chart_id = made["chart_id"]
     deleted_at = "SELECT deleted_at FROM tables WHERE id = %s"
@@ -1176,9 +1505,9 @@ def test_delete_dataset_refuses_another_dashboards_marker(live, extension):
 
 def test_tools_need_the_write_scope(live, extension):
     """Analyst (Alpha, who holds `can_write` on Chart, Dataset and Dashboard) with an ask token, which carries no
-    Superset write scope: `tools/list` shows none of the eight write tools, and calling `create_dashboard` is refused
+    Superset write scope: `tools/list` shows none of the seven write tools, and calling `create_dashboard` is refused
     by `mcp_auth_hook` (`SupersetPermissionDenied`), creating nothing. The control: with a build token `tools/list`
-    shows all eight."""
+    shows all seven."""
     ask_token = live.token(BUILDER, scope=ASK)
     assert not {TOOL_PREFIX + base for base in WRITE_TOOLS} & listed_tools(live, ask_token)
     assert {TOOL_PREFIX + base for base in WRITE_TOOLS} <= listed_tools(live, live.token(BUILDER, scope=BUILD))
@@ -1195,18 +1524,18 @@ def test_gamma_sees_only_what_its_roles_allow(live, extension, policy_id):
     `generate_dashboard`, and only reads Dataset (`GAMMA_READ_ONLY_MODEL_VIEWS`, `superset/security/manager.py`).
 
     With a build token, `gamma_only` (Gamma) and `policy_only` (Gamma, sql_lab and the `policy` dataset) each list
-    exactly the five chart and dashboard tools and none of the three dataset tools. Each tool Gamma sees still refuses
+    exactly the four chart and dashboard tools and none of the three dataset tools. Each tool Gamma sees still refuses
     it what its roles do not reach:
     - `create_chart` on `policy`, which `gamma_only` may not read, for a dashboard `gamma_only` made, answers
       `{not_found: "dataset"}` and saves no chart;
     - analyst's dashboard, published and without charts, is one Gamma may read and does not edit: `set_layout` as
-      `gamma_only`, and `claim_chart` of a chart `policy_only` made for it, each answer
-      `{not_editor: true, editors: [analyst's label]}`, and the dashboard is as it was;
+      `gamma_only`, and `create_chart` of a chart on `policy` for it as `policy_only` (who may read `policy`), each
+      answer `{not_editor: true, editors: [analyst's label]}`; no such chart is saved, and the dashboard is as it was;
     - a dataset tool, which Gamma does not list, is refused when called anyway (`SupersetPermissionDenied`).
 
     These are Superset's guards. mnemiq's own door refuses a non-builder (`NOT_A_BUILDER`: building needs Alpha and
     sql_lab) before it calls any tool."""
-    chart_and_dashboard = {"create_dashboard", "claim_chart", "create_chart", "patch_chart", "set_layout"}
+    chart_and_dashboard = {"create_dashboard", "create_chart", "patch_chart", "set_layout"}
     gamma = as_user(live, "gamma_only")
     reader = as_user(live, "policy_only")
     for username in ("gamma_only", "policy_only"):
@@ -1226,9 +1555,9 @@ def test_gamma_sees_only_what_its_roles_allow(live, extension, policy_id):
     assert metadata("SELECT count(*) FROM slices WHERE slice_name = %s", (funnel.title,)) == [(0,)]
     assert call(gamma, "set_layout", dashboard_id=build.dashboard_id, positions=positions([]),
                 expect_changed_on=changed_on(gamma, "dashboard", build.dashboard_id)) == refused
-    own_chart = mcp_chart(reader, spec(Family.BIG_NUMBER, policy_id))
-    assert call(reader, "claim_chart", chart_id=own_chart, dashboard_id=build.dashboard_id,
-                marker=format_marker(str(uuid.uuid4()), "kpi", build.dashboard_id)) == refused
+    kpi = spec(Family.BIG_NUMBER, policy_id)
+    assert call(reader, "create_chart", **config_request(build, kpi, build.marker("kpi"))) == refused
+    assert metadata("SELECT count(*) FROM slices WHERE slice_name = %s", (kpi.title,)) == [(0,)]
     assert metadata("SELECT published, changed_on, position_json, json_metadata FROM dashboards WHERE id = %s",
                     (build.dashboard_id,)) == [before]
     assert members(build.dashboard_id) == []
@@ -1245,7 +1574,8 @@ def test_set_layout_refuses_a_chart_the_caller_cannot_read(live, extension, poli
     dashboard has no member and the layout it had. The control: analyst adding the same chart to a dashboard of its
     own answers `{ok}`, so the refusal is the caller's access, not the chart."""
     analyst = as_user(live, BUILDER)
-    chart_id = mcp_chart(analyst, spec(Family.BIG_NUMBER, policy_id))
+    own = new_build(analyst, "analyst's layout")
+    chart_id = made_chart(own, spec(Family.BIG_NUMBER, policy_id), "kpi")
     gamma = as_user(live, "gamma_only")
     gamma_build = new_build(gamma, "gamma's layout")
     (before,) = metadata("SELECT position_json, json_metadata FROM dashboards WHERE id = %s",
@@ -1256,7 +1586,6 @@ def test_set_layout_refuses_a_chart_the_caller_cannot_read(live, extension, poli
     assert members(gamma_build.dashboard_id) == []
     assert metadata("SELECT position_json, json_metadata FROM dashboards WHERE id = %s",
                     (gamma_build.dashboard_id,)) == [before]
-    own = new_build(analyst, "analyst's layout")
     assert call(analyst, "set_layout", dashboard_id=own.dashboard_id, positions=positions([chart_id]),
                 add_chart_ids=[chart_id], expect_changed_on=changed_on(analyst, "dashboard", own.dashboard_id)) == {
         "ok": True}
@@ -1288,7 +1617,7 @@ def test_dataset_metrics_answers_an_empty_request(live, extension):
 
 
 def test_dataset_metrics_reads_currency_and_certification(live, extension):
-    """A dataset the build made with a metric of its own (`total_premium`, with a format and a warning), then
+    """A dataset made with a metric of its own (`total_premium`, with a format and a warning: `_seeded_dataset`), then
     `avg_premium` added with a verbose name, a `,.2f` format, a USD currency and a description, and a certification
     written on `avg_premium` (`extra`: certified by `Finance`, `audited`) the way Superset's own dataset editor stores
     it. `dataset_metrics` for that dataset answers one entry `{dataset_id, metrics}` whose metrics, in the dataset's
@@ -1299,7 +1628,7 @@ def test_dataset_metrics_reads_currency_and_certification(live, extension):
     stores."""
     client = as_user(live, BUILDER)
     build = new_build(client, "metric details")
-    dataset_id = _claimed_dataset(live, build, "metrics", metrics=[{
+    dataset_id = _seeded_dataset(live, build, "metrics", [{
         "metric_name": "total_premium", "expression": "SUM(premium)", "d3format": ",.0f",
         "warning_text": "counts every row"}])
     assert call(client, "add_saved_metric", dataset_id=dataset_id, metric=_metric(
@@ -1339,7 +1668,7 @@ def test_dataset_metrics_leaves_out_an_unreachable_dataset_without_naming_it(liv
     for all three."""
     analyst = as_user(live, BUILDER)
     build = new_build(analyst, "unreachable")
-    hidden = _claimed_dataset(live, build, "hidden")
+    hidden = marked_dataset(live, build, "hidden")
     (name,) = metadata("SELECT table_name FROM tables WHERE id = %s", (hidden,))[0]
     missing = 2_000_000_000
     reader = as_user(live, "policy_only")
@@ -1355,16 +1684,15 @@ def test_dataset_metrics_leaves_out_an_unreachable_dataset_without_naming_it(liv
 
 
 def test_editors_of_names_editors_of_readable_objects_only(live, extension, policy_id):
-    """analyst's claimed chart and claimed dataset (editors: the build dashboard's, analyst) are answered to analyst as
+    """analyst's chart and dataset, each made by the extension for a build's dashboard (editors: the dashboard's,
+    analyst), are answered to analyst as
     `{charts: [{chart_id, editors: [analyst's label]}], datasets: [{dataset_id, editors: [analyst's label]}]}`; a chart
     and a dataset id that do not exist are left out. `gamma_only`, which reads neither, is answered
     `{charts: [], datasets: []}`, with no id and no label."""
     analyst = as_user(live, BUILDER)
     build = new_build(analyst, "editors of")
-    chart_id = mcp_chart(analyst, spec(Family.BIG_NUMBER, policy_id))
-    assert call(analyst, "claim_chart", chart_id=chart_id, dashboard_id=build.dashboard_id,
-                marker=build.marker("kpi")) == {"ok": True}
-    dataset_id = _claimed_dataset(live, build, "data")
+    chart_id = made_chart(build, spec(Family.BIG_NUMBER, policy_id), "kpi")
+    dataset_id = marked_dataset(live, build, "data")
     missing = 2_000_000_000
     answer = call(analyst, "editors_of", chart_ids=[chart_id, missing], dataset_ids=[dataset_id, missing])
     assert answer == {"charts": [{"chart_id": chart_id, "editors": [label_of(BUILDER)]}],
@@ -1384,7 +1712,7 @@ def test_get_layout_round_trips_through_set_layout(live, extension, policy_id):
     answered `{not_found: "dashboard"}`."""
     client = as_user(live, BUILDER)
     build = new_build(client, "layout read")
-    one, two = (mcp_chart(client, spec(Family.BIG_NUMBER, policy_id)) for _ in range(2))
+    one, two = (made_chart(build, spec(Family.BIG_NUMBER, policy_id), f"kpi_{i}") for i in range(2))
     assert _layout(build, [one, two], add=[one, two]) == {"ok": True}
     answer = call(client, "get_layout", dashboard_id=build.dashboard_id)
     assert set(answer) == {"dashboard_id", "position_json", "changed_on"} and answer["dashboard_id"] == build.dashboard_id

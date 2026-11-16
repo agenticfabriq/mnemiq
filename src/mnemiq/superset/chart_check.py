@@ -10,10 +10,11 @@ Superset 7.0.0rc2 decide most of it:
 
 - `get_chart_data` (`superset/mcp_service/chart/tool/get_chart_data.py`) runs a chart's saved query context when it has
   one, and otherwise rebuilds one from `form_data` (`build_query_dicts_from_form_data` in
-  `superset/mcp_service/chart/chart_helpers.py`) with no post-processing. Every chart MCP's `generate_chart` saves has
-  none until mnemiq's extension claims it and saves a query context built as the chart's plugin builds its query,
-  without post-processing. So a chart whose shown numbers come after the query (a rolling window, a time comparison, a
-  contribution, a forecast, quartiles, bins) is not checked, whichever query its data tool runs.
+  `superset/mcp_service/chart/chart_helpers.py`) with no post-processing. A chart mnemiq's extension creates
+  (`create_chart`) is saved with one whenever the extension's `params.query_context` builds one for its family, built
+  as the chart's plugin builds its query, without post-processing; one MCP's `generate_chart` saves has none. So a
+  chart whose shown numbers come after the query (a rolling window, a time comparison, a contribution, a forecast,
+  quartiles, bins) is not checked, whichever query its data tool runs.
 - Superset's rows are read as the chart's groups only on evidence in the answer itself. Each result used carries every
   grouping column the chart's settings name, and none carries the `GROUPING()` markers of a grouping-sets query.
   Under a time grain every x-axis value sits on the grain: the rebuild puts a string x-axis among the query's

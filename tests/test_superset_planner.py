@@ -60,8 +60,8 @@ SNAPSHOT = Snapshot(version="v1", source_id="only", created_at="t", columns=[
 GRANTS = GrantSet(frozenset({"policy", "claim", "agent"}))
 GOAL = "Premium by region and month"
 WRITES = ("generate_chart", "create_dataset", "create_virtual_dataset", "delete_chart", "remove_chart_from_dashboard",
-          *(TOOL_PREFIX + name for name in ("create_dashboard", "claim_chart", "claim_dataset", "create_chart",
-                                            "patch_chart", "add_saved_metric", "delete_dataset", "set_layout")))
+          *(TOOL_PREFIX + name for name in ("create_dashboard", "create_dataset", "create_chart", "patch_chart",
+                                            "add_saved_metric", "delete_dataset", "set_layout")))
 
 
 class Tools:

@@ -1,4 +1,4 @@
-"""The extension's MCP tools: registration only. What each tool does is its function in `writes` (the eight that change
+"""The extension's MCP tools: registration only. What each tool does is its function in `writes` (the seven that change
 Superset) or `reads` (the three that only read).
 
 Superset registers each under `extensions.agenticfabriq.mnemiq.<name>` (`superset/core/mcp/core_mcp_injection.py`,
@@ -26,25 +26,18 @@ def create_dashboard(request: dict[str, Any]) -> dict[str, Any]:
     return writes.create_dashboard(request)
 
 
-@tool(name="claim_chart", class_permission_name="Chart", method_permission_name="write",
-      description="Make a chart a dashboard's: the dashboard's editors (with ENABLE_VIEWERS and "
-                  "VIEWER_PROMISCUOUS_MODE on, the dataset rule instead), a build marker and its saved query. "
-                  "request: {chart_id, dashboard_id, marker}.")
-def claim_chart(request: dict[str, Any]) -> dict[str, Any]:
-    return writes.claim_chart(request)
-
-
-@tool(name="claim_dataset", class_permission_name="Dataset", method_permission_name="write",
-      description="Make a dataset a dashboard's: a build marker, and its existing editors kept, with the caller and "
-                  "only the dashboard's users who can already read it added. "
-                  "request: {dataset_id, dashboard_id, marker}.")
-def claim_dataset(request: dict[str, Any]) -> dict[str, Any]:
-    return writes.claim_dataset(request)
+@tool(name="create_dataset", class_permission_name="Dataset", method_permission_name="write",
+      description="Create a dataset over a table, or over sql when given, for a dashboard, with a build marker, "
+                  "and as editors the caller and the dashboard's users whose grants already reach it. "
+                  "request: {database_id, schema, table_name, sql?, description?, dashboard_id, marker}.")
+def create_dataset(request: dict[str, Any]) -> dict[str, Any]:
+    return writes.create_dataset(request)
 
 
 @tool(name="create_chart", class_permission_name="Chart", method_permission_name="write",
-      description="Create a funnel or sankey chart for a dashboard, after checking its query runs. "
-                  "request: {dataset_id, viz_type, slice_name, params, dashboard_id, marker}.")
+      description="Create a chart for a dashboard, after checking its query runs, in one of two shapes. "
+                  "request: {dataset_id, slice_name, dashboard_id, marker} and either {viz_type, params} "
+                  "(a funnel or sankey) or {config, set?} (MCP's chart config, and format keys to merge).")
 def create_chart(request: dict[str, Any]) -> dict[str, Any]:
     return writes.create_chart(request)
 

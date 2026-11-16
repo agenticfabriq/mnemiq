@@ -7,6 +7,9 @@ have the extension installed does not say so: rc2's MCP service masks the not-fo
 exception inside an installed tool produces. Superset's default tool search hides tools from `tools/list`, so the list
 cannot settle it either. `require_extension` settles it by one call of a probe: `dataset_metrics` with no datasets, which
 the installed extension answers with an empty list and never fails on. `call_tool` asks it once a call fails that way.
+
+A build needs more than an extension: it needs one that makes every object a build makes, which an older one does not.
+`require_build_tools` asks for that before a build is planned (`ExtensionOutdated`).
 """
 
 from __future__ import annotations
@@ -15,14 +18,14 @@ from collections.abc import Callable
 
 from mnemiq.superset.client import SupersetToolError
 
-__all__ = ["DATASET_METRICS_BATCH", "EXTENSION_TOOLS", "ExtensionMissing", "TOOL_PREFIX", "call_tool",
-           "dashboard_editorship", "dataset_metrics", "require_extension"]
+__all__ = ["DATASET_METRICS_BATCH", "EXTENSION_TOOLS", "ExtensionMissing", "ExtensionOutdated", "TOOL_PREFIX",
+           "call_tool", "dashboard_editorship", "dataset_metrics", "require_build_tools", "require_extension"]
 
 TOOL_PREFIX = "extensions.agenticfabriq.mnemiq."
 
 # The base name of every tool the extension offers; the single source the client and the test fake build names from.
-EXTENSION_TOOLS = ("create_dashboard", "claim_chart", "claim_dataset", "create_chart", "patch_chart",
-                   "add_saved_metric", "delete_dataset", "set_layout", "dataset_metrics", "editors_of", "get_layout")
+EXTENSION_TOOLS = ("create_dashboard", "create_dataset", "create_chart", "patch_chart", "add_saved_metric",
+                   "delete_dataset", "set_layout", "dataset_metrics", "editors_of", "get_layout")
 
 # The most dataset ids one `dataset_metrics` call takes: the extension refuses a request naming more
 # (`reads.MAX_DATASETS` in the extension).
@@ -30,6 +33,9 @@ DATASET_METRICS_BATCH = 20
 
 # The probe, which the installed extension answers with an empty list and never fails on.
 _PROBE = ("dataset_metrics", {"dataset_ids": []})
+# The build's probe: the extension's own create of a dataset, which a build sends and an older extension lacks. This
+# one refuses an empty request as a request it cannot read, before it touches Superset.
+_BUILD_PROBE = "create_dataset"
 _MASKED = "An unexpected error occurred"
 
 
@@ -38,8 +44,22 @@ class ExtensionMissing(RuntimeError):
     `.detail` only."""
 
     def __init__(self, tool: str, *, detail: str = "") -> None:
-        super().__init__(f"Superset does not offer mnemiq's extension tool {tool}: the extension is not installed there")
+        super().__init__(self._said(tool))
         self.detail = detail
+
+    @staticmethod
+    def _said(tool: str) -> str:
+        return f"Superset does not offer mnemiq's extension tool {tool}: the extension is not installed there"
+
+
+class ExtensionOutdated(ExtensionMissing):
+    """Superset offers the extension, but one older than this mnemiq, without a tool a build calls. Answered as a
+    missing extension is, with its own sentence; what Superset said is in `.detail` only."""
+
+    @staticmethod
+    def _said(tool: str) -> str:
+        return (f"Superset's mnemiq extension is older than this mnemiq and does not offer {tool}, which a build calls: "
+                "update the extension installed there")
 
 
 def _is_not_offered(tool: str, failure: SupersetToolError) -> bool:
@@ -59,6 +79,25 @@ def require_extension(client) -> None:
         if _is_not_offered(probe, failure):
             raise ExtensionMissing(probe, detail=failure.detail) from None
         raise
+
+
+def require_build_tools(client) -> None:
+    """Return when Superset offers the extension's tools a build calls, as the client's caller sees them. One call,
+    of the build's probe: `create_dataset` with an empty request, which this extension refuses (`{"refused": ...}`)
+    without touching Superset. A Superset that does not offer it is asked the extension's own probe: with no extension
+    at all, `ExtensionMissing`; with one, it is older than this mnemiq (`ExtensionOutdated`). Any answer other than
+    the refusal raises `SupersetToolError`, and any other failure is raised as the client raised it."""
+    tool = TOOL_PREFIX + _BUILD_PROBE
+    try:
+        answer = client.call(tool, {})
+    except SupersetToolError as failure:
+        if not _is_not_offered(tool, failure):
+            raise
+        require_extension(client)
+        raise ExtensionOutdated(tool, detail=failure.detail) from None
+    if not (isinstance(answer, dict) and "refused" in answer):
+        raise SupersetToolError(f"the extension's {_BUILD_PROBE} did not refuse an empty request",
+                                detail=str(answer)[:200])
 
 
 def call_tool(client, base: str, request: dict, *, before_call: Callable[[], None] | None = None) -> dict:
