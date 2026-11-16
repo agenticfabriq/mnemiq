@@ -18,8 +18,10 @@ Every tool keeps these rules:
   be sent again. Once the checks that refuse the caller pass, it takes one lock keyed by the marker, on a connection
   of its own (`_marker_lock`), and holds it from the look for the object whose description's last line is that
   marker through the create's commit: rc2's own checks (a chart's validation and query check) and the create command
-  run under it, on a miss only. A second send of the create waits for the first and then answers what it made. A
-  wait past the lock timeout, a lock granted only after mnemiq's deadline for the call, or a look the metadata
+  run under it, on a miss only. A second send of the create waits for the first and then answers what it made. On
+  Postgres the command's own transaction also takes a second lock, on another key of the marker, and looks again just
+  before the command (`_last_look`), so a marker's lock lost with its connection still lets no second object be made.
+  A wait past the lock timeout, a lock granted only after mnemiq's deadline for the call, or a look the metadata
   database cannot answer, answers `{"busy": true}`. A SQLite metadata database takes no such lock.
 - Its answer is short and structured. Superset's own text never reaches it: any of Superset's exceptions is logged
   here and answered by its kind.
@@ -517,6 +519,9 @@ _MYSQL = ("mysql", "mariadb")
 # the database session ends.
 _PG_LOCK = "SELECT pg_advisory_lock(hashtextextended(:marker, 0))"
 _PG_UNLOCK = "SELECT pg_advisory_unlock(hashtextextended(:marker, 0))"
+# The second guard on Postgres: the create command's own transaction takes a transaction's advisory lock on another
+# key of the marker, so it never waits for the session's lock on the first, and its commit or rollback releases it.
+_PG_CREATE_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended('mnemiq-create:' || :marker, 0))"
 # The marker's lock on MySQL: a named lock, which belongs to a connection, not a transaction.
 _MYSQL_LOCK = "SELECT GET_LOCK(:name, :seconds)"
 _MYSQL_UNLOCK = "SELECT RELEASE_LOCK(:name)"
@@ -716,6 +721,30 @@ def _look(model: type, marker: str, *, kind: str) -> dict | None:
         return BUSY
 
 
+def _last_look(model: type, marker: str, *, kind: str) -> dict | None:
+    """On Postgres, just before a create's command and in the command's own transaction: the answer for the objects
+    of `model` that `marker` names, or None when there is none, looked for again under a second lock.
+
+    The marker's lock is a session's lock on a connection of its own, which sits idle while the create works; if that
+    database session ends, the lock goes with it, while the create's own session works on, and a second send of the
+    create may take the lock, find nothing and make the object. So the session's lock waits are bounded again
+    (`_bound_lock_waits`: rc2's checks may have ended the transaction the look bounded), the transaction takes an
+    advisory lock on another key of the marker (`_PG_CREATE_LOCK`), held until the command's commit or rollback, and
+    looks again (`_marked`, `_found_answer`), in a fresh READ COMMITTED snapshot. Of two creates that both passed the
+    look, the second to take this lock finds the first's object, committed, and answers it. Between this and the
+    command nothing commits or rolls back the session. A wait past the lock timeout (55P03) is raised and answered
+    `{"busy": true}` (`_answering`, `_failed`). MySQL and SQLite take no second lock: None."""
+    from sqlalchemy import text
+
+    session = _session()
+    if session.get_bind().dialect.name != "postgresql":
+        return None
+    _bound_lock_waits(session)
+    session.execute(text(_PG_CREATE_LOCK), {"marker": marker})
+    found = _marked(model, marker)
+    return _found_answer(found, kind=kind) if found else None
+
+
 def _find_or_create(model: type, marker: str, *, kind: str, started: float, create: Callable[[], dict],
                     then: Callable[[dict], dict] | None = None) -> dict:
     """The object of `model` that `marker` names, or `create()`'s answer when there is none, all under the marker's
@@ -725,9 +754,13 @@ def _find_or_create(model: type, marker: str, *, kind: str, started: float, crea
 
     The caller's own checks run before this (its request, the objects it names, being an editor of the dashboard), so
     a caller they refuse never waits for the lock. Under it run the look (`_look`) and, on a miss, `create()`: rc2's
-    own checks (a chart's validation, mapping and query check), the create command and its commit. The lock is on a
-    connection of its own, so whatever rc2 commits or rolls back in the session keeps it held, and no other send of the
-    create can make the object while a check of this one refuses it: that refusal is answered as it is. The session's
+    own checks (a chart's validation, mapping and query check), on Postgres the last look in the command's own
+    transaction (`_last_look`, which `create()` calls just before its command), the create command and its commit.
+    The lock is on a connection of its own, so whatever rc2 commits or rolls back in the session keeps it held, and no
+    other send of the create can make the object while a check of this one refuses it: that refusal is answered as it
+    is. Should that connection's database session end while the create works, the lock goes with it; the last look
+    then still finds an object another send made meanwhile, and the lost connection is closed when the lock is let go
+    (`_release_marker_lock`). The session's
     transaction ends before the lock is let go. A lock not taken answers `{"busy": true}` or the refusal that says
     why, and so does one granted after mnemiq's deadline for the call, counted from `started`, the tool's start."""
     try:
@@ -868,6 +901,8 @@ def create_dashboard(found: dict) -> dict:
     from superset.models.dashboard import Dashboard
 
     def create() -> dict:
+        if (made := _last_look(Dashboard, found["marker"], kind="dashboard")) is not None:
+            return made
         try:
             dashboard = CreateDashboardCommand({"dashboard_title": found["title"], "published": False,
                                                 "description": found["marker"]}).run()
@@ -982,6 +1017,8 @@ def create_dataset(found: dict) -> dict:
     command = CreateDatasetCommand(properties)
 
     def create() -> dict:
+        if (made := _last_look(SqlaTable, found["marker"], kind="dataset")) is not None:
+            return made
         try:
             dataset = command.run()
         except DatasetSoftDeletedTwinExistsError:
@@ -1139,8 +1176,9 @@ def create_chart(found: dict) -> dict:
         viz_type, form_data, context = checked
         editors = _chart_editors(dataset, dashboard, ())
         # rc2's checks may have ended the transaction the look bounded (Superset's metastore cache commits the session
-        # when it stores a chart's data), and a bound holds only to its transaction's end: bound the command's own.
-        _bound_lock_waits(_session())
+        # when it stores a chart's data): `_last_look` bounds the command's own transaction again.
+        if (made := _last_look(Slice, found["marker"], kind="chart")) is not None:
+            return made
         try:
             chart = CreateChartCommand({
                 "slice_name": found["slice_name"], "viz_type": viz_type, "datasource_id": dataset_id,
