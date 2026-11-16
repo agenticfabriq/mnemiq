@@ -672,6 +672,8 @@ def _release_marker_lock(connection: Any, dialect: str, marker: str) -> None:
 
 
 _LOCK_LOST = "mnemiq extension: a marker's lock was lost while its create worked; answered busy, nothing made"
+_LOCK_UNCONFIRMED = ("mnemiq extension: a create could not confirm its marker's lock is held; answered busy, nothing "
+                     "made")
 
 
 @dataclass(frozen=True)
@@ -688,11 +690,18 @@ class _HeldLock:
         that connection, whose commit or rollback ends neither a session's advisory lock nor a named lock. On Postgres
         `_PG_HOLDS`: the lock as `pg_locks` lists it for the connection's own database session. On MySQL (MariaDB's
         dialect included) `_MYSQL_HOLDS`: whether the connection holding the named lock is this one. True only on an
-        answer of true or 1. Any other answer (MySQL's 0 for a lock another connection holds, NULL for one nobody
-        holds), or any database error (the connection's database session ended, and the lock with it), is False,
-        logged as a lost lock with the error: the create then answers `{"busy": true}` and makes nothing
-        (`_guarded_look`). A lost lock is never taken again, here or anywhere: holding it again is not holding it
-        without a break.
+        answer of true or 1; anything else is False, and the create then answers `{"busy": true}` and makes nothing
+        (`_guarded_look`). Each False is logged once, as a warning that tells its two cases apart:
+
+        - The lock was lost (`_LOCK_LOST`): an answer of not held (false; MySQL's 0 for a lock another connection
+          holds, NULL for one nobody holds), or a database error on a connection SQLAlchemy then found lost and
+          invalidated (its database session ended, and the lock with it), logged with the error. An idle timeout
+          shorter than a create's work under its lock gives this one.
+        - The lock is not confirmed (`_LOCK_UNCONFIRMED`): any other database error, the connection kept, logged with
+          the error. The lock may well still be held (a statement the database canceled by its `statement_timeout`,
+          for one), and the release that follows lets it go.
+
+        A lost lock is never taken again, here or anywhere: holding it again is not holding it without a break.
 
         No other dialect's lock is answered as held."""
         from sqlalchemy import text
@@ -708,7 +717,7 @@ class _HeldLock:
             with self.connection.begin():
                 answer = self.connection.execute(text(statement), key).scalar()
         except SQLAlchemyError as exc:
-            logger.warning(_LOCK_LOST, exc_info=exc)
+            logger.warning(_LOCK_LOST if self.connection.invalidated else _LOCK_UNCONFIRMED, exc_info=exc)
             return False
         if isinstance(answer, int) and answer == 1:  # Postgres answers true (a bool is an int), MySQL 1
             return True

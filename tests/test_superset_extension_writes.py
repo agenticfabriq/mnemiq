@@ -2172,7 +2172,9 @@ def test_a_lost_lock_is_logged_as_lost(request, caplog, cause):
     """A create that answers busy because its marker's lock was lost says so, once, as a warning: an idle timeout
     shorter than a chart's query check makes every send of that chart lose its lock this way, and the log is how an
     operator learns why the build never finishes it. The database's error rides on the record when the hold check
-    raised one. An answer neither true nor 1 counts as not held, NULL among them."""
+    raised one on its lost connection (a database error with the connection kept is logged apart:
+    `test_a_hold_check_that_cannot_answer_is_logged_apart_from_a_lost_lock`). An answer neither true nor 1 counts as
+    not held, NULL among them."""
     if cause == "lost":
         _lose_the_marker_lock_before_the_command(request, "config chart")
     else:
@@ -2183,6 +2185,29 @@ def test_a_lost_lock_is_logged_as_lost(request, caplog, cause):
     lost = [record for record in caplog.records if record.getMessage() == LOST]
     assert [record.levelname for record in lost] == ["WARNING"], caplog.records
     assert (lost[0].exc_info is not None) is (cause == "lost")
+
+
+UNCONFIRMED = "mnemiq extension: a create could not confirm its marker's lock is held; answered busy, nothing made"
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+@pytest.mark.parametrize("error", [pytest.param(stubs.database_error("57014"), id="the statement canceled"),
+                                   pytest.param(stubs.database_error("42883"), id="another database error")])
+def test_a_hold_check_that_cannot_answer_is_logged_apart_from_a_lost_lock(creating, caplog, dialect, error):
+    """The hold check's statement fails while its connection is kept (a statement the database canceled, for one, by
+    its `statement_timeout`): whether the lock is held is not known, and it may well be. The create answers busy and
+    makes nothing, as for a lost lock, but says it could not confirm the lock, once, as a warning carrying the error,
+    never that the lock was lost. The release then runs on the same connection and lets the lock go."""
+    metadata = creating.on(dialect)
+    metadata.holds_answer = error
+    with caplog.at_level("WARNING", logger=writes.__name__):
+        assert make_from_config() == {"busy": True}
+    assert [(record.getMessage(), record.exc_info and record.exc_info[1]) for record in caplog.records] == [
+        (UNCONFIRMED, error)]
+    assert creating.superset.rows["Slice"] == [] and commands(creating.superset) == []
+    assert creating.superset.ran[-3:] == [("rollback",), *let_go(dialect, STEP)]
+    assert ("invalidate", 1) not in creating.superset.ran
+    assert metadata.leaked == [] and _all_let_go(metadata)
 
 
 @pytest.mark.parametrize("answer", [True, 1])
