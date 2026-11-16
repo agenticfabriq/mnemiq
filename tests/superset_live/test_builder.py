@@ -5,18 +5,19 @@ makes and drops.
 
 A build's plan comes from a stub planner (`FakePlanner`), which returns a fixed plan and asks no model: no model client
 is made or called while a build runs, and the stub model is asked nothing. Everything after the planner is mnemiq's
-own: the plan check (a written measure a saved metric says the same as is replaced by it), the build's steps, the id
-floor each create is judged by, the layout and the value check.
+own: the plan check (a written measure a saved metric says the same as is replaced by it), the build's steps, each
+made by the extension's create carrying its step's marker, the layout and the value check.
 
 The module makes a table of its own in the live source database, of a name no run has used, before it enriches: so
 the snapshot holds a table no Superset dataset exists for, which a build makes one for. The module removes what that
 build made, and the table, once it is done.
 
 Each test states its expectation in its docstring. A build's record (each request's step, its key, kind and status,
-the Superset calls it made and its latency; each create's floor and the id it made; each chart's id, type and check
-status) is printed as an `OBSERVED` line, which `pytest -rA` shows for passing tests too, and written as JSON to the
-directory `MNEMIQ_TEST_SUPERSET_RECORD_DIR` names when it is set. No token, key, password or value from the data goes
-into it: a comparison of numbers is asserted as a bool, so a failure does not print them either.
+the Superset calls it made and its latency; each step's id and whether what it made carries its marker; each chart's
+id, type and check status) is printed as an `OBSERVED` line, which `pytest -rA` shows for passing tests too, and
+written as JSON to the directory `MNEMIQ_TEST_SUPERSET_RECORD_DIR` names when it is set. No token, key, password or
+value from the data goes into it: a comparison of numbers is asserted as a bool, so a failure does not print them
+either.
 """
 
 from __future__ import annotations
@@ -24,10 +25,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from collections import Counter
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -39,8 +42,8 @@ from mnemiq.server.superset_refusals import SIGN_IN_AGAIN
 from mnemiq.superset.build_store import BUILD_TABLE, MEASURE_TABLE
 from mnemiq.superset.builder import start_build
 from mnemiq.superset.chart_form import _NOT_CHECKED_TYPES
-from mnemiq.superset.charts import ChartSpec, Family, WrittenRef
-from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetRefusedCaller
+from mnemiq.superset.charts import ChartSpec, Family, WrittenRef, generate_chart_request
+from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetRefusedCaller, SupersetUnavailable
 from mnemiq.superset.extension import TOOL_PREFIX
 from mnemiq.superset.marker import Marker, format_marker, parse_marker
 from mnemiq.superset.measures import Measure, MeasureKind
@@ -50,6 +53,7 @@ from tests.superset_extension_path import use_extension_source
 from tests.superset_live.live import (
     Call,
     Recorder,
+    carrying,
     enrich_and_build,
     fingerprint_of,
     ground_truth,
@@ -79,12 +83,20 @@ RECORD_DIR = "MNEMIQ_TEST_SUPERSET_RECORD_DIR"
 # What a build answer's step may hold (`superset_build._build`).
 STEP_FIELDS = {"key", "kind", "status", "object_id", "started_at", "lease_until"}
 BUILD_FIELDS = {"build_id", "status", "dashboard_id", "steps", "checks", "ran", "message"}
-# The calls that change something in Superset.
+# The calls that change something in Superset: MCP's own creates and the extension's write tools.
 WRITES = {"generate_chart", "create_dataset", "create_virtual_dataset",
-          *(TOOL_PREFIX + base for base in ("create_dashboard", "claim_chart", "claim_dataset", "create_chart",
-                                            "patch_chart", "add_saved_metric", "delete_dataset", "set_layout"))}
-# The list each create's floor is read from, by the step's kind.
-FLOOR_TOOLS = {"dashboard": "list_dashboards", "chart": "list_charts", "dataset": "list_datasets"}
+          *(TOOL_PREFIX + base for base in ("create_dashboard", "create_dataset", "create_chart", "patch_chart",
+                                            "add_saved_metric", "delete_dataset", "set_layout"))}
+CREATE_DATASET = TOOL_PREFIX + "create_dataset"
+CREATE_CHART = TOOL_PREFIX + "create_chart"
+# The probe a build's start sends (`require_build_tools`): the extension's `create_dataset` with an empty request,
+# which it refuses without touching Superset.
+PROBE = CREATE_DATASET
+# What a build never calls: MCP's own creates, the claims an older extension offered, and a patch after a create.
+NEVER_CALLED = {"generate_chart", "create_dataset", "create_virtual_dataset",
+                *(TOOL_PREFIX + base for base in ("claim_chart", "claim_dataset", "patch_chart"))}
+# The table each kind of object a build makes is kept in, in Superset's metadata database.
+TABLES = {"dashboard": "dashboards", "dataset": "tables", "chart": "slices"}
 
 
 def observe(test: str, **facts) -> None:
@@ -129,13 +141,6 @@ def made_by(username: str) -> dict[str, set[int]]:
             for kind, table in (("dashboards", "dashboards"), ("charts", "slices"), ("datasets", "tables"))}
 
 
-def highest(username: str, table: str) -> int:
-    """The highest id among `username`'s objects of `table` not in the trash, 0 for none: what a floor reads."""
-    (row,) = metadata(f"SELECT coalesce(max(id), 0) FROM {table} WHERE created_by_fk = %s AND deleted_at IS NULL",
-                      (user_id(username),))
-    return row[0]
-
-
 def saved_metrics(dataset_id: int) -> dict[str, str]:
     return {name: expression for name, expression in
             metadata("SELECT metric_name, expression FROM sql_metrics WHERE table_id = %s", (dataset_id,))}
@@ -166,6 +171,18 @@ def chart_metrics(params: dict) -> list:
 
 def short(tool: str) -> str:
     return tool.replace(TOOL_PREFIX, "ext.")
+
+
+def writes(calls: list[Call]) -> list[str]:
+    """The tools among `calls` that change something in Superset: every write tool's call but the start's probe, an
+    empty `create_dataset` that the extension refuses."""
+    return [call.tool for call in calls if call.tool in WRITES and not (call.tool == PROBE and call.request == {})]
+
+
+def step_marker(build_id: str, key: str, kind: str, dashboard_id: int | None) -> str:
+    """The marker a build's step gives what it makes: the dashboard shell's own (`new`), else its step's for the
+    dashboard."""
+    return format_marker(build_id, key, None if kind == "dashboard" else dashboard_id)
 
 
 # --- the deployment ------------------------------------------------------------------------------------------------
@@ -486,8 +503,10 @@ def run_build(live, served: Served, model, plan: BuildPlan, name: str, *, builde
 
 def summary(run: BuildRun, served: Served, plan: BuildPlan | None = None) -> dict:
     """The build's record: each request (its step's key, kind and status, its HTTP status, latency, and the Superset
-    calls it made by tool, with their JSON-RPC requests), each step's floor and the id it made, and each chart's id,
-    type and check status. Ids, names, statuses and timings only: never a value, a token or a lease id."""
+    calls it made by tool, with their JSON-RPC requests), each step's id and whether what it made carries its marker
+    (None for a step that makes nothing: a layout, a check, or the dashboard step of a build on an existing dashboard,
+    whose intent names no title), and each chart's id, type and check status. Ids, names, statuses and timings only:
+    never a value, a token or a lease id."""
     final = run.final
     kinds = {step["key"]: step["kind"] for step in final.get("steps", [])}
     raw = {step["key"]: step for step in served.raw_steps(run.build_id)} if run.build_id else {}
@@ -505,9 +524,18 @@ def summary(run: BuildRun, served: Served, plan: BuildPlan | None = None) -> dic
             **({"detail": request.body["detail"]} if "detail" in request.body else {}),
             **({"refused": request.body["refused"]} if "refused" in request.body else {}),
         })
+    dashboard_id = final.get("dashboard_id")
+
+    def marked(key: str, step: dict) -> bool | None:
+        if step["kind"] not in TABLES or step["object_id"] is None or dashboard_id is None:
+            return None
+        if step["kind"] == "dashboard" and (step.get("intent") or {}).get("name") is None:
+            return None
+        marker = step_marker(run.build_id, key, step["kind"], dashboard_id)
+        return [found for found, _ in carrying(TABLES[step["kind"]], marker)] == [step["object_id"]]
+
     steps = [{"key": key, "kind": step["kind"], "status": step["status"], "object_id": step["object_id"],
-              "id_floor": (step.get("intent") or {}).get("id_floor"), "reason": step.get("reason")}
-             for key, step in raw.items()]
+              "marked": marked(key, step), "reason": step.get("reason")} for key, step in raw.items()]
     families = {chart.key: chart.family.value for chart in plan.charts} if plan else {}
     charts = []
     for key, step in raw.items():
@@ -524,6 +552,13 @@ def summary(run: BuildRun, served: Served, plan: BuildPlan | None = None) -> dic
                             "embeddings": run.model_after[1] - run.model_before[1],
                             "profile_usage": run.model_after[2] - run.model_before[2],
                             "llm_clients_made": run.llm_made, "llm_completions": run.llm_asked}}
+
+
+def never_called(run: BuildRun) -> list[tuple[str, str]]:
+    """Each call of the build to a tool it never calls, with its request's label: none, for a build that made every
+    object through the extension's creates."""
+    return [(request.label, call.tool) for request in run.requests for call in request.calls
+            if call.tool in NEVER_CALLED]
 
 
 def assert_no_model_call(run: BuildRun) -> None:
@@ -621,7 +656,6 @@ class SixCharts:
     plan: BuildPlan
     metrics_after_planting: dict[str, str]
     metrics_after_build: dict[str, str]
-    floors_before: dict[str, int]
     kept_plan: dict
     raw_steps: list[dict]
     summary: dict
@@ -632,7 +666,6 @@ def six_charts(live, served, model, policy_id, planted) -> SixCharts:
     """The six-chart build, once, for every test that reads it: the goal "sales by region and month", run to its end as
     `analyst`, and its record."""
     plan = six_chart_plan(policy_id)
-    floors_before = {"dashboards": highest(BUILDER, "dashboards"), "slices": highest(BUILDER, "slices")}
     metrics_after_planting = saved_metrics(policy_id)
     run = run_build(live, served, model, plan, "sales-by-region-and-month")
     found = summary(run, served, plan) if run.build_id else {"stopped": run.stopped,
@@ -640,8 +673,7 @@ def six_charts(live, served, model, policy_id, planted) -> SixCharts:
     record("sales-by-region-and-month", found)
     kept_plan = served.raw_plan(run.build_id) if run.build_id else {}
     raw_steps = served.raw_steps(run.build_id) if run.build_id else []
-    return SixCharts(run, plan, metrics_after_planting, saved_metrics(policy_id), floors_before, kept_plan, raw_steps,
-                     found)
+    return SixCharts(run, plan, metrics_after_planting, saved_metrics(policy_id), kept_plan, raw_steps, found)
 
 
 def test_six_charts_reuse_the_planted_metric_and_every_one_checks(live, six_charts, policy_id, planted):
@@ -730,31 +762,28 @@ def test_six_charts_reuse_the_planted_metric_and_every_one_checks(live, six_char
             layout=placed, message=run.last_step["message"])
 
 
-def test_every_made_id_is_above_its_floor(six_charts):
-    """The id floor, live. Before each create, the step reads the highest id among the builder's objects of that kind
-    (`created_by_me`, ordered by id, descending, one item) and records it in its intent. Expected: every create step
-    (the dashboard, each chart) records a floor, its list call was ordered by id and descending, and the id it made
-    is above its floor; the dashboard's floor is analyst's highest dashboard id before the build, the first chart's
-    analyst's highest chart id before it, and each later chart's the chart made just before it."""
+def test_every_object_a_build_made_carries_its_marker(six_charts):
+    """The marker, live. Every object the six-chart build made is the one object in Superset whose description's last
+    line is its step's marker, in the trash or not: the dashboard its shell's (`new`), each chart its step's for the
+    dashboard. Each was made by the step's one create through the extension (`create_dashboard`, `create_chart`),
+    which carried that marker and was answered that id. No request of the build called MCP's `generate_chart`,
+    `create_dataset` or `create_virtual_dataset`, a claim, or `patch_chart`: nothing was made another way, taken over
+    after it was made, or changed after its create."""
     run = six_charts.run
     assert_ran_to_the_end(run)
-    made = [step for step in six_charts.raw_steps if step["kind"] in ("dashboard", "chart")]
-    floors = [(step["key"], (step.get("intent") or {}).get("id_floor"), step["object_id"]) for step in made]
-    assert all(type(floor) is int and type(made_id) is int and made_id > floor for _, floor, made_id in floors), floors
-    by_key = {key: (floor, made_id) for key, floor, made_id in floors}
-    before = six_charts.floors_before
-    assert by_key["dashboard"][0] == before["dashboards"], (by_key["dashboard"], before)
-    charts = [key for key, _, _ in floors if key != "dashboard"]
-    expected = [before["slices"], *(by_key[key][1] for key in charts[:-1])]
-    assert [by_key[key][0] for key in charts] == expected, (floors, before)
-    for request in run.requests:
-        if request.label != "next" or request.build.get("ran") not in by_key:
-            continue
-        kind = "dashboard" if request.build["ran"] == "dashboard" else "chart"
-        listed = [call.request for call in request.calls if call.tool == FLOOR_TOOLS[kind]]
-        assert listed and listed[0] == {"created_by_me": True, "select_columns": ["id"], "order_column": "id",
-                                        "order_direction": "desc", "page": 1, "page_size": 1}, listed
-    observe("floors", floors=floors)
+    dashboard_id = run.final["dashboard_id"]
+    made = {step["key"]: step for step in six_charts.raw_steps if step["kind"] in ("dashboard", "chart")}
+    assert len(made) == 1 + len(six_charts.plan.charts)
+    for key, step in made.items():
+        kind, made_id = step["kind"], step["object_id"]
+        marker = step_marker(run.build_id, key, kind, dashboard_id)
+        assert carrying(TABLES[kind], marker) == [(made_id, None)], key
+        [request] = [r for r in run.requests if r.label == "next" and r.build.get("ran") == key]
+        creates = [call for call in request.calls if call.tool == TOOL_PREFIX + f"create_{kind}"]
+        assert len(creates) == 1, (key, [call.tool for call in request.calls])
+        assert creates[0].request["marker"] == marker and creates[0].payload == {f"{kind}_id": made_id}, key
+    assert never_called(run) == []
+    observe("markers", made={key: step["object_id"] for key, step in made.items()})
 
 
 def test_every_superset_call_of_a_build_carries_its_requests_token(six_charts):
@@ -886,7 +915,7 @@ def test_an_unknown_users_token_is_refused_by_superset_in_mnemiqs_words(live, se
         assert answer.headers["www-authenticate"] == "Bearer"
         assert not any(text and text in answer.text for text in said), route
         assert "nobody" not in answer.text
-    assert not [call.tool for call in calls if call.tool in WRITES]
+    assert writes(calls) == []
     assert served.raw_steps(kept.build_id) == before
     observe("unknown user", status={route: a.status_code for route, a in answers.items()},
             detail=SIGN_IN_AGAIN, superset_said=sorted(said), calls=[c.tool for c in calls])
@@ -898,7 +927,7 @@ def test_an_unknown_users_token_is_refused_by_superset_in_mnemiqs_words(live, se
 def test_a_funnel_is_made_through_the_extension_and_its_data_read(live, served, model, policy_id):
     """A funnel by chat: the stub's plan holds one funnel (`COUNT(id)` of policies by status). Expected: the build
     runs to `done` (dashboard, funnel, layout, check); the funnel was made by the extension's `create_chart`, never
-    MCP's `generate_chart`, and needed no claim; Superset holds it as a `funnel` chart created by analyst, analyst
+    MCP's `generate_chart`, a claim or `patch_chart`; Superset holds it as a `funnel` chart created by analyst, analyst
     among its editors and its editors the dashboard's, its description ending in this build's marker; Superset's
     `get_chart_data`, asked as analyst with a minted token, answers one row per status, each count the source's. No
     model client is made or called. Its check status is recorded (rendering is not this PR's)."""
@@ -917,8 +946,8 @@ def test_a_funnel_is_made_through_the_extension_and_its_data_read(live, served, 
     dashboard_id = final["dashboard_id"]
     [step_request] = [r for r in run.requests if r.build.get("ran") == funnel.key]
     tools = [call.tool for call in step_request.calls]
-    assert TOOL_PREFIX + "create_chart" in tools
-    assert "generate_chart" not in tools and TOOL_PREFIX + "claim_chart" not in tools, tools
+    assert tools.count(CREATE_CHART) == 1, tools
+    assert never_called(run) == []
     stored = stored_chart(chart_id)
     assert stored["viz_type"] == "funnel" and stored["deleted_at"] is None
     assert stored["created_by"] == user_id(BUILDER)
@@ -999,7 +1028,10 @@ def test_a_dashboard_is_built_on_by_its_editors_only(live, served, model, policy
                                     f"{label_of(BUILDER)}."), start.body
     assert refused.planner.goals == []
     tools = {short(call.tool) for call in start.calls}
-    assert "ext.editors_of" in tools and tools <= {"execute_sql", "ext.dataset_metrics", "ext.editors_of"}, tools
+    assert "ext.editors_of" in tools and tools <= {"execute_sql", short(PROBE), "ext.editors_of"}, tools
+    assert [(call.request, "refused" in (call.payload or {})) for call in start.calls if call.tool == PROBE] == [
+        ({}, True)]
+    assert writes(start.calls) == []
     assert served.builds() == builds_before and made_by("west") == before
     assert_no_model_call(refused)
 
@@ -1017,7 +1049,7 @@ def test_a_dashboard_is_built_on_by_its_editors_only(live, served, model, policy
                                  f"{label_of(BUILDER)}"), failed["message"]
     assert served.raw_steps(stopped.build_id)[0]["reason"] == "not_editor"
     assert made_by("west") == before
-    assert not [call.tool for r in stopped.requests for call in r.calls if call.tool in WRITES]
+    assert writes([call for r in stopped.requests for call in r.calls]) == []
     assert_no_model_call(stopped)
 
     passed = run_build(live, served, model, one_bar(policy_id), "editor-passes-step-one", builder=BUILDER,
@@ -1029,7 +1061,7 @@ def test_a_dashboard_is_built_on_by_its_editors_only(live, served, model, policy
     assert first["steps"][0]["status"] == "done" and first["steps"][0]["object_id"] == dashboard_id
     tools = [short(call.tool) for call in passed.requests[1].calls]
     assert {"ext.editors_of", "ext.get_layout"} <= set(tools), tools
-    assert not [call.tool for call in passed.requests[1].calls if call.tool in WRITES], tools
+    assert writes(passed.requests[1].calls) == [], tools
     assert_no_model_call(passed)
     observe("editors only", dashboard_id=dashboard_id, at_start=start.body["detail"], at_step_one=failed["message"],
             editor=first["steps"][0]["status"])
@@ -1063,7 +1095,7 @@ def test_a_measure_label_superset_would_rewrite_is_refused_before_anything_is_ma
         "reason": f"mnemiq could not plan this dashboard: measure 'recent_premium': {reason}",
         "parts": [{"part": "measure 'recent_premium'", "reason": reason}]}}, start.body
     assert run.planner.goals == ["recent premium by region"] * 2
-    assert not [call.tool for call in start.calls if call.tool in WRITES]
+    assert writes(start.calls) == []
     assert served.builds() == builds_before and made_by(BUILDER) == before
     assert_no_model_call(run)
     observe("label refused", status=start.status_code, parts=start.body["refused"]["parts"],
@@ -1073,16 +1105,17 @@ def test_a_measure_label_superset_would_rewrite_is_refused_before_anything_is_ma
 # --- a dataset the build makes ---------------------------------------------------------------------------------------
 
 
-def test_a_dataset_the_build_makes_is_above_its_floor_and_its_chart_checks(live, served, model, sales_table):
+def test_a_dataset_the_build_makes_carries_its_marker_and_its_chart_checks(live, served, model, sales_table):
     """The dataset step, live. The module's own table is in the snapshot, and Superset has no dataset for it. The
     stub's plan makes one (a physical dataset on the table) and puts one bar chart on it: `SUM(amount)` by region, a
     currency measure. Expected:
     - the build runs to `done`: dashboard, the dataset, the chart, layout, check;
-    - the dataset step read its floor from `list_datasets` (`created_by_me`, by id, descending, one item), recorded
-      it, made the dataset with MCP's `create_dataset` and claimed it with the extension's `claim_dataset`; the id it
-      made is above the floor, and the floor is analyst's highest dataset id before the build;
-    - Superset holds the dataset on the table, physical, created by analyst, its description ending in this build's
-      marker; the chart reads it, and its check status is `CHECKED`;
+    - the dataset step sent one create, the extension's `create_dataset`, for the table (no SQL) and the build's
+      dashboard, carrying its step's marker, and was answered the dataset's id; no request called MCP's
+      `create_dataset`, `create_virtual_dataset` or `generate_chart`, a claim, or `patch_chart`;
+    - Superset holds the dataset on the table, physical, created by analyst, its description's last line the step's
+      marker, the one dataset carrying it, analyst among its editors; the chart reads it, and its check status is
+      `CHECKED`;
     - `get_chart_data`, asked as analyst with a minted token, shows the table's sums by region, the source's;
     - no model client is made or called.
     Teardown removes the chart and the dataset as analyst removes them, and drops the table."""
@@ -1096,7 +1129,6 @@ def test_a_dataset_the_build_makes_is_above_its_floor_and_its_chart_checks(live,
                       filters=(), row_limit=None, source=None, target=None)
     plan = BuildPlan(charts=(chart,), measures=(amount,),
                      datasets=(PlannedDataset(key="dataset_1", placeholder=-1, table=name),))
-    floor_before = highest(BUILDER, "tables")
     run = run_build(live, served, model, plan, "dataset-step", goal="amount sold by region")
     record("dataset-step", summary(run, served, plan))
     raw = {step["key"]: step for step in served.raw_steps(run.build_id)} if run.build_id else {}
@@ -1106,23 +1138,24 @@ def test_a_dataset_the_build_makes_is_above_its_floor_and_its_chart_checks(live,
     sales_table.chart_ids = [made for made in [(raw.get(chart.key) or {}).get("object_id")] if made is not None]
     assert_ran_to_the_end(run)
     assert [step["key"] for step in run.final["steps"]] == ["dashboard", "dataset_1", chart.key, "layout", "check"]
+    dashboard_id, dataset_id = run.final["dashboard_id"], raw["dataset_1"]["object_id"]
+    marker = format_marker(run.build_id, "dataset_1", dashboard_id)
 
     [made] = [r for r in run.requests if r.build.get("ran") == "dataset_1"]
-    tools = [call.tool for call in made.calls]
-    assert "create_dataset" in tools and TOOL_PREFIX + "claim_dataset" in tools, tools
-    assert "create_virtual_dataset" not in tools
-    listed = [call.request for call in made.calls if call.tool == FLOOR_TOOLS["dataset"]]
-    assert listed and listed[0] == {"created_by_me": True, "select_columns": ["id"], "order_column": "id",
-                                    "order_direction": "desc", "page": 1, "page_size": 1}, listed
-    floor, dataset_id = (raw["dataset_1"].get("intent") or {}).get("id_floor"), raw["dataset_1"]["object_id"]
-    assert type(floor) is int and type(dataset_id) is int and dataset_id > floor, (floor, dataset_id)
-    assert floor == floor_before, (floor, floor_before)
+    creates = [call for call in made.calls if call.tool == CREATE_DATASET]
+    assert len(creates) == 1, [call.tool for call in made.calls]
+    sent = creates[0].request
+    assert (sent["table_name"], sent["schema"], sent["dashboard_id"], sent["marker"]) == (
+        name, "public", dashboard_id, marker), sent
+    assert "sql" not in sent and creates[0].payload == {"dataset_id": dataset_id}
+    assert never_called(run) == []
 
     (row,) = metadata("SELECT table_name, schema, sql, created_by_fk, deleted_at, description FROM tables "
                       "WHERE id = %s", (dataset_id,))
     assert row[:5] == (name, "public", None, user_id(BUILDER), None), row[:5]
-    dashboard_id = run.final["dashboard_id"]
     assert parse_marker(row[5]) == Marker(run.build_id, "dataset_1", dashboard_id)
+    assert carrying("tables", marker) == [(dataset_id, None)]
+    assert user_subject(BUILDER) in editor_ids("sqlatable_editors", "table_id", dataset_id)
     chart_id = raw[chart.key]["object_id"]
     (on,) = metadata("SELECT datasource_id, datasource_type FROM slices WHERE id = %s", (chart_id,))
     assert on == (dataset_id, "table"), on
@@ -1136,5 +1169,188 @@ def test_a_dataset_the_build_makes_is_above_its_floor_and_its_chart_checks(live,
     same = shown == truth
     assert len(data) == 3 and same, (len(data), same)
     assert_no_model_call(run)
-    observe("dataset step", dataset_id=dataset_id, floor=floor, chart_id=chart_id, check=run.final["checks"],
+    observe("dataset step", dataset_id=dataset_id, chart_id=chart_id, check=run.final["checks"],
             message=run.last_step.get("message"))
+
+
+# --- a create whose answer is lost ---------------------------------------------------------------------------------
+
+
+def members(dashboard_id: int) -> list[int]:
+    return [row[0] for row in metadata("SELECT slice_id FROM dashboard_slices WHERE dashboard_id = %s ORDER BY 1",
+                                       (dashboard_id,))]
+
+
+@dataclass
+class Removed:
+    """Charts and dashboards a test made, removed when it ends as analyst removes them: each chart through MCP's
+    `delete_chart`, then each dashboard through MCP's `delete_dashboard`. An id is recorded before anything about it is
+    asserted."""
+
+    charts: list[int] = field(default_factory=list)
+    dashboards: list[int] = field(default_factory=list)
+
+
+@pytest.fixture
+def removed(live) -> Iterator[Removed]:
+    found = Removed()
+    yield found
+    builder = as_user(live, BUILDER)
+    problems: list = []
+    for tool, ids in (("delete_chart", found.charts), ("delete_dashboard", found.dashboards)):
+        for object_id in dict.fromkeys(ids):
+            try:
+                answer = builder.call(tool, {"identifier": object_id})
+            except Exception as exc:  # noqa: BLE001 (reported, so the rest is still removed)
+                problems.append((tool, object_id, type(exc).__name__))
+                continue
+            if answer.get("success") is False:
+                problems.append((tool, object_id, answer.get("error_type")))
+    assert not problems, problems
+
+
+@dataclass
+class Lost:
+    """What `lost_first` saw: what Superset answered the first call (None when it was never sent), and any error the
+    work run in between raised."""
+
+    answers: list = field(default_factory=list)
+    errors: list = field(default_factory=list)
+
+
+@contextmanager
+def lost_first(tool: str, *, sent: bool, meanwhile=None) -> Iterator[Lost]:
+    """Inside the block, the client every adapter holds is wrapped in process (`SupersetMcp.call`, beneath the recorder
+    `run_build` puts over it): the first call of `tool` is sent and runs in Superset (`sent`), or never reaches it, and
+    either way its caller is answered `SupersetUnavailable`, as when an answer is lost on its way back or the service
+    cannot be reached. Every other call is the client's own. `meanwhile(call)`, when given, runs once in between, on a
+    thread of its own, with the client's own `call`, so nothing it sends is recorded as the build's."""
+    lost = Lost()
+    with pytest.MonkeyPatch.context() as patch:
+        real = SupersetMcp.call
+
+        def in_between() -> None:
+            try:
+                meanwhile(real)
+            except BaseException as exc:  # noqa: BLE001 (reported by the test)
+                lost.errors.append(exc)
+
+        def call(self, name, request, **kwargs):
+            if name != tool or lost.answers:
+                return real(self, name, request, **kwargs)
+            lost.answers.append(real(self, name, request, **kwargs) if sent else None)
+            if meanwhile is not None:
+                worker = threading.Thread(target=in_between)
+                worker.start()
+                worker.join(120)
+            raise SupersetUnavailable("the test lost this call's answer")
+
+        patch.setattr(SupersetMcp, "call", call)
+        yield lost
+
+
+def test_a_build_whose_chart_answer_is_lost_makes_one_chart(live, served, model, policy_id, removed):
+    """A lost answer, live. In a one-chart build (a bar of policies by region), the first `create_chart` the chart step
+    sends runs in Superset and returns, and its answer is replaced in process by `SupersetUnavailable`, as when it is
+    lost on its way back (`lost_first`). Expected:
+    - that request answers 200 with the chart step `uncertain` and mnemiq's sentence that Superset did not answer while
+      making the chart, the step holding no id; the next request sends the same create (the same request, the same
+      marker) and is answered the chart the first one made;
+    - the build runs to `done`; Superset holds exactly one chart carrying the step's marker, the one the build recorded
+      and the dashboard's one chart; it is `CHECKED`;
+    - no request called MCP's `generate_chart`, `create_dataset` or `create_virtual_dataset`, a claim, or `patch_chart`;
+      no model client is made or called."""
+    plan = one_bar(policy_id)
+    chart = plan.charts[0]
+    with lost_first(CREATE_CHART, sent=True) as lost:
+        run = run_build(live, served, model, plan, "lost-chart-answer", goal="policies by region")
+    record("lost-chart-answer", summary(run, served, plan))
+    dashboard_id = run.final.get("dashboard_id")
+    marker = format_marker(run.build_id, chart.key, dashboard_id) if run.build_id and dashboard_id else None
+    removed.dashboards.extend([dashboard_id] if dashboard_id else [])
+    removed.charts.extend(chart_id for chart_id, _ in (carrying("slices", marker) if marker else []))
+    assert_ran_to_the_end(run)
+    [made] = lost.answers
+    assert set(made) == {"chart_id"}, made
+    tries = [request for request in run.requests if request.build.get("ran") == chart.key]
+    assert len(tries) == 2, [(r.label, r.build.get("ran")) for r in run.requests]
+    silent, settled = tries
+    [step] = [s for s in silent.build["steps"] if s["key"] == chart.key]
+    assert (step["status"], step["object_id"]) == ("uncertain", None), step
+    assert silent.build["message"].startswith(f"Superset did not answer while making the chart {chart.title!r}")
+    sent = [[call for call in request.calls if call.tool == CREATE_CHART] for request in tries]
+    assert [len(calls) for calls in sent] == [1, 1], sent
+    (first,), (again,) = sent
+    assert isinstance(first.raised, SupersetUnavailable) and first.payload is None
+    assert again.request == first.request and first.request["marker"] == marker
+    assert again.payload == made
+    [built] = [s["object_id"] for s in run.final["steps"] if s["key"] == chart.key]
+    assert built == made["chart_id"]
+    assert carrying("slices", marker) == [(built, None)]
+    assert members(dashboard_id) == [built]
+    assert run.final["checks"] == {str(built): "checked"}, (run.final["checks"], run.last_step.get("message"))
+    assert never_called(run) == []
+    assert_no_model_call(run)
+    observe("lost answer", chart_id=built, silent=silent.build["message"], check=run.final["checks"])
+
+
+def test_a_hand_made_same_named_chart_is_never_adopted(live, served, model, policy_id, removed):
+    """A chart made by hand is never a build's, whatever its name. In a one-chart build (a bar of policies by region),
+    the chart step's first `create_chart` is answered `SupersetUnavailable` in process (`lost_first`), and in between,
+    after the step began and before its retry, analyst, the builder, makes by hand with MCP's `generate_chart` a chart
+    of the same name on the same dataset, which carries no marker. Twice: once with the first create run in Superset
+    (its answer lost on the way back), once with it never reaching Superset. Expected, each time:
+    - the build runs to `done`, and its chart step's object is the one chart carrying the step's marker, never the
+      hand-made one: the chart the first create made in the first case; in the second, a chart the retry made, after
+      the hand-made one, since none carried the marker;
+    - the two creates the step sent are one request; the hand-made chart is as it was made (its name, dataset, params,
+      description and `changed_on`), carries no marker, and is not among the dashboard's charts, which are the build's
+      chart alone; the build's chart is `CHECKED`;
+    - no request called MCP's creates, a claim or `patch_chart`; no model client is made or called.
+    The hand-made charts are removed with the builds' own."""
+    plan = one_bar(policy_id)
+    chart = plan.charts[0]
+    row = "SELECT slice_name, datasource_id, params, description, changed_on, deleted_at FROM slices WHERE id = %s"
+    seen = {}
+    for case, sent in (("answer-lost", True), ("never-sent", False)):
+        hand: dict = {}
+
+        def make_by_hand(real_call, hand=hand) -> None:
+            answer = real_call(as_user(live, BUILDER), "generate_chart",
+                               generate_chart_request(chart, {}, {}, currency="USD"))
+            hand["id"] = (answer.get("chart") or {}).get("id")
+            hand["row"] = metadata(row, (hand["id"],))
+
+        with lost_first(CREATE_CHART, sent=sent, meanwhile=make_by_hand) as lost:
+            run = run_build(live, served, model, plan, f"hand-made-{case}", goal="policies by region")
+        record(f"hand-made-{case}", summary(run, served, plan))
+        dashboard_id = run.final.get("dashboard_id")
+        marker = format_marker(run.build_id, chart.key, dashboard_id) if run.build_id and dashboard_id else None
+        removed.dashboards.extend([dashboard_id] if dashboard_id else [])
+        removed.charts.extend([hand["id"]] if type(hand.get("id")) is int else [])
+        removed.charts.extend(chart_id for chart_id, _ in (carrying("slices", marker) if marker else []))
+        assert lost.errors == [], (case, lost.errors)
+        assert_ran_to_the_end(run)
+        hand_id = hand["id"]
+        assert type(hand_id) is int, case
+        [built] = [s["object_id"] for s in run.final["steps"] if s["key"] == chart.key]
+        assert built != hand_id and carrying("slices", marker) == [(built, None)], (case, built, hand_id)
+        assert lost.answers == ([{"chart_id": built}] if sent else [None]), (case, lost.answers)
+        if not sent:
+            assert built > hand_id, (case, built, hand_id)
+        creates = [call for request in run.requests for call in request.calls if call.tool == CREATE_CHART]
+        assert len(creates) == 2 and creates[0].request == creates[1].request, case
+        assert creates[1].payload == {"chart_id": built}, case
+        stored = metadata(row, (hand_id,))
+        assert stored == hand["row"], case
+        (name, dataset_id, _, description, _, deleted_at), = stored
+        assert (name, dataset_id, deleted_at) == (chart.title, policy_id, None)
+        assert parse_marker(description) is None, case
+        assert metadata("SELECT slice_name, datasource_id FROM slices WHERE id = %s", (built,)) == [
+            (chart.title, policy_id)]
+        assert members(dashboard_id) == [built], case
+        assert run.final["checks"] == {str(built): "checked"}, (case, run.final["checks"])
+        assert never_called(run) == [], case
+        assert_no_model_call(run)
+        seen[case] = {"built": built, "hand_made": hand_id}
+    observe("hand made", **seen)
