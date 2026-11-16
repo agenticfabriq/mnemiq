@@ -17,11 +17,11 @@ What counts, kept narrow so prose is not read as codes:
   a column or table name. A quoted literal opens after a non-word character and closes before one, and neither starts
   nor ends with whitespace, so the apostrophe in "lot's" never opens one and swallows the code after it.
 - Only a code the definition selects on counts. A mention in an explicit exclusion (`<> 'X'`, `!= 'X'`,
-  `NOT IN ('X')`, "is not 'X'", "other than", "except", "excluding", "exclude ... = 'X'" or "... IN ('X')",
-  "'X' ... are excluded") is filtered out by a query that follows the definition, which keeps every row whether or not
-  the data holds it, so a definition that only excludes is never reported. A nearby negation that still selects
-  ("not only 'X' but also", "do not omit ... 'X'", "do not exclude ... 'X'") is not an exclusion, and "exclude" reaches
-  only its own predicate.
+  `NOT IN ('X')`, `NOT (... 'X')`, "is not 'X'", "other than", "except", "excluding", "exclude ... = 'X'" or
+  "... IN ('X')", "'X' ... are excluded") is filtered out by a query that follows the definition, which keeps every
+  row whether or not the data holds it, so a definition that only excludes is never reported. A nearby negation that
+  still selects ("not only 'X' but also", "do not omit ... 'X'", "do not exclude ... 'X'") is not an exclusion, and
+  "exclude" reaches only its own predicate.
 - A code counts for a column only when it has the shape of one of the column's values: capitals, small letters and
   digits in the same places. `'from May to June'` is never a code for a column of `AB12`s.
 - A column is judged only when every column of that name in the snapshot is indexed: a code may be in the one whose
@@ -52,6 +52,8 @@ _EXCLUDED_BEFORE = re.compile(
 # ...or just after it. Both read a coordinated list ("'X', 'Y' and 'Z'") as one mention.
 _EXCLUDED_AFTER = re.compile(
     r"^\s*\)?\s*(?:rows?\s+)?(?:are|is)\s+(?:excluded|ignored|dropped|removed|left\s+out|filtered\s+out)\b", re.IGNORECASE)
+# A negation opening a parenthesised predicate, as SQL writes one.
+_NOT_PAREN = re.compile(r"\bnot\s*\(", re.IGNORECASE)
 # What may stand between two codes of one list: a comma, "and", "or", or both.
 _LIST_GAP = re.compile(r"\s*(?:,\s*)?(?:(?:and|or)\s+)?", re.IGNORECASE)
 _BARE = re.compile(r"(?<![\w'\"-])[A-Z0-9][A-Z0-9_-]*(?![\w'\"-])")
@@ -81,11 +83,21 @@ def _names(column: str, text: str) -> bool:
     return re.search(rf"(?<![\w]){re.escape(column)}(?!\w)", text, re.IGNORECASE) is not None
 
 
+def _inside_not(before: str) -> bool:
+    """Whether `before` ends inside a `NOT (` it opened and has not closed: `NOT (SHIP_MODE IN ('X'))`."""
+    for opened in reversed(list(_NOT_PAREN.finditer(before))):
+        rest = before[opened.end():]
+        if rest.count("(") - rest.count(")") >= 0:
+            return True
+    return False
+
+
 def _excluded(text: str, start: int, end: int) -> bool:
     """Whether the mention at `text[start:end]` sits in an explicit exclusion within its own clause."""
     before = _CLAUSE_END.split(text[:start])[-1]
     after = _CLAUSE_END.split(text[end:], maxsplit=1)[0]
-    return _EXCLUDED_BEFORE.search(before) is not None or _EXCLUDED_AFTER.search(after) is not None
+    return (_EXCLUDED_BEFORE.search(before) is not None or _EXCLUDED_AFTER.search(after) is not None
+            or _inside_not(before))
 
 
 def _codes(text: str, names: set[str]) -> list[str]:
