@@ -825,9 +825,9 @@ class Metadata:
     times out),
     `aborted` (the session's transaction is aborted, as Postgres aborts one a statement failed in: every statement fails
     with SQLSTATE 25P02 until a rollback), `gone` (the session's connection is gone: every statement fails, a rollback
-    or not) and `breaks` (what of `aborted` or `gone` happens, once, when the session reaches a moment:
-    `"isolation"` or `"lookup"`). `waiting` holds the connections waiting for a lock, and `leaked` each lock a
-    connection still held when it was closed."""
+    or not; SQLAlchemy marks the error as an invalidated connection) and `breaks` (what of `aborted` or `gone`
+    happens, once, when the session reaches a moment: `"isolation"` or `"lookup"`). `waiting` holds the connections
+    waiting for a lock, and `leaked` each lock a connection still held when it was closed."""
 
     def __init__(self, superset: SimpleNamespace, dialect: str) -> None:
         self.superset = superset
@@ -851,7 +851,7 @@ class Metadata:
     def statement(self) -> None:
         """A statement on the session, which fails while its connection is gone or its transaction is aborted."""
         if self.gone:
-            raise stubs.database_error("08006")
+            raise stubs.database_error("08006", invalidated=True)
         if self.aborted:
             raise stubs.database_error("25P02")
 
@@ -881,6 +881,7 @@ class Metadata:
         self.statement()
         if self.contended is not None and self.contended in statement:
             raise stubs.database_error("55P03")
+
 
     def query(self, model: type) -> _Lookup:
         return _Lookup(self, model)
@@ -1751,20 +1752,86 @@ def test_a_failed_unlock_invalidates_the_connection(creating, dialect, release):
 
 
 @pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
-def test_a_failure_taking_the_lock_closes_its_connection(creating, dialect):
-    """The lock statement fails other than by waiting past the lock timeout (the connection lost mid-statement,
-    SQLSTATE 08006): whether the lock was taken on the connection is not known, so it is closed rather than put back in
-    the pool (invalidated), and the error is raised, as a metadata failure the create cannot answer is. Nothing is
-    looked up, checked or made."""
+@pytest.mark.parametrize(("error", "answer"), [
+    pytest.param(stubs.database_error("08006", invalidated=True), {"busy": True}, id="the connection lost"),
+    pytest.param(stubs.database_error("42883"), {"failed": True}, id="another database error")])
+def test_a_failure_taking_the_lock_closes_its_connection(creating, dialect, error, answer):
+    """The lock statement fails other than by waiting past the lock timeout: whether the lock was taken on the
+    connection is not known, so it is closed rather than put back in the pool (invalidated). The error is answered,
+    never raised out of the tool: busy for a lost connection, failed for another error. Nothing is looked up, checked
+    or made."""
     metadata = creating.on(dialect)
-    metadata.lock_error = stubs.database_error("08006")
+    metadata.lock_error = error
     for make in (make_dashboard, make_funnel):
         creating.superset.ran.clear()
-        with pytest.raises(stubs.DBAPIError):
-            make()
-        assert creating.superset.ran[-3:] == [("on", ANY, "rollback"), ("invalidate", ANY), ("close", ANY)]
+        assert make() == answer
+        assert creating.superset.ran[-4:] == [("on", ANY, "rollback"), ("invalidate", ANY), ("close", ANY),
+                                              ("rollback",)]
         assert not {"isolation", "lookup", "validate", "chart_data"} & set(_kinds(creating.superset))
         assert commands(creating.superset) == []
+
+
+class _Unreachable(dict):
+    """Objects by id, every read of which fails with `error`, as a DAO's read does when the metadata database fails."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__()
+        self.error = error
+
+    def get(self, key, default=None):
+        raise self.error
+
+
+@pytest.mark.parametrize("lost", [pytest.param(True, id="the connection lost"),
+                                  pytest.param(False, id="another database error")])
+@pytest.mark.parametrize("where", ["taking the lock", "the checks before the lock", "the chart's last bound"])
+def test_a_database_error_outside_a_command_is_answered_not_raised(creating, monkeypatch, where, lost):
+    """A database error outside any command (taking the marker's lock, the caller's checks before it, or the chart's
+    last bound on its lock waits) reaches the write tool's one boundary for database errors: the session is rolled
+    back and the error answered, busy for a lost connection (the same request may be sent again), failed for another;
+    never raised out of the tool, which mnemiq would count as the tool failing. A retry once the database answers
+    again, with the chart an earlier send committed, answers that chart."""
+    metadata, superset = creating.metadata, creating.superset
+    error = stubs.database_error("08006", invalidated=True) if lost else stubs.database_error("42883")
+    if where == "taking the lock":
+        metadata.lock_error = error
+    elif where == "the checks before the lock":
+        superset.dashboards = _Unreachable(error)
+    else:
+        module = sys.modules["superset.mcp_service.chart.compile"]
+        compiling = module._compile_chart
+        monkeypatch.setattr(module, "_compile_chart", lambda form_data, dataset_id: (
+            setattr(metadata, "gone" if lost else "aborted", True), compiling(form_data, dataset_id))[1])
+    assert make_from_config() == ({"busy": True} if lost else {"failed": True})
+    assert commands(superset) == [] and superset.ran[-1] == ("rollback",)
+    if where == "the chart's last bound":
+        assert superset.ran[-5:] == [BOUND, ("rollback",), *let_go("postgresql", STEP), ("rollback",)]
+    metadata.lock_error, metadata.gone = None, False
+    superset.dashboards = {12: creating.dashboard}
+    superset.rows["Slice"].append(_row(9, STEP))
+    assert make_from_config() == {"chart_id": 9}
+    assert commands(superset) == []
+
+
+def test_only_a_write_tool_answers_a_database_error(superset):
+    """The boundary for database errors is the write tools' (`_answering`): the same failure in a read tool's body is
+    raised as it was, and a non-database error is raised by both."""
+    from agenticfabriq.mnemiq import reads
+
+    superset.session = Metadata(superset, "postgresql")
+
+    def failing(found: dict) -> dict:
+        raise stubs.database_error("08006", invalidated=True)
+
+    def broken(found: dict) -> dict:
+        raise RuntimeError("not a database error")
+
+    assert writes._answering("delete_dataset")(failing)({"dataset_id": 4, "dashboard_id": 12}) == {"busy": True}
+    assert superset.ran == [("rollback",)]
+    with pytest.raises(stubs.DBAPIError):
+        writes._answering("get_layout", reads.REQUESTS)(failing)({"dashboard_id": 12})
+    with pytest.raises(RuntimeError):
+        writes._answering("delete_dataset")(broken)({"dataset_id": 4, "dashboard_id": 12})
 
 
 def test_a_lock_granted_as_its_wait_times_out_is_not_put_back_in_the_pool(creating):

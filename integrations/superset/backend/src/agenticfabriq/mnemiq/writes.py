@@ -12,7 +12,8 @@ Every tool keeps these rules:
   one's `changed_on`, and answers `{"stale": true}`. `{"busy": true}` is for a lock-contention error
   (`superset/versioning/db_errors.py`, `is_lock_contention_error`), a wait past the lock timeout among them
   (`lock_row`), and for a metadata connection lost mid-statement or not to be had from the pool (`_failed`): the
-  same request may be sent again.
+  same request may be sent again. A database error outside a command is answered too, by the same rule, never raised
+  out of the tool (`_answering`).
 - A create carrying a build's marker makes its object once (`_find_or_create`), so a create whose answer was lost may
   be sent again. Once the checks that refuse the caller pass, it takes one lock keyed by the marker, on a connection
   of its own (`_marker_lock`), and holds it from the look for the object whose description's last line is that
@@ -267,7 +268,15 @@ def with_marker(description: str | None, marker: str) -> str:
 def _answering(tool: str, requests: Mapping[str, dict[str, _Field]] = REQUESTS) -> Callable[
         [Callable[[dict], dict]], Callable[[Any], dict]]:
     """Reads the request for `tool` (its fields in `requests`) before the body runs, and answers a `Refused` with its
-    answer."""
+    answer.
+
+    A write tool (one `REQUESTS` reads) has one boundary for database errors around its whole body: a SQLAlchemy
+    error that reaches it, from anywhere a command does not answer it (the checks before a lock, taking or letting go
+    a marker's lock, a bound on lock waits), is answered by `_failed` once the session is rolled back:
+    `{"busy": true}` for a lost race or a metadata connection lost or not to be had, where the same request may be
+    sent again, else `{"failed": true}`. Never raised out of the tool, which mnemiq would count as the tool failing.
+    A lock's own helpers have let it go and closed its connection by then. A read tool raises it as before."""
+    writing = tool in REQUESTS
 
     def wrap(body: Callable[[dict], dict]) -> Callable[[Any], dict]:
         @functools.wraps(body)
@@ -276,6 +285,14 @@ def _answering(tool: str, requests: Mapping[str, dict[str, _Field]] = REQUESTS) 
                 return body(read(tool, request, requests))
             except Refused as refused:
                 return refused.answer
+            except Exception as exc:
+                from sqlalchemy.exc import SQLAlchemyError
+
+                if not writing or not isinstance(exc, SQLAlchemyError):
+                    raise
+                with contextlib.suppress(SQLAlchemyError):
+                    _session().rollback()
+                return _failed(tool, exc)
 
         return run
 
