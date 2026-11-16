@@ -735,7 +735,7 @@ def test_histogram_check_context_selects_the_groups_then_the_column():
     assert context["result_type"] == "full" and context["force"] is False
     (query,) = context["queries"]
     assert query["columns"] == ["region", "amount"]
-    assert query["metrics"] == []
+    assert "metrics" not in query  # a plain row select, as the histogram's own `buildQuery` sends none
     assert query["filters"] == [WEST_Q]
     assert "post_processing" not in query
     assert json.loads(json.dumps(context)) == context
@@ -743,7 +743,23 @@ def test_histogram_check_context_selects_the_groups_then_the_column():
 
 def test_histogram_check_context_selects_the_column_alone_without_groups():
     (query,) = ext.histogram_check_context({"viz_type": "histogram_v2", "column": "amount"}, DATASET)["queries"]
-    assert query["columns"] == ["amount"] and query["metrics"] == [] and query["filters"] == []
+    assert query["columns"] == ["amount"] and "metrics" not in query and query["filters"] == []
+
+
+_COUNT_ALL = [{"expressionType": "SQL", "sqlExpression": "COUNT(*)", "label": "COUNT(*)"}]
+
+
+@pytest.mark.parametrize("having", [
+    {"expressionType": "SIMPLE", "clause": "HAVING", "subject": "amount", "operator": ">", "comparator": 1},
+    {"expressionType": "SQL", "clause": "HAVING", "sqlExpression": "SUM(amount) > 1"},
+])
+def test_histogram_check_context_aggregates_when_a_having_filter_is_present(having):
+    """The histogram's `buildQuery` sends `COUNT(*)` as its metric only when an adhoc filter's clause is HAVING, so
+    the query groups and a HAVING clause has an aggregate to hold; the groups then the column stay as they were."""
+    form = {**HISTOGRAM, "adhoc_filters": [WEST, having]}
+    (query,) = ext.histogram_check_context(form, DATASET)["queries"]
+    assert query["metrics"] == _COUNT_ALL
+    assert query["columns"] == ["region", "amount"]
 
 
 def test_histogram_check_context_does_not_change_its_form_data():

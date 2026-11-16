@@ -2451,7 +2451,7 @@ def test_a_histograms_check_selects_its_column_its_groups_under_its_filters(crea
     assert set(make_from_config()) == {"chart_id"}
     ((_, context),) = [entry for entry in creating.superset.ran if entry[0] == "chart_data"]
     (query,) = context["queries"]
-    assert query["columns"] == ["region", "amount"] and query["metrics"] == []
+    assert query["columns"] == ["region", "amount"] and "metrics" not in query
     assert query["filters"] == [{"col": "region", "op": "==", "val": "West"}]
     assert query["row_limit"] == writes._CHART_ROW_LIMIT_PROBE
     assert context["result_type"] == "full"

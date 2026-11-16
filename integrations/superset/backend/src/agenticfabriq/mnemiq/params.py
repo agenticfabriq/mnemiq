@@ -616,10 +616,11 @@ def query_context(viz_type: str, params: Mapping, datasource_id: int) -> dict | 
 
 def histogram_check_context(form_data: Mapping, datasource_id: int) -> dict:
     """The query context the extension runs to check a histogram (`histogram_v2`) before it is saved: the observations
-    and their grouping columns, the form data's `groupby` then its `column`, no metrics and no post-processing, under
-    the form data's filters, read as the other families' queries read them. rc2's own compile check builds a histogram's
-    query from metrics and groupby and so finds nothing to select, because the histogram names its column under
-    `column` alone. Not a chart's saved query context. Raises ValueError for a bad `datasource_id`, for form data
+    and their grouping columns, the form data's `groupby` then its `column`, no post-processing, under the form data's
+    filters, read as the other families' queries read them. Its metrics are the histogram's own `buildQuery`'s: none
+    (a plain row select), or `COUNT(*)` when an adhoc filter's clause is HAVING, so a HAVING filter has an aggregate
+    to hold. rc2's own compile check leaves a histogram's column out of its query, which it builds from metrics and
+    groupby, because the histogram names its column under `column` alone. Not a chart's saved query context. Raises ValueError for a bad `datasource_id`, for form data
     that is not a mapping, and for form data without a `column`."""
     if isinstance(datasource_id, bool) or not isinstance(datasource_id, int) or datasource_id < 1:
         raise ValueError("datasource_id must be a positive integer")
@@ -630,11 +631,13 @@ def histogram_check_context(form_data: Mapping, datasource_id: int) -> dict:
         raise ValueError("a histogram's params name no column")
     filters, extras = _filters_and_extras(form_data)
     groups = [c for c in _ensure_list(form_data.get("groupby")) if c != ""]
+    query = {"columns": _dedupe([*groups, column], _column_label), "filters": filters, "extras": extras}
+    if any(isinstance(f, Mapping) and f.get("clause") == "HAVING" for f in _ensure_list(form_data.get("adhoc_filters"))):
+        query["metrics"] = [{"expressionType": "SQL", "sqlExpression": "COUNT(*)", "label": "COUNT(*)"}]
     context = {
         "datasource": {"id": datasource_id, "type": "table"},
         "force": False,
-        "queries": [{"columns": _dedupe([*groups, column], _column_label), "metrics": [], "filters": filters,
-                     "extras": extras}],
+        "queries": [query],
         "result_format": "json",
         "result_type": "full",
     }
