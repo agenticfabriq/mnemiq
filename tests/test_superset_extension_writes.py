@@ -702,6 +702,7 @@ class _Lookup:
 
     def __iter__(self):
         self.metadata.log.append(("lookup", self.model.__name__))
+        self.metadata.statement()
         rows = [row for row in self.metadata.superset.rows[self.model.__name__]
                 if all(_holds(predicate, row) for predicate in self.predicates)]
         return iter(sorted(rows, key=lambda row: [getattr(row, name) for name in self.ordered]))
@@ -733,13 +734,23 @@ class Metadata:
     for each statement the session executes, `("lookup", model)` when a query is read, `("commit",)` and
     `("rollback",)`; and, on a connection of its own (`engine.connect()`), `("connect", n)`, `("on", n, statement,
     parameters)` and `("close", n)`. A test may set `isolation` (what the session's connection reports), `contended`
-    (a text whose statement waits past the lock timeout, SQLSTATE 55P03), `got_lock` (what `GET_LOCK` answers) and
-    `pool_exhausted` (`engine.connect()` times out)."""
+    (a text whose statement waits past the lock timeout, SQLSTATE 55P03), `got_lock` (what `GET_LOCK` answers),
+    `pool_exhausted` (`engine.connect()` times out), `aborted` (the session's transaction is aborted, as Postgres
+    aborts one a statement failed in: every statement fails with SQLSTATE 25P02 until a rollback) and `gone` (the
+    session's connection is gone: every statement fails, a rollback or not)."""
 
     def __init__(self, superset: SimpleNamespace, dialect: str) -> None:
         self.superset, self.connections = superset, 0
         self.isolation, self.contended, self.got_lock, self.pool_exhausted = "READ COMMITTED", None, 1, False
+        self.aborted = self.gone = False
         self.engine = SimpleNamespace(dialect=SimpleNamespace(name=dialect), connect=self._connect)
+
+    def statement(self) -> None:
+        """A statement on the session, which fails while its connection is gone or its transaction is aborted."""
+        if self.gone:
+            raise stubs.database_error("08006")
+        if self.aborted:
+            raise stubs.database_error("25P02")
 
     @property
     def log(self) -> list:
@@ -753,6 +764,7 @@ class Metadata:
 
     def _isolation(self) -> str:
         self.log.append(("isolation",))
+        self.statement()
         return self.isolation
 
     def _connect(self) -> _Connection:
@@ -763,6 +775,7 @@ class Metadata:
 
     def execute(self, statement, parameters=None) -> None:
         self.log.append(("execute", statement, parameters))
+        self.statement()
         if self.contended is not None and self.contended in statement:
             raise stubs.database_error("55P03")
 
@@ -774,6 +787,7 @@ class Metadata:
 
     def rollback(self) -> None:
         self.log.append(("rollback",))
+        self.aborted = False
 
 
 def commands(superset: SimpleNamespace, *names: str) -> list:
@@ -1527,18 +1541,22 @@ CHECKS = {
     "compile": (make_from_config, "compile", {"refused": "query_failed"}),
     "query check": (make_funnel, "chart_data", {"refused": "query_failed"}),
 }
-AFTER_A_REFUSAL = ["isolation", "execute", "execute", "lookup", "rollback"]
+# What runs after a check refused a chart: the session rolled back, then the look under the marker's lock.
+AFTER_A_REFUSAL = ["rollback", "isolation", "execute", "execute", "lookup", "rollback"]
 
 
-def _refusing(monkeypatch, superset: SimpleNamespace, check: str, winners=()) -> None:
+def _refusing(monkeypatch, superset: SimpleNamespace, check: str, winners=(), breaks: str | None = None) -> None:
     """`check` refuses the chart from now on, and while it runs another send of the same create commits `winners`:
     the race a retry sent while its first send still runs meets when the first commits just after the retry looked
     for the chart before its check. rc2's validation answers the config invalid; its mapping leaves no chart type;
     `_compile_chart` answers a failure, as it does for a source database that timed out; a funnel's query answers a
-    failed query."""
+    failed query. `breaks` names what the check's own failure did to the metadata session: `"aborted"` its
+    transaction, as a statement that failed in it on Postgres does, or `"gone"` its connection."""
 
     def meanwhile() -> None:
         superset.rows["Slice"].extend(winners)
+        if breaks is not None:
+            setattr(superset.session, breaks, True)
 
     if check == "validation":
         superset.config_valid = False
@@ -1620,6 +1638,33 @@ def test_a_chart_refused_while_its_marker_lock_is_held_answers_busy(creating, mo
     make, ran, _ = CHECKS[check]
     _refusing(monkeypatch, creating.superset, check)
     assert make() == {"busy": True}
+    assert "lookup" not in _after(creating.superset, ran)
+    assert commands(creating.superset) == []
+
+
+@pytest.mark.parametrize("made", [pytest.param(True, id="made meanwhile"), pytest.param(False, id="not made")])
+@pytest.mark.parametrize("check", CHECKS)
+def test_a_check_that_aborted_the_transaction_is_still_followed_by_the_look(creating, monkeypatch, check, made):
+    """The check failed on a database error in the metadata session (a statement timeout while it read the dataset,
+    say), and so refused the chart; on Postgres that error aborts the session's transaction, and every statement
+    fails until a rollback. The look after the refusal rolls the session back first (a refused create holds nothing
+    in it), so it takes the lock in a new transaction: a chart another send made meanwhile is answered, and with
+    none the check's own refusal."""
+    make, ran, refusal = CHECKS[check]
+    _refusing(monkeypatch, creating.superset, check, winners=[_row(9, STEP)] if made else (), breaks="aborted")
+    assert make() == ({"chart_id": 9} if made else refusal)
+    assert _after(creating.superset, ran) == AFTER_A_REFUSAL
+    assert commands(creating.superset) == []
+
+
+@pytest.mark.parametrize("check", CHECKS)
+def test_a_look_the_metadata_database_cannot_answer_answers_the_refusal(creating, monkeypatch, check):
+    """The metadata database's connection went away during the check, so the look after the refusal fails too,
+    rolled back or not: the check's own refusal is answered, as before the look was made, never an error out of the
+    tool, though another send's chart is there. Nothing is made."""
+    make, ran, refusal = CHECKS[check]
+    _refusing(monkeypatch, creating.superset, check, winners=[_row(9, STEP)], breaks="gone")
+    assert make() == refusal
     assert "lookup" not in _after(creating.superset, ran)
     assert commands(creating.superset) == []
 

@@ -651,8 +651,22 @@ def _made_meanwhile(model: type, marker: str, *, kind: str, refusal: dict) -> di
     or query check): the object of `model` that `marker` names, when another send of the create committed it while the
     check ran, else `refusal`. Looked for under the lock as `_find_or_create` looks (`_under_marker_lock`), so a send
     still holding the lock, its object not yet committed, answers `{"busy": true}`, which may be sent again, not the
-    refusal, which stops the build. Only the lookup runs inside the lock."""
-    return _under_marker_lock(model, marker, kind=kind, otherwise=lambda: refusal)
+    refusal, which stops the build. Only the lookup runs inside the lock.
+
+    The check may have failed on a database error in the metadata session, which on Postgres aborts the session's
+    transaction: every statement fails until a rollback. So the session is rolled back first. A refused create holds
+    nothing in it, and at READ COMMITTED nothing depends on what it read before; the lock is taken in the new
+    transaction. A look that still fails on the database (its connection gone) answers `refusal`, as the create did
+    before it looked."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    try:
+        _session().rollback()
+        return _under_marker_lock(model, marker, kind=kind, otherwise=lambda: refusal)
+    except SQLAlchemyError as exc:
+        logger.warning("mnemiq extension: a refused create could not look for its object under the marker's lock",
+                       exc_info=exc)
+        return refusal
 
 
 def _dashboard(dashboard_id: int) -> Any:
