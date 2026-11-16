@@ -9,13 +9,18 @@ What the tools do inside Superset (the locks, the commands, the answers) is the 
 import ast
 import contextlib
 import hashlib
+import itertools
 import json
 import re
 import sqlite3
 import sys
+import threading
+import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import ANY
 
 import pytest
@@ -702,6 +707,7 @@ class _Lookup:
 
     def __iter__(self):
         self.metadata.log.append(("lookup", self.model.__name__))
+        self.metadata.at("lookup")
         self.metadata.statement()
         rows = [row for row in self.metadata.superset.rows[self.model.__name__]
                 if all(_holds(predicate, row) for predicate in self.predicates)]
@@ -712,19 +718,97 @@ class _Lookup:
 
 
 class _Connection:
-    """A connection of its own, as `engine.connect()` hands one out: `GET_LOCK` answers the metadata's `got_lock`."""
+    """A connection of its own, as `engine.connect()` hands one out, on which a create takes its marker's lock. What
+    runs on it is logged as `("on", n, ...)`: its transaction (`begin`) as `"begin"`, then `"commit"`, or `"rollback"`
+    when its block raises; each statement with its parameters. Its lock statements take a real lock of the
+    metadata's (`Metadata.locks`), keyed by the marker (Postgres) or the lock's name (MySQL), so requests in two
+    threads wait for each other as two sessions of the database do: Postgres's `pg_advisory_lock` for the
+    `lock_timeout` set in its transaction, then failing with SQLSTATE 55P03; MySQL's `GET_LOCK` for its seconds, then
+    answering 0 (or the metadata's `got_lock`, when that is not 1, without taking the lock). The lock outlives the
+    transaction it was taken in, as a session's lock does. An unlock answers the metadata's `released` (raised, when it
+    is an exception; the database's own answer when it is None) and lets the lock go only when that is 1. Invalidating
+    the connection lets go whatever it holds, as closing a database session does (`("invalidate", n)`); closing it
+    while it still holds a lock leaves the lock held, as a pool's reset does, and records it in the metadata's
+    `leaked`."""
 
     def __init__(self, metadata: "Metadata", number: int) -> None:
         self.metadata, self.number = metadata, number
+        self.timeout_s: float | None = None
+        self.holding: str | None = None
         metadata.log.append(("connect", number))
 
+    def _log(self, *entry) -> None:
+        self.metadata.log.append(("on", self.number, *entry))
+
+    @contextlib.contextmanager
+    def begin(self):
+        self._log("begin")
+        try:
+            yield
+        except BaseException:
+            self._log("rollback")
+            raise
+        finally:
+            self.timeout_s = None  # `set_config(..., true)` holds until the transaction ends
+        self._log("commit")
+
     def execute(self, statement, parameters=None) -> SimpleNamespace:
-        self.metadata.log.append(("on", self.number, statement, parameters))
-        answer = self.metadata.got_lock if "GET_LOCK" in statement else 1
+        self._log(statement, parameters)
+        metadata = self.metadata
+        if metadata.lock_error is not None and statement in (PG_LOCK, GET_LOCK):
+            raise metadata.lock_error
+        if metadata.contended is not None and metadata.contended in statement:
+            raise stubs.database_error("55P03")
+        answer: Any = 1
+        if statement == LOCK_TIMEOUT:
+            self.timeout_s = int(parameters["timeout"].removesuffix("ms")) / 1000
+        elif statement == PG_LOCK:
+            if not self._take(parameters["marker"], self.timeout_s):
+                raise stubs.database_error("55P03")
+            answer = None  # `pg_advisory_lock` returns void
+        elif statement == GET_LOCK:
+            answer = metadata.got_lock
+            if answer == 1:
+                answer = int(self._take(parameters["name"], parameters["seconds"]))
+        elif statement in (PG_UNLOCK, RELEASE_LOCK):
+            answer = self._release(statement)
         return SimpleNamespace(scalar=lambda: answer)
+
+    def _take(self, key: str, seconds: float | None) -> bool:
+        lock = self.metadata.locks.setdefault(key, threading.Lock())
+        if not lock.acquire(blocking=False):
+            self.metadata.waiting.append(self.number)
+            try:
+                if not lock.acquire(timeout=30 if seconds is None else seconds):
+                    return False
+            finally:
+                self.metadata.waiting.remove(self.number)
+        self.holding = key
+        return True
+
+    def _release(self, statement: str) -> Any:
+        answer = self.metadata.released
+        if isinstance(answer, BaseException):
+            raise answer
+        if answer is None:
+            answer = True if statement == PG_UNLOCK else 1  # Postgres answers a boolean, MySQL a number
+        if answer == 1 and self.holding is not None:
+            self._let_go()
+        return answer
+
+    def _let_go(self) -> None:
+        self.metadata.locks[self.holding].release()
+        self.holding = None
+
+    def invalidate(self) -> None:
+        self.metadata.log.append(("invalidate", self.number))
+        if self.holding is not None:
+            self._let_go()
 
     def close(self) -> None:
         self.metadata.log.append(("close", self.number))
+        if self.holding is not None:
+            self.metadata.leaked.append(self.holding)
 
 
 class Metadata:
@@ -732,18 +816,34 @@ class Metadata:
     stand-ins' `rows`, and what it does goes to the stand-ins' `ran`, in order with the commands run there:
     `("isolation",)` when the session's connection's isolation level is read, `("execute", statement, parameters)`
     for each statement the session executes, `("lookup", model)` when a query is read, `("commit",)` and
-    `("rollback",)`; and, on a connection of its own (`engine.connect()`), `("connect", n)`, `("on", n, statement,
-    parameters)` and `("close", n)`. A test may set `isolation` (what the session's connection reports), `contended`
-    (a text whose statement waits past the lock timeout, SQLSTATE 55P03), `got_lock` (what `GET_LOCK` answers),
-    `pool_exhausted` (`engine.connect()` times out), `aborted` (the session's transaction is aborted, as Postgres
-    aborts one a statement failed in: every statement fails with SQLSTATE 25P02 until a rollback) and `gone` (the
-    session's connection is gone: every statement fails, a rollback or not)."""
+    `("rollback",)`; and, on a connection of its own (`engine.connect()`, `_Connection`), `("connect", n)`, `("on", n,
+    ...)`, `("invalidate", n)` and `("close", n)`. A test may set `isolation` (what the session's connection reports),
+    `contended` (a text whose statement on a connection of its own waits past the lock timeout, SQLSTATE 55P03),
+    `got_lock` (what `GET_LOCK` answers without taking the lock, when not 1), `lock_error` (what the lock statement
+    raises instead), `released` (what an unlock answers, or raises), `pool_exhausted` (`engine.connect()` times out),
+    `aborted` (the session's transaction is aborted, as Postgres aborts one a statement failed in: every statement fails
+    with SQLSTATE 25P02 until a rollback), `gone` (the session's connection is gone: every statement fails, a rollback
+    or not) and `breaks` (what of `aborted` or `gone` happens, once, when the session reaches a moment:
+    `"isolation"` or `"lookup"`). `waiting` holds the connections waiting for a lock, and `leaked` each lock a
+    connection still held when it was closed."""
 
     def __init__(self, superset: SimpleNamespace, dialect: str) -> None:
-        self.superset, self.connections = superset, 0
+        self.superset = superset
         self.isolation, self.contended, self.got_lock, self.pool_exhausted = "READ COMMITTED", None, 1, False
+        self.lock_error: BaseException | None = None
+        self.released: Any = None
         self.aborted = self.gone = False
+        self.breaks: dict[str, str] = {}
+        self.locks: dict[str, threading.Lock] = {}
+        self.waiting: list[int] = []
+        self.leaked: list[str] = []
+        self._numbers = itertools.count(1)
         self.engine = SimpleNamespace(dialect=SimpleNamespace(name=dialect), connect=self._connect)
+
+    def at(self, moment: str) -> None:
+        """The session reaches `moment`: what `breaks` names for it happens now, once."""
+        if (broken := self.breaks.pop(moment, None)) is not None:
+            setattr(self, broken, True)
 
     def statement(self) -> None:
         """A statement on the session, which fails while its connection is gone or its transaction is aborted."""
@@ -764,14 +864,14 @@ class Metadata:
 
     def _isolation(self) -> str:
         self.log.append(("isolation",))
+        self.at("isolation")
         self.statement()
         return self.isolation
 
     def _connect(self) -> _Connection:
         if self.pool_exhausted:
             raise stubs.PoolTimeoutError("QueuePool limit of size 5 overflow 10 reached")
-        self.connections += 1
-        return _Connection(self, self.connections)
+        return _Connection(self, next(self._numbers))
 
     def execute(self, statement, parameters=None) -> None:
         self.log.append(("execute", statement, parameters))
@@ -1037,16 +1137,41 @@ def test_a_chart_whose_editors_read_its_data_gets_the_dataset_rule(claiming):
 
 SHELL = format_marker(BUILD, "dashboard", None)
 STEP = format_marker(BUILD, "chart_1", 12)
-ADVISORY_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended(:marker, 0))"
+PG_LOCK = "SELECT pg_advisory_lock(hashtextextended(:marker, 0))"
+PG_UNLOCK = "SELECT pg_advisory_unlock(hashtextextended(:marker, 0))"
 GET_LOCK = "SELECT GET_LOCK(:name, :seconds)"
 RELEASE_LOCK = "SELECT RELEASE_LOCK(:name)"
+
+
+def _lock_name(marker: str) -> str:
+    """MySQL's name for `marker`'s lock: `mnemiq:` and the marker's SHA-256, cut to 63 characters (MySQL allows 64)."""
+    return "mnemiq:" + hashlib.sha256(marker.encode()).hexdigest()[:56]
+
+
+def taken(dialect: str, marker: str, n: int = 1, seconds: float = 30) -> list:
+    """What taking `marker`'s lock runs, with the lock timeout `seconds`: connection `n` of its own, and on it a short
+    transaction, committed once the lock is held (Postgres's with its wait bounded first)."""
+    if dialect == "postgresql":
+        asked = [("on", n, LOCK_TIMEOUT, {"timeout": f"{round(seconds * 1000)}ms"}),
+                 ("on", n, PG_LOCK, {"marker": marker})]
+    else:
+        asked = [("on", n, GET_LOCK, {"name": _lock_name(marker), "seconds": max(1, int(seconds))})]
+    return [("connect", n), ("on", n, "begin"), *asked, ("on", n, "commit")]
+
+
+def let_go(dialect: str, marker: str, n: int = 1) -> list:
+    """What letting `marker`'s lock go runs: the release on connection `n`, then the connection closed."""
+    if dialect == "postgresql":
+        return [("on", n, PG_UNLOCK, {"marker": marker}), ("close", n)]
+    return [("on", n, RELEASE_LOCK, {"name": _lock_name(marker)}), ("close", n)]
 
 
 @pytest.fixture
 def creating(monkeypatch, superset):
     """Creates with Superset stood in, on a Postgres metadata database (`metadata`; `on(dialect)` makes it another):
     dashboard 12, edited by `analyst Live`, and dataset 7 are there; the caller reads every object but those in
-    `unreadable` and edits every one but those in `not_edited`."""
+    `unreadable` and edits every one but those in `not_edited`. Afterwards no connection was put back in the pool
+    still holding a marker's lock."""
     state = SimpleNamespace(superset=superset, unreadable=[], not_edited=[],
                             dashboard=SimpleNamespace(id=12, editors=[SimpleNamespace(id=101, label="analyst Live")]))
 
@@ -1058,14 +1183,17 @@ def creating(monkeypatch, superset):
                                is_editor=lambda resource: not any(resource is kept for kept in state.not_edited))
     monkeypatch.setattr(writes, "_security", lambda: security)
     superset.dashboards, superset.datasets = {12: state.dashboard}, {7: SimpleNamespace(id=7)}
+    databases: list[Metadata] = []
 
     def on(dialect: str) -> Metadata:
         state.metadata = superset.session = Metadata(superset, dialect)
+        databases.append(state.metadata)
         return state.metadata
 
     state.on = on
     on("postgresql")
-    return state
+    yield state
+    assert [leaked for database in databases for leaked in database.leaked] == []
 
 
 def make_dashboard(marker: str = SHELL) -> dict:
@@ -1193,70 +1321,40 @@ def test_a_found_object_is_answered_only_to_an_editor_who_may_read_it(creating):
     assert len(commands(creating.superset)) == 1
 
 
-def test_the_marker_lock_is_taken_before_the_lookup(creating):
-    """On Postgres: the session's isolation is checked, the wait bounded (`lock_timeout`, as `lock_row` bounds it),
-    then the transaction's advisory lock keyed by the marker taken, and only then the lookup and the create, whose
-    commit releases the lock. A found object ends the transaction by a rollback, which releases it."""
-    make_dashboard()
-    assert creating.superset.ran == [
-        ("isolation",), ("execute", LOCK_TIMEOUT, {"timeout": "30000ms"}), ("execute", ADVISORY_LOCK, {"marker": SHELL}),
-        ("lookup", "Dashboard"), ("CreateDashboardCommand", ANY), ("commit",), ("rollback",)]
-    creating.superset.ran.clear()
-    make_dashboard()
-    assert creating.superset.ran == [
-        ("isolation",), ("execute", LOCK_TIMEOUT, {"timeout": "30000ms"}), ("execute", ADVISORY_LOCK, {"marker": SHELL}),
-        ("lookup", "Dashboard"), ("rollback",)]
-
-
-def test_the_marker_lock_is_held_until_the_create_commits(creating):
-    """Inside the lock run only the lookup and the create, so nothing ends the transaction before the create's own
-    commit; the query check, which runs Superset's chart data command and may end a transaction of its own, runs
-    before the lock. (The last rollback ends the transaction the commit left, which holds nothing.)"""
-    make_funnel()
-    kinds = _kinds(creating.superset)
-    lock = creating.superset.ran.index(("execute", ADVISORY_LOCK, {"marker": STEP}))
-    assert "chart_data" in kinds[:lock]
-    assert kinds[lock + 1:] == ["lookup", "CreateChartCommand", "commit", "rollback"]
-
-
-# What a create runs before it asks for the marker's lock: a chart's reads the session's isolation and, at READ
-# COMMITTED, looks for its chart without the lock, then checks its query.
-BEFORE_THE_LOCK = ((make_dashboard, []), (make_funnel, ["isolation", "lookup", "chart_data"]))
-
-
 def test_a_contended_marker_lock_answers_busy(creating):
-    """Another create holding the marker's lock past the lock timeout (55P03): busy, nothing looked up under the lock
-    or made, and the transaction the error aborted ends."""
-    creating.metadata.contended = "pg_advisory_xact_lock"
-    for make, before in BEFORE_THE_LOCK:
+    """Another request holding the marker's lock past the lock timeout (55P03 on Postgres): busy, with nothing of the
+    create's own work run (no look, none of rc2's checks, no create), since the lock is taken before all of it. The
+    lock's transaction is rolled back and its connection closed; the request's transaction ends."""
+    creating.metadata.contended = "pg_advisory_lock"
+    for n, (make, marker) in enumerate(((make_dashboard, SHELL), (make_funnel, STEP), (make_from_config, STEP)), 1):
         creating.superset.ran.clear()
         assert make() == {"busy": True}
-        assert _kinds(creating.superset) == [*before, "isolation", "execute", "execute", "rollback"]
+        assert creating.superset.ran == [
+            ("connect", n), ("on", n, "begin"), ("on", n, LOCK_TIMEOUT, {"timeout": "30000ms"}),
+            ("on", n, PG_LOCK, {"marker": marker}), ("on", n, "rollback"), ("close", n), ("rollback",)]
 
 
 @pytest.mark.parametrize("dialect", ["mysql", "mariadb"])
 def test_mysql_takes_and_releases_a_named_lock(creating, dialect):
     """A MySQL named lock belongs to a connection, not a transaction, so it is taken and released on a connection of
-    its own, never the session's, held from before the lookup until after the create's commit, and released also when
-    the create raises. Its name is built in Python from the marker: 63 characters, inside MySQL's 64."""
+    its own, never the session's, held from before the look until after the create's commit, and released also when
+    the create raises, the create's own exception going on. Its name is built in Python from the marker: 63
+    characters, inside MySQL's 64."""
     creating.on(dialect)
-    name = "mnemiq:" + hashlib.sha256(SHELL.encode()).hexdigest()[:56]
-    assert len(name) == 63
+    assert len(_lock_name(SHELL)) == 63
     made = make_dashboard()
     assert set(made) == {"dashboard_id"}, made
     assert creating.superset.ran == [
-        ("isolation",), ("connect", 1), ("on", 1, GET_LOCK, {"name": name, "seconds": 30}), ("lookup", "Dashboard"),
-        ("CreateDashboardCommand", ANY), ("commit",), ("on", 1, RELEASE_LOCK, {"name": name}), ("close", 1),
-        ("rollback",)]
+        *taken(dialect, SHELL), ("isolation",), ("lookup", "Dashboard"), ("CreateDashboardCommand", ANY), ("commit",),
+        ("rollback",), *let_go(dialect, SHELL)]
     creating.superset.ran.clear()
     creating.superset.rows["Dashboard"].clear()
     creating.superset.create = RuntimeError("the metadata database went away")
     with pytest.raises(RuntimeError):
         make_dashboard()
     assert creating.superset.ran == [
-        ("isolation",), ("connect", 2), ("on", 2, GET_LOCK, {"name": name, "seconds": 30}), ("lookup", "Dashboard"),
-        ("CreateDashboardCommand", ANY), ("rollback",), ("on", 2, RELEASE_LOCK, {"name": name}), ("close", 2),
-        ("rollback",)]
+        *taken(dialect, SHELL, 2), ("isolation",), ("lookup", "Dashboard"), ("CreateDashboardCommand", ANY),
+        ("rollback",), ("rollback",), *let_go(dialect, SHELL, 2)]
 
 
 @pytest.mark.parametrize(("configured", "seconds"), [(2.5, 2), (0.5, 1), (44.9, 44)])
@@ -1272,26 +1370,30 @@ def test_mysql_waits_whole_seconds_inside_the_lock_timeout(creating, configured,
 
 @pytest.mark.parametrize("got", [0, None])
 def test_a_mysql_lock_timeout_answers_busy(creating, got):
-    """`GET_LOCK` answers 0 when its wait times out and NULL on an error: busy, with no lookup and no create."""
+    """`GET_LOCK` answers 0 when its wait times out and NULL on an error: busy, with no look, none of rc2's checks
+    and no create; the lock's transaction is rolled back and its connection closed."""
     creating.on("mysql").got_lock = got
-    assert make_dashboard() == {"busy": True}
-    assert creating.superset.ran == [("isolation",), ("connect", 1), ("on", 1, GET_LOCK, ANY), ("close", 1),
-                                     ("rollback",)]
+    for n, make in enumerate((make_dashboard, make_funnel), 1):
+        creating.superset.ran.clear()
+        assert make() == {"busy": True}
+        assert creating.superset.ran == [("connect", n), ("on", n, "begin"), ("on", n, GET_LOCK, ANY),
+                                         ("on", n, "rollback"), ("close", n), ("rollback",)]
 
 
 @pytest.mark.parametrize("dialect", ["postgresql", "mysql", "mariadb"])
 @pytest.mark.parametrize("level", ["REPEATABLE READ", "SERIALIZABLE", "READ UNCOMMITTED"])
 def test_a_create_under_another_isolation_level_is_refused(creating, dialect, level):
-    """The lookup must see an object the moment another create commits it, which READ COMMITTED gives; under a
+    """The look must see an object the moment another create commits it, which READ COMMITTED gives; under a
     snapshot fixed earlier in the transaction it would not, and under READ UNCOMMITTED it would see a row another
-    create has written but may still roll back. Refused before any lock, the lookup under it, or create. A chart's
-    look before its query check reads the isolation too and looks for nothing at another level, so a chart the marker
-    names already is refused as every create is, never answered from an uncommitted row."""
+    create has written but may still roll back. The level is read under the marker's lock, before the look: another
+    level is refused with no look, none of rc2's checks and no create, and the lock is let go. A chart the marker names
+    already is refused as every create is, never answered from a row the look could misread."""
     creating.on(dialect).isolation = level
-    for make, before in ((make_dashboard, []), (make_funnel, ["isolation", "chart_data"])):
+    for n, (make, marker) in enumerate(((make_dashboard, SHELL), (make_funnel, STEP)), 1):
         creating.superset.ran.clear()
         assert make() == {"refused": "isolation"}
-        assert _kinds(creating.superset) == [*before, "isolation", "rollback"]
+        assert creating.superset.ran == [*taken(dialect, marker, n), ("isolation",), ("rollback",),
+                                         *let_go(dialect, marker, n)]
     creating.superset.rows["Slice"].append(_row(9, STEP))
     creating.superset.ran.clear()
     assert make_funnel() == {"refused": "isolation"}
@@ -1302,11 +1404,15 @@ def test_a_create_under_another_isolation_level_is_refused(creating, dialect, le
     assert set(make_dashboard()) == {"dashboard_id"}
 
 
-def test_an_exhausted_pool_answers_busy(creating):
-    """No connection comes free for MySQL's named lock within the pool's timeout: busy, nothing looked up or made."""
-    creating.on("mysql").pool_exhausted = True
-    assert make_dashboard() == {"busy": True}
-    assert "lookup" not in _kinds(creating.superset) and commands(creating.superset) == []
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+def test_an_exhausted_pool_answers_busy(creating, dialect):
+    """No connection comes free in the pool for the marker's lock within the pool's timeout: busy, nothing looked up,
+    checked or made, and the request's transaction ends."""
+    creating.on(dialect).pool_exhausted = True
+    for make in (make_dashboard, make_funnel, make_from_config):
+        creating.superset.ran.clear()
+        assert make() == {"busy": True}
+        assert creating.superset.ran == [("rollback",)]
 
 
 def test_a_retry_by_a_caller_no_longer_an_editor_is_refused_first(creating):
@@ -1330,23 +1436,23 @@ def test_sqlite_takes_no_marker_lock(creating):
     assert len(commands(creating.superset)) == 2
     creating.superset.ran.clear()
     assert make_funnel() == chart
-    assert creating.superset.ran == [("lookup", "Slice")]
+    assert creating.superset.ran == [("lookup", "Slice"), ("rollback",)]
 
 
 def test_another_metadata_database_is_refused(creating):
     """A metadata database the marker's lock is not written for is refused, rather than created on without a lock; a
-    chart its marker names already too, which the look before its query check does not make on such a database."""
+    chart its marker names already too: no connection is taken, nothing looked up, checked or made."""
     creating.on("mssql")
     assert make_dashboard() == {"refused": "metadata_database"}
     creating.superset.rows["Slice"].append(_row(9, STEP))
     assert make_funnel() == {"refused": "metadata_database"}
-    assert "lookup" not in _kinds(creating.superset) and commands(creating.superset) == []
+    assert set(_kinds(creating.superset)) == {"rollback"} and commands(creating.superset) == []
 
 
 def test_the_lookup_reads_each_row_as_the_database_holds_it(superset, monkeypatch):
-    """A row the session already holds (the look before a chart's query check loaded it) is read again as the
-    database holds it now, under the lock, not as the session first loaded it: the lookup asks for
-    `populate_existing`, as `lock_row` does, before it reads a row."""
+    """A row the session already holds (an earlier read in the same session loaded it) is read again as the database
+    holds it now, under the lock, not as the session first loaded it: the lookup asks for `populate_existing`, as
+    `lock_row` does, before it reads a row."""
     session = _Session("postgresql")
 
     class Rows(_Query):
@@ -1432,17 +1538,6 @@ def test_a_config_is_checked_for_the_dataset_and_dashboard_before_it_is_validate
     assert _kinds(creating.superset) == []
 
 
-def test_the_config_path_validates_and_compiles_before_the_lock(creating):
-    """Validation, mapping and the compile check run before the marker's lock: inside it run only the lookup and the
-    create, so nothing ends the transaction before the create's own commit."""
-    make_from_config()
-    kinds = _kinds(creating.superset)
-    lock = creating.superset.ran.index(("execute", ADVISORY_LOCK, {"marker": STEP}))
-    assert kinds[:lock].count("validate") == kinds[:lock].count("map") == kinds[:lock].count("compile") == 1
-    assert kinds[:lock].index("validate") < kinds[:lock].index("map") < kinds[:lock].index("compile")
-    assert kinds[lock + 1:] == ["lookup", "CreateChartCommand", "commit", "rollback"]
-
-
 @pytest.mark.parametrize("key", ["datasource", "datasource_id", "datasource_type", "viz_type"])
 def test_set_may_not_rebind_a_charts_dataset_or_type(creating, key):
     """`set` carries format keys only: the dataset binding is the request's and the type is the config's, as a chart's
@@ -1451,7 +1546,7 @@ def test_set_may_not_rebind_a_charts_dataset_or_type(creating, key):
     assert _kinds(creating.superset) == [] and commands(creating.superset) == []
 
 
-# ---------------------------------------------------------------- a retry of a chart already made
+# ---------------------------------------------------------------- the marker's lock, held through the create
 
 def _failing_query(superset: SimpleNamespace, path: str) -> None:
     """The chart's query check fails from now on, as it does when the source database is slow or gone: rc2's
@@ -1464,42 +1559,194 @@ def _failing_query(superset: SimpleNamespace, path: str) -> None:
 
 
 MAKERS = {"config": make_from_config, "funnel": make_funnel}
-QUERY_CHECKS = {"config": ["validate", "map", "compile"], "funnel": ["chart_data"]}
 PATHS = [pytest.param("config", id="config: validation, mapping, _compile_chart"),
          pytest.param("funnel", id="funnel: _check_query")]
+# Each create: how it is sent, the model it looks in, its marker, and the key of its answer.
+CREATES = {"dashboard": (make_dashboard, "Dashboard", SHELL, "dashboard_id"),
+           "funnel chart": (make_funnel, "Slice", STEP, "chart_id"),
+           "config chart": (make_from_config, "Slice", STEP, "chart_id"),
+           "dataset": (lambda: make_dataset(), "SqlaTable", format_marker(BUILD, "data_1", 3), "dataset_id")}
+# What each create runs on a miss, under the marker's lock: rc2's checks, the command and its commit, and a dataset's
+# editors step (whose row lock's transaction ends with a rollback).
+WORK = {"dashboard": [("CreateDashboardCommand", ANY), ("commit",)],
+        "funnel chart": [("chart_data", ANY), ("CreateChartCommand", ANY), ("commit",)],
+        "config chart": [("validate", ANY), ("map", CONFIG, 7), ("compile", ANY, 7), ("CreateChartCommand", ANY),
+                         ("commit",)],
+        "dataset": [("CreateDatasetCommand", ANY), ("raise_for_access", "builder", ANY), ("commit",),
+                    ("UpdateDatasetCommand", ANY), ("commit",), ("rollback",)]}
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+@pytest.mark.parametrize("create", list(CREATES))
+def test_the_marker_lock_is_held_from_the_look_through_the_creates_commit(request, dialect, create):
+    """Once the caller's own checks pass, a create takes its marker's lock, on a connection of its own, in a short
+    transaction committed once the lock is held, and holds it through: the isolation check, the look, on a miss rc2's
+    own checks (a chart's validation, mapping and compile check, or a funnel's query check), the create command and its
+    commit, and a dataset's editors step. The request's transaction then ends, and only then is the lock released and
+    its connection closed. Nothing of the work runs before the lock. Sent again, the create takes the lock, finds the
+    object and answers it (a dataset after setting its editors again, still under the lock), running none of rc2's
+    checks."""
+    stage = request.getfixturevalue("lock_rows" if create == "dataset" else "creating")
+    superset = stage.superset
+    metadata = superset.session = Metadata(superset, dialect)
+    make, model, marker, key = CREATES[create]
+    made = make()
+    assert set(made) == {key}, made
+    assert superset.ran == [*taken(dialect, marker), ("isolation",), ("lookup", model), *WORK[create], ("rollback",),
+                            *let_go(dialect, marker)]
+    superset.ran.clear()
+    assert make() == made
+    again = [("UpdateDatasetCommand", ANY), ("commit",), ("rollback",)] if create == "dataset" else []
+    assert superset.ran == [*taken(dialect, marker, 2), ("isolation",), ("lookup", model), *again, ("rollback",),
+                            *let_go(dialect, marker, 2)]
+    assert metadata.leaked == [] and metadata.waiting == []
+
+
+def _slow_first_check(monkeypatch, superset: SimpleNamespace, path: str, checks: list, in_check: threading.Event,
+                      go: threading.Event) -> None:
+    """The chart's query check, each run recorded in `checks`: the first holds until `go` is set (a slow source
+    database), having set `in_check`; every later one fails at once, as a retry's check against that database may time
+    out sooner than the first's."""
+
+    def check(run: Callable[[], Any], failure: Any) -> Any:
+        checks.append(threading.current_thread().name)
+        if len(checks) > 1:
+            return failure
+        in_check.set()
+        go.wait(10)
+        return run()
+
+    if path == "config":
+        module = sys.modules["superset.mcp_service.chart.compile"]
+        compiling = module._compile_chart
+        monkeypatch.setattr(module, "_compile_chart", lambda form_data, dataset_id: check(
+            lambda: compiling(form_data, dataset_id), SimpleNamespace(success=False)))
+    else:
+        command = sys.modules["superset.commands.chart.data.get_data_command"].ChartDataCommand
+        running = command.run
+        monkeypatch.setattr(command, "run", lambda self: check(
+            lambda: running(self), {"queries": [{"error": "the source database timed out", "status": "failed"}]}))
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+@pytest.mark.parametrize("path", PATHS)
+@pytest.mark.parametrize("first_finishes", [pytest.param(True, id="the first finishes inside the wait"),
+                                            pytest.param(False, id="the wait passes the lock timeout")])
+def test_a_second_request_waits_for_the_first_and_answers_what_it_made(creating, monkeypatch, dialect, path,
+                                                                       first_finishes):
+    """A first request holds the marker's lock through its query check, which a slow source database holds up; its
+    answer is lost, and the same create is sent again, whose own query check would fail at once. The second request
+    waits for the lock. When the first finishes inside the wait, the second finds the chart the first made and answers
+    it; when the wait passes the lock timeout, it answers busy, and the same create sent once the first has finished
+    answers the first's chart. In neither case does the second run a query check or answer a refusal, which would stop
+    the build though the first makes the chart."""
+    metadata = creating.on(dialect)
+    creating.superset.config["MNEMIQ_LOCK_TIMEOUT_S"] = 10 if first_finishes else 0.2
+    checks: list[str] = []
+    in_check, go = threading.Event(), threading.Event()
+    _slow_first_check(monkeypatch, creating.superset, path, checks, in_check, go)
+    make = MAKERS[path]
+    answers: dict[str, dict] = {}
+    errors: list[BaseException] = []
+
+    def send(name: str) -> None:
+        try:
+            answers[name] = make()
+        except BaseException as exc:  # noqa: BLE001 (reported below)
+            errors.append(exc)
+
+    first = threading.Thread(target=send, args=("first",), name="first", daemon=True)
+    try:
+        first.start()
+        assert in_check.wait(5), ("the first request never reached its query check", errors)
+        if first_finishes:
+            second = threading.Thread(target=send, args=("second",), name="second", daemon=True)
+            second.start()
+            deadline = time.monotonic() + 5
+            while not metadata.waiting:
+                assert time.monotonic() < deadline, ("the second request never waited for the lock", answers, errors)
+                time.sleep(0.01)
+            go.set()
+            second.join(10)
+        else:
+            send("second")
+    finally:
+        go.set()
+        first.join(10)
+    assert not errors, errors
+    assert set(answers["first"]) == {"chart_id"}, answers
+    if first_finishes:
+        assert answers["second"] == answers["first"], answers
+    else:
+        assert answers["second"] == {"busy": True}, answers
+        assert make() == answers["first"]
+    assert checks == ["first"]
+    assert len(commands(creating.superset, "CreateChartCommand")) == 1
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+@pytest.mark.parametrize("release", [pytest.param(stubs.database_error("08006"), id="the release raises"),
+                                     pytest.param(0, id="the release answers that nothing was released")])
+def test_a_failed_unlock_invalidates_the_connection(creating, dialect, release):
+    """A session's lock outlives a pooled connection's reset, so a connection whose release failed (it raised, or
+    answered that it released nothing) is closed rather than put back in the pool: invalidated, which ends the
+    database session and with it the lock. The create's own answer stands, and when the create itself raised, its
+    exception is the one that goes on, not the release's. Either way the lock is free afterwards."""
+    metadata = creating.on(dialect)
+    metadata.released = release
+    made = make_dashboard()
+    assert set(made) == {"dashboard_id"}, made
+    assert creating.superset.ran[-4:] == [("rollback",), let_go(dialect, SHELL)[0], ("invalidate", 1), ("close", 1)]
+    creating.superset.ran.clear()
+    creating.superset.rows["Dashboard"].clear()
+    creating.superset.create = RuntimeError("the metadata database went away")
+    with pytest.raises(RuntimeError):
+        make_dashboard()
+    assert creating.superset.ran[-3:] == [let_go(dialect, SHELL, 2)[0], ("invalidate", 2), ("close", 2)]
+    assert metadata.leaked == []
+    assert all(lock.acquire(blocking=False) for lock in metadata.locks.values())
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+def test_a_failure_taking_the_lock_closes_its_connection(creating, dialect):
+    """The lock statement fails other than by waiting past the lock timeout (the connection lost mid-statement,
+    SQLSTATE 08006): whether the lock was taken on the connection is not known, so it is closed rather than put back in
+    the pool (invalidated), and the error is raised, as a metadata failure the create cannot answer is. Nothing is
+    looked up, checked or made."""
+    metadata = creating.on(dialect)
+    metadata.lock_error = stubs.database_error("08006")
+    for make in (make_dashboard, make_funnel):
+        creating.superset.ran.clear()
+        with pytest.raises(stubs.DBAPIError):
+            make()
+        assert creating.superset.ran[-3:] == [("on", ANY, "rollback"), ("invalidate", ANY), ("close", ANY)]
+        assert not {"isolation", "lookup", "validate", "chart_data"} & set(_kinds(creating.superset))
+        assert commands(creating.superset) == []
 
 
 @pytest.mark.parametrize("path", PATHS)
 def test_a_retry_of_a_chart_already_made_runs_no_query_check_again(creating, path):
     """The first create committed and its answer was lost, most likely because Superset or the source database was
-    slow; now the chart's query check would fail. The retry looks for the step's chart before any of rc2's work and
-    answers it: no validation, mapping or query check runs again, and no lock is taken. The control: a step whose
-    chart was never made, sent now, is refused by the failing check."""
+    slow; now the chart's query check would fail. The retry looks for the step's chart under the marker's lock before
+    any of rc2's work and answers it: no validation, mapping or query check runs again. The control: a step whose chart
+    was never made, sent now, is refused by the failing check."""
     make = MAKERS[path]
     made = make()
     assert set(made) == {"chart_id"}, made
     _failing_query(creating.superset, path)
     creating.superset.ran.clear()
     assert make() == made
-    assert creating.superset.ran == [("isolation",), ("lookup", "Slice")]
+    assert creating.superset.ran == [*taken("postgresql", STEP, 2), ("isolation",), ("lookup", "Slice"), ("rollback",),
+                                     *let_go("postgresql", STEP, 2)]
     assert make(format_marker(BUILD, "chart_2", 12)) == {"refused": "query_failed"}
     assert commands(creating.superset) == []
 
 
-@pytest.mark.parametrize("path", PATHS)
-def test_a_chart_not_found_before_the_query_check_runs_the_whole_path(creating, path):
-    """The lookup before rc2's work finds nothing: the query check runs (for a config, validation and mapping first),
-    then the marker's lock, the lookup under it, which is the one that decides, and the create."""
-    MAKERS[path]()
-    assert _kinds(creating.superset) == ["isolation", "lookup", *QUERY_CHECKS[path], "isolation", "execute", "execute",
-                                         "lookup", "CreateChartCommand", "commit", "rollback"]
-
-
 @pytest.mark.parametrize("found", ["not edited", "unreadable", "two carrying the marker"])
-def test_a_chart_found_before_the_query_check_is_answered_as_under_the_lock(creating, found):
-    """The lookup before rc2's work answers what it finds by the rules the lookup under the lock answers by: a chart
-    the caller does not edit, with its editors; one it may not read, as one that does not exist; more than one, as the
-    candidates the caller may read. None of it runs the query check, which would now fail."""
+def test_a_found_chart_is_answered_by_the_found_rules_before_any_query_check(creating, found):
+    """The look answers what it finds by the rules every object found by its marker is answered by: a chart the caller
+    does not edit, with its editors; one it may not read, as one that does not exist; more than one, as the
+    candidates the caller may read. None of it runs rc2's validation, mapping or query check, which would now fail."""
     rows = creating.superset.rows["Slice"]
     rows.append(_row(9, STEP))
     if found == "not edited":
@@ -1515,28 +1762,11 @@ def test_a_chart_found_before_the_query_check_is_answered_as_under_the_lock(crea
         expected = {"candidates": [9]}
     _failing_query(creating.superset, "config")
     assert make_from_config() == expected
-    assert creating.superset.ran == [("isolation",), ("lookup", "Slice")]
-
-
-def test_a_chart_made_while_the_query_check_ran_is_found_under_the_lock(creating, monkeypatch):
-    """The lookup before the query check decides nothing when it finds nothing: another send of the create commits
-    the chart while this one's query runs, and the lookup under the marker's lock finds it and answers it; nothing
-    more is made."""
-    compile_module = sys.modules["superset.mcp_service.chart.compile"]
-    checked = compile_module._compile_chart
-
-    def meanwhile(form_data: dict, dataset_id: int) -> SimpleNamespace:
-        creating.superset.rows["Slice"].append(_row(9, STEP))
-        return checked(form_data, dataset_id)
-
-    monkeypatch.setattr(compile_module, "_compile_chart", meanwhile)
-    assert make_from_config() == {"chart_id": 9}
+    assert not {"validate", "map", "compile"} & set(_kinds(creating.superset))
     assert commands(creating.superset) == []
 
 
-# ---------------------------------------------------------------- a chart refused by its own check, made meanwhile
-
-# Each of a chart's own checks that may refuse it, before the marker's lock: the create it belongs to, what the
+# Each of a chart's own checks that may refuse it, under the marker's lock: the create it belongs to, what the
 # check's run is recorded as, and the refusal it answers.
 CHECKS = {
     "validation": (make_from_config, "validate", {"refused": "config"}),
@@ -1544,46 +1774,20 @@ CHECKS = {
     "compile": (make_from_config, "compile", {"refused": "query_failed"}),
     "query check": (make_funnel, "chart_data", {"refused": "query_failed"}),
 }
-# What runs after a check refused a chart: the session rolled back, then the look under the marker's lock.
-AFTER_A_REFUSAL = ["rollback", "isolation", "execute", "execute", "lookup", "rollback"]
 
 
-def _refusing(monkeypatch, superset: SimpleNamespace, check: str, winners=(), breaks: str | None = None) -> None:
-    """`check` refuses the chart from now on, and while it runs another send of the same create commits `winners`:
-    the race a retry sent while its first send still runs meets when the first commits just after the retry looked
-    for the chart before its check. rc2's validation answers the config invalid; its mapping leaves no chart type;
+def _refusing(superset: SimpleNamespace, check: str) -> None:
+    """`check` refuses the chart: rc2's validation answers the config invalid; its mapping leaves no chart type;
     `_compile_chart` answers a failure, as it does for a source database that timed out; a funnel's query answers a
-    failed query. `breaks` names what the check's own failure did to the metadata session: `"aborted"` its
-    transaction, as a statement that failed in it on Postgres does, or `"gone"` its connection."""
-
-    def meanwhile() -> None:
-        superset.rows["Slice"].extend(winners)
-        if breaks is not None:
-            setattr(superset.session, breaks, True)
-
+    failed query."""
     if check == "validation":
         superset.config_valid = False
-        pipeline = sys.modules["superset.mcp_service.chart.validation"].ValidationPipeline
-        validate = pipeline.validate_request_with_warnings
-        monkeypatch.setattr(pipeline, "validate_request_with_warnings",
-                            staticmethod(lambda request: (meanwhile(), validate(request))[1]))
     elif check == "mapping":
         superset.mapped = {"metric": "count"}
-        module = sys.modules["superset.mcp_service.chart.chart_utils"]
-        mapping = module.map_config_to_form_data
-        monkeypatch.setattr(module, "map_config_to_form_data",
-                            lambda config, dataset_id=None: (meanwhile(), mapping(config, dataset_id))[1])
     elif check == "compile":
         superset.compiled = SimpleNamespace(success=False)
-        module = sys.modules["superset.mcp_service.chart.compile"]
-        compiling = module._compile_chart
-        monkeypatch.setattr(module, "_compile_chart",
-                            lambda form_data, dataset_id: (meanwhile(), compiling(form_data, dataset_id))[1])
     else:
         superset.chart_data = {"queries": [{"error": "the source database timed out", "status": "failed"}]}
-        command = sys.modules["superset.commands.chart.data.get_data_command"].ChartDataCommand
-        running = command.run
-        monkeypatch.setattr(command, "run", lambda self: (meanwhile(), running(self))[1])
 
 
 def _after(superset: SimpleNamespace, ran: str) -> list[str]:
@@ -1593,94 +1797,17 @@ def _after(superset: SimpleNamespace, ran: str) -> list[str]:
 
 
 @pytest.mark.parametrize("check", CHECKS)
-def test_a_chart_made_while_its_own_check_refused_it_is_answered(creating, monkeypatch, check):
-    """A retry sent while its first send still runs finds no chart before its check; the first send commits the chart
-    while the retry's check runs; then the check refuses the retry (a source database slow enough to lose the first
-    answer may time the retry's query out). Before it answers the refusal, which would stop the build, the create
-    looks again under the marker's lock, finds the chart and answers it. Nothing more is made."""
-    make, ran, _ = CHECKS[check]
-    _refusing(monkeypatch, creating.superset, check, winners=[_row(9, STEP)])
-    assert make() == {"chart_id": 9}
-    assert _after(creating.superset, ran) == AFTER_A_REFUSAL
-    assert commands(creating.superset) == []
-
-
-@pytest.mark.parametrize("found", ["not edited", "unreadable", "two carrying the marker"])
-def test_a_chart_found_after_its_own_check_refused_it_is_answered_as_under_the_lock(creating, monkeypatch, found):
-    """What the look after a refusal finds is answered by the rules every lookup under the lock answers by: a chart
-    the caller does not edit, with its editors; one it may not read, as one that does not exist; more than one, as
-    the candidates the caller may read."""
-    winners = [_row(9, STEP)]
-    if found == "not edited":
-        winners[0].editors = [SimpleNamespace(id=102, label="owner Live")]
-        creating.not_edited.append(winners[0])
-        expected = {"not_editor": True, "editors": ["owner Live"]}
-    elif found == "unreadable":
-        creating.unreadable.append(winners[0])
-        expected = {"not_found": "chart"}
-    else:
-        winners.append(_row(11, f"Copied by hand.\n{STEP}"))
-        creating.unreadable.append(winners[1])
-        expected = {"candidates": [9]}
-    _refusing(monkeypatch, creating.superset, "compile", winners=winners)
-    assert make_from_config() == expected
-    assert commands(creating.superset) == []
-
-
-@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
-@pytest.mark.parametrize("check", CHECKS)
-def test_a_chart_refused_while_its_marker_lock_is_held_answers_busy(creating, monkeypatch, check, dialect):
-    """The first send still holds the marker's lock, its create not yet committed, when the retry's own check refuses
-    it: the retry cannot tell whether that chart will be made, so it answers busy, which the build may send again,
-    never the refusal, which would stop it. Nothing is looked up under the lock or made."""
-    metadata = creating.on(dialect)
-    if dialect == "mysql":
-        metadata.got_lock = 0
-    else:
-        metadata.contended = "pg_advisory_xact_lock"
-    make, ran, _ = CHECKS[check]
-    _refusing(monkeypatch, creating.superset, check)
-    assert make() == {"busy": True}
-    assert "lookup" not in _after(creating.superset, ran)
-    assert commands(creating.superset) == []
-
-
-@pytest.mark.parametrize("made", [pytest.param(True, id="made meanwhile"), pytest.param(False, id="not made")])
-@pytest.mark.parametrize("check", CHECKS)
-def test_a_check_that_aborted_the_transaction_is_still_followed_by_the_look(creating, monkeypatch, check, made):
-    """The check failed on a database error in the metadata session (a statement timeout while it read the dataset,
-    say), and so refused the chart; on Postgres that error aborts the session's transaction, and every statement
-    fails until a rollback. The look after the refusal rolls the session back first (a refused create holds nothing
-    in it), so it takes the lock in a new transaction: a chart another send made meanwhile is answered, and with
-    none the check's own refusal."""
+def test_a_chart_its_own_check_refuses_is_answered_the_refusal_under_the_lock(creating, check):
+    """rc2's validation, mapping or query check refuses the chart under the marker's lock, where no other send of the
+    create can be making the chart, so the refusal is answered as it is: after nothing more of the chart's path (a
+    config the validation refuses is not mapped, nor its query run), the request's transaction ends and the lock is
+    let go. Nothing is made."""
     make, ran, refusal = CHECKS[check]
-    _refusing(monkeypatch, creating.superset, check, winners=[_row(9, STEP)] if made else (), breaks="aborted")
-    assert make() == ({"chart_id": 9} if made else refusal)
-    assert _after(creating.superset, ran) == AFTER_A_REFUSAL
-    assert commands(creating.superset) == []
-
-
-@pytest.mark.parametrize("check", CHECKS)
-def test_a_look_the_metadata_database_cannot_answer_answers_the_refusal(creating, monkeypatch, check):
-    """The metadata database's connection went away during the check, so the look after the refusal fails too,
-    rolled back or not: the check's own refusal is answered, as before the look was made, never an error out of the
-    tool, though another send's chart is there. Nothing is made."""
-    make, ran, refusal = CHECKS[check]
-    _refusing(monkeypatch, creating.superset, check, winners=[_row(9, STEP)], breaks="gone")
+    _refusing(creating.superset, check)
     assert make() == refusal
-    assert "lookup" not in _after(creating.superset, ran)
-    assert commands(creating.superset) == []
-
-
-@pytest.mark.parametrize("check", CHECKS)
-def test_a_chart_its_own_check_refused_and_nobody_made_answers_the_refusal(creating, monkeypatch, check):
-    """No chart carries the marker under the lock either: the check's own refusal is answered, after nothing else of
-    the chart's path has run (a config the validation refuses is not mapped, nor its query run), and nothing is
-    made."""
-    make, ran, refusal = CHECKS[check]
-    _refusing(monkeypatch, creating.superset, check)
-    assert make() == refusal
-    assert _after(creating.superset, ran) == AFTER_A_REFUSAL
+    assert creating.superset.ran[:7] == [*taken("postgresql", STEP), ("isolation",), ("lookup", "Slice")]
+    assert creating.superset.ran[-3:] == [("rollback",), *let_go("postgresql", STEP)]
+    assert _after(creating.superset, ran) == ["rollback", "on", "close"]
     assert commands(creating.superset) == []
 
 
