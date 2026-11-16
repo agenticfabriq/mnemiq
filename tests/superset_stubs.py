@@ -31,6 +31,10 @@ class SupersetParseError(SupersetErrorException):
     """rc2's error for SQL it cannot parse."""
 
 
+class SupersetDisallowedSQLFunctionException(SupersetErrorException):
+    """rc2's error for a query using a function its `DISALLOWED_SQL_FUNCTIONS` lists."""
+
+
 class QueryObjectValidationError(SupersetException):
     pass
 
@@ -161,7 +165,8 @@ class SubjectType:
 def install(monkeypatch) -> SimpleNamespace:
     """The stand-ins, installed for this test. The answer holds what a test may set (`chart_data`: what running a
     query context does, a payload or an exception; `delete`, `restore`: what each command's `run` does, None or an
-    exception; `update`: what `UpdateDashboardCommand.run` does; `config`: Superset's config, as
+    exception; `update`: what `UpdateDashboardCommand.run` does; `compiled`: what MCP's `_compile_chart` answers, or
+    raises; `config`: Superset's config, as
     `flask.current_app.config`; `features`: the feature flags `is_feature_enabled` answers on; `g`: `flask.g`, whose
     `user` is the request's user; `user_subjects`: each user's own subject, by user id, as `get_user_subject` finds it;
     `charts`, `dashboards`, `datasets`: what `ChartDAO`, `DashboardDAO` and `DatasetDAO` find, by id; `session`:
@@ -316,6 +321,8 @@ def install(monkeypatch) -> SimpleNamespace:
 
     def _compile_chart(form_data: dict, dataset_id: int) -> SimpleNamespace:
         state.ran.append(("compile", form_data, dataset_id))
+        if isinstance(state.compiled, BaseException):
+            raise state.compiled
         return state.compiled
 
     def get_user_id():

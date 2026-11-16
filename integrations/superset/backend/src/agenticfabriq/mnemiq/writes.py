@@ -1256,6 +1256,7 @@ def _config_form(found: dict, dataset: Any) -> tuple[str, dict, dict | None] | d
     `_check_query`, as rc2's compile leaves a histogram's column out of its query), so a chart whose query fails is never saved.
     (viz_type, form data, query context), or the refusal. Runs under the marker's lock, which is held on a connection
     of its own, so whatever rc2 commits or rolls back here keeps it held."""
+    from superset.exceptions import SupersetException, SupersetSecurityException
     from superset.mcp_service.chart.chart_utils import map_config_to_form_data
     from superset.mcp_service.chart.compile import _compile_chart
     from superset.mcp_service.chart.validation import ValidationPipeline
@@ -1296,9 +1297,19 @@ def _config_form(found: dict, dataset: Any) -> tuple[str, dict, dict | None] | d
             if _has_rows(result):
                 logger.warning("mnemiq extension: create_chart's histogram has no row with a group set")
                 return {"refused": "query_failed"}
-    elif not _compile_chart(form_data, dataset.id).success:
-        logger.warning("mnemiq extension: create_chart's query failed")
-        return {"refused": "query_failed"}
+    else:
+        # `_compile_chart` answers a query that fails, but raises Superset's own errors (a dataset's SQL using a
+        # function Superset disallows in a chart's query among them): answered as `_probe` answers them.
+        try:
+            compiled = _compile_chart(form_data, dataset.id)
+        except SupersetSecurityException:
+            return _not_found("dataset")
+        except SupersetException as exc:
+            logger.warning("mnemiq extension: create_chart's query did not run", exc_info=exc)
+            return {"refused": "query_failed"}
+        if not compiled.success:
+            logger.warning("mnemiq extension: create_chart's query failed")
+            return {"refused": "query_failed"}
     return viz_type, form_data, context
 
 

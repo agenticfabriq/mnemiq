@@ -1660,6 +1660,26 @@ def test_each_format_key_is_merged_into_the_saved_params(creating, key, value):
     assert json.loads(properties["params"])[key] == value
 
 
+@pytest.mark.parametrize(("raised", "answer"), [
+    pytest.param(stubs.SupersetSecurityException("You need access to the following tables: secret"),
+                 {"not_found": "dataset"}, id="access refused"),
+    pytest.param(stubs.SupersetDisallowedSQLFunctionException("pg_sleep is not allowed"),
+                 {"refused": "query_failed"}, id="a function Superset disallows")])
+def test_a_compile_check_that_raises_a_superset_error_is_answered_not_raised(creating, caplog, raised, answer):
+    """MCP's `_compile_chart` answers a query that fails as a failed compile, but it raises Superset's own errors
+    (`SupersetErrorException`), such as the one for a dataset's SQL using a function Superset disallows in a chart's
+    query. The tool answers them as `_probe` answers the same errors: a refused access as a dataset that does not
+    exist, any other as a query that failed, logged with its error. Never raised out of the tool, which would reach
+    mnemiq as the tool failing, with Superset's words; nothing is made."""
+    creating.superset.compiled = raised
+    with caplog.at_level("WARNING", logger=writes.__name__):
+        assert make_from_config() == answer
+    assert commands(creating.superset) == [] and creating.superset.rows["Slice"] == []
+    logged = [record for record in caplog.records if record.getMessage().startswith("mnemiq extension: create_chart")]
+    expected = [] if answer == {"not_found": "dataset"} else [("WARNING", raised)]
+    assert [(record.levelname, record.exc_info and record.exc_info[1]) for record in logged] == expected
+
+
 # ---------------------------------------------------------------- the marker's lock, held through the create
 
 def _failing_query(superset: SimpleNamespace, path: str) -> None:
