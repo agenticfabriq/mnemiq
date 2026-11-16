@@ -124,14 +124,16 @@ def _codes(text: str, names: set[str]) -> list[tuple[str, int]]:
     """The codes the text selects on, each with where it is: every quoted or bare mention outside an exclusion.
 
     Consecutive mentions joined only by a comma, "and" or "or" are one list, read as one mention: "'X' and 'Y' are
-    excluded" excludes both, and "exclude ... = 'X' or 'Y'" both."""
+    excluded" excludes both, and "exclude ... = 'X' or 'Y'" both. A gap that ends a clause (a blank line) joins
+    nothing, so a list never carries a code into the next clause's exclusion."""
     quoted = [(m.group(1) or m.group(2), m.start(), m.end()) for m in _QUOTED.finditer(text)]
     bare = [(m.group(0), m.start(), m.end()) for m in _BARE.finditer(text)
             if m.group(0).lower() not in names and any(c.isalpha() for c in m.group(0))
             and any(c.isdigit() for c in m.group(0))]
     lists: list[list[tuple[str, int, int]]] = []
     for mention in sorted(quoted + bare, key=lambda m: m[1]):
-        if lists and _LIST_GAP.fullmatch(text[lists[-1][-1][2]:mention[1]]):
+        gap = text[lists[-1][-1][2]:mention[1]] if lists else ""
+        if lists and _LIST_GAP.fullmatch(gap) and _CLAUSE_END.search(gap) is None:
             lists[-1].append(mention)
         else:
             lists.append([mention])

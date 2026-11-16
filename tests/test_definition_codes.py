@@ -414,6 +414,19 @@ def test_an_exclusion_covers_its_whole_list_and_only_its_own_predicate():
     assert stale("Count SHIP_MODE 'X', 'Y', and 'Z' rows.") == [("X", "Y", "Z")]
 
 
+def test_a_list_never_spans_a_blank_line():
+    # A blank line ends a clause, so a code before it never joins the list after it, nor that list's exclusion.
+    held = _index({("shipments", "SHIP_MODE"): ["R"]})
+
+    def stale(text):
+        return [f.codes for f in stale_codes(_snapshot([("ship mode", text)], [("shipments", "SHIP_MODE")]), held)]
+
+    assert stale("SHIP_MODE = 'Q' is express; SHIP_MODE = 'R'\n\n'X' rows are excluded.") == []
+    assert stale("SHIP_MODE = 'Q' is express; SHIP_MODE = 'R'\n  \n'X' rows are excluded.") == []
+    # A single newline ends no clause, so a list broken across lines is still one list.
+    assert stale("Rows with SHIP_MODE 'X' and\n'Y' are excluded.") == []
+
+
 def test_each_code_counts_for_its_own_column():
     # Both columns hold one-letter codes, so shape alone cannot say whose E is: the predicate it sits in does.
     held = _index({("shipments", "SHIP_MODE"): ["A", "G"], ("shipments", "SERVICE_LEVEL"): ["E", "S"]})
