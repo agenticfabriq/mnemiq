@@ -1237,11 +1237,12 @@ def test_a_create_whose_lock_connection_ends_mid_check_makes_nothing(live, exten
     locked (`ACCESS EXCLUSIVE`, from a connection of its own) while the create runs, so the chart's query check waits
     for it, and the create holds its marker's lock, idle on a connection of its own, through that wait. With the check
     waiting, the test finds the marker lock's database session in `pg_locks` by the marker's key and ends it
-    (`pg_terminate_backend`), as an idle timeout shorter than a chart's query check would, so the lock goes with it;
-    then it lets the table go. Reaching its command, the create finds no chart and finds its lock no longer held: it
-    answers exactly `{busy: true}`, and no chart carries the marker or the chart's name. The same request sent again
-    makes the chart: `{chart_id}`, the one chart carrying the marker. Every other create in this suite passes the same
-    hold check, so a hold check that misread `pg_locks` would answer busy there.
+    (`pg_terminate_backend`, which waits for the session to exit), as an idle timeout shorter than a chart's query
+    check would, so the lock goes with it; only once the session has ended does it let the table go. Reaching its
+    command, the create finds no chart and finds its lock no longer held: it answers exactly `{busy: true}`, and no
+    chart carries the marker or the chart's name. The same request sent again makes the chart: `{chart_id}`, the one
+    chart carrying the marker. Every other create in this suite passes the same hold check, so a hold check that
+    misread `pg_locks` would answer busy there.
 
     (A source that sleeps cannot hold the check: Superset 7.0.0rc2 refuses `pg_sleep` in a chart's query, as one of
     its `DISALLOWED_SQL_FUNCTIONS`.)"""
@@ -1286,7 +1287,10 @@ def test_a_create_whose_lock_connection_ends_mid_check_makes_nothing(live, exten
             time.sleep(0.05)
         waiting_after = time.monotonic() - started
         (holder,) = holders
-        terminated = metadata("SELECT pg_terminate_backend(%s)", (holder,))
+        # With a timeout, Postgres waits up to 5 seconds for the session to exit and answers whether it did: the lock
+        # has gone with it before the check can run on.
+        terminated = metadata("SELECT pg_terminate_backend(%s, 5000)", (holder,))
+        assert terminated == [(True,)], terminated
     finally:
         held.rollback()
         held.close()
@@ -1297,7 +1301,6 @@ def test_a_create_whose_lock_connection_ends_mid_check_makes_nothing(live, exten
     observe("lock_lost_mid_check", answers=answers, check_waiting_after_s=round(waiting_after, 2),
             terminated=terminated, answered_after_s=round(answered_after, 2), chart_rows=after_first)
     assert not errors, errors
-    assert terminated == [(True,)]
     assert answers == [{"busy": True}], answers
     assert after_first == ([], [(0,)])
     again = made.chart(call(client, "create_chart", **request))
