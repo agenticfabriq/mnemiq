@@ -1360,6 +1360,22 @@ def test_a_config_chart_saves_what_generate_chart_saves(live, extension, policy_
     assert set(refused) == BOTH_REFUSE, refused
 
 
+def test_a_histogram_over_a_text_column_is_refused_and_nothing_is_made(live, extension, policy_id, made):
+    """A histogram of the text column `region`, sent to the extension's `create_chart` as mnemiq's own
+    `config_chart_request` builds it, is refused and no chart of its name exists afterwards. The histogram over a
+    numeric column (`premium`) is still made: `test_a_config_chart_saves_what_generate_chart_saves` saves it
+    (its "histogram" family), so it is not repeated here."""
+    client = as_user(live, BUILDER)
+    build = made.build(client, "text histogram")
+    chart = spec(Family.HISTOGRAM, policy_id, measures=(), dimensions=("region",))
+    answer = config_chart(build, chart, "text_histogram")
+    observe("text_histogram", answer=answer)
+    # rc2 refuses it in `map_config_to_form_data`: the histogram plugin's `post_map_validate` raises
+    # NON_NUMERIC_HISTOGRAM_COLUMN for a column it knows is text, which the extension answers as a refused config.
+    assert answer == {"refused": "config"}, answer
+    assert metadata("SELECT count(*) FROM slices WHERE slice_name = %s", (chart.title,)) == [(0,)]
+
+
 # --- editors and deletes ----------------------------------------------------------------------------------------------
 
 
