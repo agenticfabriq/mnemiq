@@ -732,17 +732,29 @@ def _last_look(model: type, marker: str, *, kind: str) -> dict | None:
     advisory lock on another key of the marker (`_PG_CREATE_LOCK`), held until the command's commit or rollback, and
     looks again (`_marked`, `_found_answer`), in a fresh READ COMMITTED snapshot. Of two creates that both passed the
     look, the second to take this lock finds the first's object, committed, and answers it. Between this and the
-    command nothing commits or rolls back the session. A wait past the lock timeout (55P03) is raised and answered
-    `{"busy": true}` (`_answering`, `_failed`). MySQL and SQLite take no second lock: None."""
+    command nothing commits or rolls back the session. MySQL and SQLite take no second lock: None.
+
+    Any database error here (a wait past the lock timeout, a connection gone, a statement that failed) answers
+    `{"busy": true}`, as the first look's does (`_look`), after rolling the session back, which ends the transaction
+    and releases this lock with nothing made: whether another send made the object is not known, and a refusal would
+    stop the build though it may have."""
     from sqlalchemy import text
+    from sqlalchemy.exc import SQLAlchemyError
 
     session = _session()
     if session.get_bind().dialect.name != "postgresql":
         return None
-    _bound_lock_waits(session)
-    session.execute(text(_PG_CREATE_LOCK), {"marker": marker})
-    found = _marked(model, marker)
-    return _found_answer(found, kind=kind) if found else None
+    try:
+        _bound_lock_waits(session)
+        session.execute(text(_PG_CREATE_LOCK), {"marker": marker})
+        found = _marked(model, marker)
+        return _found_answer(found, kind=kind) if found else None
+    except SQLAlchemyError as exc:
+        logger.warning("mnemiq extension: a create could not look for its object before its command; answered busy",
+                       exc_info=exc)
+        with contextlib.suppress(SQLAlchemyError):
+            session.rollback()
+        return BUSY
 
 
 def _find_or_create(model: type, marker: str, *, kind: str, started: float, create: Callable[[], dict],
@@ -752,17 +764,17 @@ def _find_or_create(model: type, marker: str, *, kind: str, started: float, crea
     of making a second, and a second send while the first still runs waits for the first and then answers what it
     made. `then(answer)` runs under the lock too, after the object was found or made (a dataset's editors).
 
-    The caller's own checks run before this (its request, the objects it names, being an editor of the dashboard), so
-    a caller they refuse never waits for the lock. Under it run the look (`_look`) and, on a miss, `create()`: rc2's
-    own checks (a chart's validation, mapping and query check), on Postgres the last look in the command's own
-    transaction (`_last_look`, which `create()` calls just before its command), the create command and its commit.
-    The lock is on a connection of its own, so whatever rc2 commits or rolls back in the session keeps it held, and no
-    other send of the create can make the object while a check of this one refuses it: that refusal is answered as it
-    is. Should that connection's database session end while the create works, the lock goes with it; the last look
-    then still finds an object another send made meanwhile, and the lost connection is closed when the lock is let go
-    (`_release_marker_lock`). The session's
-    transaction ends before the lock is let go. A lock not taken answers `{"busy": true}` or the refusal that says
-    why, and so does one granted after mnemiq's deadline for the call, counted from `started`, the tool's start."""
+    The caller's own checks run before this (its request, the objects it names, being an editor of the dashboard), so a
+    caller they refuse never waits for the lock. Under it run the look (`_look`) and, on a miss, `create()`: rc2's own
+    checks (a chart's validation, mapping and query check), on Postgres the last look in the command's own transaction
+    (`_last_look`, which `create()` calls just before its command), the create command and its commit. The lock is on a
+    connection of its own, so whatever rc2 commits or rolls back in the session keeps it held, and no other send of the
+    create can make the object while a check of this one refuses it: that refusal is answered as it is. Should that
+    connection's database session end while the create works, the lock goes with it; the last look then still finds an
+    object another send made meanwhile, and the lost connection is closed when the lock is let go
+    (`_release_marker_lock`). The session's transaction ends before the lock is let go. A lock not taken answers
+    `{"busy": true}` or the refusal that says why, and so does one granted after mnemiq's deadline for the call, counted
+    from `started`, the tool's start."""
     try:
         with _marker_lock(marker, started):
             try:

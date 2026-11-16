@@ -709,6 +709,7 @@ class _Lookup:
         self.metadata.log.append(("lookup", self.model.__name__))
         self.metadata.at("lookup")
         self.metadata.statement()
+        self.metadata.occurs("lookup")
         rows = [row for row in self.metadata.superset.rows[self.model.__name__]
                 if all(_holds(predicate, row) for predicate in self.predicates)]
         return iter(sorted(rows, key=lambda row: [getattr(row, name) for name in self.ordered]))
@@ -835,7 +836,8 @@ class Metadata:
     locks too, keyed by the marker, held until the session commits or rolls back. `waiting` holds the connections
     waiting for a lock, and `leaked` each lock a connection still held when it was closed. `drop_lock_connections()`
     ends the database session of every connection of its own: their locks are let go, and every later statement on
-    them fails."""
+    them fails. `fail_at` maps a session statement, or `"lookup"`, to `(n, error)`: its n-th occurrence on the session
+    raises `error`."""
 
     def __init__(self, superset: SimpleNamespace, dialect: str) -> None:
         self.superset = superset
@@ -850,6 +852,8 @@ class Metadata:
         self.xact_locks: dict[str, threading.Lock] = {}
         self.held_xact: list[str] = []
         self.opened: list[_Connection] = []
+        self.fail_at: dict[str, tuple[int, BaseException]] = {}
+        self.occurrences: dict[str, int] = {}
         self.waiting: list[int] = []
         self.leaked: list[str] = []
         self._numbers = itertools.count(1)
@@ -865,6 +869,13 @@ class Metadata:
             if connection.holding is not None:
                 connection._let_go()
             connection.lost = True
+
+    def occurs(self, key: str) -> None:
+        """One more `key` (a statement, or `"lookup"`) on the session: the error `fail_at` names for this occurrence is
+        raised."""
+        self.occurrences[key] = self.occurrences.get(key, 0) + 1
+        if key in self.fail_at and self.fail_at[key][0] == self.occurrences[key]:
+            raise self.fail_at[key][1]
 
     def statement(self) -> None:
         """A statement on the session, which fails while its connection is gone or its transaction is aborted."""
@@ -900,6 +911,7 @@ class Metadata:
             meanwhile()
         self.log.append(("execute", statement, parameters))
         self.statement()
+        self.occurs(statement)
         if self.contended is not None and self.contended in statement:
             raise stubs.database_error("55P03")
         if statement == CREATE_LOCK:
@@ -1852,8 +1864,8 @@ def test_a_contended_create_lock_answers_busy(creating):
     and the transaction the error aborted ends before the marker's lock is let go."""
     creating.metadata.contended = "pg_advisory_xact_lock"
     assert make_dashboard() == {"busy": True}
-    assert creating.superset.ran[-5:] == [("execute", CREATE_LOCK, {"marker": SHELL}), ("rollback",),
-                                          *let_go("postgresql", SHELL), ("rollback",)]
+    assert creating.superset.ran[-5:] == [("execute", CREATE_LOCK, {"marker": SHELL}), ("rollback",), ("rollback",),
+                                          *let_go("postgresql", SHELL)]
     assert commands(creating.superset) == []
 
 
@@ -1872,11 +1884,12 @@ class _Unreachable(dict):
                                   pytest.param(False, id="another database error")])
 @pytest.mark.parametrize("where", ["taking the lock", "the checks before the lock", "the chart's last bound"])
 def test_a_database_error_outside_a_command_is_answered_not_raised(creating, monkeypatch, where, lost):
-    """A database error outside any command (taking the marker's lock, the caller's checks before it, or the chart's
-    last bound on its lock waits) reaches the write tool's one boundary for database errors: the session is rolled
-    back and the error answered, busy for a lost connection (the same request may be sent again), failed for another;
-    never raised out of the tool, which mnemiq would count as the tool failing. A retry once the database answers
-    again, with the chart an earlier send committed, answers that chart."""
+    """A database error outside any command (taking the marker's lock, or the caller's checks before it) reaches the
+    write tool's one boundary for database errors: the session is rolled back and the error answered, busy for a lost
+    connection (the same request may be sent again), failed for another; never raised out of the tool, which mnemiq
+    would count as the tool failing. At the chart's last bound on its lock waits, inside the last look, any database
+    error answers busy, as a look's does (`test_a_last_look_that_cannot_run_answers_busy`). A retry once the database
+    answers again, with the chart an earlier send committed, answers that chart."""
     metadata, superset = creating.metadata, creating.superset
     error = stubs.database_error("08006", invalidated=True) if lost else stubs.database_error("42883")
     if where == "taking the lock":
@@ -1888,15 +1901,43 @@ def test_a_database_error_outside_a_command_is_answered_not_raised(creating, mon
         compiling = module._compile_chart
         monkeypatch.setattr(module, "_compile_chart", lambda form_data, dataset_id: (
             setattr(metadata, "gone" if lost else "aborted", True), compiling(form_data, dataset_id))[1])
-    assert make_from_config() == ({"busy": True} if lost else {"failed": True})
-    assert commands(superset) == [] and superset.ran[-1] == ("rollback",)
+    assert make_from_config() == ({"busy": True} if lost or where == "the chart's last bound" else {"failed": True})
+    assert commands(superset) == []
     if where == "the chart's last bound":
-        assert superset.ran[-5:] == [BOUND, ("rollback",), *let_go("postgresql", STEP), ("rollback",)]
+        assert superset.ran[-5:] == [BOUND, ("rollback",), ("rollback",), *let_go("postgresql", STEP)]
+    else:
+        assert superset.ran[-1] == ("rollback",)
     metadata.lock_error, metadata.gone = None, False
     superset.dashboards = {12: creating.dashboard}
     superset.rows["Slice"].append(_row(9, STEP))
     assert make_from_config() == {"chart_id": 9}
     assert commands(superset) == []
+
+
+# Where a last look may fail: the n-th occurrence on the session of its bound, its create lock, or its lookup (the
+# first look's bound and lookup come first).
+LAST_LOOK = {"the bound": (LOCK_TIMEOUT, 2), "the create lock": (CREATE_LOCK, 1), "the lookup": ("lookup", 2)}
+
+
+@pytest.mark.parametrize("moment", list(LAST_LOOK))
+@pytest.mark.parametrize("create", list(CREATES))
+def test_a_last_look_that_cannot_run_answers_busy(request, create, moment):
+    """The last look, like the first, answers busy for any database error, a failure neither contention nor a lost
+    connection among them (SQLSTATE 42883 here): whether another send made the object is not known, and a refusal
+    would stop the build though it may have. The rollback ends the transaction, releasing the create lock with nothing
+    made, and the marker's lock is let go. Sent again with the database answering, the create makes the object."""
+    stage = request.getfixturevalue("lock_rows" if create == "dataset" else "creating")
+    superset = stage.superset
+    metadata = superset.session = Metadata(superset, "postgresql")
+    make, model, marker, key = CREATES[create]
+    statement, n = LAST_LOOK[moment]
+    metadata.fail_at[statement] = (n, stubs.database_error("42883"))
+    assert make() == {"busy": True}
+    assert commands(superset, COMMANDS[create]) == [] and metadata.held_xact == []
+    assert superset.ran[-4:] == [("rollback",), ("rollback",), *let_go("postgresql", marker)]
+    made = make()
+    assert set(made) == {key}, made
+    assert len(superset.rows[model]) == 1 and metadata.leaked == []
 
 
 def test_only_a_write_tool_answers_a_database_error(superset):
