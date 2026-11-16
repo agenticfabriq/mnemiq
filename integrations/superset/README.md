@@ -103,18 +103,21 @@ answers `{"busy": true}` and changes nothing; the same request may be sent again
 Superset's own error text never reaches them.
 
 A create carrying a build's marker (`create_dashboard`, `create_dataset`, `create_chart`) makes its object once, so a
-create whose answer was lost may be sent again. Under a lock keyed by the marker (a transaction's advisory lock on
-Postgres, a named lock on MySQL, each waited for at most `MNEMIQ_LOCK_TIMEOUT_S`, else `{"busy": true}`) it looks for
-an object not in the trash whose description's last line is that marker: it answers that one's id; when there are
-several it creates nothing and answers `{"candidates": [...]}`, the ids of those the caller may read (the list may be
-empty); and it creates the object when there is none. `create_chart` also looks once before it runs the chart's
-query, without the lock but only where the lock is taken (SQLite, or Postgres or MySQL at READ COMMITTED), so a chart
-already made is answered without running its query again; and when its config or its query is refused, it looks
-again under the lock before it answers, so a chart that another send of the same create made meanwhile is answered
-rather than refused, and one still being made answers `{"busy": true}`. On any other metadata database than
-Postgres, MySQL or SQLite a create answers `{"refused": "metadata_database"}`. A SQLite metadata database takes no
-marker lock, being Superset's single-person development default: there a create sent again while the first is still
-running could make a second object.
+create whose answer was lost may be sent again. Once the caller passes the create's own checks (the request, the
+dataset and dashboard it names, being an editor of the dashboard), the create takes one lock keyed by the marker, on a
+metadata database connection of its own (a session's advisory lock on Postgres, a named lock on MySQL), and holds it
+until the object is made and committed. Under it, the create looks for an object not in the trash whose description's
+last line is that marker: it answers that one's id; when there are several it creates nothing and answers
+`{"candidates": [...]}`, the ids of those the caller may read (the list may be empty); and when there is none, it runs
+Superset's own checks (a chart's config validation and its query, a dataset's table) and creates the object, a
+dataset's editors included. So a chart already made is answered without running its query again, and a create sent
+again while the first is still running waits for the first and answers what it made. A wait for the lock longer than
+`MNEMIQ_LOCK_TIMEOUT_S`, no free connection in the metadata database's pool to take it on, or a look the metadata
+database cannot answer, answers `{"busy": true}`: the same request may be sent again. While it holds the lock a create
+uses two of the metadata database's pooled connections. On any other metadata database than Postgres, MySQL or SQLite
+a create answers `{"refused": "metadata_database"}`. A SQLite metadata database takes no marker lock, being Superset's
+single-person development default: there a create sent again while the first is still running could make a second
+object.
 
 On Postgres and MySQL the lookup needs the metadata database's READ COMMITTED isolation; under any other level every
 create answers `{"refused": "isolation"}`, a create of a chart already made included. Superset 7.0.0rc2 sets READ

@@ -286,7 +286,8 @@ still to come. In short:
     the object the first one made instead of making another.
   - So if a create times out, the next `/next` sends it again at once. If Superset made the object, mnemiq gets its
     id back; if not, it is made now. If Superset is still running the first create, the second waits for it to finish
-    and answers with what it made; if it waits too long, the next `/next` asks again.
+    and answers with what it made; if it waits too long, or Superset's metadata database does not answer, the next
+    `/next` asks again.
   - Only an object that carries the step's marker is ever taken as the step's own. A chart someone makes by hand with
     the planned name is left alone. If two objects carry the same marker, the build stops and names those the
     builder can read.
