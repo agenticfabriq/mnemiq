@@ -117,13 +117,17 @@ chart's config validation and its query, a dataset's table; a histogram's query 
 7.0.0rc2's compile check leaves a histogram's column out of its query) and creates the object, a dataset's editors included. So a
 chart already made is answered without running its query again, and a create sent again while the first is still running
 waits for the first and answers what it made. On Postgres a second lock guards the create itself: just before its
-command, in the command's own transaction, the create takes a transaction's lock on another key of the marker and looks
-again, so if the first lock's connection was lost while the create worked (its lock goes with it), an object another
-send made meanwhile is still found and answered rather than made twice. On MySQL the named lock is the only guard: if
-its connection is lost while a create works, a second send of the create can make a second object. A wait for the lock
-longer than `MNEMIQ_LOCK_TIMEOUT_S` or cut short by the metadata database's `statement_timeout`, no free connection in
-the metadata database's pool to take it on, or a look the metadata database cannot answer (the first or the one just
-before the command), answers `{"busy": true}`: the same request may be sent again. A create whose lock comes free more
+command, in the command's own transaction, the create takes a transaction's lock on another key of the marker, looks
+again, and confirms on its marker lock's own connection that the lock is still held (the hold check, a short
+transaction of its own on that connection, which does not end the lock). So if the first lock's connection was lost
+while the create worked (its lock goes with it), an object another send made meanwhile is found and answered rather
+than made twice, and a create whose lock was lost answers `{"busy": true}` and makes nothing: it never takes the lost
+lock again, and the extension logs a warning that the marker's lock was lost while the create worked. On MySQL the
+named lock is the only guard: if its connection is lost while a create works, a second send of the create can make a
+second object. A wait for the lock longer than `MNEMIQ_LOCK_TIMEOUT_S` or cut short by the metadata database's
+`statement_timeout`, no free connection in the metadata database's pool to take it on, or a look the metadata database
+cannot answer (the first or the one just before the command), answers `{"busy": true}`: the same request may be sent
+again. A create whose lock comes free more
 than 45 seconds after the create began (mnemiq's default deadline for a call) lets it go at once and answers
 `{"busy": true}`, since mnemiq has by then stopped waiting for the answer and sends the create again. Where mnemiq is
 set to wait longer than 45 seconds for a call, such a create still answers busy, and is then sent again. While it waits
@@ -138,9 +142,11 @@ Postgres metadata database directly, or through a pooler that keeps one server s
 the lock goes back to the pooler when the lock's transaction commits, and later statements of the create's connection,
 its release among them, may reach other sessions: a second send of a create then runs its own checks rather than waiting
 for the first (only the create's own transaction lock keeps it from making a second object), and a marker's lock can
-stay held after its create has ended. A timeout that closes an idle connection (Postgres's `idle_session_timeout`, a
-proxy's or a load balancer's) shorter than a chart's query check can close the lock's connection while the check runs,
-and so release the lock early, with the same effect.
+stay held after its create has ended. The hold check's short transaction may reach another server session too, so a
+create may answer `{"busy": true}` though its lock is held, or count as held a lock another session holds. Transaction
+pooling is not supported. A timeout that closes an idle connection (Postgres's `idle_session_timeout`, a proxy's or a
+load balancer's) shorter than a chart's query check closes the lock's connection while the check runs, so such a create
+answers `{"busy": true}` every time it is sent: the timeout must be longer than a chart's query check.
 
 On Postgres and MySQL the lookup needs the metadata database's READ COMMITTED isolation; under any other level every
 create answers `{"refused": "isolation"}`, a create of a chart already made included. Superset 7.0.0rc2 sets READ
