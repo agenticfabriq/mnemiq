@@ -787,6 +787,18 @@ def test_histogram_check_context_without_groups_not_null_keeps_the_observations_
     assert "post_processing" not in query
 
 
+@pytest.mark.parametrize("grouped", [True, False])
+@pytest.mark.parametrize("grain_key", ["granularity_sqla", "granularity"])
+def test_histogram_check_context_carries_the_time_window_and_granularity(grouped, grain_key):
+    """`buildQueryObject`'s `time_range` and `granularity` (from `granularity_sqla` or `granularity`), as the base
+    query every other family starts from reads them, in both probes."""
+    form = {**HISTOGRAM, "time_range": "Last year", grain_key: "order_date"}
+    (query,) = ext.histogram_check_context(form, DATASET, grouped=grouped)["queries"]
+    assert query["time_range"] == "Last year" and query["granularity"] == "order_date"
+    (plain,) = ext.histogram_check_context(HISTOGRAM, DATASET, grouped=grouped)["queries"]
+    assert "time_range" not in plain and "granularity" not in plain
+
+
 _COUNT_ALL = [{"expressionType": "SQL", "sqlExpression": "COUNT(*)", "label": "COUNT(*)"}]
 
 

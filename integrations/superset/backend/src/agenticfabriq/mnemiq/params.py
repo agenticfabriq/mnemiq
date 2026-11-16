@@ -657,14 +657,19 @@ def _histogram_operator(form_data: Mapping, column: Any, groups: list) -> dict:
 
 
 def histogram_check_context(form_data: Mapping, datasource_id: int, grouped: bool = True) -> dict:
-    """The query context the extension runs to check a histogram (`histogram_v2`) before it is saved: the observations
-    and their grouping columns, the form data's `groupby` then its `column`, under the form data's filters, read as
-    the other families' queries read them, with the histogram operator the chart's own query carries (so a column
-    that holds non-numeric values fails the check, as it fails the chart). Its metrics are the histogram's own `buildQuery`'s: none
-    (a plain row select), or `COUNT(*)` when an adhoc filter's clause is HAVING, so a HAVING filter has an aggregate
-    to hold. Its filters are the form data's and then each selected column not null, because the check reads only two
-    unordered rows and the operator fails on a null group value: the probe differs from the chart's query there. rc2's own compile check leaves a histogram's column out of its query, which it builds from metrics and
-    groupby, because the histogram names its column under `column` alone. Not a chart's saved query context. Raises ValueError for a bad `datasource_id`, for form data
+    """The query context the extension runs to check a histogram (`histogram_v2`) before it is saved: a row select of
+    its grouping columns and its `column` (the form data's `groupby`, then `column`), under the base query every
+    family starts from (`_base_query`, which is `buildQueryObject`: the filters and extras, `time_range` and
+    `granularity`, read once), carrying the histogram operator the chart's own query carries, so a column holding
+    non-numeric values fails the check as it fails the chart. Its metrics are the histogram's own `buildQuery`'s:
+    none (a plain row select), or `COUNT(*)` when an adhoc filter's clause is HAVING, so a HAVING filter has an
+    aggregate to hold. rc2's own compile check leaves a histogram's column out of its query, which it builds from
+    metrics and groupby, because the histogram names its column under `column` alone.
+
+    The probe differs from the chart's own query in three ways only: its row limit (set by the caller), a not-null
+    filter on each selected column (the check reads two unordered rows, and the operator fails on a null group value),
+    and, with `grouped` False (the second look, at whether any observation exists), no operator and a not-null filter
+    on the column alone. Not a chart's saved query context. Raises ValueError for a bad `datasource_id`, for form data
     that is not a mapping, and for form data without a `column`."""
     if isinstance(datasource_id, bool) or not isinstance(datasource_id, int) or datasource_id < 1:
         raise ValueError("datasource_id must be a positive integer")
@@ -673,16 +678,15 @@ def histogram_check_context(form_data: Mapping, datasource_id: int, grouped: boo
     column = form_data.get("column")
     if not (isinstance(column, str) and column) and not _is_adhoc_column(column):
         raise ValueError("a histogram's params name no column")
-    filters, extras = _filters_and_extras(form_data)
+    base = _base_query(form_data)
     groups = [c for c in _ensure_list(form_data.get("groupby")) if c != ""]
     columns = _dedupe([*groups, column], _column_label)
-    # The probe reads two rows with no order, and the operator fails on a group value that is null (it cannot unstack
-    # them) whatever the rest of the chart holds; so the probe, not the saved chart, keeps its rows to non-null ones.
     # A null-only sample would be an empty frame the operator passes, and a non-numeric value still fails it.
-    # With `grouped` False (the second look, at whether any observation exists), only the column is kept not null and
-    # there is no operator.
-    filters = [*filters, *({"col": c, "op": "IS NOT NULL"} for c in (columns if grouped else [column]))]
-    query = {"columns": columns, "filters": filters, "extras": extras}
+    not_null = [{"col": c, "op": "IS NOT NULL"} for c in (columns if grouped else [column])]
+    query = {"columns": columns, "filters": [*base["filters"], *not_null], "extras": base["extras"]}
+    for key in ("time_range", "granularity"):
+        if key in base:
+            query[key] = base[key]
     if any(isinstance(f, Mapping) and f.get("clause") == "HAVING" for f in _ensure_list(form_data.get("adhoc_filters"))):
         query["metrics"] = [{"expressionType": "SQL", "sqlExpression": "COUNT(*)", "label": "COUNT(*)"}]
     if grouped:
