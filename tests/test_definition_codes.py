@@ -400,6 +400,8 @@ def test_an_exclusion_covers_its_whole_list_and_only_its_own_predicate():
 
     assert stale("Rows with SHIP_MODE 'X' and 'Y' are excluded.") == []
     assert stale("Exclude rows with SHIP_MODE = 'X' or 'Y'.") == []
+    assert stale("Exclude rows where SHIP_MODE IN ('X', 'Y').") == []
+    assert stale("Do not exclude rows where SHIP_MODE IN ('X', 'Y').") == [("X", "Y")]
     assert stale("Do not exclude SHIP_MODE = 'X'.") == [("X",)]
     assert stale("Exclude SHIP_MODE = 'X' and include SHIP_MODE = 'Y'.") == [("Y",)]
     assert stale("Count SHIP_MODE 'X', 'Y', and 'Z' rows.") == [("X", "Y", "Z")]

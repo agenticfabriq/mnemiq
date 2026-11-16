@@ -17,9 +17,9 @@ What counts, kept narrow so prose is not read as codes:
   a column or table name. A quoted literal opens after a non-word character and closes before one, and neither starts
   nor ends with whitespace, so the apostrophe in "lot's" never opens one and swallows the code after it.
 - Only a code the definition selects on counts. A mention in an explicit exclusion (`<> 'X'`, `!= 'X'`,
-  `NOT IN ('X')`, "is not 'X'", "other than", "except", "excluding", "exclude ... = 'X'", "'X' ... are excluded") is
-  filtered out by a query that follows the definition, which keeps every row whether or not the data holds it, so a
-  definition that only excludes is never reported. A nearby negation that still selects ("not only 'X' but also",
+  `NOT IN ('X')`, "is not 'X'", "other than", "except", "excluding", "exclude ... = 'X'" or "... IN ('X')",
+  "'X' ... are excluded") is filtered out by a query that follows the definition, which keeps every row whether or not
+  the data holds it, so a definition that only excludes is never reported. A nearby negation that still selects ("not only 'X' but also",
   "do not omit ... 'X'", "do not exclude ... 'X'") is not an exclusion, and "exclude" reaches only its own predicate.
 - A code counts for a column only when it has the shape of one of the column's values: capitals, small letters and
   digits in the same places. `'from May to June'` is never a code for a column of `AB12`s.
@@ -45,8 +45,9 @@ _CLAUSE_END = re.compile(r"[.;:?\n]|!(?!=)")
 _EXCLUDED_BEFORE = re.compile(
     r"(?:<>|!=|\bnot\s+in\s*\((?:[^()]*,)?|\b(?:is|are|was|were)\s+(?:not|never)|\bnot\s+equals?(?:\s+to)?|\bother\s+than"
     r"|\bexcept(?:\s+for)?|\bexcluding|\bbut\s+not"
-    # "exclude ... =", not negated, and reaching back over no other quoted code: its own predicate only.
-    r"|(?<!\bnot )(?<!\bnever )(?<!n't )\bexclud\w*\b[^.;:?\n'\"]*?=)\s*$", re.IGNORECASE)
+    # "exclude ... =" or "exclude ... IN (", not negated, and reaching back over no other quoted code: its own
+    # predicate only.
+    r"|(?<!\bnot )(?<!\bnever )(?<!n't )\bexclud\w*\b[^.;:?\n'\"]*?(?:=|\bin\s*\())\s*$", re.IGNORECASE)
 # ...or just after it. Both read a coordinated list ("'X', 'Y' and 'Z'") as one mention.
 _EXCLUDED_AFTER = re.compile(
     r"^\s*\)?\s*(?:rows?\s+)?(?:are|is)\s+(?:excluded|ignored|dropped|removed|left\s+out|filtered\s+out)\b", re.IGNORECASE)
