@@ -70,6 +70,9 @@ BAD_MARKER = {"refused": "marker"}
 # What opens a Jinja block; Superset renders a stored expression as a template, so none is saved.
 _TEMPLATE = re.compile(r"\{[{%#]")
 _ISO_4217 = re.compile(r"[A-Z]{3}")
+# The keys a create's `set` may carry: the display formats mnemiq's `owed_format_params` makes, which MCP's chart config
+# cannot. Nothing `set` carries may change which rows a chart reads or what it is bound to.
+_CREATE_SET_KEYS = frozenset({"column_config", "number_format", "currency_format"})
 _CHART_ROW_LIMIT_PROBE = 2  # the rows `create_chart`'s check asks for, as MCP's `_compile_chart` asks for two
 
 
@@ -1185,7 +1188,8 @@ def _config_form(found: dict, dataset: Any) -> tuple[str, dict, dict | None] | d
 @_answering("create_chart")
 def create_chart(found: dict) -> dict:
     """A chart on the dataset, for the dashboard, in one of two shapes: a funnel or a sankey as `{viz_type, params}`,
-    or any family as MCP's own chart config, `{config}` with the format keys `set` to merge into its params. Its query
+    or any family as MCP's own chart config, `{config}` with the format keys `set` (only `_CREATE_SET_KEYS`) to merge into
+    its params. Its query
     is run first and the chart saved only if it runs; then `CreateChartCommand` saves its params, its query context,
     the editors `_chart_editors` chooses and the build's marker, once for the marker. The editors are read in the
     create's own transaction. The chart joins the dashboard when a layout places it (`set_layout`).
@@ -1209,8 +1213,7 @@ def create_chart(found: dict) -> dict:
         shaped = found["viz_type"] is not None and found["params"] is not None and found["set"] is None
     if not shaped:
         return {"refused": "request"}
-    # `set` carries format keys: the dataset is the request's and the type the config's, as a chart's patch leaves them.
-    if from_config and not (params._BINDING_KEYS | {"viz_type"}).isdisjoint(found["set"] or ()):
+    if from_config and not set(found["set"] or ()) <= _CREATE_SET_KEYS:
         return {"refused": "set"}
     dataset_id = found["dataset_id"]
     prepared = _funnel_form(found) if own else None

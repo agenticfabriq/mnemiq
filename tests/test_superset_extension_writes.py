@@ -1604,12 +1604,23 @@ def test_a_config_is_checked_for_the_dataset_and_dashboard_before_it_is_validate
     assert _kinds(creating.superset) == []
 
 
-@pytest.mark.parametrize("key", ["datasource", "datasource_id", "datasource_type", "viz_type"])
-def test_set_may_not_rebind_a_charts_dataset_or_type(creating, key):
-    """`set` carries format keys only: the dataset binding is the request's and the type is the config's, as a chart's
-    patch leaves them. Refused before anything is validated, mapped, run, locked or created."""
+@pytest.mark.parametrize("key", ["datasource", "datasource_id", "datasource_type", "viz_type", "time_range",
+                                 "extra_form_data", "bins", "adhoc_filters", "color_scheme"])
+def test_set_carries_only_the_format_keys(creating, key):
+    """`set` carries the format keys `owed_format_params` makes, and nothing that could change which rows a chart reads
+    or what it is bound to. Refused before anything is validated, mapped, run, locked or created."""
     assert make_from_config(set={key: "funnel" if key == "viz_type" else 8}) == {"refused": "set"}
     assert _kinds(creating.superset) == [] and commands(creating.superset) == []
+    assert creating.superset.ran == []
+
+
+@pytest.mark.parametrize("key, value", [("column_config", {"sales": {"d3NumberFormat": ",.2f"}}),
+                                        ("number_format", ",.2f"), ("currency_format", {"symbol": "USD"})])
+def test_each_format_key_is_merged_into_the_saved_params(creating, key, value):
+    made = make_from_config(set={key: value})
+    assert set(made) == {"chart_id"}, made
+    ((_, properties),) = commands(creating.superset)
+    assert json.loads(properties["params"])[key] == value
 
 
 # ---------------------------------------------------------------- the marker's lock, held through the create
@@ -2427,10 +2438,10 @@ def test_a_histogram_from_a_config_is_saved(creating):
     """rc2's mapping makes the form data and `set` is merged over it; the saved params are those; the query context is
     none (the histogram is not checked by the value check); the marker and the editors are a created chart's."""
     creating.superset.mapped = copy.deepcopy(HISTOGRAM_FORM)
-    made = make_from_config(set={"color_scheme": "supersetColors"})
+    made = make_from_config(set={"number_format": ",.2f"})
     assert set(made) == {"chart_id"}, made
     ((_, properties),) = commands(creating.superset)
-    assert json.loads(properties["params"]) == {**HISTOGRAM_FORM, "color_scheme": "supersetColors"}
+    assert json.loads(properties["params"]) == {**HISTOGRAM_FORM, "number_format": ",.2f"}
     assert properties["query_context"] is None
     assert properties["viz_type"] == "histogram_v2" and properties["description"] == STEP
     assert properties["editors"] == [101]
