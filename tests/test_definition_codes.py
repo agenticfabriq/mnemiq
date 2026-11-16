@@ -404,6 +404,11 @@ def test_an_exclusion_covers_its_whole_list_and_only_its_own_predicate():
     assert stale("Do not exclude rows where SHIP_MODE IN ('X', 'Y').") == [("X", "Y")]
     assert stale("Count rows where NOT (SHIP_MODE IN ('X', 'Y')).") == []
     assert stale("Count rows where NOT (SHIP_MODE = 'X') AND SHIP_MODE = 'Y'.") == [("Y",)]
+    # A qualified name's dot and a newline inside SQL end no clause; a sentence's full stop does.
+    assert stale("Count rows where NOT (s.SHIP_MODE IN ('X', 'Y')).") == []
+    assert stale("Count rows where NOT (\n    SHIP_MODE IN ('X', 'Y')\n).") == []
+    assert stale("Exclude rows where s.SHIP_MODE = 'X'.") == []
+    assert stale("Exclude nothing. SHIP_MODE = 'X' is air.") == [("X",)]
     assert stale("Do not exclude SHIP_MODE = 'X'.") == [("X",)]
     assert stale("Exclude SHIP_MODE = 'X' and include SHIP_MODE = 'Y'.") == [("Y",)]
     assert stale("Count SHIP_MODE 'X', 'Y', and 'Z' rows.") == [("X", "Y", "Z")]

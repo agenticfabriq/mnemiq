@@ -40,15 +40,16 @@ from mnemiq.semantic.textmatch import similarity
 # Opened after a non-word character, closed before one, never starting or ending in whitespace: "'AX' or 'AY'" yields AX
 # and AY, not " or ", and "the lot's mode='-A' or '-G'" yields -A and -G, not "s mode=".
 _QUOTED = re.compile(r"(?<!\w)'([^'\s](?:[^'\n]{0,62}[^'\s])?)'(?!\w)|(?<!\w)\"([^\"\s](?:[^\"\n]{0,62}[^\"\s])?)\"(?!\w)")
-# A clause ends at . ; : ? a newline, or a ! that does not begin !=.
-_CLAUSE_END = re.compile(r"[.;:?\n]|!(?!=)")
+# A clause ends at a full stop (a . before whitespace or the end, never a qualified name's), ; : ?, a blank line, or a !
+# that does not begin !=. A single newline inside SQL ends nothing.
+_CLAUSE_END = re.compile(r"\.(?=\s|$)|[;:?]|\n\s*\n|!(?!=)")
 # An explicit exclusion just before the code, in its clause...
 _EXCLUDED_BEFORE = re.compile(
     r"(?:<>|!=|\bnot\s+in\s*\((?:[^()]*,)?|\b(?:is|are|was|were)\s+(?:not|never)|\bnot\s+equals?(?:\s+to)?|\bother\s+than"
     r"|\bexcept(?:\s+for)?|\bexcluding|\bbut\s+not"
     # "exclude ... =" or "exclude ... IN (", not negated, and reaching back over no other quoted code: its own
     # predicate only.
-    r"|(?<!\bnot )(?<!\bnever )(?<!n't )\bexclud\w*\b[^.;:?\n'\"]*?(?:=|\bin\s*\())\s*$", re.IGNORECASE)
+    r"|(?<!\bnot )(?<!\bnever )(?<!n't )\bexclud\w*\b(?:[^.;:?'\"]|\.(?!\s|$))*?(?:=|\bin\s*\())\s*$", re.IGNORECASE)
 # ...or just after it. Both read a coordinated list ("'X', 'Y' and 'Z'") as one mention.
 _EXCLUDED_AFTER = re.compile(
     r"^\s*\)?\s*(?:rows?\s+)?(?:are|is)\s+(?:excluded|ignored|dropped|removed|left\s+out|filtered\s+out)\b", re.IGNORECASE)
