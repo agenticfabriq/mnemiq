@@ -15,8 +15,9 @@ every ask-path statement is, and then `reusable`: a saved metric on its dataset 
 Each chart meets `plan_refusal` and the plan's own rules here (its key, its columns, its filters, the saved metrics it
 names). A refused part goes back to the model once; refused again, it refuses the plan, and the reason names it.
 
-**Datasets.** A chart on a table with no dataset gets a planned `create_dataset`; a measure that needs a join gets a
-planned `create_virtual_dataset`, the join decided with the measure by `check_measure`. A planned dataset has no id
+**Datasets.** A chart on a table with no dataset gets a planned dataset over the table; a measure that needs a join
+gets a planned virtual dataset over the join's SQL, the join decided with the measure by `check_measure`. The builder
+makes each with the extension's `create_dataset`, a virtual one with its `sql`. A planned dataset has no id
 until it is made, so the plan's charts and measures carry its negative `placeholder` until `with_made_datasets` puts
 the made id in its place. Every dataset Superset makes carries a saved metric `count` (`COUNT_METRIC`), which is
 Superset's, never one of mnemiq's measures.

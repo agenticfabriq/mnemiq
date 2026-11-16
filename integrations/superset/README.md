@@ -105,13 +105,22 @@ Superset's own error text never reaches them.
 A create carrying a build's marker (`create_dashboard`, `create_dataset`, `create_chart`) makes its object once, so a
 create whose answer was lost may be sent again. Under a lock keyed by the marker (a transaction's advisory lock on
 Postgres, a named lock on MySQL, each waited for at most `MNEMIQ_LOCK_TIMEOUT_S`, else `{"busy": true}`) it looks for
-an object out of the trash whose description's last line is that marker: it answers that one's id; when there are
+an object not in the trash whose description's last line is that marker: it answers that one's id; when there are
 several it creates nothing and answers `{"candidates": [...]}`, the ids of those the caller may read (the list may be
-empty); and it creates the object when there is none. The lookup needs the metadata database's READ COMMITTED
-isolation, Superset's default on Postgres and MySQL; under any other level a create answers `{"refused":
-"isolation"}`, and on any other metadata database `{"refused": "metadata_database"}`. A SQLite metadata database takes
-no marker lock, being Superset's single-person development default: there a create sent again while the first is still
-running could make a second object.
+empty); and it creates the object when there is none. `create_chart` also looks once before it runs the chart's
+query, without the lock, so a chart already made is answered without running its query again. On any other metadata
+database than Postgres, MySQL or SQLite a create answers `{"refused": "metadata_database"}`. A SQLite metadata
+database takes no marker lock, being Superset's single-person development default: there a create sent again while
+the first is still running could make a second object.
+
+On Postgres and MySQL the lookup needs the metadata database's READ COMMITTED isolation; under any other level a
+create answers `{"refused": "isolation"}`. Superset 7.0.0rc2 sets READ COMMITTED itself only when
+`SQLALCHEMY_ENGINE_OPTIONS` names no isolation level and `SQLALCHEMY_DATABASE_URI` is a `postgresql` or a `mysql` URI
+(with any driver). A `mariadb://` URI, or options naming another level, need it set in `superset_config.py`:
+
+```python
+SQLALCHEMY_ENGINE_OPTIONS = {"isolation_level": "READ COMMITTED"}   # with any other options already set there
+```
 
 ## The read tools
 

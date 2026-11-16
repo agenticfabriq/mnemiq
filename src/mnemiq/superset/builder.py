@@ -18,9 +18,10 @@ Nothing is looked for by its name: an object without the step's marker, or with 
 **A lost answer is sent again at once.** A create whose call ends unanswered (`SupersetUnavailable`, a timeout among
 them) leaves its step uncertain, and the next request sends the same create: if Superset made the object, the create
 answers with it; if not, it makes it. A first call that Superset runs only after the retry waits for the marker's lock
-and then answers with the object the retry made. Every other call a step makes may be sent again too, so no step
-waits for its lease to pass. The lease makes one request at a time run a step; it does not stand for how long Superset
-may take.
+and then answers with the object the retry made. Every other call a step makes may be sent again too, so a step
+whose call went unanswered is run again by the next request, without waiting for its lease to pass. The lease makes
+one request at a time run a step; it does not stand for how long Superset may take. A step whose worker ended before
+it recorded its outcome still holds its claim, so `next_step` raises `BuildBusy` until that lease passes.
 
 **What a build keeps** is the plan, the step states, the ids of what it made, and each measure of the dashboard (a
 saved metric a chart reuses among them) with the charts that show it and each chart's check status. Never a value: a

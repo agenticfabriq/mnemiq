@@ -50,7 +50,8 @@ from agenticfabriq.mnemiq import params
 
 logger = logging.getLogger(__name__)
 
-# The chart types only the extension creates; MCP's `generate_chart` makes every other one.
+# The chart types MCP's chart config has none for: `create_chart` takes them as their own form data (`{viz_type,
+# params}`), and every other type as MCP's chart config (`{config, set?}`).
 EXTENSION_MADE = ("funnel", "sankey_v2")
 
 OK = {"ok": True}
@@ -469,7 +470,7 @@ def _like_suffix(marker: str) -> str:
 
 
 def _marked(model: type, marker: str) -> list[Any]:
-    """The rows of `model`, out of the trash, whose description's last line is exactly `marker`, by id. Two filters:
+    """The rows of `model`, not in the trash, whose description's last line is exactly `marker`, by id. Two filters:
     the database's keeps a description that ends with the marker (`LIKE`, `_like_suffix`; SQLAlchemy writes the
     escape character as each dialect reads it, where a hand-written `ESCAPE '\\'` is an unterminated string to MySQL's
     default mode); Python's then keeps a row only when its last line is the marker alone, so a marker with text typed
