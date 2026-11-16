@@ -1087,13 +1087,23 @@ def test_the_sql_filter_reads_an_underscore_literally():
     assert selected("a%b_c\\d", ["x a%b_c\\d", "x aZbYc\\d", "x a%b_c\\\\d"]) == ["x a%b_c\\d"]
 
 
-def test_a_marker_not_alone_on_the_last_line_is_not_found(creating):
-    """A person typed before the marker on its line: the database's filter passes the row (its description ends with
-    the marker), and Python's, which keeps only a last line that is the marker alone, does not. The retry makes a new
-    dashboard."""
-    typed = _row(3, "prose" + SHELL)
+@pytest.mark.parametrize("description", [
+    pytest.param("prose" + SHELL, id="text typed before it on its line"),
+    pytest.param(SHELL + " and text typed after it", id="text typed after it on its line"),
+    pytest.param(f"{SHELL}\nA line typed under it.", id="a line typed under it")])
+@pytest.mark.parametrize("filters", ["both filters", "Python's alone"])
+def test_a_marker_not_alone_on_the_last_line_is_not_found(creating, monkeypatch, description, filters):
+    """A person typed next to the marker: before it on its line, after it on its line, or a line under it. The lookup
+    keeps only a description whose last line is the marker alone, so the row is not found and the retry makes a new
+    dashboard. Each filter holds on its own: the database's passes only the first shape (its description still ends
+    with the marker), and Python's turns away all three when the database's passes every row."""
+    typed = _row(3, description)
     creating.superset.rows["Dashboard"].append(typed)
-    assert _holds(("like", "description", writes._like_suffix(SHELL), "\\"), typed)
+    if filters == "Python's alone":
+        monkeypatch.setattr(writes, "_like_suffix", lambda marker: "%")
+        assert _holds(("like", "description", "%", "\\"), typed)
+    else:
+        assert _holds(("like", "description", writes._like_suffix(SHELL), "\\"), typed) is description.endswith(SHELL)
     made = make_dashboard()
     assert set(made) == {"dashboard_id"} and made["dashboard_id"] != 3, made
     assert len(commands(creating.superset, "CreateDashboardCommand")) == 1
