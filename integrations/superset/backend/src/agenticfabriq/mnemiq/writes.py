@@ -17,7 +17,9 @@ Every tool keeps these rules:
   create whose answer was lost may be sent again. Every check that refuses the caller runs before the lock, and only
   the lookup and the create inside it, whose commit releases it. A marker's lock not taken in time answers
   `{"busy": true}` too. A chart's create also looks for its chart once without the lock before rc2 checks its query
-  (`_made_already`), so a retry of a chart already made never runs that query again.
+  (`_made_already`), so a retry of a chart already made never runs that query again; and a chart its own check
+  refuses looks again under the lock before it answers the refusal (`_made_meanwhile`), so a chart another send
+  committed while the check ran is answered, not refused.
 - Its answer is short and structured. Superset's own text never reaches it: any of Superset's exceptions is logged
   here and answered by its kind.
 - A caller who is not an editor of the object is told so before anything about the object's state (a stale
@@ -594,25 +596,41 @@ def _made_already(model: type, marker: str, *, kind: str) -> dict | None:
     return _found_answer(found, kind=kind) if found else None
 
 
-def _find_or_create(model: type, marker: str, *, kind: str, create: Callable[[], dict]) -> dict:
-    """The object of `model` that `marker` names, or `create()`'s answer when there is none, under the marker's lock
-    (`_marker_lock`): a create whose answer was lost, sent again, answers the object the first one made instead of
-    making a second. What it finds (`_marked`) is answered by `_found_answer`. A lock not taken answers
-    `{"busy": true}` or the refusal that says why.
-
-    Only the lookup and the create run inside the lock. Every check that refuses the caller, and any of rc2's work
-    that might end the session's transaction (a query check), runs before it, so the lock is held until the create's
-    own commit. Whatever is answered, the session's transaction ends here, so a found object releases the lock too."""
+def _under_marker_lock(model: type, marker: str, *, kind: str, otherwise: Callable[[], dict]) -> dict:
+    """Under the marker's lock (`_marker_lock`): the answer for the objects of `model` that `marker` names (`_marked`,
+    answered by `_found_answer`), or `otherwise()`'s when there is none. A lock not taken answers `{"busy": true}` or
+    the refusal that says why. Whatever is answered, the session's transaction ends here, so a found object releases
+    the lock too."""
     try:
         with _marker_lock(marker):
             found = _marked(model, marker)
             if not found:
-                return create()
+                return otherwise()
             return _found_answer(found, kind=kind)
     except _NotLocked as not_locked:
         return not_locked.answer
     finally:
         _session().rollback()
+
+
+def _find_or_create(model: type, marker: str, *, kind: str, create: Callable[[], dict]) -> dict:
+    """The object of `model` that `marker` names, or `create()`'s answer when there is none, under the marker's lock
+    (`_under_marker_lock`): a create whose answer was lost, sent again, answers the object the first one made instead
+    of making a second.
+
+    Only the lookup and the create run inside the lock. Every check that refuses the caller, and any of rc2's work
+    that might end the session's transaction (a query check), runs before it, so the lock is held until the create's
+    own commit."""
+    return _under_marker_lock(model, marker, kind=kind, otherwise=create)
+
+
+def _made_meanwhile(model: type, marker: str, *, kind: str, refusal: dict) -> dict:
+    """The answer for a create its own check refused before the marker's lock (a chart's config validation, mapping
+    or query check): the object of `model` that `marker` names, when another send of the create committed it while the
+    check ran, else `refusal`. Looked for under the lock as `_find_or_create` looks (`_under_marker_lock`), so a send
+    still holding the lock, its object not yet committed, answers `{"busy": true}`, which may be sent again, not the
+    refusal, which stops the build. Only the lookup runs inside the lock."""
+    return _under_marker_lock(model, marker, kind=kind, otherwise=lambda: refusal)
 
 
 def _dashboard(dashboard_id: int) -> Any:
@@ -912,7 +930,11 @@ def create_chart(found: dict) -> dict:
 
     A chart the marker names already is answered before its query is checked (`_made_already`), once the request, the
     dataset and the dashboard pass their checks: a retry of a chart whose answer was lost never runs the source query
-    again, which a slow source database, the likely cause of the lost answer, could now fail."""
+    again, which a slow source database, the likely cause of the lost answer, could now fail. A retry sent while its
+    first send still runs may find nothing there and then be refused by its own check (the config's validation or
+    mapping, or the query); before it answers that refusal it looks again under the marker's lock
+    (`_made_meanwhile`), so a chart the first send committed meanwhile is answered, and a first send still holding
+    the lock answers `{"busy": true}`."""
     if claim_marker(found["marker"], found["dashboard_id"]) is None:
         return BAD_MARKER
     from_config = found["config"] is not None
@@ -945,10 +967,14 @@ def create_chart(found: dict) -> dict:
     if prepared is None:
         found["set"] = found["set"] or {}
         prepared = _config_form(found, dataset)
-        if isinstance(prepared, dict):
-            return prepared
     elif (failure := _check_query(prepared[2])) is not None:
-        return failure
+        prepared = failure
+    if isinstance(prepared, dict):
+        # A refused config or query looks again; a dataset the query check may not read is answered as it is, since
+        # a chart another send made changes nothing the caller may read.
+        if "refused" in prepared:
+            return _made_meanwhile(Slice, found["marker"], kind="chart", refusal=prepared)
+        return prepared
     viz_type, form_data, context = prepared
     editors = _chart_editors(dataset, dashboard, ())
     from superset.commands.chart.create import CreateChartCommand

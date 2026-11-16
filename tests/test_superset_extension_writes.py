@@ -1362,18 +1362,6 @@ def test_each_shape_alone_is_read(creating):
     assert set(make_from_config(format_marker(BUILD, "chart_3", 12), set={})) == {"chart_id"}
 
 
-def test_a_config_rc2_rejects_is_refused_as_config(creating):
-    creating.superset.config_valid = False
-    assert make_from_config() == {"refused": "config"}
-    assert _kinds(creating.superset) == ["lookup", "validate"]
-
-
-def test_a_config_whose_query_fails_saves_nothing(creating):
-    creating.superset.compiled = SimpleNamespace(success=False)
-    assert make_from_config() == {"refused": "query_failed"}
-    assert _kinds(creating.superset) == ["lookup", "validate", "map", "compile"]
-
-
 def test_a_config_is_checked_for_the_dataset_and_dashboard_before_it_is_validated(creating):
     creating.not_edited.append(creating.dashboard)
     assert make_from_config() == {"not_editor": True, "editors": ["analyst Live"]}
@@ -1479,6 +1467,125 @@ def test_a_chart_made_while_the_query_check_ran_is_found_under_the_lock(creating
 
     monkeypatch.setattr(compile_module, "_compile_chart", meanwhile)
     assert make_from_config() == {"chart_id": 9}
+    assert commands(creating.superset) == []
+
+
+# ---------------------------------------------------------------- a chart refused by its own check, made meanwhile
+
+# Each of a chart's own checks that may refuse it, before the marker's lock: the create it belongs to, what the
+# check's run is recorded as, and the refusal it answers.
+CHECKS = {
+    "validation": (make_from_config, "validate", {"refused": "config"}),
+    "mapping": (make_from_config, "map", {"refused": "config"}),
+    "compile": (make_from_config, "compile", {"refused": "query_failed"}),
+    "query check": (make_funnel, "chart_data", {"refused": "query_failed"}),
+}
+AFTER_A_REFUSAL = ["isolation", "execute", "execute", "lookup", "rollback"]
+
+
+def _refusing(monkeypatch, superset: SimpleNamespace, check: str, winners=()) -> None:
+    """`check` refuses the chart from now on, and while it runs another send of the same create commits `winners`:
+    the race a retry sent while its first send still runs meets when the first commits just after the retry looked
+    for the chart before its check. rc2's validation answers the config invalid; its mapping leaves no chart type;
+    `_compile_chart` answers a failure, as it does for a source database that timed out; a funnel's query answers a
+    failed query."""
+
+    def meanwhile() -> None:
+        superset.rows["Slice"].extend(winners)
+
+    if check == "validation":
+        superset.config_valid = False
+        pipeline = sys.modules["superset.mcp_service.chart.validation"].ValidationPipeline
+        validate = pipeline.validate_request_with_warnings
+        monkeypatch.setattr(pipeline, "validate_request_with_warnings",
+                            staticmethod(lambda request: (meanwhile(), validate(request))[1]))
+    elif check == "mapping":
+        superset.mapped = {"metric": "count"}
+        module = sys.modules["superset.mcp_service.chart.chart_utils"]
+        mapping = module.map_config_to_form_data
+        monkeypatch.setattr(module, "map_config_to_form_data",
+                            lambda config, dataset_id=None: (meanwhile(), mapping(config, dataset_id))[1])
+    elif check == "compile":
+        superset.compiled = SimpleNamespace(success=False)
+        module = sys.modules["superset.mcp_service.chart.compile"]
+        compiling = module._compile_chart
+        monkeypatch.setattr(module, "_compile_chart",
+                            lambda form_data, dataset_id: (meanwhile(), compiling(form_data, dataset_id))[1])
+    else:
+        superset.chart_data = {"queries": [{"error": "the source database timed out", "status": "failed"}]}
+        command = sys.modules["superset.commands.chart.data.get_data_command"].ChartDataCommand
+        running = command.run
+        monkeypatch.setattr(command, "run", lambda self: (meanwhile(), running(self))[1])
+
+
+def _after(superset: SimpleNamespace, ran: str) -> list[str]:
+    """What ran after the check `ran` names."""
+    kinds = _kinds(superset)
+    return kinds[kinds.index(ran) + 1:]
+
+
+@pytest.mark.parametrize("check", CHECKS)
+def test_a_chart_made_while_its_own_check_refused_it_is_answered(creating, monkeypatch, check):
+    """A retry sent while its first send still runs finds no chart before its check; the first send commits the chart
+    while the retry's check runs; then the check refuses the retry (a source database slow enough to lose the first
+    answer may time the retry's query out). Before it answers the refusal, which would stop the build, the create
+    looks again under the marker's lock, finds the chart and answers it. Nothing more is made."""
+    make, ran, _ = CHECKS[check]
+    _refusing(monkeypatch, creating.superset, check, winners=[_row(9, STEP)])
+    assert make() == {"chart_id": 9}
+    assert _after(creating.superset, ran) == AFTER_A_REFUSAL
+    assert commands(creating.superset) == []
+
+
+@pytest.mark.parametrize("found", ["not edited", "unreadable", "two carrying the marker"])
+def test_a_chart_found_after_its_own_check_refused_it_is_answered_as_under_the_lock(creating, monkeypatch, found):
+    """What the look after a refusal finds is answered by the rules every lookup under the lock answers by: a chart
+    the caller does not edit, with its editors; one it may not read, as one that does not exist; more than one, as
+    the candidates the caller may read."""
+    winners = [_row(9, STEP)]
+    if found == "not edited":
+        winners[0].editors = [SimpleNamespace(id=102, label="owner Live")]
+        creating.not_edited.append(winners[0])
+        expected = {"not_editor": True, "editors": ["owner Live"]}
+    elif found == "unreadable":
+        creating.unreadable.append(winners[0])
+        expected = {"not_found": "chart"}
+    else:
+        winners.append(_row(11, f"Copied by hand.\n{STEP}"))
+        creating.unreadable.append(winners[1])
+        expected = {"candidates": [9]}
+    _refusing(monkeypatch, creating.superset, "compile", winners=winners)
+    assert make_from_config() == expected
+    assert commands(creating.superset) == []
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+@pytest.mark.parametrize("check", CHECKS)
+def test_a_chart_refused_while_its_marker_lock_is_held_answers_busy(creating, monkeypatch, check, dialect):
+    """The first send still holds the marker's lock, its create not yet committed, when the retry's own check refuses
+    it: the retry cannot tell whether that chart will be made, so it answers busy, which the build may send again,
+    never the refusal, which would stop it. Nothing is looked up under the lock or made."""
+    metadata = creating.on(dialect)
+    if dialect == "mysql":
+        metadata.got_lock = 0
+    else:
+        metadata.contended = "pg_advisory_xact_lock"
+    make, ran, _ = CHECKS[check]
+    _refusing(monkeypatch, creating.superset, check)
+    assert make() == {"busy": True}
+    assert "lookup" not in _after(creating.superset, ran)
+    assert commands(creating.superset) == []
+
+
+@pytest.mark.parametrize("check", CHECKS)
+def test_a_chart_its_own_check_refused_and_nobody_made_answers_the_refusal(creating, monkeypatch, check):
+    """No chart carries the marker under the lock either: the check's own refusal is answered, after nothing else of
+    the chart's path has run (a config the validation refuses is not mapped, nor its query run), and nothing is
+    made."""
+    make, ran, refusal = CHECKS[check]
+    _refusing(monkeypatch, creating.superset, check)
+    assert make() == refusal
+    assert _after(creating.superset, ran) == AFTER_A_REFUSAL
     assert commands(creating.superset) == []
 
 
