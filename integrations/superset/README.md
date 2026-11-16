@@ -98,40 +98,46 @@ answered `{"not_editor": true, "editors": [...]}` naming the dataset's editors: 
 ### Locks
 
 Every write to an existing row first locks that row and compares the `changed_on` the caller read, so of two racing
-writers the second answers `{"stale": true}`. A write that waits for the row longer than `MNEMIQ_LOCK_TIMEOUT_S`
-answers `{"busy": true}` and changes nothing; the same request may be sent again. So does a write whose connection to
-the metadata database was lost mid-statement, or that found no free connection in the pool: it either did not write
-or cannot tell whether it did, and a create sent again finds what an earlier send made by its build marker. Answers
-are short structured objects; Superset's own error text never reaches them.
+writers the second answers `{"stale": true}`. A write that waits for the row longer than `MNEMIQ_LOCK_TIMEOUT_S` answers
+`{"busy": true}` and changes nothing; the same request may be sent again. So does a write whose connection to the
+metadata database was lost mid-statement, or that found no free connection in the pool: it either did not write or
+cannot tell whether it did, and a create sent again finds what an earlier send made by its build marker. Any other
+database error is answered `{"failed": true}`; a write tool never raises one. Answers are short structured objects;
+Superset's own error text never reaches them.
 
 A create carrying a build's marker (`create_dashboard`, `create_dataset`, `create_chart`) makes its object once, so a
-create whose answer was lost may be sent again. Once the caller passes the create's own checks (the request, the
-dataset and dashboard it names, being an editor of the dashboard), the create takes one lock keyed by the marker, on a
-metadata database connection of its own (a session's advisory lock on Postgres, a named lock on MySQL), and holds it
-until the object is made and committed. Under it, the create looks for an object not in the trash whose description's
-last line is that marker: it answers that one's id; when there are several it creates nothing and answers
-`{"candidates": [...]}`, the ids of those the caller may read (the list may be empty); and when there is none, it runs
-Superset's own checks (a chart's config validation and its query, a dataset's table) and creates the object, a
-dataset's editors included. So a chart already made is answered without running its query again, and a create sent
-again while the first is still running waits for the first and answers what it made. A wait for the lock longer than
-`MNEMIQ_LOCK_TIMEOUT_S`, no free connection in the metadata database's pool to take it on, or a look the metadata
-database cannot answer, answers `{"busy": true}`: the same request may be sent again. A create whose lock comes free
-more than 45 seconds after the create began (mnemiq's default deadline for a call) lets it go at once and answers
+create whose answer was lost may be sent again. Once the caller passes the create's own checks (the request, the dataset
+and dashboard it names, being an editor of the dashboard), the create takes one lock keyed by the marker, on a metadata
+database connection of its own (a session's advisory lock on Postgres, a named lock on MySQL), and holds it until the
+object is made and committed. Under it, the create looks for an object not in the trash whose description's last line is
+that marker: it answers that one's id; when there are several it creates nothing and answers `{"candidates": [...]}`,
+the ids of those the caller may read (the list may be empty); and when there is none, it runs Superset's own checks (a
+chart's config validation and its query, a dataset's table) and creates the object, a dataset's editors included. So a
+chart already made is answered without running its query again, and a create sent again while the first is still running
+waits for the first and answers what it made. On Postgres a second lock guards the create itself: just before its
+command, in the command's own transaction, the create takes a transaction's lock on another key of the marker and looks
+again, so if the first lock's connection was lost while the create worked (its lock goes with it), an object another
+send made meanwhile is still found and answered rather than made twice. On MySQL the named lock is the only guard: if
+its connection is lost while a create works, a second send of the create can make a second object. A wait for the lock
+longer than `MNEMIQ_LOCK_TIMEOUT_S`, no free connection in the metadata database's pool to take it on, or a look the
+metadata database cannot answer, answers `{"busy": true}`: the same request may be sent again. A create whose lock comes
+free more than 45 seconds after the create began (mnemiq's default deadline for a call) lets it go at once and answers
 `{"busy": true}`, since mnemiq has by then stopped waiting for the answer and sends the create again. Where mnemiq is
-set to wait longer than 45 seconds for a call, such a create still answers busy, and is then sent again. While it
-waits for the lock and while it holds it, a create uses two of the metadata database's pooled connections. On any other metadata
-database than Postgres, MySQL or SQLite a create answers `{"refused": "metadata_database"}`. A SQLite metadata
-database takes no marker lock, being Superset's single-person development default: there a create sent again while
-the first is still running could make a second object.
+set to wait longer than 45 seconds for a call, such a create still answers busy, and is then sent again. While it waits
+for the lock and while it holds it, a create uses two of the metadata database's pooled connections. On any other
+metadata database than Postgres, MySQL or SQLite a create answers `{"refused": "metadata_database"}`. A SQLite metadata
+database takes no marker lock, being Superset's single-person development default: there a create sent again while the
+first is still running could make a second object.
 
-On Postgres the marker's lock belongs to one database session, the one its connection opened. So Superset must reach
-a Postgres metadata database directly, or through a pooler that keeps one server session for each client connection
-(PgBouncer's `pool_mode = session`). Behind transaction pooling (`pool_mode = transaction`) the server session that
-took the lock goes back to the pooler when the lock's transaction commits, and later statements of the create's
-connection, its release among them, may reach other sessions: two sends of one create are then not kept apart, and a
-marker's lock can stay held after its create has ended. A timeout that closes an idle
-connection (Postgres's `idle_session_timeout`, a proxy's or a load balancer's) shorter than a chart's query check can
-close the lock's connection while the check runs, and so release the lock early.
+On Postgres the marker's lock belongs to one database session, the one its connection opened. So Superset must reach a
+Postgres metadata database directly, or through a pooler that keeps one server session for each client connection
+(PgBouncer's `pool_mode = session`). Behind transaction pooling (`pool_mode = transaction`) the server session that took
+the lock goes back to the pooler when the lock's transaction commits, and later statements of the create's connection,
+its release among them, may reach other sessions: a second send of a create then runs its own checks rather than waiting
+for the first (only the create's own transaction lock keeps it from making a second object), and a marker's lock can
+stay held after its create has ended. A timeout that closes an idle connection (Postgres's `idle_session_timeout`, a
+proxy's or a load balancer's) shorter than a chart's query check can close the lock's connection while the check runs,
+and so release the lock early, with the same effect.
 
 On Postgres and MySQL the lookup needs the metadata database's READ COMMITTED isolation; under any other level every
 create answers `{"refused": "isolation"}`, a create of a chart already made included. Superset 7.0.0rc2 sets READ
