@@ -1584,6 +1584,23 @@ def test_an_existing_table_dataset_answers_exists(lock_rows, raised):
     assert commands(lock_rows.superset, "UpdateDatasetCommand") == []
 
 
+@pytest.mark.parametrize("classnames", [
+    pytest.param({"DatasetDataAccessIsNotAllowed"}, id="a table the caller may not read"),
+    pytest.param({"DatasetDataAccessIsNotAllowed", "DatasetExistsValidationError"},
+                 id="a table the caller may not read that has a dataset")])
+def test_a_table_the_caller_may_not_read_is_answered_as_no_dataset(lock_rows, classnames):
+    """rc2 lists `DatasetDataAccessIsNotAllowed` when the caller may not read the table (or what a virtual dataset's
+    SQL reads), and `DatasetExistsValidationError` beside it when a dataset already holds the table. An object the
+    caller may not read is answered as one that does not exist: `{"not_found": "dataset"}`, with a dataset there or
+    without one, so the answer never tells the caller a dataset holds a table it may not read. Nothing more is
+    written."""
+    from tests import superset_stubs as stubs_module
+
+    lock_rows.superset.create = stubs_module.DatasetInvalidError(classnames)
+    assert make_dataset() == {"not_found": "dataset"}
+    assert commands(lock_rows.superset, "UpdateDatasetCommand") == []
+
+
 def test_another_invalid_dataset_is_refused_as_invalid(lock_rows):
     from tests import superset_stubs as stubs_module
 

@@ -747,12 +747,17 @@ def create_dashboard(found: dict) -> dict:
 
 
 def _dataset_creation_answer(exc: Exception) -> dict:
-    """The answer for a dataset create's failure: `{"exists": true}` when rc2 refuses it because a dataset already
-    holds the table (live, or in the trash as a twin), else `_command_answer`'s."""
+    """The answer for a dataset create's failure. A table the caller may not read, or a virtual dataset's SQL that
+    reads one (rc2 lists `DatasetDataAccessIsNotAllowed`), is answered as a dataset that does not exist, whatever rc2
+    lists beside it, so the answer never says whether a dataset already holds that table. Else `{"exists": true}` when
+    rc2 refuses the create because a dataset already holds the table (live, or in the trash as a twin), else
+    `_command_answer`'s."""
     from superset.commands.dataset.exceptions import DatasetInvalidError, DatasetSoftDeletedTwinExistsError
 
-    if isinstance(exc, DatasetSoftDeletedTwinExistsError) or (
-            isinstance(exc, DatasetInvalidError) and "DatasetExistsValidationError" in exc.get_list_classnames()):
+    listed = exc.get_list_classnames() if isinstance(exc, DatasetInvalidError) else []
+    if "DatasetDataAccessIsNotAllowed" in listed:
+        return _not_found("dataset")
+    if isinstance(exc, DatasetSoftDeletedTwinExistsError) or "DatasetExistsValidationError" in listed:
         return EXISTS
     return _command_answer("create_dataset", exc, kind="dataset")
 
