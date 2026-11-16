@@ -65,6 +65,7 @@ _SQL_BEFORE = re.compile(
     r"|\b(?:any|all)\s*\()\s*$", re.IGNORECASE)
 _SQL_SELECTS = re.compile(
     r"(?:(?<![<>!])=|\bin\s*\((?:[^()]*,)?|\b(?<!not )i?like|\bis\s+not\s+distinct\s+from)\s*$", re.IGNORECASE)
+_SPACE = re.compile(r"\s+")
 # A negation opening a parenthesised predicate, as SQL writes one.
 _NOT_PAREN = re.compile(r"\bnot\s*\(", re.IGNORECASE)
 # What may stand between two codes of one list: a comma, "and", "or", or both.
@@ -111,8 +112,9 @@ def _inside_not(before: str) -> bool:
 def _excluded(text: str, start: int, end: int) -> bool:
     """Whether the mention at `text[start:end]` does not select its code: an explicit exclusion within its own clause,
     or an SQL operator before it that is not a selecting form."""
-    before = _CLAUSE_END.split(text[:start])[-1]
-    after = _CLAUSE_END.split(text[end:], maxsplit=1)[0]
+    # Whitespace collapsed, so "NOT  LIKE", "NOT\nLIKE" and "not  exclude" read as their one-space forms.
+    before = _SPACE.sub(" ", _CLAUSE_END.split(text[:start])[-1])
+    after = _SPACE.sub(" ", _CLAUSE_END.split(text[end:], maxsplit=1)[0])
     sql = _SQL_BEFORE.search(before) is not None and _SQL_SELECTS.search(before) is None
     return (_EXCLUDED_BEFORE.search(before) is not None or _EXCLUDED_AFTER.search(after) is not None
             or _inside_not(before) or sql)

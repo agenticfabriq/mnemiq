@@ -464,6 +464,11 @@ def test_an_sql_operator_selects_a_code_only_in_a_known_selecting_form():
                  "Count shipments where SHIP_MODE NOT ILIKE 'X'.", "Count shipments where SHIP_MODE < 'X'.",
                  "Count shipments where SHIP_MODE BETWEEN 'B' AND 'X'."]:
         assert stale(text) == [], text
+    # However the SQL is spaced.
+    for text in ["Count shipments where SHIP_MODE NOT  LIKE 'X'.", "Count shipments where SHIP_MODE NOT\n  LIKE 'X'.",
+                 "Count shipments where SHIP_MODE NOT\tILIKE 'X'."]:
+        assert stale(text) == [], text
+    assert stale("Do not  exclude rows where SHIP_MODE = 'X'.") == [("X",)]
     # Forms that select the code: counted.
     for text in ["Count shipments where SHIP_MODE IS NOT DISTINCT FROM 'X'.", "Count shipments where SHIP_MODE LIKE 'X'.",
                  "Count shipments where SHIP_MODE = 'X'.", "Count shipments where SHIP_MODE IN ('X').",
