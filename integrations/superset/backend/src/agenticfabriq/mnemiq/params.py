@@ -614,14 +614,35 @@ def query_context(viz_type: str, params: Mapping, datasource_id: int) -> dict | 
     return json.loads(json.dumps(context))
 
 
+def _bins_number(value: Any) -> float:
+    """JavaScript's `Number(value)` for the JSON values a config carries: null and a blank string are 0, a boolean 1
+    or 0, a numeric string (surrounding whitespace allowed) its number, an integer past any float infinite, and
+    anything else NaN."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (bool, int, float)):
+        try:
+            return float(value)
+        except OverflowError:
+            return math.inf if value > 0 else -math.inf
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return 0.0
+        if "_" in text:
+            return math.nan
+        try:
+            return float(text)
+        except ValueError:
+            return math.nan
+    return math.nan
+
+
 def _histogram_operator(form_data: Mapping, column: Any, groups: list) -> dict:
     """`histogramOperator` (`.../src/operators/histogramOperator.ts`): `bins` as `Number(bins)`, or 5 where that is
     NaN (a missing one included); the column and groups by label; `cumulative` and `normalize` as the form data has
     them (JSON drops an undefined one). Raises ValueError for a `bins` that is infinite, which no chart can bin."""
-    try:
-        bins = float(form_data["bins"]) if "bins" in form_data else float("nan")
-    except (TypeError, ValueError):
-        bins = float("nan")
+    bins = _bins_number(form_data["bins"]) if "bins" in form_data else float("nan")
     if bins != bins:
         bins = 5
     elif not math.isfinite(bins):
@@ -635,7 +656,7 @@ def _histogram_operator(form_data: Mapping, column: Any, groups: list) -> dict:
     return {"operation": "histogram", "options": options}
 
 
-def histogram_check_context(form_data: Mapping, datasource_id: int) -> dict:
+def histogram_check_context(form_data: Mapping, datasource_id: int, grouped: bool = True) -> dict:
     """The query context the extension runs to check a histogram (`histogram_v2`) before it is saved: the observations
     and their grouping columns, the form data's `groupby` then its `column`, under the form data's filters, read as
     the other families' queries read them, with the histogram operator the chart's own query carries (so a column
@@ -658,11 +679,14 @@ def histogram_check_context(form_data: Mapping, datasource_id: int) -> dict:
     # The probe reads two rows with no order, and the operator fails on a group value that is null (it cannot unstack
     # them) whatever the rest of the chart holds; so the probe, not the saved chart, keeps its rows to non-null ones.
     # A null-only sample would be an empty frame the operator passes, and a non-numeric value still fails it.
-    filters = [*filters, *({"col": c, "op": "IS NOT NULL"} for c in columns)]
+    # With `grouped` False (the second look, at whether any observation exists), only the column is kept not null and
+    # there is no operator.
+    filters = [*filters, *({"col": c, "op": "IS NOT NULL"} for c in (columns if grouped else [column]))]
     query = {"columns": columns, "filters": filters, "extras": extras}
     if any(isinstance(f, Mapping) and f.get("clause") == "HAVING" for f in _ensure_list(form_data.get("adhoc_filters"))):
         query["metrics"] = [{"expressionType": "SQL", "sqlExpression": "COUNT(*)", "label": "COUNT(*)"}]
-    query["post_processing"] = [_histogram_operator(form_data, column, groups)]
+    if grouped:
+        query["post_processing"] = [_histogram_operator(form_data, column, groups)]
     context = {
         "datasource": {"id": datasource_id, "type": "table"},
         "force": False,

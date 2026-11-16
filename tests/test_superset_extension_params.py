@@ -760,15 +760,31 @@ def test_histogram_check_context_keeps_an_adhoc_columns_own_object_in_its_null_f
     assert query["filters"] == [{"col": adhoc, "op": "IS NOT NULL"}]
 
 
-@pytest.mark.parametrize("bins, parsed", [("absent", 5), ("12", 12), ("x", 5), (7.0, 7)])
-def test_histogram_check_context_reads_bins_as_the_operator_does(bins, parsed):
-    """`histogramOperator`: `Number(bins)`, or 5 where that is NaN; a missing `bins` is NaN."""
+@pytest.mark.parametrize("bins, parsed", [
+    ("absent", 5), ("12", 12), (" 12 ", 12), ("x", 5), (7.0, 7), (None, 0), ("", 0), ("  ", 0), (True, 1),
+    (False, 0), ("1_0", 5), ("nan", 5), ([1, 2], 5)])
+def test_histogram_check_context_reads_bins_as_javascripts_number(bins, parsed):
+    """`histogramOperator`: `Number(bins)`, or 5 where that is NaN; a missing `bins` is NaN, null and a blank string
+    are 0 and a boolean is 1 or 0."""
     form = {"viz_type": "histogram_v2", "column": "amount", "cumulative": True, "normalize": True, "bins": bins}
     if bins == "absent":
         form.pop("bins")
     (query,) = ext.histogram_check_context(form, DATASET)["queries"]
     assert query["post_processing"] == [{"operation": "histogram", "options": {
         "column": "amount", "groupby": [], "bins": parsed, "cumulative": True, "normalize": True}}]
+
+
+def test_histogram_check_context_refuses_an_integer_bins_no_float_holds():
+    with pytest.raises(ValueError):
+        ext.histogram_check_context({**HISTOGRAM, "bins": 10**400}, DATASET)
+
+
+def test_histogram_check_context_without_groups_not_null_keeps_the_observations_and_no_operator():
+    """The second probe: the form data's filters and the column not null, no group filter, no operator."""
+    (query,) = ext.histogram_check_context(HISTOGRAM, DATASET, grouped=False)["queries"]
+    assert query["columns"] == ["region", "amount"]
+    assert query["filters"] == [WEST_Q, {"col": "amount", "op": "IS NOT NULL"}]
+    assert "post_processing" not in query
 
 
 _COUNT_ALL = [{"expressionType": "SQL", "sqlExpression": "COUNT(*)", "label": "COUNT(*)"}]

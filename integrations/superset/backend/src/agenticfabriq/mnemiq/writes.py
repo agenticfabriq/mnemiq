@@ -1074,6 +1074,16 @@ def _check_query(context: dict) -> dict | None:
     """Runs the query context's queries, two rows each, as `ChartDataCommand` runs a chart's, so a chart whose query
     fails is never saved (as MCP's `_compile_chart`, `superset/mcp_service/chart/compile.py`, checks its own). None
     when they run; else the answer."""
+    return _probe(context)[0]
+
+
+def _has_rows(result: Any) -> bool:
+    queries = result.get("queries") if isinstance(result, dict) else None
+    return bool(queries) and any(isinstance(q, dict) and q.get("data") for q in queries)
+
+
+def _probe(context: dict) -> tuple[dict | None, Any]:
+    """`_check_query`'s run: (the answer or None, the command's result)."""
     from marshmallow import ValidationError
     from sqlalchemy.exc import SQLAlchemyError
     from superset.charts.schemas import ChartDataQueryContextSchema
@@ -1089,16 +1099,16 @@ def _check_query(context: dict) -> dict | None:
         command.validate()
         result = command.run()
     except SupersetSecurityException:
-        return _not_found("dataset")
+        return _not_found("dataset"), None
     # Any other of Superset's exceptions (a command's, or one raised building the query object, such as
     # `QueryObjectValidationError`), the schema's and the database's: the MCP service would pass its words on.
     except (SupersetException, ValidationError, SQLAlchemyError, ValueError, KeyError) as exc:
         logger.warning("mnemiq extension: create_chart's query did not run", exc_info=exc)
-        return {"refused": "query_failed"}
+        return {"refused": "query_failed"}, None
     if query_result_failure(result) is not None:
         logger.warning("mnemiq extension: create_chart's query failed")
-        return {"refused": "query_failed"}
-    return None
+        return {"refused": "query_failed"}, None
+    return None, result
 
 
 def _funnel_form(found: dict) -> tuple[str, dict, dict] | dict:
@@ -1153,8 +1163,19 @@ def _config_form(found: dict, dataset: Any) -> tuple[str, dict, dict | None] | d
     if check is not None:
         # rc2's `_compile_chart` builds its query from metrics and groupby and leaves a histogram's column (named
         # under `column` alone) out, so the extension's own check runs a query that selects the groups and the column.
-        if (refused := _check_query(check)) is not None:
+        refused, result = _probe(check)
+        if refused is not None:
             return refused
+        if len(check["queries"][0]["columns"]) > 1 and not _has_rows(result):
+            # The probe keeps only rows with every group set. None left may be an empty chart, which renders, or
+            # observations with no usable group, which the operator cannot unstack: a look without the group filters
+            # tells them apart.
+            refused, result = _probe(params.histogram_check_context(form_data, dataset_id, grouped=False))
+            if refused is not None:
+                return refused
+            if _has_rows(result):
+                logger.warning("mnemiq extension: create_chart's histogram has no row with a group set")
+                return {"refused": "query_failed"}
     elif not _compile_chart(form_data, dataset.id).success:
         logger.warning("mnemiq extension: create_chart's query failed")
         return {"refused": "query_failed"}

@@ -2448,6 +2448,7 @@ def test_a_histogram_without_a_column_is_refused_as_config(creating):
 
 def test_a_histograms_check_selects_its_column_its_groups_under_its_filters(creating):
     creating.superset.mapped = copy.deepcopy(HISTOGRAM_FORM)
+    creating.superset.chart_data = {"queries": [{"data": [{"region": "West", "0 - 1": 2}], "status": "success"}]}
     assert set(make_from_config()) == {"chart_id"}
     ((_, context),) = [entry for entry in creating.superset.ran if entry[0] == "chart_data"]
     (query,) = context["queries"]
@@ -2476,6 +2477,53 @@ def test_a_histogram_with_bins_that_are_not_finite_is_refused_as_config(creating
     creating.superset.mapped = {**copy.deepcopy(HISTOGRAM_FORM), "bins": bins}
     assert make_from_config() == {"refused": "config"}
     assert commands(creating.superset) == [] and "chart_data" not in _kinds(creating.superset)
+
+
+def _rows_when_groups_are_not_filtered(rows):
+    """A stub answer for a probe: the filtered probe (a group-not-null filter) finds no rows; the one without it
+    finds `rows`."""
+    def answer(context):
+        (query,) = context["queries"]
+        filtered = {"col": "region", "op": "IS NOT NULL"} in query["filters"]
+        return {"queries": [{"data": [] if filtered else rows, "status": "success"}]}
+    return answer
+
+
+def test_a_histogram_with_observations_and_no_usable_group_is_refused(creating):
+    """Every group value null: the group-not-null probe is empty, but the chart keeps those rows and its operator
+    cannot unstack them, so a second probe, without the group filter, finds them and the chart is refused."""
+    creating.superset.mapped = copy.deepcopy(HISTOGRAM_FORM)
+    creating.superset.chart_data = _rows_when_groups_are_not_filtered([{"region": None, "amount": 1}])
+    assert make_from_config() == {"refused": "query_failed"}
+    assert len([entry for entry in creating.superset.ran if entry[0] == "chart_data"]) == 2
+    assert commands(creating.superset) == []
+
+
+def test_a_histogram_of_nothing_is_saved(creating):
+    """No rows at all (an empty table or a filter that keeps none): an empty chart, which passes."""
+    creating.superset.mapped = copy.deepcopy(HISTOGRAM_FORM)
+    creating.superset.chart_data = _rows_when_groups_are_not_filtered([])
+    assert set(make_from_config()) == {"chart_id"}
+
+
+def test_a_histogram_with_usable_groups_runs_one_probe(creating):
+    creating.superset.mapped = copy.deepcopy(HISTOGRAM_FORM)
+    creating.superset.chart_data = {"queries": [{"data": [{"region": "West", "0 - 1": 2}], "status": "success"}]}
+    assert set(make_from_config()) == {"chart_id"}
+    assert len([entry for entry in creating.superset.ran if entry[0] == "chart_data"]) == 1
+
+
+@pytest.mark.parametrize("bins", [None, "", 10**400])
+def test_a_histogram_with_bins_the_operator_cannot_take_is_refused(creating, bins):
+    """Null and a blank string are 0 bins in the frontend, which the operator refuses on the probe; an integer past
+    any float is refused as config."""
+    creating.superset.mapped = {**copy.deepcopy(HISTOGRAM_FORM), "bins": bins}
+    creating.superset.chart_data = lambda context: (_ for _ in ()).throw(
+        ValueError("`bins` must be an integer")) if context["queries"][0]["post_processing"][0]["options"]["bins"] == 0 \
+        else {"queries": [{"data": [], "status": "success"}]}
+    answer = make_from_config()
+    assert answer == ({"refused": "config"} if bins == 10**400 else {"refused": "query_failed"})
+    assert commands(creating.superset) == []
 
 
 def test_a_histogram_whose_post_processing_raises_is_refused_and_nothing_is_made(creating):
