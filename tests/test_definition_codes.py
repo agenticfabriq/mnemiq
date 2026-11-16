@@ -369,3 +369,23 @@ def test_the_warning_reads_the_policy_once(tmp_path, monkeypatch, caplog):
     assert len(opened) == 1, opened
     (line,) = _stale_lines(caplog)
     assert "XY98" in line
+
+
+def test_the_row_filter_list_agrees_with_each_roles_grants(tmp_path):
+    """Two places read a policy's row filters: `grants_for`, which the engine applies, and `row_filtered_objects`, which
+    decides what this warning may quote. Pinned together, so a filter `grants_for` learns to read cannot be missed here."""
+    from mnemiq.authz.grants import FileAuthzProvider
+    from mnemiq.contract import IdentityContext
+
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps({"roles": {
+        "analyst": ["orders"],
+        "west": {"read": ["orders", "returns"], "row_filters": {"ORDERS": "region = 'w'", "returns": "region = 'w'"}},
+        "east": {"read": ["orders"], "row_filters": {"orders": "region = 'e'"}},
+        "writer": {"read": ["orders"], "write": ["orders"]}}}))
+    policy = FileAuthzProvider(str(path))
+    per_role = set()
+    for role in policy.policy_roles():
+        grants = policy.grants_for(IdentityContext(tenant_id="t", principal_id="p", roles=[role]))
+        per_role |= {table.lower() for table in grants.row_filters}
+    assert {table.lower() for table in policy.row_filtered_objects()} == per_role == {"orders", "returns"}
