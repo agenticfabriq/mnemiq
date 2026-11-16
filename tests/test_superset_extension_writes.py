@@ -1272,9 +1272,12 @@ def _kinds(superset: SimpleNamespace) -> list[str]:
     return [entry[0] for entry in superset.ran]
 
 
-def test_create_dashboard_twice_with_one_marker_makes_one(creating):
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+def test_create_dashboard_twice_with_one_marker_makes_one(creating, dialect):
     """A create whose answer was lost is sent again with the same marker: the second finds the dashboard the first
-    made, by its marker, and answers it; the command ran once."""
+    made, by its marker, and answers it; the command ran once. On Postgres a last look just before the command
+    would also find it, so MySQL, where only the first look exists, is what proves the first look."""
+    creating.on(dialect)
     first = make_dashboard()
     assert set(first) == {"dashboard_id"}, first
     assert make_dashboard() == first
@@ -1282,7 +1285,9 @@ def test_create_dashboard_twice_with_one_marker_makes_one(creating):
         "dashboard_title": "Policies", "published": False, "description": SHELL})]
 
 
-def test_create_chart_twice_with_one_marker_makes_one(creating):
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+def test_create_chart_twice_with_one_marker_makes_one(creating, dialect):
+    creating.on(dialect)
     first = make_funnel()
     assert set(first) == {"chart_id"}, first
     assert make_funnel() == first
