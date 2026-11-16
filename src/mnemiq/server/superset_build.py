@@ -10,11 +10,12 @@ request, and the build as it stands. Mounted only in Superset mode, and no other
   refusal, which is an answer too. The build keeps the profile it was asked under (`profile`, None for the
   deployment's default). Before anything is planned or kept, Superset is asked whether the person may build (the
   grants; a non-builder is refused as one, `NOT_A_BUILDER`, and nothing about a dashboard they named is read), then
-  whether the extension is there, then, for a `dashboard_id`, whether they edit that dashboard (the extension's
-  `editors_of`): one they cannot read, or that does not exist, is a 404 that does not say which, and one they read
-  but do not edit a 403 naming its editors. A model that does not answer the planning prompt is a 503 saying to try
-  again; a prompt its server refuses or cuts as too long is a refused plan, since the goal and the schema are too
-  large to plan in one prompt.
+  whether the extension is there and offers every create a build sends (`require_build_tools`: a missing one and an
+  older one are each refused with a sentence of their own), then, for a `dashboard_id`, whether they edit that
+  dashboard (the extension's `editors_of`): one they cannot read, or that does not exist, is a 404 that does not say
+  which, and one they read but do not edit a 403 naming its editors. A model that does not answer the planning prompt
+  is a 503 saying to try again; a prompt its server refuses or cuts as too long is a refused plan, since the goal and
+  the schema are too large to plan in one prompt.
 - `GET /v1/superset/builds/{build_id}`: the build as it stands, read from the build store alone.
 - `POST /v1/superset/builds/{build_id}/next`: the build's next step, claimed, run and recorded (`builder.next_step`);
   409 while another request's step holds the build.
@@ -57,7 +58,7 @@ from mnemiq.superset.build_store import MAX_ID, BuildNotFound, BuildStore, Build
 from mnemiq.superset.builder import BuildBusy, BuildState, build_state, next_step, start_build
 from mnemiq.superset.client import SupersetToolError
 from mnemiq.superset.executor import SupersetCredentialMissing, superset_executor
-from mnemiq.superset.extension import ExtensionMissing, dashboard_editorship, require_extension
+from mnemiq.superset.extension import ExtensionMissing, dashboard_editorship, require_build_tools
 from mnemiq.superset.planner import MAX_GOAL, BuildPlan, PlanContext, PlanRefused, plan_build
 
 __all__ = ["WRITE_SCOPES", "mount_superset_build"]
@@ -247,8 +248,9 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
             # Whether Superset lets this person build at all, first: a non-builder is refused as one (NOT_A_BUILDER)
             # and learns nothing of a dashboard they named, its editors included.
             grants = runtime.builder_grants(adapter)
-            # Before anything is planned or kept: every write of a build goes through the extension.
-            require_extension(adapter.client)
+            # Before anything is planned or kept: every write of a build goes through the extension, which must be
+            # one that makes every object a build makes.
+            require_build_tools(adapter.client)
             if body.dashboard_id is not None:
                 _held_to_its_editors(adapter.client, body.dashboard_id)
             plan = plan_build(body.goal, planner=planner, client=adapter.client, adapter=adapter,

@@ -66,11 +66,9 @@ from them what it already may do through Superset's own tools.
 
 | Tool | Gated by | What it does |
 |---|---|---|
-| `create_dashboard` | Dashboard | An unpublished, empty dashboard with the caller as its editor. |
-| `create_dataset` | Dataset | A dataset over a table, or over `sql` when given, made with its build marker and its editors set as a claim sets them; sent again, it answers the dataset the first send made. |
-| `claim_chart` | Chart | Gives a chart the dashboard's editors and a build marker, and saves its query context. |
-| `claim_dataset` | Dataset | Gives a dataset a build marker and, as editors, the caller and the dashboard's users whose grants reach it. |
-| `create_chart` | Chart | A funnel or a sankey, saved only once its query runs. |
+| `create_dashboard` | Dashboard | An unpublished, empty dashboard with the caller as its editor and a build marker. |
+| `create_dataset` | Dataset | A dataset over a table, or over `sql` when given, made with its build marker and, as editors, the caller and the dashboard's users whose grants reach it. |
+| `create_chart` | Chart | A chart of any family, from MCP's own chart config (and format keys to merge) or a funnel's or a sankey's form data, made with the dashboard's editors, a build marker and its query context, and saved only once its query runs. |
 | `patch_chart` | Chart | Sets and unsets named params keys, keeping every other key. |
 | `add_saved_metric` | Dataset | Adds one aggregating saved metric, keeping the others. |
 | `delete_dataset` | Dataset | Moves a dataset a build made to the trash once no chart uses it. |
@@ -80,19 +78,19 @@ from them what it already may do through Superset's own tools.
 
 In Superset 7.0.0rc2 an editor of a dataset may read its data: the access check admits a dataset's editors, and
 SQL Lab admits an editor of any dataset over a table to that table. Editors are users, roles and groups, and a role or
-a group made an editor makes every member one. So the tools choose editors with care: whether a user can already read a dataset is checked when the claim adds
-them, and the extension never changes a dataset's source.
+a group made an editor makes every member one. So the tools choose editors with care: whether a user can already
+read a dataset is checked when the tool adds them, and the extension never changes a dataset's source.
 
-- A dataset that `claim_dataset` claims for a dashboard keeps its editors (the claim removes none) and adds the
-  caller and each user among the dashboard's editors whose grants already reach both the dataset and its table:
-  datasource access to the dataset, or access to its database, to all databases or to all datasources. These are
-  the grants SQL Lab's strict check of a table admits. Schema or catalog access alone does not count: it reads the
-  dataset, but SQL Lab's strict check skips it, and there editorship of the dataset would reach the table. Each user
-  is judged as that user, and being an editor of the dataset does not count. A role or a group among the
-  dashboard's editors is never added.
-- A chart that `claim_chart` or `create_chart` makes a dashboard's gets the dashboard's editors. When
-  `ENABLE_VIEWERS` is on and `VIEWER_PROMISCUOUS_MODE` is set, a chart's editors may read its dataset's data, so a
-  chart's editors are then chosen as a dataset's are, against the chart's dataset.
+- A dataset that `create_dataset` makes for a dashboard, or finds by its build marker when sent again, keeps its
+  editors (the tool removes none) and adds the caller and each user among the dashboard's editors whose grants already
+  reach both the dataset and its table: datasource access to the dataset, or access to its database, to all databases
+  or to all datasources. These are the grants SQL Lab's strict check of a table admits. Schema or catalog access alone
+  does not count: it reads the dataset, but SQL Lab's strict check skips it, and there editorship of the dataset would
+  reach the table. Each user is judged as that user, and being an editor of the dataset does not count. A role or a
+  group among the dashboard's editors is never added.
+- A chart that `create_chart` makes for a dashboard gets the dashboard's editors. When `ENABLE_VIEWERS` is on and
+  `VIEWER_PROMISCUOUS_MODE` is set, a chart's editors may read its dataset's data, so a chart's editors are then chosen
+  as a dataset's are, against the chart's dataset.
 
 A co-editor of the dashboard who is not an editor of one of its datasets, and asks mnemiq to change or remove it, is
 answered `{"not_editor": true, "editors": [...]}` naming the dataset's editors: whom to ask.
@@ -104,12 +102,12 @@ writers the second answers `{"stale": true}`. A write that waits for the row lon
 answers `{"busy": true}` and changes nothing; the same request may be sent again. Answers are short structured objects;
 Superset's own error text never reaches them.
 
-A create carrying a build's marker (`create_dashboard`, `create_chart`) makes its object once, so a create whose
-answer was lost may be sent again. Under a lock keyed by the marker (a transaction's advisory lock on Postgres, a named
-lock on MySQL, each waited for at most `MNEMIQ_LOCK_TIMEOUT_S`, else `{"busy": true}`) it looks for an object out of
-the trash whose description's last line is that marker: it answers that one's id; when there are several it creates
-nothing and answers `{"candidates": [...]}`, the ids of those the caller may read (the list may be empty); and it
-creates the object when there is none. The lookup needs the metadata database's READ COMMITTED
+A create carrying a build's marker (`create_dashboard`, `create_dataset`, `create_chart`) makes its object once, so a
+create whose answer was lost may be sent again. Under a lock keyed by the marker (a transaction's advisory lock on
+Postgres, a named lock on MySQL, each waited for at most `MNEMIQ_LOCK_TIMEOUT_S`, else `{"busy": true}`) it looks for
+an object out of the trash whose description's last line is that marker: it answers that one's id; when there are
+several it creates nothing and answers `{"candidates": [...]}`, the ids of those the caller may read (the list may be
+empty); and it creates the object when there is none. The lookup needs the metadata database's READ COMMITTED
 isolation, Superset's default on Postgres and MySQL; under any other level a create answers `{"refused":
 "isolation"}`, and on any other metadata database `{"refused": "metadata_database"}`. A SQLite metadata database takes
 no marker lock, being Superset's single-person development default: there a create sent again while the first is still

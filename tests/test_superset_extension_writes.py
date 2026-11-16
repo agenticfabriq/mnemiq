@@ -39,9 +39,8 @@ def refusal(tool, request):
 
 
 def test_every_write_tool_has_a_request_reader():
-    assert set(writes.REQUESTS) == {"create_dashboard", "create_dataset", "claim_chart", "claim_dataset",
-                                    "create_chart", "patch_chart", "add_saved_metric", "delete_dataset",
-                                    "set_layout"}
+    assert set(writes.REQUESTS) == {"create_dashboard", "create_dataset", "create_chart", "patch_chart",
+                                    "add_saved_metric", "delete_dataset", "set_layout"}
 
 
 @pytest.mark.parametrize("bad", [0, -3, True, False, "7", 7.0, None, [7]])
@@ -117,7 +116,7 @@ def test_a_description_keeps_its_prose_and_ends_with_the_marker():
     assert writes.with_marker("", marker) == marker
     assert writes.with_marker("Revenue by month.\n\n", marker) == f"Revenue by month.\n{marker}"
     assert writes.with_marker("Revenue\nby month.", marker) == f"Revenue\nby month.\n{marker}"
-    # The same claim made again leaves one marker line, not two.
+    # A description that already ends with the marker keeps one marker line, not two.
     assert writes.with_marker(f"Revenue by month.\n{marker}\n", marker) == f"Revenue by month.\n{marker}"
     assert writes.with_marker(marker, marker) == marker
     # A marker pasted mid-text is prose (a marker is read from the last line only), and stays.
@@ -185,9 +184,9 @@ def test_a_dashboard_title_is_a_short_name():
 
 TOOLS_SOURCE = Path(writes.__file__).with_name("tools.py")
 # The class permission each write tool is gated by; its method is `write`.
-WRITE_CLASSES = {"create_dashboard": "Dashboard", "create_dataset": "Dataset", "claim_chart": "Chart", "claim_dataset": "Dataset",
-                 "create_chart": "Chart", "patch_chart": "Chart", "add_saved_metric": "Dataset",
-                 "delete_dataset": "Dataset", "set_layout": "Dashboard"}
+WRITE_CLASSES = {"create_dashboard": "Dashboard", "create_dataset": "Dataset", "create_chart": "Chart",
+                 "patch_chart": "Chart", "add_saved_metric": "Dataset", "delete_dataset": "Dataset",
+                 "set_layout": "Dashboard"}
 # The class permission each read tool is gated by; its method is `read`.
 READ_CLASSES = {"dataset_metrics": "Dataset", "editors_of": "Chart", "get_layout": "Dashboard"}
 ALL_CLASSES = {**WRITE_CLASSES, **READ_CLASSES}
@@ -231,7 +230,7 @@ def registration_problems(source: str) -> list[str]:
 def test_the_tools_are_mnemiqs_names_with_stock_permissions():
     from mnemiq.superset.extension import EXTENSION_TOOLS
 
-    assert set(EXTENSION_TOOLS) == set(ALL_CLASSES) and len(EXTENSION_TOOLS) == 12
+    assert set(EXTENSION_TOOLS) == set(ALL_CLASSES) and len(EXTENSION_TOOLS) == 10
     assert set(writes.REQUESTS) == set(WRITE_CLASSES)
     assert registration_problems(TOOLS_SOURCE.read_text()) == []
 
@@ -250,8 +249,8 @@ def test_the_tools_are_mnemiqs_names_with_stock_permissions():
     ('name="delete_dataset", class_permission_name="Dataset", method_permission_name="write"',
      'name="delete_dataset", class_permission_name="Dataset", method_permission_name="read"',
      "delete_dataset is not gated as a write"),
-    ("return writes.claim_dataset(request)", "return writes.claim_chart(request)",
-     "claim_dataset calls ['writes.claim_chart']"),
+    ("return writes.create_dataset(request)", "return writes.create_chart(request)",
+     "create_dataset calls ['writes.create_chart']"),
 ])
 def test_the_registration_check_flags_a_planted_defect(old, new, flagged):
     source = TOOLS_SOURCE.read_text()
@@ -300,7 +299,7 @@ def _extension_sources() -> list[str]:
 
 def test_the_readme_documents_every_tool_and_setting():
     assert readme_problems(README.read_text(), TOOLS_SOURCE.read_text(), _extension_sources()) == []
-    assert len(registered(TOOLS_SOURCE.read_text())) == 12
+    assert len(registered(TOOLS_SOURCE.read_text())) == 10
 
 
 @pytest.mark.parametrize(("old", "new", "flagged"), [
@@ -321,8 +320,7 @@ def test_the_readme_check_flags_a_planted_defect(old, new, flagged):
 WRITES_SOURCE = Path(writes.__file__)
 # Each tool that writes an existing row: the model whose row it locks first, and the request field naming the row.
 # Creating a dashboard, a dataset or a chart writes a new row and locks no row, only its marker (`_find_or_create`).
-LOCKED = {"patch_chart": ("Slice", "chart_id"), "claim_chart": ("Slice", "chart_id"),
-          "claim_dataset": ("SqlaTable", "dataset_id"), "add_saved_metric": ("SqlaTable", "dataset_id"),
+LOCKED = {"patch_chart": ("Slice", "chart_id"), "add_saved_metric": ("SqlaTable", "dataset_id"),
           "delete_dataset": ("SqlaTable", "dataset_id"), "set_layout": ("Dashboard", "dashboard_id")}
 UNLOCKED = {"create_dashboard", "create_dataset", "create_chart"}
 
@@ -415,14 +413,11 @@ def test_every_locked_write_locks_its_row_first():
      'return _patch(found, _session().get(Slice, found["chart_id"]))', "_patch compares changed_on outside a lock"),
     ('return _locked(Dashboard, found["dashboard_id"]', 'return _locked(Slice, found["dashboard_id"]',
      "set_layout does not answer through _locked(Dashboard, found['dashboard_id'], ...)"),
-    # A claim that compares markers on an unlocked read of the chart, before its lock.
-    ('    return _locked(Slice, found["chart_id"], lambda chart: _claim(\n',
-     '    from superset.daos.chart import ChartDAO\n'
-     '    held = params.parse_marker(ChartDAO.find_by_id(found["chart_id"]).description)\n'
-     '    if held is not None and held != claim_marker(found["marker"], found["dashboard_id"]):\n'
-     '        return CLAIMED_BY_ANOTHER\n'
-     '    return _locked(Slice, found["chart_id"], lambda chart: _claim(\n',
-     "claim_chart reads before its lock: find_by_id, parse_marker"),
+    # A patch that decides on an unlocked read of the chart, before its lock.
+    ('    return _locked(Slice, found["chart_id"], lambda chart: _patch(found, chart))',
+     '    if not _readable_chart(found["chart_id"]):\n        return _not_found("chart")\n'
+     '    return _locked(Slice, found["chart_id"], lambda chart: _patch(found, chart))',
+     "patch_chart reads before its lock: _not_found, _readable_chart"),
     ('    return _locked(SqlaTable, found["dataset_id"], lambda dataset: _delete(found, dataset))',
      '    if _dataset(found["dataset_id"]) is None:\n        return _not_found("dataset")\n'
      '    return _locked(SqlaTable, found["dataset_id"], lambda dataset: _delete(found, dataset))',
@@ -835,7 +830,7 @@ def _person(user_id: int, name: str, grants=(), member_of=()) -> SimpleNamespace
 
 
 class Security:
-    """rc2's security manager, stood in for the checks a claim makes, each read as `flask.g.user`, as rc2 reads them
+    """rc2's security manager, stood in for the checks a create makes, each read as `flask.g.user`, as rc2 reads them
     (`superset/security/manager.py`): `can_access` is a grant of the user's roles; `can_access_database` is
     all-datasource, all-database or database access, and `can_access_schema` that or schema access; `is_editor` is
     any of the user's subjects (its own, its roles', its groups') among the object's editors; and
@@ -885,7 +880,7 @@ def claiming(monkeypatch, superset):
     - `outsider`, granted nothing, and `member`, granted nothing but a member of the role `R2`, which already edits the
       dataset: neither may read it by a grant (`member` reads it only as an editor);
     - the role `R` and the group `G`, editors of the dashboard.
-    The dataset's editors before the claim: its creator `creator` (not on the dashboard), the builder and `R2`."""
+    The dataset's editors: its creator `creator` (not on the dashboard), the builder and `R2`."""
     people = {name: _person(user_id, name, grants, member_of) for user_id, name, grants, member_of in (
         (1, "builder", {("all_datasource_access", "all_datasource_access")}, ()),
         (2, "reader", {("datasource_access", DATASET_PERM)}, ()),
@@ -922,31 +917,38 @@ def _sent_editors(superset, command: str) -> list[int]:
     return properties["editors"]
 
 
-def test_a_claimed_dataset_gets_only_editors_who_could_already_read_it(claiming):
+def _found(claiming) -> dict:
+    """`create_dataset` sent for the `claiming` dataset (4), which already carries the request's marker, as an earlier
+    send of it left it: found by its marker, and its editors set again."""
+    claiming.dataset.deleted_at = None
+    claiming.dataset.description = DATA
+    claiming.superset.rows["SqlaTable"].append(claiming.dataset)
+    return make_dataset()
+
+
+def test_a_found_dataset_keeps_its_editors_and_adds_only_those_who_could_already_read_it(claiming):
     """rc2 admits a dataset's editors to its data (`raise_for_access`) and, in SQL Lab, to its table, and an editor
-    subject that is a role or a group makes every member an editor. So `claim_dataset` keeps the dataset's editors,
+    subject that is a role or a group makes every member an editor. So `create_dataset` keeps the dataset's editors,
     adds the caller, and adds only those of the dashboard's users whose grants already reach both the dataset and, in
     SQL Lab's strict check, its table, judged as each of them: `reader` (datasource access) and `database_reader`
     (database access). Not `schema_reader`, whom only editorship would admit to the table in SQL Lab; not `outsider`;
     not `member` (who reads it only as an editor, through `R2`); never the role `R` or the group `G`. The request's
     user is the builder again afterwards."""
     ids = claiming.ids
-    answer = writes.claim_dataset({"dataset_id": 4, "dashboard_id": 3, "marker": format_marker(BUILD, "data", 3)})
-    assert answer == {"ok": True}
+    assert _found(claiming) == {"dataset_id": 4}
+    assert commands(claiming.superset, "CreateDatasetCommand") == []
     assert _sent_editors(claiming.superset, "UpdateDatasetCommand") == [
         ids["creator"], ids["builder"], 302, ids["reader"], ids["database_reader"]]
     assert {"reader", "schema_reader", "outsider", "member", "database_reader"} <= set(claiming.security.judged)
     assert claiming.superset.g.user is claiming.people["builder"]
-    ((_, (_, properties)),) = commands(claiming.superset, "UpdateDatasetCommand")
-    assert properties["description"] == format_marker(BUILD, "data", 3)
 
 
 def test_the_request_user_comes_back_when_a_check_fails(claiming):
-    """A check that raises while the claim judges a co-editor leaves the request's user the builder, which rc2's
+    """A check that raises while the create judges a co-editor leaves the request's user the builder, which rc2's
     `override_user` would not (it puts the user back only when its block returns), and saves nothing."""
     claiming.security.raises_for = "outsider"
     with pytest.raises(RuntimeError):
-        writes.claim_dataset({"dataset_id": 4, "dashboard_id": 3, "marker": format_marker(BUILD, "data", 3)})
+        _found(claiming)
     assert claiming.superset.g.user is claiming.people["builder"]
     assert commands(claiming.superset) == []
 
@@ -955,7 +957,7 @@ def test_a_dashboard_user_subject_without_a_user_is_skipped(claiming):
     """A user subject whose `user` is None (its account is gone) is neither judged nor made an editor."""
     gone = SimpleNamespace(id=199, type=USER, label="Gone", user=None)
     claiming.dashboard.editors.append(gone)
-    writes.claim_dataset({"dataset_id": 4, "dashboard_id": 3, "marker": format_marker(BUILD, "data", 3)})
+    _found(claiming)
     assert 199 not in _sent_editors(claiming.superset, "UpdateDatasetCommand")
 
 
@@ -967,24 +969,13 @@ def test_as_user_removes_the_user_it_set_when_the_request_had_none(superset):
     assert not hasattr(superset.g, "user")
 
 
-def _chart(claiming, editors) -> SimpleNamespace:
-    form_data = {"viz_type": "funnel", "groupby": ["status"], "metric": "count", "datasource": "4__table"}
-    return SimpleNamespace(id=9, description=None, datasource_type="table", datasource_id=4, viz_type="funnel",
-                           params=json.dumps(form_data), datasource=claiming.dataset, editors=editors)
-
-
 @pytest.mark.parametrize("features, promiscuous", [(set(), False), ({"ENABLE_VIEWERS"}, False), (set(), True)])
 def test_a_chart_gets_the_dashboards_editors(claiming, features, promiscuous):
     """A chart's editors may not read its data for being its editors unless `ENABLE_VIEWERS` is on and
     `VIEWER_PROMISCUOUS_MODE` is set (`has_promiscuous_chart_access` in rc2's `raise_for_access`), so short of both a
-    claimed or created chart gets the dashboard's editors, every one, roles and groups included, as before."""
+    created chart gets the dashboard's editors, every one, roles and groups included."""
     claiming.superset.features, claiming.superset.config["VIEWER_PROMISCUOUS_MODE"] = features, promiscuous
-    claiming.locked["Slice"] = _chart(claiming, [claiming.people["builder"].subject,
-                                                 claiming.people["creator"].subject])
     everyone = [subject.id for subject in claiming.dashboard.editors]
-    assert writes.claim_chart({"chart_id": 9, "dashboard_id": 3,
-                               "marker": format_marker(BUILD, "kpi", 3)}) == {"ok": True}
-    assert _sent_editors(claiming.superset, "UpdateChartCommand") == everyone
     made = writes.create_chart({"dataset_id": 4, "viz_type": "funnel", "slice_name": "stages",
                                 "params": {"groupby": ["status"], "metric": "count"}, "dashboard_id": 3,
                                 "marker": format_marker(BUILD, "stages", 3)})
@@ -994,17 +985,10 @@ def test_a_chart_gets_the_dashboards_editors(claiming, features, promiscuous):
 
 def test_a_chart_whose_editors_read_its_data_gets_the_dataset_rule(claiming):
     """With `ENABLE_VIEWERS` on and `VIEWER_PROMISCUOUS_MODE` set, a chart's editors may read its dataset's data, so a
-    claimed chart keeps its editors and adds the caller and the dashboard's users whose grants already reach the
-    chart's dataset and its table (`reader`, `database_reader`; not `schema_reader`); a created chart gets the caller
-    and those users."""
+    created chart gets as editors the caller and the dashboard's users whose grants already reach the chart's dataset
+    and its table (`reader`, `database_reader`; not `schema_reader`)."""
     claiming.superset.features, claiming.superset.config["VIEWER_PROMISCUOUS_MODE"] = {"ENABLE_VIEWERS"}, True
     ids = claiming.ids
-    claiming.locked["Slice"] = _chart(claiming, [claiming.people["creator"].subject,
-                                                 claiming.people["builder"].subject])
-    assert writes.claim_chart({"chart_id": 9, "dashboard_id": 3,
-                               "marker": format_marker(BUILD, "kpi", 3)}) == {"ok": True}
-    assert _sent_editors(claiming.superset, "UpdateChartCommand") == [
-        ids["creator"], ids["builder"], ids["reader"], ids["database_reader"]]
     made = writes.create_chart({"dataset_id": 4, "viz_type": "funnel", "slice_name": "stages",
                                 "params": {"groupby": ["status"], "metric": "count"}, "dashboard_id": 3,
                                 "marker": format_marker(BUILD, "stages", 3)})
@@ -1515,10 +1499,10 @@ def test_create_dataset_checks_the_marker_and_the_dashboard_before_anything(lock
     assert commands(superset) == []
 
 
-def test_the_extension_offers_exactly_the_twelve_tools():
+def test_the_extension_offers_exactly_the_ten_tools():
     from mnemiq.superset.extension import EXTENSION_TOOLS
 
-    assert sorted(EXTENSION_TOOLS) == sorted([
-        "create_dashboard", "create_dataset", "claim_chart", "claim_dataset", "create_chart", "patch_chart",
-        "add_saved_metric", "delete_dataset", "set_layout", "dataset_metrics", "editors_of", "get_layout"])
+    assert EXTENSION_TOOLS == (
+        "create_dashboard", "create_dataset", "create_chart", "patch_chart", "add_saved_metric", "delete_dataset",
+        "set_layout", "dataset_metrics", "editors_of", "get_layout")
     assert registered(TOOLS_SOURCE.read_text()).keys() == set(EXTENSION_TOOLS)

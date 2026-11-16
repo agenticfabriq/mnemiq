@@ -62,6 +62,7 @@ GOAL = "Policies by region"
 # The sentences the build routes answer with, as the person reads them.
 NOT_FOR_BUILDING = "This sign-in was made for asking, not building; open the builder from Superset again."
 EXTENSION_MISSING = "This Superset does not have the mnemiq extension installed."
+EXTENSION_OUTDATED = "This Superset's mnemiq extension is older than this mnemiq; update the extension in Superset."
 STEP_RUNNING = "a step of this build is already running"
 DASHBOARD_BUSY = "another build of this dashboard is still building; it must finish or stop first"
 NO_SUCH_DASHBOARD = "This builder can read no dashboard of that id, so nothing was planned."
@@ -90,10 +91,11 @@ guard_fanout = true
 
 BUILD_ROUTES = {("POST", "/v1/superset/builds"), ("GET", "/v1/superset/builds/{build_id}"),
                 ("POST", "/v1/superset/builds/{build_id}/next")}
-# The calls that change something in Superset, which a refused request never makes.
+# The calls that change something in Superset, which a refused request never makes. The build's probe of the
+# extension, its `create_dataset` with an empty request, changes nothing: `_writes` passes over it.
 WRITES = {"generate_chart", "create_dataset", "create_virtual_dataset",
-          *(TOOL_PREFIX + base for base in ("create_dashboard", "claim_chart", "claim_dataset", "create_chart",
-                                            "patch_chart", "add_saved_metric", "delete_dataset", "set_layout"))}
+          *(TOOL_PREFIX + base for base in ("create_dashboard", "create_dataset", "create_chart", "patch_chart",
+                                            "add_saved_metric", "delete_dataset", "set_layout"))}
 
 
 @pytest.fixture(autouse=True)
@@ -237,7 +239,7 @@ def _stored(store, client, token: str | None = None, plan=ONE_BAR, **more):
 
 
 def _writes(fake) -> list[str]:
-    return [call.tool for call in fake.calls if call.tool in WRITES]
+    return [call.tool for call in fake.calls if call.tool in WRITES and call.request != {}]
 
 
 def _routes(app) -> set[tuple[str, str]]:
@@ -456,9 +458,28 @@ def test_missing_extension_is_named(served, fake, world, store):
     assert "Error ID" not in r.text and "unexpected" not in r.text
     assert store._builds == {} and _writes(fake) == []
     assert runtime.profiles[runtime.default_profile].planner.goals == []
-    # Settled by one call of the extension's probe, not the probe asked twice.
+    # Settled by the build's probe and then the extension's own, which tells no extension from an older one, each
+    # asked once.
     assert [call.tool for call in fake.calls if call.tool.startswith("extensions.")] == [
-        TOOL_PREFIX + "dataset_metrics"]
+        TOOL_PREFIX + "create_dataset", TOOL_PREFIX + "dataset_metrics"]
+
+
+def test_an_outdated_extension_is_refused_before_planning(served, fake, world, store):
+    """A Superset whose mnemiq extension is older than this mnemiq, and lacks the create a build sends: the build's
+    probe of it (`create_dataset` with an empty request, which this extension refuses without touching Superset)
+    meets rc2's masked internal error, while the extension's own probe answers. The build is refused with the status
+    a missing extension gets and a sentence saying to update it, before anything is planned or kept."""
+    client, runtime = served
+    world.hooks["create_dataset"] = Hook(instead=_masked("create_dataset"))
+    r = _start(client)
+    assert r.status_code == 503, r.text
+    assert r.json()["detail"] == EXTENSION_OUTDATED
+    assert "Error ID" not in r.text and "unexpected" not in r.text
+    assert store._builds == {} and _writes(fake) == []
+    assert runtime.profiles[runtime.default_profile].planner.goals == []
+    assert [call.tool for call in fake.calls if call.tool.startswith("extensions.")] == [
+        TOOL_PREFIX + "create_dataset", TOOL_PREFIX + "dataset_metrics"]
+    assert [call.request for call in fake.calls if call.tool == TOOL_PREFIX + "create_dataset"] == [{}]
 
 
 def test_an_extension_gone_mid_build_is_named(served, fake, world, store):
@@ -488,7 +509,7 @@ def test_a_build_runs_through_the_routes_and_no_answer_holds_a_lease(served, fak
         leases.update(step["lease_id"] for build in store._builds.values() for step in build["steps"]
                       if step["lease_id"])
 
-    for tool in ("create_dashboard", "generate_chart", "get_layout", "get_chart_data"):
+    for tool in ("create_dashboard", "create_chart", "get_layout", "get_chart_data"):
         world.hooks[tool] = Hook(after=keep_leases)
     started = _start(client)
     assert started.status_code == 201, started.text
@@ -593,14 +614,14 @@ PLANNING = {"list_datasets", "list_metrics", "list_dashboards"}
 
 def _asked_only_who_may_build_and_whether_they_edit(fake, dashboard_id: int) -> None:
     """What Superset was asked, in order, and nothing else: the grants' dry run (whether the builder may build), the
-    extension's probe (`dataset_metrics` of no dataset), and its read of whether the builder edits the dashboard. No
-    planning call and no create."""
-    assert [call.tool for call in fake.calls] == ["execute_sql", TOOL_PREFIX + "dataset_metrics",
+    build's probe of the extension (`create_dataset` with an empty request, which it refuses), and its read of whether
+    the builder edits the dashboard. No planning call and no create."""
+    assert [call.tool for call in fake.calls] == ["execute_sql", TOOL_PREFIX + "create_dataset",
                                                   TOOL_PREFIX + "editors_of"], [call.tool for call in fake.calls]
     grants, probe, editors = fake.calls
-    assert grants.request.get("dry_run") is True and probe.request == {"dataset_ids": []}
+    assert grants.request.get("dry_run") is True and probe.request == {}
     assert editors.request == {"dashboard_ids": [dashboard_id]}
-    assert not {call.tool for call in fake.calls} & (PLANNING | WRITES)
+    assert not {call.tool for call in fake.calls} & PLANNING and _writes(fake) == []
 
 
 def test_a_dashboard_the_builder_cannot_read_is_not_found_before_anything_is_planned(served, fake, world, store):

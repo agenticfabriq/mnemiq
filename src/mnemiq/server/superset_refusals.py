@@ -26,7 +26,7 @@ from mnemiq.superset.client import (
     SupersetUnavailable,
 )
 from mnemiq.superset.executor import SupersetCredentialMissing, SupersetReadOnly
-from mnemiq.superset.extension import ExtensionMissing
+from mnemiq.superset.extension import ExtensionMissing, ExtensionOutdated
 from mnemiq.superset.grants import GRANTS_UNREADABLE, NOT_A_BUILDER, GrantsUnreadable, NotABuilder, SupersetMisconfigured
 from mnemiq.superset.payload import SupersetAccessRefused
 from mnemiq.superset.settings import SNAPSHOT_REFUSED, SupersetSnapshotRefused
@@ -39,6 +39,8 @@ DENIED = "Superset refused this request and did not say why; its log records the
 ACCESS_REFUSED = "Superset refused access to something this request reads."
 # A build asked of a Superset that does not offer the extension's tools, through which every build writes.
 EXTENSION_MISSING = "This Superset does not have the mnemiq extension installed."
+# A build asked of a Superset whose extension is older than this mnemiq, and lacks a tool every build calls.
+EXTENSION_OUTDATED = "This Superset's mnemiq extension is older than this mnemiq; update the extension in Superset."
 # A build route asked with a token minted for asking, which carries none of Superset's write scopes.
 NOT_FOR_BUILDING = "This sign-in was made for asking, not building; open the builder from Superset again."
 
@@ -89,7 +91,9 @@ def superset_refusal(exc: BaseException) -> Refused | None:
     if isinstance(exc, NotForBuilding):
         return Refused(403, NOT_FOR_BUILDING,
                        challenge=f'Bearer error="insufficient_scope", scope="{" ".join(exc.needed)}"')
-    if isinstance(exc, ExtensionMissing):  # which tool was asked for, and Superset's words, are in the log only
+    if isinstance(exc, ExtensionOutdated):  # which tool was asked for, and Superset's words, are in the log only
+        return Refused(503, EXTENSION_OUTDATED)
+    if isinstance(exc, ExtensionMissing):
         return Refused(503, EXTENSION_MISSING)
     if isinstance(exc, BuildStoreMissing):
         return Refused(503, STORE_MISSING)

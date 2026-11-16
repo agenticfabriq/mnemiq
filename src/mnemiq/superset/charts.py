@@ -1,9 +1,12 @@
 """Chart specs for the fifteen v1 chart types, and the requests that build them.
 
-A `ChartSpec` says what a chart shows, in mnemiq's words. `generate_chart_request` turns it into the request rc2's MCP
-`generate_chart` takes (`GenerateChartRequest` in `superset/mcp_service/chart/schemas.py`, whose per-type `*ChartConfig`
-models reject a field they do not know, so no request here carries one they lack). Funnel and sankey are not among MCP's
-chart types; `extension_chart_request` builds the request for the extension's `create_chart`, with the `form_data`
+A `ChartSpec` says what a chart shows, in mnemiq's words. Every chart a build makes is made by the extension's
+`create_chart`, in one of its two shapes. `config_chart_request` builds the one for MCP's chart types: the chart config
+rc2's MCP `generate_chart` takes (`GenerateChartRequest` in `superset/mcp_service/chart/schemas.py`, whose per-type
+`*ChartConfig` models reject a field they do not know, so no request here carries one they lack), which the extension
+validates and maps as `generate_chart` does, and the format keys that config cannot carry (`owed_format_params`), which
+it merges into the chart's params. `generate_chart_request` is that config as `generate_chart` itself takes it. Funnel
+and sankey are not among MCP's chart types; `extension_chart_request` builds their request, with the `form_data`
 Superset's own funnel and sankey plugins read.
 
 Nothing here sends anything. Every number a chart shows is formatted from the kind of the measure it plots
@@ -20,7 +23,8 @@ from mnemiq.superset.measures import Measure, MeasureKind, display_format
 from mnemiq.superset.saved_metrics import SavedMetric
 
 __all__ = ["ChartSpec", "Family", "Filter", "MCP_FAMILIES", "MeasureRef", "SavedRef", "WrittenRef",
-           "extension_chart_request", "generate_chart_request", "owed_format_params", "plan_refusal"]
+           "config_chart_request", "extension_chart_request", "generate_chart_request", "owed_format_params",
+           "plan_refusal"]
 
 
 class Family(StrEnum):
@@ -349,13 +353,30 @@ def generate_chart_request(spec: ChartSpec, measures: dict[str, Measure], saved:
             "save_chart": True, "generate_preview": False}
 
 
+def config_chart_request(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, SavedMetric], *,
+                         currency: str) -> dict:
+    """The request for the extension's `create_chart` that makes `spec`, of one of MCP's chart types, as a chart: its
+    dataset, its title as the chart's name, MCP's chart config (`generate_chart_request`'s), and under `set` the format
+    keys that config cannot carry (`owed_format_params`), left out when there are none. The caller adds the
+    dashboard and the build's marker. `measures` and `saved` are `generate_chart_request`'s; the caller has passed
+    `plan_refusal`."""
+    if spec.family in EXTENSION_FAMILIES:
+        raise ValueError(f"{spec.family.name.lower()} is not an MCP chart type; build it with extension_chart_request")
+    request = {"dataset_id": spec.dataset_id, "slice_name": spec.title,
+               "config": _config(spec, measures, saved, currency)}
+    owed = owed_format_params(spec, measures, saved, currency=currency)
+    if owed:
+        request["set"] = owed
+    return request
+
+
 def owed_format_params(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, SavedMetric], *,
                        currency: str) -> dict:
-    """The top-level `params` keys to set after the chart is created, for a format rc2's renderers read and MCP's
+    """The top-level `params` keys to merge into the chart's params, for a format rc2's renderers read and MCP's
     models cannot send: a table's per-column `currencyFormat` (`TableColumnConfig` has only `d3NumberFormat`) and a
     treemap's `number_format` and `currency_format` (`TreemapChartConfig` has no format field). Empty when the request
     already carries the measure's whole format. The table's value is the whole `column_config`, every column the request
-    set included, since a patch replaces a top-level key. Histogram and handlebars have no metric format key at all, so
+    set included, since a merge replaces a top-level key. Histogram and handlebars have no metric format key at all, so
     they owe nothing."""
     refs, deployment = spec.measures, currency
     if spec.family is Family.TABLE:
@@ -399,7 +420,7 @@ def extension_chart_request(spec: ChartSpec, measures: dict[str, Measure], saved
     """The request for the extension's `create_chart` for a funnel or a sankey: the minimal `form_data` their plugins
     read. A sankey has no number format control, so it carries none."""
     if spec.family not in EXTENSION_FAMILIES:
-        raise ValueError(f"{spec.family.name.lower()} is an MCP chart type; build it with generate_chart_request")
+        raise ValueError(f"{spec.family.name.lower()} is an MCP chart type; build it with config_chart_request")
     params: dict = {"viz_type": spec.family.value, "datasource": f"{spec.dataset_id}__table",
                     "metric": _form_metric(spec.measures[0], measures)}
     if spec.family is Family.FUNNEL:

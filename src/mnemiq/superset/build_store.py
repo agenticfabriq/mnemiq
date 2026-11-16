@@ -8,7 +8,7 @@ the charts that show it and of the datasets mnemiq made for it, and each chart's
 The guarantee is upstream, not here: the planner is given no value (it sees the schema, saved metrics' names and
 expressions, and dashboards' titles), a value check's numbers ride back in its response only, and a measure's value is
 computed through Superset as whoever asks, each time, and kept nowhere. The store's own checks are a backstop. An intent
-holds five named fields and a measure's row ids and statuses, so neither has room for a number; a step's reason is
+holds four named fields and a measure's row ids and statuses, so neither has room for a number; a step's reason is
 one of `REASONS`, never text it was given. A plan is held to the shape the planner declares beside its writer
 (`planner.PLAN_JSON_SHAPE`): an allow-list of its keys at every depth refuses any other key and an object or a list
 where the writer writes a single value, so a value has no key to be kept under. Beneath it,
@@ -32,10 +32,9 @@ different machines agree on when a lease passes.
 
 A worker renews its lease before each of its calls (`renew_lease`), and starts no call once that fails. A lease that
 has passed turns its step `uncertain`, and the next claim takes that step to reconcile it, keeping the first claim's
-intent and `started_at`: reconciliation looks for what the first worker may have made from when it began. A worker
-whose row-locked or repeatable call (a claim, a patch, a layout save) timed out finishes its step `uncertain` itself,
-so the next claim need not wait for the lease; one whose create timed out leaves the claim to run out, since Superset
-may still be making the object. Each claim has a lease id of its own, so a worker whose step was taken from it can
+intent and `started_at`. A worker whose call ended unanswered finishes its step `uncertain` itself, so the next claim
+need not wait for the lease: each call a step makes may be sent again, a create among them, which the extension answers
+with the object the first one made. Each claim has a lease id of its own, so a worker whose step was taken from it can
 neither renew nor finish it (`LeaseLost`).
 """
 
@@ -89,7 +88,7 @@ BUILDING = "building"
 # The names a value, a row, a result or a sample is kept under. No key of a stored plan reads, folded (`_folded`), as
 # one of them.
 VALUE_SHAPED_KEYS = frozenset({"value", "values", "row", "rows", "data", "result", "results", "sample", "samples"})
-_INTENT_KEYS = ("key", "kind", "name", "dataset_id", "id_floor")
+_INTENT_KEYS = ("key", "kind", "name", "dataset_id")
 
 # Why a step failed, or was left uncertain, as a code: what a later read of the build says, never Superset's words.
 REASONS = frozenset({"not_editor", "not_found", "claimed_by_another", "extension_refused", "not_saved", "too_large",
@@ -192,8 +191,8 @@ class LeaseLost(Exception):
 @dataclass(frozen=True)
 class StepState:
     """One step of a build. `status` is `pending`, `done`, `uncertain` or `failed`; a step whose lease has passed reads
-    `uncertain`. `intent` is what the claim recorded (`key`, `kind`, `name`, `dataset_id`, and the `id_floor` the step
-    read before its create), `started_at` when, both kept from the first claim while the step is reconciled.
+    `uncertain`. `intent` is what the claim recorded (`key`, `kind`, `name` and `dataset_id`), `started_at` when, both
+    kept from the first claim while the step is reconciled.
     `lease_id` names the claim holding the step, if any, and `lease_until` when its lease passes. `reason` is why it
     failed or was left uncertain, one of `REASONS`. Times are ISO 8601 in UTC, on Postgres's clock."""
 
@@ -366,27 +365,6 @@ class BuildStore:
         except BuildNotFound:
             return False
         return renewed is True
-
-    def record_floor(self, tenant: str, build_id: str, key: str, lease_id: str, id_floor: int) -> bool:
-        """Keep `id_floor`, the highest id of the builder's objects of the step's kind read before its create, in the
-        intent of step `key`, if the claim `lease_id` still holds it and its lease has not passed; a floor already
-        kept stays, the first claim's. True when the step's intent then holds a floor; False otherwise: the worker
-        sends no create."""
-        tenant, key, lease_id = _text(tenant, "tenant"), _text(key, "step key"), _text(lease_id, "lease id")
-        id_floor = _floor_id(id_floor)
-        build = _build_uuid(build_id)
-        if build is None:
-            return False
-
-        def record(steps: list[dict], dashboard_id: int | None, now: datetime):
-            changed, held = _record_floor(steps, key, lease_id, id_floor, now)
-            return changed, dashboard_id, held
-
-        try:
-            held, _ = self._change(tenant, build, None, record)
-        except BuildNotFound:
-            return False
-        return held is True
 
     def finish_step(self, tenant: str, build_id: str, key: str, status: str, object_id: int | None, *,
                     lease_id: str, reason: str | None = None) -> StoredBuild:
@@ -605,17 +583,6 @@ def _renew(steps: list[dict], key: str, lease_id: str, now: datetime,
     return steps, True
 
 
-def _record_floor(steps: list[dict], key: str, lease_id: str, id_floor: int,
-                  now: datetime) -> tuple[list[dict] | None, bool]:
-    step = next((step for step in steps if step["key"] == key), None)
-    if step is None or step["lease_id"] != lease_id or not _holds(step, now) or step["intent"] is None:
-        return None, False
-    if step["intent"].get("id_floor") is not None:
-        return None, True
-    step["intent"]["id_floor"] = id_floor
-    return steps, True
-
-
 def _released(steps: list[dict], now: datetime, updated_at: datetime) -> list[dict] | None:
     """`steps` with the next step not done failed as abandoned, when the build was last touched `ABANDONED_AFTER_S`
     or more before `now` and no claim of it holds; None when it still holds its dashboard."""
@@ -669,9 +636,14 @@ def _iso(moment: datetime) -> str:
 
 def _step_state(step: dict, now: datetime) -> StepState:
     return StepState(key=step["key"], kind=step["kind"], status=UNCERTAIN if _passed(step, now) else step["status"],
-                     object_id=step["object_id"], started_at=step["started_at"],
-                     intent=None if step["intent"] is None else dict(step["intent"]), lease_id=step["lease_id"],
-                     lease_until=step["lease_until"], reason=step.get("reason"))
+                     object_id=step["object_id"], started_at=step["started_at"], intent=_kept_intent(step["intent"]),
+                     lease_id=step["lease_id"], lease_until=step["lease_until"], reason=step.get("reason"))
+
+
+def _kept_intent(intent: dict | None) -> dict | None:
+    """A stored intent as it reads: its `_INTENT_KEYS`. An older build's holds an `id_floor` too, the highest id it
+    read before its create, which no step reads any more; it is left out."""
+    return None if intent is None else {name: value for name, value in intent.items() if name in _INTENT_KEYS}
 
 
 def _stored_build(row: tuple) -> StoredBuild:
@@ -715,12 +687,6 @@ def _ids(values: Iterable[int], what: str) -> list[int]:
     if len(set(ids)) != len(ids):
         raise ValueError(f"{what} names an id twice")
     return ids
-
-
-def _floor_id(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_ID:
-        raise ValueError("a step's floor is the id it read, 0 when there was none")
-    return value
 
 
 def _reason(value: object) -> str | None:
@@ -775,9 +741,8 @@ def _new_steps(build_id: str, steps: Sequence[tuple[str, str]]) -> list[dict]:
 
 
 def _intent(intent: object) -> dict:
-    """The intent, refused unless it holds the step's `key` and `kind`, and at most its planned `name` (a string),
-    `dataset_id` (an id) and `id_floor` (an id, or 0); with all five keys, absent ones None. `started_at` is the
-    store's own."""
+    """The intent, refused unless it holds the step's `key` and `kind`, and at most its planned `name` (a string) and
+    `dataset_id` (an id); with all four keys, absent ones None. `started_at` is the store's own."""
     if not isinstance(intent, Mapping):
         raise ValueError("an intent is a mapping")
     other = [str(name) for name in intent if name not in _INTENT_KEYS]
@@ -791,8 +756,7 @@ def _intent(intent: object) -> dict:
     if name is not None and not isinstance(name, str):
         raise ValueError("an intent's name is a string")
     dataset_id = _id(intent.get("dataset_id"), "an intent's dataset id", optional=True)
-    id_floor = None if intent.get("id_floor") is None else _floor_id(intent.get("id_floor"))
-    return {"key": key, "kind": kind, "name": name, "dataset_id": dataset_id, "id_floor": id_floor}
+    return {"key": key, "kind": kind, "name": name, "dataset_id": dataset_id}
 
 
 def _plan(plan: object) -> dict:

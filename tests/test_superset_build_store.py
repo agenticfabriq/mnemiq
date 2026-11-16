@@ -122,10 +122,8 @@ STORE_COLUMNS = {
 
 
 def _intent(key: str, kind: str, name: str | None = None, dataset_id: int | None = None) -> dict:
-    """The intent a builder records when it claims a step: the step, its kind, the planned name and dataset, and no
-    floor yet (the step records it before its create, `record_floor`)."""
-    return {"key": key, "kind": kind, "name": name or key.replace("_", " "), "dataset_id": dataset_id,
-            "id_floor": None}
+    """The intent a builder records when it claims a step: the step, its kind, the planned name and dataset."""
+    return {"key": key, "kind": kind, "name": name or key.replace("_", " "), "dataset_id": dataset_id}
 
 
 def _offline_store() -> BuildStore:
@@ -390,13 +388,13 @@ def test_a_plan_that_is_not_json_is_refused(plan):
     {"key": "dashboard", "kind": "dashboard", "dataset_id": 987654.321},
     {"key": "dashboard", "kind": "dashboard", "dataset_id": True},
     {"key": "dashboard", "kind": "picture"},
-    {"key": "dashboard", "kind": "dashboard", "id_floor": -1},
-    {"key": "dashboard", "kind": "dashboard", "id_floor": 4.5},
-    {"key": "dashboard", "kind": "dashboard", "id_floor": True},
+    {"key": "dashboard", "kind": "dashboard", "id_floor": 41},
+    {"key": "dashboard", "kind": "dashboard", "id_floor": None},
 ])
 def test_an_intent_holds_the_step_its_kind_its_name_and_its_dataset_only(intent):
     """The intent a claim records: the step, its kind, the planned name, the dataset. `started_at` is the store's own, read
-    from Postgres's clock, and nothing else is accepted, so no value can ride in an intent."""
+    from Postgres's clock, and nothing else is accepted, so no value can ride in an intent. An `id_floor`, which an
+    earlier mnemiq recorded before a create, is no longer written."""
     with pytest.raises(ValueError):
         _offline_store().claim_next_step(TENANT, str(uuid.uuid4()), ANA, intent)
 
@@ -425,12 +423,6 @@ def test_a_step_keeps_only_a_reason_code_of_the_stores(reason):
     with pytest.raises(ValueError):
         _offline_store().finish_step(TENANT, str(uuid.uuid4()), "dashboard", "failed", None,
                                      lease_id=str(uuid.uuid4()), reason=reason)
-
-
-@pytest.mark.parametrize("id_floor", [-1, 1.5, True, "41", None])
-def test_a_floor_is_an_id_or_zero(id_floor):
-    with pytest.raises(ValueError):
-        _offline_store().record_floor(TENANT, str(uuid.uuid4()), "dashboard", str(uuid.uuid4()), id_floor)
 
 
 @pytest.mark.parametrize("saved_metric", [3, "", ["total_premium"]])
@@ -1187,22 +1179,26 @@ def test_the_live_dashboard_rule_is_postgres_own(store, store_dsn):
     assert "status = 'building'" in definition and "dashboard_id IS NOT NULL" in definition
 
 
-# --- A step's floor, its reason, a reused saved metric's row, and a build left untouched.
+# --- An intent kept by an older build, a step's reason, a reused saved metric's row, and a build left untouched.
 
-def test_a_floor_is_recorded_once_under_the_claim(store):
-    """The highest id of the builder's objects before a create is kept in the step's intent once, under the claim
-    that read it: a second floor leaves the first, another claim records none, and a reconciling claim keeps it."""
+def test_a_stored_intent_with_an_id_floor_still_reads(store, store_dsn):
+    """A step claimed by an earlier mnemiq holds an `id_floor` in its stored intent, the highest id it read before its
+    create. It still reads, without it: from the build, from the reconciling claim that keeps the first claim's
+    intent, and once finished."""
     build = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS)
     claimed = store.claim_next_step(TENANT, build.build_id, ANA, _intent("dashboard", "dashboard"), lease_s=1)
-    assert claimed.intent["id_floor"] is None
-    assert store.record_floor(TENANT, build.build_id, "dashboard", str(uuid.uuid4()), 41) is False
-    assert store.record_floor(TENANT, build.build_id, "dashboard", claimed.lease_id, 41) is True
-    assert store.record_floor(TENANT, build.build_id, "dashboard", claimed.lease_id, 99) is True
-    assert store.load_build(TENANT, build.build_id, ANA).step("dashboard").intent["id_floor"] == 41
+    assert claimed.intent == _intent("dashboard", "dashboard")
+    with psycopg.connect(store_dsn, autocommit=True) as con:
+        con.execute(sql.SQL("UPDATE {} SET steps = jsonb_set(steps, ARRAY['0', 'intent', 'id_floor'], '41') "
+                            "WHERE build_id = %s").format(sql.Identifier(BUILD_TABLE)), (build.build_id,))
+    assert _raw_build(store_dsn, build.build_id)["steps"][0]["intent"]["id_floor"] == 41  # planted past the store
+    planned = _intent("dashboard", "dashboard")
+    assert store.load_build(TENANT, build.build_id, ANA).step("dashboard").intent == planned
     time.sleep(1.2)
-    assert store.record_floor(TENANT, build.build_id, "dashboard", claimed.lease_id, 50) is False  # its lease passed
     again = store.claim_next_step(TENANT, build.build_id, ANA, _intent("dashboard", "dashboard"))
-    assert again.status == "uncertain" and again.intent["id_floor"] == 41
+    assert again.status == "uncertain" and again.intent == planned
+    done = store.finish_step(TENANT, build.build_id, "dashboard", "done", 41, lease_id=again.lease_id)
+    assert done.step("dashboard").intent == planned and done.step("dashboard").status == "done"
 
 
 def test_a_step_keeps_its_reason(store):

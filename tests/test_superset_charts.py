@@ -10,7 +10,8 @@ from __future__ import annotations
 import pytest
 
 from mnemiq.superset.charts import (HANDLEBARS_TEMPLATE, MCP_FAMILIES, ChartSpec, Family, Filter, SavedRef, WrittenRef,
-                                    extension_chart_request, generate_chart_request, owed_format_params, plan_refusal)
+                                    config_chart_request, extension_chart_request, generate_chart_request,
+                                    owed_format_params, plan_refusal)
 from mnemiq.superset.measures import Measure, MeasureKind
 from mnemiq.superset.saved_metrics import UNKNOWN, SavedMetric
 
@@ -177,6 +178,22 @@ def test_filters_use_the_filter_config_fields():
     assert config["filters"] == [{"column": "region", "op": "IN", "value": ["east", "west"]},
                                  {"column": "amount", "op": "IS NULL"}]
     assert config["row_limit"] == 50
+
+
+def test_a_chart_of_mcps_types_is_asked_of_the_extension_as_its_config_and_what_it_owes():
+    """The extension's `create_chart` takes the chart config `generate_chart` would (`generate_chart_request`'s), the
+    title as the chart's name, and under `set` the format keys that config cannot carry, left out when there are
+    none. A funnel or a sankey has no config: asked for one, it is refused."""
+    table = _spec(Family.TABLE)
+    assert config_chart_request(table, {}, {}, currency="USD") == {
+        "dataset_id": 7, "slice_name": "A chart", "config": _build(table)["config"],
+        "set": owed_format_params(table, {}, {}, currency="USD")}
+    assert config_chart_request(table, {}, {}, currency="USD")["set"]["column_config"]["Revenue"]["currencyFormat"] == USD
+    bar = _spec(Family.BAR)
+    assert config_chart_request(bar, {}, {}, currency="USD") == {"dataset_id": 7, "slice_name": "A chart",
+                                                                 "config": _build(bar)["config"]}
+    with pytest.raises(ValueError):
+        config_chart_request(_spec(Family.FUNNEL, dimensions=("stage",)), {}, {}, currency="USD")
 
 
 def test_funnel_and_sankey_go_to_the_extension():

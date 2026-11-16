@@ -186,6 +186,41 @@ def test_require_extension_asks_once():
         assert [c.tool for c in fake.calls] == [DATASET_METRICS]
 
 
+def test_require_build_tools_tells_an_older_extension_from_none():
+    """Whether Superset offers the creates a build sends, settled by one call of the extension's `create_dataset` with
+    an empty request, which this extension refuses without touching Superset. rc2's masked error is then told apart
+    by the extension's own probe: an extension that answers it is older than this mnemiq (`ExtensionOutdated`); one
+    that does not is missing. An answer that is not a refusal, and any other failure, are raised as tool errors."""
+    from mnemiq.superset.client import SupersetToolError
+    from mnemiq.superset.extension import ExtensionOutdated, require_build_tools
+
+    create = TOOL_PREFIX + "create_dataset"
+    masked = RuntimeError(f"Internal error in {create}: An unexpected error occurred. Error ID: 2.")
+    with FakeSuperset() as fake:
+        fake.reply(create, lambda request, authorization: {"refused": "request", "field": "database_id"})
+        assert require_build_tools(_client(fake)) is None
+        assert [(c.tool, c.request) for c in fake.calls] == [(create, {})]
+    with FakeSuperset(extension=False) as fake:
+        with pytest.raises(ExtensionMissing) as caught:
+            require_build_tools(_client(fake))
+        assert not isinstance(caught.value, ExtensionOutdated)
+        assert [c.tool for c in fake.calls] == [create, DATASET_METRICS]
+    with FakeSuperset() as fake:
+        fake.reply(create, lambda request, authorization: masked)
+        fake.reply(DATASET_METRICS, lambda request, authorization: {"datasets": []})
+        with pytest.raises(ExtensionOutdated) as caught:
+            require_build_tools(_client(fake))
+        assert "older than this mnemiq" in str(caught.value) and "Error ID" not in str(caught.value)
+        assert "Error ID" in caught.value.detail
+        assert [c.tool for c in fake.calls] == [create, DATASET_METRICS]
+    for answer in ({"dataset_id": 5}, RuntimeError("boom")):
+        with FakeSuperset() as fake:
+            fake.reply(create, lambda request, authorization, answer=answer: answer)
+            with pytest.raises(SupersetToolError):
+                require_build_tools(_client(fake))
+            assert [c.tool for c in fake.calls] == [create]
+
+
 def test_equivalent_saved_metric_is_reused():
     saved = [_saved("total_amount", "SUM(amount)"), _saved("other", "SUM(amount)", dataset_id=2, certified_by="x")]
     assert normalized("sum( amount )") == normalized("SUM(amount)")

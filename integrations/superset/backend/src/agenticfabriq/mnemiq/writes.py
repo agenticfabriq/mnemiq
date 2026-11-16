@@ -56,7 +56,6 @@ OK = {"ok": True}
 STALE = {"stale": True}
 BUSY = {"busy": True}
 FAILED = {"failed": True}
-CLAIMED_BY_ANOTHER = {"claimed_by_another": True}
 EXISTS = {"exists": True}
 BAD_MARKER = {"refused": "marker"}
 
@@ -197,8 +196,6 @@ REQUESTS: dict[str, dict[str, _Field]] = {
                        "table_name": _Field(_text(250)), "sql": _Field(_text(None), False),
                        "description": _Field(_optional_text(None), False), "dashboard_id": _DASHBOARD_ID,
                        "marker": _MARKER},
-    "claim_chart": {"chart_id": _Field(_an_id), "dashboard_id": _DASHBOARD_ID, "marker": _MARKER},
-    "claim_dataset": {"dataset_id": _Field(_an_id), "dashboard_id": _DASHBOARD_ID, "marker": _MARKER},
     # Exactly one shape, which `create_chart` checks: `{viz_type, params}`, or `{config, set?}`.
     "create_chart": {"dataset_id": _Field(_an_id), "viz_type": _Field(_one_of(EXTENSION_MADE), False),
                      "slice_name": _Field(_text(250)), "params": _Field(_an_object, False),
@@ -254,7 +251,7 @@ def claim_marker(text: Any, dashboard_id: int | None) -> params.Marker | None:
 
 def with_marker(description: str | None, marker: str) -> str:
     """`description` ending with `marker` as its last line, after its prose. A marker already on the last line is
-    replaced, so the same claim made twice leaves one."""
+    replaced, so a description never ends with two."""
     lines = (description or "").rstrip().splitlines()
     if lines and params.parse_marker(lines[-1]) is not None:
         lines.pop()
@@ -696,19 +693,16 @@ def _chart_data_by_editorship() -> bool:
 
 
 def _chart_editors(dataset: Any, dashboard: Any, kept: Iterable[Any]) -> list[int]:
-    """The editor subjects for a chart on `dataset` made or claimed for `dashboard`: the dashboard's editors, unless
-    a chart's editors may read its data for being its editors (`_chart_data_by_editorship`); then they are chosen as
-    a dataset's are (`_data_editors`), `kept` being the chart's editors now."""
+    """The editor subjects for a chart on `dataset` made for `dashboard`: the dashboard's editors, unless a chart's
+    editors may read its data for being its editors (`_chart_data_by_editorship`); then they are chosen as a dataset's
+    are (`_data_editors`), `kept` being the chart's editors now."""
     if _chart_data_by_editorship():
         return _data_editors(dataset, dashboard, kept)
     return _editor_ids(dashboard)
 
 
-def _claimed_chart_editors(chart: Any, dashboard: Any) -> list[int]:
-    return _chart_editors(chart.datasource, dashboard, chart.editors)
-
-
 def _claimed_dataset_editors(dataset: Any, dashboard: Any) -> list[int]:
+    """A dataset's editors for `dashboard`: those it has, and whom `_data_editors` adds."""
     return _data_editors(dataset, dashboard, dataset.editors)
 
 
@@ -735,83 +729,6 @@ def create_dashboard(found: dict) -> dict:
     return _find_or_create(Dashboard, found["marker"], kind="dashboard", create=create)
 
 
-def _claim(found: dict, resource: Any, *, kind: str, extra: Callable[[Any], dict | Mapping],
-           editors: Callable[[Any, Any], list[int]], command: Callable[[int, dict], Any]) -> dict:
-    """What `claim_chart` and `claim_dataset` share: under the resource's lock, refuse one the caller does not edit or
-    whose dashboard the caller does not edit, then one another build's marker holds; then one command sets the
-    editors `editors(resource, dashboard)` chooses and the marker (and `extra(resource)`'s properties)."""
-    readable = resource is not None and (_security().can_access_chart(resource) if kind == "chart"
-                                         else _security().can_access_datasource(resource))
-    if not readable:
-        return _not_found(kind)
-    dashboard = _dashboard(found["dashboard_id"])
-    if dashboard is None:
-        return _not_found("dashboard")
-    for edited in (resource, dashboard):
-        if not _security().is_editor(edited):
-            return _not_editor(edited)
-    # Read under the lock: of two builds claiming one chart, the second reads the first one's marker.
-    held = params.parse_marker(resource.description)
-    if held is not None and held != claim_marker(found["marker"], found["dashboard_id"]):
-        return CLAIMED_BY_ANOTHER
-    more = extra(resource)
-    if "refused" in more:
-        return dict(more)
-    properties = {"editors": editors(resource, dashboard),
-                  "description": with_marker(resource.description, found["marker"]), **more}
-    try:
-        command(resource.id, properties).run()
-    except _command_errors() as exc:
-        return _command_answer(f"claim_{kind}", exc, kind=kind, editable=resource)
-    return OK
-
-
-def _chart_query_context(chart: Any) -> dict:
-    """The properties a claim writes beside the editors and the marker: the query context of the chart's family,
-    built from its params (null for a family that has none), or a refusal."""
-    if chart.datasource_type != "table":
-        return {"refused": "datasource"}
-    form_data = _stored_object(chart.params)
-    if form_data is None:
-        return {"refused": "params"}
-    try:
-        context = params.query_context(chart.viz_type, form_data, chart.datasource_id)
-    except ValueError:
-        return {"refused": "params"}
-    return {"query_context": _dumps(context)}
-
-
-@_answering("claim_chart")
-def claim_chart(found: dict) -> dict:
-    """Makes a chart the dashboard's: its editors become the dashboard's (or, where a chart's editors may read its
-    data, are chosen as a dataset's: `_chart_editors`), its description ends with the build's marker, and it gets the
-    query context of its family, in one `UpdateChartCommand` under the chart's lock. A chart another build's marker
-    holds is refused; the same claim made again is answered as the first was."""
-    if claim_marker(found["marker"], found["dashboard_id"]) is None:
-        return BAD_MARKER
-    from superset.commands.chart.update import UpdateChartCommand
-    from superset.models.slice import Slice
-
-    return _locked(Slice, found["chart_id"], lambda chart: _claim(
-        found, chart, kind="chart", extra=_chart_query_context, editors=_claimed_chart_editors,
-        command=UpdateChartCommand))
-
-
-@_answering("claim_dataset")
-def claim_dataset(found: dict) -> dict:
-    """Makes a dataset the dashboard's, as `claim_chart` makes a chart, through `UpdateDatasetCommand`. Its editors
-    are those it has, the caller, and the dashboard's users whose grants already reach it (`_data_editors`): a co-editor
-    left out is answered `{"not_editor": true, "editors": [...]}` when it asks to change or delete the dataset."""
-    if claim_marker(found["marker"], found["dashboard_id"]) is None:
-        return BAD_MARKER
-    from superset.commands.dataset.update import UpdateDatasetCommand
-    from superset.connectors.sqla.models import SqlaTable
-
-    return _locked(SqlaTable, found["dataset_id"], lambda dataset: _claim(
-        found, dataset, kind="dataset", extra=lambda _: {}, editors=_claimed_dataset_editors,
-        command=UpdateDatasetCommand))
-
-
 def _dataset_creation_answer(exc: Exception) -> dict:
     """The answer for a dataset create's failure: `{"exists": true}` when rc2 refuses it because a dataset already
     holds the table (live, or in the trash as a twin), else `_command_answer`'s."""
@@ -824,8 +741,8 @@ def _dataset_creation_answer(exc: Exception) -> dict:
 
 
 def _set_dataset_editors(found: dict, dataset_id: int) -> dict:
-    """The dataset's editors, set under its row lock by the rule a claim chose them by (`_claimed_dataset_editors`):
-    the caller and the dashboard's users whose grants already reach it. `OK`, or why not."""
+    """The dataset's editors, set under its row lock (`_claimed_dataset_editors`): those it has, the caller, and the
+    dashboard's users whose grants already reach it. `OK`, or why not."""
     from superset.commands.dataset.update import UpdateDatasetCommand
     from superset.connectors.sqla.models import SqlaTable
 

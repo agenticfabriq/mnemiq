@@ -1,14 +1,17 @@
 """What a dashboard build's tests run against: a Superset whose state lives in memory and is served on `FakeSuperset`,
 and a build store with the Postgres store's own rules over a dict, on a clock the test moves.
 
-`World` answers every tool a build calls as rc2 and mnemiq's extension do, as far as a build can tell: MCP's
-`generate_chart` saves a chart with the `form_data` its mappers write and no query context, its name and its SQL
-metrics' labels as rc2's validators leave them (`rc2_saved`); the extension's claims
-write the editors, the marker and the query context (with the extension's own `params.query_context`, so the query is
-the one the extension saves); `get_chart_data` runs a chart's saved query context; `execute_sql` runs mnemiq's own
-statement. Both run on one DuckDB of fixed rows, by two separate paths, so a chart whose numbers are right is checked
-and one the test skews is not. Superset's clock is the test's clock, written with no zone as rc2's `datetime.now`
-default writes `created_on`.
+`World` answers every tool a build calls as rc2 and mnemiq's extension do, as far as a build can tell. The extension's
+creates (`create_dashboard`, `create_dataset`, `create_chart`) first look for the object carrying the request's marker
+as its description's last line, and answer with it, or with `candidates` when there are several, as the extension's
+`_find_or_create` does; only when there is none do they make one, with the marker. `create_chart` saves a chart from
+MCP's chart config with the `form_data` MCP's mappers write, the request's `set` merged over it, and its name and its
+SQL metrics' labels as rc2's validators leave them (`rc2_saved`), or a funnel or a sankey from its own form data; and
+the query context of the extension's own `params.query_context`, so the query is the one the extension saves.
+`get_chart_data` runs a chart's saved query context and `execute_sql` mnemiq's own statement, both on one DuckDB of
+fixed rows, by two separate paths, so a chart whose numbers are right is checked and one the test skews is not. MCP's
+own creates (`generate_chart`, `create_dataset`, `create_virtual_dataset`) are served too, though no build calls them.
+Superset's clock is the test's clock, written with no zone as rc2's `datetime.now` default writes `created_on`.
 
 `MemoryBuildStore` keeps builds and measures as `BuildStore` does, through the store module's own transitions and
 checks (`_claim`, `_renew`, `_finish`, `_plan`, `_intent`, ...), each change made whole under one lock, as the
@@ -23,6 +26,7 @@ import itertools
 import json
 import re
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -35,7 +39,7 @@ from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Column, Snapshot
 from mnemiq.superset import build_store as bs
 from mnemiq.superset.build_store import BuildNotFound, StoredBuild
-from mnemiq.superset.extension import TOOL_PREFIX
+from mnemiq.superset.extension import EXTENSION_TOOLS, TOOL_PREFIX
 from tests.superset_extension_path import use_extension_source
 
 use_extension_source()
@@ -218,18 +222,6 @@ class MemoryBuildStore:
                 self._write(row, changed, row["dashboard_id"])
             return renewed is True
 
-    def record_floor(self, tenant, build_id, key, lease_id, id_floor) -> bool:
-        id_floor = bs._floor_id(id_floor)
-        with self._lock:
-            try:
-                row = self._row(tenant, build_id, None)
-            except BuildNotFound:
-                return False
-            changed, held = bs._record_floor(copy.deepcopy(row["steps"]), key, lease_id, id_floor, self._now())
-            if changed is not None:
-                self._write(row, changed, row["dashboard_id"])
-            return held
-
     def finish_step(self, tenant, build_id, key, status, object_id, *, lease_id, reason=None) -> StoredBuild:
         if status not in bs._FINISHED_AS:
             raise ValueError("a step finishes done, failed or uncertain")
@@ -314,6 +306,16 @@ class Hook:
     instead: Callable | None = None
 
 
+@dataclass
+class Late:
+    """A call held at Superset's door (`World.run_late`): `release` lets it run, `ran` is set once it has, and
+    `answers` holds what it answered."""
+
+    release: threading.Event
+    ran: threading.Event
+    answers: list
+
+
 class World:
     """Superset, as a build reads and writes it. `world.datasets`, `world.charts` and `world.dashboards` are its rows,
     and its clock is the test's."""
@@ -381,14 +383,47 @@ class World:
         return found
 
     def calls(self, tool: str) -> list:
-        name = tool if tool in self._plain_tools() else TOOL_PREFIX + tool
+        """The calls of `tool`: the extension's tool of that name when it offers one (so `create_dataset` is the
+        extension's), else Superset's own. MCP's `create_dataset` is read off `fake.calls` by its name."""
+        name = TOOL_PREFIX + tool if tool in EXTENSION_TOOLS else tool
         return [call for call in self.fake.calls if call.tool == name]
 
-    @staticmethod
-    def _plain_tools() -> set[str]:
-        from tests.superset_fake import SUPERSET_TOOLS
+    # --- what a test makes of one call: its answer lost, or the call run late
 
-        return set(SUPERSET_TOOLS)
+    def lose_answer(self, tool: str, *, hold_s: float) -> threading.Event:
+        """The next call of `tool` does its work and commits it, then holds its answer `hold_s` seconds, past the
+        deadline of a client that waits less, which then raises `SupersetUnavailable`: a create whose answer was lost
+        after Superset made the object. Later calls answer at once. The event is set once the held call has ended."""
+        ended, held = threading.Event(), []
+
+        def hold(request, answer, _world):
+            if not held:
+                held.append(True)
+                time.sleep(hold_s)
+                ended.set()
+
+        self.hooks[tool] = Hook(after=hold)
+        return ended
+
+    def run_late(self, tool: str) -> Late:
+        """The next call of `tool` waits at Superset's door, doing nothing, until `release` is set, so a client whose
+        deadline passes meanwhile raises `SupersetUnavailable` with nothing made; once released, the call runs, late,
+        its answer is kept in `answers`, and `ran` is set. Later calls run at once."""
+        late = Late(release=threading.Event(), ran=threading.Event(), answers=[])
+        first = []
+
+        def wait(request, _world):
+            if not first:
+                first.append(True)
+                late.release.wait(30)
+
+        def keep(request, answer, _world):
+            if late.release.is_set() and not late.ran.is_set():
+                late.answers.append(answer)
+                late.ran.set()
+
+        self.hooks[tool] = Hook(before=wait, after=keep)
+        return late
 
     # --- serving
 
@@ -420,9 +455,9 @@ class World:
                  "list_dashboards": self._list_dashboards, "generate_chart": self._generate_chart,
                  "create_dataset": self._create_dataset, "create_virtual_dataset": self._create_virtual_dataset,
                  "execute_sql": self._execute_sql}
-        extension = {"create_dashboard": self._create_dashboard, "claim_chart": self._claim_chart,
-                     "claim_dataset": self._claim_dataset, "create_chart": self._create_chart,
-                     "patch_chart": self._patch_chart, "add_saved_metric": self._add_saved_metric,
+        extension = {"create_dashboard": self._create_dashboard, "create_dataset": self._make_dataset,
+                     "create_chart": self._create_chart, "patch_chart": self._patch_chart,
+                     "add_saved_metric": self._add_saved_metric,
                      "set_layout": self._set_layout, "dataset_metrics": self._dataset_metrics,
                      "get_layout": self._get_layout, "editors_of": self._editors_of}
         return {**plain, **{TOOL_PREFIX + name: handler for name, handler in extension.items()}}
@@ -518,7 +553,7 @@ class World:
     def _list_dashboards(self, request: dict, user: str) -> dict:
         return self._page(list(self.dashboards.values()), request, user, "dashboards", self._dashboard_shown)
 
-    # --- making things, as MCP makes them
+    # --- making things, as MCP makes them: served, though no build calls them
 
     def _metric(self, column: dict) -> Any:
         """`create_metric_object` (`superset/mcp_service/chart/chart_utils.py`) for the two kinds a build sends, an SQL
@@ -636,71 +671,128 @@ class World:
     def _editor_of(self, row: dict, user: str) -> bool:
         return user in row["editors"]
 
+    @staticmethod
+    def _marked(rows: dict[int, dict], marker: str) -> list[dict]:
+        """The rows whose description's last line is exactly `marker`, by id: the extension's `_marked`."""
+        return [rows[i] for i in sorted(rows) if (rows[i]["description"] or "").splitlines()[-1:] == [marker]]
+
+    def _find_or_create(self, rows: dict[int, dict], marker: str, kind: str, user: str,
+                        create: Callable[[], dict]) -> dict:
+        """The extension's `_find_or_create`: the object `marker` names, answered when the caller edits it; every one,
+        when there are several (the builder reads every object here); `create()`'s answer when there is none."""
+        found = self._marked(rows, marker)
+        if not found:
+            return create()
+        if len(found) > 1:
+            return {"candidates": [row["id"] for row in found]}
+        (row,) = found
+        if not self._editor_of(row, user):
+            return {"not_editor": True, "editors": sorted(row["editors"])}
+        return {f"{kind}_id": row["id"]}
+
     def _create_dashboard(self, request: dict, user: str) -> dict:
         found = extension_writes.read("create_dashboard", request)
         if extension_writes.claim_marker(found["marker"], None) is None:
             return {"refused": "marker"}
-        dashboard_id = next(self._ids["dashboard"])
-        moment = self._stamp()
-        self.dashboards[dashboard_id] = {"id": dashboard_id, "dashboard_title": found["title"], "published": False,
-                                         "description": found["marker"], "position_json": None, "json_metadata": "{}",
-                                         "editors": [user, "colleague"], "members": [], "created_by": user,
-                                         "created_on": moment, "changed_on": moment}
-        return {"dashboard_id": dashboard_id}
 
-    def _claim(self, row: dict | None, kind: str, found: dict, user: str, extra: Callable[[dict], dict]) -> dict:
-        if row is None:
-            return {"not_found": kind}
+        def create() -> dict:
+            dashboard_id = next(self._ids["dashboard"])
+            moment = self._stamp()
+            self.dashboards[dashboard_id] = {
+                "id": dashboard_id, "dashboard_title": found["title"], "published": False,
+                "description": found["marker"], "position_json": None, "json_metadata": "{}",
+                "editors": [user, "colleague"], "members": [], "created_by": user, "created_on": moment,
+                "changed_on": moment}
+            return {"dashboard_id": dashboard_id}
+
+        return self._find_or_create(self.dashboards, found["marker"], "dashboard", user, create)
+
+    def _edited_dashboard(self, found: dict, user: str) -> dict | tuple[dict]:
+        """The request's dashboard, as `(row,)`, when the caller edits it; else the extension's answer."""
         dashboard = self.dashboards.get(found["dashboard_id"])
-        if dashboard is None:
-            return {"not_found": "dashboard"}
-        for edited in (row, dashboard):
-            if not self._editor_of(edited, user):
-                return {"not_editor": True, "editors": sorted(edited["editors"])}
-        held = extension_params.parse_marker(row["description"])
-        if held is not None and held != extension_writes.claim_marker(found["marker"], found["dashboard_id"]):
-            return {"claimed_by_another": True}
-        row.update(editors=list(dashboard["editors"]),
-                   description=extension_writes.with_marker(row["description"], found["marker"]), **extra(row))
-        row["changed_on"] = self._stamp()
-        return {"ok": True}
-
-    def _claim_chart(self, request: dict, user: str) -> dict:
-        found = extension_writes.read("claim_chart", request)
-        if extension_writes.claim_marker(found["marker"], found["dashboard_id"]) is None:
-            return {"refused": "marker"}
-        return self._claim(self.charts.get(found["chart_id"]), "chart", found, user, lambda chart: {
-            "query_context": extension_params.query_context(chart["viz_type"], chart["params"],
-                                                            chart["datasource_id"])})
-
-    def _claim_dataset(self, request: dict, user: str) -> dict:
-        found = extension_writes.read("claim_dataset", request)
-        if extension_writes.claim_marker(found["marker"], found["dashboard_id"]) is None:
-            return {"refused": "marker"}
-        return self._claim(self.datasets.get(found["dataset_id"]), "dataset", found, user, lambda _: {})
-
-    def _create_chart(self, request: dict, user: str) -> dict:
-        found = extension_writes.read("create_chart", request)
-        if extension_writes.claim_marker(found["marker"], found["dashboard_id"]) is None:
-            return {"refused": "marker"}
-        dataset_id, viz_type, form = found["dataset_id"], found["viz_type"], found["params"]
-        form.setdefault("viz_type", viz_type)
-        form.setdefault("datasource", f"{dataset_id}__table")
-        dataset, dashboard = self.datasets.get(dataset_id), self.dashboards.get(found["dashboard_id"])
-        if dataset is None:
-            return {"not_found": "dataset"}
         if dashboard is None:
             return {"not_found": "dashboard"}
         if not self._editor_of(dashboard, user):
             return {"not_editor": True, "editors": sorted(dashboard["editors"])}
-        chart_id = next(self._ids["chart"])
-        moment = self._stamp()
-        self.charts[chart_id] = {
-            "id": chart_id, "slice_name": found["slice_name"], "viz_type": viz_type, "params": form,
-            "datasource_id": dataset_id, "datasource_name": f"{dataset['schema']}.{dataset['table_name']}",
-            "description": found["marker"], "query_context": extension_params.query_context(viz_type, form, dataset_id),
-            "created_by": user, "created_on": moment, "changed_on": moment, "editors": list(dashboard["editors"])}
-        return {"chart_id": chart_id}
+        return (dashboard,)
+
+    def _make_dataset(self, request: dict, user: str) -> dict:
+        """The extension's `create_dataset`: a dataset over the table, or over `sql` (a virtual one), with the marker
+        after its prose, and the dashboard's editors as its editors (the World does not judge whose grants reach the
+        data; the extension's own tests do). A table name the schema already holds a dataset of is answered
+        `exists`."""
+        found = extension_writes.read("create_dataset", request)
+        if extension_writes.claim_marker(found["marker"], found["dashboard_id"]) is None:
+            return {"refused": "marker"}
+        edited = self._edited_dashboard(found, user)
+        if isinstance(edited, dict):
+            return edited
+        (dashboard,) = edited
+
+        def create() -> dict:
+            if any(d["table_name"] == found["table_name"] and d["schema"] == found["schema"]
+                   and d["database_id"] == found["database_id"] for d in self.datasets.values()):
+                return {"exists": True}
+            dataset_id = next(self._ids["dataset"])
+            self.datasets[dataset_id] = self._dataset_row(
+                dataset_id, found["table_name"], found["sql"],
+                extension_writes.with_marker(found["description"], found["marker"]), user, self._stamp())
+            self.datasets[dataset_id]["editors"] = list(dashboard["editors"])
+            return {"dataset_id": dataset_id}
+
+        return self._find_or_create(self.datasets, found["marker"], "dataset", user, create)
+
+    def _create_chart(self, request: dict, user: str) -> dict:
+        """The extension's `create_chart`, in its two shapes: `{viz_type, params}` (a funnel or a sankey), or MCP's
+        chart config as `{config, set?}`, mapped as MCP maps it (`form_data`) with `set` merged over it, the chart's
+        name and labels as rc2's validators leave them; a config they refuse is refused as the extension refuses it."""
+        found = extension_writes.read("create_chart", request)
+        if extension_writes.claim_marker(found["marker"], found["dashboard_id"]) is None:
+            return {"refused": "marker"}
+        from_config = found["config"] is not None
+        if from_config:
+            shaped = found["viz_type"] is None and found["params"] is None
+        else:
+            shaped = found["viz_type"] is not None and found["params"] is not None and found["set"] is None
+        if not shaped:
+            return {"refused": "request"}
+        if from_config and set(found["set"] or ()) & {"datasource", "datasource_id", "datasource_type", "viz_type"}:
+            return {"refused": "set"}
+        dataset_id = found["dataset_id"]
+        dataset = self.datasets.get(dataset_id)
+        if dataset is None:
+            return {"not_found": "dataset"}
+        edited = self._edited_dashboard(found, user)
+        if isinstance(edited, dict):
+            return edited
+        (dashboard,) = edited
+        if from_config:
+            name = rc2_saved(found["slice_name"])
+            labels = [rc2_saved(c["label"]) for c in _labelled_columns(found["config"])]
+            if any(isinstance(text, ValueError) for text in (name, *labels)):
+                return {"refused": "config"}
+            form = {**self.form_data(dataset_id, found["config"]), **(found["set"] or {})}
+            viz_type = form["viz_type"]
+        else:
+            name, viz_type, form = found["slice_name"], found["viz_type"], found["params"]
+            form.setdefault("viz_type", viz_type)
+            form.setdefault("datasource", f"{dataset_id}__table")
+        try:
+            context = extension_params.query_context(viz_type, form, dataset_id)
+        except ValueError:
+            return {"refused": "config" if from_config else "params"}
+
+        def create() -> dict:
+            chart_id = next(self._ids["chart"])
+            moment = self._stamp()
+            self.charts[chart_id] = {
+                "id": chart_id, "slice_name": name, "viz_type": viz_type, "params": form,
+                "datasource_id": dataset_id, "datasource_name": f"{dataset['schema']}.{dataset['table_name']}",
+                "description": found["marker"], "query_context": context, "created_by": user, "created_on": moment,
+                "changed_on": moment, "editors": list(dashboard["editors"])}
+            return {"chart_id": chart_id}
+
+        return self._find_or_create(self.charts, found["marker"], "chart", user, create)
 
     def _patch_chart(self, request: dict, user: str) -> dict:
         found = extension_writes.read("patch_chart", request)
