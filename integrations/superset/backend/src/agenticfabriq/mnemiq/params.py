@@ -617,13 +617,15 @@ def query_context(viz_type: str, params: Mapping, datasource_id: int) -> dict | 
 def _histogram_operator(form_data: Mapping, column: Any, groups: list) -> dict:
     """`histogramOperator` (`.../src/operators/histogramOperator.ts`): `bins` as `Number(bins)`, or 5 where that is
     NaN (a missing one included); the column and groups by label; `cumulative` and `normalize` as the form data has
-    them (JSON drops an undefined one)."""
+    them (JSON drops an undefined one). Raises ValueError for a `bins` that is infinite, which no chart can bin."""
     try:
         bins = float(form_data["bins"]) if "bins" in form_data else float("nan")
     except (TypeError, ValueError):
         bins = float("nan")
     if bins != bins:
         bins = 5
+    elif not math.isfinite(bins):
+        raise ValueError("a histogram's `bins` is not a finite number")
     elif bins == int(bins):
         bins = int(bins)
     options = {"column": _column_label(column), "groupby": [_column_label(g) for g in groups], "bins": bins}
@@ -639,7 +641,8 @@ def histogram_check_context(form_data: Mapping, datasource_id: int) -> dict:
     the other families' queries read them, with the histogram operator the chart's own query carries (so a column
     that holds non-numeric values fails the check, as it fails the chart). Its metrics are the histogram's own `buildQuery`'s: none
     (a plain row select), or `COUNT(*)` when an adhoc filter's clause is HAVING, so a HAVING filter has an aggregate
-    to hold. rc2's own compile check leaves a histogram's column out of its query, which it builds from metrics and
+    to hold. Its filters are the form data's and then each selected column not null, because the check reads only two
+    unordered rows and the operator fails on a null group value: the probe differs from the chart's query there. rc2's own compile check leaves a histogram's column out of its query, which it builds from metrics and
     groupby, because the histogram names its column under `column` alone. Not a chart's saved query context. Raises ValueError for a bad `datasource_id`, for form data
     that is not a mapping, and for form data without a `column`."""
     if isinstance(datasource_id, bool) or not isinstance(datasource_id, int) or datasource_id < 1:
@@ -651,7 +654,12 @@ def histogram_check_context(form_data: Mapping, datasource_id: int) -> dict:
         raise ValueError("a histogram's params name no column")
     filters, extras = _filters_and_extras(form_data)
     groups = [c for c in _ensure_list(form_data.get("groupby")) if c != ""]
-    query = {"columns": _dedupe([*groups, column], _column_label), "filters": filters, "extras": extras}
+    columns = _dedupe([*groups, column], _column_label)
+    # The probe reads two rows with no order, and the operator fails on a group value that is null (it cannot unstack
+    # them) whatever the rest of the chart holds; so the probe, not the saved chart, keeps its rows to non-null ones.
+    # A null-only sample would be an empty frame the operator passes, and a non-numeric value still fails it.
+    filters = [*filters, *({"col": c, "op": "IS NOT NULL"} for c in columns)]
+    query = {"columns": columns, "filters": filters, "extras": extras}
     if any(isinstance(f, Mapping) and f.get("clause") == "HAVING" for f in _ensure_list(form_data.get("adhoc_filters"))):
         query["metrics"] = [{"expressionType": "SQL", "sqlExpression": "COUNT(*)", "label": "COUNT(*)"}]
     query["post_processing"] = [_histogram_operator(form_data, column, groups)]

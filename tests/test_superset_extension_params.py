@@ -736,7 +736,7 @@ def test_histogram_check_context_selects_the_groups_then_the_column():
     (query,) = context["queries"]
     assert query["columns"] == ["region", "amount"]
     assert "metrics" not in query  # a plain row select, as the histogram's own `buildQuery` sends none
-    assert query["filters"] == [WEST_Q]
+    assert query["filters"] == [WEST_Q, {"col": "region", "op": "IS NOT NULL"}, {"col": "amount", "op": "IS NOT NULL"}]
     assert query["post_processing"] == [{"operation": "histogram", "options": {
         "column": "amount", "groupby": ["region"], "bins": 10, "cumulative": False, "normalize": False}}]
     assert json.loads(json.dumps(context)) == context
@@ -744,7 +744,20 @@ def test_histogram_check_context_selects_the_groups_then_the_column():
 
 def test_histogram_check_context_selects_the_column_alone_without_groups():
     (query,) = ext.histogram_check_context({"viz_type": "histogram_v2", "column": "amount"}, DATASET)["queries"]
-    assert query["columns"] == ["amount"] and "metrics" not in query and query["filters"] == []
+    assert query["columns"] == ["amount"] and "metrics" not in query
+    assert query["filters"] == [{"col": "amount", "op": "IS NOT NULL"}]
+
+
+@pytest.mark.parametrize("bins", ["inf", "Infinity", "-inf", 1e999, float("inf")])
+def test_histogram_check_context_refuses_bins_that_are_not_finite(bins):
+    with pytest.raises(ValueError):
+        ext.histogram_check_context({**HISTOGRAM, "bins": bins}, DATASET)
+
+
+def test_histogram_check_context_keeps_an_adhoc_columns_own_object_in_its_null_filter():
+    adhoc = {"label": "doubled", "sqlExpression": "amount * 2", "expressionType": "SQL"}
+    (query,) = ext.histogram_check_context({"viz_type": "histogram_v2", "column": adhoc}, DATASET)["queries"]
+    assert query["filters"] == [{"col": adhoc, "op": "IS NOT NULL"}]
 
 
 @pytest.mark.parametrize("bins, parsed", [("absent", 5), ("12", 12), ("x", 5), (7.0, 7)])

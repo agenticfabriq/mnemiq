@@ -2452,7 +2452,8 @@ def test_a_histograms_check_selects_its_column_its_groups_under_its_filters(crea
     ((_, context),) = [entry for entry in creating.superset.ran if entry[0] == "chart_data"]
     (query,) = context["queries"]
     assert query["columns"] == ["region", "amount"] and "metrics" not in query
-    assert query["filters"] == [{"col": "region", "op": "==", "val": "West"}]
+    assert query["filters"] == [{"col": "region", "op": "==", "val": "West"}, {"col": "region", "op": "IS NOT NULL"},
+                                {"col": "amount", "op": "IS NOT NULL"}]
     assert query["row_limit"] == writes._CHART_ROW_LIMIT_PROBE
     assert context["result_type"] == "full"
     assert query["post_processing"] == [{"operation": "histogram", "options": {
@@ -2467,6 +2468,13 @@ def test_a_mapping_a_plugin_refuses_is_refused_as_config(creating):
     ran = creating.superset.ran
     assert ran[:8] == [*taken("postgresql", STEP), *looked("postgresql", "Slice")]
     assert ran[-3:] == [("rollback",), *let_go("postgresql", STEP)]
+    assert commands(creating.superset) == [] and "chart_data" not in _kinds(creating.superset)
+
+
+@pytest.mark.parametrize("bins", ["inf", "Infinity", 1e999])
+def test_a_histogram_with_bins_that_are_not_finite_is_refused_as_config(creating, bins):
+    creating.superset.mapped = {**copy.deepcopy(HISTOGRAM_FORM), "bins": bins}
+    assert make_from_config() == {"refused": "config"}
     assert commands(creating.superset) == [] and "chart_data" not in _kinds(creating.superset)
 
 
