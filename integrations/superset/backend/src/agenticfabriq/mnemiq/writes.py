@@ -802,11 +802,11 @@ def create_dashboard(found: dict) -> dict:
 
 
 def _dataset_creation_answer(exc: Exception) -> dict:
-    """The answer for a dataset create's failure, but for a dataset in the trash holding the table (`_twin_answer`).
-    A table the caller may not read, or a virtual dataset's SQL that reads one (rc2 lists
-    `DatasetDataAccessIsNotAllowed`), is answered as a dataset that does not exist, whatever rc2 lists beside it, so
-    the answer never says whether a dataset already holds that table. Else `{"exists": true}` when rc2 refuses the
-    create because a live dataset already holds the table, else `_command_answer`'s."""
+    """The answer for a dataset create's failure (one with `DatasetSoftDeletedTwinExistsError` is `_twin_answer`'s). A
+    caller who may not read the table, or what a virtual dataset's SQL reads (`DatasetDataAccessIsNotAllowed` among
+    the errors listed), is answered `{"not_found": "dataset"}`, with a dataset over the table or none. A table a
+    dataset already holds (`DatasetExistsValidationError`) is answered `{"exists": true}` only to a caller Superset's
+    own access check admits; anything else as `_command_answer` answers it."""
     from superset.commands.dataset.exceptions import DatasetInvalidError
 
     listed = exc.get_list_classnames() if isinstance(exc, DatasetInvalidError) else []
@@ -818,23 +818,21 @@ def _dataset_creation_answer(exc: Exception) -> dict:
 
 
 def _twin_answer(command: Any) -> dict:
-    """The answer for a dataset's create that rc2 refused because a dataset in the trash holds its table
-    (`DatasetSoftDeletedTwinExistsError`). rc2's `CreateDatasetCommand.validate` raises that error from its uniqueness
-    check, before it checks the caller's access, so the error says nothing about access, and `{"exists": true}` would
-    tell a caller who may not read the table that a dataset holds it. So the check rc2 skipped is made here, as the
-    caller and as `validate` makes it: `raise_for_access` for the table, or for `sql` with its catalog and schema when
-    the request gives it, on what `validate` had resolved into the command's properties when it raised (the database
-    read from its id, the default catalog when none was given, a schema read from the SQL). A refusal is answered
-    `{"not_found": "dataset"}` and SQL rc2 cannot parse `{"refused": "invalid"}`, each as the same request is answered
-    with no dataset in the trash; else `{"exists": true}`."""
+    """The answer for a dataset's create refused with `DatasetSoftDeletedTwinExistsError`: a dataset in the trash holds
+    its table. As for a live dataset over the table, the answer depends on whether the caller may read the table, or
+    what a virtual dataset's SQL reads: `raise_for_access` is asked as the caller, with the arguments
+    `CreateDatasetCommand.validate` gives it (the table, or `sql` with its catalog and schema), on what `validate`
+    resolved into the command's properties (the database read from its id, the default catalog when none was given,
+    a schema read from the SQL). A caller it refuses is answered `{"not_found": "dataset"}`, and SQL it cannot parse
+    `{"refused": "invalid"}`, as the same request is answered with no dataset in the trash; `{"exists": true}` only
+    to a caller it admits. A database failure while it checks is answered by `_failed`."""
     from sqlalchemy.exc import SQLAlchemyError
     from superset.exceptions import SupersetParseError, SupersetSecurityException
     from superset.sql.parse import Table
 
     resolved = command._properties
     database, catalog, schema, sql = (resolved.get(key) for key in ("database", "catalog", "schema", "sql"))
-    # rc2 checks uniqueness only on a database it found, and `raise_for_access` checks no table without one: an
-    # unchecked answer is never given.
+    # No database to ask about: answered as no dataset, never as an `exists` no check admitted.
     if database is None:
         return _not_found("dataset")
     try:
@@ -879,12 +877,13 @@ def create_dataset(found: dict) -> dict:
     """A dataset over a table, or over `sql` when it is given (a virtual dataset), for the dashboard: `description`'s
     prose and the build's marker as its last line, in `CreateDatasetCommand`'s own transaction, once for the marker:
     sent again, it answers the dataset the first one made (`_find_or_create`), before rc2 can refuse the table as
-    already holding one. A table that already has a dataset not made for this marker is answered `{"exists": true}`
-    when the caller may read the table, else as one that does not exist (`_dataset_creation_answer`; for a dataset in
-    the trash, `_twin_answer`, after the marker's lock is released). The dashboard must be readable and edited by the
-    caller. After the create commits, and on the found path, the dataset's editors are set under its row lock
-    (`_set_dataset_editors`); if that answers anything but `OK`, so does this tool, and a retry finds the marked
-    dataset and sets them again."""
+    already holding one. A caller who may not read the table (or what a virtual dataset's SQL reads) is answered
+    `{"not_found": "dataset"}`, with a dataset over the table, one in the trash, or none; a table that already has a
+    dataset not made for this marker, live or in the trash, is answered `{"exists": true}` only to a caller
+    Superset's own access check admits (`_dataset_creation_answer`, and `_twin_answer` after the marker's lock is
+    released). The dashboard must be readable and edited by the caller. After the create commits, and on the found
+    path, the dataset's editors are set under its row lock (`_set_dataset_editors`); if that answers anything but
+    `OK`, so does this tool, and a retry finds the marked dataset and sets them again."""
     if claim_marker(found["marker"], found["dashboard_id"]) is None:
         return BAD_MARKER
     dashboard = _dashboard(found["dashboard_id"])

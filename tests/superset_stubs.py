@@ -163,9 +163,9 @@ def install(monkeypatch) -> SimpleNamespace:
     `db.session`, which each command commits when its `run` returns and rolls back when it raises, as rc2's
     `@transaction` does; `rows`: the metadata database's dashboards and charts, by model name, to which each create
     command adds the row it makes; `create`: an exception a create command raises instead; `dataset_database`: the
-    database a dataset's create reads from its id; `twin`: the uuid of a dataset in the trash holding the table a
-    dataset's create names, or None; `security`: rc2's security manager as a dataset's create asks it, or None to
-    ask nothing) and what the tools did (`ran`: each command run, in order, with its arguments)."""
+    database a dataset's create reads from its id; `twin`: whether a dataset in the trash holds the table a dataset's
+    create names; `security`: rc2's security manager as a dataset's create asks it, or None to ask nothing) and what
+    the tools did (`ran`: each command run, in order, with its arguments)."""
     state = SimpleNamespace(chart_data={"queries": [{"data": [], "status": "success"}]}, delete=None, restore=None,
                             config_valid=True, mapped={"viz_type": "big_number_total", "metric": "count",
                                                        "_mcp_warnings": ["a sample warning"]},
@@ -174,7 +174,7 @@ def install(monkeypatch) -> SimpleNamespace:
                             user_subjects={}, charts={}, dashboards={}, datasets={}, session=None,
                             rows={"Dashboard": [], "Slice": [], "SqlaTable": []}, next_id=500,
                             dataset_database=SimpleNamespace(perm=None, get_default_catalog=lambda: None),
-                            twin=None, security=None)
+                            twin=False, security=None)
 
     class Db:
         @property
@@ -259,13 +259,13 @@ def install(monkeypatch) -> SimpleNamespace:
         return Command
 
     class CreateDatasetCommand:
-        """rc2's `CreateDatasetCommand` (`superset/commands/dataset/create.py`), its `validate` in rc2's order: the
-        database read from its id into the command's own copy of the properties (`_properties`), with the database's
-        default catalog when none is given; then uniqueness, where a dataset in the trash holding the table (`twin`)
-        raises `DatasetSoftDeletedTwinExistsError` at once, before access is checked; then access, asked as the
-        caller of `security.raise_for_access` with the arguments rc2 passes (the table, or `sql` with its catalog and
-        schema), a refusal listed as `DatasetDataAccessIsNotAllowed` and SQL it cannot parse as a `ValidationError`.
-        Then the dataset is made as every create command makes its row (`created`)."""
+        """rc2's `CreateDatasetCommand` (`superset/commands/dataset/create.py`), as far as the tools read it. Its
+        `validate` reads the database from its id into the command's own copy of the properties (`_properties`), with
+        the database's default catalog when none is given; refuses a table a dataset in the trash holds (`twin`) with
+        `DatasetSoftDeletedTwinExistsError`; and asks `security.raise_for_access`, as the caller and with the
+        arguments rc2 passes (the table, or `sql` with its catalog and schema), listing a refusal as
+        `DatasetDataAccessIsNotAllowed` and SQL it cannot parse as a `ValidationError`. Then the dataset is made as
+        every create command makes its row (`created`)."""
 
         def __init__(self, properties: dict) -> None:
             self.properties, self._properties = properties, properties.copy()
@@ -279,8 +279,8 @@ def install(monkeypatch) -> SimpleNamespace:
             if not catalog:
                 catalog = self._properties["catalog"] = database.get_default_catalog()
             schema, table_name, sql = (self._properties.get(key) for key in ("schema", "table_name", "sql"))
-            if state.twin is not None:
-                raise DatasetSoftDeletedTwinExistsError(state.twin)
+            if state.twin:
+                raise DatasetSoftDeletedTwinExistsError()
             if state.security is None:
                 return
             try:

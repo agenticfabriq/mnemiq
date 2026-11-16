@@ -1779,8 +1779,6 @@ def test_an_existing_table_dataset_answers_exists(lock_rows):
     assert commands(lock_rows.superset, "UpdateDatasetCommand") == []
 
 
-# A dataset in the trash, holding the table a create names.
-TWIN = "0d6f4a0e-2b1c-4c7e-9a51-3f8e6b2d7c19"
 SALES_SQL = "SELECT * FROM public.sales"
 # A dataset over a table, and one over SQL.
 SOURCES = [pytest.param({}, id="a table"), pytest.param({"table_name": "active_sales", "sql": SALES_SQL}, id="sql")]
@@ -1803,18 +1801,16 @@ def _access_rc2_asks(superset: SimpleNamespace, source: dict) -> dict:
 
 @pytest.mark.parametrize("source", SOURCES)
 def test_a_table_whose_dataset_is_in_the_trash_is_no_dataset_to_a_caller_who_may_not_read_it(lock_rows, source):
-    """rc2's `CreateDatasetCommand.validate` raises `DatasetSoftDeletedTwinExistsError` from its uniqueness check,
-    before it checks the caller's access to the table or to what a virtual dataset's SQL reads (the stand-in keeps
-    that order), so that error says nothing about access. A caller whose grants do not reach the table is answered
-    `{"not_found": "dataset"}`, as for the same table with no dataset in the trash (the control, where rc2's own
-    check refuses it), so the answer never says one is there. The check is the one the command skipped: as the
-    caller, with what the command resolved, once the marker's lock is released. Nothing more is written."""
+    """A caller who may not read the table (or what a virtual dataset's SQL reads) is answered
+    `{"not_found": "dataset"}` when a dataset in the trash holds the table, as when none does (the control): the
+    answer never says one is there. Its access is asked as the caller, with what the command resolved (the database
+    read from its id, its default catalog), once the marker's lock is released. Nothing more is written."""
     superset = lock_rows.superset
     superset.session = Metadata(superset, "mysql")
     superset.g.user = lock_rows.people["outsider"]
     assert make_dataset(**source) == {"not_found": "dataset"}
     superset.ran.clear()
-    superset.twin = TWIN
+    superset.twin = True
     assert make_dataset(**source) == {"not_found": "dataset"}
     ((_, user, asked),) = _asked_for_access(superset)
     assert user == "outsider" and asked == _access_rc2_asks(superset, source)
@@ -1825,10 +1821,10 @@ def test_a_table_whose_dataset_is_in_the_trash_is_no_dataset_to_a_caller_who_may
 
 @pytest.mark.parametrize("source", SOURCES)
 def test_a_table_whose_dataset_is_in_the_trash_exists_to_a_caller_who_may_read_it(lock_rows, source):
-    """The same twin, for a caller whose grants reach the table: `{"exists": true}`, the access asked as that caller.
+    """The same table, for a caller whose grants reach it: `{"exists": true}`, its access asked as that caller.
     Nothing more is written."""
     superset = lock_rows.superset
-    superset.twin = TWIN
+    superset.twin = True
     assert make_dataset(**source) == {"exists": True}
     ((_, user, asked),) = _asked_for_access(superset)
     assert user == "builder" and asked == _access_rc2_asks(superset, source)
@@ -1843,18 +1839,18 @@ def test_a_database_error_checking_access_over_a_table_whose_dataset_is_in_the_t
     """The access check reads Superset's metadata database, which may fail: answered as any database failure of the
     create is (`{"failed": true}`, or `{"busy": true}` for lock contention), never raised out of the tool."""
     lock_rows.security.fails = error
-    lock_rows.superset.twin = TWIN
+    lock_rows.superset.twin = True
     assert make_dataset() == answer
     assert len(_asked_for_access(lock_rows.superset)) == 1
     assert commands(lock_rows.superset, "UpdateDatasetCommand") == []
 
 
 def test_sql_rc2_cannot_parse_over_a_table_whose_dataset_is_in_the_trash_is_refused_as_invalid(lock_rows):
-    """SQL rc2 cannot parse, for which its access check answers neither yes nor no: refused as invalid, as the same
-    SQL is with no dataset in the trash (the control), so this answer does not say one is there either."""
+    """SQL whose access cannot be asked, because it does not parse: refused as invalid, as the same SQL is with no
+    dataset in the trash (the control), so this answer does not say one is there either."""
     lock_rows.security.unparseable = True
     assert make_dataset(table_name="active_sales", sql=SALES_SQL) == {"refused": "invalid"}
-    lock_rows.superset.twin = TWIN
+    lock_rows.superset.twin = True
     assert make_dataset(table_name="active_sales", sql=SALES_SQL) == {"refused": "invalid"}
     assert commands(lock_rows.superset, "UpdateDatasetCommand") == []
 
@@ -1864,11 +1860,9 @@ def test_sql_rc2_cannot_parse_over_a_table_whose_dataset_is_in_the_trash_is_refu
     pytest.param({"DatasetDataAccessIsNotAllowed", "DatasetExistsValidationError"},
                  id="a table the caller may not read that has a dataset")])
 def test_a_table_the_caller_may_not_read_is_answered_as_no_dataset(lock_rows, classnames):
-    """rc2 lists `DatasetDataAccessIsNotAllowed` when the caller may not read the table (or what a virtual dataset's
-    SQL reads), and `DatasetExistsValidationError` beside it when a dataset already holds the table. An object the
-    caller may not read is answered as one that does not exist: `{"not_found": "dataset"}`, with a dataset there or
-    without one, so the answer never tells the caller a dataset holds a table it may not read. Nothing more is
-    written."""
+    """A caller who may not read the table (or what a virtual dataset's SQL reads), refused with
+    `DatasetDataAccessIsNotAllowed`, is answered `{"not_found": "dataset"}`, with a dataset over the table or none:
+    an object the caller may not read is answered as one that does not exist. Nothing more is written."""
     from tests import superset_stubs as stubs_module
 
     lock_rows.superset.create = stubs_module.DatasetInvalidError(classnames)
