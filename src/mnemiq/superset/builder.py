@@ -484,9 +484,9 @@ def _candidates(ids: object, what: str) -> _Stop:
                                    "builder cannot read any of them, so this build cannot tell which is its own; ask "
                                    "an editor of them to remove the ones that are not wanted, and start the build "
                                    "again")
-    return _Stop("candidates", f"Superset holds {len(named)} objects carrying the marker of {what} "
-                               f"({', '.join(named)}), so this build cannot tell which is its own; remove the ones "
-                               "that are not wanted and start the build again")
+    return _Stop("candidates", f"Superset holds more than one object carrying the marker of {what}, so this build "
+                               f"cannot tell which is its own; of them, this builder can read {', '.join(named)}; "
+                               "remove the ones that are not wanted and start the build again")
 
 
 def _marker(build: StoredBuild, key: str, dashboard_id: int | None) -> str:

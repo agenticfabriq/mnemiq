@@ -692,6 +692,7 @@ def test_two_objects_carrying_the_steps_marker_stop_the_build_naming_them(fake, 
              for _ in range(2)]
     stopped = _next(store, build, _adapter(fake))
     assert stopped.status == "failed" and _step(stopped, "policies_by_region").reason == "candidates", stopped
+    assert "more than one object" in stopped.message, stopped.message
     assert all(str(chart_id) in stopped.message for chart_id in twins), stopped.message
     assert sorted(world.charts) == sorted(twins)
     later = build_state(store, store.load_build(TENANT, build, PRINCIPAL))
@@ -707,6 +708,20 @@ def test_candidates_this_builder_cannot_read_stop_the_build_saying_so(fake, worl
     stopped = _next(store, build, _adapter(fake))
     assert stopped.status == "failed" and _step(stopped, "policies_by_region").reason == "candidates", stopped
     assert "more than one" in stopped.message and "cannot read" in stopped.message, stopped.message
+    assert world.charts == {}
+
+
+def test_candidates_of_which_this_builder_reads_one_stop_the_build_naming_it(fake, world, store):
+    """Two objects carry the step's marker and this builder may read one (3): the extension names that one alone.
+    The step stops saying more than one object carries the marker, and naming the one it can read, never counting the
+    list as the objects Superset holds."""
+    build = _start(store, ONE_BAR).build_id
+    _run_to(store, build, _adapter(fake), "policies_by_region")
+    world.hooks["create_chart"] = Hook(instead=lambda request, _w: {"candidates": [3]})
+    stopped = _next(store, build, _adapter(fake))
+    assert stopped.status == "failed" and _step(stopped, "policies_by_region").reason == "candidates", stopped
+    assert "more than one object" in stopped.message and "can read 3" in stopped.message, stopped.message
+    assert "1 objects" not in stopped.message, stopped.message
     assert world.charts == {}
 
 

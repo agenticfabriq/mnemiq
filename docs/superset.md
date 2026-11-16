@@ -288,7 +288,8 @@ still to come. In short:
     id back; if not, it is made now. If Superset is still running the first create, the second waits for it to finish
     and answers with what it made; if it waits too long, the next `/next` asks again.
   - Only an object that carries the step's marker is ever taken as the step's own. A chart someone makes by hand with
-    the planned name is left alone. If two objects carry the same marker, the build stops and names them.
+    the planned name is left alone. If two objects carry the same marker, the build stops and names those the
+    builder can read.
 - **One build of a dashboard at a time.** While a build of a dashboard is building, starting another build of it is
   refused with a 409. A build left untouched for 20 minutes (twice the lease), with no step running, no longer holds
   its dashboard: the next build of that dashboard stops it, as abandoned, and takes the dashboard over.
