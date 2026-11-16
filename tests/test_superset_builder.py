@@ -471,6 +471,24 @@ def test_a_layout_raced_by_a_hand_edit_is_recomputed_once(fake, world, store):
     assert len(world.calls("set_layout")) == 2 and len(world.calls("get_layout")) == 2
 
 
+@pytest.mark.parametrize("tool", ["get_layout", "set_layout"])
+def test_a_layout_call_that_goes_unanswered_is_sent_again_at_once(fake, world, store, tool):
+    """A call of the layout step that Superset does not answer in time (the layout's read, or its save after Superset
+    saved it) leaves the step uncertain at once, nothing waiting on its lease: the next request, with no clock advance,
+    runs the step again to done, the layout saved once and the chart on the dashboard once."""
+    build = _start(store, ONE_BAR).build_id
+    _run_to(store, build, _adapter(fake), "layout")
+    ended = world.lose_answer(tool, hold_s=2)
+    lost = _next(store, build, _adapter(fake, timeout_s=1))
+    assert lost.ran == "layout" and _step(lost, "layout").status == "uncertain", lost
+    assert _step(lost, "layout").reason == "superset_silent"
+    again = _next(store, build, _adapter(fake))
+    assert again.ran == "layout" and _step(again, "layout").status == "done", again
+    chart = _step(again, "policies_by_region").object_id
+    assert world.dashboards[again.dashboard_id]["members"] == [chart]
+    assert len(world.calls("set_layout")) == 1 and ended.wait(10)
+
+
 def test_an_unreadable_layout_answer_is_a_failed_read(fake, world, store):
     """`get_layout` answering something that is not a layout reads as a layout that could not be read, never as a
     save that failed."""
