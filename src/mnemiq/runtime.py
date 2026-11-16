@@ -30,7 +30,8 @@ from mnemiq.semantic.ontology_index import OntologyIndex
 from mnemiq.sql.decide_write import decide_write
 from mnemiq.semantic.cards import build_cards
 from mnemiq.semantic.starters import compose_starters
-from mnemiq.semantic.values import NoValueIndex
+from mnemiq.semantic.definition_codes import stale_codes
+from mnemiq.semantic.values import NoValueIndex, ValueIndex, shown
 from mnemiq.sql.views import inventory_for
 from mnemiq.sql.policy import AccessPolicy, build_access_policy
 from mnemiq.sql.schema import visible_schema
@@ -240,6 +241,7 @@ class Runtime:
             # is a deployment property this repo cannot see.
             _warn_view_inventory(snapshot, _acknowledged(self.settings))
             _warn_cut_meaning(snapshot)
+            _warn_stale_codes(snapshot, self.con, self.authz, superset=self._superset_mode)
             for settings, profile in ([(lp.settings, lp.profile) for lp in self.profiles.values()] if self.profiles
                                       else [(self.settings, None)]):
                 _warn_prompt_window(settings, self.con, snapshot, getattr(self, "adapter", None),
@@ -778,6 +780,59 @@ def _warn_cut_meaning(snapshot: Snapshot | None) -> None:
         return
     for sentence in cut_meaning(snapshot):
         logger.warning("%s. Shorten it, or split it in two", sentence)
+
+
+def _row_filtered_tables(authz: AuthzProvider | None) -> set[str] | str:
+    """Every table some role of the policy reads through a row filter, or why that cannot be said.
+
+    From one read of the policy (`row_filtered_objects`), never from its roles and their grants read one by one: a
+    policy edited between those reads could pair one version's roles with another's filters. A provider that cannot
+    say, or a policy that cannot be read, is not one without row filters."""
+    read = getattr(authz, "row_filtered_objects", None)
+    if read is None:
+        return "the access policy's row filters cannot be listed"
+    tables = read()
+    if tables is None:
+        return "the access policy could not be read"
+    return set(tables)
+
+
+def _warn_stale_codes(snapshot: Snapshot | None, con, authz: AuthzProvider | None, *, superset: bool) -> None:
+    """Say, at load, each definition that names codes its column holds none of (`stale_codes`).
+
+    At boot and on a snapshot swap, beside the cut warning, because the snapshot's definitions are its subject. Not
+    acknowledgeable: the writer follows the definition, so until it is corrected every question it governs filters on a
+    value no row has.
+
+    The real values are quoted as the value check quotes them (`shown`, the few most like the code), except for a table
+    some role reads through a row filter, or under a policy that cannot be read or whose roles cannot be listed: the
+    value index is read without any filter, so listing them would show values from rows a role cannot read (M5), and
+    the line says why.
+
+    Superset mode harvests no values, so it judges nothing (`NoValueIndex`), as its writer is given none. An index that
+    cannot be read is said and skipped: an advisory never stops a boot, or a swap on a user's request."""
+    if snapshot is None:
+        return
+    try:
+        found = stale_codes(snapshot, NoValueIndex() if superset else ValueIndex(con))
+        filtered = _row_filtered_tables(authz) if found else set()
+    except Exception as exc:  # the index, the store or the policy unreadable: report and go on
+        logger.warning("definitions were not checked against the value index (%s: %s)", type(exc).__name__, exc)
+        return
+    from mnemiq.sql.qualify import names_one_object
+
+    for stale in found:
+        codes = ", ".join(repr(c) for c in stale.codes)
+        if isinstance(filtered, str):
+            held = (f"its values are not listed, because {filtered}, so a row filter may apply to it and the value "
+                    "index is read without one")
+        elif any(names_one_object(obj, filtered) for obj in stale.objects):
+            held = "its values are not listed, because a row filter applies to it and the value index is read without one"
+        else:
+            held = f"its values include: {', '.join(shown(v) for v in stale.nearest)}"
+        logger.warning("definition %r names %s for %s, which holds none of them; %s. A query that follows the "
+                       "definition filters on a value no row has: correct the definition",
+                       stale.term, codes, stale.column, held)
 
 
 def _warn_view_inventory(snapshot, acknowledged: frozenset[str]) -> None:
@@ -1324,6 +1379,7 @@ def build_runtime(settings: Settings) -> Runtime:
     # nothing to report, which is every deployment except a schema with no helpers.
     _warn_view_inventory(snapshot, _acknowledged(settings))
     _warn_cut_meaning(snapshot)
+    _warn_stale_codes(snapshot, con, _boot_authz, superset=superset)
     for profile_name, profile in profiles.items():
         if len(profiles) > 1:
             logger.info("the prompt window of profile %s:", profile_name)

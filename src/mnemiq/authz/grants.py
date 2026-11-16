@@ -103,6 +103,27 @@ class FileAuthzProvider:
         except (OSError, json.JSONDecodeError, KeyError, TypeError):
             return []
 
+    def row_filtered_objects(self) -> frozenset[str] | None:
+        """Every object some role of this policy reads through a row filter, from ONE read of the file.
+
+        For advisories that must not show a filtered table's values. One read, so a policy edited while it is
+        consulted cannot pair one version's roles with another's filters. None when the file cannot be read or does
+        not have the shape `grants_for` reads, which is not a policy without filters.
+        """
+        try:
+            with open(self._path) as fh:
+                roles = json.load(fh)["roles"]
+            objects: set[str] = set()
+            for granted in roles.values():
+                if isinstance(granted, dict):
+                    filters = granted.get("row_filters") or {}
+                    if not isinstance(filters, dict):
+                        return None
+                    objects.update(str(table) for table in filters)
+            return frozenset(objects)
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, AttributeError):
+            return None
+
     def grants_for(self, identity: IdentityContext) -> GrantSet:
         try:
             with open(self._path) as fh:
