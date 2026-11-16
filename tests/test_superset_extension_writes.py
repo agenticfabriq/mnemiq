@@ -2082,6 +2082,7 @@ def test_a_lock_lost_with_its_connection_is_not_released_on_a_fresh_one(request,
     unlock = PG_UNLOCK if dialect == "postgresql" else RELEASE_LOCK
     assert not [entry for entry in superset.ran if entry[2:3] == (unlock,) or entry[0] == "reconnect"], superset.ran
     holds = (HOLDS, {"marker": marker}) if dialect == "postgresql" else (MYSQL_HOLDS, {"name": _lock_name(marker)})
+    assert ("on", 1, *holds) in superset.ran, superset.ran
     at = superset.ran.index(("on", 1, *holds))
     assert superset.ran[at + 1:] == [("invalidate", 1), ("on", 1, "rollback"), ("rollback",), ("rollback",),
                                      ("close", 1)]
