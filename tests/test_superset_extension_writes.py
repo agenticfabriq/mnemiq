@@ -735,17 +735,24 @@ class _Connection:
     answering 0 (or the metadata's `got_lock`, when that is not 1, without taking the lock). The lock outlives the
     transaction it was taken in, as a session's lock does. The hold check answers whether this connection holds the
     marker's lock (`HOLDS`, Postgres: true or false; `MYSQL_HOLDS`, MySQL: 1 or 0), or the metadata's `holds_answer`
-    when a test set it (None among them, MySQL's NULL for a lock nobody holds). An unlock answers the metadata's
-    `released` (raised, when it is an exception; the database's own answer when it is None) and lets the lock go only
-    when that is 1. Invalidating the connection lets go whatever it holds, as closing a database session does
-    (`("invalidate", n)`); closing it while it still holds a lock leaves the lock held, as a pool's reset does, and
+    when a test set it (None among them, MySQL's NULL for a lock nobody holds; raised, when it is an exception, the
+    connection kept). An unlock answers the metadata's `released` (raised, when it is an exception), or else the
+    database's own answer: Postgres true when this database session holds the lock and false when it does not; MySQL 1
+    when it does, 0 when another session does, NULL when none does. It lets the lock go only when that is 1.
+
+    As SQLAlchemy 2.0's `Connection` does: a statement on a connection whose database session ended (`lost`) fails,
+    and the failure invalidates the connection (`("invalidate", n)`, `invalidated`); the next statement on an
+    invalidated connection quietly reconnects it (`("reconnect", n)`), to a fresh database session that holds nothing.
+    Invalidating the connection lets go whatever it holds, as closing a database session does, and invalidating it
+    again does nothing; closing it while it still holds a lock leaves the lock held, as a pool's reset does, and
     records it in the metadata's `leaked`."""
 
     def __init__(self, metadata: "Metadata", number: int) -> None:
         self.metadata, self.number = metadata, number
         self.timeout_s: float | None = None
         self.holding: str | None = None
-        self.lost = False  # its database session ended: every statement fails, and it holds no lock
+        self.lost = False  # its database session ended: its next statement fails, and it holds no lock
+        self.invalidated = False  # SQLAlchemy closed its database connection; the next statement reconnects
         metadata.log.append(("connect", number))
         metadata.opened.append(self)
 
@@ -765,9 +772,13 @@ class _Connection:
         self._log("commit")
 
     def execute(self, statement, parameters=None) -> SimpleNamespace:
+        if self.invalidated:  # SQLAlchemy's `_revalidate_connection`: a fresh pooled connection, a new session
+            self.metadata.log.append(("reconnect", self.number))
+            self.invalidated = self.lost = False
         self._log(statement, parameters)
         metadata = self.metadata
-        if self.lost:
+        if self.lost:  # SQLAlchemy finds the connection lost, invalidates it, and raises
+            self.invalidate()
             raise stubs.database_error("08006", invalidated=True)
         if metadata.lock_error is not None and statement in (PG_LOCK, GET_LOCK):
             raise metadata.lock_error
@@ -785,8 +796,10 @@ class _Connection:
             if answer == 1:
                 answer = int(self._take(parameters["name"], parameters["seconds"]))
         elif statement in (PG_UNLOCK, RELEASE_LOCK):
-            answer = self._release(statement)
+            answer = self._release(statement, parameters["marker" if statement == PG_UNLOCK else "name"])
         elif statement in (HOLDS, MYSQL_HOLDS):
+            if isinstance(metadata.holds_answer, BaseException):
+                raise metadata.holds_answer
             if metadata.holds_answer is not _UNSET:
                 answer = metadata.holds_answer
             elif statement == HOLDS:
@@ -810,12 +823,18 @@ class _Connection:
         self.holding = key
         return True
 
-    def _release(self, statement: str) -> Any:
+    def _release(self, statement: str, key: str) -> Any:
         answer = self.metadata.released
         if isinstance(answer, BaseException):
             raise answer
-        if answer is None:
-            answer = True if statement == PG_UNLOCK else 1  # Postgres answers a boolean, MySQL a number
+        if answer is None:  # the database's own answer: Postgres a boolean, MySQL a number or NULL
+            if statement == PG_UNLOCK:
+                answer = self.holding == key
+            elif self.holding == key:
+                answer = 1
+            else:
+                lock = self.metadata.locks.get(key)
+                answer = 0 if lock is not None and lock.locked() else None
         if answer == 1 and self.holding is not None:
             self._let_go()
         return answer
@@ -825,6 +844,9 @@ class _Connection:
         self.holding = None
 
     def invalidate(self) -> None:
+        if self.invalidated:  # SQLAlchemy's `invalidate` does nothing on a connection already invalidated
+            return
+        self.invalidated = True
         self.metadata.log.append(("invalidate", self.number))
         if self.holding is not None:
             self._let_go()
@@ -846,7 +868,8 @@ class Metadata:
     `got_lock` (what `GET_LOCK` answers without taking the lock, when not 1), `lock_error` (what the lock statement
     raises instead), `late_grant` (Postgres grants the lock just as its wait times out, and the statement still fails
     with 55P03, the lock held), `released` (what an unlock answers, or raises), `holds_answer` (what the hold check
-    answers instead of whether the connection holds the lock, when a test set it: None too), `pool_exhausted`
+    answers instead of whether the connection holds the lock, when a test set it: None too; or raises, the connection
+    kept), `pool_exhausted`
     (`engine.connect()` times out),
     `aborted` (the session's transaction is aborted, as Postgres aborts one a statement failed in: every statement fails
     with SQLSTATE 25P02 until a rollback), `gone` (the session's connection is gone: every statement fails, a rollback
@@ -2037,6 +2060,30 @@ def test_a_create_whose_lock_was_lost_before_its_command_makes_nothing_and_answe
     lock = PG_LOCK if dialect == "postgresql" else GET_LOCK
     assert [entry for entry in superset.ran if entry[0] == "connect" or entry[2:3] == (lock,)] == [
         ("connect", 1), ("on", 1, lock, ANY)]
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+@pytest.mark.parametrize("create", list(CREATES))
+def test_a_lock_lost_with_its_connection_is_not_released_on_a_fresh_one(request, caplog, create, dialect):
+    """The hold check's statement fails on the lock's lost connection, and SQLAlchemy invalidates that connection;
+    its next statement would reconnect it quietly, to a fresh pooled connection whose database session holds nothing,
+    where an unlock answers that it released nothing. So the release runs nothing on a connection already
+    invalidated: the lock went with its database session, and the loss is logged once, as the lost-lock warning. No
+    unlock statement, no reconnection (no second pooled connection taken), no "not released" warning; the connection is
+    closed, and every lock is free."""
+    superset, metadata = _lose_the_marker_lock_before_the_command(request, create, dialect)
+    make, _, marker, _ = CREATES[create]
+    with caplog.at_level("INFO", logger=writes.__name__):
+        assert make() == {"busy": True}
+    warnings = [record.getMessage() for record in caplog.records if record.levelname == "WARNING"]
+    assert warnings == [LOST], warnings
+    unlock = PG_UNLOCK if dialect == "postgresql" else RELEASE_LOCK
+    assert not [entry for entry in superset.ran if entry[2:3] == (unlock,) or entry[0] == "reconnect"], superset.ran
+    holds = (HOLDS, {"marker": marker}) if dialect == "postgresql" else (MYSQL_HOLDS, {"name": _lock_name(marker)})
+    at = superset.ran.index(("on", 1, *holds))
+    assert superset.ran[at + 1:] == [("invalidate", 1), ("on", 1, "rollback"), ("rollback",), ("rollback",),
+                                     ("close", 1)]
+    assert metadata.leaked == [] and _all_let_go(metadata)
 
 
 @pytest.mark.parametrize(("dialect", "answer"), [("postgresql", False), ("mysql", 0)])

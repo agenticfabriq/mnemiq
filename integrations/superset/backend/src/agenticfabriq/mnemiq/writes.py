@@ -647,9 +647,17 @@ def _release_marker_lock(connection: Any, dialect: str, marker: str) -> None:
     """Releases `marker`'s lock on `connection`. A session's lock outlives the rollback a pool's reset makes, so a
     release that raises, or does not answer that it released the lock, invalidates the connection: SQLAlchemy closes
     it rather than putting it back in the pool, and the database session ending ends the lock. Never raises, so an
-    exception the locked work raised is the one that goes on."""
+    exception the locked work raised is the one that goes on.
+
+    A connection SQLAlchemy has already invalidated (`connection.invalidated`: a statement on it found it lost, the
+    hold check's among them) runs nothing: its database session ended and the lock went with it, and the loss was
+    logged where it was found. A statement on it now would reconnect it quietly, to a fresh pooled connection whose
+    database session holds nothing, so the release would answer that it released nothing."""
     from sqlalchemy import text
 
+    if connection.invalidated:
+        logger.info("mnemiq extension: a marker's lock went with its lost connection; nothing to release")
+        return
     statement, key = ((_PG_UNLOCK, {"marker": marker}) if dialect == "postgresql"
                       else (_MYSQL_UNLOCK, {"name": _lock_name(marker)}))
     try:
