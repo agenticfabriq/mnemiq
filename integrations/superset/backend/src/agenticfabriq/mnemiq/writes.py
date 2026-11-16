@@ -11,8 +11,8 @@ Every tool keeps these rules:
   does a tool compare the `changed_on` its caller read, so of two racing writers the second waits, then sees the first
   one's `changed_on`, and answers `{"stale": true}`. `{"busy": true}` is for a lock-contention error
   (`superset/versioning/db_errors.py`, `is_lock_contention_error`), a wait past the lock timeout among them
-  (`lock_row`), and for a metadata connection lost mid-statement or not to be had from the pool (`_failed`): the
-  same request may be sent again. A database error outside a command is answered too, by the same rule, never raised
+  (`lock_row`), for a statement the metadata database canceled (its `statement_timeout`), and for a metadata
+  connection lost mid-statement or not to be had from the pool (`_failed`): the same request may be sent again. A database error outside a command is answered too, by the same rule, never raised
   out of the tool (`_answering`).
 - A create carrying a build's marker makes its object once (`_find_or_create`), so a create whose answer was lost may
   be sent again. Once the checks that refuse the caller pass, it takes one lock keyed by the marker, on a connection
@@ -370,12 +370,30 @@ def _from_lost_connection(exc: BaseException | None) -> bool:
                for found in _chain(exc))
 
 
+def _from_canceled_statement(exc: BaseException | None) -> bool:
+    """Whether `exc`'s chain (`_chain`) holds a Postgres statement the database canceled (SQLSTATE 57014,
+    query_canceled), as its `statement_timeout` cancels a lock wait longer than it: rc2's contention codes do not
+    hold 57014. The SQLSTATE is read from the driver's error as rc2's `is_lock_contention_error` reads it (`pgcode`,
+    or `sqlstate`)."""
+    from sqlalchemy.exc import DBAPIError
+
+    for found in _chain(exc):
+        driver = getattr(found, "orig", None) if isinstance(found, DBAPIError) else None
+        if driver is not None and (getattr(driver, "pgcode", None) or getattr(driver, "sqlstate", None)) == "57014":
+            return True
+    return False
+
+
 def _failed(tool: str, exc: BaseException) -> dict:
-    """The answer for a failure no rule above it names: `{"busy": true}` for a lost lock race (`_from_lock_contention`)
-    or a metadata connection lost or not to be had (`_from_lost_connection`), where the same request may be sent again
-    (a create finds what an earlier send made by its marker); else `{"failed": true}`."""
+    """The answer for a failure no rule above it names: `{"busy": true}` for a lost lock race (`_from_lock_contention`),
+    a statement the database canceled (`_from_canceled_statement`, a lock wait cut short by its `statement_timeout`
+    among them) or a metadata connection lost or not to be had (`_from_lost_connection`), where the same request may
+    be sent again (a create finds what an earlier send made by its marker); else `{"failed": true}`."""
     if _from_lock_contention(exc):
         logger.info("mnemiq extension: %s lost a lock race", tool)
+        return BUSY
+    if _from_canceled_statement(exc):
+        logger.info("mnemiq extension: %s had a statement canceled by the metadata database", tool)
         return BUSY
     if _from_lost_connection(exc):
         logger.warning("mnemiq extension: %s lost its metadata database connection", tool, exc_info=exc)

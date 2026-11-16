@@ -1940,6 +1940,28 @@ def test_a_last_look_that_cannot_run_answers_busy(request, create, moment):
     assert len(superset.rows[model]) == 1 and metadata.leaked == []
 
 
+@pytest.mark.parametrize("where", ["the marker lock's take", "the create lock", "a command"])
+def test_a_statement_the_database_canceled_answers_busy(creating, where):
+    """A metadata database whose `statement_timeout` is shorter than the lock timeout cancels a long wait with SQLSTATE
+    57014 rather than 55P03: at the marker lock's take, at the create's own transaction lock, or in a command's own
+    statements. Busy, as for a wait past the lock timeout, since the same create sent again is safe by its marker;
+    nothing is made. The control: another database error from a command answers failed."""
+    canceled = stubs.database_error("57014")
+    metadata, superset = creating.metadata, creating.superset
+    if where == "the marker lock's take":
+        metadata.lock_error = canceled
+    elif where == "the create lock":
+        metadata.fail_at[CREATE_LOCK] = (1, canceled)
+    else:
+        superset.create = stubs.CommandException("the statement was canceled")
+        superset.create.__cause__ = canceled
+    assert make_dashboard() == {"busy": True}
+    assert superset.rows["Dashboard"] == [] and metadata.leaked == []
+    if where == "a command":
+        superset.create.__cause__ = stubs.database_error("42883")
+        assert make_dashboard() == {"failed": True}
+
+
 def test_only_a_write_tool_answers_a_database_error(superset):
     """The boundary for database errors is the write tools' (`_answering`): the same failure in a read tool's body is
     raised as it was, and a non-database error is raised by both."""

@@ -100,10 +100,11 @@ answered `{"not_editor": true, "editors": [...]}` naming the dataset's editors: 
 Every write to an existing row first locks that row and compares the `changed_on` the caller read, so of two racing
 writers the second answers `{"stale": true}`. A write that waits for the row longer than `MNEMIQ_LOCK_TIMEOUT_S` answers
 `{"busy": true}` and changes nothing; the same request may be sent again. So does a write whose connection to the
-metadata database was lost mid-statement, or that found no free connection in the pool: it either did not write or
-cannot tell whether it did, and a create sent again finds what an earlier send made by its build marker. Any other
-database error is answered `{"failed": true}`; a write tool never raises one. Answers are short structured objects;
-Superset's own error text never reaches them.
+metadata database was lost mid-statement, that found no free connection in the pool, or whose statement the metadata
+database canceled (a `statement_timeout` shorter than the lock timeout cuts a wait short with SQLSTATE 57014): it either
+did not write or cannot tell whether it did, and a create sent again finds what an earlier send made by its build
+marker. Any other database error is answered `{"failed": true}`; a write tool never raises one. Answers are short
+structured objects; Superset's own error text never reaches them.
 
 A create carrying a build's marker (`create_dashboard`, `create_dataset`, `create_chart`) makes its object once, so a
 create whose answer was lost may be sent again. Once the caller passes the create's own checks (the request, the dataset
@@ -119,9 +120,10 @@ command, in the command's own transaction, the create takes a transaction's lock
 again, so if the first lock's connection was lost while the create worked (its lock goes with it), an object another
 send made meanwhile is still found and answered rather than made twice. On MySQL the named lock is the only guard: if
 its connection is lost while a create works, a second send of the create can make a second object. A wait for the lock
-longer than `MNEMIQ_LOCK_TIMEOUT_S`, no free connection in the metadata database's pool to take it on, or a look the
-metadata database cannot answer, answers `{"busy": true}`: the same request may be sent again. A create whose lock comes
-free more than 45 seconds after the create began (mnemiq's default deadline for a call) lets it go at once and answers
+longer than `MNEMIQ_LOCK_TIMEOUT_S` or cut short by the metadata database's `statement_timeout`, no free connection in
+the metadata database's pool to take it on, or a look the metadata database cannot answer (the first or the one just
+before the command), answers `{"busy": true}`: the same request may be sent again. A create whose lock comes free more
+than 45 seconds after the create began (mnemiq's default deadline for a call) lets it go at once and answers
 `{"busy": true}`, since mnemiq has by then stopped waiting for the answer and sends the create again. Where mnemiq is
 set to wait longer than 45 seconds for a call, such a create still answers busy, and is then sent again. While it waits
 for the lock and while it holds it, a create uses two of the metadata database's pooled connections. On any other
