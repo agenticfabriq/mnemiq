@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import sys
 import types
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 
@@ -24,6 +25,10 @@ class SupersetErrorException(SupersetException):
 
 class SupersetSecurityException(SupersetErrorException):
     pass
+
+
+class SupersetParseError(SupersetErrorException):
+    """rc2's error for SQL it cannot parse."""
 
 
 class QueryObjectValidationError(SupersetException):
@@ -131,6 +136,15 @@ def model(name: str) -> type:
                            "deleted_at": Column("deleted_at")})
 
 
+@dataclass(frozen=True)
+class Table:
+    """rc2's `Table` (`superset/sql/parse.py`): a table, with its schema and catalog when known."""
+
+    table: str
+    schema: str | None = None
+    catalog: str | None = None
+
+
 class SubjectType:
     """rc2's `SubjectType` (`superset/subjects/types.py`): what an editor subject stands for."""
 
@@ -148,8 +162,10 @@ def install(monkeypatch) -> SimpleNamespace:
     `charts`, `dashboards`, `datasets`: what `ChartDAO`, `DashboardDAO` and `DatasetDAO` find, by id; `session`:
     `db.session`, which each command commits when its `run` returns and rolls back when it raises, as rc2's
     `@transaction` does; `rows`: the metadata database's dashboards and charts, by model name, to which each create
-    command adds the row it makes; `create`: an exception a create command raises instead) and what the tools did
-    (`ran`: each command run, in order, with its arguments)."""
+    command adds the row it makes; `create`: an exception a create command raises instead; `dataset_database`: the
+    database a dataset's create reads from its id; `twin`: the uuid of a dataset in the trash holding the table a
+    dataset's create names, or None; `security`: rc2's security manager as a dataset's create asks it, or None to
+    ask nothing) and what the tools did (`ran`: each command run, in order, with its arguments)."""
     state = SimpleNamespace(chart_data={"queries": [{"data": [], "status": "success"}]}, delete=None, restore=None,
                             config_valid=True, mapped={"viz_type": "big_number_total", "metric": "count",
                                                        "_mcp_warnings": ["a sample warning"]},
@@ -157,7 +173,8 @@ def install(monkeypatch) -> SimpleNamespace:
                             update=None, create=None, ran=[], config={}, features=set(), g=SimpleNamespace(),
                             user_subjects={}, charts={}, dashboards={}, datasets={}, session=None,
                             rows={"Dashboard": [], "Slice": [], "SqlaTable": []}, next_id=500,
-                            dataset_database=SimpleNamespace(perm=None))
+                            dataset_database=SimpleNamespace(perm=None, get_default_catalog=lambda: None),
+                            twin=None, security=None)
 
     class Db:
         @property
@@ -177,8 +194,10 @@ def install(monkeypatch) -> SimpleNamespace:
             state.session.commit()
         return result
 
-    def created(model_name: str, command_name: str, properties: dict) -> SimpleNamespace:
+    def created(model_name: str, command_name: str, properties: dict, validate=None) -> SimpleNamespace:
         state.ran.append((command_name, properties))
+        if validate is not None:
+            validate()
         if state.create is not None:
             raise state.create
         state.next_id += 1
@@ -239,6 +258,41 @@ def install(monkeypatch) -> SimpleNamespace:
         Command.__name__ = name
         return Command
 
+    class CreateDatasetCommand:
+        """rc2's `CreateDatasetCommand` (`superset/commands/dataset/create.py`), its `validate` in rc2's order: the
+        database read from its id into the command's own copy of the properties (`_properties`), with the database's
+        default catalog when none is given; then uniqueness, where a dataset in the trash holding the table (`twin`)
+        raises `DatasetSoftDeletedTwinExistsError` at once, before access is checked; then access, asked as the
+        caller of `security.raise_for_access` with the arguments rc2 passes (the table, or `sql` with its catalog and
+        schema), a refusal listed as `DatasetDataAccessIsNotAllowed` and SQL it cannot parse as a `ValidationError`.
+        Then the dataset is made as every create command makes its row (`created`)."""
+
+        def __init__(self, properties: dict) -> None:
+            self.properties, self._properties = properties, properties.copy()
+
+        def run(self) -> SimpleNamespace:
+            return transaction(lambda: created("SqlaTable", "CreateDatasetCommand", self.properties, self.validate))
+
+        def validate(self) -> None:
+            database = self._properties["database"] = state.dataset_database
+            catalog = self._properties.get("catalog")
+            if not catalog:
+                catalog = self._properties["catalog"] = database.get_default_catalog()
+            schema, table_name, sql = (self._properties.get(key) for key in ("schema", "table_name", "sql"))
+            if state.twin is not None:
+                raise DatasetSoftDeletedTwinExistsError(state.twin)
+            if state.security is None:
+                return
+            try:
+                if sql:
+                    state.security.raise_for_access(database=database, sql=sql, catalog=catalog, schema=schema)
+                else:
+                    state.security.raise_for_access(database=database, table=Table(table_name, schema, catalog))
+            except SupersetSecurityException:
+                raise DatasetInvalidError({"DatasetDataAccessIsNotAllowed"}) from None
+            except SupersetParseError:
+                raise DatasetInvalidError({"ValidationError"}) from None
+
     class ValidationPipeline:
         @staticmethod
         def validate_request_with_warnings(request_data: dict) -> SimpleNamespace:
@@ -276,8 +330,8 @@ def install(monkeypatch) -> SimpleNamespace:
         "superset.commands.chart.create": {"CreateChartCommand": create_command("Slice", "CreateChartCommand")},
         "superset.commands.dashboard.create": {
             "CreateDashboardCommand": create_command("Dashboard", "CreateDashboardCommand")},
-        "superset.commands.dataset.create": {
-            "CreateDatasetCommand": create_command("SqlaTable", "CreateDatasetCommand")},
+        "superset.commands.dataset.create": {"CreateDatasetCommand": CreateDatasetCommand},
+        "superset.sql.parse": {"Table": Table},
         "superset.commands.dataset.update": {"UpdateDatasetCommand": command("UpdateDatasetCommand", "update")},
         "marshmallow": {"ValidationError": MarshmallowValidationError},
         "sqlalchemy": {"text": lambda sql: sql},
@@ -285,6 +339,7 @@ def install(monkeypatch) -> SimpleNamespace:
                            "TimeoutError": PoolTimeoutError},
         "superset.exceptions": {"SupersetException": SupersetException,
                                 "SupersetSecurityException": SupersetSecurityException,
+                                "SupersetParseError": SupersetParseError,
                                 "QueryObjectValidationError": QueryObjectValidationError},
         "superset.commands.exceptions": {"CommandException": CommandException,
                                          "CommandInvalidError": CommandInvalidError,

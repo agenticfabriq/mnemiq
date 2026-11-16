@@ -835,11 +835,25 @@ class Security:
     (`superset/security/manager.py`): `can_access` is a grant of the user's roles; `can_access_database` is
     all-datasource, all-database or database access, and `can_access_schema` that or schema access; `is_editor` is
     any of the user's subjects (its own, its roles', its groups') among the object's editors; and
-    `can_access_datasource` is `raise_for_access`'s datasource leg, which counts editorship. `judged` records each
-    user the checks were asked as."""
+    `can_access_datasource` is `raise_for_access`'s datasource leg, which counts editorship; `raise_for_access`, for
+    a table or a dataset's SQL on a database, admits the user whose grants reach the database. `judged` records each
+    user the checks were asked as, and `log` each `raise_for_access` asked."""
 
-    def __init__(self, g, raises_for: str | None = None) -> None:
+    def __init__(self, g, raises_for: str | None = None, log: list | None = None) -> None:
         self.g, self.raises_for, self.judged = g, raises_for, []
+        self.log = [] if log is None else log
+        self.unparseable = False
+
+    def raise_for_access(self, database=None, table=None, sql=None, catalog=None, schema=None) -> None:
+        """rc2's `raise_for_access` as `CreateDatasetCommand.validate` asks it, for a table or for a dataset's SQL:
+        `SupersetSecurityException` unless the user's grants reach the database, and `SupersetParseError` for SQL
+        when `unparseable` is set. Recorded in `log` with the user and every argument."""
+        self.log.append(("raise_for_access", self.g.user.username, {
+            "database": database, "table": table, "sql": sql, "catalog": catalog, "schema": schema}))
+        if sql is not None and self.unparseable:
+            raise stubs.SupersetParseError("the SQL does not parse")
+        if not self.can_access_database(database):
+            raise stubs.SupersetSecurityException("the table may not be read")
 
     def can_access(self, permission: str, view: str) -> bool:
         user = self.g.user
@@ -902,7 +916,7 @@ def claiming(monkeypatch, superset):
                               database=SimpleNamespace(perm=DATABASE_PERM),
                               editors=[people["creator"].subject, builder.subject, role_2])
     superset.dashboards, superset.datasets = {3: dashboard}, {4: dataset}
-    security = Security(superset.g)
+    security = superset.security = Security(superset.g, log=superset.ran)
     monkeypatch.setattr(writes, "_security", lambda: security)
     superset.session = Metadata(superset, "sqlite")
     locked = {"SqlaTable": dataset}
@@ -1599,7 +1613,7 @@ def making(claiming):
     """`claiming`'s dashboard (3) and people, and datasets the create commands add: a row the editors step locks is
     the one made, found by id."""
     superset = claiming.superset
-    superset.dataset_database = SimpleNamespace(perm=DATABASE_PERM)
+    superset.dataset_database = SimpleNamespace(perm=DATABASE_PERM, get_default_catalog=lambda: "warehouse")
     rows = superset.rows["SqlaTable"]
     stubs_lock = lambda model, entity_id: next((row for row in rows if row.id == entity_id), None)  # noqa: E731
     claiming.monkeypatch_lock = stubs_lock
@@ -1678,16 +1692,75 @@ def test_a_found_dataset_gets_its_editors_again(lock_rows, monkeypatch):
                                                               lock_rows.ids["database_reader"]]
 
 
-@pytest.mark.parametrize("raised", [
-    pytest.param(("DatasetInvalidError", {"DatasetExistsValidationError"}), id="a table that has a dataset"),
-    pytest.param(("DatasetSoftDeletedTwinExistsError", None), id="a table whose dataset is in the trash")])
-def test_an_existing_table_dataset_answers_exists(lock_rows, raised):
-    from tests import superset_stubs as stubs_module
-
-    name, classnames = raised
-    lock_rows.superset.create = (stubs_module.DatasetInvalidError(classnames) if classnames
-                                 else getattr(stubs_module, name)("twin"))
+def test_an_existing_table_dataset_answers_exists(lock_rows):
+    lock_rows.superset.create = stubs.DatasetInvalidError({"DatasetExistsValidationError"})
     assert make_dataset() == {"exists": True}
+    assert commands(lock_rows.superset, "UpdateDatasetCommand") == []
+
+
+# A dataset in the trash, holding the table a create names.
+TWIN = "0d6f4a0e-2b1c-4c7e-9a51-3f8e6b2d7c19"
+SALES_SQL = "SELECT * FROM public.sales"
+# A dataset over a table, and one over SQL.
+SOURCES = [pytest.param({}, id="a table"), pytest.param({"table_name": "active_sales", "sql": SALES_SQL}, id="sql")]
+
+
+def _asked_for_access(superset: SimpleNamespace) -> list:
+    return [entry for entry in superset.ran if entry[0] == "raise_for_access"]
+
+
+def _access_rc2_asks(superset: SimpleNamespace, source: dict) -> dict:
+    """What rc2's `CreateDatasetCommand.validate` asks `raise_for_access` for `make_dataset(**source)`: the database
+    read from its id, and the database's default catalog, as `validate` resolves them; the table, or the SQL with its
+    catalog and schema."""
+    database = superset.dataset_database
+    if "sql" in source:
+        return {"database": database, "table": None, "sql": SALES_SQL, "catalog": "warehouse", "schema": "public"}
+    return {"database": database, "table": stubs.Table("sales", "public", "warehouse"), "sql": None, "catalog": None,
+            "schema": None}
+
+
+@pytest.mark.parametrize("source", SOURCES)
+def test_a_table_whose_dataset_is_in_the_trash_is_no_dataset_to_a_caller_who_may_not_read_it(lock_rows, source):
+    """rc2's `CreateDatasetCommand.validate` raises `DatasetSoftDeletedTwinExistsError` from its uniqueness check,
+    before it checks the caller's access to the table or to what a virtual dataset's SQL reads (the stand-in keeps
+    that order), so that error says nothing about access. A caller whose grants do not reach the table is answered
+    `{"not_found": "dataset"}`, as for the same table with no dataset in the trash (the control, where rc2's own
+    check refuses it), so the answer never says one is there. The check is the one the command skipped: as the
+    caller, with what the command resolved, once the marker's lock is released. Nothing more is written."""
+    superset = lock_rows.superset
+    superset.session = Metadata(superset, "mysql")
+    superset.g.user = lock_rows.people["outsider"]
+    assert make_dataset(**source) == {"not_found": "dataset"}
+    superset.ran.clear()
+    superset.twin = TWIN
+    assert make_dataset(**source) == {"not_found": "dataset"}
+    ((_, user, asked),) = _asked_for_access(superset)
+    assert user == "outsider" and asked == _access_rc2_asks(superset, source)
+    kinds = _kinds(superset)
+    assert kinds.index("CreateDatasetCommand") < kinds.index("close") < kinds.index("raise_for_access")
+    assert commands(superset, "UpdateDatasetCommand") == []
+
+
+@pytest.mark.parametrize("source", SOURCES)
+def test_a_table_whose_dataset_is_in_the_trash_exists_to_a_caller_who_may_read_it(lock_rows, source):
+    """The same twin, for a caller whose grants reach the table: `{"exists": true}`, the access asked as that caller.
+    Nothing more is written."""
+    superset = lock_rows.superset
+    superset.twin = TWIN
+    assert make_dataset(**source) == {"exists": True}
+    ((_, user, asked),) = _asked_for_access(superset)
+    assert user == "builder" and asked == _access_rc2_asks(superset, source)
+    assert commands(superset, "UpdateDatasetCommand") == []
+
+
+def test_sql_rc2_cannot_parse_over_a_table_whose_dataset_is_in_the_trash_is_refused_as_invalid(lock_rows):
+    """SQL rc2 cannot parse, for which its access check answers neither yes nor no: refused as invalid, as the same
+    SQL is with no dataset in the trash (the control), so this answer does not say one is there either."""
+    lock_rows.security.unparseable = True
+    assert make_dataset(table_name="active_sales", sql=SALES_SQL) == {"refused": "invalid"}
+    lock_rows.superset.twin = TWIN
+    assert make_dataset(table_name="active_sales", sql=SALES_SQL) == {"refused": "invalid"}
     assert commands(lock_rows.superset, "UpdateDatasetCommand") == []
 
 

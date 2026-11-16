@@ -766,19 +766,53 @@ def create_dashboard(found: dict) -> dict:
 
 
 def _dataset_creation_answer(exc: Exception) -> dict:
-    """The answer for a dataset create's failure. A table the caller may not read, or a virtual dataset's SQL that
-    reads one (rc2 lists `DatasetDataAccessIsNotAllowed`), is answered as a dataset that does not exist, whatever rc2
-    lists beside it, so the answer never says whether a dataset already holds that table. Else `{"exists": true}` when
-    rc2 refuses the create because a dataset already holds the table (live, or in the trash as a twin), else
-    `_command_answer`'s."""
-    from superset.commands.dataset.exceptions import DatasetInvalidError, DatasetSoftDeletedTwinExistsError
+    """The answer for a dataset create's failure, but for a dataset in the trash holding the table (`_twin_answer`).
+    A table the caller may not read, or a virtual dataset's SQL that reads one (rc2 lists
+    `DatasetDataAccessIsNotAllowed`), is answered as a dataset that does not exist, whatever rc2 lists beside it, so
+    the answer never says whether a dataset already holds that table. Else `{"exists": true}` when rc2 refuses the
+    create because a live dataset already holds the table, else `_command_answer`'s."""
+    from superset.commands.dataset.exceptions import DatasetInvalidError
 
     listed = exc.get_list_classnames() if isinstance(exc, DatasetInvalidError) else []
     if "DatasetDataAccessIsNotAllowed" in listed:
         return _not_found("dataset")
-    if isinstance(exc, DatasetSoftDeletedTwinExistsError) or "DatasetExistsValidationError" in listed:
+    if "DatasetExistsValidationError" in listed:
         return EXISTS
     return _command_answer("create_dataset", exc, kind="dataset")
+
+
+def _twin_answer(command: Any) -> dict:
+    """The answer for a dataset's create that rc2 refused because a dataset in the trash holds its table
+    (`DatasetSoftDeletedTwinExistsError`). rc2's `CreateDatasetCommand.validate` raises that error from its uniqueness
+    check, before it checks the caller's access, so the error says nothing about access, and `{"exists": true}` would
+    tell a caller who may not read the table that a dataset holds it. So the check rc2 skipped is made here, as the
+    caller and as `validate` makes it: `raise_for_access` for the table, or for `sql` with its catalog and schema when
+    the request gives it, on what `validate` had resolved into the command's properties when it raised (the database
+    read from its id, the default catalog when none was given, a schema read from the SQL). A refusal is answered
+    `{"not_found": "dataset"}` and SQL rc2 cannot parse `{"refused": "invalid"}`, each as the same request is answered
+    with no dataset in the trash; else `{"exists": true}`."""
+    from superset.exceptions import SupersetParseError, SupersetSecurityException
+    from superset.sql.parse import Table
+
+    resolved = command._properties
+    database, catalog, schema, sql = (resolved.get(key) for key in ("database", "catalog", "schema", "sql"))
+    # rc2 checks uniqueness only on a database it found, and `raise_for_access` checks no table without one: an
+    # unchecked answer is never given.
+    if database is None:
+        return _not_found("dataset")
+    try:
+        if sql:
+            _security().raise_for_access(database=database, sql=sql, catalog=catalog, schema=schema)
+        else:
+            _security().raise_for_access(database=database, table=Table(resolved["table_name"], schema, catalog))
+    except SupersetSecurityException:
+        return _not_found("dataset")
+    except SupersetParseError:
+        logger.warning("mnemiq extension: create_dataset refused as invalid: its SQL does not parse")
+        return {"refused": "invalid"}
+    except _command_errors() as exc:
+        return _failed("create_dataset", exc)
+    return EXISTS
 
 
 def _set_dataset_editors(found: dict, dataset_id: int) -> dict:
@@ -807,10 +841,12 @@ def create_dataset(found: dict) -> dict:
     """A dataset over a table, or over `sql` when it is given (a virtual dataset), for the dashboard: `description`'s
     prose and the build's marker as its last line, in `CreateDatasetCommand`'s own transaction, once for the marker:
     sent again, it answers the dataset the first one made (`_find_or_create`), before rc2 can refuse the table as
-    already holding one. A table that already has a dataset not made for this marker is answered `{"exists": true}`.
-    The dashboard must be readable and edited by the caller. After the create commits, and on the found path, the
-    dataset's editors are set under its row lock (`_set_dataset_editors`); if that answers anything but `OK`, so does
-    this tool, and a retry finds the marked dataset and sets them again."""
+    already holding one. A table that already has a dataset not made for this marker is answered `{"exists": true}`
+    when the caller may read the table, else as one that does not exist (`_dataset_creation_answer`; for a dataset in
+    the trash, `_twin_answer`, after the marker's lock is released). The dashboard must be readable and edited by the
+    caller. After the create commits, and on the found path, the dataset's editors are set under its row lock
+    (`_set_dataset_editors`); if that answers anything but `OK`, so does this tool, and a retry finds the marked
+    dataset and sets them again."""
     if claim_marker(found["marker"], found["dashboard_id"]) is None:
         return BAD_MARKER
     dashboard = _dashboard(found["dashboard_id"])
@@ -819,21 +855,28 @@ def create_dataset(found: dict) -> dict:
     if not _security().is_editor(dashboard):
         return _not_editor(dashboard)
     from superset.commands.dataset.create import CreateDatasetCommand
+    from superset.commands.dataset.exceptions import DatasetSoftDeletedTwinExistsError
     from superset.connectors.sqla.models import SqlaTable
 
     properties = {"database": found["database_id"], "schema": found["schema"], "table_name": found["table_name"],
                   "description": with_marker(found["description"], found["marker"])}
     if found["sql"] is not None:
         properties["sql"] = found["sql"]
+    command = CreateDatasetCommand(properties)
 
     def create() -> dict:
         try:
-            dataset = CreateDatasetCommand(properties).run()
+            dataset = command.run()
+        except DatasetSoftDeletedTwinExistsError:
+            raise  # answered by the caller's access, once the marker's lock is released (`_twin_answer`)
         except _command_errors() as exc:
             return _dataset_creation_answer(exc)
         return {"dataset_id": dataset.id}
 
-    answer = _find_or_create(SqlaTable, found["marker"], kind="dataset", create=create)
+    try:
+        answer = _find_or_create(SqlaTable, found["marker"], kind="dataset", create=create)
+    except DatasetSoftDeletedTwinExistsError:
+        return _twin_answer(command)
     if "dataset_id" not in answer:
         return answer
     editors = _set_dataset_editors(found, answer["dataset_id"])
