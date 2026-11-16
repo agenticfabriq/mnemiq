@@ -22,11 +22,11 @@ Every tool keeps these rules:
   before the command, the command's own transaction also takes a second lock (on Postgres a transaction's lock on
   another key of the marker; on MySQL the lock of the row the create is made under, its dashboard's or the caller's
   own user row), looks again, and confirms on the lock's own connection that the marker's lock is still held
-  (`_guarded_look`), and a create about to answer anything but its object or busy does the same again first (the
-  settle, `_settled`): a marker's lock lost with its connection lets no second object be made and no refusal stand,
-  and a create that lost it answers `{"busy": true}` and makes nothing. A wait past the lock timeout, a lock granted
-  only after mnemiq's deadline for the call, or a look the metadata database cannot answer, answers `{"busy": true}`.
-  A SQLite metadata database takes no such lock.
+  (`_guarded_look`), and a create about to answer anything but its object or busy, or to raise, does the same again
+  first (the settle, `_settled`): a marker's lock lost with its connection lets no second object be made and no
+  refusal stand, and a create that lost it answers `{"busy": true}` and makes nothing. A wait past the lock timeout, a
+  lock granted only after mnemiq's deadline for the call, or a look the metadata database cannot answer, answers
+  `{"busy": true}`. A SQLite metadata database takes no such lock.
 - Its answer is short and structured. Superset's own text never reaches it: any of Superset's exceptions is logged
   here and answered by its kind.
 - A caller who is not an editor of the object is told so before anything about the object's state (a stale
@@ -846,8 +846,8 @@ def _guarded_look(model: type, marker: str, *, kind: str, held: _HeldLock | None
     """Under a second lock, in the session's transaction: the answer for the objects of `model` that `marker` names,
     looked for again; else `{"busy": true}` when the marker's lock (`held`) is no longer held; else None. It runs
     twice: just before the create's command, in the command's own transaction, where None lets the command run; and
-    in the settle (`_settled`), before any other answer of the create but its object or busy is let go, where None
-    keeps that answer.
+    in the settle (`_settled`), before any other answer of the create but its object or busy, or anything it raised,
+    is let go, where None keeps that answer.
 
     A create may make its object, or answer a refusal, only while it has held its marker's lock without a break since
     its look, and it confirms this here, under a second lock it holds until its transaction ends (`_take_create_lock`:
@@ -899,21 +899,23 @@ def _settled(create: Callable[[Callable[[], dict | None]], dict], guard: Callabl
     """`create(guard)`'s answer, settled: an answer other than the object (`{"<kind>_id": id}`) or `{"busy": true}`
     is let go only once `guard` (the create's `_guarded_look`) has run again, after the session is rolled back. Its
     answer, when it has one (an object another send made, or busy for a lock lost or a look that cannot run), replaces
-    the create's; None (nothing found, the lock held) keeps it. A database error `create` raises is settled the same
-    way: `guard`'s answer, the error it replaces logged as a warning, or else the error, raised on to the write tool's
-    boundary (`_answering`), which logs it. The rollback ends a transaction rc2's checks may have left aborted, which
-    no statement of the guarded look could run in. Anything else `create` raises goes on unsettled."""
+    the create's; None (nothing found, the lock held) keeps it. Whatever `create` raises is settled the same way: a
+    database error, a refusal rc2's command raises rather than answers (a dataset's `DatasetSoftDeletedTwinExistsError`,
+    which the tool answers once the marker's lock is let go), or any other exception. `guard`'s answer replaces it,
+    the exception logged as a warning with it; or else the exception is raised on, a database error to the write
+    tool's boundary (`_answering`), which logs it. The rollback ends a transaction rc2's checks may have left aborted,
+    which no statement of the guarded look could run in."""
     from sqlalchemy.exc import SQLAlchemyError
 
     session = _session()
     try:
         answer = create(guard)
-    except SQLAlchemyError as exc:
+    except Exception as exc:
         with contextlib.suppress(SQLAlchemyError):
             session.rollback()
         if (settled := guard()) is not None:
-            logger.warning("mnemiq extension: a %s create's database error was settled: answered what its settle "
-                           "found", kind, exc_info=exc)
+            logger.warning("mnemiq extension: a %s create's error was settled: answered what its settle found", kind,
+                           exc_info=exc)
             return settled
         raise
     if f"{kind}_id" in answer or answer == BUSY:
@@ -947,15 +949,15 @@ def _find_or_create(model: type, marker: str, *, kind: str, started: float, row:
     says why, and so does one granted after mnemiq's deadline for the call, counted from `started`, the tool's start.
 
     Before `then`, `create(guard)`'s answer is settled (`_settled`): any answer but the object or busy (a refusal of
-    rc2's checks or of the command, a failure) and any database error `create` raises is let go only after the
+    rc2's checks or of the command, a failure) and anything `create` raises (a database error; a refusal the command
+    raises rather than answers, a dataset's `DatasetSoftDeletedTwinExistsError` among them) is let go only after the
     guarded look has run again, under the second lock, which another send holds from its own guarded look through its
     command's commit. So a refusal is answered once the settle finds no object, with the lock still held; an object
     another send made meanwhile is answered instead (a dataset's editors then set by `then`), and a lock lost
     meanwhile answers busy. A refusal never stands while another send of the marker is making the object, which the
-    lock alone cannot promise once its connection was lost. The first look's answers, and any other exception
-    `create` raises (`DatasetSoftDeletedTwinExistsError`, which the command raised after a guarded look that passed,
-    among them), are not settled. On SQLite, which takes no marker lock (`held` None), nothing is settled: there is
-    no lock to look again under."""
+    lock alone cannot promise once its connection was lost. The first look's answers are not settled, nor is what
+    `then` answers (a dataset's editors step), which runs once the object exists. On SQLite, which takes no marker
+    lock (`held` None), nothing is settled: there is no lock to look again under."""
     try:
         with _marker_lock(marker, started) as held:
             try:
@@ -1190,7 +1192,7 @@ def create_dataset(found: dict) -> dict:
     virtual dataset's SQL reads) is answered `{"not_found": "dataset"}`, with a dataset over the table, one in the
     trash, or none; a table that already has a dataset not made for this marker, live or in the trash, is answered
     `{"exists": true}` only to a caller Superset's own access check admits (`_dataset_creation_answer`, and
-    `_twin_answer` after the marker's lock is released). The dashboard must be readable and edited by the caller,
+    `_twin_answer` after the settle and once the marker's lock is released). The dashboard must be readable and edited by the caller,
     which is checked before the lock. After the create commits, and on the found path, the dataset's editors are set
     under its row lock (`_set_dataset_editors`), still under the marker's lock; if that answers anything but `OK`, so
     does this tool, and a retry finds the marked dataset and sets them again."""
@@ -1219,7 +1221,7 @@ def create_dataset(found: dict) -> dict:
         try:
             dataset = command.run()
         except DatasetSoftDeletedTwinExistsError:
-            raise  # answered by the caller's access, once the marker's lock is released (`_twin_answer`)
+            raise  # settled, then answered by the caller's access once the marker's lock is released (`_twin_answer`)
         except _command_errors() as exc:
             return _dataset_creation_answer(exc)
         return {"dataset_id": dataset.id}

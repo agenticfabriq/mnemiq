@@ -124,11 +124,11 @@ lock's connection was lost while the create worked (its lock goes with it), an o
 found and answered rather than made twice, and a create whose lock was lost answers `{"busy": true}` and makes
 nothing: it never takes the lost lock again, and the extension logs a warning that the marker's lock was lost while
 the create worked. When Superset's checks or the create's command answer anything but the object (a refusal or a
-failure), or raise a database error, the create first takes the second lock and looks once more, with the hold check
-(the settle), so that answer never stands while another send of the marker is making the object: it answers that
-object instead, or `{"busy": true}` when its own lock was lost. Two answers of a dataset's create are given without a
-settle: `{"exists": true}` for a table whose dataset is in the trash, answered by the caller's access once the
-marker's lock is let go, and the answer of setting the editors of a dataset already made or found. On MySQL the
+failure), or raise anything (a database error, or a refusal such as the one for a table whose dataset is in the
+trash, which is answered by the caller's access once the marker's lock is let go), the create first takes the second
+lock and looks once more, with the hold check (the settle), so that answer never stands while another send of the
+marker is making the object: it answers that object instead, or `{"busy": true}` when its own lock was lost. Only the
+answers of setting the editors of a dataset already made or found are given without a settle. On MySQL the
 second lock is a row lock: the dashboard's row for a chart or a dataset, and the caller's own user row for a
 dashboard. It is held from just before the command to its commit, so an edit of that dashboard, another create on it
 (or another dashboard create by that person) waits for it, and a wait longer than the database's own lock wait timeout

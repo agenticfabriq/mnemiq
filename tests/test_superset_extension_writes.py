@@ -1522,9 +1522,10 @@ def test_a_contended_marker_lock_answers_busy(creating):
 def test_mysql_takes_and_releases_a_named_lock(creating, dialect):
     """A MySQL named lock belongs to a connection, not a transaction, so it is taken and released on a connection of
     its own, never the session's, held from before the look until after the create's commit, and released also when
-    the create raises, the create's own exception going on. Its name is built in Python from the marker: 63
-    characters, inside MySQL's 64. Just before its command the create locks the caller's own user row and asks its
-    lock's connection whether it still holds the named lock (`guarded`), MariaDB's dialect as MySQL's."""
+    the create raises, the create's own exception going on once the settle has found nothing. Its name is built in
+    Python from the marker: 63 characters, inside MySQL's 64. Just before its command the create locks the caller's own
+    user row and asks its lock's connection whether it still holds the named lock (`guarded`), MariaDB's dialect as
+    MySQL's."""
     creating.on(dialect)
     assert len(_lock_name(SHELL)) == 63
     made = make_dashboard()
@@ -1539,7 +1540,8 @@ def test_mysql_takes_and_releases_a_named_lock(creating, dialect):
         make_dashboard()
     assert creating.superset.ran == [
         *taken(dialect, SHELL, 2), ("isolation",), ("lookup", "Dashboard"), *guarded("dashboard", dialect, 2),
-        ("CreateDashboardCommand", ANY), ("rollback",), ("rollback",), *let_go(dialect, SHELL, 2)]
+        ("CreateDashboardCommand", ANY), ("rollback",), ("rollback",), *guarded("dashboard", dialect, 2),
+        ("rollback",), *let_go(dialect, SHELL, 2)]
 
 
 @pytest.mark.parametrize(("configured", "seconds"), [(2.5, 2), (0.5, 1), (44.9, 44)])
@@ -2695,6 +2697,10 @@ def test_a_refusal_after_its_own_lock_was_lost_answers_busy(creating, monkeypatc
     assert creating.metadata.held_xact == [] and creating.metadata.leaked == []
 
 
+# What the settle logs when what a create raised is replaced by what the settle found, for each kind of object.
+SETTLED = "mnemiq extension: a {} create's error was settled: answered what its settle found"
+
+
 @pytest.mark.parametrize("made_meanwhile", [pytest.param(True, id="another send made the chart meanwhile"),
                                             pytest.param(False, id="nothing made, the lock held")])
 def test_a_database_error_in_a_creates_checks_is_settled_before_it_is_answered(creating, monkeypatch, caplog,
@@ -2724,8 +2730,7 @@ def test_a_database_error_in_a_creates_checks_is_settled_before_it_is_answered(c
     carrying = [(record.levelname, record.getMessage()) for record in caplog.records
                 if record.exc_info and record.exc_info[1] is error]
     if made_meanwhile:
-        assert carrying == [("WARNING", "mnemiq extension: a chart create's database error was settled: answered "
-                                        "what its settle found")], caplog.records
+        assert carrying == [("WARNING", SETTLED.format("chart"))], caplog.records
     else:
         assert carrying == [("WARNING", "mnemiq extension: create_chart failed")], caplog.records
     assert commands(superset) == [] and metadata.leaked == []
@@ -2763,6 +2768,50 @@ def test_a_dataset_the_settle_finds_gets_its_editors_set(lock_rows):
     assert _sent_editors(superset, "UpdateDatasetCommand") == [
         ids["creator"], ids["builder"], 302, ids["reader"], ids["database_reader"]]
     assert _kinds(superset).index("CreateDatasetCommand") < _kinds(superset).index("UpdateDatasetCommand")
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+def test_a_raised_twin_refusal_answers_the_dataset_a_settle_finds(lock_rows, caplog, dialect):
+    """rc2's dataset command refuses a table a dataset in the trash holds by raising
+    (`DatasetSoftDeletedTwinExistsError`), which the tool answers by the caller's access once the marker's lock is let
+    go (`_twin_answer`). The settle covers whatever a create raises, this refusal among it. A dataset create passes its
+    guarded look, and then its marker lock's connection ends; its command raises the refusal, and once that command
+    has rolled back (letting the second lock go), another send of the create, holding the lost lock, commits the
+    step's dataset. The first send's settle finds that dataset and answers it, with its editors set; the refusal it
+    replaces is logged as a warning carrying it, and the caller's access to the table is never asked."""
+    superset, dataset, ids = lock_rows.superset, lock_rows.dataset, lock_rows.ids
+    metadata = superset.session = Metadata(superset, dialect)
+    superset.twin = True
+    dataset.deleted_at, dataset.description = None, DATA
+
+    def lost_after_the_hold_check() -> None:
+        metadata.drop_lock_connections()
+        metadata.before_create_lock = lambda: superset.rows["SqlaTable"].append(dataset)
+
+    metadata.after_hold_check = lost_after_the_hold_check
+    with caplog.at_level("WARNING", logger=writes.__name__):
+        assert make_dataset() == {"dataset_id": 4}
+    assert _asked_for_access(superset) == []
+    assert _sent_editors(superset, "UpdateDatasetCommand") == [
+        ids["creator"], ids["builder"], 302, ids["reader"], ids["database_reader"]]
+    assert [(record.levelname, record.getMessage()) for record in caplog.records if record.exc_info
+            and type(record.exc_info[1]).__name__ == "DatasetSoftDeletedTwinExistsError"] == [
+        ("WARNING", SETTLED.format("dataset"))]
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+def test_a_raised_twin_refusal_the_settle_keeps_is_answered_by_the_callers_access(lock_rows, dialect):
+    """The control: the same refusal, the marker's lock held throughout and no dataset made meanwhile. The settle runs
+    after the command's rollback (the second lock, the look, the hold check) and finds nothing, so the refusal goes on:
+    once the marker's lock is let go it is answered by the caller's access to the table, `{"exists": true}` for a
+    caller whose grants reach it, as without the settle. Nothing more is written."""
+    superset = lock_rows.superset
+    superset.session = Metadata(superset, dialect)
+    superset.twin = True
+    assert make_dataset() == {"exists": True}
+    assert _after(superset, "CreateDatasetCommand") == [("rollback",), *settled("dataset", dialect=dialect),
+                                                        ("raise_for_access", "builder", ANY)]
+    assert commands(superset, "UpdateDatasetCommand") == []
 
 
 @pytest.mark.parametrize("kind", ["config chart", "funnel chart", "physical dataset"])
