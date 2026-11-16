@@ -737,13 +737,25 @@ def test_histogram_check_context_selects_the_groups_then_the_column():
     assert query["columns"] == ["region", "amount"]
     assert "metrics" not in query  # a plain row select, as the histogram's own `buildQuery` sends none
     assert query["filters"] == [WEST_Q]
-    assert "post_processing" not in query
+    assert query["post_processing"] == [{"operation": "histogram", "options": {
+        "column": "amount", "groupby": ["region"], "bins": 10, "cumulative": False, "normalize": False}}]
     assert json.loads(json.dumps(context)) == context
 
 
 def test_histogram_check_context_selects_the_column_alone_without_groups():
     (query,) = ext.histogram_check_context({"viz_type": "histogram_v2", "column": "amount"}, DATASET)["queries"]
     assert query["columns"] == ["amount"] and "metrics" not in query and query["filters"] == []
+
+
+@pytest.mark.parametrize("bins, parsed", [("absent", 5), ("12", 12), ("x", 5), (7.0, 7)])
+def test_histogram_check_context_reads_bins_as_the_operator_does(bins, parsed):
+    """`histogramOperator`: `Number(bins)`, or 5 where that is NaN; a missing `bins` is NaN."""
+    form = {"viz_type": "histogram_v2", "column": "amount", "cumulative": True, "normalize": True, "bins": bins}
+    if bins == "absent":
+        form.pop("bins")
+    (query,) = ext.histogram_check_context(form, DATASET)["queries"]
+    assert query["post_processing"] == [{"operation": "histogram", "options": {
+        "column": "amount", "groupby": [], "bins": parsed, "cumulative": True, "normalize": True}}]
 
 
 _COUNT_ALL = [{"expressionType": "SQL", "sqlExpression": "COUNT(*)", "label": "COUNT(*)"}]

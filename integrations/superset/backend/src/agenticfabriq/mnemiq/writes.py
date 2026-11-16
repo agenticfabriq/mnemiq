@@ -1135,7 +1135,11 @@ def _config_form(found: dict, dataset: Any) -> tuple[str, dict, dict | None] | d
         "dataset_id": dataset_id, "config": found["config"], "chart_name": found["slice_name"], "save_chart": True})
     if not validated.is_valid or validated.request is None:
         return {"refused": "config"}
-    form_data = map_config_to_form_data(validated.request.config, dataset_id=dataset_id)
+    try:
+        # A plugin's `post_map_validate` refuses by raising ValueError, as a histogram's does a non-numeric column.
+        form_data = map_config_to_form_data(validated.request.config, dataset_id=dataset_id)
+    except ValueError:
+        return {"refused": "config"}
     form_data.pop("_mcp_warnings", None)
     form_data.update(found["set"])
     viz_type = form_data.get("viz_type")

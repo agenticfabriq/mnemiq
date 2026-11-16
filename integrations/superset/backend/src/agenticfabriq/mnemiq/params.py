@@ -614,10 +614,30 @@ def query_context(viz_type: str, params: Mapping, datasource_id: int) -> dict | 
     return json.loads(json.dumps(context))
 
 
+def _histogram_operator(form_data: Mapping, column: Any, groups: list) -> dict:
+    """`histogramOperator` (`.../src/operators/histogramOperator.ts`): `bins` as `Number(bins)`, or 5 where that is
+    NaN (a missing one included); the column and groups by label; `cumulative` and `normalize` as the form data has
+    them (JSON drops an undefined one)."""
+    try:
+        bins = float(form_data["bins"]) if "bins" in form_data else float("nan")
+    except (TypeError, ValueError):
+        bins = float("nan")
+    if bins != bins:
+        bins = 5
+    elif bins == int(bins):
+        bins = int(bins)
+    options = {"column": _column_label(column), "groupby": [_column_label(g) for g in groups], "bins": bins}
+    for key in ("cumulative", "normalize"):
+        if key in form_data:
+            options[key] = form_data[key]
+    return {"operation": "histogram", "options": options}
+
+
 def histogram_check_context(form_data: Mapping, datasource_id: int) -> dict:
     """The query context the extension runs to check a histogram (`histogram_v2`) before it is saved: the observations
-    and their grouping columns, the form data's `groupby` then its `column`, no post-processing, under the form data's
-    filters, read as the other families' queries read them. Its metrics are the histogram's own `buildQuery`'s: none
+    and their grouping columns, the form data's `groupby` then its `column`, under the form data's filters, read as
+    the other families' queries read them, with the histogram operator the chart's own query carries (so a column
+    that holds non-numeric values fails the check, as it fails the chart). Its metrics are the histogram's own `buildQuery`'s: none
     (a plain row select), or `COUNT(*)` when an adhoc filter's clause is HAVING, so a HAVING filter has an aggregate
     to hold. rc2's own compile check leaves a histogram's column out of its query, which it builds from metrics and
     groupby, because the histogram names its column under `column` alone. Not a chart's saved query context. Raises ValueError for a bad `datasource_id`, for form data
@@ -634,6 +654,7 @@ def histogram_check_context(form_data: Mapping, datasource_id: int) -> dict:
     query = {"columns": _dedupe([*groups, column], _column_label), "filters": filters, "extras": extras}
     if any(isinstance(f, Mapping) and f.get("clause") == "HAVING" for f in _ensure_list(form_data.get("adhoc_filters"))):
         query["metrics"] = [{"expressionType": "SQL", "sqlExpression": "COUNT(*)", "label": "COUNT(*)"}]
+    query["post_processing"] = [_histogram_operator(form_data, column, groups)]
     context = {
         "datasource": {"id": datasource_id, "type": "table"},
         "force": False,

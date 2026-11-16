@@ -309,6 +309,8 @@ def install(monkeypatch) -> SimpleNamespace:
 
     def map_config_to_form_data(config: dict, dataset_id=None) -> dict:
         state.ran.append(("map", config, dataset_id))
+        if isinstance(state.mapped, BaseException):
+            raise state.mapped
         return copy.deepcopy(state.mapped)
 
     def _compile_chart(form_data: dict, dataset_id: int) -> SimpleNamespace:

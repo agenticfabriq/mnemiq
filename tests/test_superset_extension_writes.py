@@ -2455,6 +2455,27 @@ def test_a_histograms_check_selects_its_column_its_groups_under_its_filters(crea
     assert query["filters"] == [{"col": "region", "op": "==", "val": "West"}]
     assert query["row_limit"] == writes._CHART_ROW_LIMIT_PROBE
     assert context["result_type"] == "full"
+    assert query["post_processing"] == [{"operation": "histogram", "options": {
+        "column": "amount", "groupby": ["region"], "bins": 10, "cumulative": False, "normalize": False}}]
+
+
+def test_a_mapping_a_plugin_refuses_is_refused_as_config(creating):
+    """rc2's `map_config_to_form_data` raises ValueError when a plugin's `post_map_validate` refuses (a histogram's
+    non-numeric column; the mapping runs before the viz type is known, so any family): refused under the marker's lock, after the look; nothing is made."""
+    creating.superset.mapped = ValueError("the column is not numeric")
+    assert make_from_config() == {"refused": "config"}
+    ran = creating.superset.ran
+    assert ran[:8] == [*taken("postgresql", STEP), *looked("postgresql", "Slice")]
+    assert ran[-3:] == [("rollback",), *let_go("postgresql", STEP)]
+    assert commands(creating.superset) == [] and "chart_data" not in _kinds(creating.superset)
+
+
+def test_a_histogram_whose_post_processing_raises_is_refused_and_nothing_is_made(creating):
+    """A populated non-numeric column: the histogram operator raises ValueError on the probe's rows."""
+    creating.superset.mapped = copy.deepcopy(HISTOGRAM_FORM)
+    creating.superset.chart_data = ValueError("Column 'amount' contains non-numeric values")
+    assert make_from_config() == {"refused": "query_failed"}
+    assert commands(creating.superset) == []
 
 
 def test_a_histogram_whose_check_fails_is_refused_and_nothing_is_made(creating):
