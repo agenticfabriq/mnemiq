@@ -785,25 +785,16 @@ def _warn_cut_meaning(snapshot: Snapshot | None) -> None:
 def _row_filtered_tables(authz: AuthzProvider | None) -> set[str] | str:
     """Every table some role of the policy reads through a row filter, or why that cannot be said.
 
-    A file policy that cannot be read lists no roles, which is not a policy without row filters: its grants say so
-    (`available` false), and so does each role's if the file breaks between reads."""
-    roles = getattr(authz, "policy_roles", None)
-    if roles is None:
-        return "the access policy's roles cannot be listed"
-    from mnemiq.contract import IdentityContext
-
-    def grants(names: list[str]):
-        return authz.grants_for(IdentityContext(tenant_id="boot", principal_id="boot", roles=names))
-
-    if not grants([]).available:
+    From one read of the policy (`row_filtered_objects`), never from its roles and their grants read one by one: a
+    policy edited between those reads could pair one version's roles with another's filters. A provider that cannot
+    say, or a policy that cannot be read, is not one without row filters."""
+    read = getattr(authz, "row_filtered_objects", None)
+    if read is None:
+        return "the access policy's row filters cannot be listed"
+    tables = read()
+    if tables is None:
         return "the access policy could not be read"
-    tables: set[str] = set()
-    for role in roles():
-        role_grants = grants([role])
-        if not role_grants.available:
-            return "the access policy could not be read"
-        tables |= set(role_grants.row_filters)
-    return tables
+    return set(tables)
 
 
 def _warn_stale_codes(snapshot: Snapshot | None, con, authz: AuthzProvider | None, *, superset: bool) -> None:

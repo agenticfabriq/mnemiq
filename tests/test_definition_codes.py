@@ -309,3 +309,63 @@ def test_an_all_capitals_word_is_not_a_code():
     snap = _snapshot([("region", "REGION_CODE is the sales region, as the FAQ and the NOTE say.")],
                      [("sales", "REGION_CODE")])
     assert stale_codes(snap, _index({("sales", "REGION_CODE"): ["EAST", "WEST"]})) == []
+
+
+def test_inequality_and_exclusion_forms_are_exclusions():
+    held = _index({("shipments", "SHIP_MODE"): ["R"]})
+    for text in ["Count rows where SHIP_MODE != 'X'.", "Count rows where SHIP_MODE!='X'.",
+                 "Count rows where SHIP_MODE NOT IN ('X', 'Y').", "Every SHIP_MODE other than 'X' counts.",
+                 "Every SHIP_MODE except 'X' counts.", "Count shipments excluding 'X'.",
+                 "A shipment counts when its SHIP_MODE is not 'X'.", "Rows with SHIP_MODE = 'X' are excluded."]:
+        snap = _snapshot([("ship mode", text)], [("shipments", "SHIP_MODE")])
+        assert stale_codes(snap, held) == [], text
+
+
+def test_a_nearby_negation_that_selects_still_counts():
+    # Neither is an exclusion: each selects on X, which the data does not hold.
+    held = _index({("shipments", "SHIP_MODE"): ["R"]})
+    for text in ["SHIP_MODE is not only 'X' but also 'Y'.", "Do not omit SHIP_MODE = 'X'."]:
+        snap = _snapshot([("ship mode", text)], [("shipments", "SHIP_MODE")])
+        assert [f.term for f in stale_codes(snap, held)] == ["ship mode"], text
+
+
+def test_the_policys_row_filters_are_read_once(tmp_path):
+    """One read of the file, so a policy edited between reads cannot pair one version's roles with another's filters."""
+    from mnemiq.authz.grants import FileAuthzProvider
+
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps({"roles": {"analyst": ["orders"],
+                                          "west": {"read": ["orders"], "row_filters": {"ORDERS": "PLANT_CODE = 'A'"}}}}))
+    assert FileAuthzProvider(str(path)).row_filtered_objects() == frozenset({"ORDERS"})
+    for broken in ["{", json.dumps({"roles": ["analyst"]}), json.dumps({"roles": {"w": {"row_filters": ["ORDERS"]}}}),
+                   json.dumps({"no roles": {}})]:
+        path.write_text(broken)
+        assert FileAuthzProvider(str(path)).row_filtered_objects() is None, broken
+    assert FileAuthzProvider(str(tmp_path / "missing.json")).row_filtered_objects() is None
+
+
+def test_the_warning_reads_the_policy_once(tmp_path, monkeypatch, caplog):
+    import builtins
+
+    from mnemiq.authz.grants import FileAuthzProvider
+    from mnemiq.runtime import _warn_stale_codes
+
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps({"roles": {"analyst": ["orders"]}}))
+    opened: list[str] = []
+    real_open = builtins.open
+
+    def counting_open(file, *a, **k):
+        if str(file) == str(path):
+            opened.append(str(file))
+        return real_open(file, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+    store = duckdb.connect()
+    ValueIndex(store)._con.execute("INSERT INTO value_index VALUES ('only', 'orders', 'PLANT_CODE', 'XY98')")
+    snap = _snapshot([("plant", "Every order ships from plant AB12, on PLANT_CODE.")], [("orders", "PLANT_CODE")])
+    with caplog.at_level(logging.WARNING):
+        _warn_stale_codes(snap, store, FileAuthzProvider(str(path)), superset=False)
+    assert len(opened) == 1, opened
+    (line,) = _stale_lines(caplog)
+    assert "XY98" in line
