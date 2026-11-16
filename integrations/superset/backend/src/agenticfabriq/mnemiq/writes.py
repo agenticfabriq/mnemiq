@@ -193,6 +193,10 @@ _EXPECT_CHANGED_ON = _Field(_an_instant)
 # Every write tool's request, field by field.
 REQUESTS: dict[str, dict[str, _Field]] = {
     "create_dashboard": {"title": _Field(_text(500)), "marker": _MARKER},
+    "create_dataset": {"database_id": _Field(_an_id), "schema": _Field(_text(255)),
+                       "table_name": _Field(_text(250)), "sql": _Field(_text(None), False),
+                       "description": _Field(_optional_text(None), False), "dashboard_id": _DASHBOARD_ID,
+                       "marker": _MARKER},
     "claim_chart": {"chart_id": _Field(_an_id), "dashboard_id": _DASHBOARD_ID, "marker": _MARKER},
     "claim_dataset": {"dataset_id": _Field(_an_id), "dashboard_id": _DASHBOARD_ID, "marker": _MARKER},
     # Exactly one shape, which `create_chart` checks: `{viz_type, params}`, or `{config, set?}`.
@@ -580,7 +584,8 @@ def _find_or_create(model: type, marker: str, *, kind: str, create: Callable[[],
             if not found:
                 return create()
             security = _security()
-            readable = {"dashboard": security.can_access_dashboard, "chart": security.can_access_chart}[kind]
+            readable = {"dashboard": security.can_access_dashboard, "chart": security.can_access_chart,
+                        "dataset": security.can_access_datasource}[kind]
             if len(found) > 1:
                 return {"candidates": [row.id for row in found if readable(row)]}
             (row,) = found
@@ -805,6 +810,76 @@ def claim_dataset(found: dict) -> dict:
     return _locked(SqlaTable, found["dataset_id"], lambda dataset: _claim(
         found, dataset, kind="dataset", extra=lambda _: {}, editors=_claimed_dataset_editors,
         command=UpdateDatasetCommand))
+
+
+def _dataset_creation_answer(exc: Exception) -> dict:
+    """The answer for a dataset create's failure: `{"exists": true}` when rc2 refuses it because a dataset already
+    holds the table (live, or in the trash as a twin), else `_command_answer`'s."""
+    from superset.commands.dataset.exceptions import DatasetInvalidError, DatasetSoftDeletedTwinExistsError
+
+    if isinstance(exc, DatasetSoftDeletedTwinExistsError) or (
+            isinstance(exc, DatasetInvalidError) and "DatasetExistsValidationError" in exc.get_list_classnames()):
+        return EXISTS
+    return _command_answer("create_dataset", exc, kind="dataset")
+
+
+def _set_dataset_editors(found: dict, dataset_id: int) -> dict:
+    """The dataset's editors, set under its row lock by the rule a claim chose them by (`_claimed_dataset_editors`):
+    the caller and the dashboard's users whose grants already reach it. `OK`, or why not."""
+    from superset.commands.dataset.update import UpdateDatasetCommand
+    from superset.connectors.sqla.models import SqlaTable
+
+    def write(dataset: Any) -> dict:
+        if dataset is None or not _security().can_access_datasource(dataset):
+            return _not_found("dataset")
+        dashboard = _dashboard(found["dashboard_id"])
+        if dashboard is None:
+            return _not_found("dashboard")
+        try:
+            UpdateDatasetCommand(dataset.id, {"editors": _claimed_dataset_editors(dataset, dashboard)}).run()
+        except _command_errors() as exc:
+            return _command_answer("create_dataset", exc, kind="dataset", editable=dataset)
+        return OK
+
+    return _locked(SqlaTable, dataset_id, write)
+
+
+@_answering("create_dataset")
+def create_dataset(found: dict) -> dict:
+    """A dataset over a table, or over `sql` when it is given (a virtual dataset), for the dashboard: `description`'s
+    prose and the build's marker as its last line, in `CreateDatasetCommand`'s own transaction, once for the marker:
+    sent again, it answers the dataset the first one made (`_find_or_create`), before rc2 can refuse the table as
+    already holding one. A table that already has a dataset not made for this marker is answered `{"exists": true}`.
+    The dashboard must be readable and edited by the caller. After the create commits, and on the found path, the
+    dataset's editors are set under its row lock (`_set_dataset_editors`); if that answers anything but `OK`, so does
+    this tool, and a retry finds the marked dataset and sets them again."""
+    if claim_marker(found["marker"], found["dashboard_id"]) is None:
+        return BAD_MARKER
+    dashboard = _dashboard(found["dashboard_id"])
+    if dashboard is None:
+        return _not_found("dashboard")
+    if not _security().is_editor(dashboard):
+        return _not_editor(dashboard)
+    from superset.commands.dataset.create import CreateDatasetCommand
+    from superset.connectors.sqla.models import SqlaTable
+
+    properties = {"database": found["database_id"], "schema": found["schema"], "table_name": found["table_name"],
+                  "description": with_marker(found["description"], found["marker"])}
+    if found["sql"] is not None:
+        properties["sql"] = found["sql"]
+
+    def create() -> dict:
+        try:
+            dataset = CreateDatasetCommand(properties).run()
+        except _command_errors() as exc:
+            return _dataset_creation_answer(exc)
+        return {"dataset_id": dataset.id}
+
+    answer = _find_or_create(SqlaTable, found["marker"], kind="dataset", create=create)
+    if "dataset_id" not in answer:
+        return answer
+    editors = _set_dataset_editors(found, answer["dataset_id"])
+    return answer if editors == OK else editors
 
 
 def _check_query(context: dict) -> dict | None:

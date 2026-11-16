@@ -1,4 +1,4 @@
-"""The extension's MCP tools: registration only. What each tool does is its function in `writes` (the eight that change
+"""The extension's MCP tools: registration only. What each tool does is its function in `writes` (the nine that change
 Superset) or `reads` (the three that only read).
 
 Superset registers each under `extensions.agenticfabriq.mnemiq.<name>` (`superset/core/mcp/core_mcp_injection.py`,
@@ -24,6 +24,14 @@ from agenticfabriq.mnemiq import reads, writes
       description="Create an unpublished, empty dashboard owned by the caller. request: {title, marker}.")
 def create_dashboard(request: dict[str, Any]) -> dict[str, Any]:
     return writes.create_dashboard(request)
+
+
+@tool(name="create_dataset", class_permission_name="Dataset", method_permission_name="write",
+      description="Create a dataset over a table, or over sql when given, for a dashboard, with a build marker and "
+                  "its editors chosen as a claim chooses them. request: {database_id, schema, table_name, sql?, "
+                  "description?, dashboard_id, marker}.")
+def create_dataset(request: dict[str, Any]) -> dict[str, Any]:
+    return writes.create_dataset(request)
 
 
 @tool(name="claim_chart", class_permission_name="Chart", method_permission_name="write",

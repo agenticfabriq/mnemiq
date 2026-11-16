@@ -59,6 +59,21 @@ class DatasetNotFoundError(CommandException):
     pass
 
 
+class DatasetInvalidError(CommandInvalidError):
+    """rc2's `DatasetInvalidError`: `get_list_classnames` names the validation errors it holds."""
+
+    def __init__(self, classnames=()) -> None:
+        super().__init__("Dataset parameters are invalid.")
+        self.classnames = sorted(classnames)
+
+    def get_list_classnames(self) -> list[str]:
+        return self.classnames
+
+
+class DatasetSoftDeletedTwinExistsError(CommandException):
+    pass
+
+
 class DatasetRestoreFailedError(CommandException):
     pass
 
@@ -141,7 +156,8 @@ def install(monkeypatch) -> SimpleNamespace:
                             compiled=SimpleNamespace(success=True),
                             update=None, create=None, ran=[], config={}, features=set(), g=SimpleNamespace(),
                             user_subjects={}, charts={}, dashboards={}, datasets={}, session=None,
-                            rows={"Dashboard": [], "Slice": []}, next_id=500)
+                            rows={"Dashboard": [], "Slice": [], "SqlaTable": []}, next_id=500,
+                            dataset_database=SimpleNamespace(perm=None))
 
     class Db:
         @property
@@ -168,6 +184,11 @@ def install(monkeypatch) -> SimpleNamespace:
         state.next_id += 1
         row = SimpleNamespace(id=state.next_id, description=properties.get("description"), deleted_at=None,
                               editors=[])
+        if model_name == "SqlaTable":
+            row.perm, row.schema_perm, row.database = None, None, state.dataset_database
+            # rc2's create makes its creator an editor of the dataset.
+            creator = getattr(getattr(state.g, "user", None), "subject", None)
+            row.editors = [creator] if creator is not None else []
         state.rows[model_name].append(row)
         return row
 
@@ -255,6 +276,8 @@ def install(monkeypatch) -> SimpleNamespace:
         "superset.commands.chart.create": {"CreateChartCommand": create_command("Slice", "CreateChartCommand")},
         "superset.commands.dashboard.create": {
             "CreateDashboardCommand": create_command("Dashboard", "CreateDashboardCommand")},
+        "superset.commands.dataset.create": {
+            "CreateDatasetCommand": create_command("SqlaTable", "CreateDatasetCommand")},
         "superset.commands.dataset.update": {"UpdateDatasetCommand": command("UpdateDatasetCommand", "update")},
         "marshmallow": {"ValidationError": MarshmallowValidationError},
         "sqlalchemy": {"text": lambda sql: sql},
@@ -267,7 +290,9 @@ def install(monkeypatch) -> SimpleNamespace:
                                          "CommandInvalidError": CommandInvalidError,
                                          "ObjectNotFoundError": ObjectNotFoundError, "ForbiddenError": ForbiddenError},
         "superset.commands.chart.exceptions": {"ChartNotFoundError": ChartNotFoundError},
-        "superset.commands.dataset.exceptions": {"DatasetNotFoundError": DatasetNotFoundError},
+        "superset.commands.dataset.exceptions": {
+            "DatasetNotFoundError": DatasetNotFoundError, "DatasetInvalidError": DatasetInvalidError,
+            "DatasetSoftDeletedTwinExistsError": DatasetSoftDeletedTwinExistsError},
         "superset.charts.schemas": {"ChartDataQueryContextSchema": ChartDataQueryContextSchema},
         "superset.commands.chart.data.get_data_command": {"ChartDataCommand": ChartDataCommand},
         "superset.mcp_service.chart.validation": {"ValidationPipeline": ValidationPipeline},

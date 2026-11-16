@@ -21,8 +21,8 @@ __all__ = ["DATASET_METRICS_BATCH", "EXTENSION_TOOLS", "ExtensionMissing", "TOOL
 TOOL_PREFIX = "extensions.agenticfabriq.mnemiq."
 
 # The base name of every tool the extension offers; the single source the client and the test fake build names from.
-EXTENSION_TOOLS = ("create_dashboard", "claim_chart", "claim_dataset", "create_chart", "patch_chart",
-                   "add_saved_metric", "delete_dataset", "set_layout", "dataset_metrics", "editors_of", "get_layout")
+EXTENSION_TOOLS = ("create_dashboard", "create_dataset", "claim_chart", "claim_dataset", "create_chart",
+                   "patch_chart", "add_saved_metric", "delete_dataset", "set_layout", "dataset_metrics", "editors_of", "get_layout")
 
 # The most dataset ids one `dataset_metrics` call takes: the extension refuses a request naming more
 # (`reads.MAX_DATASETS` in the extension).

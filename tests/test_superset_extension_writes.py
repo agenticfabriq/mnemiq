@@ -39,8 +39,9 @@ def refusal(tool, request):
 
 
 def test_every_write_tool_has_a_request_reader():
-    assert set(writes.REQUESTS) == {"create_dashboard", "claim_chart", "claim_dataset", "create_chart", "patch_chart",
-                                    "add_saved_metric", "delete_dataset", "set_layout"}
+    assert set(writes.REQUESTS) == {"create_dashboard", "create_dataset", "claim_chart", "claim_dataset",
+                                    "create_chart", "patch_chart", "add_saved_metric", "delete_dataset",
+                                    "set_layout"}
 
 
 @pytest.mark.parametrize("bad", [0, -3, True, False, "7", 7.0, None, [7]])
@@ -184,7 +185,7 @@ def test_a_dashboard_title_is_a_short_name():
 
 TOOLS_SOURCE = Path(writes.__file__).with_name("tools.py")
 # The class permission each write tool is gated by; its method is `write`.
-WRITE_CLASSES = {"create_dashboard": "Dashboard", "claim_chart": "Chart", "claim_dataset": "Dataset",
+WRITE_CLASSES = {"create_dashboard": "Dashboard", "create_dataset": "Dataset", "claim_chart": "Chart", "claim_dataset": "Dataset",
                  "create_chart": "Chart", "patch_chart": "Chart", "add_saved_metric": "Dataset",
                  "delete_dataset": "Dataset", "set_layout": "Dashboard"}
 # The class permission each read tool is gated by; its method is `read`.
@@ -230,7 +231,7 @@ def registration_problems(source: str) -> list[str]:
 def test_the_tools_are_mnemiqs_names_with_stock_permissions():
     from mnemiq.superset.extension import EXTENSION_TOOLS
 
-    assert set(EXTENSION_TOOLS) == set(ALL_CLASSES) and len(EXTENSION_TOOLS) == 11
+    assert set(EXTENSION_TOOLS) == set(ALL_CLASSES) and len(EXTENSION_TOOLS) == 12
     assert set(writes.REQUESTS) == set(WRITE_CLASSES)
     assert registration_problems(TOOLS_SOURCE.read_text()) == []
 
@@ -299,7 +300,7 @@ def _extension_sources() -> list[str]:
 
 def test_the_readme_documents_every_tool_and_setting():
     assert readme_problems(README.read_text(), TOOLS_SOURCE.read_text(), _extension_sources()) == []
-    assert len(registered(TOOLS_SOURCE.read_text())) == 11
+    assert len(registered(TOOLS_SOURCE.read_text())) == 12
 
 
 @pytest.mark.parametrize(("old", "new", "flagged"), [
@@ -319,11 +320,11 @@ def test_the_readme_check_flags_a_planted_defect(old, new, flagged):
 
 WRITES_SOURCE = Path(writes.__file__)
 # Each tool that writes an existing row: the model whose row it locks first, and the request field naming the row.
-# Creating a dashboard or a chart writes a new row and locks no row, only its marker (`_find_or_create`).
+# Creating a dashboard, a dataset or a chart writes a new row and locks no row, only its marker (`_find_or_create`).
 LOCKED = {"patch_chart": ("Slice", "chart_id"), "claim_chart": ("Slice", "chart_id"),
           "claim_dataset": ("SqlaTable", "dataset_id"), "add_saved_metric": ("SqlaTable", "dataset_id"),
           "delete_dataset": ("SqlaTable", "dataset_id"), "set_layout": ("Dashboard", "dashboard_id")}
-UNLOCKED = {"create_dashboard", "create_chart"}
+UNLOCKED = {"create_dashboard", "create_dataset", "create_chart"}
 
 
 def _calls(node: ast.AST) -> list[ast.Call]:
@@ -1395,3 +1396,129 @@ def test_set_may_not_rebind_a_charts_dataset_or_type(creating, key):
     patch leaves them. Refused before anything is validated, mapped, run, locked or created."""
     assert make_from_config(set={key: "funnel" if key == "viz_type" else 8}) == {"refused": "set"}
     assert _kinds(creating.superset) == [] and commands(creating.superset) == []
+
+
+# ---------------------------------------------------------------- create_dataset
+
+DATA = format_marker(BUILD, "data_1", 3)
+
+
+@pytest.fixture
+def making(claiming):
+    """`claiming`'s dashboard (3) and people, and datasets the create commands add: a row the editors step locks is
+    the one made, found by id."""
+    superset = claiming.superset
+    superset.dataset_database = SimpleNamespace(perm=DATABASE_PERM)
+    rows = superset.rows["SqlaTable"]
+    stubs_lock = lambda model, entity_id: next((row for row in rows if row.id == entity_id), None)  # noqa: E731
+    claiming.monkeypatch_lock = stubs_lock
+    return claiming
+
+
+@pytest.fixture
+def lock_rows(monkeypatch, making):
+    monkeypatch.setattr(writes, "lock_row", making.monkeypatch_lock)
+    return making
+
+
+def make_dataset(marker: str = DATA, **more) -> dict:
+    request = {"database_id": 1, "schema": "public", "table_name": "sales", "dashboard_id": 3, "marker": marker}
+    return writes.create_dataset({**request, **more})
+
+
+def test_create_dataset_physical_carries_the_marker_and_data_editors(lock_rows):
+    """The table's dataset is made with the marker as its description, in the create's own command; then, under the
+    dataset's row lock, its editors are the caller and the dashboard's users whose grants already reach it."""
+    superset, ids = lock_rows.superset, lock_rows.ids
+    answer = make_dataset()
+    assert set(answer) == {"dataset_id"}, answer
+    assert commands(superset, "CreateDatasetCommand") == [("CreateDatasetCommand", {
+        "database": 1, "schema": "public", "table_name": "sales", "description": DATA})]
+    ((_, (dataset_id, properties)),) = commands(superset, "UpdateDatasetCommand")
+    assert dataset_id == answer["dataset_id"] and properties == {"editors": [ids["builder"], ids["database_reader"]]}
+    assert _kinds(superset).index("CreateDatasetCommand") < _kinds(superset).index("UpdateDatasetCommand")
+    assert superset.g.user is lock_rows.people["builder"]
+
+
+def test_create_dataset_virtual_carries_its_prose_then_the_marker(lock_rows):
+    answer = make_dataset(table_name="active_sales", sql="SELECT 1 AS n", description="Active sales")
+    assert set(answer) == {"dataset_id"}, answer
+    ((_, properties),) = commands(lock_rows.superset, "CreateDatasetCommand")
+    assert properties == {"database": 1, "schema": "public", "table_name": "active_sales", "sql": "SELECT 1 AS n",
+                          "description": f"Active sales\n{DATA}"}
+
+
+def test_create_dataset_twice_with_one_marker_makes_one(lock_rows):
+    first = make_dataset()
+    assert make_dataset() == first
+    assert len(commands(lock_rows.superset, "CreateDatasetCommand")) == 1
+
+
+def test_a_physical_dataset_this_step_made_is_found_before_the_exists_check(lock_rows):
+    """The first create's answer was lost; the table now has its dataset, so rc2 would refuse the same create as
+    already existing. The retry finds the dataset by its marker first and never sends the create."""
+    from tests.superset_stubs import DatasetInvalidError
+
+    superset = lock_rows.superset
+    first = make_dataset()
+    superset.create = DatasetInvalidError({"DatasetExistsValidationError"})
+    assert make_dataset() == first
+    assert len(commands(superset, "CreateDatasetCommand")) == 1
+
+
+def test_a_found_dataset_gets_its_editors_again(lock_rows, monkeypatch):
+    """A call cut between the create and the editors leaves a marked dataset; the retry finds it and sets them."""
+    from tests import superset_stubs as stubs_module
+
+    superset = lock_rows.superset
+    real = lock_rows.monkeypatch_lock
+
+    def contended(model, entity_id):
+        raise stubs_module.database_error("55P03")
+
+    monkeypatch.setattr(writes, "lock_row", contended)
+    assert make_dataset() == {"busy": True}
+    assert commands(superset, "UpdateDatasetCommand") == []
+    (row,) = superset.rows["SqlaTable"]
+    monkeypatch.setattr(writes, "lock_row", real)
+    assert make_dataset() == {"dataset_id": row.id}
+    assert len(commands(superset, "CreateDatasetCommand")) == 1
+    assert _sent_editors(superset, "UpdateDatasetCommand") == [lock_rows.ids["builder"],
+                                                              lock_rows.ids["database_reader"]]
+
+
+@pytest.mark.parametrize("raised", [
+    pytest.param(("DatasetInvalidError", {"DatasetExistsValidationError"}), id="a table that has a dataset"),
+    pytest.param(("DatasetSoftDeletedTwinExistsError", None), id="a table whose dataset is in the trash")])
+def test_an_existing_table_dataset_answers_exists(lock_rows, raised):
+    from tests import superset_stubs as stubs_module
+
+    name, classnames = raised
+    lock_rows.superset.create = (stubs_module.DatasetInvalidError(classnames) if classnames
+                                 else getattr(stubs_module, name)("twin"))
+    assert make_dataset() == {"exists": True}
+    assert commands(lock_rows.superset, "UpdateDatasetCommand") == []
+
+
+def test_another_invalid_dataset_is_refused_as_invalid(lock_rows):
+    from tests import superset_stubs as stubs_module
+
+    lock_rows.superset.create = stubs_module.DatasetInvalidError({"TableNotFoundValidationError"})
+    assert make_dataset() == {"refused": "invalid"}
+
+
+def test_create_dataset_checks_the_marker_and_the_dashboard_before_anything(lock_rows):
+    superset = lock_rows.superset
+    assert make_dataset(marker=format_marker(BUILD, "data_1", 4)) == {"refused": "marker"}
+    assert make_dataset(dashboard_id=99, marker=format_marker(BUILD, "data_1", 99)) == {"not_found": "dashboard"}
+    assert [entry for entry in superset.ran if entry[0] in ("lookup", "execute")] == []
+    assert commands(superset) == []
+
+
+def test_the_extension_offers_exactly_the_twelve_tools():
+    from mnemiq.superset.extension import EXTENSION_TOOLS
+
+    assert sorted(EXTENSION_TOOLS) == sorted([
+        "create_dashboard", "create_dataset", "claim_chart", "claim_dataset", "create_chart", "patch_chart",
+        "add_saved_metric", "delete_dataset", "set_layout", "dataset_metrics", "editors_of", "get_layout"])
+    assert registered(TOOLS_SOURCE.read_text()).keys() == set(EXTENSION_TOOLS)

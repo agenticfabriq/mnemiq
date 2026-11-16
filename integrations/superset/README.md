@@ -67,6 +67,7 @@ from them what it already may do through Superset's own tools.
 | Tool | Gated by | What it does |
 |---|---|---|
 | `create_dashboard` | Dashboard | An unpublished, empty dashboard with the caller as its editor. |
+| `create_dataset` | Dataset | A dataset over a table, or over `sql` when given, made with its build marker and its editors set as a claim sets them; sent again, it answers the dataset the first send made. |
 | `claim_chart` | Chart | Gives a chart the dashboard's editors and a build marker, and saves its query context. |
 | `claim_dataset` | Dataset | Gives a dataset a build marker and, as editors, the caller and the dashboard's users whose grants reach it. |
 | `create_chart` | Chart | A funnel or a sankey, saved only once its query runs. |
