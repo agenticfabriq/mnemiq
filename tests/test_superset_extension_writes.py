@@ -859,14 +859,17 @@ class Security:
     def __init__(self, g, raises_for: str | None = None, log: list | None = None) -> None:
         self.g, self.raises_for, self.judged = g, raises_for, []
         self.log = [] if log is None else log
-        self.unparseable = False
+        self.unparseable, self.fails = False, None
 
     def raise_for_access(self, database=None, table=None, sql=None, catalog=None, schema=None) -> None:
         """rc2's `raise_for_access` as `CreateDatasetCommand.validate` asks it, for a table or for a dataset's SQL:
-        `SupersetSecurityException` unless the user's grants reach the database, and `SupersetParseError` for SQL
-        when `unparseable` is set. Recorded in `log` with the user and every argument."""
+        `SupersetSecurityException` unless the user's grants reach the database, `SupersetParseError` for SQL when
+        `unparseable` is set, and `fails` (a database error reading the metadata) when set. Recorded in `log` with the
+        user and every argument."""
         self.log.append(("raise_for_access", self.g.user.username, {
             "database": database, "table": table, "sql": sql, "catalog": catalog, "schema": schema}))
+        if self.fails is not None:
+            raise self.fails
         if sql is not None and self.unparseable:
             raise stubs.SupersetParseError("the SQL does not parse")
         if not self.can_access_database(database):
@@ -1830,6 +1833,20 @@ def test_a_table_whose_dataset_is_in_the_trash_exists_to_a_caller_who_may_read_i
     ((_, user, asked),) = _asked_for_access(superset)
     assert user == "builder" and asked == _access_rc2_asks(superset, source)
     assert commands(superset, "UpdateDatasetCommand") == []
+
+
+@pytest.mark.parametrize(("error", "answer"), [
+    pytest.param(stubs.SQLAlchemyError("the metadata database went away"), {"failed": True}, id="a database error"),
+    pytest.param(stubs.database_error("55P03"), {"busy": True}, id="a lock wait past the timeout")])
+def test_a_database_error_checking_access_over_a_table_whose_dataset_is_in_the_trash_is_answered(lock_rows, error,
+                                                                                                answer):
+    """The access check reads Superset's metadata database, which may fail: answered as any database failure of the
+    create is (`{"failed": true}`, or `{"busy": true}` for lock contention), never raised out of the tool."""
+    lock_rows.security.fails = error
+    lock_rows.superset.twin = TWIN
+    assert make_dataset() == answer
+    assert len(_asked_for_access(lock_rows.superset)) == 1
+    assert commands(lock_rows.superset, "UpdateDatasetCommand") == []
 
 
 def test_sql_rc2_cannot_parse_over_a_table_whose_dataset_is_in_the_trash_is_refused_as_invalid(lock_rows):

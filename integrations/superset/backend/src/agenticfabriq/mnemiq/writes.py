@@ -827,6 +827,7 @@ def _twin_answer(command: Any) -> dict:
     read from its id, the default catalog when none was given, a schema read from the SQL). A refusal is answered
     `{"not_found": "dataset"}` and SQL rc2 cannot parse `{"refused": "invalid"}`, each as the same request is answered
     with no dataset in the trash; else `{"exists": true}`."""
+    from sqlalchemy.exc import SQLAlchemyError
     from superset.exceptions import SupersetParseError, SupersetSecurityException
     from superset.sql.parse import Table
 
@@ -846,7 +847,8 @@ def _twin_answer(command: Any) -> dict:
     except SupersetParseError:
         logger.warning("mnemiq extension: create_dataset refused as invalid: its SQL does not parse")
         return {"refused": "invalid"}
-    except _command_errors() as exc:
+    # The check reads the metadata database: a failure there is answered as the create's own database failures are.
+    except (*_command_errors(), SQLAlchemyError) as exc:
         return _failed("create_dataset", exc)
     return EXISTS
 
