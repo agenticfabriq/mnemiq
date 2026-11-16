@@ -689,6 +689,9 @@ class _Lookup:
     def __init__(self, metadata: "Metadata", model: type) -> None:
         self.metadata, self.model, self.predicates, self.ordered = metadata, model, [], []
 
+    def populate_existing(self):
+        return self
+
     def filter(self, *predicates):
         self.predicates.extend(predicates)
         return self
@@ -1199,9 +1202,9 @@ def test_the_marker_lock_is_held_until_the_create_commits(creating):
     assert kinds[lock + 1:] == ["lookup", "CreateChartCommand", "commit", "rollback"]
 
 
-# What a create runs before it asks for the marker's lock: a chart's looks for its chart without the lock, then
-# checks its query.
-BEFORE_THE_LOCK = ((make_dashboard, []), (make_funnel, ["lookup", "chart_data"]))
+# What a create runs before it asks for the marker's lock: a chart's reads the session's isolation and, at READ
+# COMMITTED, looks for its chart without the lock, then checks its query.
+BEFORE_THE_LOCK = ((make_dashboard, []), (make_funnel, ["isolation", "lookup", "chart_data"]))
 
 
 def test_a_contended_marker_lock_answers_busy(creating):
@@ -1259,22 +1262,26 @@ def test_a_mysql_lock_timeout_answers_busy(creating, got):
                                      ("rollback",)]
 
 
-@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql", "mariadb"])
 @pytest.mark.parametrize("level", ["REPEATABLE READ", "SERIALIZABLE", "READ UNCOMMITTED"])
 def test_a_create_under_another_isolation_level_is_refused(creating, dialect, level):
     """The lookup must see an object the moment another create commits it, which READ COMMITTED gives; under a
-    snapshot fixed earlier in the transaction it would not. Refused before any lock, the lookup under it, or create.
-    A chart the marker names already is committed, so the look for it before its query check answers it at any
-    level."""
+    snapshot fixed earlier in the transaction it would not, and under READ UNCOMMITTED it would see a row another
+    create has written but may still roll back. Refused before any lock, the lookup under it, or create. A chart's
+    look before its query check reads the isolation too and looks for nothing at another level, so a chart the marker
+    names already is refused as every create is, never answered from an uncommitted row."""
     creating.on(dialect).isolation = level
-    for make, before in BEFORE_THE_LOCK:
+    for make, before in ((make_dashboard, []), (make_funnel, ["isolation", "chart_data"])):
         creating.superset.ran.clear()
         assert make() == {"refused": "isolation"}
         assert _kinds(creating.superset) == [*before, "isolation", "rollback"]
     creating.superset.rows["Slice"].append(_row(9, STEP))
-    assert make_funnel() == {"chart_id": 9}
-    # The control: READ COMMITTED, however SQLAlchemy spells it, creates.
+    creating.superset.ran.clear()
+    assert make_funnel() == {"refused": "isolation"}
+    assert "lookup" not in _kinds(creating.superset) and commands(creating.superset) == []
+    # The control: READ COMMITTED, however SQLAlchemy spells it, answers the chart and creates.
     creating.metadata.isolation = "read committed"
+    assert make_funnel() == {"chart_id": 9}
     assert set(make_dashboard()) == {"dashboard_id"}
 
 
@@ -1297,19 +1304,45 @@ def test_a_retry_by_a_caller_no_longer_an_editor_is_refused_first(creating):
 
 def test_sqlite_takes_no_marker_lock(creating):
     """SQLite, Superset's single-person development default: no lock and no isolation check, and a retry still finds
-    the object its marker names."""
+    the object its marker names, a chart's before its query check too."""
     creating.on("sqlite")
     first = make_dashboard()
     assert make_dashboard() == first
+    chart = make_funnel()
     assert {"isolation", "execute", "connect"} & set(_kinds(creating.superset)) == set()
-    assert len(commands(creating.superset)) == 1
+    assert len(commands(creating.superset)) == 2
+    creating.superset.ran.clear()
+    assert make_funnel() == chart
+    assert creating.superset.ran == [("lookup", "Slice")]
 
 
 def test_another_metadata_database_is_refused(creating):
-    """A metadata database the marker's lock is not written for is refused, rather than created on without a lock."""
+    """A metadata database the marker's lock is not written for is refused, rather than created on without a lock; a
+    chart its marker names already too, which the look before its query check does not make on such a database."""
     creating.on("mssql")
     assert make_dashboard() == {"refused": "metadata_database"}
+    creating.superset.rows["Slice"].append(_row(9, STEP))
+    assert make_funnel() == {"refused": "metadata_database"}
     assert "lookup" not in _kinds(creating.superset) and commands(creating.superset) == []
+
+
+def test_the_lookup_reads_each_row_as_the_database_holds_it(superset, monkeypatch):
+    """A row the session already holds (the look before a chart's query check loaded it) is read again as the
+    database holds it now, under the lock, not as the session first loaded it: the lookup asks for
+    `populate_existing`, as `lock_row` does, before it reads a row."""
+    session = _Session("postgresql")
+
+    class Rows(_Query):
+        def __iter__(self):
+            self.log.append(("read",))
+            return iter([])
+
+    session.query = lambda model: (session.log.append(("query", model)), Rows(session.log))[1]
+    monkeypatch.setattr(writes, "_session", lambda: session)
+    slices = stubs.model("Slice")
+    assert writes._marked(slices, STEP) == []
+    kinds = [entry[0] for entry in session.log]
+    assert kinds[:2] == ["query", "populate_existing"] and kinds[-1] == "read"
 
 
 # ---------------------------------------------------------------- create_chart from MCP's own chart config
@@ -1431,7 +1464,7 @@ def test_a_retry_of_a_chart_already_made_runs_no_query_check_again(creating, pat
     _failing_query(creating.superset, path)
     creating.superset.ran.clear()
     assert make() == made
-    assert creating.superset.ran == [("lookup", "Slice")]
+    assert creating.superset.ran == [("isolation",), ("lookup", "Slice")]
     assert make(format_marker(BUILD, "chart_2", 12)) == {"refused": "query_failed"}
     assert commands(creating.superset) == []
 
@@ -1441,8 +1474,8 @@ def test_a_chart_not_found_before_the_query_check_runs_the_whole_path(creating, 
     """The lookup before rc2's work finds nothing: the query check runs (for a config, validation and mapping first),
     then the marker's lock, the lookup under it, which is the one that decides, and the create."""
     MAKERS[path]()
-    assert _kinds(creating.superset) == ["lookup", *QUERY_CHECKS[path], "isolation", "execute", "execute", "lookup",
-                                         "CreateChartCommand", "commit", "rollback"]
+    assert _kinds(creating.superset) == ["isolation", "lookup", *QUERY_CHECKS[path], "isolation", "execute", "execute",
+                                         "lookup", "CreateChartCommand", "commit", "rollback"]
 
 
 @pytest.mark.parametrize("found", ["not edited", "unreadable", "two carrying the marker"])
@@ -1465,7 +1498,7 @@ def test_a_chart_found_before_the_query_check_is_answered_as_under_the_lock(crea
         expected = {"candidates": [9]}
     _failing_query(creating.superset, "config")
     assert make_from_config() == expected
-    assert creating.superset.ran == [("lookup", "Slice")]
+    assert creating.superset.ran == [("isolation",), ("lookup", "Slice")]
 
 
 def test_a_chart_made_while_the_query_check_ran_is_found_under_the_lock(creating, monkeypatch):

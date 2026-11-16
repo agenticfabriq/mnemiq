@@ -16,10 +16,10 @@ Every tool keeps these rules:
   answers the object whose description's last line is that marker, and creates one only when there is none, so a
   create whose answer was lost may be sent again. Every check that refuses the caller runs before the lock, and only
   the lookup and the create inside it, whose commit releases it. A marker's lock not taken in time answers
-  `{"busy": true}` too. A chart's create also looks for its chart once without the lock before rc2 checks its query
-  (`_made_already`), so a retry of a chart already made never runs that query again; and a chart its own check
-  refuses looks again under the lock before it answers the refusal (`_made_meanwhile`), so a chart another send
-  committed while the check ran is answered, not refused.
+  `{"busy": true}` too. A chart's create also looks for its chart once without the lock before rc2 checks its query,
+  on a metadata database the lock is taken on (`_made_already`), so a retry of a chart already made never runs that
+  query again; and a chart its own check refuses looks again under the lock before it answers the refusal
+  (`_made_meanwhile`), so a chart another send committed while the check ran is answered, not refused.
 - Its answer is short and structured. Superset's own text never reaches it: any of Superset's exceptions is logged
   here and answered by its kind.
 - A caller who is not an editor of the object is told so before anything about the object's state (a stale
@@ -477,7 +477,8 @@ def _marked(model: type, marker: str) -> list[Any]:
     escape character as each dialect reads it, where a hand-written `ESCAPE '\\'` is an unterminated string to MySQL's
     default mode); Python's then keeps a row only when its last line is the marker alone, so a marker with text typed
     before it on its line is not found, as one with text after it or under it is not."""
-    rows = (_session().query(model)
+    # `populate_existing`: a row the session already holds (from the look before the lock) is read as it is now.
+    rows = (_session().query(model).populate_existing()
             .filter(model.description.like(_like_suffix(marker), escape="\\"), model.deleted_at.is_(None))
             .order_by(model.id))
     return [row for row in rows if (row.description or "").splitlines()[-1:] == [marker]]
@@ -516,16 +517,39 @@ def _named_lock(engine: Any, marker: str) -> Iterator[None]:
         connection.close()
 
 
+def _lock_refusal(session: Any, *, warn: bool = True) -> dict | None:
+    """Why the marker's lock is not taken on `session`'s metadata database, or None when it is: on SQLite, which takes
+    none, and on Postgres or MySQL (MariaDB's dialect included) whose session reads at READ COMMITTED. Another level is
+    `{"refused": "isolation"}` and another database `{"refused": "metadata_database"}`, each logged when `warn`."""
+    dialect = session.get_bind().dialect.name
+    if dialect == "sqlite":
+        return None
+    if dialect != "postgresql" and dialect not in _MYSQL:
+        if warn:
+            logger.warning("mnemiq extension: a create carrying a marker takes no lock on a %s metadata database",
+                           dialect)
+        return {"refused": "metadata_database"}
+    level = session.connection().get_isolation_level()
+    if not isinstance(level, str) or level.upper() != "READ COMMITTED":
+        if warn:
+            logger.warning("mnemiq extension: a create carrying a marker needs the metadata database's READ "
+                           "COMMITTED isolation, not %s", level)
+        return {"refused": "isolation"}
+    return None
+
+
 @contextlib.contextmanager
 def _marker_lock(marker: str) -> Iterator[None]:
     """Holds the lock keyed by `marker` over the block, so that of two creates carrying one marker the second looks
-    for the object only once the first has committed it or given up. Raises `_NotLocked` when the lock is not taken.
+    for the object only once the first has committed it or given up. Raises `_NotLocked` when the lock is not taken,
+    first when the metadata database is not one it is taken on (`_lock_refusal`).
 
-    The lookup must see an object the moment another create commits it, which READ COMMITTED gives: rc2 sets it on
-    Postgres and MySQL unless `SQLALCHEMY_ENGINE_OPTIONS` names another level (`SupersetAppInitializer.
-    set_db_default_isolation`). Under a level whose snapshot is fixed at the transaction's first read, before the
-    lock, a create could miss the object another one made, so the session's own level is read first and any other
-    level is refused (`{"refused": "isolation"}`).
+    The lookup must see an object the moment another create commits it, which READ COMMITTED gives: rc2 sets it
+    unless `SQLALCHEMY_ENGINE_OPTIONS` names another level, and only for a `postgresql` or a `mysql` backend, so not
+    for a `mariadb://` URI (`SupersetAppInitializer.set_db_default_isolation`). Under a level whose snapshot is fixed
+    at the transaction's first read, before the lock, a create could miss the object another one made, and under
+    READ UNCOMMITTED it could find one another create has written but may still roll back, so the session's own level
+    is read first and any other level is refused (`{"refused": "isolation"}`).
 
     - Postgres: the transaction's advisory lock on the marker's hash, its wait bounded as `lock_row`'s is
       (`_bound_lock_waits`), so a wait past the lock timeout (55P03) answers `{"busy": true}`. The transaction's end
@@ -539,19 +563,12 @@ def _marker_lock(marker: str) -> Iterator[None]:
     from superset.versioning.db_errors import is_lock_contention_error
 
     session = _session()
+    if (refusal := _lock_refusal(session)) is not None:
+        raise _NotLocked(refusal)
     dialect = session.get_bind().dialect.name
     if dialect == "sqlite":
         yield
         return
-    if dialect != "postgresql" and dialect not in _MYSQL:
-        logger.warning("mnemiq extension: a create carrying a marker takes no lock on a %s metadata database",
-                       dialect)
-        raise _NotLocked({"refused": "metadata_database"})
-    level = session.connection().get_isolation_level()
-    if not isinstance(level, str) or level.upper() != "READ COMMITTED":
-        logger.warning("mnemiq extension: a create carrying a marker needs the metadata database's READ COMMITTED "
-                       "isolation, not %s", level)
-        raise _NotLocked({"refused": "isolation"})
     if dialect in _MYSQL:
         with _named_lock(session.get_bind(), marker):
             yield
@@ -590,8 +607,13 @@ def _made_already(model: type, marker: str, *, kind: str) -> dict | None:
     there is none. A create whose own work before the lock may fail where it once ran (a chart's query check, which a
     slow or unreachable source database fails) looks first, after the checks that refuse the caller: an object an
     earlier send made is then answered as `_find_or_create` answers one (`_found_answer`), and that work never runs
-    again for it. What it finds is committed, so it is answered whatever the metadata database's isolation. None
-    decides nothing: the lookup under the lock (`_find_or_create`) is the one that decides whether to create."""
+    again for it. It looks only where the lock is taken (`_lock_refusal`): on SQLite, or on Postgres or MySQL at READ
+    COMMITTED, where what it reads has been committed. On any other database or at any other level it answers None,
+    and the create is refused as the lock refuses it, never answered from a row another create has written but may
+    still roll back (which MySQL's READ UNCOMMITTED reads). None decides nothing: the lookup under the lock
+    (`_find_or_create`) is the one that decides whether to create."""
+    if _lock_refusal(_session(), warn=False) is not None:
+        return None
     found = _marked(model, marker)
     return _found_answer(found, kind=kind) if found else None
 

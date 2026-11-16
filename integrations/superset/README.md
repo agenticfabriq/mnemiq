@@ -108,17 +108,19 @@ Postgres, a named lock on MySQL, each waited for at most `MNEMIQ_LOCK_TIMEOUT_S`
 an object not in the trash whose description's last line is that marker: it answers that one's id; when there are
 several it creates nothing and answers `{"candidates": [...]}`, the ids of those the caller may read (the list may be
 empty); and it creates the object when there is none. `create_chart` also looks once before it runs the chart's
-query, without the lock, so a chart already made is answered without running its query again; and when its config
-or its query is refused, it looks again under the lock before it answers, so a chart that another send of the same
-create made meanwhile is answered rather than refused, and one still being made answers `{"busy": true}`. On any
-other metadata database than Postgres, MySQL or SQLite a create answers `{"refused": "metadata_database"}`. A SQLite
-metadata database takes no marker lock, being Superset's single-person development default: there a create sent
-again while the first is still running could make a second object.
+query, without the lock but only where the lock is taken (SQLite, or Postgres or MySQL at READ COMMITTED), so a chart
+already made is answered without running its query again; and when its config or its query is refused, it looks
+again under the lock before it answers, so a chart that another send of the same create made meanwhile is answered
+rather than refused, and one still being made answers `{"busy": true}`. On any other metadata database than
+Postgres, MySQL or SQLite a create answers `{"refused": "metadata_database"}`. A SQLite metadata database takes no
+marker lock, being Superset's single-person development default: there a create sent again while the first is still
+running could make a second object.
 
-On Postgres and MySQL the lookup needs the metadata database's READ COMMITTED isolation; under any other level a
-create answers `{"refused": "isolation"}`. Superset 7.0.0rc2 sets READ COMMITTED itself only when
-`SQLALCHEMY_ENGINE_OPTIONS` names no isolation level and `SQLALCHEMY_DATABASE_URI` is a `postgresql` or a `mysql` URI
-(with any driver). A `mariadb://` URI, or options naming another level, need it set in `superset_config.py`:
+On Postgres and MySQL the lookup needs the metadata database's READ COMMITTED isolation; under any other level every
+create answers `{"refused": "isolation"}`, a create of a chart already made included. Superset 7.0.0rc2 sets READ
+COMMITTED itself only when `SQLALCHEMY_ENGINE_OPTIONS` names no isolation level and `SQLALCHEMY_DATABASE_URI` is a
+`postgresql` or a `mysql` URI (with any driver). A `mariadb://` URI, or options naming another level, need it set in
+`superset_config.py`:
 
 ```python
 SQLALCHEMY_ENGINE_OPTIONS = {"isolation_level": "READ COMMITTED"}   # with any other options already set there
