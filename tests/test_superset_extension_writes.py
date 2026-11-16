@@ -1848,6 +1848,31 @@ def test_a_lock_granted_after_the_call_deadline_answers_busy(request, monkeypatc
     assert metadata.leaked == []
 
 
+@pytest.mark.parametrize("tool", ["delete_dataset", "create_dashboard"])
+@pytest.mark.parametrize(("cause", "answer"), [
+    pytest.param(stubs.PoolTimeoutError("QueuePool limit of size 5 overflow 10 reached"), {"busy": True},
+                 id="no pooled connection came free"),
+    pytest.param(stubs.database_error("08006", invalidated=True), {"busy": True},
+                 id="the connection lost mid-statement"),
+    pytest.param(stubs.database_error("08006"), {"failed": True}, id="a database error, the connection kept"),
+    pytest.param(stubs.database_error("23505"), {"failed": True}, id="a unique violation")])
+def test_a_command_whose_metadata_connection_was_lost_answers_busy(request, tool, cause, answer):
+    """A command that failed because the metadata database's connection could not be had (no pooled connection came
+    free in time) or was lost mid-statement (SQLAlchemy invalidated it) may or may not have written: busy, and the
+    same request may be sent again (a create finds what an earlier send made by its marker). Any other database
+    error, the connection kept, is answered as a failure."""
+    failure = stubs.CommandException("Superset's words")
+    failure.__cause__ = cause
+    if tool == "delete_dataset":
+        stage = request.getfixturevalue("deleting")
+        stage.charts, stage.superset.delete = [[]], failure
+        assert delete(_dataset(MARKED)) == answer
+    else:
+        stage = request.getfixturevalue("creating")
+        stage.superset.create = failure
+        assert make_dashboard() == answer
+
+
 @pytest.mark.parametrize("path", PATHS)
 def test_a_retry_of_a_chart_already_made_runs_no_query_check_again(creating, path):
     """The first create committed and its answer was lost, most likely because Superset or the source database was

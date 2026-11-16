@@ -88,7 +88,10 @@ class SQLAlchemyError(Exception):
 
 
 class DBAPIError(SQLAlchemyError):
-    pass
+    """SQLAlchemy's wrapper of a driver's error; `connection_invalidated` is set when SQLAlchemy found the connection
+    lost and invalidated it."""
+
+    connection_invalidated = False
 
 
 class PoolTimeoutError(SQLAlchemyError):
@@ -110,10 +113,12 @@ def is_lock_contention_error(exc) -> bool:
     return getattr(getattr(exc, "orig", None), "pgcode", None) in PG_LOCK_CONTENTION
 
 
-def database_error(sqlstate: str) -> DBAPIError:
-    """A database error as SQLAlchemy wraps a psycopg2 one, its SQLSTATE on the driver error (`orig.pgcode`)."""
+def database_error(sqlstate: str, invalidated: bool = False) -> DBAPIError:
+    """A database error as SQLAlchemy wraps a psycopg2 one, its SQLSTATE on the driver error (`orig.pgcode`), with the
+    connection marked invalidated when `invalidated` (SQLAlchemy found it lost)."""
     error = DBAPIError(f"(psycopg2.errors) SQLSTATE {sqlstate}")
     error.orig = SimpleNamespace(pgcode=sqlstate)
+    error.connection_invalidated = invalidated
     return error
 
 

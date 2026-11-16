@@ -9,9 +9,10 @@ Every tool keeps these rules:
   version restore takes it) and holds the locked entity until the command returns: the command's `@transaction`
   (`superset/utils/decorators.py`) commits in the same session, and that commit releases the lock. Only under the lock
   does a tool compare the `changed_on` its caller read, so of two racing writers the second waits, then sees the first
-  one's `changed_on`, and answers `{"stale": true}`. `{"busy": true}` is for a lock-contention error alone
+  one's `changed_on`, and answers `{"stale": true}`. `{"busy": true}` is for a lock-contention error
   (`superset/versioning/db_errors.py`, `is_lock_contention_error`), a wait past the lock timeout among them
-  (`lock_row`), and the same request may be sent again.
+  (`lock_row`), and for a metadata connection lost mid-statement or not to be had from the pool (`_failed`): the
+  same request may be sent again.
 - A create carrying a build's marker makes its object once (`_find_or_create`), so a create whose answer was lost may
   be sent again. Once the checks that refuse the caller pass, it takes one lock keyed by the marker, on a connection
   of its own (`_marker_lock`), and holds it from the look for the object whose description's last line is that
@@ -319,24 +320,46 @@ def _not_editor(resource: Any) -> dict:
     return {"not_editor": True, "editors": sorted({subject.label for subject in resource.editors})}
 
 
-def _from_lock_contention(exc: BaseException | None) -> bool:
-    """Whether a database lock-contention error is anywhere in `exc`'s chain: a command reraises the database error
+def _chain(exc: BaseException | None) -> Iterator[BaseException]:
+    """`exc` and each exception it was raised from or while handling, once each: a command reraises the database error
     it caught as its own failure, `from` it (`superset/utils/decorators.py`, `on_error`)."""
-    from sqlalchemy.exc import DBAPIError
-    from superset.versioning.db_errors import is_lock_contention_error
-
     seen: set[int] = set()
     while exc is not None and id(exc) not in seen:
         seen.add(id(exc))
-        if isinstance(exc, DBAPIError) and is_lock_contention_error(exc):
-            return True
+        yield exc
         exc = exc.__cause__ or exc.__context__
-    return False
+
+
+def _from_lock_contention(exc: BaseException | None) -> bool:
+    """Whether a database lock-contention error is anywhere in `exc`'s chain (`_chain`)."""
+    from sqlalchemy.exc import DBAPIError
+    from superset.versioning.db_errors import is_lock_contention_error
+
+    return any(isinstance(found, DBAPIError) and is_lock_contention_error(found) for found in _chain(exc))
+
+
+def _from_lost_connection(exc: BaseException | None) -> bool:
+    """Whether `exc`'s chain (`_chain`) holds a metadata connection that could not be had or was lost: no pooled
+    connection came free in time (SQLAlchemy's `TimeoutError`), or SQLAlchemy found the connection lost mid-statement
+    and invalidated it (a `DBAPIError` with `connection_invalidated`). The write did not happen, or whether it was
+    committed is not known."""
+    from sqlalchemy.exc import DBAPIError
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+    return any(isinstance(found, PoolTimeoutError)
+               or (isinstance(found, DBAPIError) and getattr(found, "connection_invalidated", False))
+               for found in _chain(exc))
 
 
 def _failed(tool: str, exc: BaseException) -> dict:
+    """The answer for a failure no rule above it names: `{"busy": true}` for a lost lock race (`_from_lock_contention`)
+    or a metadata connection lost or not to be had (`_from_lost_connection`), where the same request may be sent again
+    (a create finds what an earlier send made by its marker); else `{"failed": true}`."""
     if _from_lock_contention(exc):
         logger.info("mnemiq extension: %s lost a lock race", tool)
+        return BUSY
+    if _from_lost_connection(exc):
+        logger.warning("mnemiq extension: %s lost its metadata database connection", tool, exc_info=exc)
         return BUSY
     logger.warning("mnemiq extension: %s failed", tool, exc_info=exc)
     return FAILED
