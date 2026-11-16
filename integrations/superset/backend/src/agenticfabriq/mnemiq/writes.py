@@ -17,8 +17,8 @@ Every tool keeps these rules:
   of its own (`_marker_lock`), and holds it from the look for the object whose description's last line is that
   marker through the create's commit: rc2's own checks (a chart's validation and query check) and the create command
   run under it, on a miss only. A second send of the create waits for the first and then answers what it made. A
-  wait past the lock timeout, or a look the metadata database cannot answer, answers `{"busy": true}`. A SQLite
-  metadata database takes no such lock.
+  wait past the lock timeout, a lock granted only after mnemiq's deadline for the call, or a look the metadata
+  database cannot answer, answers `{"busy": true}`. A SQLite metadata database takes no such lock.
 - Its answer is short and structured. Superset's own text never reaches it: any of Superset's exceptions is logged
   here and answered by its kind.
 - A caller who is not an editor of the object is told so before anything about the object's state (a stale
@@ -42,6 +42,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -373,6 +374,9 @@ def _command_errors() -> tuple[type[Exception], ...]:
 LOCK_TIMEOUT_S = 30
 # mnemiq's deadline for a call, in seconds (its default): a lock wait as long as this may end after mnemiq gave up.
 CALL_DEADLINE_S = 45
+# The clock a create measures its own time by, from the tool's start: monotonic, so a change of the wall clock moves
+# nothing.
+_clock = time.monotonic
 
 
 def _lock_timeout_s() -> float:
@@ -581,7 +585,7 @@ def _release_marker_lock(connection: Any, dialect: str, marker: str) -> None:
 
 
 @contextlib.contextmanager
-def _marker_lock(marker: str) -> Iterator[None]:
+def _marker_lock(marker: str, started: float) -> Iterator[None]:
     """Holds the lock keyed by `marker` over the block, so that of two creates carrying one marker the second looks
     for the object only once the first has committed it or given up. The lock is taken on a connection of its own
     (`engine.connect()`), never the session's: a session's lock on Postgres, a named lock on MySQL
@@ -589,6 +593,10 @@ def _marker_lock(marker: str) -> Iterator[None]:
     released after the block (`_release_marker_lock`), when the block raises too, and the connection closed. Raises
     `_NotLocked` when the lock is not taken: `{"busy": true}` for a wait past the lock timeout, or when no connection
     comes free in the pool in time (SQLAlchemy's `TimeoutError`).
+
+    A lock granted more than `CALL_DEADLINE_S` after `started` (the tool's start, on `_clock`) is let go at once,
+    with `{"busy": true}` and the block not run: mnemiq has stopped waiting for this answer, and its own retry, sent
+    the same, decides.
 
     - SQLite: no lock. A SQLite metadata database is Superset's single-person development default, where a create sent
       again while its own lost first one still runs does not happen in practice.
@@ -612,6 +620,9 @@ def _marker_lock(marker: str) -> Iterator[None]:
     try:
         _take_marker_lock(connection, dialect, marker)
         try:
+            if _clock() - started > CALL_DEADLINE_S:
+                logger.info("mnemiq extension: a marker's lock came free after mnemiq's deadline for the call")
+                raise _NotLocked(BUSY)
             yield
         finally:
             _release_marker_lock(connection, dialect, marker)
@@ -665,7 +676,7 @@ def _look(model: type, marker: str, *, kind: str) -> dict | None:
         return BUSY
 
 
-def _find_or_create(model: type, marker: str, *, kind: str, create: Callable[[], dict],
+def _find_or_create(model: type, marker: str, *, kind: str, started: float, create: Callable[[], dict],
                     then: Callable[[dict], dict] | None = None) -> dict:
     """The object of `model` that `marker` names, or `create()`'s answer when there is none, all under the marker's
     lock (`_marker_lock`): a create whose answer was lost, sent again, answers the object the first one made instead
@@ -678,9 +689,9 @@ def _find_or_create(model: type, marker: str, *, kind: str, create: Callable[[],
     connection of its own, so whatever rc2 commits or rolls back in the session keeps it held, and no other send of the
     create can make the object while a check of this one refuses it: that refusal is answered as it is. The session's
     transaction ends before the lock is let go. A lock not taken answers `{"busy": true}` or the refusal that says
-    why."""
+    why, and so does one granted after mnemiq's deadline for the call, counted from `started`, the tool's start."""
     try:
-        with _marker_lock(marker):
+        with _marker_lock(marker, started):
             try:
                 answer = _look(model, marker, kind=kind)
                 if answer is None:
@@ -810,6 +821,7 @@ def create_dashboard(found: dict) -> dict:
     description, made once for the marker: under the marker's lock, held from the look through the create's commit
     (`_find_or_create`), so sent again, it answers the dashboard the first one made, waiting for it while it is being
     made. The marker is the shell's own (`new`): the dashboard has no id until this returns."""
+    started = _clock()
     if claim_marker(found["marker"], None) is None:
         return BAD_MARKER
     from superset.commands.dashboard.create import CreateDashboardCommand
@@ -823,7 +835,7 @@ def create_dashboard(found: dict) -> dict:
             return _command_answer("create_dashboard", exc, kind="dashboard")
         return {"dashboard_id": dashboard.id}
 
-    return _find_or_create(Dashboard, found["marker"], kind="dashboard", create=create)
+    return _find_or_create(Dashboard, found["marker"], kind="dashboard", started=started, create=create)
 
 
 def _dataset_creation_answer(exc: Exception) -> dict:
@@ -911,6 +923,7 @@ def create_dataset(found: dict) -> dict:
     which is checked before the lock. After the create commits, and on the found path, the dataset's editors are set
     under its row lock (`_set_dataset_editors`), still under the marker's lock; if that answers anything but `OK`, so
     does this tool, and a retry finds the marked dataset and sets them again."""
+    started = _clock()
     if claim_marker(found["marker"], found["dashboard_id"]) is None:
         return BAD_MARKER
     dashboard = _dashboard(found["dashboard_id"])
@@ -944,7 +957,8 @@ def create_dataset(found: dict) -> dict:
         return answer if editors == OK else editors
 
     try:
-        return _find_or_create(SqlaTable, found["marker"], kind="dataset", create=create, then=with_editors)
+        return _find_or_create(SqlaTable, found["marker"], kind="dataset", started=started, create=create,
+                               then=with_editors)
     except DatasetSoftDeletedTwinExistsError:
         return _twin_answer(command)
 
@@ -1045,6 +1059,7 @@ def create_chart(found: dict) -> dict:
     answers the chart it made, never a refusal of its own check while the first may still make the chart. Only a
     look that finds nothing runs the config's validation and mapping and the query check, whose refusal is then
     answered as it is."""
+    started = _clock()
     if claim_marker(found["marker"], found["dashboard_id"]) is None:
         return BAD_MARKER
     from_config = found["config"] is not None
@@ -1096,7 +1111,7 @@ def create_chart(found: dict) -> dict:
             return _command_answer("create_chart", exc, kind="dataset")
         return {"chart_id": chart.id}
 
-    return _find_or_create(Slice, found["marker"], kind="chart", create=create)
+    return _find_or_create(Slice, found["marker"], kind="chart", started=started, create=create)
 
 
 def _patch(found: dict, chart: Any) -> dict:

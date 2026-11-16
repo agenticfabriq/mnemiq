@@ -1813,6 +1813,41 @@ def test_a_creates_own_lock_waits_are_bounded_on_postgres(creating, monkeypatch,
     assert not {"commit", "rollback"} & {entry[0] for entry in ran[last_bound + 1:command_at]}, ran
 
 
+class _Clock:
+    """A monotonic clock stood in: the tool's start reads 1000 seconds, every later reading `after` seconds more."""
+
+    def __init__(self, after: float) -> None:
+        self.after, self.readings = after, 0
+
+    def __call__(self) -> float:
+        self.readings += 1
+        return 1000.0 if self.readings == 1 else 1000.0 + self.after
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+@pytest.mark.parametrize("create", ["dashboard", "config chart", "dataset"])
+def test_a_lock_granted_after_the_call_deadline_answers_busy(request, monkeypatch, dialect, create):
+    """The marker's lock came free only after mnemiq's deadline for the call (`CALL_DEADLINE_S` from the tool's start,
+    on a monotonic clock): mnemiq has stopped waiting for this answer, and its own retry decides. The create lets the
+    lock go and answers busy, without a look, a check or a command. The control: granted just inside the deadline,
+    the create looks and makes its object."""
+    stage = request.getfixturevalue("lock_rows" if create == "dataset" else "creating")
+    superset = stage.superset
+    metadata = superset.session = Metadata(superset, dialect)
+    make, model, marker, key = CREATES[create]
+    monkeypatch.setattr(writes, "_clock", _Clock(writes.CALL_DEADLINE_S + 0.001))
+    assert make() == {"busy": True}
+    assert superset.ran == [*taken(dialect, marker), *let_go(dialect, marker), ("rollback",)]
+    assert commands(superset) == []
+    superset.ran.clear()
+    monkeypatch.setattr(writes, "_clock", _Clock(writes.CALL_DEADLINE_S - 0.001))
+    made = make()
+    assert set(made) == {key}, made
+    expected = [*taken(dialect, marker, 2), *looked(dialect, model)]
+    assert superset.ran[:len(expected)] == expected
+    assert metadata.leaked == []
+
+
 @pytest.mark.parametrize("path", PATHS)
 def test_a_retry_of_a_chart_already_made_runs_no_query_check_again(creating, path):
     """The first create committed and its answer was lost, most likely because Superset or the source database was
