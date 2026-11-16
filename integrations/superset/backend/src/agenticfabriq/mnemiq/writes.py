@@ -16,7 +16,8 @@ Every tool keeps these rules:
   answers the object whose description's last line is that marker, and creates one only when there is none, so a
   create whose answer was lost may be sent again. Every check that refuses the caller runs before the lock, and only
   the lookup and the create inside it, whose commit releases it. A marker's lock not taken in time answers
-  `{"busy": true}` too.
+  `{"busy": true}` too. A chart's create also looks for its chart once without the lock before rc2 checks its query
+  (`_made_already`), so a retry of a chart already made never runs that query again.
 - Its answer is short and structured. Superset's own text never reaches it: any of Superset's exceptions is logged
   here and answered by its kind.
 - A caller who is not an editor of the object is told so before anything about the object's state (a stale
@@ -563,14 +564,40 @@ def _marker_lock(marker: str) -> Iterator[None]:
     yield
 
 
+def _found_answer(found: list[Any], *, kind: str) -> dict:
+    """The answer for the objects of `kind` a lookup found carrying a marker (`_marked`, at least one). One is answered
+    `{"<kind>_id": id}` when the caller may read it and edits it, else as one that does not exist or with its editors
+    (`_not_editor`). More than one stops the create with `{"candidates": [ids]}`, for the build to name: the ids of
+    those the caller may read, the others answered as objects that do not exist, so the list may be empty."""
+    security = _security()
+    readable = {"dashboard": security.can_access_dashboard, "chart": security.can_access_chart,
+                "dataset": security.can_access_datasource}[kind]
+    if len(found) > 1:
+        return {"candidates": [row.id for row in found if readable(row)]}
+    (row,) = found
+    if not readable(row):
+        return _not_found(kind)
+    if not security.is_editor(row):
+        return _not_editor(row)
+    return {f"{kind}_id": row.id}
+
+
+def _made_already(model: type, marker: str, *, kind: str) -> dict | None:
+    """The answer for the object of `model` that `marker` names, looked for without the marker's lock, or None when
+    there is none. A create whose own work before the lock may fail where it once ran (a chart's query check, which a
+    slow or unreachable source database fails) looks first, after the checks that refuse the caller: an object an
+    earlier send made is then answered as `_find_or_create` answers one (`_found_answer`), and that work never runs
+    again for it. What it finds is committed, so it is answered whatever the metadata database's isolation. None
+    decides nothing: the lookup under the lock (`_find_or_create`) is the one that decides whether to create."""
+    found = _marked(model, marker)
+    return _found_answer(found, kind=kind) if found else None
+
+
 def _find_or_create(model: type, marker: str, *, kind: str, create: Callable[[], dict]) -> dict:
     """The object of `model` that `marker` names, or `create()`'s answer when there is none, under the marker's lock
     (`_marker_lock`): a create whose answer was lost, sent again, answers the object the first one made instead of
-    making a second. One object found (`_marked`) is answered `{"<kind>_id": id}` when the caller may read it and
-    edits it, else as one that does not exist or with its editors (`_not_editor`). More than one stops the create
-    with `{"candidates": [ids]}`, for the build to name: the ids of those the caller may read, the others answered as
-    objects that do not exist, so the list may be empty. A lock not taken answers `{"busy": true}` or the refusal that
-    says why.
+    making a second. What it finds (`_marked`) is answered by `_found_answer`. A lock not taken answers
+    `{"busy": true}` or the refusal that says why.
 
     Only the lookup and the create run inside the lock. Every check that refuses the caller, and any of rc2's work
     that might end the session's transaction (a query check), runs before it, so the lock is held until the create's
@@ -580,17 +607,7 @@ def _find_or_create(model: type, marker: str, *, kind: str, create: Callable[[],
             found = _marked(model, marker)
             if not found:
                 return create()
-            security = _security()
-            readable = {"dashboard": security.can_access_dashboard, "chart": security.can_access_chart,
-                        "dataset": security.can_access_datasource}[kind]
-            if len(found) > 1:
-                return {"candidates": [row.id for row in found if readable(row)]}
-            (row,) = found
-            if not readable(row):
-                return _not_found(kind)
-            if not security.is_editor(row):
-                return _not_editor(row)
-            return {f"{kind}_id": row.id}
+            return _found_answer(found, kind=kind)
     except _NotLocked as not_locked:
         return not_locked.answer
     finally:
@@ -885,7 +902,11 @@ def create_chart(found: dict) -> dict:
     is run first and the chart saved only if it runs; then `CreateChartCommand` saves its params, its query context,
     the editors `_chart_editors` chooses and the build's marker, once for the marker: sent again, it answers the chart
     the first one made (`_find_or_create`). The editors are read in the create's own transaction. The chart joins the
-    dashboard when a layout places it (`set_layout`)."""
+    dashboard when a layout places it (`set_layout`).
+
+    A chart the marker names already is answered before its query is checked (`_made_already`), once the request, the
+    dataset and the dashboard pass their checks: a retry of a chart whose answer was lost never runs the source query
+    again, which a slow source database, the likely cause of the lost answer, could now fail."""
     if claim_marker(found["marker"], found["dashboard_id"]) is None:
         return BAD_MARKER
     from_config = found["config"] is not None
@@ -911,6 +932,10 @@ def create_chart(found: dict) -> dict:
         return _not_found("dashboard")
     if not _security().is_editor(dashboard):
         return _not_editor(dashboard)
+    from superset.models.slice import Slice
+
+    if (made := _made_already(Slice, found["marker"], kind="chart")) is not None:
+        return made
     if prepared is None:
         found["set"] = found["set"] or {}
         prepared = _config_form(found, dataset)
@@ -921,7 +946,6 @@ def create_chart(found: dict) -> dict:
     viz_type, form_data, context = prepared
     editors = _chart_editors(dataset, dashboard, ())
     from superset.commands.chart.create import CreateChartCommand
-    from superset.models.slice import Slice
 
     def create() -> dict:
         try:

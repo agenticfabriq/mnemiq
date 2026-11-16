@@ -1135,8 +1135,8 @@ def test_create_chart_twice_with_one_marker_makes_one_chart(live, extension, pol
 def test_concurrent_creates_with_one_marker_make_one_chart(live, extension, policy_id, made):
     """Two clients send one create (a bar chart by region, one marker) at once. The test holds the marker's lock from
     a connection of its own until both creates wait for it, so both have passed every check that runs before the lock
-    and neither has looked for the chart yet, then lets it go well inside the lock timeout: the two then look and
-    create one after the other. Both answer the same `{chart_id}`, and Superset holds one chart carrying the marker
+    (their look for the chart without it found none) and neither has looked under it yet, then lets it go well inside
+    the lock timeout: the two then look and create one after the other. Both answer the same `{chart_id}`, and Superset holds one chart carrying the marker
     and one of that name."""
     client = as_user(live, BUILDER)
     build = made.build(client, "concurrent")
