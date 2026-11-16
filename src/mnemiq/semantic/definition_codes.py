@@ -19,8 +19,9 @@ What counts, kept narrow so prose is not read as codes:
 - Only a code the definition selects on counts. A mention in an explicit exclusion (`<> 'X'`, `!= 'X'`,
   `NOT IN ('X')`, "is not 'X'", "other than", "except", "excluding", "exclude ... = 'X'" or "... IN ('X')",
   "'X' ... are excluded") is filtered out by a query that follows the definition, which keeps every row whether or not
-  the data holds it, so a definition that only excludes is never reported. A nearby negation that still selects ("not only 'X' but also",
-  "do not omit ... 'X'", "do not exclude ... 'X'") is not an exclusion, and "exclude" reaches only its own predicate.
+  the data holds it, so a definition that only excludes is never reported. A nearby negation that still selects
+  ("not only 'X' but also", "do not omit ... 'X'", "do not exclude ... 'X'") is not an exclusion, and "exclude" reaches
+  only its own predicate.
 - A code counts for a column only when it has the shape of one of the column's values: capitals, small letters and
   digits in the same places. `'from May to June'` is never a code for a column of `AB12`s.
 - A column is judged only when every column of that name in the snapshot is indexed: a code may be in the one whose
