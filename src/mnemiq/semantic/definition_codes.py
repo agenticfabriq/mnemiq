@@ -145,13 +145,14 @@ def _judged(snapshot: Snapshot, values) -> dict[str, tuple[str, tuple[str, ...],
 
 
 def _unjudged(snapshot: Snapshot, judged: dict) -> set[str]:
-    """Identifier-like column names, lowercased, that may hold a code but cannot be judged: text or untyped columns the
-    index does not hold whole. A code in such a column's predicate is that column's, and unknown."""
+    """Column names, lowercased, that may hold a code but cannot be judged: text or untyped columns the index does not
+    hold whole, plain-word names (`status`) included. A code in such a column's predicate is that column's, and
+    unknown."""
     out = set()
     for col in snapshot.columns:
         key = col.name.lower()
         typed = (col.data_type or "").lower()
-        if key not in judged and _identifier_like(key) and (not typed or any(t in typed for t in _TEXT_TYPES)):
+        if key not in judged and (not typed or any(t in typed for t in _TEXT_TYPES)):
             out.add(key)
     return out
 
@@ -162,8 +163,9 @@ def _attributed(text: str, judged: dict, names: set[str], unjudged: set[str]) ->
     A code is for the column named last before it in its own clause, judged or not: credited when that column is judged
     and the code has the shape of its values, and skipped otherwise, since it is that column's and not another's. A
     code with no column before it in its clause is credited to the one judged column the text names whose values share
-    its shape, and skipped when several do or when the text names a column that cannot be judged: which column it is
-    for cannot be told, and a guess could report a column it was never about."""
+    its shape, and skipped when several do or when the text names an identifier-like column that cannot be judged:
+    which column it is for cannot be told, and a guess could report a column it was never about. A plain-word name
+    (`status`) takes the codes of its own predicate but stops no other, since the same word in prose names nothing."""
     judged_at = {key: at for key, (column, _, _) in judged.items() if (at := _named_at(column, text))}
     other_at = {key: at for key in unjudged if (at := _named_at(key, text))}
     shapes = {key: {_shape(v) for v in judged[key][2]} for key in judged_at}
@@ -177,7 +179,7 @@ def _attributed(text: str, judged: dict, names: set[str], unjudged: set[str]) ->
                 out.setdefault(key, []).append(code)
             continue
         fits = [key for key in judged_at if _shape(code) in shapes[key]]
-        if len(fits) == 1 and not other_at:
+        if len(fits) == 1 and not any(_identifier_like(key) for key in other_at):
             out.setdefault(fits[0], []).append(code)
     return out
 

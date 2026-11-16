@@ -440,3 +440,14 @@ def test_a_code_in_an_unjudged_columns_predicate_is_never_handed_to_another():
     # With no column before it, a code is not handed to the one indexed column while an unindexed one is named.
     assert stale("'E' marks express; it is a SERVICE_LEVEL, beside SHIP_MODE.") == []
     assert stale("Count shipments where SERVICE_LEVEL = 'E' and SHIP_MODE = 'Q'.") == [("SHIP_MODE", ("Q",))]
+
+
+def test_a_plain_word_column_keeps_the_codes_in_its_own_predicate():
+    # `status` is never judged (a plain word), but `status = 'E'` is its predicate: E is not SHIP_MODE's.
+    held = _index({("shipments", "SHIP_MODE"): ["A", "G"]})
+    columns = [("shipments", "SHIP_MODE"), ("shipments", "status")]
+    snap = _snapshot([("ship", "Count shipments where SHIP_MODE <> 'X' and status = 'E'.")], columns)
+    assert stale_codes(snap, held) == []
+    # A plain word elsewhere in the text does not stop a code with no column before it from counting.
+    snap = _snapshot([("ship", "'Q' is rush, whatever the status; SHIP_MODE carries it.")], columns)
+    assert [(f.column, f.codes) for f in stale_codes(snap, held)] == [("SHIP_MODE", ("Q",))]
