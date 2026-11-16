@@ -121,6 +121,9 @@ class NoValueIndex:
     def nearest(self, object_id: str, column: str, literal: str, k: int = 8) -> list[str]:
         return []
 
+    def values(self, object_id: str, column: str) -> list[str]:
+        return []
+
 
 class ValueIndex:
     """Read side of the value index. Resilient to a store built before value grounding: the
@@ -153,6 +156,10 @@ class ValueIndex:
                 [object_id, column],
             ).fetchall()
         ]
+
+    def values(self, object_id: str, column: str) -> list[str]:
+        """Every value the index holds for the column, sorted; none for a column it does not index."""
+        return sorted(self._values(object_id, column))
 
     def nearest(self, object_id: str, column: str, literal: str, k: int = 8) -> list[str]:
         # Ties broken by the value: `_values` reads in no fixed order, and a stable sort would keep that order for
