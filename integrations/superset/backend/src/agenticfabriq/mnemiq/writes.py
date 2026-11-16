@@ -70,6 +70,9 @@ BAD_MARKER = {"refused": "marker"}
 # What opens a Jinja block; Superset renders a stored expression as a template, so none is saved.
 _TEMPLATE = re.compile(r"\{[{%#]")
 _ISO_4217 = re.compile(r"[A-Z]{3}")
+# The keys a create's `set` may carry: the display formats mnemiq's `owed_format_params` makes, which MCP's chart config
+# cannot. Nothing `set` carries may change which rows a chart reads or what it is bound to.
+_CREATE_SET_KEYS = frozenset({"column_config", "number_format", "currency_format"})
 _CHART_ROW_LIMIT_PROBE = 2  # the rows `create_chart`'s check asks for, as MCP's `_compile_chart` asks for two
 
 
@@ -1074,6 +1077,16 @@ def _check_query(context: dict) -> dict | None:
     """Runs the query context's queries, two rows each, as `ChartDataCommand` runs a chart's, so a chart whose query
     fails is never saved (as MCP's `_compile_chart`, `superset/mcp_service/chart/compile.py`, checks its own). None
     when they run; else the answer."""
+    return _probe(context)[0]
+
+
+def _has_rows(result: Any) -> bool:
+    queries = result.get("queries") if isinstance(result, dict) else None
+    return bool(queries) and any(isinstance(q, dict) and q.get("data") for q in queries)
+
+
+def _probe(context: dict) -> tuple[dict | None, Any]:
+    """`_check_query`'s run: (the answer or None, the command's result)."""
     from marshmallow import ValidationError
     from sqlalchemy.exc import SQLAlchemyError
     from superset.charts.schemas import ChartDataQueryContextSchema
@@ -1089,16 +1102,16 @@ def _check_query(context: dict) -> dict | None:
         command.validate()
         result = command.run()
     except SupersetSecurityException:
-        return _not_found("dataset")
+        return _not_found("dataset"), None
     # Any other of Superset's exceptions (a command's, or one raised building the query object, such as
     # `QueryObjectValidationError`), the schema's and the database's: the MCP service would pass its words on.
     except (SupersetException, ValidationError, SQLAlchemyError, ValueError, KeyError) as exc:
         logger.warning("mnemiq extension: create_chart's query did not run", exc_info=exc)
-        return {"refused": "query_failed"}
+        return {"refused": "query_failed"}, None
     if query_result_failure(result) is not None:
         logger.warning("mnemiq extension: create_chart's query failed")
-        return {"refused": "query_failed"}
-    return None
+        return {"refused": "query_failed"}, None
+    return None, result
 
 
 def _funnel_form(found: dict) -> tuple[str, dict, dict] | dict:
@@ -1122,7 +1135,8 @@ def _funnel_form(found: dict) -> tuple[str, dict, dict] | dict:
 def _config_form(found: dict, dataset: Any) -> tuple[str, dict, dict | None] | dict:
     """MCP's chart config made into a chart as its `generate_chart` saves one: the config validated
     (`ValidationPipeline`), mapped to form data (`map_config_to_form_data`, whose warnings key is dropped), the
-    request's `set` merged over it, and the query run (`_compile_chart`), so a chart whose query fails is never saved.
+    request's `set` merged over it, and the query run (`_compile_chart`; a histogram's by the extension's own
+    `_check_query`, as rc2's compile leaves a histogram's column out of its query), so a chart whose query fails is never saved.
     (viz_type, form data, query context), or the refusal. Runs under the marker's lock, which is held on a connection
     of its own, so whatever rc2 commits or rolls back here keeps it held."""
     from superset.mcp_service.chart.chart_utils import map_config_to_form_data
@@ -1134,7 +1148,11 @@ def _config_form(found: dict, dataset: Any) -> tuple[str, dict, dict | None] | d
         "dataset_id": dataset_id, "config": found["config"], "chart_name": found["slice_name"], "save_chart": True})
     if not validated.is_valid or validated.request is None:
         return {"refused": "config"}
-    form_data = map_config_to_form_data(validated.request.config, dataset_id=dataset_id)
+    try:
+        # A plugin's `post_map_validate` refuses by raising ValueError, as a histogram's does a non-numeric column.
+        form_data = map_config_to_form_data(validated.request.config, dataset_id=dataset_id)
+    except ValueError:
+        return {"refused": "config"}
     form_data.pop("_mcp_warnings", None)
     form_data.update(found["set"])
     viz_type = form_data.get("viz_type")
@@ -1142,9 +1160,26 @@ def _config_form(found: dict, dataset: Any) -> tuple[str, dict, dict | None] | d
         return {"refused": "config"}
     try:
         context = params.query_context(viz_type, form_data, dataset_id)
+        check = params.histogram_check_context(form_data, dataset_id) if viz_type == "histogram_v2" else None
     except ValueError:
         return {"refused": "config"}
-    if not _compile_chart(form_data, dataset.id).success:
+    if check is not None:
+        # rc2's `_compile_chart` builds its query from metrics and groupby and leaves a histogram's column (named
+        # under `column` alone) out, so the extension's own check runs a query that selects the groups and the column.
+        refused, result = _probe(check)
+        if refused is not None:
+            return refused
+        if len(check["queries"][0]["columns"]) > 1 and not _has_rows(result):
+            # The probe keeps only rows with every group set. None left may be an empty chart, which renders, or
+            # observations with no usable group, which the operator cannot unstack: a look without the group filters
+            # tells them apart.
+            refused, result = _probe(params.histogram_check_context(form_data, dataset_id, grouped=False))
+            if refused is not None:
+                return refused
+            if _has_rows(result):
+                logger.warning("mnemiq extension: create_chart's histogram has no row with a group set")
+                return {"refused": "query_failed"}
+    elif not _compile_chart(form_data, dataset.id).success:
         logger.warning("mnemiq extension: create_chart's query failed")
         return {"refused": "query_failed"}
     return viz_type, form_data, context
@@ -1153,7 +1188,8 @@ def _config_form(found: dict, dataset: Any) -> tuple[str, dict, dict | None] | d
 @_answering("create_chart")
 def create_chart(found: dict) -> dict:
     """A chart on the dataset, for the dashboard, in one of two shapes: a funnel or a sankey as `{viz_type, params}`,
-    or any family as MCP's own chart config, `{config}` with the format keys `set` to merge into its params. Its query
+    or any family as MCP's own chart config, `{config}` with the format keys `set` (only `_CREATE_SET_KEYS`) to merge into
+    its params. Its query
     is run first and the chart saved only if it runs; then `CreateChartCommand` saves its params, its query context,
     the editors `_chart_editors` chooses and the build's marker, once for the marker. The editors are read in the
     create's own transaction. The chart joins the dashboard when a layout places it (`set_layout`).
@@ -1177,8 +1213,7 @@ def create_chart(found: dict) -> dict:
         shaped = found["viz_type"] is not None and found["params"] is not None and found["set"] is None
     if not shaped:
         return {"refused": "request"}
-    # `set` carries format keys: the dataset is the request's and the type the config's, as a chart's patch leaves them.
-    if from_config and not (params._BINDING_KEYS | {"viz_type"}).isdisjoint(found["set"] or ()):
+    if from_config and not set(found["set"] or ()) <= _CREATE_SET_KEYS:
         return {"refused": "set"}
     dataset_id = found["dataset_id"]
     prepared = _funnel_form(found) if own else None

@@ -967,6 +967,44 @@ def test_a_funnel_is_made_through_the_extension_and_its_data_read(live, served, 
             check=final["checks"].get(str(chart_id)), message=run.last_step.get("message"))
 
 
+# --- a histogram, made through the extension ------------------------------------------------------------------------
+
+
+def test_a_build_with_a_histogram_makes_it(live, served, model, policy_id):
+    """A histogram and a bar in one stub plan. Expected: the build runs to `done`; the histogram exists as a
+    `histogram_v2` chart carrying this build's marker and is on the dashboard, saved with no query context; the value
+    check leaves it NOT_CHECKED, and the build's message names it with the histogram rule's reason
+    (`_NOT_CHECKED_TYPES`), while the bar is CHECKED (the one status the build keeps, for the charts of its measures).
+    No model client is made or called."""
+    policies = Measure(name="policies", label="Policies", expression="COUNT(id)", kind=MeasureKind.COUNT,
+                       dataset_id=policy_id, description="Policies written", asked_by="")
+    fields = {"time_column": None, "time_grain": None, "filters": (), "row_limit": None, "source": None, "target": None}
+    histogram = ChartSpec(key="premium_spread", family=Family.HISTOGRAM, title="Spread of premiums",
+                          dataset_id=policy_id, measures=(), dimensions=("premium",), **fields)
+    bar = ChartSpec(key="policies_by_region", family=Family.BAR, title="Policies by region", dataset_id=policy_id,
+                    measures=(WrittenRef(policies),), dimensions=("region",), **fields)
+    plan = BuildPlan(charts=(histogram, bar), measures=(policies,))
+    run = run_build(live, served, model, plan, "histogram", goal="the spread of premiums and policies by region")
+    found = summary(run, served, plan) if run.build_id else {"stopped": run.stopped}
+    record("histogram", found)
+    assert_ran_to_the_end(run)
+    final = run.final
+    ids = {step["key"]: step["object_id"] for step in final["steps"] if step["kind"] == "chart"}
+    assert set(ids) == {histogram.key, bar.key}, ids
+    dashboard_id = final["dashboard_id"]
+    stored = stored_chart(ids[histogram.key])
+    assert stored["viz_type"] == "histogram_v2" and stored["deleted_at"] is None
+    assert parse_marker(stored["description"]) == Marker(run.build_id, histogram.key, dashboard_id)
+    assert ids[histogram.key] in members(dashboard_id) and ids[bar.key] in members(dashboard_id)
+    assert metadata("SELECT query_context FROM slices WHERE id = %s", (ids[histogram.key],)) == [(None,)]
+    assert final["checks"] == {str(ids[bar.key]): "checked"}, final["checks"]
+    assert run.last_step["message"] == (
+        f"1 of 2 charts checked; not checked: {histogram.title!r} (not_checked: {_NOT_CHECKED_TYPES['histogram_v2']})")
+    assert_no_model_call(run)
+    observe("histogram", chart_ids=ids, dashboard_id=dashboard_id, checks=final["checks"],
+            message=run.last_step.get("message"))
+
+
 # --- an existing dashboard, for its editors only -------------------------------------------------------------------
 
 

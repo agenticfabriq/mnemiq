@@ -614,6 +614,93 @@ def query_context(viz_type: str, params: Mapping, datasource_id: int) -> dict | 
     return json.loads(json.dumps(context))
 
 
+def _bins_number(value: Any) -> float:
+    """JavaScript's `Number(value)` for the JSON values a config carries: null and a blank string are 0, a boolean 1
+    or 0, a numeric string (surrounding whitespace allowed) its number, an integer past any float infinite, and
+    anything else NaN."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (bool, int, float)):
+        try:
+            return float(value)
+        except OverflowError:
+            return math.inf if value > 0 else -math.inf
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return 0.0
+        if "_" in text:
+            return math.nan
+        try:
+            return float(text)
+        except ValueError:
+            return math.nan
+    return math.nan
+
+
+def _histogram_operator(form_data: Mapping, column: Any, groups: list) -> dict:
+    """`histogramOperator` (`.../src/operators/histogramOperator.ts`): `bins` as `Number(bins)`, or 5 where that is
+    NaN (a missing one included); the column and groups by label; `cumulative` and `normalize` as the form data has
+    them (JSON drops an undefined one). Raises ValueError for a `bins` that is infinite, which no chart can bin."""
+    bins = _bins_number(form_data["bins"]) if "bins" in form_data else float("nan")
+    if bins != bins:
+        bins = 5
+    elif not math.isfinite(bins):
+        raise ValueError("a histogram's `bins` is not a finite number")
+    elif bins == int(bins):
+        bins = int(bins)
+    options = {"column": _column_label(column), "groupby": [_column_label(g) for g in groups], "bins": bins}
+    for key in ("cumulative", "normalize"):
+        if key in form_data:
+            options[key] = form_data[key]
+    return {"operation": "histogram", "options": options}
+
+
+def histogram_check_context(form_data: Mapping, datasource_id: int, grouped: bool = True) -> dict:
+    """The query context the extension runs to check a histogram (`histogram_v2`) before it is saved: a row select of
+    its grouping columns and its `column` (the form data's `groupby`, then `column`), under the base query every
+    family starts from (`_base_query`, which is `buildQueryObject`: the filters and extras, `time_range` and
+    `granularity`, read once), carrying the histogram operator the chart's own query carries, so a column holding
+    non-numeric values fails the check as it fails the chart. Its metrics are the histogram's own `buildQuery`'s:
+    none (a plain row select), or `COUNT(*)` when an adhoc filter's clause is HAVING, so a HAVING filter has an
+    aggregate to hold. rc2's own compile check leaves a histogram's column out of its query, which it builds from
+    metrics and groupby, because the histogram names its column under `column` alone.
+
+    The probe differs from the chart's own query in three ways only: its row limit (set by the caller), a not-null
+    filter on each selected column (the check reads two unordered rows, and the operator fails on a null group value),
+    and, with `grouped` False (the second look, at whether any observation exists), no operator and a not-null filter
+    on the column alone. Not a chart's saved query context. Raises ValueError for a bad `datasource_id`, for form data
+    that is not a mapping, and for form data without a `column`."""
+    if isinstance(datasource_id, bool) or not isinstance(datasource_id, int) or datasource_id < 1:
+        raise ValueError("datasource_id must be a positive integer")
+    if not isinstance(form_data, Mapping):
+        raise ValueError("params must be a mapping")
+    column = form_data.get("column")
+    if not (isinstance(column, str) and column) and not _is_adhoc_column(column):
+        raise ValueError("a histogram's params name no column")
+    base = _base_query(form_data)
+    groups = [c for c in _ensure_list(form_data.get("groupby")) if c != ""]
+    columns = _dedupe([*groups, column], _column_label)
+    # A null-only sample would be an empty frame the operator passes, and a non-numeric value still fails it.
+    not_null = [{"col": c, "op": "IS NOT NULL"} for c in (columns if grouped else [column])]
+    query = {"columns": columns, "filters": [*base["filters"], *not_null], "extras": base["extras"]}
+    for key in ("time_range", "granularity"):
+        if key in base:
+            query[key] = base[key]
+    if any(isinstance(f, Mapping) and f.get("clause") == "HAVING" for f in _ensure_list(form_data.get("adhoc_filters"))):
+        query["metrics"] = [{"expressionType": "SQL", "sqlExpression": "COUNT(*)", "label": "COUNT(*)"}]
+    if grouped:
+        query["post_processing"] = [_histogram_operator(form_data, column, groups)]
+    context = {
+        "datasource": {"id": datasource_id, "type": "table"},
+        "force": False,
+        "queries": [query],
+        "result_format": "json",
+        "result_type": "full",
+    }
+    return json.loads(json.dumps(context))
+
+
 # ---------------------------------------------------------------- the patch
 
 class PatchRefused(ValueError):

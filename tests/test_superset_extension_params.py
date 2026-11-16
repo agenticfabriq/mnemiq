@@ -719,3 +719,114 @@ def test_metric_stub_list_keeps_every_existing_id():
     with pytest.raises(ValueError):
         ext.metric_stub_list([{"metric_name": "no id"}], new)
     assert ext.metric_stub_list([], new) == [new]
+
+
+# ---------------------------------------------------------------- a histogram's own check query
+
+HISTOGRAM = {"viz_type": "histogram_v2", "column": "amount", "groupby": ["region"], "bins": 10, "normalize": False,
+             "cumulative": False, "row_limit": 10000, "adhoc_filters": [WEST]}
+
+
+def test_histogram_check_context_selects_the_groups_then_the_column():
+    """The observations and their grouping columns: the form data's `groupby`, then its `column`; no metrics and no
+    post-processing; the form data's filters, read as the other families' builders read them."""
+    context = ext.histogram_check_context(HISTOGRAM, DATASET)
+    assert context["datasource"] == {"id": DATASET, "type": "table"}
+    assert context["result_type"] == "full" and context["force"] is False
+    (query,) = context["queries"]
+    assert query["columns"] == ["region", "amount"]
+    assert "metrics" not in query  # a plain row select, as the histogram's own `buildQuery` sends none
+    assert query["filters"] == [WEST_Q, {"col": "region", "op": "IS NOT NULL"}, {"col": "amount", "op": "IS NOT NULL"}]
+    assert query["post_processing"] == [{"operation": "histogram", "options": {
+        "column": "amount", "groupby": ["region"], "bins": 10, "cumulative": False, "normalize": False}}]
+    assert json.loads(json.dumps(context)) == context
+
+
+def test_histogram_check_context_selects_the_column_alone_without_groups():
+    (query,) = ext.histogram_check_context({"viz_type": "histogram_v2", "column": "amount"}, DATASET)["queries"]
+    assert query["columns"] == ["amount"] and "metrics" not in query
+    assert query["filters"] == [{"col": "amount", "op": "IS NOT NULL"}]
+
+
+@pytest.mark.parametrize("bins", ["inf", "Infinity", "-inf", 1e999, float("inf")])
+def test_histogram_check_context_refuses_bins_that_are_not_finite(bins):
+    with pytest.raises(ValueError):
+        ext.histogram_check_context({**HISTOGRAM, "bins": bins}, DATASET)
+
+
+def test_histogram_check_context_keeps_an_adhoc_columns_own_object_in_its_null_filter():
+    adhoc = {"label": "doubled", "sqlExpression": "amount * 2", "expressionType": "SQL"}
+    (query,) = ext.histogram_check_context({"viz_type": "histogram_v2", "column": adhoc}, DATASET)["queries"]
+    assert query["filters"] == [{"col": adhoc, "op": "IS NOT NULL"}]
+
+
+@pytest.mark.parametrize("bins, parsed", [
+    ("absent", 5), ("12", 12), (" 12 ", 12), ("x", 5), (7.0, 7), (None, 0), ("", 0), ("  ", 0), (True, 1),
+    (False, 0), ("1_0", 5), ("nan", 5), ([1, 2], 5)])
+def test_histogram_check_context_reads_bins_as_javascripts_number(bins, parsed):
+    """`histogramOperator`: `Number(bins)`, or 5 where that is NaN; a missing `bins` is NaN, null and a blank string
+    are 0 and a boolean is 1 or 0."""
+    form = {"viz_type": "histogram_v2", "column": "amount", "cumulative": True, "normalize": True, "bins": bins}
+    if bins == "absent":
+        form.pop("bins")
+    (query,) = ext.histogram_check_context(form, DATASET)["queries"]
+    assert query["post_processing"] == [{"operation": "histogram", "options": {
+        "column": "amount", "groupby": [], "bins": parsed, "cumulative": True, "normalize": True}}]
+
+
+def test_histogram_check_context_refuses_an_integer_bins_no_float_holds():
+    with pytest.raises(ValueError):
+        ext.histogram_check_context({**HISTOGRAM, "bins": 10**400}, DATASET)
+
+
+def test_histogram_check_context_without_groups_not_null_keeps_the_observations_and_no_operator():
+    """The second probe: the form data's filters and the column not null, no group filter, no operator."""
+    (query,) = ext.histogram_check_context(HISTOGRAM, DATASET, grouped=False)["queries"]
+    assert query["columns"] == ["region", "amount"]
+    assert query["filters"] == [WEST_Q, {"col": "amount", "op": "IS NOT NULL"}]
+    assert "post_processing" not in query
+
+
+@pytest.mark.parametrize("grouped", [True, False])
+@pytest.mark.parametrize("grain_key", ["granularity_sqla", "granularity"])
+def test_histogram_check_context_carries_the_time_window_and_granularity(grouped, grain_key):
+    """`buildQueryObject`'s `time_range` and `granularity` (from `granularity_sqla` or `granularity`), as the base
+    query every other family starts from reads them, in both probes."""
+    form = {**HISTOGRAM, "time_range": "Last year", grain_key: "order_date"}
+    (query,) = ext.histogram_check_context(form, DATASET, grouped=grouped)["queries"]
+    assert query["time_range"] == "Last year" and query["granularity"] == "order_date"
+    (plain,) = ext.histogram_check_context(HISTOGRAM, DATASET, grouped=grouped)["queries"]
+    assert "time_range" not in plain and "granularity" not in plain
+
+
+_COUNT_ALL = [{"expressionType": "SQL", "sqlExpression": "COUNT(*)", "label": "COUNT(*)"}]
+
+
+@pytest.mark.parametrize("having", [
+    {"expressionType": "SIMPLE", "clause": "HAVING", "subject": "amount", "operator": ">", "comparator": 1},
+    {"expressionType": "SQL", "clause": "HAVING", "sqlExpression": "SUM(amount) > 1"},
+])
+def test_histogram_check_context_aggregates_when_a_having_filter_is_present(having):
+    """The histogram's `buildQuery` sends `COUNT(*)` as its metric only when an adhoc filter's clause is HAVING, so
+    the query groups and a HAVING clause has an aggregate to hold; the groups then the column stay as they were."""
+    form = {**HISTOGRAM, "adhoc_filters": [WEST, having]}
+    (query,) = ext.histogram_check_context(form, DATASET)["queries"]
+    assert query["metrics"] == _COUNT_ALL
+    assert query["columns"] == ["region", "amount"]
+
+
+def test_histogram_check_context_does_not_change_its_form_data():
+    before = copy.deepcopy(HISTOGRAM)
+    ext.histogram_check_context(HISTOGRAM, DATASET)
+    assert HISTOGRAM == before
+
+
+@pytest.mark.parametrize("form", [{"viz_type": "histogram_v2"}, {"column": None}, {"column": ""}, {"column": []}])
+def test_histogram_check_context_needs_a_column(form):
+    with pytest.raises(ValueError):
+        ext.histogram_check_context({"groupby": ["region"], **form}, DATASET)
+
+
+def test_histogram_check_context_needs_a_dataset():
+    with pytest.raises(ValueError):
+        ext.histogram_check_context(HISTOGRAM, 0)

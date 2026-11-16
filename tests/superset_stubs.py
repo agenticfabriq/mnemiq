@@ -230,7 +230,8 @@ def install(monkeypatch) -> SimpleNamespace:
 
         def run(self) -> dict:
             state.ran.append(("chart_data", self.query_context))
-            return state.chart_data
+            # A test may set a function of the query context to answer each probe as its query asks.
+            return state.chart_data(self.query_context) if callable(state.chart_data) else state.chart_data
 
     def query_result_failure(result):
         failed = [q for q in result.get("queries", []) if q.get("error") or q.get("status") == "failed"]
@@ -309,6 +310,8 @@ def install(monkeypatch) -> SimpleNamespace:
 
     def map_config_to_form_data(config: dict, dataset_id=None) -> dict:
         state.ran.append(("map", config, dataset_id))
+        if isinstance(state.mapped, BaseException):
+            raise state.mapped
         return copy.deepcopy(state.mapped)
 
     def _compile_chart(form_data: dict, dataset_id: int) -> SimpleNamespace:
