@@ -781,6 +781,9 @@ class _Connection:
             answer = self._release(statement)
         elif statement == HOLDS:
             answer = self.holding == parameters["marker"] if metadata.holds_answer is None else metadata.holds_answer
+            if metadata.after_hold_check is not None:
+                meanwhile, metadata.after_hold_check = metadata.after_hold_check, None
+                meanwhile()
         return SimpleNamespace(scalar=lambda: answer)
 
     def _take(self, key: str, seconds: float | None) -> bool:
@@ -836,16 +839,21 @@ class Metadata:
     `aborted` (the session's transaction is aborted, as Postgres aborts one a statement failed in: every statement fails
     with SQLSTATE 25P02 until a rollback), `gone` (the session's connection is gone: every statement fails, a rollback
     or not; SQLAlchemy marks the error as an invalidated connection), `breaks` (what of `aborted` or `gone` happens,
-    once, when the session reaches a moment: `"isolation"` or `"lookup"`) and `before_create_lock` (run once, just
-    before the session takes a create's transaction lock). The session's transaction locks (`CREATE_LOCK`) are real
-    locks too, keyed by the marker, held until the session commits or rolls back. `waiting` holds the connections
-    waiting for a lock, and `leaked` each lock a connection still held when it was closed. `drop_lock_connections()`
+    once, when the session reaches a moment: `"isolation"` or `"lookup"`), `before_create_lock` (run once, just
+    before the session takes a create's transaction lock) and `after_hold_check` (run once, on the lock's connection,
+    once the hold check has its answer and before it is returned). The session's transaction locks (`CREATE_LOCK`) are
+    real locks too, keyed by the marker, held until the session commits or rolls back. The session's transaction
+    state, whether it is `aborted` and the transaction locks it holds (`held_xact`), is each thread's own, as
+    Superset's scoped session is one session per thread: two sends in two threads each roll back only their own
+    transaction. `waiting` holds the connections waiting for a lock, `waiting_xact` the threads whose session waits for
+    a transaction lock, and `leaked` each lock a connection still held when it was closed. `drop_lock_connections()`
     ends the database session of every connection of its own: their locks are let go, and every later statement on
     them fails. `fail_at` maps a session statement, or `"lookup"`, to `(n, error)`: its n-th occurrence on the session
     raises `error`."""
 
     def __init__(self, superset: SimpleNamespace, dialect: str) -> None:
         self.superset = superset
+        self._transaction = threading.local()  # each thread's session's own transaction state
         self.isolation, self.contended, self.got_lock, self.pool_exhausted = "READ COMMITTED", None, 1, False
         self.lock_error: BaseException | None = None
         self.late_grant = False
@@ -854,9 +862,10 @@ class Metadata:
         self.aborted = self.gone = False
         self.breaks: dict[str, str] = {}
         self.before_create_lock: Callable[[], None] | None = None
+        self.after_hold_check: Callable[[], None] | None = None
         self.locks: dict[str, threading.Lock] = {}
         self.xact_locks: dict[str, threading.Lock] = {}
-        self.held_xact: list[str] = []
+        self.waiting_xact: list[str] = []
         self.opened: list[_Connection] = []
         self.fail_at: dict[str, tuple[int, BaseException]] = {}
         self.occurrences: dict[str, int] = {}
@@ -864,6 +873,22 @@ class Metadata:
         self.leaked: list[str] = []
         self._numbers = itertools.count(1)
         self.engine = SimpleNamespace(dialect=SimpleNamespace(name=dialect), connect=self._connect)
+
+    @property
+    def aborted(self) -> bool:
+        """Whether this thread's session's transaction is aborted."""
+        return getattr(self._transaction, "aborted", False)
+
+    @aborted.setter
+    def aborted(self, value: bool) -> None:
+        self._transaction.aborted = value
+
+    @property
+    def held_xact(self) -> list[str]:
+        """The transaction locks this thread's session holds, by marker."""
+        if not hasattr(self._transaction, "held_xact"):
+            self._transaction.held_xact = []
+        return self._transaction.held_xact
 
     def at(self, moment: str) -> None:
         """The session reaches `moment`: what `breaks` names for it happens now, once."""
@@ -922,8 +947,14 @@ class Metadata:
             raise stubs.database_error("55P03")
         if statement == CREATE_LOCK:
             key = parameters["marker"]
-            if not self.xact_locks.setdefault(key, threading.Lock()).acquire(timeout=5):
-                raise stubs.database_error("55P03")
+            lock = self.xact_locks.setdefault(key, threading.Lock())
+            if not lock.acquire(blocking=False):
+                self.waiting_xact.append(threading.current_thread().name)
+                try:
+                    if not lock.acquire(timeout=5):
+                        raise stubs.database_error("55P03")
+                finally:
+                    self.waiting_xact.remove(threading.current_thread().name)
             self.held_xact.append(key)
 
     def _end_transaction(self) -> None:
@@ -2263,25 +2294,206 @@ def _refusing(superset: SimpleNamespace, check: str) -> None:
         superset.chart_data = {"queries": [{"error": "the source database timed out", "status": "failed"}]}
 
 
-def _after(superset: SimpleNamespace, ran: str) -> list[str]:
-    """What ran after the check `ran` names."""
-    kinds = _kinds(superset)
-    return kinds[kinds.index(ran) + 1:]
+def _after(superset: SimpleNamespace, ran: str) -> list:
+    """What ran after the check `ran` names (its first run)."""
+    return superset.ran[_kinds(superset).index(ran) + 1:]
+
+
+def settled(create: str, n: int = 1) -> list:
+    """What `create` runs on Postgres once a check of its own refused it, the marker's lock held on connection `n`: the
+    settle (the session rolled back, then the guarded look, `guarded`, which finds nothing and the lock held), the
+    request's transaction ended, and the lock let go."""
+    marker = CREATES[create][2]
+    return [("rollback",), *guarded(create, "postgresql", n), ("rollback",), *let_go("postgresql", marker, n)]
 
 
 @pytest.mark.parametrize("check", CHECKS)
 def test_a_chart_its_own_check_refuses_is_answered_the_refusal_under_the_lock(creating, check):
-    """rc2's validation, mapping or query check refuses the chart under the marker's lock, where no other send of the
-    create can be making the chart, so the refusal is answered as it is: after nothing more of the chart's path (a
-    config the validation refuses is not mapped, nor its query run), the request's transaction ends and the lock is
-    let go. Nothing is made."""
+    """rc2's validation, mapping or query check refuses the chart under the marker's lock. The refusal is answered
+    once the settle finds no chart with the lock still held: after nothing more of the chart's path (a config the
+    validation refuses is not mapped, nor its query run), the session is rolled back and the guarded look runs (the
+    second lock, the look, the hold check); then the request's transaction ends and the lock is let go. Nothing is
+    made."""
     make, ran, refusal = CHECKS[check]
     _refusing(creating.superset, check)
     assert make() == refusal
     assert creating.superset.ran[:8] == [*taken("postgresql", STEP), *looked("postgresql", "Slice")]
-    assert creating.superset.ran[-3:] == [("rollback",), *let_go("postgresql", STEP)]
-    assert _after(creating.superset, ran) == ["rollback", "on", "close"]
+    assert _after(creating.superset, ran) == settled("funnel chart" if make is make_funnel else "config chart")
     assert commands(creating.superset) == []
+
+
+def _when_checked(monkeypatch, check: str, meanwhile: Callable[[], None]) -> None:
+    """`meanwhile()` runs each time `check` (one of `CHECKS`) runs, just before the check itself: rc2's validation, its
+    mapping, `_compile_chart`, or a funnel's query."""
+    if check == "validation":
+        pipeline = sys.modules["superset.mcp_service.chart.validation"].ValidationPipeline
+        validating = pipeline.validate_request_with_warnings
+        monkeypatch.setattr(pipeline, "validate_request_with_warnings",
+                            staticmethod(lambda request: (meanwhile(), validating(request))[1]))
+    elif check == "query check":
+        command = sys.modules["superset.commands.chart.data.get_data_command"].ChartDataCommand
+        running = command.run
+        monkeypatch.setattr(command, "run", lambda self: (meanwhile(), running(self))[1])
+    else:
+        module, name = {"mapping": ("superset.mcp_service.chart.chart_utils", "map_config_to_form_data"),
+                        "compile": ("superset.mcp_service.chart.compile", "_compile_chart")}[check]
+        checking = getattr(sys.modules[module], name)
+        monkeypatch.setattr(sys.modules[module], name,
+                            lambda *args, **kwargs: (meanwhile(), checking(*args, **kwargs))[1])
+
+
+def _sender(make: Callable[[], dict], answers: dict, errors: list) -> Callable[[str], None]:
+    """A send of `make`, by name: its answer goes to `answers[name]`, anything it raises to `errors`."""
+
+    def send(name: str) -> None:
+        try:
+            answers[name] = make()
+        except BaseException as exc:  # noqa: BLE001 (reported by the test)
+            errors.append(exc)
+
+    return send
+
+
+def test_a_retrys_refusal_answers_the_chart_a_first_send_made_meanwhile(creating):
+    """A first send of a chart passes its guarded look: it holds the second lock, has found nothing and has found its
+    marker's lock held. Then that lock's connection ends, and a retry of the same create, sent meanwhile, takes the
+    marker's lock and finds nothing yet; the retry's own query check refuses the chart, as a check against a slow
+    source may. Before it answers that refusal the retry settles it: it waits for the second lock, which the first
+    holds until its command commits, then looks again and finds the first's chart. Both sends answer the one chart,
+    and the build never records a refusal for a chart Superset holds."""
+    metadata, superset = creating.metadata, creating.superset
+    answers: dict[str, dict] = {}
+    errors: list[BaseException] = []
+    send = _sender(make_from_config, answers, errors)
+    retry = threading.Thread(target=send, args=("retry",), name="retry", daemon=True)
+
+    def meanwhile() -> None:
+        metadata.drop_lock_connections()
+        superset.compiled = SimpleNamespace(success=False)
+        retry.start()
+        deadline = time.monotonic() + 5
+        while not metadata.waiting_xact and retry.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    metadata.after_hold_check = meanwhile
+    try:
+        send("first")
+    finally:
+        if retry.ident is not None:
+            retry.join(10)
+    assert not errors, errors
+    assert set(answers.get("first", {})) == {"chart_id"}, answers
+    assert answers.get("retry") == answers["first"], answers
+    assert _kinds(superset).count("compile") == 2
+    assert len(superset.rows["Slice"]) == 1 and len(commands(superset, "CreateChartCommand")) == 1
+    assert metadata.waiting_xact == []
+
+
+def test_a_first_send_whose_lock_was_lost_while_a_retry_refused_makes_nothing(creating, monkeypatch):
+    """The interleaving the settle and the hold check close together. A first send's marker lock's connection ends
+    while its query check runs. A retry takes the marker's lock, finds nothing, and its own check refuses the chart;
+    it settles the refusal, finding nothing with its lock still held, and answers the refusal, which the build
+    records. Then the first send's check passes: at its guarded look it finds nothing and finds its lock lost, so it
+    answers busy and makes nothing. No chart stands behind the refusal the build recorded."""
+    metadata, superset = creating.metadata, creating.superset
+    answers: dict[str, dict] = {}
+    errors: list[BaseException] = []
+    send = _sender(make_from_config, answers, errors)
+    retry = threading.Thread(target=send, args=("retry",), name="retry", daemon=True)
+
+    def meanwhile() -> None:
+        if retry.ident is not None:
+            return  # the retry's own check, which refuses
+        metadata.drop_lock_connections()
+        superset.compiled = SimpleNamespace(success=False)
+        retry.start()
+        retry.join(10)
+        superset.compiled = SimpleNamespace(success=True)
+
+    _when_checked(monkeypatch, "compile", meanwhile)
+    send("first")
+    assert not errors, errors
+    assert answers == {"retry": {"refused": "query_failed"}, "first": {"busy": True}}, answers
+    assert superset.rows["Slice"] == [] and commands(superset) == []
+    ran = superset.ran
+    retry_ran = ran[ran.index(("connect", 2)):ran.index(("close", 2)) + 1]
+    assert retry_ran == [*taken("postgresql", STEP, 2), *looked("postgresql", "Slice"), ("validate", ANY),
+                         ("map", CONFIG, 7), ("compile", ANY, 7), *settled("config chart", 2)]
+    assert metadata.held_xact == [] and metadata.waiting_xact == []
+
+
+@pytest.mark.parametrize("check", CHECKS)
+def test_a_refusal_after_its_own_lock_was_lost_answers_busy(creating, monkeypatch, check):
+    """A chart's own check refuses it after the marker lock's connection ended while the check ran, with no other send
+    of the create. Another send may have taken the lock meanwhile and be making the chart, so the refusal is not
+    answered: the settle finds nothing and finds the lock lost, and the create answers busy, having made nothing. The
+    same request may be sent again."""
+    make, _, _ = CHECKS[check]
+    _refusing(creating.superset, check)
+    _when_checked(monkeypatch, check, creating.metadata.drop_lock_connections)
+    assert make() == {"busy": True}
+    assert creating.superset.rows["Slice"] == [] and commands(creating.superset) == []
+    assert creating.metadata.held_xact == [] and creating.metadata.leaked == []
+
+
+@pytest.mark.parametrize("made_meanwhile", [pytest.param(True, id="another send made the chart meanwhile"),
+                                            pytest.param(False, id="nothing made, the lock held")])
+def test_a_database_error_in_a_creates_checks_is_settled_before_it_is_answered(creating, monkeypatch, made_meanwhile):
+    """A database error raised out of a chart's own checks (here the config's mapping, SQLSTATE XX000, which aborts the
+    session's transaction) is settled as a refusal is: the session is rolled back, which ends the aborted transaction,
+    and the guarded look runs. When another send committed the step's chart meanwhile (this send's lock lost), that
+    chart is answered. Else, nothing found and the lock held, the error goes on to the write tool's boundary for
+    database errors and is answered `{"failed": true}`, as before."""
+    metadata, superset = creating.metadata, creating.superset
+    superset.mapped = stubs.database_error("XX000")
+
+    def aborting() -> None:
+        metadata.aborted = True
+        if made_meanwhile:
+            metadata.drop_lock_connections()
+            superset.rows["Slice"].append(_row(9, STEP))
+
+    _when_checked(monkeypatch, "mapping", aborting)
+    if made_meanwhile:
+        assert make_from_config() == {"chart_id": 9}
+    else:
+        assert make_from_config() == {"failed": True}
+        assert _after(superset, "map") == [*settled("config chart"), ("rollback",)]
+    assert commands(superset) == [] and metadata.leaked == []
+
+
+def test_a_commands_own_refusal_is_answered_after_the_settle(lock_rows):
+    """A dataset whose command refuses it (a dataset not made for this marker already holds the table), its marker's
+    lock held throughout, answers `{"exists": true}`, but only once the settle has run after the command's rollback:
+    the second lock, the look and the hold check, as for any answer but the object or busy."""
+    superset = lock_rows.superset
+    superset.session = Metadata(superset, "postgresql")
+    superset.create = stubs.DatasetInvalidError({"DatasetExistsValidationError"})
+    assert make_dataset() == {"exists": True}
+    assert _after(superset, "CreateDatasetCommand") == [("raise_for_access", "builder", ANY), ("rollback",),
+                                                        *settled("dataset")]
+    assert commands(superset, "UpdateDatasetCommand") == []
+
+
+def test_a_dataset_the_settle_finds_gets_its_editors_set(lock_rows):
+    """The settle runs before a dataset's editors step. A dataset create passes its guarded look, and then its marker
+    lock's connection ends; its command refuses the dataset, and once that command has rolled back (letting the second
+    lock go), another send of the create, holding the lost lock, commits the dataset over the same table. The first
+    send's settle finds that dataset and answers it, with its editors set as for any dataset found by its marker."""
+    superset, dataset, ids = lock_rows.superset, lock_rows.dataset, lock_rows.ids
+    metadata = superset.session = Metadata(superset, "postgresql")
+    superset.create = stubs.DatasetInvalidError({"DatasetExistsValidationError"})
+    dataset.deleted_at, dataset.description = None, DATA
+
+    def lost_after_the_hold_check() -> None:
+        metadata.drop_lock_connections()
+        metadata.before_create_lock = lambda: superset.rows["SqlaTable"].append(dataset)
+
+    metadata.after_hold_check = lost_after_the_hold_check
+    assert make_dataset() == {"dataset_id": 4}
+    assert _sent_editors(superset, "UpdateDatasetCommand") == [
+        ids["creator"], ids["builder"], 302, ids["reader"], ids["database_reader"]]
+    assert _kinds(superset).index("CreateDatasetCommand") < _kinds(superset).index("UpdateDatasetCommand")
 
 
 @pytest.mark.parametrize("kind", ["config chart", "funnel chart", "physical dataset"])
@@ -2644,7 +2856,7 @@ def test_a_histogram_whose_check_fails_is_refused_and_nothing_is_made(creating):
     assert make_from_config() == {"refused": "query_failed"}
     ran = creating.superset.ran
     assert ran[:8] == [*taken("postgresql", STEP), *looked("postgresql", "Slice")]
-    assert _after(creating.superset, "chart_data") == ["rollback", "on", "close"]
+    assert _after(creating.superset, "chart_data") == settled("config chart")
     assert commands(creating.superset) == []
 
 

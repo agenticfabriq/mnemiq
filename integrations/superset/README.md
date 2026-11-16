@@ -122,12 +122,15 @@ again, and confirms on its marker lock's own connection that the lock is still h
 transaction of its own on that connection, which does not end the lock). So if the first lock's connection was lost
 while the create worked (its lock goes with it), an object another send made meanwhile is found and answered rather
 than made twice, and a create whose lock was lost answers `{"busy": true}` and makes nothing: it never takes the lost
-lock again, and the extension logs a warning that the marker's lock was lost while the create worked. On MySQL the
-named lock is the only guard: if its connection is lost while a create works, a second send of the create can make a
-second object. A wait for the lock longer than `MNEMIQ_LOCK_TIMEOUT_S` or cut short by the metadata database's
-`statement_timeout`, no free connection in the metadata database's pool to take it on, or a look the metadata database
-cannot answer (the first or the one just before the command), answers `{"busy": true}`: the same request may be sent
-again. A create whose lock comes free more
+lock again, and the extension logs a warning that the marker's lock was lost while the create worked. A create about
+to answer anything but its object or `{"busy": true}` (a refusal of Superset's checks or of its command, or a failure)
+first takes the second lock and looks once more, with the hold check, so a refusal never stands while another send of
+the marker is making the object: it answers that object instead, or `{"busy": true}` when its own lock was lost.
+On MySQL the named lock is the only guard: if its connection is lost while a create works, a second send of the
+create can make a second object. A wait for the lock longer than `MNEMIQ_LOCK_TIMEOUT_S` or cut short by the
+metadata database's `statement_timeout`, no free connection in the metadata database's pool to take it on, or a look
+the metadata database cannot answer (the first or the one just before the command), answers `{"busy": true}`: the same
+request may be sent again. A create whose lock comes free more
 than 45 seconds after the create began (mnemiq's default deadline for a call) lets it go at once and answers
 `{"busy": true}`, since mnemiq has by then stopped waiting for the answer and sends the create again. Where mnemiq is
 set to wait longer than 45 seconds for a call, such a create still answers busy, and is then sent again. While it waits

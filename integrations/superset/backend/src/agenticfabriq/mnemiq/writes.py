@@ -851,6 +851,34 @@ def _guarded_look(model: type, marker: str, *, kind: str, held: _HeldLock | None
     return BUSY
 
 
+def _settled(create: Callable[[Callable[[], dict | None]], dict], guard: Callable[[], dict | None], *,
+             kind: str) -> dict:
+    """`create(guard)`'s answer, settled: an answer other than the object (`{"<kind>_id": id}`) or `{"busy": true}`
+    is let go only once `guard` (the create's `_guarded_look`) has run again, after the session is rolled back. Its
+    answer, when it has one (an object another send made, or busy for a lock lost or a look that cannot run), replaces
+    the create's; None (nothing found, the lock held) keeps it. A database error `create` raises is settled the same
+    way: `guard`'s answer, or else the error, raised on to the write tool's boundary (`_answering`). The rollback ends
+    a transaction rc2's checks may have left aborted, which no statement of the guarded look could run in. Anything
+    else `create` raises goes on unsettled."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    session = _session()
+    try:
+        answer = create(guard)
+    except SQLAlchemyError:
+        with contextlib.suppress(SQLAlchemyError):
+            session.rollback()
+        if (settled := guard()) is not None:
+            return settled
+        raise
+    if f"{kind}_id" in answer or answer == BUSY:
+        return answer
+    with contextlib.suppress(SQLAlchemyError):
+        session.rollback()
+    settled = guard()
+    return answer if settled is None else settled
+
+
 def _find_or_create(model: type, marker: str, *, kind: str, started: float, row: tuple[type, int | None],
                     create: Callable[[Callable[[], dict | None]], dict],
                     then: Callable[[dict], dict] | None = None) -> dict:
@@ -865,19 +893,29 @@ def _find_or_create(model: type, marker: str, *, kind: str, started: float, row:
     transaction (`guard`, this create's `_guarded_look`, with the lock held and `row`, which `create` calls just
     before its command), the create command and its commit. `row` is the row the create is made under, as `(model,
     id)`: a chart's or a dataset's dashboard, or the caller's own user row for a dashboard. The lock is on a connection
-    of its own, so whatever rc2 commits or rolls back in the session keeps it held, and no other send of the create can
-    make the object while a check of this one refuses it: that refusal is answered as it is. Should that connection's
-    database session end while the create works, the lock goes with it and is never taken again: the guarded look
-    then answers an object another send made meanwhile, or else `{"busy": true}` with nothing made, and the lost
-    connection is closed when the lock is let go (`_release_marker_lock`). The session's transaction ends before the
-    lock is let go. A lock not taken answers `{"busy": true}` or the refusal that says why, and so does one granted
-    after mnemiq's deadline for the call, counted from `started`, the tool's start."""
+    of its own, so whatever rc2 commits or rolls back in the session keeps it held. Should that connection's database
+    session end while the create works, the lock goes with it and is never taken again: the guarded look then answers
+    an object another send made meanwhile, or else `{"busy": true}` with nothing made, and the lost connection is
+    closed when the lock is let go (`_release_marker_lock`). The session's transaction ends before the lock is let go.
+    A lock not taken answers `{"busy": true}` or the refusal that says why, and so does one granted after mnemiq's
+    deadline for the call, counted from `started`, the tool's start.
+
+    Before `then`, `create(guard)`'s answer is settled (`_settled`): any answer but the object or busy (a refusal of
+    rc2's checks or of the command, a failure) and any database error `create` raises is let go only after the
+    guarded look has run again, under the second lock, which another send holds from its own guarded look through its
+    command's commit. So a refusal is answered once the settle finds no object, with the lock still held; an object
+    another send made meanwhile is answered instead (a dataset's editors then set by `then`), and a lock lost
+    meanwhile answers busy. A refusal never stands while another send of the marker is making the object, which the
+    lock alone cannot promise once its connection was lost. The first look's answers, and any other exception
+    `create` raises (`DatasetSoftDeletedTwinExistsError`, which the command raised after a guarded look that passed,
+    among them), are not settled."""
     try:
         with _marker_lock(marker, started) as held:
             try:
                 answer = _look(model, marker, kind=kind)
                 if answer is None:
-                    answer = create(functools.partial(_guarded_look, model, marker, kind=kind, held=held, row=row))
+                    answer = _settled(create, functools.partial(_guarded_look, model, marker, kind=kind, held=held,
+                                                                row=row), kind=kind)
                 return then(answer) if then is not None else answer
             finally:
                 _session().rollback()
@@ -1279,8 +1317,8 @@ def create_chart(found: dict) -> dict:
     chart whose answer was lost never runs the source query again, which a slow source database, the likely cause of
     the lost answer, could now fail; and a retry sent while its first send still runs waits for the first, then
     answers the chart it made, never a refusal of its own check while the first may still make the chart. Only a
-    look that finds nothing runs the config's validation and mapping and the query check, whose refusal is then
-    answered as it is."""
+    look that finds nothing runs the config's validation and mapping and the query check. Their refusal is answered
+    once the settle (`_settled`) finds no chart, with the lock still held."""
     started = _clock()
     if claim_marker(found["marker"], found["dashboard_id"]) is None:
         return BAD_MARKER
