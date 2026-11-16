@@ -819,9 +819,10 @@ def _look(model: type, marker: str, *, kind: str) -> dict | None:
         return BUSY
 
 
-def _take_create_lock(session: Any, marker: str, row: tuple[type, int | None]) -> bool:
+def _take_create_lock(session: Any, held: _HeldLock, row: tuple[type, int | None]) -> bool:
     """Takes a create's second lock in `session`'s transaction, held until that transaction ends (the command's commit,
-    or a rollback): True once it is held.
+    or a rollback): True once it is held. Which lock is read from the dialect the marker's lock was taken on
+    (`held.dialect`), the one its hold check reads too.
 
     - Postgres: a transaction's advisory lock on another key of the marker (`_PG_CREATE_LOCK`), so it never waits for
       the session's lock on the first; `row` is not read.
@@ -829,16 +830,24 @@ def _take_create_lock(session: Any, marker: str, row: tuple[type, int | None]) -
       chart's or a dataset's dashboard, or the caller's own user row for a dashboard. It is taken by `lock_row`, the
       one rule for row locks, so every other write that locks the row (an edit of that dashboard, another create under
       it) waits for this create's commit, and this create for theirs; the wait is bounded by MySQL's own
-      `innodb_lock_wait_timeout`. False, with no lock taken, when there is no such row to lock (a dashboard deleted
-      meanwhile; an id of None, which matches no row).
+      `innodb_lock_wait_timeout`. False, logged, with no lock taken, when there is no such row to lock (a dashboard
+      deleted meanwhile; an id of None, which matches no row).
+    - Any other dialect: False, logged, with no lock taken (fail closed; `_marker_lock` takes no lock there).
 
     A wait past the lock timeout raises, as any database error does."""
     from sqlalchemy import text
 
-    if session.get_bind().dialect.name == "postgresql":
-        session.execute(text(_PG_CREATE_LOCK), {"marker": marker})
+    if held.dialect == "postgresql":
+        session.execute(text(_PG_CREATE_LOCK), {"marker": held.marker})
         return True
-    return lock_row(*row) is not None
+    if held.dialect in _MYSQL:
+        if lock_row(*row) is None:
+            logger.info("mnemiq extension: a create's row to lock is gone; answered busy")
+            return False
+        return True
+    logger.warning("mnemiq extension: a create takes no second lock on a %s metadata database; answered busy",
+                   held.dialect)
+    return False
 
 
 def _guarded_look(model: type, marker: str, *, kind: str, held: _HeldLock | None,
@@ -862,8 +871,9 @@ def _guarded_look(model: type, marker: str, *, kind: str, held: _HeldLock | None
     refused and let it go, and an object made now would stand behind a refusal the build has already recorded.
 
     In order: the session's lock waits are bounded again on Postgres (`_bound_lock_waits`: rc2's checks may have ended
-    the transaction the first look bounded); the second lock is taken (`_take_create_lock`; on MySQL a row no longer
-    there answers busy, logged); the look runs again (`_marked`, `_found_answer`) in a fresh READ COMMITTED snapshot,
+    the transaction the first look bounded); the second lock is taken (`_take_create_lock`, by the marker lock's
+    dialect; on MySQL a row no longer there, or any dialect but Postgres's and MySQL's, answers busy, logged, with
+    neither the look nor the hold check run); the look runs again (`_marked`, `_found_answer`) in a fresh READ COMMITTED snapshot,
     so of two creates that both passed the first look, the second to take the second lock finds the first's object,
     committed, and answers it; and, nothing found, the hold check. Run before the command, it is followed by the
     command with nothing committing or rolling back the session between them, so the second lock is held through the
@@ -880,12 +890,12 @@ def _guarded_look(model: type, marker: str, *, kind: str, held: _HeldLock | None
     session = _session()
     try:
         _bound_lock_waits(session)
-        if not _take_create_lock(session, marker, row):
-            logger.info("mnemiq extension: a create's row to lock is gone; answered busy")
-        elif found := _marked(model, marker):
-            return _found_answer(found, kind=kind)
-        elif held.still_held():
-            return None
+        # No second lock (logged where it was not taken) answers busy, with neither the look nor the hold check run.
+        if _take_create_lock(session, held, row):
+            if found := _marked(model, marker):
+                return _found_answer(found, kind=kind)
+            if held.still_held():
+                return None
     except SQLAlchemyError as exc:
         logger.warning("mnemiq extension: a create could not look for its object under its second lock; answered busy",
                        exc_info=exc)

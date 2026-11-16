@@ -2224,12 +2224,38 @@ def test_a_hold_check_answering_true_or_1_lets_the_create_make_its_object(creati
 def test_a_second_lock_not_taken_answers_busy(creating, monkeypatch):
     """A guarded look whose second lock is not taken (`_take_create_lock` answers False) answers busy, rolls the
     session back and makes nothing: neither the look nor the hold check runs without the second lock."""
-    monkeypatch.setattr(writes, "_take_create_lock", lambda session, marker, row: False)
+    monkeypatch.setattr(writes, "_take_create_lock", lambda session, held, row: False)
     assert make_dashboard() == {"busy": True}
     ran = creating.superset.ran
     assert ran[-5:] == [BOUND, ("rollback",), ("rollback",), *let_go("postgresql", SHELL)]
     assert ran.count(("lookup", "Dashboard")) == 1 and ("on", 1, HOLDS, {"marker": SHELL}) not in ran
     assert commands(creating.superset) == []
+
+
+@pytest.mark.parametrize(("held_on", "bind", "second"), [
+    pytest.param("mysql", "postgresql", ("lock_row", "Dashboard", 12), id="a MySQL marker lock: the row lock"),
+    pytest.param("postgresql", "mysql", ("execute", CREATE_LOCK, {"marker": STEP}),
+                 id="a Postgres marker lock: the transaction lock"),
+    pytest.param("oracle", "mysql", None, id="any other marker lock: none")])
+def test_a_creates_second_lock_follows_its_marker_locks_dialect(creating, caplog, held_on, bind, second):
+    """Which second lock a guarded look takes is read from the marker's lock as it was taken (`_HeldLock.dialect`), the
+    one source its hold check reads too, never from the session's bind again: a Postgres transaction lock for a
+    Postgres marker lock, the row's lock for a MySQL one. For any other dialect it takes none and answers busy, says
+    why, and runs no look and no hold check without it (fail closed). The marker lock's connection here holds nothing,
+    so every case answers busy; what differs is the lock taken."""
+    metadata = creating.on(bind)
+    held = writes._HeldLock(metadata.engine.connect(), held_on, STEP)
+    models = sys.modules["superset.models.slice"].Slice, sys.modules["superset.models.dashboard"].Dashboard
+    with caplog.at_level("WARNING", logger=writes.__name__):
+        assert writes._guarded_look(models[0], STEP, kind="chart", held=held, row=(models[1], 12)) == {"busy": True}
+    ran = creating.superset.ran
+    assert [entry for entry in ran if entry[0] == "lock_row" or entry[1:2] == (CREATE_LOCK,)] == (
+        [second] if second else [])
+    if second is None:
+        assert "lookup" not in _kinds(creating.superset) and ("on", 1, "begin") not in ran
+        assert [record.getMessage() for record in caplog.records] == [
+            "mnemiq extension: a create takes no second lock on a oracle metadata database; answered busy"]
+    assert metadata.held_xact == []
 
 
 def test_a_contended_create_lock_answers_busy(creating):
