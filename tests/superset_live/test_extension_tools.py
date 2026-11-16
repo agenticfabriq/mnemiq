@@ -382,8 +382,10 @@ def _waiting_on(table: str) -> int:
 
 
 def _hold_marker(marker: str):
-    """A connection of the test's own to Superset's metadata database, inside a transaction that holds the lock a
-    create carrying `marker` takes (`pg_advisory_xact_lock(hashtextextended(marker, 0))`) until it is rolled back."""
+    """A connection of the test's own to Superset's metadata database, inside a transaction that holds an advisory lock
+    on the key a create carrying `marker` takes its lock on (`hashtextextended(marker, 0)`) until it is rolled back.
+    Postgres's advisory locks of a transaction and of a session share their keys, so the create's own lock on that
+    key (`pg_advisory_lock`) waits for this one."""
     import psycopg
 
     con = psycopg.connect(required("MNEMIQ_TEST_SUPERSET_METADATA_URI")["MNEMIQ_TEST_SUPERSET_METADATA_URI"],
@@ -1134,10 +1136,11 @@ def test_create_chart_twice_with_one_marker_makes_one_chart(live, extension, pol
 
 def test_concurrent_creates_with_one_marker_make_one_chart(live, extension, policy_id, made):
     """Two clients send one create (a bar chart by region, one marker) at once. The test holds the marker's lock from
-    a connection of its own until both creates wait for it, so both have passed every check that runs before the lock
-    (their look for the chart without it found none) and neither has looked under it yet, then lets it go well inside
-    the lock timeout: the two then look and create one after the other. Both answer the same `{chart_id}`, and Superset holds one chart carrying the marker
-    and one of that name."""
+    a connection of its own until both creates wait for it, so both have passed the caller's checks, which run before
+    the lock, and neither has looked for the chart or checked its query yet; then it lets the lock go well inside the
+    lock timeout. The first to take it looks, checks the chart's query and makes the chart, holding the lock through
+    the commit; the other waits for it, then finds that chart. Both answer the same `{chart_id}`, and Superset holds
+    one chart carrying the marker and one of that name."""
     client = as_user(live, BUILDER)
     build = made.build(client, "concurrent")
     chart = spec(Family.BAR, policy_id, dimensions=("region",))
@@ -1179,10 +1182,10 @@ def test_concurrent_creates_with_one_marker_make_one_chart(live, extension, poli
 
 def test_a_create_behind_a_held_marker_lock_answers_busy(live, extension, policy_id, made):
     """While a connection of the test's own holds the marker's lock inside a transaction (as a create carrying that
-    marker holds it until its commit), a create carrying the marker (a pie by status) waits for it the lock timeout
-    (30 seconds, the extension's default, which the suite's Superset keeps) and answers exactly `{busy: true}`, within
-    40 seconds of the call, having made nothing: no chart carries the marker or the chart's name. Let go, the same
-    request makes the chart: `{chart_id}`, the one chart carrying the marker."""
+    marker holds it from its look until after its commit), a create carrying the marker (a pie by status) waits for it
+    the lock timeout (30 seconds, the extension's default, which the suite's Superset keeps) and answers exactly
+    `{busy: true}`, within 40 seconds of the call, having made nothing: no chart carries the marker or the chart's
+    name. Let go, the same request makes the chart: `{chart_id}`, the one chart carrying the marker."""
     client = as_user(live, BUILDER)
     build = made.build(client, "held lock")
     chart = spec(Family.PIE, policy_id, dimensions=("status",))
