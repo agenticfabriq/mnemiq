@@ -1684,6 +1684,29 @@ def test_a_chart_its_own_check_refused_and_nobody_made_answers_the_refusal(creat
     assert commands(creating.superset) == []
 
 
+@pytest.mark.parametrize("kind", ["config chart", "funnel chart", "physical dataset"])
+@pytest.mark.parametrize("planted", ["no marker", "another build's marker"])
+def test_an_unmarked_object_of_the_same_name_is_never_answered(request, kind, planted):
+    """Objects of the request's own name (a chart on the same dataset) whose description does not end in the
+    request's marker, none or another build's, are never answered: the create runs, answers the new object's id, and
+    leaves the planted ones as they were."""
+    chart = "chart" in kind
+    stage = request.getfixturevalue("creating" if chart else "lock_rows")
+    superset = stage.superset
+    other = format_marker("1b4e28ba-2fa1-41d2-883f-0016d3cca427", "chart_1" if chart else "data_1", 12 if chart else 3)
+    description = "Prose of its own." if planted == "no marker" else f"Prose of its own.\n{other}"
+    named = {"slice_name": "Premium" if kind == "config chart" else "Stages", "datasource_id": 7} if chart \
+        else {"table_name": "sales"}
+    twins = [SimpleNamespace(**vars(_row(41 + n, description)), **named) for n in range(2)]
+    before = [dict(vars(twin)) for twin in twins]
+    superset.rows["Slice" if chart else "SqlaTable"].extend(twins)
+    answer = {"config chart": make_from_config, "funnel chart": make_funnel, "physical dataset": make_dataset}[kind]()
+    key = "chart_id" if chart else "dataset_id"
+    assert set(answer) == {key} and answer[key] not in {41, 42}, answer
+    assert len(commands(superset, "CreateChartCommand" if chart else "CreateDatasetCommand")) == 1
+    assert [dict(vars(twin)) for twin in twins] == before
+
+
 # ---------------------------------------------------------------- create_dataset
 
 DATA = format_marker(BUILD, "data_1", 3)
