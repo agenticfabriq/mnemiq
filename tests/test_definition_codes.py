@@ -426,3 +426,17 @@ def test_each_code_counts_for_its_own_column():
     assert stale("Count shipments where SERVICE_LEVEL = 'E' and SHIP_MODE = 'Q'.") == [("SHIP_MODE", ("Q",))]
     # Named before any column in its clause, with two that could hold it: ambiguous, so not judged.
     assert stale("'Q' marks rush orders; see SHIP_MODE and SERVICE_LEVEL.") == []
+
+
+def test_a_code_in_an_unjudged_columns_predicate_is_never_handed_to_another():
+    # SERVICE_LEVEL is in the snapshot but not indexed: its E is its own, unknown, never SHIP_MODE's.
+    held = _index({("shipments", "SHIP_MODE"): ["A", "G"]})
+    columns = [("shipments", "SHIP_MODE"), ("shipments", "SERVICE_LEVEL")]
+
+    def stale(text):
+        return [(f.column, f.codes) for f in stale_codes(_snapshot([("ship", text)], columns), held)]
+
+    assert stale("Count shipments where SHIP_MODE <> 'X' and SERVICE_LEVEL = 'E'.") == []
+    # With no column before it, a code is not handed to the one indexed column while an unindexed one is named.
+    assert stale("'E' marks express; it is a SERVICE_LEVEL, beside SHIP_MODE.") == []
+    assert stale("Count shipments where SERVICE_LEVEL = 'E' and SHIP_MODE = 'Q'.") == [("SHIP_MODE", ("Q",))]

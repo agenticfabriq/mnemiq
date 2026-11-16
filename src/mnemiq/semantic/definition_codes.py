@@ -23,8 +23,9 @@ What counts, kept narrow so prose is not read as codes:
   still selects ("not only 'X' but also", "do not omit ... 'X'", "do not exclude ... 'X'") is not an exclusion, and
   "exclude" reaches only its own predicate.
 - A code counts for a column only when it has the shape of one of the column's values: capitals, small letters and
-  digits in the same places. `'from May to June'` is never a code for a column of `AB12`s. When two named columns
-  share the code's shape, it counts for the one named last before it in its clause, and for neither if none is.
+  digits in the same places. `'from May to June'` is never a code for a column of `AB12`s. It counts for the column
+  named last before it in its clause, indexed or not, and for no other; with no column before it, for the one judged
+  column that fits, unless several fit or a column that cannot be judged is named too.
 - A column is judged only when every column of that name in the snapshot is indexed: a code may be in the one whose
   values were not read, which is unknown, not absent.
 
@@ -60,6 +61,8 @@ _NOT_PAREN = re.compile(r"\bnot\s*\(", re.IGNORECASE)
 _LIST_GAP = re.compile(r"\s*(?:,\s*)?(?:(?:and|or)\s+)?", re.IGNORECASE)
 _BARE = re.compile(r"(?<![\w'\"-])[A-Z0-9][A-Z0-9_-]*(?![\w'\"-])")
 NEAREST = 8  # real values quoted, as many as the value check quotes
+# Column types that can hold a code, as the value index reads them (semantic/values.py).
+_TEXT_TYPES = ("char", "text", "string", "clob")
 
 
 @dataclass(frozen=True)
@@ -141,23 +144,40 @@ def _judged(snapshot: Snapshot, values) -> dict[str, tuple[str, tuple[str, ...],
     return judged
 
 
-def _attributed(text: str, judged: dict, names: set[str]) -> dict[str, list[str]]:
+def _unjudged(snapshot: Snapshot, judged: dict) -> set[str]:
+    """Identifier-like column names, lowercased, that may hold a code but cannot be judged: text or untyped columns the
+    index does not hold whole. A code in such a column's predicate is that column's, and unknown."""
+    out = set()
+    for col in snapshot.columns:
+        key = col.name.lower()
+        typed = (col.data_type or "").lower()
+        if key not in judged and _identifier_like(key) and (not typed or any(t in typed for t in _TEXT_TYPES)):
+            out.add(key)
+    return out
+
+
+def _attributed(text: str, judged: dict, names: set[str], unjudged: set[str]) -> dict[str, list[str]]:
     """The codes `text` selects on, each credited to the judged column it is for, by column key.
 
-    A code is for a column the text names whose values share its shape. When only one does, it is that one; when
-    several do, it is the one named last before the code in its own clause, and with none there the code is skipped:
-    which column it is for cannot be told, and a guess could report a column the code was never about."""
-    named = {key: _named_at(column, text) for key, (column, _, _) in judged.items()}
-    named = {key: at for key, at in named.items() if at}
-    shapes = {key: {_shape(v) for v in judged[key][2]} for key in named}
+    A code is for the column named last before it in its own clause, judged or not: credited when that column is judged
+    and the code has the shape of its values, and skipped otherwise, since it is that column's and not another's. A
+    code with no column before it in its clause is credited to the one judged column the text names whose values share
+    its shape, and skipped when several do or when the text names a column that cannot be judged: which column it is
+    for cannot be told, and a guess could report a column it was never about."""
+    judged_at = {key: at for key, (column, _, _) in judged.items() if (at := _named_at(column, text))}
+    other_at = {key: at for key in unjudged if (at := _named_at(key, text))}
+    shapes = {key: {_shape(v) for v in judged[key][2]} for key in judged_at}
     out: dict[str, list[str]] = {}
     for code, start in _codes(text, names):
-        fits = [key for key in named if _shape(code) in shapes[key]]
-        if len(fits) > 1:
-            clause = start - len(_CLAUSE_END.split(text[:start])[-1])
-            before = [(at, key) for key in fits for at in named[key] if clause <= at < start]
-            fits = [max(before)[1]] if before else []
-        if fits:
+        clause = start - len(_CLAUSE_END.split(text[:start])[-1])
+        before = [(at, key) for key, ats in (judged_at | other_at).items() for at in ats if clause <= at < start]
+        if before:
+            key = max(before)[1]
+            if key in judged_at and _shape(code) in shapes[key]:
+                out.setdefault(key, []).append(code)
+            continue
+        fits = [key for key in judged_at if _shape(code) in shapes[key]]
+        if len(fits) == 1 and not other_at:
             out.setdefault(fits[0], []).append(code)
     return out
 
@@ -169,9 +189,10 @@ def stale_codes(snapshot: Snapshot, values) -> list[StaleCodes]:
     (`NoValueIndex`) judges nothing."""
     judged = _judged(snapshot, values)
     names = {col.name.lower() for col in snapshot.columns} | {col.object_id.lower() for col in snapshot.columns}
+    unjudged = _unjudged(snapshot, judged)
     found: list[StaleCodes] = []
     for definition in snapshot.definitions:
-        for key, codes in sorted(_attributed(definition.definition, judged, names).items()):
+        for key, codes in sorted(_attributed(definition.definition, judged, names, unjudged).items()):
             column, objects, held = judged[key]
             named = sorted(set(codes))
             if any(c in held for c in named):
