@@ -17,7 +17,8 @@ Every tool keeps these rules:
   of its own (`_marker_lock`), and holds it from the look for the object whose description's last line is that
   marker through the create's commit: rc2's own checks (a chart's validation and query check) and the create command
   run under it, on a miss only. A second send of the create waits for the first and then answers what it made. A
-  wait past the lock timeout answers `{"busy": true}`. A SQLite metadata database takes no such lock.
+  wait past the lock timeout, or a look the metadata database cannot answer, answers `{"busy": true}`. A SQLite
+  metadata database takes no such lock.
 - Its answer is short and structured. Superset's own text never reaches it: any of Superset's exceptions is logged
   here and answered by its kind.
 - A caller who is not an editor of the object is told so before anything about the object's state (a stale
@@ -635,11 +636,25 @@ def _found_answer(found: list[Any], *, kind: str) -> dict:
 def _look(model: type, marker: str, *, kind: str) -> dict | None:
     """Under the marker's lock: the answer for the objects of `model` that `marker` names (`_marked`, answered by
     `_found_answer`), or None when there is none, once the session's isolation is the one the look needs
-    (`_isolation_refusal`, whose refusal is the answer otherwise)."""
-    if (refusal := _isolation_refusal(_session())) is not None:
-        return refusal
-    found = _marked(model, marker)
-    return _found_answer(found, kind=kind) if found else None
+    (`_isolation_refusal`, whose refusal is the answer otherwise).
+
+    A look the metadata database cannot answer (its connection gone, the session's transaction aborted) answers
+    `{"busy": true}`, after rolling the session back, which ends an aborted transaction: whether the object is there
+    is not known, and the same request may be sent again. Never a refusal, which would stop the build though another
+    send may have made the object."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    session = _session()
+    try:
+        if (refusal := _isolation_refusal(session)) is not None:
+            return refusal
+        found = _marked(model, marker)
+        return _found_answer(found, kind=kind) if found else None
+    except SQLAlchemyError as exc:
+        logger.warning("mnemiq extension: a create could not look for its object; answered busy", exc_info=exc)
+        with contextlib.suppress(SQLAlchemyError):
+            session.rollback()
+        return BUSY
 
 
 def _find_or_create(model: type, marker: str, *, kind: str, create: Callable[[], dict],

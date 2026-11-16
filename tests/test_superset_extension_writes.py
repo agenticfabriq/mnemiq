@@ -1685,6 +1685,31 @@ def test_a_second_request_waits_for_the_first_and_answers_what_it_made(creating,
 
 
 @pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+@pytest.mark.parametrize("breaks", ["gone", "aborted"])
+@pytest.mark.parametrize("moment", ["isolation", "lookup"])
+@pytest.mark.parametrize("create", ["dashboard", "funnel chart", "config chart"])
+def test_a_look_that_cannot_run_answers_busy(creating, dialect, breaks, moment, create):
+    """Another send of the create has committed its object, and this one's look cannot run: the metadata session's
+    connection is gone, or its transaction aborted, when it reads its isolation or looks. Whether the object is there
+    is not known, so the create answers busy (the same request may be sent again), never a refusal and never an
+    error out of the tool; it runs none of rc2's checks, makes nothing, rolls the session back (which ends an aborted
+    transaction) and lets the lock go. Sent again with the database back, it answers the object the other send
+    made."""
+    metadata = creating.on(dialect)
+    make, model, marker, key = CREATES[create]
+    creating.superset.rows[model].append(_row(9, marker))
+    metadata.breaks[moment] = breaks
+    assert make() == {"busy": True}
+    assert not {"validate", "map", "compile", "chart_data"} & set(_kinds(creating.superset))
+    assert commands(creating.superset) == []
+    assert creating.superset.ran[-3:] == [("rollback",), *let_go(dialect, marker)]
+    assert metadata.aborted is False
+    metadata.gone = False
+    assert make() == {key: 9}
+    assert commands(creating.superset) == []
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
 @pytest.mark.parametrize("release", [pytest.param(stubs.database_error("08006"), id="the release raises"),
                                      pytest.param(0, id="the release answers that nothing was released")])
 def test_a_failed_unlock_invalidates_the_connection(creating, dialect, release):
