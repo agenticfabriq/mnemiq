@@ -403,10 +403,13 @@ _SET_LOCK_TIMEOUT = "SELECT set_config('lock_timeout', :timeout, true)"
 def _bound_lock_waits(session: Any) -> None:
     """On a Postgres metadata database, bounds each lock wait for the rest of `session`'s transaction
     (`_SET_LOCK_TIMEOUT`). A wait past it fails with SQLSTATE 55P03 (lock_not_available), which rc2's
-    `is_lock_contention_error` counts as contention (`superset/versioning/db_errors.py`, `_PG_LOCK_CONTENTION`)."""
+    `is_lock_contention_error` counts as contention (`superset/versioning/db_errors.py`, `_PG_LOCK_CONTENTION`).
+    SQLite takes no row locks, and MySQL has no lock timeout that ends with the transaction: there nothing is set,
+    and the database's own setting applies."""
     from sqlalchemy import text
 
-    session.execute(text(_SET_LOCK_TIMEOUT), {"timeout": _lock_timeout()})
+    if session.get_bind().dialect.name == "postgresql":
+        session.execute(text(_SET_LOCK_TIMEOUT), {"timeout": _lock_timeout()})
 
 
 def lock_row(model: type, entity_id: int) -> Any:
@@ -427,8 +430,7 @@ def lock_row(model: type, entity_id: int) -> Any:
     its relationships (editors, metrics, charts) load when first read, in the same locked transaction. Every locked
     tool takes its lock here, so the rule is one rule."""
     session = _session()
-    if session.get_bind().dialect.name == "postgresql":
-        _bound_lock_waits(session)
+    _bound_lock_waits(session)
     return (session.query(model).populate_existing().enable_eagerloads(False)
             .filter(model.id == entity_id).with_for_update().one_or_none())
 
@@ -529,10 +531,12 @@ def _take_marker_lock(connection: Any, dialect: str, marker: str) -> None:
     inside the setting's bound, and at least one; `GET_LOCK` answers 1 when it holds the lock (0 when its wait timed
     out, NULL on an error).
 
-    A lock not taken in time, or contended (`is_lock_contention_error`), raises `_NotLocked` with `{"busy": true}`.
-    Any other failure is raised, with the connection invalidated first: SQLAlchemy then closes it rather than putting
-    it back in the pool, and the database session ending ends any lock it may hold (a commit failed after the lock was
-    taken, say)."""
+    A lock not taken in time, or contended (`is_lock_contention_error`), raises `_NotLocked` with `{"busy": true}`;
+    any other failure is raised. Whatever stops the take, the connection is invalidated first: SQLAlchemy then closes
+    it rather than putting it back in the pool, and the database session ending ends any lock it may hold. A failed
+    take may hold one: Postgres can grant a waited-for lock just as the wait's lock timeout fires and still fail the
+    statement with 55P03 (`LockErrorCleanup` keeps a lock granted while it waited), and the transaction's rollback
+    does not end a session's lock; a commit can fail after the lock was taken."""
     from sqlalchemy import text
     from sqlalchemy.exc import DBAPIError
     from superset.versioning.db_errors import is_lock_contention_error
@@ -545,14 +549,14 @@ def _take_marker_lock(connection: Any, dialect: str, marker: str) -> None:
             elif connection.execute(text(_MYSQL_LOCK), {"name": _lock_name(marker),
                                                         "seconds": max(1, int(_lock_timeout_s()))}).scalar() != 1:
                 raise _NotLocked(BUSY)
-    except _NotLocked:
-        logger.info("mnemiq extension: the lock on a marker is contended")
-        raise
     except BaseException as exc:
+        connection.invalidate()
+        if isinstance(exc, _NotLocked):
+            logger.info("mnemiq extension: the lock on a marker is contended")
+            raise
         if isinstance(exc, DBAPIError) and is_lock_contention_error(exc):
             logger.info("mnemiq extension: the lock on a marker is contended")
             raise _NotLocked(BUSY) from exc
-        connection.invalidate()
         raise
 
 
@@ -636,7 +640,10 @@ def _found_answer(found: list[Any], *, kind: str) -> dict:
 def _look(model: type, marker: str, *, kind: str) -> dict | None:
     """Under the marker's lock: the answer for the objects of `model` that `marker` names (`_marked`, answered by
     `_found_answer`), or None when there is none, once the session's isolation is the one the look needs
-    (`_isolation_refusal`, whose refusal is the answer otherwise).
+    (`_isolation_refusal`, whose refusal is the answer otherwise). Before it looks, the session's own lock waits are
+    bounded as `lock_row` bounds them (`_bound_lock_waits`), for the rest of its transaction: a statement of the
+    create's that waits for a row another transaction holds then fails with 55P03, answered `{"busy": true}`, rather
+    than waiting unbounded while the marker's lock is held.
 
     A look the metadata database cannot answer (its connection gone, the session's transaction aborted) answers
     `{"busy": true}`, after rolling the session back, which ends an aborted transaction: whether the object is there
@@ -648,6 +655,7 @@ def _look(model: type, marker: str, *, kind: str) -> dict | None:
     try:
         if (refusal := _isolation_refusal(session)) is not None:
             return refusal
+        _bound_lock_waits(session)
         found = _marked(model, marker)
         return _found_answer(found, kind=kind) if found else None
     except SQLAlchemyError as exc:
@@ -1075,6 +1083,9 @@ def create_chart(found: dict) -> dict:
             return checked
         viz_type, form_data, context = checked
         editors = _chart_editors(dataset, dashboard, ())
+        # rc2's checks may have ended the transaction the look bounded (Superset's metastore cache commits the session
+        # when it stores a chart's data), and a bound holds only to its transaction's end: bound the command's own.
+        _bound_lock_waits(_session())
         try:
             chart = CreateChartCommand({
                 "slice_name": found["slice_name"], "viz_type": viz_type, "datasource_id": dataset_id,
