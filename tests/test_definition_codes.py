@@ -412,3 +412,17 @@ def test_an_exclusion_covers_its_whole_list_and_only_its_own_predicate():
     assert stale("Do not exclude SHIP_MODE = 'X'.") == [("X",)]
     assert stale("Exclude SHIP_MODE = 'X' and include SHIP_MODE = 'Y'.") == [("Y",)]
     assert stale("Count SHIP_MODE 'X', 'Y', and 'Z' rows.") == [("X", "Y", "Z")]
+
+
+def test_each_code_counts_for_its_own_column():
+    # Both columns hold one-letter codes, so shape alone cannot say whose E is: the predicate it sits in does.
+    held = _index({("shipments", "SHIP_MODE"): ["A", "G"], ("shipments", "SERVICE_LEVEL"): ["E", "S"]})
+    columns = [("shipments", "SHIP_MODE"), ("shipments", "SERVICE_LEVEL")]
+
+    def stale(text):
+        return [(f.column, f.codes) for f in stale_codes(_snapshot([("ship", text)], columns), held)]
+
+    assert stale("Count shipments where SHIP_MODE <> 'X' and SERVICE_LEVEL = 'E'.") == []
+    assert stale("Count shipments where SERVICE_LEVEL = 'E' and SHIP_MODE = 'Q'.") == [("SHIP_MODE", ("Q",))]
+    # Named before any column in its clause, with two that could hold it: ambiguous, so not judged.
+    assert stale("'Q' marks rush orders; see SHIP_MODE and SERVICE_LEVEL.") == []

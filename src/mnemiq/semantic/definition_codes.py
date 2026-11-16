@@ -23,7 +23,8 @@ What counts, kept narrow so prose is not read as codes:
   still selects ("not only 'X' but also", "do not omit ... 'X'", "do not exclude ... 'X'") is not an exclusion, and
   "exclude" reaches only its own predicate.
 - A code counts for a column only when it has the shape of one of the column's values: capitals, small letters and
-  digits in the same places. `'from May to June'` is never a code for a column of `AB12`s.
+  digits in the same places. `'from May to June'` is never a code for a column of `AB12`s. When two named columns
+  share the code's shape, it counts for the one named last before it in its clause, and for neither if none is.
 - A column is judged only when every column of that name in the snapshot is indexed: a code may be in the one whose
   values were not read, which is unknown, not absent.
 
@@ -80,8 +81,9 @@ def _identifier_like(name: str) -> bool:
     return "_" in name or any(c.isdigit() for c in name)
 
 
-def _names(column: str, text: str) -> bool:
-    return re.search(rf"(?<![\w]){re.escape(column)}(?!\w)", text, re.IGNORECASE) is not None
+def _named_at(column: str, text: str) -> list[int]:
+    """Where `text` names `column`, as a whole word in any case."""
+    return [m.start() for m in re.finditer(rf"(?<![\w]){re.escape(column)}(?!\w)", text, re.IGNORECASE)]
 
 
 def _inside_not(before: str) -> bool:
@@ -101,8 +103,8 @@ def _excluded(text: str, start: int, end: int) -> bool:
             or _inside_not(before))
 
 
-def _codes(text: str, names: set[str]) -> list[str]:
-    """The codes the text selects on: each quoted or bare code with at least one mention outside an exclusion.
+def _codes(text: str, names: set[str]) -> list[tuple[str, int]]:
+    """The codes the text selects on, each with where it is: every quoted or bare mention outside an exclusion.
 
     Consecutive mentions joined only by a comma, "and" or "or" are one list, read as one mention: "'X' and 'Y' are
     excluded" excludes both, and "exclude ... = 'X' or 'Y'" both."""
@@ -116,21 +118,19 @@ def _codes(text: str, names: set[str]) -> list[str]:
             lists[-1].append(mention)
         else:
             lists.append([mention])
-    return [code for group in lists if not _excluded(text, group[0][1], group[-1][2]) for code, _, _ in group]
+    return [(code, start) for group in lists if not _excluded(text, group[0][1], group[-1][2])
+            for code, start, _ in group]
 
 
-def stale_codes(snapshot: Snapshot, values) -> list[StaleCodes]:
-    """Each definition and indexed column where the definition names codes the column holds none of.
-
-    `values` is the value index (`ValueIndex`), read through `has` and `values`; an index that holds nothing
-    (`NoValueIndex`) judges nothing."""
+def _judged(snapshot: Snapshot, values) -> dict[str, tuple[str, tuple[str, ...], list[str]]]:
+    """Each column name that can be judged, lowercased: as the snapshot spells it, the objects that hold it, and every
+    value they hold. Only identifier-like names, and only when every column of that name is indexed."""
     read = getattr(values, "values", None)
     if read is None:
-        return []
+        return {}
     by_name: dict[str, list[tuple[str, str]]] = {}
     for col in snapshot.columns:
         by_name.setdefault(col.name.lower(), []).append((col.object_id, col.name))
-    names = set(by_name) | {col.object_id.lower() for col in snapshot.columns}
     judged: dict[str, tuple[str, tuple[str, ...], list[str]]] = {}
     for key, cols in by_name.items():
         if not _identifier_like(key) or not all(values.has(obj, name) for obj, name in cols):
@@ -138,16 +138,43 @@ def stale_codes(snapshot: Snapshot, values) -> list[StaleCodes]:
         held = sorted({v for obj, name in cols for v in read(obj, name)})
         if held:
             judged[key] = (cols[0][1], tuple(sorted(obj for obj, _ in cols)), held)
+    return judged
+
+
+def _attributed(text: str, judged: dict, names: set[str]) -> dict[str, list[str]]:
+    """The codes `text` selects on, each credited to the judged column it is for, by column key.
+
+    A code is for a column the text names whose values share its shape. When only one does, it is that one; when
+    several do, it is the one named last before the code in its own clause, and with none there the code is skipped:
+    which column it is for cannot be told, and a guess could report a column the code was never about."""
+    named = {key: _named_at(column, text) for key, (column, _, _) in judged.items()}
+    named = {key: at for key, at in named.items() if at}
+    shapes = {key: {_shape(v) for v in judged[key][2]} for key in named}
+    out: dict[str, list[str]] = {}
+    for code, start in _codes(text, names):
+        fits = [key for key in named if _shape(code) in shapes[key]]
+        if len(fits) > 1:
+            clause = start - len(_CLAUSE_END.split(text[:start])[-1])
+            before = [(at, key) for key in fits for at in named[key] if clause <= at < start]
+            fits = [max(before)[1]] if before else []
+        if fits:
+            out.setdefault(fits[0], []).append(code)
+    return out
+
+
+def stale_codes(snapshot: Snapshot, values) -> list[StaleCodes]:
+    """Each definition and indexed column where the definition names codes the column holds none of.
+
+    `values` is the value index (`ValueIndex`), read through `has` and `values`; an index that holds nothing
+    (`NoValueIndex`) judges nothing."""
+    judged = _judged(snapshot, values)
+    names = {col.name.lower() for col in snapshot.columns} | {col.object_id.lower() for col in snapshot.columns}
     found: list[StaleCodes] = []
     for definition in snapshot.definitions:
-        text = definition.definition
-        codes = _codes(text, names)
-        for key, (column, objects, held) in sorted(judged.items()):
-            if not _names(column, text):
-                continue
-            shapes = {_shape(v) for v in held}
-            named = sorted({c for c in codes if _shape(c) in shapes})
-            if not named or any(c in held for c in named):
+        for key, codes in sorted(_attributed(definition.definition, judged, names).items()):
+            column, objects, held = judged[key]
+            named = sorted(set(codes))
+            if any(c in held for c in named):
                 continue
             nearest = sorted(held, key=lambda v: (-similarity(named[0], v), v))[:NEAREST]
             found.append(StaleCodes(definition.term, column, objects, tuple(named), tuple(nearest)))
