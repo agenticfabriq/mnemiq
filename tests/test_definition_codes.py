@@ -451,3 +451,21 @@ def test_a_plain_word_column_keeps_the_codes_in_its_own_predicate():
     # A plain word elsewhere in the text does not stop a code with no column before it from counting.
     snap = _snapshot([("ship", "'Q' is rush, whatever the status; SHIP_MODE carries it.")], columns)
     assert [(f.column, f.codes) for f in stale_codes(snap, held)] == [("SHIP_MODE", ("Q",))]
+
+
+def test_an_sql_operator_selects_a_code_only_in_a_known_selecting_form():
+    held = _index({("shipments", "SHIP_MODE"): ["A", "G"]})
+
+    def stale(text):
+        return [f.codes for f in stale_codes(_snapshot([("ship", text)], [("shipments", "SHIP_MODE")]), held)]
+
+    # Exclusions and comparisons whose selection is uncertain: never counted.
+    for text in ["Count shipments where SHIP_MODE IS DISTINCT FROM 'X'.", "Count shipments where SHIP_MODE NOT LIKE 'X'.",
+                 "Count shipments where SHIP_MODE NOT ILIKE 'X'.", "Count shipments where SHIP_MODE < 'X'.",
+                 "Count shipments where SHIP_MODE BETWEEN 'B' AND 'X'."]:
+        assert stale(text) == [], text
+    # Forms that select the code: counted.
+    for text in ["Count shipments where SHIP_MODE IS NOT DISTINCT FROM 'X'.", "Count shipments where SHIP_MODE LIKE 'X'.",
+                 "Count shipments where SHIP_MODE = 'X'.", "Count shipments where SHIP_MODE IN ('X').",
+                 "Count shipments whose SHIP_MODE is 'X'."]:
+        assert stale(text) == [("X",)], text

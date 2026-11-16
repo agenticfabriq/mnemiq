@@ -21,7 +21,9 @@ What counts, kept narrow so prose is not read as codes:
   "... IN ('X')", "'X' ... are excluded") is filtered out by a query that follows the definition, which keeps every
   row whether or not the data holds it, so a definition that only excludes is never reported. A nearby negation that
   still selects ("not only 'X' but also", "do not omit ... 'X'", "do not exclude ... 'X'") is not an exclusion, and
-  "exclude" reaches only its own predicate.
+  "exclude" reaches only its own predicate. After an SQL operator a code counts only in a selecting form (`=`,
+  `IN (`, `LIKE`, `IS NOT DISTINCT FROM`); after any other (`<`, `BETWEEN`, `IS DISTINCT FROM`, `NOT LIKE`, ...) it
+  does not.
 - A code counts for a column only when it has the shape of one of the column's values: capitals, small letters and
   digits in the same places. `'from May to June'` is never a code for a column of `AB12`s. It counts for the column
   named last before it in its clause, indexed or not, and for no other; with no column before it, for the one judged
@@ -55,6 +57,14 @@ _EXCLUDED_BEFORE = re.compile(
 # ...or just after it. Both read a coordinated list ("'X', 'Y' and 'Z'") as one mention.
 _EXCLUDED_AFTER = re.compile(
     r"^\s*\)?\s*(?:rows?\s+)?(?:are|is)\s+(?:excluded|ignored|dropped|removed|left\s+out|filtered\s+out)\b", re.IGNORECASE)
+# An SQL operator just before the code. There a code counts only in a form that selects it (=, IN (, LIKE, IS NOT
+# DISTINCT FROM); any other (<, >, BETWEEN, IS DISTINCT FROM, NOT LIKE, SIMILAR TO, ...) may keep every row whether or
+# not the data holds the code, so the code does not count. Prose before a code is read as prose.
+_SQL_BEFORE = re.compile(
+    r"(?:<>|!=|<=|>=|[=<>]|\bin\s*\((?:[^()]*,)?|\b(?:i?like|from|between|similar\s+to|regexp|rlike|glob)"
+    r"|\b(?:any|all)\s*\()\s*$", re.IGNORECASE)
+_SQL_SELECTS = re.compile(
+    r"(?:(?<![<>!])=|\bin\s*\((?:[^()]*,)?|\b(?<!not )i?like|\bis\s+not\s+distinct\s+from)\s*$", re.IGNORECASE)
 # A negation opening a parenthesised predicate, as SQL writes one.
 _NOT_PAREN = re.compile(r"\bnot\s*\(", re.IGNORECASE)
 # What may stand between two codes of one list: a comma, "and", "or", or both.
@@ -99,11 +109,13 @@ def _inside_not(before: str) -> bool:
 
 
 def _excluded(text: str, start: int, end: int) -> bool:
-    """Whether the mention at `text[start:end]` sits in an explicit exclusion within its own clause."""
+    """Whether the mention at `text[start:end]` does not select its code: an explicit exclusion within its own clause,
+    or an SQL operator before it that is not a selecting form."""
     before = _CLAUSE_END.split(text[:start])[-1]
     after = _CLAUSE_END.split(text[end:], maxsplit=1)[0]
+    sql = _SQL_BEFORE.search(before) is not None and _SQL_SELECTS.search(before) is None
     return (_EXCLUDED_BEFORE.search(before) is not None or _EXCLUDED_AFTER.search(after) is not None
-            or _inside_not(before))
+            or _inside_not(before) or sql)
 
 
 def _codes(text: str, names: set[str]) -> list[tuple[str, int]]:
