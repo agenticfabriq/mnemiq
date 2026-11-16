@@ -14,8 +14,11 @@ What counts, kept narrow so prose is not read as codes:
 - A column is named when its name, holding an underscore or a digit, appears as a whole word (any case): a plain-word
   name such as `status` is also English and is never read from prose.
 - A code is a quoted literal, or a bare token of capitals and digits holding both, such as `AB12`, that is not itself
-  a column or table name. A quoted literal neither starts nor ends with whitespace, and its closing quote is not
-  followed by a letter or digit, so the apostrophe in "lot's" never pairs with a quote and swallows the code after it.
+  a column or table name. A quoted literal opens after a non-word character and closes before one, and neither starts
+  nor ends with whitespace, so the apostrophe in "lot's" never opens one and swallows the code after it.
+- Only a code the definition selects on counts. One named after a negation in its own clause ("not 'X'", "<> 'X'",
+  "exclude ... 'X'") is filtered out by a query that follows the definition, which keeps every row whether or not the
+  data holds it; a definition that only excludes is never reported.
 - A code counts for a column only when it has the shape of one of the column's values: capitals, small letters and
   digits in the same places. `'from May to June'` is never a code for a column of `AB12`s.
 - A column is judged only when every column of that name in the snapshot is indexed: a code may be in the one whose
@@ -31,9 +34,14 @@ from dataclasses import dataclass
 from mnemiq.contract import Snapshot
 from mnemiq.semantic.textmatch import similarity
 
-# Never starting or ending in whitespace, and closed before a non-word character: "'AX' or 'AY'" yields AX and AY, not
-# " or ", and "the lot's mode is 'A'" yields A.
-_QUOTED = re.compile(r"'([^'\s](?:[^'\n]{0,62}[^'\s])?)'(?!\w)|\"([^\"\s](?:[^\"\n]{0,62}[^\"\s])?)\"(?!\w)")
+# Opened after a non-word character, closed before one, never starting or ending in whitespace: "'AX' or 'AY'" yields AX
+# and AY, not " or ", and "the lot's mode='-A' or '-G'" yields -A and -G, not "s mode=".
+_QUOTED = re.compile(r"(?<!\w)'([^'\s](?:[^'\n]{0,62}[^'\s])?)'(?!\w)|(?<!\w)\"([^\"\s](?:[^\"\n]{0,62}[^\"\s])?)\"(?!\w)")
+# A negation in the code's own clause, within the few words before it.
+_NEGATION = re.compile(r"\b(?:not|no|never|except|excluding|exclude[sd]?|without|ignor(?:e|es|ed|ing)|other than|neither|nor|"
+                       r"unless)\b|<>|!=", re.IGNORECASE)
+_CLAUSE_END = re.compile(r"[.;:!?\n]")
+_NEGATION_WORDS = 6
 _BARE = re.compile(r"(?<![\w'\"-])[A-Z0-9][A-Z0-9_-]*(?![\w'\"-])")
 NEAREST = 8  # real values quoted, as many as the value check quotes
 
@@ -61,11 +69,19 @@ def _names(column: str, text: str) -> bool:
     return re.search(rf"(?<![\w]){re.escape(column)}(?!\w)", text, re.IGNORECASE) is not None
 
 
+def _negated(text: str, start: int) -> bool:
+    """Whether a negation comes before `start` in its own clause, within `_NEGATION_WORDS` words."""
+    clause = _CLAUSE_END.split(text[:start])[-1]
+    return _NEGATION.search(" ".join(clause.split()[-_NEGATION_WORDS:])) is not None
+
+
 def _codes(text: str, names: set[str]) -> list[str]:
-    quoted = [a or b for a, b in _QUOTED.findall(text)]
-    bare = [t for t in _BARE.findall(text)
-            if t.lower() not in names and any(c.isalpha() for c in t) and any(c.isdigit() for c in t)]
-    return quoted + bare
+    """The codes the text selects on: each quoted or bare code with at least one mention not after a negation."""
+    quoted = [(m.group(1) or m.group(2), m.start()) for m in _QUOTED.finditer(text)]
+    bare = [(m.group(0), m.start()) for m in _BARE.finditer(text)
+            if m.group(0).lower() not in names and any(c.isalpha() for c in m.group(0))
+            and any(c.isdigit() for c in m.group(0))]
+    return [code for code, start in quoted + bare if not _negated(text, start)]
 
 
 def stale_codes(snapshot: Snapshot, values) -> list[StaleCodes]:

@@ -265,3 +265,47 @@ def test_superset_mode_judges_nothing(caplog):
     with caplog.at_level(logging.WARNING):
         _warn_stale_codes(snap, store, None, superset=False)
     assert len(_stale_lines(caplog)) == 1
+
+
+def test_a_definition_that_only_excludes_a_code_is_not_reported():
+    # Following it filters the code OUT, and every row is kept: the definition is right on data with no X rows.
+    snap = _snapshot([("ship mode", "Exclude rows with SHIP_MODE = 'X'; never count SHIP_MODE <> 'Y' twice.")],
+                     [("shipments", "SHIP_MODE")])
+    assert stale_codes(snap, _index({("shipments", "SHIP_MODE"): ["A", "G"]})) == []
+
+
+def test_a_code_both_excluded_and_named_plainly_counts():
+    # "not 'Q1'" excludes, and the sentence after names Q1 plainly as the good tier: the definition selects on it.
+    snap = _snapshot([("tier", "A part is defective when its QUALITY_TIER is not 'Q1'; Q1 is a good part.")],
+                     [("parts", "QUALITY_TIER")])
+    (found,) = stale_codes(snap, _index({("parts", "QUALITY_TIER"): ["Q2", "Q3"]}))
+    assert found.codes == ("Q1",)
+
+
+def test_an_apostrophe_before_a_punctuated_code_opens_nothing():
+    # Opened at "lot's", a literal would run to the quote before -A and swallow it, leaving -G alone and unheld.
+    snap = _snapshot([("ship mode", "The lot's SHIP_MODE='-A' or '-G'.")], [("shipments", "SHIP_MODE")])
+    assert stale_codes(snap, _index({("shipments", "SHIP_MODE"): ["-A"]})) == []
+
+
+def test_an_unreadable_policy_lists_no_values(tmp_path, caplog):
+    """A policy that cannot be read lists no roles, and that is not a policy without row filters: say nothing of the
+    values (M5)."""
+    from mnemiq.authz.grants import FileAuthzProvider
+    from mnemiq.runtime import _warn_stale_codes
+
+    store = duckdb.connect()
+    ValueIndex(store)._con.execute("INSERT INTO value_index VALUES ('only', 'orders', 'PLANT_CODE', 'XY98')")
+    snap = _snapshot([("plant", "Every order ships from plant AB12, on PLANT_CODE.")], [("orders", "PLANT_CODE")])
+    with caplog.at_level(logging.WARNING):
+        _warn_stale_codes(snap, store, FileAuthzProvider(str(tmp_path / "missing.json")), superset=False)
+    lines = _stale_lines(caplog)
+    assert len(lines) == 1 and "AB12" in lines[0] and "XY98" not in lines[0], caplog.text
+    assert "could not be read" in lines[0]
+
+
+def test_an_all_capitals_word_is_not_a_code():
+    # NOTE has the shape of the region codes, but a bare code must hold a digit: an acronym or a shouted word is prose.
+    snap = _snapshot([("region", "REGION_CODE is the sales region, as the FAQ and the NOTE say.")],
+                     [("sales", "REGION_CODE")])
+    assert stale_codes(snap, _index({("sales", "REGION_CODE"): ["EAST", "WEST"]})) == []

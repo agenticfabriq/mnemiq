@@ -782,16 +782,27 @@ def _warn_cut_meaning(snapshot: Snapshot | None) -> None:
         logger.warning("%s. Shorten it, or split it in two", sentence)
 
 
-def _row_filtered_tables(authz: AuthzProvider | None) -> set[str] | None:
-    """Every table some role of the policy reads through a row filter; None when the provider cannot list its roles."""
+def _row_filtered_tables(authz: AuthzProvider | None) -> set[str] | str:
+    """Every table some role of the policy reads through a row filter, or why that cannot be said.
+
+    A file policy that cannot be read lists no roles, which is not a policy without row filters: its grants say so
+    (`available` false), and so does each role's if the file breaks between reads."""
     roles = getattr(authz, "policy_roles", None)
     if roles is None:
-        return None
+        return "the access policy's roles cannot be listed"
     from mnemiq.contract import IdentityContext
 
+    def grants(names: list[str]):
+        return authz.grants_for(IdentityContext(tenant_id="boot", principal_id="boot", roles=names))
+
+    if not grants([]).available:
+        return "the access policy could not be read"
     tables: set[str] = set()
     for role in roles():
-        tables |= set(authz.grants_for(IdentityContext(tenant_id="boot", principal_id="boot", roles=[role])).row_filters)
+        role_grants = grants([role])
+        if not role_grants.available:
+            return "the access policy could not be read"
+        tables |= set(role_grants.row_filters)
     return tables
 
 
@@ -803,8 +814,9 @@ def _warn_stale_codes(snapshot: Snapshot | None, con, authz: AuthzProvider | Non
     value no row has.
 
     The real values are quoted as the value check quotes them (`shown`, the few most like the code), except for a table
-    some role reads through a row filter, or under a policy whose roles cannot be listed: the value index is read
-    without any filter, so listing them would show values from rows a role cannot read (M5), and the line says so.
+    some role reads through a row filter, or under a policy that cannot be read or whose roles cannot be listed: the
+    value index is read without any filter, so listing them would show values from rows a role cannot read (M5), and
+    the line says why.
 
     Superset mode harvests no values, so it judges nothing (`NoValueIndex`), as its writer is given none. An index that
     cannot be read is said and skipped: an advisory never stops a boot, or a swap on a user's request."""
@@ -820,9 +832,11 @@ def _warn_stale_codes(snapshot: Snapshot | None, con, authz: AuthzProvider | Non
 
     for stale in found:
         codes = ", ".join(repr(c) for c in stale.codes)
-        if filtered is None or any(names_one_object(obj, filtered) for obj in stale.objects):
-            held = ("its values are not listed, because a row filter may apply to it and the value index is "
-                    "read without one")
+        if isinstance(filtered, str):
+            held = (f"its values are not listed, because {filtered}, so a row filter may apply to it and the value "
+                    "index is read without one")
+        elif any(names_one_object(obj, filtered) for obj in stale.objects):
+            held = "its values are not listed, because a row filter applies to it and the value index is read without one"
         else:
             held = f"its values include: {', '.join(shown(v) for v in stale.nearest)}"
         logger.warning("definition %r names %s for %s, which holds none of them; %s. A query that follows the "
