@@ -326,7 +326,8 @@ def test_the_readme_check_flags_a_planted_defect(old, new, flagged):
 
 WRITES_SOURCE = Path(writes.__file__)
 # Each tool that writes an existing row: the model whose row it locks first, and the request field naming the row.
-# Creating a dashboard, a dataset or a chart writes a new row and locks no row, only its marker (`_find_or_create`).
+# Creating a dashboard, a dataset or a chart writes a new row and does not lock a row itself: it locks its marker
+# (`_find_or_create`), and on MySQL its second lock is a row lock taken under that (`_take_create_lock`).
 LOCKED = {"patch_chart": ("Slice", "chart_id"), "add_saved_metric": ("SqlaTable", "dataset_id"),
           "delete_dataset": ("SqlaTable", "dataset_id"), "set_layout": ("Dashboard", "dashboard_id")}
 UNLOCKED = {"create_dashboard", "create_dataset", "create_chart"}
@@ -719,6 +720,11 @@ class _Lookup:
         return list(self)
 
 
+# What `Metadata.holds_answer` is when no test set it: the hold check then answers whether the connection holds the
+# lock. A sentinel, so that a test may set None, MySQL's answer for a lock nobody holds.
+_UNSET = object()
+
+
 class _Connection:
     """A connection of its own, as `engine.connect()` hands one out, on which a create takes its marker's lock. What
     runs on it is logged as `("on", n, ...)`: its transaction (`begin`) as `"begin"`, then `"commit"`, or `"rollback"`
@@ -727,17 +733,26 @@ class _Connection:
     threads wait for each other as two sessions of the database do: Postgres's `pg_advisory_lock` for the
     `lock_timeout` set in its transaction, then failing with SQLSTATE 55P03; MySQL's `GET_LOCK` for its seconds, then
     answering 0 (or the metadata's `got_lock`, when that is not 1, without taking the lock). The lock outlives the
-    transaction it was taken in, as a session's lock does. An unlock answers the metadata's `released` (raised, when it
-    is an exception; the database's own answer when it is None) and lets the lock go only when that is 1. Invalidating
-    the connection lets go whatever it holds, as closing a database session does (`("invalidate", n)`); closing it
-    while it still holds a lock leaves the lock held, as a pool's reset does, and records it in the metadata's
-    `leaked`."""
+    transaction it was taken in, as a session's lock does. The hold check answers whether this connection holds the
+    marker's lock (`HOLDS`, Postgres: true or false; `MYSQL_HOLDS`, MySQL: 1 or 0), or the metadata's `holds_answer`
+    when a test set it (None among them, MySQL's NULL for a lock nobody holds; raised, when it is an exception, the
+    connection kept). An unlock answers the metadata's `released` (raised, when it is an exception), or else the
+    database's own answer: Postgres true when this database session holds the lock and false when it does not; MySQL 1
+    when it does, 0 when another session does, NULL when none does. It lets the lock go only when that is 1.
+
+    As SQLAlchemy 2.0's `Connection` does: a statement on a connection whose database session ended (`lost`) fails,
+    and the failure invalidates the connection (`("invalidate", n)`, `invalidated`); the next statement on an
+    invalidated connection quietly reconnects it (`("reconnect", n)`), to a fresh database session that holds nothing.
+    Invalidating the connection lets go whatever it holds, as closing a database session does, and invalidating it
+    again does nothing; closing it while it still holds a lock leaves the lock held, as a pool's reset does, and
+    records it in the metadata's `leaked`."""
 
     def __init__(self, metadata: "Metadata", number: int) -> None:
         self.metadata, self.number = metadata, number
         self.timeout_s: float | None = None
         self.holding: str | None = None
-        self.lost = False  # its database session ended: every statement fails, and it holds no lock
+        self.lost = False  # its database session ended: its next statement fails, and it holds no lock
+        self.invalidated = False  # SQLAlchemy closed its database connection; the next statement reconnects
         metadata.log.append(("connect", number))
         metadata.opened.append(self)
 
@@ -757,9 +772,13 @@ class _Connection:
         self._log("commit")
 
     def execute(self, statement, parameters=None) -> SimpleNamespace:
+        if self.invalidated:  # SQLAlchemy's `_revalidate_connection`: a fresh pooled connection, a new session
+            self.metadata.log.append(("reconnect", self.number))
+            self.invalidated = self.lost = False
         self._log(statement, parameters)
         metadata = self.metadata
-        if self.lost:
+        if self.lost:  # SQLAlchemy finds the connection lost, invalidates it, and raises
+            self.invalidate()
             raise stubs.database_error("08006", invalidated=True)
         if metadata.lock_error is not None and statement in (PG_LOCK, GET_LOCK):
             raise metadata.lock_error
@@ -777,7 +796,19 @@ class _Connection:
             if answer == 1:
                 answer = int(self._take(parameters["name"], parameters["seconds"]))
         elif statement in (PG_UNLOCK, RELEASE_LOCK):
-            answer = self._release(statement)
+            answer = self._release(statement, parameters["marker" if statement == PG_UNLOCK else "name"])
+        elif statement in (HOLDS, MYSQL_HOLDS):
+            if isinstance(metadata.holds_answer, BaseException):
+                raise metadata.holds_answer
+            if metadata.holds_answer is not _UNSET:
+                answer = metadata.holds_answer
+            elif statement == HOLDS:
+                answer = self.holding == parameters["marker"]
+            else:
+                answer = int(self.holding == parameters["name"])
+            if metadata.after_hold_check is not None:
+                meanwhile, metadata.after_hold_check = metadata.after_hold_check, None
+                meanwhile()
         return SimpleNamespace(scalar=lambda: answer)
 
     def _take(self, key: str, seconds: float | None) -> bool:
@@ -792,12 +823,18 @@ class _Connection:
         self.holding = key
         return True
 
-    def _release(self, statement: str) -> Any:
+    def _release(self, statement: str, key: str) -> Any:
         answer = self.metadata.released
         if isinstance(answer, BaseException):
             raise answer
-        if answer is None:
-            answer = True if statement == PG_UNLOCK else 1  # Postgres answers a boolean, MySQL a number
+        if answer is None:  # the database's own answer: Postgres a boolean, MySQL a number or NULL
+            if statement == PG_UNLOCK:
+                answer = self.holding == key
+            elif self.holding == key:
+                answer = 1
+            else:
+                lock = self.metadata.locks.get(key)
+                answer = 0 if lock is not None and lock.locked() else None
         if answer == 1 and self.holding is not None:
             self._let_go()
         return answer
@@ -807,6 +844,9 @@ class _Connection:
         self.holding = None
 
     def invalidate(self) -> None:
+        if self.invalidated:  # SQLAlchemy's `invalidate` does nothing on a connection already invalidated
+            return
+        self.invalidated = True
         self.metadata.log.append(("invalidate", self.number))
         if self.holding is not None:
             self._let_go()
@@ -827,31 +867,42 @@ class Metadata:
     `contended` (a text whose statement on a connection of its own waits past the lock timeout, SQLSTATE 55P03),
     `got_lock` (what `GET_LOCK` answers without taking the lock, when not 1), `lock_error` (what the lock statement
     raises instead), `late_grant` (Postgres grants the lock just as its wait times out, and the statement still fails
-    with 55P03, the lock held), `released` (what an unlock answers, or raises), `pool_exhausted` (`engine.connect()`
-    times out),
+    with 55P03, the lock held), `released` (what an unlock answers, or raises), `holds_answer` (what the hold check
+    answers instead of whether the connection holds the lock, when a test set it: None too; or raises, the connection
+    kept), `pool_exhausted`
+    (`engine.connect()` times out),
     `aborted` (the session's transaction is aborted, as Postgres aborts one a statement failed in: every statement fails
     with SQLSTATE 25P02 until a rollback), `gone` (the session's connection is gone: every statement fails, a rollback
     or not; SQLAlchemy marks the error as an invalidated connection), `breaks` (what of `aborted` or `gone` happens,
-    once, when the session reaches a moment: `"isolation"` or `"lookup"`) and `before_create_lock` (run once, just
-    before the session takes a create's transaction lock). The session's transaction locks (`CREATE_LOCK`) are real
-    locks too, keyed by the marker, held until the session commits or rolls back. `waiting` holds the connections
-    waiting for a lock, and `leaked` each lock a connection still held when it was closed. `drop_lock_connections()`
-    ends the database session of every connection of its own: their locks are let go, and every later statement on
-    them fails. `fail_at` maps a session statement, or `"lookup"`, to `(n, error)`: its n-th occurrence on the session
-    raises `error`."""
+    once, when the session reaches a moment: `"isolation"` or `"lookup"`), `before_create_lock` (run once, just
+    before the session takes a create's second lock: Postgres's transaction lock, or MySQL's row lock) and
+    `after_hold_check` (run once, on the lock's connection, once the hold check has its answer and before it is
+    returned). The session's transaction locks (`CREATE_LOCK`) are real locks too, keyed by the marker, held until the
+    session commits or rolls back; so are the row locks `lock_row` takes (`Metadata.lock_row`, logged as
+    `("lock_row", model, id)`), keyed by `(model, id)`. The session's transaction state, whether it is `aborted` and
+    the transaction and row locks it holds (`held_xact`), is each thread's own, as Superset's scoped session is one
+    session per thread: two sends in two threads each roll back only their own transaction. `waiting` holds the
+    connections waiting for a lock, `waiting_xact` the threads whose session waits for a transaction or row lock, and
+    `leaked` each lock a connection still held when it was closed. `drop_lock_connections()` ends the database session
+    of every connection of its own: their locks are let go, and every later statement on them fails. `fail_at` maps a
+    session statement, `"lookup"` or `"lock_row"`, to `(n, error)`: its n-th occurrence on the session raises
+    `error`."""
 
     def __init__(self, superset: SimpleNamespace, dialect: str) -> None:
         self.superset = superset
+        self._transaction = threading.local()  # each thread's session's own transaction state
         self.isolation, self.contended, self.got_lock, self.pool_exhausted = "READ COMMITTED", None, 1, False
         self.lock_error: BaseException | None = None
         self.late_grant = False
         self.released: Any = None
+        self.holds_answer: Any = _UNSET
         self.aborted = self.gone = False
         self.breaks: dict[str, str] = {}
         self.before_create_lock: Callable[[], None] | None = None
+        self.after_hold_check: Callable[[], None] | None = None
         self.locks: dict[str, threading.Lock] = {}
         self.xact_locks: dict[str, threading.Lock] = {}
-        self.held_xact: list[str] = []
+        self.waiting_xact: list[str] = []
         self.opened: list[_Connection] = []
         self.fail_at: dict[str, tuple[int, BaseException]] = {}
         self.occurrences: dict[str, int] = {}
@@ -859,6 +910,22 @@ class Metadata:
         self.leaked: list[str] = []
         self._numbers = itertools.count(1)
         self.engine = SimpleNamespace(dialect=SimpleNamespace(name=dialect), connect=self._connect)
+
+    @property
+    def aborted(self) -> bool:
+        """Whether this thread's session's transaction is aborted."""
+        return getattr(self._transaction, "aborted", False)
+
+    @aborted.setter
+    def aborted(self, value: bool) -> None:
+        self._transaction.aborted = value
+
+    @property
+    def held_xact(self) -> list[str]:
+        """The transaction locks this thread's session holds, by marker."""
+        if not hasattr(self._transaction, "held_xact"):
+            self._transaction.held_xact = []
+        return self._transaction.held_xact
 
     def at(self, moment: str) -> None:
         """The session reaches `moment`: what `breaks` names for it happens now, once."""
@@ -907,19 +974,55 @@ class Metadata:
         return _Connection(self, next(self._numbers))
 
     def execute(self, statement, parameters=None) -> None:
-        if statement == CREATE_LOCK and self.before_create_lock is not None:
-            meanwhile, self.before_create_lock = self.before_create_lock, None
-            meanwhile()
+        if statement == CREATE_LOCK:
+            self._before_second_lock()
         self.log.append(("execute", statement, parameters))
         self.statement()
         self.occurs(statement)
         if self.contended is not None and self.contended in statement:
             raise stubs.database_error("55P03")
         if statement == CREATE_LOCK:
-            key = parameters["marker"]
-            if not self.xact_locks.setdefault(key, threading.Lock()).acquire(timeout=5):
-                raise stubs.database_error("55P03")
-            self.held_xact.append(key)
+            self._take_xact(parameters["marker"])
+
+    def lock_row(self, model: type, entity_id: int | None) -> Any:
+        """`writes.lock_row` on this database, for the rows a create's second lock locks on MySQL: a dashboard (the
+        stand-ins' `dashboards`, by id) or the request's own user (`g.user`, by its id). The row, locked until the
+        session's transaction ends, or None when there is no such row, an id of None among them (`id = NULL` matches no
+        row), and no lock taken."""
+        self._before_second_lock()
+        self.log.append(("lock_row", model.__name__, entity_id))
+        self.statement()
+        self.occurs("lock_row")
+        if model.__name__ == "Dashboard":
+            row = self.superset.dashboards.get(entity_id)
+        else:
+            assert model.__name__ == "User", f"the fake locks no {model.__name__} row"
+            user = getattr(self.superset.g, "user", None)
+            row = user if user is not None and entity_id is not None and user.id == entity_id else None
+        if row is not None:
+            self._take_xact((model.__name__, entity_id))
+        return row
+
+    def _before_second_lock(self) -> None:
+        if self.before_create_lock is not None:
+            meanwhile, self.before_create_lock = self.before_create_lock, None
+            meanwhile()
+
+    def _take_xact(self, key: Any) -> None:
+        """Takes the lock `key` for this thread's session's transaction, held until it commits or rolls back: at once
+        when the transaction holds it already, as a transaction locking its own row again does; else waiting up to 5
+        seconds for another thread's session to let it go, then failing with SQLSTATE 55P03."""
+        if key in self.held_xact:
+            return
+        lock = self.xact_locks.setdefault(key, threading.Lock())
+        if not lock.acquire(blocking=False):
+            self.waiting_xact.append(threading.current_thread().name)
+            try:
+                if not lock.acquire(timeout=5):
+                    raise stubs.database_error("55P03")
+            finally:
+                self.waiting_xact.remove(threading.current_thread().name)
+        self.held_xact.append(key)
 
     def _end_transaction(self) -> None:
         while self.held_xact:
@@ -936,6 +1039,12 @@ class Metadata:
         self.log.append(("rollback",))
         self.aborted = False
         self._end_transaction()
+
+
+def _all_let_go(metadata: Metadata) -> bool:
+    """Whether every lock of `metadata` is free, whichever thread's session or connection took it: the markers' locks,
+    the create locks and the row locks."""
+    return not any(lock.locked() for lock in (*metadata.locks.values(), *metadata.xact_locks.values()))
 
 
 def commands(superset: SimpleNamespace, *names: str) -> list:
@@ -1188,8 +1297,14 @@ STEP = format_marker(BUILD, "chart_1", 12)
 PG_LOCK = "SELECT pg_advisory_lock(hashtextextended(:marker, 0))"
 PG_UNLOCK = "SELECT pg_advisory_unlock(hashtextextended(:marker, 0))"
 CREATE_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended('mnemiq-create:' || :marker, 0))"
+HOLDS = writes._PG_HOLDS
 GET_LOCK = "SELECT GET_LOCK(:name, :seconds)"
 RELEASE_LOCK = "SELECT RELEASE_LOCK(:name)"
+# MySQL's hold check, written out rather than read from `writes`, so a change of the statement is seen here: 1 when
+# this connection holds the named lock, 0 when another does, NULL when nobody does.
+MYSQL_HOLDS = "SELECT IS_USED_LOCK(:name) = CONNECTION_ID()"
+# The request's own user in `creating`, whose row a dashboard create locks on MySQL.
+CALLER_ID = 1
 
 
 def _lock_name(marker: str) -> str:
@@ -1228,17 +1343,19 @@ def looked(dialect: str, model: str) -> list:
 @pytest.fixture
 def creating(monkeypatch, superset):
     """Creates with Superset stood in, on a Postgres metadata database (`metadata`; `on(dialect)` makes it another):
-    dashboard 12, edited by `analyst Live`, and dataset 7 are there; the caller reads every object but those in
-    `unreadable` and edits every one but those in `not_edited`. Afterwards no connection was put back in the pool
-    still holding a marker's lock."""
+    dashboard 12, edited by `analyst Live`, and dataset 7 are there; the caller, user `CALLER_ID`, reads every object
+    but those in `unreadable` and edits every one but those in `not_edited`. A row lock is the metadata database's
+    (`Metadata.lock_row`). Afterwards no connection was put back in the pool still holding a marker's lock."""
     state = SimpleNamespace(superset=superset, unreadable=[], not_edited=[],
                             dashboard=SimpleNamespace(id=12, editors=[SimpleNamespace(id=101, label="analyst Live")]))
+    superset.g.user = SimpleNamespace(id=CALLER_ID)
+    monkeypatch.setattr(writes, "lock_row", lambda model, entity_id: superset.session.lock_row(model, entity_id))
 
     def readable(resource) -> bool:
         return not any(resource is hidden for hidden in state.unreadable)
 
     security = SimpleNamespace(can_access_dashboard=readable, can_access_chart=readable,
-                               can_access_datasource=readable,
+                               can_access_datasource=readable, user_model=stubs.model("User"),
                                is_editor=lambda resource: not any(resource is kept for kept in state.not_edited))
     monkeypatch.setattr(writes, "_security", lambda: security)
     superset.dashboards, superset.datasets = {12: state.dashboard}, {7: SimpleNamespace(id=7)}
@@ -1276,8 +1393,9 @@ def _kinds(superset: SimpleNamespace) -> list[str]:
 @pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
 def test_create_dashboard_twice_with_one_marker_makes_one(creating, dialect):
     """A create whose answer was lost is sent again with the same marker: the second finds the dashboard the first
-    made, by its marker, and answers it; the command ran once. On Postgres a last look just before the command
-    would also find it, so MySQL, where only the first look exists, is what proves the first look."""
+    made, by its marker, and answers it; the command ran once. The guarded look just before the command would also
+    find it: the second send's trail in `test_the_marker_lock_is_held_from_the_look_through_the_creates_commit` is what
+    shows the first look answers it."""
     creating.on(dialect)
     first = make_dashboard()
     assert set(first) == {"dashboard_id"}, first
@@ -1404,23 +1522,26 @@ def test_a_contended_marker_lock_answers_busy(creating):
 def test_mysql_takes_and_releases_a_named_lock(creating, dialect):
     """A MySQL named lock belongs to a connection, not a transaction, so it is taken and released on a connection of
     its own, never the session's, held from before the look until after the create's commit, and released also when
-    the create raises, the create's own exception going on. Its name is built in Python from the marker: 63
-    characters, inside MySQL's 64."""
+    the create raises, the create's own exception going on once the settle has found nothing. Its name is built in
+    Python from the marker: 63 characters, inside MySQL's 64. Just before its command the create locks the caller's own
+    user row and asks its lock's connection whether it still holds the named lock (`guarded`), MariaDB's dialect as
+    MySQL's."""
     creating.on(dialect)
     assert len(_lock_name(SHELL)) == 63
     made = make_dashboard()
     assert set(made) == {"dashboard_id"}, made
     assert creating.superset.ran == [
-        *taken(dialect, SHELL), ("isolation",), ("lookup", "Dashboard"), ("CreateDashboardCommand", ANY), ("commit",),
-        ("rollback",), *let_go(dialect, SHELL)]
+        *taken(dialect, SHELL), ("isolation",), ("lookup", "Dashboard"), *guarded("dashboard", dialect),
+        ("CreateDashboardCommand", ANY), ("commit",), ("rollback",), *let_go(dialect, SHELL)]
     creating.superset.ran.clear()
     creating.superset.rows["Dashboard"].clear()
     creating.superset.create = RuntimeError("the metadata database went away")
     with pytest.raises(RuntimeError):
         make_dashboard()
     assert creating.superset.ran == [
-        *taken(dialect, SHELL, 2), ("isolation",), ("lookup", "Dashboard"), ("CreateDashboardCommand", ANY),
-        ("rollback",), ("rollback",), *let_go(dialect, SHELL, 2)]
+        *taken(dialect, SHELL, 2), ("isolation",), ("lookup", "Dashboard"), *guarded("dashboard", dialect, 2),
+        ("CreateDashboardCommand", ANY), ("rollback",), ("rollback",), *guarded("dashboard", dialect, 2),
+        ("rollback",), *let_go(dialect, SHELL, 2)]
 
 
 @pytest.mark.parametrize(("configured", "seconds"), [(2.5, 2), (0.5, 1), (44.9, 44)])
@@ -1623,6 +1744,26 @@ def test_each_format_key_is_merged_into_the_saved_params(creating, key, value):
     assert json.loads(properties["params"])[key] == value
 
 
+@pytest.mark.parametrize(("raised", "answer"), [
+    pytest.param(stubs.SupersetSecurityException("You need access to the following tables: secret"),
+                 {"not_found": "dataset"}, id="access refused"),
+    pytest.param(stubs.SupersetDisallowedSQLFunctionException("pg_sleep is not allowed"),
+                 {"refused": "query_failed"}, id="a function Superset disallows")])
+def test_a_compile_check_that_raises_a_superset_error_is_answered_not_raised(creating, caplog, raised, answer):
+    """MCP's `_compile_chart` answers a query that fails as a failed compile, but it raises Superset's own errors
+    (`SupersetErrorException`), such as the one for a dataset's SQL using a function Superset disallows in a chart's
+    query. The tool answers them as `_probe` answers the same errors: a refused access as a dataset that does not
+    exist, any other as a query that failed, logged with its error. Never raised out of the tool, which would reach
+    mnemiq as the tool failing, with Superset's words; nothing is made."""
+    creating.superset.compiled = raised
+    with caplog.at_level("WARNING", logger=writes.__name__):
+        assert make_from_config() == answer
+    assert commands(creating.superset) == [] and creating.superset.rows["Slice"] == []
+    logged = [record for record in caplog.records if record.getMessage().startswith("mnemiq extension: create_chart")]
+    expected = [] if answer == {"not_found": "dataset"} else [("WARNING", raised)]
+    assert [(record.levelname, record.exc_info and record.exc_info[1]) for record in logged] == expected
+
+
 # ---------------------------------------------------------------- the marker's lock, held through the create
 
 def _failing_query(superset: SimpleNamespace, path: str) -> None:
@@ -1643,21 +1784,33 @@ CREATES = {"dashboard": (make_dashboard, "Dashboard", SHELL, "dashboard_id"),
            "funnel chart": (make_funnel, "Slice", STEP, "chart_id"),
            "config chart": (make_from_config, "Slice", STEP, "chart_id"),
            "dataset": (lambda: make_dataset(), "SqlaTable", format_marker(BUILD, "data_1", 3), "dataset_id")}
-def guarded(create: str, dialect: str) -> list:
-    """What `create` runs on Postgres just before its command, in the command's own transaction: the session's lock
-    waits bounded again (rc2's checks may have ended the transaction the look bounded), the transaction's lock on the
-    marker's second key, and a last look."""
-    if dialect != "postgresql":
+# The row each create locks as its second lock on MySQL: a chart's or a dataset's dashboard, the caller's own user row
+# for a dashboard.
+SECOND_ROWS = {"dashboard": ("User", CALLER_ID), "funnel chart": ("Dashboard", 12), "config chart": ("Dashboard", 12),
+               "dataset": ("Dashboard", 3)}
+
+
+def guarded(create: str, dialect: str, n: int = 1) -> list:
+    """What `create`'s guarded look runs, just before its command and again in a settle: in the session's transaction,
+    its second lock (on Postgres the session's lock waits bounded again, as rc2's checks may have ended the transaction
+    the look bounded, then the transaction's lock on the marker's second key; on MySQL the row lock, `SECOND_ROWS`)
+    and a look again; then, finding nothing, the hold check on the marker lock's own connection `n`, in a short
+    transaction of its own. SQLite runs none of it."""
+    if dialect == "sqlite":
         return []
     _, model, marker, _ = CREATES[create]
-    return [BOUND, ("execute", CREATE_LOCK, {"marker": marker}), ("lookup", model)]
+    if dialect == "postgresql":
+        second, holds = [BOUND, ("execute", CREATE_LOCK, {"marker": marker})], (HOLDS, {"marker": marker})
+    else:
+        second, holds = [("lock_row", *SECOND_ROWS[create])], (MYSQL_HOLDS, {"name": _lock_name(marker)})
+    return [*second, ("lookup", model), ("on", n, "begin"), ("on", n, *holds), ("on", n, "commit")]
 
 
-def work(create: str, dialect: str) -> list:
-    """What `create` runs on a miss, under the marker's lock: rc2's checks; on Postgres the guard just before the
-    command (`guarded`); the command and its commit; and a dataset's editors step (whose row lock's transaction ends
-    with a rollback)."""
-    last = guarded(create, dialect)
+def work(create: str, dialect: str, n: int = 1) -> list:
+    """What `create` runs on a miss, under the marker's lock (held on connection `n`): rc2's checks; the guarded look
+    just before the command (`guarded`); the command and its commit; and a dataset's editors step (whose row lock's
+    transaction ends with a rollback)."""
+    last = guarded(create, dialect, n)
     return {"dashboard": [*last, ("CreateDashboardCommand", ANY), ("commit",)],
             "funnel chart": [("chart_data", ANY), *last, ("CreateChartCommand", ANY), ("commit",)],
             "config chart": [("validate", ANY), ("map", CONFIG, 7), ("compile", ANY, 7), *last,
@@ -1672,18 +1825,20 @@ def test_the_marker_lock_is_held_from_the_look_through_the_creates_commit(reques
     """Once the caller's own checks pass, a create takes its marker's lock, on a connection of its own, in a short
     transaction committed once the lock is held, and holds it through: the isolation check, on Postgres the bound on
     the session's own lock waits, the look, on a miss rc2's own checks (a chart's validation, mapping and compile
-    check, or a funnel's query check), on Postgres the guard in the command's own transaction (`guarded`), the create
-    command and its commit, and a dataset's editors step. The request's
-    transaction then ends, and only then is the lock released and its connection closed. Nothing of the work runs
-    before the lock. Sent again, the create takes the lock, finds the object and answers it (a dataset after setting
-    its editors again, still under the lock), running none of rc2's checks."""
+    check, or a funnel's query check), the guarded look in the command's own transaction (`guarded`: its second lock
+    is a transaction's lock on Postgres and a row lock on MySQL), the create command and its commit, and a dataset's
+    editors step. The request's transaction then ends, and only then is
+    the lock released and its connection closed: the hold check's short transaction on that connection did not end
+    the lock, whose release still answers that it let it go (no invalidation). Nothing of the work runs before the
+    lock. Sent again, the create takes the lock, finds the object and answers it (a dataset after setting its editors
+    again, still under the lock), running none of rc2's checks."""
     stage = request.getfixturevalue("lock_rows" if create == "dataset" else "creating")
     superset = stage.superset
     metadata = superset.session = Metadata(superset, dialect)
     make, model, marker, key = CREATES[create]
     made = make()
     assert set(made) == {key}, made
-    assert superset.ran == [*taken(dialect, marker), *looked(dialect, model), *work(create, dialect), ("rollback",),
+    assert superset.ran == [*taken(dialect, marker), *looked(dialect, model), *work(create, dialect, 1), ("rollback",),
                             *let_go(dialect, marker)]
     superset.ran.clear()
     assert make() == made
@@ -1848,18 +2003,19 @@ COMMANDS = {"dashboard": "CreateDashboardCommand", "funnel chart": "CreateChartC
             "config chart": "CreateChartCommand", "dataset": "CreateDatasetCommand"}
 
 
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
 @pytest.mark.parametrize("create", list(CREATES))
-def test_a_create_whose_marker_lock_was_lost_answers_what_a_second_send_made(request, create):
-    """On Postgres the marker's lock is held by a connection of its own, which sits idle while the create works (a
-    chart's query check). If that connection's database session ends, its lock goes with it while the create's own
-    session works on, and a second send of the create takes the lock, finds nothing and makes the object. So just
-    before its command each create takes a second lock, in the command's own transaction and on another key of the
-    marker, and looks again under it: the first send, reaching its command, finds the object the second made and
-    answers it. Superset holds one object. The first learns its lock's connection was lost only when it lets the lock
-    go, and closes that connection."""
+def test_a_create_whose_marker_lock_was_lost_answers_what_a_second_send_made(request, create, dialect):
+    """The marker's lock is held by a connection of its own, which sits idle while the create works (a chart's query
+    check). If that connection's database session ends, its lock goes with it while the create's own session works
+    on, and a second send of the create takes the lock, finds nothing and makes the object. So just before its command
+    each create takes a second lock in the command's own transaction (on Postgres a transaction's lock on another key
+    of the marker, on MySQL the row it is made under) and looks again under it: the first send, reaching its command,
+    finds the object the second made and answers it. Superset holds one object. The first learns its lock's
+    connection was lost only when it lets the lock go, and closes that connection."""
     stage = request.getfixturevalue("lock_rows" if create == "dataset" else "creating")
     superset = stage.superset
-    metadata = superset.session = Metadata(superset, "postgresql")
+    metadata = superset.session = Metadata(superset, dialect)
     make, model, _, key = CREATES[create]
     second: dict = {}
 
@@ -1874,6 +2030,233 @@ def test_a_create_whose_marker_lock_was_lost_answers_what_a_second_send_made(req
     assert len(superset.rows[model]) == 1
     assert len(commands(superset, COMMANDS[create])) == 1
     assert ("invalidate", 1) in superset.ran and metadata.leaked == []
+
+
+def _lose_the_marker_lock_before_the_command(request, create: str,
+                                             dialect: str = "postgresql") -> tuple[SimpleNamespace, Metadata]:
+    """`create`'s stage on `dialect`, its marker lock's connection to end just before its command's own transaction
+    takes its second lock, with no other send of the create meanwhile."""
+    stage = request.getfixturevalue("lock_rows" if create == "dataset" else "creating")
+    superset = stage.superset
+    metadata = superset.session = Metadata(superset, dialect)
+    metadata.before_create_lock = metadata.drop_lock_connections
+    return superset, metadata
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+@pytest.mark.parametrize("create", list(CREATES))
+def test_a_create_whose_lock_was_lost_before_its_command_makes_nothing_and_answers_busy(request, create, dialect):
+    """The marker lock's connection ends while the create works (an idle timeout during a chart's query check), and
+    no other send of the create comes: the guarded look finds nothing, and the hold check on the lock's own connection
+    fails. The create makes nothing and answers busy: it no longer holds its marker's lock without a break since its
+    look, so another send may have taken the lock and refused, and a create made now could stand behind that refusal.
+    Nothing takes the lost lock again. The session is rolled back, which releases the second lock, and the lost
+    connection is closed when the lock is let go."""
+    superset, metadata = _lose_the_marker_lock_before_the_command(request, create, dialect)
+    make, model, _, _ = CREATES[create]
+    assert make() == {"busy": True}
+    assert superset.rows[model] == []
+    assert commands(superset, COMMANDS[create]) == []
+    assert ("invalidate", 1) in superset.ran and metadata.held_xact == [] and metadata.leaked == []
+    assert _all_let_go(metadata)
+    lock = PG_LOCK if dialect == "postgresql" else GET_LOCK
+    assert [entry for entry in superset.ran if entry[0] == "connect" or entry[2:3] == (lock,)] == [
+        ("connect", 1), ("on", 1, lock, ANY)]
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+@pytest.mark.parametrize("create", list(CREATES))
+def test_a_lock_lost_with_its_connection_is_not_released_on_a_fresh_one(request, caplog, create, dialect):
+    """The hold check's statement fails on the lock's lost connection, and SQLAlchemy invalidates that connection;
+    its next statement would reconnect it quietly, to a fresh pooled connection whose database session holds nothing,
+    where an unlock answers that it released nothing. So the release runs nothing on a connection already
+    invalidated: the lock went with its database session, and the loss is logged once, as the lost-lock warning. No
+    unlock statement, no reconnection (no second pooled connection taken), no "not released" warning; the connection is
+    closed, and every lock is free."""
+    superset, metadata = _lose_the_marker_lock_before_the_command(request, create, dialect)
+    make, _, marker, _ = CREATES[create]
+    with caplog.at_level("INFO", logger=writes.__name__):
+        assert make() == {"busy": True}
+    warnings = [record.getMessage() for record in caplog.records if record.levelname == "WARNING"]
+    assert warnings == [LOST], warnings
+    unlock = PG_UNLOCK if dialect == "postgresql" else RELEASE_LOCK
+    assert not [entry for entry in superset.ran if entry[2:3] == (unlock,) or entry[0] == "reconnect"], superset.ran
+    holds = (HOLDS, {"marker": marker}) if dialect == "postgresql" else (MYSQL_HOLDS, {"name": _lock_name(marker)})
+    assert ("on", 1, *holds) in superset.ran, superset.ran
+    at = superset.ran.index(("on", 1, *holds))
+    assert superset.ran[at + 1:] == [("invalidate", 1), ("on", 1, "rollback"), ("rollback",), ("rollback",),
+                                     ("close", 1)]
+    assert metadata.leaked == [] and _all_let_go(metadata)
+
+
+@pytest.mark.parametrize(("dialect", "answer"), [("postgresql", False), ("mysql", 0)])
+def test_a_hold_check_on_another_session_answers_busy(creating, dialect, answer):
+    """The hold check answers that the lock is not held while its connection is still there, as it does when it
+    reaches another database session than the one that took the lock (a pooler in transaction mode; on MySQL, 0: a
+    session holds the named lock, but not this one): busy, and nothing is made."""
+    creating.on(dialect).holds_answer = answer
+    assert make_from_config() == {"busy": True}
+    assert creating.superset.rows["Slice"] == [] and commands(creating.superset) == []
+    assert creating.metadata.held_xact == [] and creating.metadata.leaked == []
+
+
+def test_mysql_a_free_named_lock_is_not_held(creating):
+    """MySQL's hold check answers NULL when nobody holds the named lock: the create's lock was let go or lost. Not
+    held: busy, nothing made, and the second lock let go."""
+    creating.on("mysql").holds_answer = None
+    assert make_from_config() == {"busy": True}
+    assert creating.superset.rows["Slice"] == [] and commands(creating.superset) == []
+    assert ("on", 1, MYSQL_HOLDS, {"name": _lock_name(STEP)}) in creating.superset.ran
+    assert creating.metadata.held_xact == [] and _all_let_go(creating.metadata)
+
+
+ROW_GONE = "mnemiq extension: a create's row to lock is gone; answered busy"
+
+
+@pytest.mark.parametrize("create", ["funnel chart", "config chart", "dataset"])
+def test_mysql_a_create_whose_dashboard_row_is_gone_answers_busy(request, caplog, create):
+    """On MySQL a chart's or a dataset's second lock is its dashboard's row. A dashboard deleted after the create's own
+    checks read it leaves no row to lock: the create answers busy, says why, makes nothing and runs no look or hold
+    check without the lock; the session is rolled back. The retry's own checks then find no dashboard."""
+    stage = request.getfixturevalue("lock_rows" if create == "dataset" else "creating")
+    superset = stage.superset
+    metadata = superset.session = Metadata(superset, "mysql")
+    make, model, marker, _ = CREATES[create]
+    dashboard_id = SECOND_ROWS[create][1]
+    metadata.before_create_lock = lambda: superset.dashboards.pop(dashboard_id)
+    with caplog.at_level("INFO", logger=writes.__name__):
+        assert make() == {"busy": True}
+    assert [record.getMessage() for record in caplog.records if record.getMessage() == ROW_GONE] == [ROW_GONE]
+    assert superset.rows[model] == [] and commands(superset, COMMANDS[create]) == []
+    ran = superset.ran
+    at = ran.index(("lock_row", "Dashboard", dashboard_id))
+    assert ran[at + 1:] == [("rollback",), ("rollback",), *let_go("mysql", marker)]
+    assert metadata.held_xact == [] and _all_let_go(metadata)
+    assert make() == {"not_found": "dashboard"}
+
+
+@pytest.mark.parametrize("gone", ["the user deleted meanwhile", "no user id"])
+def test_mysql_a_dashboard_create_whose_user_row_is_gone_answers_busy(creating, gone):
+    """On MySQL a dashboard's second lock is the caller's own user row. No such row to lock (the user deleted after the
+    create began, or no user id, which matches no row): busy, and nothing made."""
+    metadata, superset = creating.on("mysql"), creating.superset
+    if gone == "no user id":
+        superset.g.user = None
+    else:
+        metadata.before_create_lock = lambda: setattr(superset.g, "user", None)
+    assert make_dashboard() == {"busy": True}
+    assert superset.rows["Dashboard"] == [] and commands(superset) == []
+    assert ("lock_row", "User", None if gone == "no user id" else CALLER_ID) in superset.ran
+    assert metadata.held_xact == [] and _all_let_go(metadata)
+
+
+def test_mysql_a_row_lock_wait_past_the_databases_timeout_answers_busy(creating):
+    """MySQL bounds a row lock's wait by its own `innodb_lock_wait_timeout` and then fails the statement (error 1205),
+    as it does when an edit of the dashboard, or another create on it, holds the row longer: the create answers busy,
+    makes nothing and lets its marker's lock go. Sent again once the row is free, it makes the chart."""
+    metadata, superset = creating.on("mysql"), creating.superset
+    metadata.fail_at["lock_row"] = (1, stubs.DBAPIError(
+        "(MySQLdb.OperationalError) (1205, 'Lock wait timeout exceeded; try restarting transaction')"))
+    assert make_funnel() == {"busy": True}
+    assert superset.rows["Slice"] == [] and commands(superset) == []
+    assert superset.ran[-4:] == [("rollback",), ("rollback",), *let_go("mysql", STEP)]
+    assert set(make_funnel()) == {"chart_id"}
+    assert len(superset.rows["Slice"]) == 1 and _all_let_go(metadata)
+
+
+LOST = "mnemiq extension: a marker's lock was lost while its create worked; answered busy, nothing made"
+
+
+@pytest.mark.parametrize("cause", [pytest.param("lost", id="the lock's connection ended"),
+                                   pytest.param(False, id="the hold check answered false"),
+                                   pytest.param(0, id="the hold check answered 0"),
+                                   pytest.param(None, id="the hold check answered NULL")])
+def test_a_lost_lock_is_logged_as_lost(request, caplog, cause):
+    """A create that answers busy because its marker's lock was lost says so, once, as a warning: an idle timeout
+    shorter than a chart's query check makes every send of that chart lose its lock this way, and the log is how an
+    operator learns why the build never finishes it. The database's error rides on the record when the hold check
+    raised one on its lost connection (a database error with the connection kept is logged apart:
+    `test_a_hold_check_that_cannot_answer_is_logged_apart_from_a_lost_lock`). An answer neither true nor 1 counts as
+    not held, NULL among them."""
+    if cause == "lost":
+        _lose_the_marker_lock_before_the_command(request, "config chart")
+    else:
+        stage = request.getfixturevalue("creating")
+        stage.metadata.holds_answer = cause
+    with caplog.at_level("WARNING", logger=writes.__name__):
+        assert make_from_config() == {"busy": True}
+    lost = [record for record in caplog.records if record.getMessage() == LOST]
+    assert [record.levelname for record in lost] == ["WARNING"], caplog.records
+    assert (lost[0].exc_info is not None) is (cause == "lost")
+
+
+UNCONFIRMED = "mnemiq extension: a create could not confirm its marker's lock is held; answered busy, nothing made"
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+@pytest.mark.parametrize("error", [pytest.param(stubs.database_error("57014"), id="the statement canceled"),
+                                   pytest.param(stubs.database_error("42883"), id="another database error")])
+def test_a_hold_check_that_cannot_answer_is_logged_apart_from_a_lost_lock(creating, caplog, dialect, error):
+    """The hold check's statement fails while its connection is kept (a statement the database canceled, for one, by
+    its `statement_timeout`): whether the lock is held is not known, and it may well be. The create answers busy and
+    makes nothing, as for a lost lock, but says it could not confirm the lock, once, as a warning carrying the error,
+    never that the lock was lost. The release then runs on the same connection and lets the lock go."""
+    metadata = creating.on(dialect)
+    metadata.holds_answer = error
+    with caplog.at_level("WARNING", logger=writes.__name__):
+        assert make_from_config() == {"busy": True}
+    assert [(record.getMessage(), record.exc_info and record.exc_info[1]) for record in caplog.records] == [
+        (UNCONFIRMED, error)]
+    assert creating.superset.rows["Slice"] == [] and commands(creating.superset) == []
+    assert creating.superset.ran[-3:] == [("rollback",), *let_go(dialect, STEP)]
+    assert ("invalidate", 1) not in creating.superset.ran
+    assert metadata.leaked == [] and _all_let_go(metadata)
+
+
+@pytest.mark.parametrize("answer", [True, 1])
+def test_a_hold_check_answering_true_or_1_lets_the_create_make_its_object(creating, answer):
+    """The hold check counts the lock as held on Postgres's `true`, or a 1, and on nothing else (`false`, `0`, `NULL`:
+    `test_a_lost_lock_is_logged_as_lost`)."""
+    creating.metadata.holds_answer = answer
+    assert set(make_from_config()) == {"chart_id"}
+    assert len(commands(creating.superset, "CreateChartCommand")) == 1
+
+
+def test_a_second_lock_not_taken_answers_busy(creating, monkeypatch):
+    """A guarded look whose second lock is not taken (`_take_create_lock` answers False) answers busy, rolls the
+    session back and makes nothing: neither the look nor the hold check runs without the second lock."""
+    monkeypatch.setattr(writes, "_take_create_lock", lambda session, held, row: False)
+    assert make_dashboard() == {"busy": True}
+    ran = creating.superset.ran
+    assert ran[-5:] == [BOUND, ("rollback",), ("rollback",), *let_go("postgresql", SHELL)]
+    assert ran.count(("lookup", "Dashboard")) == 1 and ("on", 1, HOLDS, {"marker": SHELL}) not in ran
+    assert commands(creating.superset) == []
+
+
+@pytest.mark.parametrize(("held_on", "bind", "second"), [
+    pytest.param("mysql", "postgresql", ("lock_row", "Dashboard", 12), id="a MySQL marker lock: the row lock"),
+    pytest.param("postgresql", "mysql", ("execute", CREATE_LOCK, {"marker": STEP}),
+                 id="a Postgres marker lock: the transaction lock"),
+    pytest.param("oracle", "mysql", None, id="any other marker lock: none")])
+def test_a_creates_second_lock_follows_its_marker_locks_dialect(creating, caplog, held_on, bind, second):
+    """Which second lock a guarded look takes is read from the marker's lock as it was taken (`_HeldLock.dialect`), the
+    one source its hold check reads too, never from the session's bind again: a Postgres transaction lock for a
+    Postgres marker lock, the row's lock for a MySQL one. For any other dialect it takes none and answers busy, says
+    why, and runs no look and no hold check without it (fail closed). The marker lock's connection here holds nothing,
+    so every case answers busy; what differs is the lock taken."""
+    metadata = creating.on(bind)
+    held = writes._HeldLock(metadata.engine.connect(), held_on, STEP)
+    models = sys.modules["superset.models.slice"].Slice, sys.modules["superset.models.dashboard"].Dashboard
+    with caplog.at_level("WARNING", logger=writes.__name__):
+        assert writes._guarded_look(models[0], STEP, kind="chart", held=held, row=(models[1], 12)) == {"busy": True}
+    ran = creating.superset.ran
+    assert [entry for entry in ran if entry[0] == "lock_row" or entry[1:2] == (CREATE_LOCK,)] == (
+        [second] if second else [])
+    if second is None:
+        assert "lookup" not in _kinds(creating.superset) and ("on", 1, "begin") not in ran
+        assert [record.getMessage() for record in caplog.records] == [
+            "mnemiq extension: a create takes no second lock on a oracle metadata database; answered busy"]
+    assert metadata.held_xact == []
 
 
 def test_a_contended_create_lock_answers_busy(creating):
@@ -1904,9 +2287,9 @@ def test_a_database_error_outside_a_command_is_answered_not_raised(creating, mon
     """A database error outside any command (taking the marker's lock, or the caller's checks before it) reaches the
     write tool's one boundary for database errors: the session is rolled back and the error answered, busy for a lost
     connection (the same request may be sent again), failed for another; never raised out of the tool, which mnemiq
-    would count as the tool failing. At the chart's last bound on its lock waits, inside the last look, any database
-    error answers busy, as a look's does (`test_a_last_look_that_cannot_run_answers_busy`). A retry once the database
-    answers again, with the chart an earlier send committed, answers that chart."""
+    would count as the tool failing. At the chart's last bound on its lock waits, inside the guarded look, any
+    database error answers busy, as a look's does (`test_a_guarded_look_that_cannot_run_answers_busy`). A retry once
+    the database answers again, with the chart an earlier send committed, answers that chart."""
     metadata, superset = creating.metadata, creating.superset
     error = stubs.database_error("08006", invalidated=True) if lost else stubs.database_error("42883")
     if where == "taking the lock":
@@ -1931,25 +2314,32 @@ def test_a_database_error_outside_a_command_is_answered_not_raised(creating, mon
     assert commands(superset) == []
 
 
-# Where a last look may fail: the n-th occurrence on the session of its bound, its create lock, or its lookup (the
+# Where a guarded look may fail: the n-th occurrence on the session of its bound, its create lock, or its lookup (the
 # first look's bound and lookup come first).
-LAST_LOOK = {"the bound": (LOCK_TIMEOUT, 2), "the create lock": (CREATE_LOCK, 1), "the lookup": ("lookup", 2)}
+GUARDED_LOOK = {"the bound": (LOCK_TIMEOUT, 2), "the create lock": (CREATE_LOCK, 1), "the lookup": ("lookup", 2)}
 
 
-@pytest.mark.parametrize("moment", list(LAST_LOOK))
+@pytest.mark.parametrize("moment", list(GUARDED_LOOK))
 @pytest.mark.parametrize("create", list(CREATES))
-def test_a_last_look_that_cannot_run_answers_busy(request, create, moment):
-    """The last look, like the first, answers busy for any database error, a failure neither contention nor a lost
-    connection among them (SQLSTATE 42883 here): whether another send made the object is not known, and a refusal
-    would stop the build though it may have. The rollback ends the transaction, releasing the create lock with nothing
-    made, and the marker's lock is let go. Sent again with the database answering, the create makes the object."""
+def test_a_guarded_look_that_cannot_run_answers_busy(request, caplog, create, moment):
+    """The guarded look, like the first look, answers busy for any database error, a failure neither contention nor a
+    lost connection among them (SQLSTATE 42883 here): whether another send made the object is not known, and a
+    refusal would stop the build though it may have. It says so in a warning carrying the error, in words true of
+    both its runs, before the command and in a settle. The rollback ends the transaction, releasing the create lock
+    with nothing made, and the marker's lock is let go. Sent again with the database answering, the create makes the
+    object."""
     stage = request.getfixturevalue("lock_rows" if create == "dataset" else "creating")
     superset = stage.superset
     metadata = superset.session = Metadata(superset, "postgresql")
     make, model, marker, key = CREATES[create]
-    statement, n = LAST_LOOK[moment]
-    metadata.fail_at[statement] = (n, stubs.database_error("42883"))
-    assert make() == {"busy": True}
+    statement, n = GUARDED_LOOK[moment]
+    error = stubs.database_error("42883")
+    metadata.fail_at[statement] = (n, error)
+    with caplog.at_level("WARNING", logger=writes.__name__):
+        assert make() == {"busy": True}
+    assert [(record.levelname, record.getMessage()) for record in caplog.records
+            if record.exc_info and record.exc_info[1] is error] == [
+        ("WARNING", "mnemiq extension: a create could not look for its object under its second lock; answered busy")]
     assert commands(superset, COMMANDS[create]) == [] and metadata.held_xact == []
     assert superset.ran[-4:] == [("rollback",), ("rollback",), *let_go("postgresql", marker)]
     made = make()
@@ -2172,25 +2562,283 @@ def _refusing(superset: SimpleNamespace, check: str) -> None:
         superset.chart_data = {"queries": [{"error": "the source database timed out", "status": "failed"}]}
 
 
-def _after(superset: SimpleNamespace, ran: str) -> list[str]:
-    """What ran after the check `ran` names."""
-    kinds = _kinds(superset)
-    return kinds[kinds.index(ran) + 1:]
+def _after(superset: SimpleNamespace, ran: str) -> list:
+    """What ran after the check `ran` names (its first run)."""
+    return superset.ran[_kinds(superset).index(ran) + 1:]
+
+
+def settled(create: str, n: int = 1, dialect: str = "postgresql") -> list:
+    """What `create` runs on `dialect` once a check of its own refused it, the marker's lock held on connection `n`:
+    the settle (the session rolled back, then the guarded look, `guarded`, which finds nothing and the lock held), the
+    request's transaction ended, and the lock let go."""
+    marker = CREATES[create][2]
+    return [("rollback",), *guarded(create, dialect, n), ("rollback",), *let_go(dialect, marker, n)]
 
 
 @pytest.mark.parametrize("check", CHECKS)
 def test_a_chart_its_own_check_refuses_is_answered_the_refusal_under_the_lock(creating, check):
-    """rc2's validation, mapping or query check refuses the chart under the marker's lock, where no other send of the
-    create can be making the chart, so the refusal is answered as it is: after nothing more of the chart's path (a
-    config the validation refuses is not mapped, nor its query run), the request's transaction ends and the lock is
-    let go. Nothing is made."""
+    """rc2's validation, mapping or query check refuses the chart under the marker's lock. The refusal is answered
+    once the settle finds no chart with the lock still held: after nothing more of the chart's path (a config the
+    validation refuses is not mapped, nor its query run), the session is rolled back and the guarded look runs (the
+    second lock, the look, the hold check); then the request's transaction ends and the lock is let go. Nothing is
+    made."""
     make, ran, refusal = CHECKS[check]
     _refusing(creating.superset, check)
     assert make() == refusal
     assert creating.superset.ran[:8] == [*taken("postgresql", STEP), *looked("postgresql", "Slice")]
-    assert creating.superset.ran[-3:] == [("rollback",), *let_go("postgresql", STEP)]
-    assert _after(creating.superset, ran) == ["rollback", "on", "close"]
+    assert _after(creating.superset, ran) == settled("funnel chart" if make is make_funnel else "config chart")
     assert commands(creating.superset) == []
+
+
+@pytest.mark.parametrize("check", ["compile", "query check"])
+def test_sqlite_runs_no_settle(creating, check):
+    """A SQLite metadata database takes no marker lock, so a create there has no guarded look and nothing to settle a
+    refusal under: a chart its own check refuses is answered the refusal with nothing run after the check but the
+    request's transaction ending, once."""
+    creating.on("sqlite")
+    make, ran, refusal = CHECKS[check]
+    _refusing(creating.superset, check)
+    assert make() == refusal
+    assert creating.superset.ran[0] == ("lookup", "Slice")
+    assert _after(creating.superset, ran) == [("rollback",)]
+
+
+def _when_checked(monkeypatch, check: str, meanwhile: Callable[[], None]) -> None:
+    """`meanwhile()` runs each time `check` (one of `CHECKS`) runs, just before the check itself: rc2's validation, its
+    mapping, `_compile_chart`, or a funnel's query."""
+    if check == "validation":
+        pipeline = sys.modules["superset.mcp_service.chart.validation"].ValidationPipeline
+        validating = pipeline.validate_request_with_warnings
+        monkeypatch.setattr(pipeline, "validate_request_with_warnings",
+                            staticmethod(lambda request: (meanwhile(), validating(request))[1]))
+    elif check == "query check":
+        command = sys.modules["superset.commands.chart.data.get_data_command"].ChartDataCommand
+        running = command.run
+        monkeypatch.setattr(command, "run", lambda self: (meanwhile(), running(self))[1])
+    else:
+        module, name = {"mapping": ("superset.mcp_service.chart.chart_utils", "map_config_to_form_data"),
+                        "compile": ("superset.mcp_service.chart.compile", "_compile_chart")}[check]
+        checking = getattr(sys.modules[module], name)
+        monkeypatch.setattr(sys.modules[module], name,
+                            lambda *args, **kwargs: (meanwhile(), checking(*args, **kwargs))[1])
+
+
+def _sender(make: Callable[[], dict], answers: dict, errors: list) -> Callable[[str], None]:
+    """A send of `make`, by name: its answer goes to `answers[name]`, anything it raises to `errors`."""
+
+    def send(name: str) -> None:
+        try:
+            answers[name] = make()
+        except BaseException as exc:  # noqa: BLE001 (reported by the test)
+            errors.append(exc)
+
+    return send
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+def test_a_retrys_refusal_answers_the_chart_a_first_send_made_meanwhile(creating, dialect):
+    """A first send of a chart passes its guarded look: it holds the second lock (on MySQL the dashboard's row), has
+    found nothing and has found its marker's lock held. Then that lock's connection ends, and a retry of the same
+    create, sent meanwhile, takes the marker's lock and finds nothing yet; the retry's own query check refuses the
+    chart, as a check against a slow source may. Before it answers that refusal the retry settles it: it waits for the
+    second lock, which the first holds until its command commits, then looks again and finds the first's chart. Both
+    sends answer the one chart, and the build never records a refusal for a chart Superset holds. Afterwards every
+    lock is free, whichever send took it."""
+    metadata, superset = creating.on(dialect), creating.superset
+    answers: dict[str, dict] = {}
+    errors: list[BaseException] = []
+    send = _sender(make_from_config, answers, errors)
+    retry = threading.Thread(target=send, args=("retry",), name="retry", daemon=True)
+    waited: list[list[str]] = []  # who waited for the second lock while the first held it
+
+    def meanwhile() -> None:
+        metadata.drop_lock_connections()
+        superset.compiled = SimpleNamespace(success=False)
+        retry.start()
+        deadline = time.monotonic() + 5
+        while not metadata.waiting_xact and retry.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        waited.append(list(metadata.waiting_xact))
+
+    metadata.after_hold_check = meanwhile
+    try:
+        send("first")
+    finally:
+        if retry.ident is not None:
+            retry.join(10)
+    assert not errors, errors
+    assert waited == [["retry"]], ("the retry never waited for the second lock", waited, answers)
+    assert set(answers.get("first", {})) == {"chart_id"}, answers
+    assert answers.get("retry") == answers["first"], answers
+    assert _kinds(superset).count("compile") == 2
+    assert len(superset.rows["Slice"]) == 1 and len(commands(superset, "CreateChartCommand")) == 1
+    assert metadata.waiting_xact == [] and _all_let_go(metadata)
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+def test_a_first_send_whose_lock_was_lost_while_a_retry_refused_makes_nothing(creating, monkeypatch, dialect):
+    """The interleaving the settle and the hold check close together. A first send's marker lock's connection ends
+    while its query check runs. A retry takes the marker's lock, finds nothing, and its own check refuses the chart;
+    it settles the refusal, finding nothing with its lock still held, and answers the refusal, which the build
+    records. Then the first send's check passes: at its guarded look it finds nothing and finds its lock lost, so it
+    answers busy and makes nothing. No chart stands behind the refusal the build recorded, and afterwards every lock
+    is free, whichever send took it."""
+    metadata, superset = creating.on(dialect), creating.superset
+    answers: dict[str, dict] = {}
+    errors: list[BaseException] = []
+    send = _sender(make_from_config, answers, errors)
+    retry = threading.Thread(target=send, args=("retry",), name="retry", daemon=True)
+
+    def meanwhile() -> None:
+        if retry.ident is not None:
+            return  # the retry's own check, which refuses
+        metadata.drop_lock_connections()
+        superset.compiled = SimpleNamespace(success=False)
+        retry.start()
+        retry.join(10)
+        superset.compiled = SimpleNamespace(success=True)
+
+    _when_checked(monkeypatch, "compile", meanwhile)
+    send("first")
+    assert not errors, errors
+    assert answers == {"retry": {"refused": "query_failed"}, "first": {"busy": True}}, answers
+    assert superset.rows["Slice"] == [] and commands(superset) == []
+    ran = superset.ran
+    retry_ran = ran[ran.index(("connect", 2)):ran.index(("close", 2)) + 1]
+    assert retry_ran == [*taken(dialect, STEP, 2), *looked(dialect, "Slice"), ("validate", ANY),
+                         ("map", CONFIG, 7), ("compile", ANY, 7), *settled("config chart", 2, dialect)]
+    assert metadata.held_xact == [] and metadata.waiting_xact == [] and _all_let_go(metadata)
+
+
+@pytest.mark.parametrize("check", CHECKS)
+def test_a_refusal_after_its_own_lock_was_lost_answers_busy(creating, monkeypatch, check):
+    """A chart's own check refuses it after the marker lock's connection ended while the check ran, with no other send
+    of the create. Another send may have taken the lock meanwhile and be making the chart, so the refusal is not
+    answered: the settle finds nothing and finds the lock lost, and the create answers busy, having made nothing. The
+    same request may be sent again."""
+    make, _, _ = CHECKS[check]
+    _refusing(creating.superset, check)
+    _when_checked(monkeypatch, check, creating.metadata.drop_lock_connections)
+    assert make() == {"busy": True}
+    assert creating.superset.rows["Slice"] == [] and commands(creating.superset) == []
+    assert creating.metadata.held_xact == [] and creating.metadata.leaked == []
+
+
+# What the settle logs when what a create raised is replaced by what the settle found, for each kind of object.
+SETTLED = "mnemiq extension: a {} create's error was settled: answered what its settle found"
+
+
+@pytest.mark.parametrize("made_meanwhile", [pytest.param(True, id="another send made the chart meanwhile"),
+                                            pytest.param(False, id="nothing made, the lock held")])
+def test_a_database_error_in_a_creates_checks_is_settled_before_it_is_answered(creating, monkeypatch, caplog,
+                                                                              made_meanwhile):
+    """A database error raised out of a chart's own checks (here the config's mapping, SQLSTATE XX000, which aborts the
+    session's transaction) is settled as a refusal is: the session is rolled back, which ends the aborted transaction,
+    and the guarded look runs. When another send committed the step's chart meanwhile (this send's lock lost), that
+    chart is answered, and the error it replaces is logged as a warning, with the error on the record. Else, nothing
+    found and the lock held, the error goes on to the write tool's boundary for database errors and is answered
+    `{"failed": true}`, as before, and logged there."""
+    metadata, superset = creating.metadata, creating.superset
+    error = superset.mapped = stubs.database_error("XX000")
+
+    def aborting() -> None:
+        metadata.aborted = True
+        if made_meanwhile:
+            metadata.drop_lock_connections()
+            superset.rows["Slice"].append(_row(9, STEP))
+
+    _when_checked(monkeypatch, "mapping", aborting)
+    with caplog.at_level("WARNING", logger=writes.__name__):
+        if made_meanwhile:
+            assert make_from_config() == {"chart_id": 9}
+        else:
+            assert make_from_config() == {"failed": True}
+            assert _after(superset, "map") == [*settled("config chart"), ("rollback",)]
+    carrying = [(record.levelname, record.getMessage()) for record in caplog.records
+                if record.exc_info and record.exc_info[1] is error]
+    if made_meanwhile:
+        assert carrying == [("WARNING", SETTLED.format("chart"))], caplog.records
+    else:
+        assert carrying == [("WARNING", "mnemiq extension: create_chart failed")], caplog.records
+    assert commands(superset) == [] and metadata.leaked == []
+
+
+def test_a_commands_own_refusal_is_answered_after_the_settle(lock_rows):
+    """A dataset whose command refuses it (a dataset not made for this marker already holds the table), its marker's
+    lock held throughout, answers `{"exists": true}`, but only once the settle has run after the command's rollback:
+    the second lock, the look and the hold check, as for any answer but the object or busy."""
+    superset = lock_rows.superset
+    superset.session = Metadata(superset, "postgresql")
+    superset.create = stubs.DatasetInvalidError({"DatasetExistsValidationError"})
+    assert make_dataset() == {"exists": True}
+    assert _after(superset, "CreateDatasetCommand") == [("raise_for_access", "builder", ANY), ("rollback",),
+                                                        *settled("dataset")]
+    assert commands(superset, "UpdateDatasetCommand") == []
+
+
+def test_a_dataset_the_settle_finds_gets_its_editors_set(lock_rows):
+    """The settle runs before a dataset's editors step. A dataset create passes its guarded look, and then its marker
+    lock's connection ends; its command refuses the dataset, and once that command has rolled back (letting the second
+    lock go), another send of the create, holding the lost lock, commits the dataset over the same table. The first
+    send's settle finds that dataset and answers it, with its editors set as for any dataset found by its marker."""
+    superset, dataset, ids = lock_rows.superset, lock_rows.dataset, lock_rows.ids
+    metadata = superset.session = Metadata(superset, "postgresql")
+    superset.create = stubs.DatasetInvalidError({"DatasetExistsValidationError"})
+    dataset.deleted_at, dataset.description = None, DATA
+
+    def lost_after_the_hold_check() -> None:
+        metadata.drop_lock_connections()
+        metadata.before_create_lock = lambda: superset.rows["SqlaTable"].append(dataset)
+
+    metadata.after_hold_check = lost_after_the_hold_check
+    assert make_dataset() == {"dataset_id": 4}
+    assert _sent_editors(superset, "UpdateDatasetCommand") == [
+        ids["creator"], ids["builder"], 302, ids["reader"], ids["database_reader"]]
+    assert _kinds(superset).index("CreateDatasetCommand") < _kinds(superset).index("UpdateDatasetCommand")
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+def test_a_raised_twin_refusal_answers_the_dataset_a_settle_finds(lock_rows, caplog, dialect):
+    """rc2's dataset command refuses a table a dataset in the trash holds by raising
+    (`DatasetSoftDeletedTwinExistsError`), which the tool answers by the caller's access once the marker's lock is let
+    go (`_twin_answer`). The settle covers whatever a create raises, this refusal among it. A dataset create passes its
+    guarded look, and then its marker lock's connection ends; its command raises the refusal, and once that command
+    has rolled back (letting the second lock go), another send of the create, holding the lost lock, commits the
+    step's dataset. The first send's settle finds that dataset and answers it, with its editors set; the refusal it
+    replaces is logged as a warning carrying it, and the caller's access to the table is never asked."""
+    superset, dataset, ids = lock_rows.superset, lock_rows.dataset, lock_rows.ids
+    metadata = superset.session = Metadata(superset, dialect)
+    superset.twin = True
+    dataset.deleted_at, dataset.description = None, DATA
+
+    def lost_after_the_hold_check() -> None:
+        metadata.drop_lock_connections()
+        metadata.before_create_lock = lambda: superset.rows["SqlaTable"].append(dataset)
+
+    metadata.after_hold_check = lost_after_the_hold_check
+    with caplog.at_level("WARNING", logger=writes.__name__):
+        assert make_dataset() == {"dataset_id": 4}
+    assert _asked_for_access(superset) == []
+    assert _sent_editors(superset, "UpdateDatasetCommand") == [
+        ids["creator"], ids["builder"], 302, ids["reader"], ids["database_reader"]]
+    assert [(record.levelname, record.getMessage()) for record in caplog.records if record.exc_info
+            and type(record.exc_info[1]).__name__ == "DatasetSoftDeletedTwinExistsError"] == [
+        ("WARNING", SETTLED.format("dataset"))]
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+def test_a_raised_twin_refusal_the_settle_keeps_is_answered_by_the_callers_access(lock_rows, dialect):
+    """The control: the same refusal, the marker's lock held throughout and no dataset made meanwhile. The settle runs
+    after the command's rollback (the second lock, the look, the hold check) and finds nothing, so the refusal goes on:
+    once the marker's lock is let go it is answered by the caller's access to the table, `{"exists": true}` for a
+    caller whose grants reach it, as without the settle. Nothing more is written."""
+    superset = lock_rows.superset
+    superset.session = Metadata(superset, dialect)
+    superset.twin = True
+    assert make_dataset() == {"exists": True}
+    assert _after(superset, "CreateDatasetCommand") == [("rollback",), *settled("dataset", dialect=dialect),
+                                                        ("raise_for_access", "builder", ANY)]
+    assert commands(superset, "UpdateDatasetCommand") == []
 
 
 @pytest.mark.parametrize("kind", ["config chart", "funnel chart", "physical dataset"])
@@ -2224,11 +2872,17 @@ DATA = format_marker(BUILD, "data_1", 3)
 @pytest.fixture
 def making(claiming):
     """`claiming`'s dashboard (3) and people, and datasets the create commands add: a row the editors step locks is
-    the one made, found by id."""
+    the one made, found by id; any other row lock (a create's second lock on MySQL) is the metadata database's
+    (`Metadata.lock_row`)."""
     superset = claiming.superset
     superset.dataset_database = SimpleNamespace(perm=DATABASE_PERM, get_default_catalog=lambda: "warehouse")
     rows = superset.rows["SqlaTable"]
-    stubs_lock = lambda model, entity_id: next((row for row in rows if row.id == entity_id), None)  # noqa: E731
+
+    def stubs_lock(model: type, entity_id: int) -> Any:
+        if model.__name__ != "SqlaTable":
+            return superset.session.lock_row(model, entity_id)
+        return next((row for row in rows if row.id == entity_id), None)
+
     claiming.monkeypatch_lock = stubs_lock
     return claiming
 
@@ -2553,7 +3207,7 @@ def test_a_histogram_whose_check_fails_is_refused_and_nothing_is_made(creating):
     assert make_from_config() == {"refused": "query_failed"}
     ran = creating.superset.ran
     assert ran[:8] == [*taken("postgresql", STEP), *looked("postgresql", "Slice")]
-    assert _after(creating.superset, "chart_data") == ["rollback", "on", "close"]
+    assert _after(creating.superset, "chart_data") == settled("config chart")
     assert commands(creating.superset) == []
 
 

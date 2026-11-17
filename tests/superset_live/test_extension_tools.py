@@ -401,6 +401,16 @@ def _waiting_on_advisory_locks() -> int:
                     "AND wait_event_type = 'Lock' AND wait_event = 'advisory' AND pid <> pg_backend_pid()")[0][0]
 
 
+def _marker_lock_holders(marker: str) -> list[int]:
+    """The pid of each metadata database session granted an advisory lock on the key a create carrying `marker` takes
+    its lock on (`hashtextextended(marker, 0)`), from `pg_locks`, which lists a bigint key as its high 32 bits
+    (`classid`) and its low 32 bits (`objid`), with `objsubid` 1."""
+    return [row[0] for row in metadata(
+        "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted AND objsubid = 1 "
+        "AND classid = ((hashtextextended(%s, 0) >> 32) & 4294967295)::oid "
+        "AND objid = (hashtextextended(%s, 0) & 4294967295)::oid ORDER BY pid", (marker, marker))]
+
+
 def race(table: str, row_id: int, writers: list[Callable[[], dict]]) -> list[dict]:
     """Each writer's answer, the writers started together while the test holds the row's lock, and the lock let go
     only once every writer waits for it. So the writers run one after another, each after the lock it waited for,
@@ -1209,6 +1219,94 @@ def test_a_create_behind_a_held_marker_lock_answers_busy(live, extension, policy
     after = made.chart(call(client, "create_chart", **request))
     assert set(after) == {"chart_id"}, after
     assert carrying("slices", marker) == [(after["chart_id"], None)]
+    assert metadata(named, (chart.title,)) == [(1,)]
+
+
+def _source_reads_waiting_on(live, table: str) -> int:
+    """How many other sessions of the source database wait for a lock while running a query that names `table`."""
+    import psycopg
+
+    with psycopg.connect(live.pg_dsn, connect_timeout=10) as con:
+        return con.execute("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                           "AND wait_event_type = 'Lock' AND query LIKE %s AND pid <> pg_backend_pid()",
+                           (f"%{table}%",)).fetchone()[0]
+
+
+def test_a_create_whose_lock_connection_ends_mid_check_makes_nothing(live, extension, made):
+    """A pie by status on a virtual dataset of the build's over a table of the test's own. The test holds that table
+    locked (`ACCESS EXCLUSIVE`, from a connection of its own) while the create runs, so the chart's query check waits
+    for it, and the create holds its marker's lock, idle on a connection of its own, through that wait. With the check
+    waiting, the test finds the marker lock's database session in `pg_locks` by the marker's key and ends it
+    (`pg_terminate_backend`, which waits for the session to exit), as an idle timeout shorter than a chart's query
+    check would, so the lock goes with it; only once the session has ended does it let the table go. Reaching its
+    command, the create finds no chart and finds its lock no longer held: it answers exactly `{busy: true}`, and no
+    chart carries the marker or the chart's name. The same request sent again makes the chart: `{chart_id}`, the one
+    chart carrying the marker. Every other create in this suite passes the same hold check, so a hold check that
+    misread `pg_locks` would answer busy there.
+
+    (A source that sleeps cannot hold the check: Superset 7.0.0rc2 refuses `pg_sleep` in a chart's query, as one of
+    its `DISALLOWED_SQL_FUNCTIONS`.)"""
+    import psycopg
+    from psycopg import sql
+
+    client = as_user(live, BUILDER)
+    build = made.build(client, "lost lock")
+    table = f"live_held_{uuid.uuid4().hex[:8]}"
+    made.tables.append(table)
+    with psycopg.connect(live.pg_dsn, autocommit=True, connect_timeout=10) as con:
+        con.execute(sql.SQL("CREATE TABLE {} AS {}").format(sql.Identifier("public", table), sql.SQL(POLICY_COLUMNS)))
+    data = made.dataset(call(client, "create_dataset", database_id=live.database_id, schema="public",
+                             table_name=f"mnemiq_live_{uuid.uuid4().hex[:10]}",
+                             sql=f"SELECT id, region, status, premium, issued FROM public.{table}",
+                             description=f"Made by mnemiq for dashboard {build.dashboard_id}.",
+                             dashboard_id=build.dashboard_id, marker=build.marker("held_data")), build.dashboard_id)
+    assert set(data) == {"dataset_id"}, data
+    chart = spec(Family.PIE, data["dataset_id"], dimensions=("status",))
+    marker = build.marker("by_status")
+    request = config_request(build, chart, marker)
+    named = "SELECT count(*) FROM slices WHERE slice_name = %s"
+    answers: list = []
+    errors: list[BaseException] = []
+
+    def send() -> None:
+        try:
+            answers.append(made.chart(call(as_user(live, BUILDER), "create_chart", **request)))
+        except BaseException as exc:  # noqa: BLE001 (reported below)
+            errors.append(exc)
+
+    first = threading.Thread(target=send)
+    held = psycopg.connect(live.pg_dsn, connect_timeout=10)
+    try:
+        held.execute(sql.SQL("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE").format(sql.Identifier("public", table)))
+        started = time.monotonic()
+        first.start()
+        while not ((holders := _marker_lock_holders(marker)) and _source_reads_waiting_on(live, table)):
+            assert time.monotonic() - started < LOCK_TIMEOUT_S, ("the create never held its lock through its check",
+                                                                 holders)
+            assert first.is_alive(), ("the create answered before its check waited", answers, errors)
+            time.sleep(0.05)
+        waiting_after = time.monotonic() - started
+        (holder,) = holders
+        # With a timeout, Postgres waits up to 5 seconds for the session to exit and answers whether it did: the lock
+        # has gone with it before the check can run on.
+        terminated = metadata("SELECT pg_terminate_backend(%s, 5000)", (holder,))
+        assert terminated == [(True,)], terminated
+    finally:
+        held.rollback()
+        held.close()
+        if first.ident is not None:
+            first.join(90)
+    answered_after = time.monotonic() - started
+    after_first = (carrying("slices", marker), metadata(named, (chart.title,)))
+    observe("lock_lost_mid_check", answers=answers, check_waiting_after_s=round(waiting_after, 2),
+            terminated=terminated, answered_after_s=round(answered_after, 2), chart_rows=after_first)
+    assert not errors, errors
+    assert answers == [{"busy": True}], answers
+    assert after_first == ([], [(0,)])
+    again = made.chart(call(client, "create_chart", **request))
+    observe("lock_lost_mid_check_sent_again", answer=again)
+    assert set(again) == {"chart_id"}, again
+    assert carrying("slices", marker) == [(again["chart_id"], None)]
     assert metadata(named, (chart.title,)) == [(1,)]
 
 
