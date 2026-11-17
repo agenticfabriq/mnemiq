@@ -17,6 +17,7 @@ import sqlite3
 import duckdb
 import pytest
 
+from mnemiq.sql.date_units import _unit_call
 from mnemiq.sql.decide import decide
 from mnemiq.sql.verdict import Approved, RefusalCode
 
@@ -96,6 +97,32 @@ def test_a_missing_column_that_is_no_date_part_keeps_its_message():
 def test_a_date_part_name_used_as_data_keeps_its_message(sql):
     v = _decide(sql, repair_hints=True)
     assert v.message == "No table in this query has a column 'hour'. Use only the columns listed on the schema cards."
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT hour, 'TIMESTAMPDIFF(hour, s, e)' FROM orders",          # inside a string literal
+    "SELECT hour FROM orders -- TIMESTAMPDIFF(hour, s, e)",          # inside a line comment
+    "SELECT hour FROM orders /* TIMESTAMPDIFF(hour, s, e) */",       # inside a block comment
+    "SELECT x.TIMESTAMPDIFF(hour, s, e) FROM orders",                # a qualified name, not the date function
+    "SELECT MY_TIMESTAMPDIFF(hour, s, e) FROM orders",               # a name that only ends like one
+])
+def test_text_that_is_not_a_call_of_the_date_function_names_no_unit(sql):
+    """Codex's review of this fix: a raw-text match fired inside literals and comments. Read as tokens, it cannot.
+    Each is refused exactly as with the setting off (a qualified call by another check altogether)."""
+    v = _decide(sql, repair_hints=True)
+    assert v.message == _decide(sql).message and "is not a column here" not in v.message
+
+
+def test_a_qualified_call_names_no_unit_even_where_a_refusal_would_reach_it():
+    """The qualified call above is refused by another check before this one is asked, so the rule is tested here too."""
+    assert _unit_call("SELECT x.TIMESTAMPDIFF(hour, s, e) FROM orders", "hour", "duckdb") is None
+    assert _unit_call("SELECT TIMESTAMPDIFF(hour, s, e) FROM orders", "hour", "duckdb") == "TIMESTAMPDIFF"
+    assert _unit_call("SELECT TIMESTAMPDIFF(hour, s, e", "hour", "no-such-dialect") is None
+
+
+def test_a_quoted_unit_is_a_column_the_writer_meant():
+    v = _decide('SELECT TIMESTAMPDIFF("HOUR", s, e) FROM orders', repair_hints=True)
+    assert not v.message.startswith("'HOUR' is not a column here"), v.message
 
 
 def test_another_refusal_is_left_as_it_is():
