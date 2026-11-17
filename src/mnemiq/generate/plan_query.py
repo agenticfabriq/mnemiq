@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import logging
 
+import re
 from dataclasses import dataclass, replace
+
+import sqlglot
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import DeferralReason, Snapshot
@@ -48,6 +51,24 @@ class Feedback:
 
     text: str
     from_source: bool
+
+
+# The feedback for a statement sent again unchanged and refused the same way (`repair_hints`): measured on a local
+# model, one told "no column 'HOUR'" sent the identical statement three times, told the same sentence each time.
+_REPEATED = ("You sent this same query before, and it is refused again for the same reason: {reason} Sent unchanged "
+             "it cannot pass; change what that reason names.")
+
+
+def same_query(a: str, b: str, dialect: str) -> bool:
+    """Whether two statements are one: equal sqlglot trees read in the writer's dialect, so spacing, keyword case and a
+    trailing semicolon do not count and a changed literal does; equal text, spacing collapsed and one trailing
+    semicolon dropped, when either does not parse."""
+    try:
+        return sqlglot.parse_one(a, read=dialect) == sqlglot.parse_one(b, read=dialect)
+    except Exception:  # noqa: BLE001 -- a statement sqlglot cannot read is compared as text
+        def text(s: str) -> str:
+            return re.sub(r"\s+", " ", s).strip().removesuffix(";").strip()
+        return text(a) == text(b)
 
 
 # What a caller is told when the decider refuses in a way no rewrite can fix: the deferral code,
@@ -170,6 +191,10 @@ def plan_query(
     # pattern to match and so no false-positive rate to measure, and it stays correct when a
     # source starts phrasing its errors differently or a DSN turns up in a shape nobody listed.
     carries_source_words = feedback.from_source if feedback else False
+    # Each statement this call refused, with its refusal, so one sent again unchanged and refused the same way is told
+    # so (`repair_hints`). Only the words fed back change: the statement is decided every time, since a refusal resting
+    # on a source call can change between attempts.
+    refused: list[tuple[str, Refusal]] = []
     # Whether the source reads a date parse (Oracle's TO_DATE) in the Gregorian calendar: only an
     # adapter that pins its sessions to it says so, and anything else reads as no.
     gregorian_calendar = getattr(adapter, "gregorian_calendar", False) is True
@@ -323,7 +348,12 @@ def plan_query(
 
         last = verdict
         carries_source_words = verdict.source_detail is not None
-        feedback = Feedback(verdict.repair_text, from_source=carries_source_words)
+        repeated = repair_hints and any(
+            same_query(sql, proposal.sql, dialect) and before.code is verdict.code and before.message == verdict.message
+            for sql, before in refused)
+        refused.append((proposal.sql, verdict))
+        feedback = Feedback(_REPEATED.format(reason=verdict.repair_text) if repeated else verdict.repair_text,
+                            from_source=carries_source_words)
 
     if last is not None and last.code not in REPAIRABLE:
         # Retried only because the INSTANCE said to -- a source whose catalogue call raised is
