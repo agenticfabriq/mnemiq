@@ -151,3 +151,18 @@ def test_plan_query_names_only_what_the_callers_grants_allow():
     off = FakeGenerator(list(replies))
     plan_query(packet, snapshot, grants, off, dialect="duckdb", target="duckdb", values=index)
     assert "It does appear" not in off.calls[1]
+
+
+def test_a_computed_column_reported_in_another_case_is_still_dropped():
+    """Codex's review: Oracle's catalogue reports virtual columns lower case (`lower(table_name)`), while the snapshot and
+    the index keep its upper-case names, so an exact match let ('ORDERS', 'REGION') through a set holding
+    ('orders', 'region'). Folded, a computed column is dropped whatever case each side spells it in."""
+    from mnemiq.sql.decide import decide
+
+    index = _Index({("ORDERS", "STATUS"): {"open"}, ("ORDERS", "REGION"): {"west"}, ("ORDERS", "LANE"): {"west"}})
+    verdict = decide("SELECT ID FROM ORDERS WHERE STATUS = 'west'", {"ORDERS": {"ID", "STATUS", "REGION", "LANE"}},
+                     adapter=_Source([("orders", "region", '"APPUSER"."MY_FN"("STATUS")')]), dialect="duckdb",
+                     target="duckdb", values=index, repair_hints=True,
+                     locatable=(("ORDERS", "LANE"), ("ORDERS", "REGION"), ("ORDERS", "STATUS")))
+    assert verdict.message.endswith(" It does appear in ORDERS.LANE: if that column is the one meant, filter on it "
+                                    "instead."), verdict.message

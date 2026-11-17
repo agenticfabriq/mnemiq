@@ -79,17 +79,20 @@ def _transpile_under_the_cap(shaped: exp.Expression, dialect: str, target: str) 
     return reread.sql(dialect=target, **UNSUPPORTED_RAISES)
 
 
-@bounded
 def _without_computed(locatable, computed_columns) -> tuple[tuple[str, str], ...] | None:
     """`locatable` less the columns the source computes on read. Only a set of them answers; None or Unanswered (the
-    catalogue could not say) leaves nothing to locate, never "nothing is computed" (`opaque_columns`)."""
+    catalogue could not say) leaves nothing to locate, never "nothing is computed" (`opaque_columns`). Compared case
+    folded: Oracle's catalogue reports them lower case where the snapshot keeps its upper-case names (Codex's review),
+    and dropping a case variant too only names fewer columns."""
     if locatable is None:
         return None
     if not isinstance(computed_columns, frozenset):
         return ()
-    return tuple(pair for pair in locatable if pair not in computed_columns)
+    computed = {(table.lower(), column.lower()) for table, column in computed_columns}
+    return tuple(pair for pair in locatable if (pair[0].lower(), pair[1].lower()) not in computed)
 
 
+@bounded
 def decide(
     sql: str,
     visible: dict[str, set[str]],
