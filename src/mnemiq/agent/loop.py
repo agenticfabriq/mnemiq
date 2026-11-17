@@ -270,6 +270,12 @@ class Agent:
         self.prose = prose
         self.empty_retries = empty_retries
         self.retry_answered_empties = retry_answered_empties
+        if repair_hints and candidates > 1:
+            # The vote path never repairs a candidate from a refusal, so the hints would run and change nothing,
+            # and a benchmark arm setting them would score as "no effect". `modes_for` refuses it too; this covers
+            # an agent built some other way (Codex's review).
+            raise ValueError(f"an agent with {candidates} candidates never repairs one from a refusal, so "
+                             "repair_hints would change nothing; leave it out")
         self.repair_hints = repair_hints
         # Defaults to the shipped limit, not to none: a construction site that forgets it still declines what no
         # stage would read alike (M147).
