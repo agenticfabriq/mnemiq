@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 
-import re
 from dataclasses import dataclass, replace
 
 import sqlglot
+from sqlglot.dialects.dialect import Dialect
+from sqlglot.tokens import TokenType
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import DeferralReason, Snapshot
@@ -61,14 +62,27 @@ _REPEATED = ("You sent this same query before, and it is refused again for the s
 
 def same_query(a: str, b: str, dialect: str) -> bool:
     """Whether two statements are one: equal sqlglot trees read in the writer's dialect, so spacing, keyword case and a
-    trailing semicolon do not count and a changed literal does; equal text, spacing collapsed and one trailing
-    semicolon dropped, when either does not parse."""
+    trailing semicolon do not count and a changed literal does. A statement that does not parse is compared token by
+    token, so the spacing between tokens is set aside and a literal's or a quoted name's own spacing is not (Codex's
+    review); one the tokenizer cannot read either is compared exactly."""
     try:
         return sqlglot.parse_one(a, read=dialect) == sqlglot.parse_one(b, read=dialect)
-    except Exception:  # noqa: BLE001 -- a statement sqlglot cannot read is compared as text
-        def text(s: str) -> str:
-            return re.sub(r"\s+", " ", s).strip().removesuffix(";").strip()
-        return text(a) == text(b)
+    except Exception:  # noqa: BLE001 -- a statement sqlglot cannot parse is compared as tokens
+        pass
+    try:
+        return _tokens(a, dialect) == _tokens(b, dialect)
+    except Exception:  # noqa: BLE001 -- nor tokenize: only the very same text is the same statement
+        return a == b
+
+
+def _tokens(sql: str, dialect: str) -> list[tuple[TokenType, str]]:
+    """`sql`'s tokens without one trailing semicolon: a literal's and a quoted name's text exactly, any other
+    token's case-folded, as an unquoted name or a keyword reads either way."""
+    tokens = [(t.token_type, t.text if t.token_type in (TokenType.STRING, TokenType.IDENTIFIER) else t.text.upper())
+              for t in Dialect.get_or_raise(dialect).tokenize(sql)]
+    if tokens and tokens[-1][0] is TokenType.SEMICOLON:
+        tokens.pop()
+    return tokens
 
 
 # What a caller is told when the decider refuses in a way no rewrite can fix: the deferral code,
@@ -280,11 +294,13 @@ def plan_query(
         )
 
         corrected = False
+        rewritten = False  # whether the corrector ran: then the refusal is about its statement
         if (
             isinstance(verdict, Refusal)
             and verdict.code in CORRECTABLE
             and corrector is not None
         ):
+            rewritten = True
             # one surgical pass: fix only the flagged problem, then re-decide (which re-runs
             # shape/access/lint/values/EXPLAIN, so a bad edit cannot slip through)
             verdict = decide(
@@ -348,10 +364,13 @@ def plan_query(
 
         last = verdict
         carries_source_words = verdict.source_detail is not None
-        repeated = repair_hints and any(
+        # Never across the corrector: its refusal is about the statement it wrote, which may differ each time while the
+        # writer's does not (Codex's review), and that path's feedback stays as it was.
+        repeated = repair_hints and not rewritten and any(
             same_query(sql, proposal.sql, dialect) and before.code is verdict.code and before.message == verdict.message
             for sql, before in refused)
-        refused.append((proposal.sql, verdict))
+        if not rewritten:
+            refused.append((proposal.sql, verdict))
         feedback = Feedback(_REPEATED.format(reason=verdict.repair_text) if repeated else verdict.repair_text,
                             from_source=carries_source_words)
 

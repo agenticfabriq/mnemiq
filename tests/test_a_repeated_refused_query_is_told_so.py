@@ -111,3 +111,39 @@ def test_a_repeat_keeps_the_source_words_marked_as_the_sources():
     assert isinstance(out, Deferred)
     for secret in ("payroll_salary", "hr_prod", "10.2.0.7", "postgresql://"):
         assert secret not in out.reason
+
+
+def test_a_changed_literal_or_quoted_name_in_unparseable_text_is_another_query():
+    """Codex's review: collapsing spacing over the raw text merged a literal's own spacing. Compared as tokens, only the
+    spacing between them is set aside."""
+    assert not same_query("SELECT 'a  b' FROM", "SELECT 'a b' FROM", "duckdb")
+    assert not same_query('SELECT "a  b" FROM', 'SELECT "a b" FROM', "duckdb")
+    assert same_query("SELECT 'a  b' FROM", "SELECT   'a  b'\nFROM ;", "duckdb")
+
+
+def test_text_the_tokenizer_cannot_read_is_compared_exactly():
+    assert same_query("SELECT 'abc FROM", "SELECT 'abc FROM", "duckdb")
+    assert not same_query("SELECT 'abc FROM", "SELECT  'abc FROM", "duckdb")
+
+
+def test_an_attempt_the_corrector_rewrote_is_never_called_a_repeat():
+    """Codex's review: after the corrector runs, the refusal is about the corrected statement, not the writer's. Two
+    identical proposals corrected two different ways and refused alike are not "sent unchanged", and the corrector
+    path's feedback stays as it was."""
+    from mnemiq.generate.correct import FakeCorrector
+
+    class _Index:
+        def has(self, table, column):
+            return (table, column) == ("orders", "status")
+
+        def contains(self, table, column, literal):
+            return literal in {"open", "closed"}
+
+        def nearest(self, table, column, literal, k=8):
+            return ["closed", "open"]
+
+    sql = "SELECT id FROM orders WHERE status = 'west'"
+    corrector = FakeCorrector([sql + " AND id > 0", sql + " AND id > 1", sql + " AND id > 2"])
+    out, gen = _plan([sql] * 3, repair_hints=True, corrector=corrector, values=_Index())
+    assert len(corrector.calls) == 3 and isinstance(out, Deferred)
+    assert not any((c or "").startswith(REPEAT) for c in gen.calls), gen.calls
