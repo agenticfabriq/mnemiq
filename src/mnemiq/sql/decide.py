@@ -36,6 +36,7 @@ from mnemiq.sql.reading import UNSUPPORTED_RAISES, as_duckdb_reads, kept, render
 from mnemiq.sql.rls import (apply_row_and_mask, as_written, check_filter_targets, unplaceable_policy,
                             with_filters_held)
 from mnemiq.sql.values_check import check_values, ground_values
+from mnemiq.sql.date_units import date_unit_refusal
 from mnemiq.sql.views import check_views
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode, Verdict
 
@@ -143,7 +144,9 @@ def decide(
     refusal = check_access(shaped, visible, target, columns=known_columns(visible, policy),
                            registry=registry)
     if refusal is not None:
-        return refusal
+        # The words only, never the verdict: a date part the writer wrote as another dialect's unit is named as one
+        # (`date_units`), where the plain refusal calls it a column no table has.
+        return (date_unit_refusal(sql, refusal, dialect) or refusal) if repair_hints else refusal
     # M65: what `check_access` reads -- `base_tables` -- is empty for a source it cannot model,
     # and an empty list passes. After it, so a source it already refuses keeps its refusal.
     unmodelled = check_unmodelled_source(shaped)
