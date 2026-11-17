@@ -35,16 +35,16 @@ from mnemiq.semantic.values import ValueIndex, build_value_index
 from mnemiq.store.bootstrap import init_store
 
 _IDENTITY = IdentityContext(tenant_id="t1", principal_id="u1", roles=["analyst"])
-_GRANTS = GrantSet(frozenset({"orders", "shipments", "returns", "returns_v", "LOTS"}),
+_GRANTS = GrantSet(frozenset({"orders", "shipments", "returns", "returns_v", "CARRIERS"}),
                    row_filters={"returns": "id > 0"}, pii_mask=frozenset({"direct"}))
-_CARDS = ("orders", "shipments", "returns", "returns_v", "LOTS")
+_CARDS = ("orders", "shipments", "returns", "returns_v", "CARRIERS")
 MISSING_SQL = "SELECT id FROM orders WHERE customer_ref = 'B-0017'"
 NOWHERE_SQL = "SELECT id FROM orders WHERE customer_ref = 'Z-0001'"
 FOUND_SQL = "SELECT id FROM orders WHERE batch_ref = 'B-0017'"
 TODAY = ("No rows matched, and 'B-0017' does not appear in orders.customer_ref, so I can't tell a true \"none\" from a "
          "misspelled value.")
 NAMED = ("No rows matched, and 'B-0017' does not appear in orders.customer_ref, though it does appear in "
-         "orders.batch_ref, shipments.batch_ref and LOTS.batch_ref, so I can't tell a true \"none\" from a misspelled "
+         "orders.batch_ref, shipments.batch_ref and CARRIERS.batch_ref, so I can't tell a true \"none\" from a misspelled "
          "value.")
 
 
@@ -65,8 +65,8 @@ def world(tmp_path, monkeypatch):
     for table in ("shipments", "returns", "ledger"):
         con.execute(f"CREATE TABLE {table} (id INTEGER, batch_ref VARCHAR)")
         con.executemany(f"INSERT INTO {table} VALUES (?, ?)", [(i, f"B-{i:04d}") for i in n])
-    con.execute('CREATE TABLE "LOTS" (id INTEGER, batch_ref VARCHAR)')
-    con.executemany('INSERT INTO "LOTS" VALUES (?, ?)', [(i, f"B-{i:04d}") for i in n])
+    con.execute('CREATE TABLE "CARRIERS" (id INTEGER, batch_ref VARCHAR)')
+    con.executemany('INSERT INTO "CARRIERS" VALUES (?, ?)', [(i, f"B-{i:04d}") for i in n])
     con.execute("CREATE VIEW returns_v AS SELECT id, batch_ref FROM returns")
     con.close()
     adapter = DuckDBAdapter.duckdb(path)
@@ -248,12 +248,12 @@ def test_a_probe_the_decider_refuses_never_runs(world, monkeypatch):
 
 
 def test_the_probe_decide_folds_names_as_the_source_does(world):
-    """An upper-case stored name, `LOTS`, decided under the source's own target: approved and probed."""
+    """An upper-case stored name, `CARRIERS`, decided under the source's own target: approved and probed."""
     adapter, snap, values = world
     recording = _Recording(adapter)
     ans, _ = _ask(recording, snap, values, [MISSING_SQL], repair_hints=True)
-    assert any('FROM "LOTS" WHERE "batch_ref"' in s for s in recording.located())
-    assert "LOTS.batch_ref" in ans.answer
+    assert any('FROM "CARRIERS" WHERE "batch_ref"' in s for s in recording.located())
+    assert "CARRIERS.batch_ref" in ans.answer
 
 
 def test_a_catalogue_that_cannot_say_which_columns_are_computed_stops_locating(world):

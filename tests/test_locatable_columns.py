@@ -166,3 +166,31 @@ def test_a_computed_column_reported_in_another_case_is_still_dropped():
                      locatable=(("ORDERS", "LANE"), ("ORDERS", "REGION"), ("ORDERS", "STATUS")))
     assert verdict.message.endswith(" It does appear in ORDERS.LANE: if that column is the one meant, filter on it "
                                     "instead."), verdict.message
+
+
+def test_a_bound_tables_computed_column_is_never_named_before_the_run():
+    """Codex's whole-branch review: the catalogue names a computed column by the source's table, the allow-list by the
+    snapshot's, so a bound table's computed column passed the subtraction. `plan_query` now leaves out every column the
+    source reports computed, under either name, as the empty-result lookup does."""
+    import json
+
+    from mnemiq.contract.semantic import SourceBinding
+    from mnemiq.generate.generator import FakeGenerator
+    from mnemiq.generate.plan_query import plan_query
+    from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
+
+    snapshot = Snapshot(version="v1", source_id="src", created_at="2026-11-17T00:00:00Z",
+                        columns=[_col("logical", "id", "INTEGER"), _col("logical", "status"), _col("logical", "region"),
+                                 _col("logical", "lane")],
+                        source_bindings=[SourceBinding(id="b1", source_id="src", object_id="logical",
+                                                       source_object="physical", binding_type="table")])
+    index = _Index({("logical", "status"): {"open"}, ("logical", "region"): {"west"}, ("logical", "lane"): {"west"}})
+    packet = ContextPacket(question="q", cards=[RetrievedCard(object_id="logical", card="TABLE logical", score=1.0)],
+                           grant_fingerprint="fp", enrichment_version="v1")
+    gen = FakeGenerator([json.dumps({"sql": "SELECT id FROM logical WHERE status = 'west'"}),
+                         json.dumps({"sql": "SELECT id FROM logical WHERE lane = 'west'"})])
+    plan_query(packet, snapshot, GrantSet(frozenset({"logical"})), gen,
+               adapter=_Source([("physical", "region", '"APPUSER"."MY_FN"("ID")')]), dialect="duckdb",
+               target="duckdb", values=index, repair_hints=True)
+    assert gen.calls[1].endswith(" It does appear in logical.lane: if that column is the one meant, filter on it "
+                                 "instead."), gen.calls[1]

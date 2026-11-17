@@ -15,7 +15,7 @@ from mnemiq.generate.generator import Generator
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.decide import decide
 from mnemiq.sql.fanout_check import guard_on, key_facts
-from mnemiq.sql.locatable import locatable_columns
+from mnemiq.sql.locatable import locatable_columns, without_computed
 from mnemiq.sql.views import inventory_for
 from mnemiq.sql.policy import build_access_policy
 from mnemiq.sql.schema import column_types, visible_schema
@@ -59,6 +59,18 @@ class Feedback:
 # model, one told "no column 'HOUR'" sent the identical statement three times, told the same sentence each time.
 _REPEATED = ("You sent this same query before, and it is refused again for the same reason: {reason} Sent unchanged "
              "it cannot pass; change what that reason names.")
+
+
+def _locatable_factory(snapshot, visible, policy, views, adapter):
+    """`locatable_columns` less the source's computed columns, as a factory that builds them on its first call only."""
+    built: list = []
+
+    def build() -> tuple[tuple[str, str], ...]:
+        if not built:
+            built.append(without_computed(locatable_columns(snapshot, visible, policy, views), adapter, snapshot))
+        return built[0]
+
+    return build
 
 
 def same_query(a: str, b: str, dialect: str) -> bool:
@@ -153,8 +165,9 @@ def plan_query(
     # from the snapshot rather than from the source at ask time: it is versioned content, and
     # a body that drifted from the one the policy was reasoned about is a governance change.
     views = inventory_for(snapshot)
-    # `repair_hints`: the columns a hint may name, from this caller's grants. None when off, so nothing is built.
-    locatable = locatable_columns(snapshot, visible, policy, views) if repair_hints else None
+    # `repair_hints`: the columns a hint may name, from this caller's grants, less every column the source computes on
+    # read. A factory, built once and only when a value is refused (the final review); None when off.
+    locatable = _locatable_factory(snapshot, visible, policy, views, adapter) if repair_hints else None
     # M109: key uniqueness from the profile, read once per question. None leaves the check off;
     # a `guard_fanout` of None is auto, resolved against this snapshot (`guard_on`).
     keys = key_facts(snapshot) if guard_on(guard_fanout, snapshot) else None

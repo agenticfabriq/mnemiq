@@ -56,15 +56,22 @@ def _unit_call(sql: str, name: str, dialect: str | None) -> str | None:
         tokens = Dialect.get_or_raise(dialect).tokenize(sql)
     except Exception:  # noqa: BLE001 -- an unreadable statement names no unit; the refusal stands as it is
         return None
-    for i in range(len(tokens) - 3):
-        func, paren, word, comma = tokens[i:i + 4]
-        if (func.token_type is TokenType.VAR and func.text.upper() in UNIT_FUNCTIONS
-                and (i == 0 or tokens[i - 1].token_type is not TokenType.DOT)
+    # Every place the bare word is written must be a unit position, or the refusal may be about the other place: the
+    # projection's `hour` in `SELECT hour, TIMESTAMPDIFF(HOUR, s, e)` is meant as a column (the final review).
+    found = None
+    for i, word in enumerate(tokens):
+        if word.token_type is not TokenType.VAR or word.text.lower() != name.lower():
+            continue
+        func, paren = (tokens[i - 2], tokens[i - 1]) if i >= 2 else (None, None)
+        comma = tokens[i + 1] if i + 1 < len(tokens) else None
+        unit = (func is not None and func.token_type is TokenType.VAR and func.text.upper() in UNIT_FUNCTIONS
+                and (i < 3 or tokens[i - 3].token_type is not TokenType.DOT)
                 and paren.token_type is TokenType.L_PAREN
-                and word.token_type is TokenType.VAR and word.text.lower() == name.lower()
-                and comma.token_type is TokenType.COMMA):
-            return func.text.upper()
-    return None
+                and comma is not None and comma.token_type is TokenType.COMMA)
+        if not unit:
+            return None
+        found = found or func.text.upper()
+    return found
 
 
 def date_unit_refusal(sql: str, refusal: Refusal, dialect: str | None) -> Refusal | None:

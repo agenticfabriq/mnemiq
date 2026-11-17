@@ -89,7 +89,11 @@ def _without_computed(locatable, computed_columns) -> tuple[tuple[str, str], ...
     if not isinstance(computed_columns, frozenset):
         return ()
     computed = {(table.lower(), column.lower()) for table, column in computed_columns}
-    return tuple(pair for pair in locatable if (pair[0].lower(), pair[1].lower()) not in computed)
+
+    def keep(pairs) -> tuple[tuple[str, str], ...]:
+        return tuple(pair for pair in pairs if (pair[0].lower(), pair[1].lower()) not in computed)
+
+    return (lambda: keep(locatable())) if callable(locatable) else keep(locatable)
 
 
 @bounded
@@ -108,7 +112,7 @@ def decide(
     types: dict[str, dict[str, str]] | None = None,
     gregorian_calendar: bool = False,
     repair_hints: bool = False,
-    locatable: tuple[tuple[str, str], ...] | None = None,
+    locatable=None,  # pairs, or a factory of them (`sql.locatable`); `repair_hints` only
 ) -> Verdict:
     """The deterministic decider: shape, then access, then proof against the real source.
 

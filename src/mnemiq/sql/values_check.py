@@ -816,7 +816,7 @@ def check_values(
     masks: Callable[[str, str], bool] | None = None,
     dialect: str | None = None,
     hints: bool = False,
-    locatable: tuple[tuple[str, str], ...] | None = None,
+    locatable: tuple[tuple[str, str], ...] | Callable[[], tuple[tuple[str, str], ...]] | None = None,
 ) -> Refusal | None:
     """Flag an equality/IN filter whose string literal does not exist in its indexed column.
 
@@ -865,8 +865,17 @@ def check_values(
                 ),
             )
         near = values.nearest(table, name, literal)
-        # `repair_hints`: where else the value is, among the columns this caller may be told about (`locatable`).
-        elsewhere = elsewhere_in_index(values, literal, locatable, (table, name)) if hints and locatable else []
+        # `repair_hints`: where else the value is, among the columns this caller may be told about (`locatable`, a
+        # factory built only here, on a refusal). Optional, so a fault in it leaves the refusal as it is with the setting
+        # off (Codex's review); the decision deadline's DecisionTimeout is a BaseException and still ends the decision.
+        elsewhere: list[str] = []
+        if hints and locatable is not None:
+            try:
+                pairs = locatable() if callable(locatable) else locatable
+                elsewhere = elsewhere_in_index(values, literal, pairs, (table, name)) if pairs else []
+            except Exception as exc:  # noqa: BLE001
+                logger.info("looking for a refused value in other columns failed (%s); the refusal stands as it is",
+                            type(exc).__name__)
         return Refusal(
             code=RefusalCode.VALUE_GROUNDING,
             message=(
@@ -908,9 +917,12 @@ def elsewhere_in_index(values, literal: str, locatable, placed: tuple[str, str])
     index holds every value unfiltered (M5), so a column outside it could disclose one the caller cannot read."""
     same = sorted(c for t, c in locatable if t == placed[0] and (t, c) != placed)
     others = sorted((t, c) for t, c in locatable if t != placed[0])
+    # One query where the index can answer it (`holders`), else one column at a time.
+    held = values.holders(literal) if hasattr(values, "holders") else None
     found = []
     for table, column in [(placed[0], c) for c in same] + others:
-        if values.has(table, column) and values.contains(table, column, literal):
+        if ((table, column) in held) if held is not None else (values.has(table, column)
+                                                               and values.contains(table, column, literal)):
             found.append(f"{table}.{column}")
             if len(found) == ELSEWHERE_NAMED:
                 break

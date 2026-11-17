@@ -42,7 +42,7 @@ from mnemiq.generate.generator import Generator, StrategyGenerator, temperature_
 from mnemiq.generate.plan_query import Deferred, Feedback, plan_query
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.decide import decide
-from mnemiq.sql.locatable import locatable_columns
+from mnemiq.sql.locatable import locatable_columns, without_computed
 from mnemiq.sql.policy import AccessPolicy, build_access_policy
 from mnemiq.sql.schema import visible_schema
 from mnemiq.sql.verdict import Approved
@@ -899,30 +899,13 @@ class Agent:
         return replace(approved, value_grounding=confirmed)
 
     def _reach(self, packet: ContextPacket, snapshot: Snapshot, grants: GrantSet) -> Reach | None:
-        """This turn's `Reach`, or None when the source cannot say which of its columns are computed: a column that
-        runs code on read is never probed, and not knowing which those are is never read as "none" (`opaque_columns`).
-        Every virtual column is left out, not only the ones whose expression calls a function: stricter, and it needs no
-        function inventory. Compared case folded, as Oracle reports them lower case."""
-        computed: set[tuple[str, str]] = set()
-        if self.adapter is not None and hasattr(self.adapter, "virtual_columns"):
-            try:
-                computed = {(t.lower(), c.lower()) for t, c, _ in self.adapter.virtual_columns()}
-            except Exception as exc:  # noqa: BLE001 -- the catalogue could not say: nothing is located this turn
-                logger.info("the source could not say which of its columns are computed (%s); no value is looked "
-                            "for in other columns this turn", type(exc).__name__)
-                return None
+        """This turn's `Reach`: a column that runs code on read is never probed (`without_computed`, which leaves
+        nothing to look in when the source cannot say which those are, never reading that as "none")."""
+        # A catalogue that cannot say which columns are computed leaves nothing to look in (`without_computed`).
         visible, policy, views = visible_schema(snapshot, grants), build_access_policy(snapshot, grants), \
             inventory_for(snapshot)
-        # The catalogue names a computed column by the source's table, the allow-list by the snapshot's, which a
-        # binding can rename: a pair is left out under either name (Codex's review).
-        physical = {b.object_id: b.source_object for b in snapshot.source_bindings}
-
-        def computed_here(table: str, column: str) -> bool:
-            return any((name.lower(), column.lower()) in computed for name in (table, physical.get(table, table)))
-
         return Reach(
-            locatable=tuple(pair for pair in locatable_columns(snapshot, visible, policy, views)
-                            if not computed_here(*pair)),
+            locatable=without_computed(locatable_columns(snapshot, visible, policy, views), self.adapter, snapshot),
             visible=visible, policy=policy, views=views, target=self.dialect,
             card_tables=tuple(dict.fromkeys(card.object_id for card in packet.cards)))
 

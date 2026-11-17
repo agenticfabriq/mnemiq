@@ -138,3 +138,64 @@ def test_off_keeps_todays_message():
     v = check_values(_ast("SELECT id FROM orders WHERE status = 'west'"), _HINT_VISIBLE, _HINT_INDEX, dialect="duckdb",
                      locatable=_ALL)
     assert v.message == _TODAY_WEST
+
+
+class _HoldersIndex(_FakeIndex):
+    """An index answering `holders` in one query; a per-column scan of any column but the placed one fails the test."""
+
+    def __init__(self, data, placed):
+        super().__init__(data)
+        self.placed, self.asked = placed, []
+
+    def holders(self, literal):
+        self.asked.append(literal)
+        return {key for key, values in self._data.items() if literal in values}
+
+    def has(self, table, column):
+        assert (table, column) == self.placed, f"scanned {table}.{column} one column at a time"
+        return super().has(table, column)
+
+    def contains(self, table, column, literal):
+        assert (table, column) == self.placed, f"scanned {table}.{column} one column at a time"
+        return super().contains(table, column, literal)
+
+
+def test_an_index_that_answers_holders_is_asked_once_not_column_by_column():
+    """The final review: one `has` and one `contains` per locatable column cost seconds on a wide schema; an index that
+    can say which columns hold a value answers in one query."""
+    index = _HoldersIndex({("orders", "status"): {"open", "closed"}, ("orders", "region"): {"west"},
+                           ("shipments", "state"): {"west"}}, placed=("orders", "status"))
+    v = check_values(_ast("SELECT id FROM orders WHERE status = 'west'"), _HINT_VISIBLE, index, dialect="duckdb",
+                     hints=True, locatable=_ALL)
+    assert index.asked == ["west"]
+    assert v.message.endswith(" It does appear in orders.region and shipments.state: if that column is the one meant, "
+                              "filter on it instead.")
+
+
+def test_the_allow_list_is_built_only_when_a_value_is_refused():
+    """The final review: built on every planning call, the allow-list cost seconds on a wide schema whether or not a
+    value was refused. Passed as a factory, it is built only on the refusal branch, and once."""
+    built = []
+
+    def factory():
+        built.append(1)
+        return _ALL
+
+    assert check_values(_ast("SELECT id FROM orders WHERE status = 'open'"), _HINT_VISIBLE, _HINT_INDEX,
+                        dialect="duckdb", hints=True, locatable=factory) is None
+    assert built == []
+    v = check_values(_ast("SELECT id FROM orders WHERE status = 'west'"), _HINT_VISIBLE, _HINT_INDEX, dialect="duckdb",
+                     hints=True, locatable=factory)
+    assert built == [1] and "It does appear in orders.lane" in v.message
+
+
+def test_a_fault_while_looking_elsewhere_leaves_todays_refusal():
+    """Codex's whole-branch review: the extra lookup is optional, so a fault in it returns the refusal as it is off."""
+    class _Down(_FakeIndex):
+        def holders(self, literal):
+            raise RuntimeError("the store went away")
+
+    index = _Down({("orders", "status"): {"open", "closed"}, ("orders", "region"): {"west"}})
+    v = check_values(_ast("SELECT id FROM orders WHERE status = 'west'"), _HINT_VISIBLE, index, dialect="duckdb",
+                     hints=True, locatable=_ALL)
+    assert v.message == _TODAY_WEST

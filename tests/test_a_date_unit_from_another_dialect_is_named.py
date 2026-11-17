@@ -170,3 +170,12 @@ def test_the_oracle_sentence_is_true():
         assert interval.total_seconds() == 5400.0  # an INTERVAL DAY TO SECOND arrives as a timedelta
     finally:
         con.close()
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT o.hour, TIMESTAMPDIFF(hour, o.s, o.e) FROM orders o",   # the refusal is about the qualified column
+    "SELECT hour, TIMESTAMPDIFF(HOUR, s, e) FROM orders",           # the projection's `hour` is meant as a column
+])
+def test_a_statement_that_also_reads_the_word_as_a_column_keeps_its_message(sql):
+    """The final review: naming the word a unit is right only when every place it is written is a unit position."""
+    assert _decide(sql, repair_hints=True).message == _decide(sql).message

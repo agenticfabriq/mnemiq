@@ -125,7 +125,10 @@ A date part written as a function's unit the way another SQL dialect writes it (
 refused as a unit, with this database's date arithmetic, where it is otherwise refused as a missing column. A
 statement sent again unchanged after a refusal is told it repeated itself. A filter value that is not in its column
 is named where it does appear, among the columns this caller may read. Deep mode never repairs its candidates from a
-refusal, so the setting is refused there.
+refusal, so the setting is refused there. It also asks the source more: once a statement's filter value is ruled out
+of its column, the catalogue is asked which columns are computed, and the source whether other columns hold the
+value, at most six probes a turn inside the same ten-second probe budget, and the decline the caller is shown names
+where the value is.
 
 ### Several candidates
 
