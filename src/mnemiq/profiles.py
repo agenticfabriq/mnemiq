@@ -530,7 +530,7 @@ def _no_credentials(value):
 # Mode fields added after profile versions were first recorded, each with the value that runs as the engine ran before
 # it existed. A field at that value is left out of the view, so a profile that does not use it keeps the version it had:
 # a version moves when what the profile runs moves (the shipped starter's evidence records its versions).
-_LATER_MODE_FIELDS = {"empty_retries": 0, "retry_answered_empties": False}
+_LATER_MODE_FIELDS = {"empty_retries": 0, "retry_answered_empties": False, "repair_hints": False}
 
 
 def resolved_view(settings: Settings, dialect: str) -> dict:

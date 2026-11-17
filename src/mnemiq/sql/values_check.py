@@ -815,6 +815,7 @@ def check_values(
     row_filtered: set[str] | None = None,
     masks: Callable[[str, str], bool] | None = None,
     dialect: str | None = None,
+    hints: bool = False,
 ) -> Refusal | None:
     """Flag an equality/IN filter whose string literal does not exist in its indexed column.
 

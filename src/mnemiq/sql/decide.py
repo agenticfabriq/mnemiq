@@ -93,6 +93,7 @@ def decide(
     keys: KeyFacts | None = None,
     types: dict[str, dict[str, str]] | None = None,
     gregorian_calendar: bool = False,
+    repair_hints: bool = False,
 ) -> Verdict:
     """The deterministic decider: shape, then access, then proof against the real source.
 
@@ -216,7 +217,7 @@ def decide(
         # M5: the index is unfiltered and this runs before the RLS rewrite below, so the
         # refusal must know which tables this identity only sees a slice of.
         grounding = check_values(shaped, visible, values, row_filtered=set(policy.row_filters),
-                                 masks=policy.masks, dialect=target)
+                                 masks=policy.masks, dialect=target, hints=repair_hints)
         if grounding is not None:
             return grounding
 

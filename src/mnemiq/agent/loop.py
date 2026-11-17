@@ -263,12 +263,14 @@ class Agent:
         prose: bool = True,
         empty_retries: int = 0,
         retry_answered_empties: bool = False,
+        repair_hints: bool = False,
     ) -> None:
         self.generator = generator
         self.plan_attempts = plan_attempts
         self.prose = prose
         self.empty_retries = empty_retries
         self.retry_answered_empties = retry_answered_empties
+        self.repair_hints = repair_hints
         # Defaults to the shipped limit, not to none: a construction site that forgets it still declines what no
         # stage would read alike (M147).
         self.max_question_chars = max_question_chars
@@ -425,6 +427,7 @@ class Agent:
                         dialect=self.dialect,
                         target=self.dialect,
                         max_attempts=self.plan_attempts,
+                        repair_hints=self.repair_hints,
                         feedback=feedback,
                         corrector=self.corrector,
                         values=self.values,

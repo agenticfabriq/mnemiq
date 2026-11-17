@@ -294,3 +294,16 @@ def test_an_empty_retry_setting_no_answer_would_read_is_refused(sections, refuse
 def test_a_negative_empty_retry_count_is_refused():
     with pytest.raises(ValueError):
         Settings(mode_settings={"instant": {"empty_retries": -1}})
+
+
+def test_repair_hints_is_set_per_mode(tmp_path):
+    profiles, _ = _load(tmp_path, _one('[profiles.only.instant]\nrepair_hints = true'))
+    modes = modes_for(profiles["only"].settings)
+    assert (modes["instant"].repair_hints, modes["thinking"].repair_hints) == (True, False)
+
+
+def test_repair_hints_is_refused_where_candidates_vote():
+    """Deep's candidates are never repaired from a refusal, so the hints would run and change nothing: an arm setting
+    it would score as "no effect"."""
+    with pytest.raises(ValueError, match="deep sets repair_hints, which a mode with several candidates never uses"):
+        modes_for(Settings(mode_settings={"deep": {"repair_hints": True}}))

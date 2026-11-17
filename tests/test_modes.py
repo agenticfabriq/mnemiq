@@ -79,3 +79,7 @@ def test_build_agent_verifier_defaults_none():
         cache=None, corrector=None, values=None, selector=None,
     )
     assert agent.verifier is None
+
+
+def test_no_mode_gives_repair_hints():
+    assert {m.repair_hints for m in MODES.values()} == {False}

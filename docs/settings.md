@@ -120,6 +120,13 @@ wrong join or a filter on the wrong column. A retry that produces nothing to ans
 or the database rejects it, leaves the result before it standing. Deep mode compares its candidates' results instead,
 so both settings are refused there.
 
+`repair_hints`, off in every mode until a profile sets it, changes what the writer is told, never what is checked.
+A date part written as a function's unit the way another SQL dialect writes it (`TIMESTAMPDIFF(HOUR, a, b)`) is
+refused as a unit, with this database's date arithmetic, where it is otherwise refused as a missing column. A
+statement sent again unchanged after a refusal is told it repeated itself. A filter value that is not in its column
+is named where it does appear, among the columns this caller may read. Deep mode never repairs its candidates from a
+refusal, so the setting is refused there.
+
 ### Several candidates
 
 Deep mode writes several candidate statements with different strategies (`candidates`), runs them all and groups
@@ -211,6 +218,7 @@ Each mode's own values. A profile changes them in its mode section; without a pr
 | `prose` | `true` | `true` | `true` | The answer's form | A model call turns the rows into sentences; off, the rows are the answer. |
 | `empty_retries` | `0` | `0` | `0` | Repair from feedback | Writer calls an empty result may buy, the writer told it was empty and why. Refused on a mode with several candidates. |
 | `retry_answered_empties` | `false` | `false` | `false` | Repair from feedback | Also retries an empty result whose every filter value was found. Needs `empty_retries` above 0. |
+| `repair_hints` | `false` | `false` | `false` | Repair from feedback | Refusals and declined empty results name the likely fix: a date unit written as another SQL dialect writes it, a query sent again unchanged, a value found in another column. Refused on a mode with several candidates. |
 
 ## Deployment settings
 

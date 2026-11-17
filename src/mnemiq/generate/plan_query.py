@@ -99,6 +99,7 @@ def plan_query(
     values=None,
     guard_undefined_terms: bool = False,
     guard_fanout: bool | None = False,
+    repair_hints: bool = False,
 ) -> Outcome:
     """Propose, decide, repair -- and defer rather than guess.
 
@@ -250,6 +251,7 @@ def plan_query(
             proposal.sql, visible, adapter=adapter, dialect=dialect, target=target,
             values=values, policy=policy, registry=registry, views=views, keys=keys, types=types,
             gregorian_calendar=gregorian_calendar,
+            repair_hints=repair_hints,
         )
 
         corrected = False
@@ -273,6 +275,7 @@ def plan_query(
                 keys=keys,
                 types=types,
                 gregorian_calendar=gregorian_calendar,
+                repair_hints=repair_hints,
             )
             # Only when the repair is what carried it: a correction that still refuses is not
             # a corrected plan, it is a failed one, and reporting it would overstate the work.
