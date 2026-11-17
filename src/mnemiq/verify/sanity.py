@@ -4,7 +4,7 @@ import math
 
 import pyarrow as pa
 
-from mnemiq.sql.values_check import ABSENT, FilterValue, ValueGrounding
+from mnemiq.sql.values_check import ABSENT, FilterValue, ValueGrounding, _listed_columns
 from mnemiq.verify.verdict import VerifyVerdict
 
 # Named in a decline, at most this many: the sentence is for a caller to act on, not an inventory.
@@ -36,7 +36,9 @@ def _named(values: list[FilterValue]) -> str:
         return f"{written}, {'JSON paths' if many else 'a JSON path'}, could not be checked"
     texts, column = _listed([v.text for v in values]), first.column
     if first.outcome == ABSENT and first.why == "probed":  # the source itself was asked
-        return f"{texts} {'do' if many else 'does'} not appear in {column}"
+        where = (f", though {'they do' if many else 'it does'} appear in {_listed_columns(list(first.found_in))}"
+                 if first.found_in else "")  # `repair_hints`: where it does appear, among what the caller may read
+        return f"{texts} {'do' if many else 'does'} not appear in {column}{where}"
     if first.outcome == ABSENT:
         return f"{texts} {'do' if many else 'does'} not appear among {column}'s known values"
     if first.why == "pattern":
@@ -91,7 +93,7 @@ def _grounded_or_why(opening: str, grounding: ValueGrounding) -> str | None:
         return None
     groups: dict[tuple, list[FilterValue]] = {}
     for value in blocking:  # in the order written, one clause per reason and column
-        groups.setdefault((value.outcome == ABSENT, value.why, value.column), []).append(value)
+        groups.setdefault((value.outcome == ABSENT, value.why, value.column, value.found_in), []).append(value)
     named = [_named(group) for group in groups.values()]
     more = f"; and {len(named) - _NAMED} more" if len(named) > _NAMED else ""
     return f"{opening}, and {'; '.join(named[:_NAMED])}{more}, {_UNSURE}"

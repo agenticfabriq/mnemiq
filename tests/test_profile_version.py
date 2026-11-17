@@ -194,3 +194,18 @@ def test_a_mode_field_added_later_moves_a_version_only_where_a_profile_sets_it(m
     every = profile_version(_settings(writer_temperature=0.0, mode_settings={
         "instant": {"empty_retries": 1, "retry_answered_empties": True}}), "duckdb")
     assert base == VERSION_ON_MAIN and len({base, retry, every}) == 3
+
+
+def test_repair_hints_off_keeps_every_profile_version(monkeypatch):
+    """`repair_hints` off runs as the engine ran before it existed, so a profile that says so keeps its version."""
+    for name in [n for n in os.environ if n.startswith("MNEMIQ_")]:
+        monkeypatch.delenv(name)
+    off = profile_version(_settings(writer_temperature=0.0, mode_settings={"instant": {"repair_hints": False}}), "duckdb")
+    assert off == profile_version(_settings(writer_temperature=0.0), "duckdb") == VERSION_ON_MAIN
+
+
+def test_repair_hints_on_moves_the_profile_version(monkeypatch):
+    for name in [n for n in os.environ if n.startswith("MNEMIQ_")]:
+        monkeypatch.delenv(name)
+    on = profile_version(_settings(writer_temperature=0.0, mode_settings={"instant": {"repair_hints": True}}), "duckdb")
+    assert on != VERSION_ON_MAIN

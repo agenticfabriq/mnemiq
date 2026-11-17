@@ -124,6 +124,9 @@ class NoValueIndex:
     def values(self, object_id: str, column: str) -> list[str]:
         return []
 
+    def holders(self, literal: str) -> set[tuple[str, str]]:
+        return set()
+
 
 class ValueIndex:
     """Read side of the value index. Resilient to a store built before value grounding: the
@@ -147,6 +150,12 @@ class ValueIndex:
             [object_id, column, literal],
         ).fetchone()
         return row is not None
+
+    def holders(self, literal: str) -> set[tuple[str, str]]:
+        """Every (object, column) the index holds `literal` in, in one query: `repair_hints` asks which columns hold a
+        refused value, and one `has` and `contains` per column cost seconds on a wide schema (the final review)."""
+        return {(o, c) for o, c in self._con.execute(
+            "SELECT DISTINCT object_id, column_name FROM value_index WHERE value_text = ?", [literal]).fetchall()}
 
     def _values(self, object_id: str, column: str) -> list[str]:
         return [

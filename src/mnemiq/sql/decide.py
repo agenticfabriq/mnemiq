@@ -36,6 +36,7 @@ from mnemiq.sql.reading import UNSUPPORTED_RAISES, as_duckdb_reads, kept, render
 from mnemiq.sql.rls import (apply_row_and_mask, as_written, check_filter_targets, unplaceable_policy,
                             with_filters_held)
 from mnemiq.sql.values_check import check_values, ground_values
+from mnemiq.sql.date_units import date_unit_refusal
 from mnemiq.sql.views import check_views
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode, Verdict
 
@@ -78,6 +79,23 @@ def _transpile_under_the_cap(shaped: exp.Expression, dialect: str, target: str) 
     return reread.sql(dialect=target, **UNSUPPORTED_RAISES)
 
 
+def _without_computed(locatable, computed_columns) -> tuple[tuple[str, str], ...] | None:
+    """`locatable` less the columns the source computes on read. Only a set of them answers; None or Unanswered (the
+    catalogue could not say) leaves nothing to locate, never "nothing is computed" (`opaque_columns`). Compared case
+    folded: Oracle's catalogue reports them lower case where the snapshot keeps its upper-case names (Codex's review),
+    and dropping a case variant too only names fewer columns."""
+    if locatable is None:
+        return None
+    if not isinstance(computed_columns, frozenset):
+        return ()
+    computed = {(table.lower(), column.lower()) for table, column in computed_columns}
+
+    def keep(pairs) -> tuple[tuple[str, str], ...]:
+        return tuple(pair for pair in pairs if (pair[0].lower(), pair[1].lower()) not in computed)
+
+    return (lambda: keep(locatable())) if callable(locatable) else keep(locatable)
+
+
 @bounded
 def decide(
     sql: str,
@@ -93,6 +111,8 @@ def decide(
     keys: KeyFacts | None = None,
     types: dict[str, dict[str, str]] | None = None,
     gregorian_calendar: bool = False,
+    repair_hints: bool = False,
+    locatable=None,  # pairs, or a factory of them (`sql.locatable`); `repair_hints` only
 ) -> Verdict:
     """The deterministic decider: shape, then access, then proof against the real source.
 
@@ -142,7 +162,9 @@ def decide(
     refusal = check_access(shaped, visible, target, columns=known_columns(visible, policy),
                            registry=registry)
     if refusal is not None:
-        return refusal
+        # The words only, never the verdict: a date part the writer wrote as another dialect's unit is named as one
+        # (`date_units`), where the plain refusal calls it a column no table has.
+        return (date_unit_refusal(sql, refusal, dialect) or refusal) if repair_hints else refusal
     # M65: what `check_access` reads -- `base_tables` -- is empty for a source it cannot model,
     # and an empty list passes. After it, so a source it already refuses keeps its refusal.
     unmodelled = check_unmodelled_source(shaped)
@@ -176,8 +198,8 @@ def decide(
     # Oracle, returning an SSN from an ungranted table while every check above passed it (M100).
     # Third shape of the same thing, after `count(*)` reaching `count_star` and `id + 1`
     # reaching a macro named `+`, and answered the same way: ask the source, do not enumerate.
-    computed = check_opaque_columns(shaped, opaque_columns(adapter, functions), target,
-                                    columns=known_columns(visible, policy))
+    computed_columns = opaque_columns(adapter, functions)
+    computed = check_opaque_columns(shaped, computed_columns, target, columns=known_columns(visible, policy))
     if computed is not None:
         return computed
 
@@ -216,7 +238,8 @@ def decide(
         # M5: the index is unfiltered and this runs before the RLS rewrite below, so the
         # refusal must know which tables this identity only sees a slice of.
         grounding = check_values(shaped, visible, values, row_filtered=set(policy.row_filters),
-                                 masks=policy.masks, dialect=target)
+                                 masks=policy.masks, dialect=target, hints=repair_hints,
+                                 locatable=_without_computed(locatable, computed_columns))
         if grounding is not None:
             return grounding
 

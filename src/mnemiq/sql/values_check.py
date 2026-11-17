@@ -815,6 +815,8 @@ def check_values(
     row_filtered: set[str] | None = None,
     masks: Callable[[str, str], bool] | None = None,
     dialect: str | None = None,
+    hints: bool = False,
+    locatable: tuple[tuple[str, str], ...] | Callable[[], tuple[tuple[str, str], ...]] | None = None,
 ) -> Refusal | None:
     """Flag an equality/IN filter whose string literal does not exist in its indexed column.
 
@@ -863,11 +865,24 @@ def check_values(
                 ),
             )
         near = values.nearest(table, name, literal)
+        # `repair_hints`: where else the value is, among the columns this caller may be told about (`locatable`, a
+        # factory built only here, on a refusal). Optional, so a fault in it leaves the refusal as it is with the setting
+        # off (Codex's review); the decision deadline's DecisionTimeout is a BaseException and still ends the decision.
+        elsewhere: list[str] = []
+        if hints and locatable is not None:
+            try:
+                pairs = locatable() if callable(locatable) else locatable
+                elsewhere = elsewhere_in_index(values, literal, pairs, (table, name)) if pairs else []
+            except Exception as exc:  # noqa: BLE001
+                logger.info("looking for a refused value in other columns failed (%s); the refusal stands as it is",
+                            type(exc).__name__)
         return Refusal(
             code=RefusalCode.VALUE_GROUNDING,
             message=(
                 f"the value {literal!r} does not appear in {table}.{name}; "
                 f"the real values include: {', '.join(shown(v) for v in near)}. Use the intended one."
+                + (f" It does appear in {_listed_columns(elsewhere)}: if that column is the one meant, filter on it "
+                   "instead." if elsewhere else "")
             ),
         )
 
@@ -889,6 +904,34 @@ def check_values(
                     return found
 
     return None
+
+
+# At most this many columns named where a refused value does appear: a sentence to act on, not an inventory. Its own
+# constant, as `verify/sanity.py` imports this module and its `_NAMED` cannot be imported back.
+ELSEWHERE_NAMED = 3
+
+
+def elsewhere_in_index(values, literal: str, locatable, placed: tuple[str, str]) -> list[str]:
+    """`table.column` for each indexed column of `locatable` that holds `literal`: the placed column's own table first,
+    then the others in sorted order, at most `ELSEWHERE_NAMED`, never the placed column. Only `locatable` is read: the
+    index holds every value unfiltered (M5), so a column outside it could disclose one the caller cannot read."""
+    same = sorted(c for t, c in locatable if t == placed[0] and (t, c) != placed)
+    others = sorted((t, c) for t, c in locatable if t != placed[0])
+    # One query where the index can answer it (`holders`), else one column at a time.
+    held = values.holders(literal) if hasattr(values, "holders") else None
+    found = []
+    for table, column in [(placed[0], c) for c in same] + others:
+        if ((table, column) in held) if held is not None else (values.has(table, column)
+                                                               and values.contains(table, column, literal)):
+            found.append(f"{table}.{column}")
+            if len(found) == ELSEWHERE_NAMED:
+                break
+    return found
+
+
+def _listed_columns(columns: list[str]) -> str:
+    """`a.b`, `a.b and c.d`, or `a.b, c.d and e.f`."""
+    return columns[0] if len(columns) == 1 else f"{', '.join(columns[:-1])} and {columns[-1]}"
 
 
 def _resolver(ast: exp.Expression, visible: dict[str, set[str]],
@@ -1032,6 +1075,9 @@ class FilterValue:
     # (table, column) for a not_indexed value compared by equality or IN with a bare column, so the
     # source can be asked whether the column holds it; None for every other value.
     placed: tuple[str, str] | None = None
+    # `repair_hints`: for a value the source ruled out of its column, the other columns that hold it, as `table.column`
+    # (`locate_elsewhere`). Empty for every other value, and whenever the setting is off.
+    found_in: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1550,6 +1596,37 @@ def confirm_by_source(grounding: ValueGrounding, holds: Callable[[str, str, str]
         found = asked[key]
         values.append(value if found is None
                       else replace(value, outcome=GROUNDED if found else ABSENT, why="probed"))
+    return replace(grounding, values=tuple(values))
+
+
+def locate_elsewhere(grounding: ValueGrounding, candidates: list[tuple[str, str]],
+                     holds: Callable[[str, str, str], bool | None], in_index: Callable[[str, str, str], bool | None],
+                     limit: int) -> ValueGrounding:
+    """`grounding` with each value the source ruled out of its column (`ABSENT`, `probed`) given `found_in`: the
+    `candidates`, in order, that hold it, at most `ELSEWHERE_NAMED`, never its own column. `in_index` answers from the
+    value index where it can (True, False), else None, and then `holds` asks the source, at most `limit` times in all
+    here. A None from `holds` is not found."""
+    asked, values = 0, []
+    for value in grounding.values:
+        if value.outcome != ABSENT or value.why != "probed" or value.placed is None:
+            values.append(value)
+            continue
+        own = (value.placed[0].lower(), value.placed[1].lower())
+        found: list[str] = []
+        for table, column in candidates:
+            if len(found) == ELSEWHERE_NAMED:
+                break
+            if (table.lower(), column.lower()) == own:
+                continue
+            held = in_index(table, column, value.text)
+            if held is None:
+                if asked >= limit:
+                    continue
+                asked += 1
+                held = holds(table, column, value.text)
+            if held:
+                found.append(f"{table}.{column}")
+        values.append(replace(value, found_in=tuple(found)) if found else value)
     return replace(grounding, values=tuple(values))
 
 

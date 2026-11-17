@@ -30,6 +30,8 @@ class Mode:
     empty_retries: int = 0
     # Also retry an empty result the sanity layer would answer, every value it filters on checked.
     retry_answered_empties: bool = False
+    # Refusals and declined empty results name the likely fix (docs/settings.md); on the single path only.
+    repair_hints: bool = False
 
 
 # Verify levels: sanity (deterministic empty/null net) in every mode; the LLM judge in
@@ -87,6 +89,9 @@ def modes_for(settings: Settings) -> dict[str, Mode]:
         if mode.candidates > 1 and retrying:
             raise ValueError(f"{name} has {mode.candidates} candidates, whose results {' and '.join(retrying)} "
                              "never read; set them on a mode with one candidate or leave them out")
+        if mode.candidates > 1 and mode.repair_hints:
+            raise ValueError(f"{name} sets repair_hints, which a mode with several candidates never uses; "
+                             "leave it out")
         if mode.retry_answered_empties and not mode.empty_retries:
             raise ValueError(f"{name} sets retry_answered_empties with no empty_retries to spend; "
                              "set empty_retries above 0 or leave it out")
@@ -130,6 +135,7 @@ def build_agent(
         prose=mode.prose,
         empty_retries=mode.empty_retries,
         retry_answered_empties=mode.retry_answered_empties,
+        repair_hints=mode.repair_hints,
         guard_undefined_terms=guard_undefined_terms,
         guard_fanout=guard_fanout,
         max_question_chars=max_question_chars,

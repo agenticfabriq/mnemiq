@@ -4,6 +4,10 @@ import logging
 
 from dataclasses import dataclass, replace
 
+import sqlglot
+from sqlglot.dialects.dialect import Dialect
+from sqlglot.tokens import TokenType
+
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import DeferralReason, Snapshot
 from mnemiq.generate.undefined_terms import ungrounded_terms
@@ -11,6 +15,7 @@ from mnemiq.generate.generator import Generator
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.decide import decide
 from mnemiq.sql.fanout_check import guard_on, key_facts
+from mnemiq.sql.locatable import locatable_columns, without_computed
 from mnemiq.sql.views import inventory_for
 from mnemiq.sql.policy import build_access_policy
 from mnemiq.sql.schema import column_types, visible_schema
@@ -48,6 +53,49 @@ class Feedback:
 
     text: str
     from_source: bool
+
+
+# The feedback for a statement sent again unchanged and refused the same way (`repair_hints`): measured on a local
+# model, one told "no column 'HOUR'" sent the identical statement three times, told the same sentence each time.
+_REPEATED = ("You sent this same query before, and it is refused again for the same reason: {reason} Sent unchanged "
+             "it cannot pass; change what that reason names.")
+
+
+def _locatable_factory(snapshot, visible, policy, views, adapter):
+    """`locatable_columns` less the source's computed columns, as a factory that builds them on its first call only."""
+    built: list = []
+
+    def build() -> tuple[tuple[str, str], ...]:
+        if not built:
+            built.append(without_computed(locatable_columns(snapshot, visible, policy, views), adapter, snapshot))
+        return built[0]
+
+    return build
+
+
+def same_query(a: str, b: str, dialect: str) -> bool:
+    """Whether two statements are one: equal sqlglot trees read in the writer's dialect, so spacing, keyword case and a
+    trailing semicolon do not count and a changed literal does. A statement that does not parse is compared token by
+    token, so the spacing between tokens is set aside and a literal's or a quoted name's own spacing is not (Codex's
+    review); one the tokenizer cannot read either is compared exactly."""
+    try:
+        return sqlglot.parse_one(a, read=dialect) == sqlglot.parse_one(b, read=dialect)
+    except Exception:  # noqa: BLE001 -- a statement sqlglot cannot parse is compared as tokens
+        pass
+    try:
+        return _tokens(a, dialect) == _tokens(b, dialect)
+    except Exception:  # noqa: BLE001 -- nor tokenize: only the very same text is the same statement
+        return a == b
+
+
+def _tokens(sql: str, dialect: str) -> list[tuple[TokenType, str]]:
+    """`sql`'s tokens without one trailing semicolon: a literal's and a quoted name's text exactly, any other
+    token's case-folded, as an unquoted name or a keyword reads either way."""
+    tokens = [(t.token_type, t.text if t.token_type in (TokenType.STRING, TokenType.IDENTIFIER) else t.text.upper())
+              for t in Dialect.get_or_raise(dialect).tokenize(sql)]
+    if tokens and tokens[-1][0] is TokenType.SEMICOLON:
+        tokens.pop()
+    return tokens
 
 
 # What a caller is told when the decider refuses in a way no rewrite can fix: the deferral code,
@@ -99,6 +147,7 @@ def plan_query(
     values=None,
     guard_undefined_terms: bool = False,
     guard_fanout: bool | None = False,
+    repair_hints: bool = False,
 ) -> Outcome:
     """Propose, decide, repair -- and defer rather than guess.
 
@@ -116,6 +165,9 @@ def plan_query(
     # from the snapshot rather than from the source at ask time: it is versioned content, and
     # a body that drifted from the one the policy was reasoned about is a governance change.
     views = inventory_for(snapshot)
+    # `repair_hints`: the columns a hint may name, from this caller's grants, less every column the source computes on
+    # read. A factory, built once and only when a value is refused (the final review); None when off.
+    locatable = _locatable_factory(snapshot, visible, policy, views, adapter) if repair_hints else None
     # M109: key uniqueness from the profile, read once per question. None leaves the check off;
     # a `guard_fanout` of None is auto, resolved against this snapshot (`guard_on`).
     keys = key_facts(snapshot) if guard_on(guard_fanout, snapshot) else None
@@ -169,6 +221,10 @@ def plan_query(
     # pattern to match and so no false-positive rate to measure, and it stays correct when a
     # source starts phrasing its errors differently or a DSN turns up in a shape nobody listed.
     carries_source_words = feedback.from_source if feedback else False
+    # Each statement this call refused, with its refusal, so one sent again unchanged and refused the same way is told
+    # so (`repair_hints`). Only the words fed back change: the statement is decided every time, since a refusal resting
+    # on a source call can change between attempts.
+    refused: list[tuple[str, Refusal]] = []
     # Whether the source reads a date parse (Oracle's TO_DATE) in the Gregorian calendar: only an
     # adapter that pins its sessions to it says so, and anything else reads as no.
     gregorian_calendar = getattr(adapter, "gregorian_calendar", False) is True
@@ -250,14 +306,18 @@ def plan_query(
             proposal.sql, visible, adapter=adapter, dialect=dialect, target=target,
             values=values, policy=policy, registry=registry, views=views, keys=keys, types=types,
             gregorian_calendar=gregorian_calendar,
+            repair_hints=repair_hints,
+            locatable=locatable,
         )
 
         corrected = False
+        rewritten = False  # whether the corrector ran: then the refusal is about its statement
         if (
             isinstance(verdict, Refusal)
             and verdict.code in CORRECTABLE
             and corrector is not None
         ):
+            rewritten = True
             # one surgical pass: fix only the flagged problem, then re-decide (which re-runs
             # shape/access/lint/values/EXPLAIN, so a bad edit cannot slip through)
             verdict = decide(
@@ -273,6 +333,8 @@ def plan_query(
                 keys=keys,
                 types=types,
                 gregorian_calendar=gregorian_calendar,
+                repair_hints=repair_hints,
+                locatable=locatable,
             )
             # Only when the repair is what carried it: a correction that still refuses is not
             # a corrected plan, it is a failed one, and reporting it would overstate the work.
@@ -320,7 +382,15 @@ def plan_query(
 
         last = verdict
         carries_source_words = verdict.source_detail is not None
-        feedback = Feedback(verdict.repair_text, from_source=carries_source_words)
+        # Never across the corrector: its refusal is about the statement it wrote, which may differ each time while the
+        # writer's does not (Codex's review), and that path's feedback stays as it was.
+        repeated = repair_hints and not rewritten and any(
+            same_query(sql, proposal.sql, dialect) and before.code is verdict.code and before.message == verdict.message
+            for sql, before in refused)
+        if not rewritten:
+            refused.append((proposal.sql, verdict))
+        feedback = Feedback(_REPEATED.format(reason=verdict.repair_text) if repeated else verdict.repair_text,
+                            from_source=carries_source_words)
 
     if last is not None and last.code not in REPAIRABLE:
         # Retried only because the INSTANCE said to -- a source whose catalogue call raised is

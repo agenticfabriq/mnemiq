@@ -79,3 +79,20 @@ def test_build_agent_verifier_defaults_none():
         cache=None, corrector=None, values=None, selector=None,
     )
     assert agent.verifier is None
+
+
+def test_no_mode_gives_repair_hints():
+    assert {m.repair_hints for m in MODES.values()} == {False}
+
+
+def test_an_agent_with_several_candidates_refuses_repair_hints_however_it_is_built():
+    """`modes_for` refuses the setting on deep, and so does the agent itself: built through `build_agent` from a
+    replaced mode, or directly, a multi-candidate agent would leave the hints off on its vote path and score a profile
+    that sets them as "no effect"."""
+    gen, syn, ad, cache, corr, vals, sel = (object() for _ in range(7))
+    with pytest.raises(ValueError, match="repair_hints"):
+        build_agent(dataclasses.replace(MODES["deep"], repair_hints=True), generator=gen, synthesizer=syn,
+                    adapter=ad, cache=cache, corrector=corr, values=vals, selector=sel)
+    with pytest.raises(ValueError, match="repair_hints"):
+        Agent(generator=gen, synthesizer=syn, adapter=ad, cache=cache, candidates=5, repair_hints=True)
+    assert Agent(generator=gen, synthesizer=syn, adapter=ad, cache=cache, candidates=1, repair_hints=True).repair_hints
