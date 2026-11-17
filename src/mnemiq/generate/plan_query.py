@@ -15,6 +15,7 @@ from mnemiq.generate.generator import Generator
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.decide import decide
 from mnemiq.sql.fanout_check import guard_on, key_facts
+from mnemiq.sql.locatable import locatable_columns
 from mnemiq.sql.views import inventory_for
 from mnemiq.sql.policy import build_access_policy
 from mnemiq.sql.schema import column_types, visible_schema
@@ -152,6 +153,8 @@ def plan_query(
     # from the snapshot rather than from the source at ask time: it is versioned content, and
     # a body that drifted from the one the policy was reasoned about is a governance change.
     views = inventory_for(snapshot)
+    # `repair_hints`: the columns a hint may name, from this caller's grants. None when off, so nothing is built.
+    locatable = locatable_columns(snapshot, visible, policy, views) if repair_hints else None
     # M109: key uniqueness from the profile, read once per question. None leaves the check off;
     # a `guard_fanout` of None is auto, resolved against this snapshot (`guard_on`).
     keys = key_facts(snapshot) if guard_on(guard_fanout, snapshot) else None
@@ -291,6 +294,7 @@ def plan_query(
             values=values, policy=policy, registry=registry, views=views, keys=keys, types=types,
             gregorian_calendar=gregorian_calendar,
             repair_hints=repair_hints,
+            locatable=locatable,
         )
 
         corrected = False
@@ -317,6 +321,7 @@ def plan_query(
                 types=types,
                 gregorian_calendar=gregorian_calendar,
                 repair_hints=repair_hints,
+                locatable=locatable,
             )
             # Only when the repair is what carried it: a correction that still refuses is not
             # a corrected plan, it is a failed one, and reporting it would overstate the work.

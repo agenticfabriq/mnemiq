@@ -816,6 +816,7 @@ def check_values(
     masks: Callable[[str, str], bool] | None = None,
     dialect: str | None = None,
     hints: bool = False,
+    locatable: tuple[tuple[str, str], ...] | None = None,
 ) -> Refusal | None:
     """Flag an equality/IN filter whose string literal does not exist in its indexed column.
 
@@ -864,11 +865,15 @@ def check_values(
                 ),
             )
         near = values.nearest(table, name, literal)
+        # `repair_hints`: where else the value is, among the columns this caller may be told about (`locatable`).
+        elsewhere = elsewhere_in_index(values, literal, locatable, (table, name)) if hints and locatable else []
         return Refusal(
             code=RefusalCode.VALUE_GROUNDING,
             message=(
                 f"the value {literal!r} does not appear in {table}.{name}; "
                 f"the real values include: {', '.join(shown(v) for v in near)}. Use the intended one."
+                + (f" It does appear in {_listed_columns(elsewhere)}: if that column is the one meant, filter on it "
+                   "instead." if elsewhere else "")
             ),
         )
 
@@ -890,6 +895,31 @@ def check_values(
                     return found
 
     return None
+
+
+# At most this many columns named where a refused value does appear: a sentence to act on, not an inventory. Its own
+# constant, as `verify/sanity.py` imports this module and its `_NAMED` cannot be imported back.
+ELSEWHERE_NAMED = 3
+
+
+def elsewhere_in_index(values, literal: str, locatable, placed: tuple[str, str]) -> list[str]:
+    """`table.column` for each indexed column of `locatable` that holds `literal`: the placed column's own table first,
+    then the others in sorted order, at most `ELSEWHERE_NAMED`, never the placed column. Only `locatable` is read: the
+    index holds every value unfiltered (M5), so a column outside it could disclose one the caller cannot read."""
+    same = sorted(c for t, c in locatable if t == placed[0] and (t, c) != placed)
+    others = sorted((t, c) for t, c in locatable if t != placed[0])
+    found = []
+    for table, column in [(placed[0], c) for c in same] + others:
+        if values.has(table, column) and values.contains(table, column, literal):
+            found.append(f"{table}.{column}")
+            if len(found) == ELSEWHERE_NAMED:
+                break
+    return found
+
+
+def _listed_columns(columns: list[str]) -> str:
+    """`a.b`, `a.b and c.d`, or `a.b, c.d and e.f`."""
+    return columns[0] if len(columns) == 1 else f"{', '.join(columns[:-1])} and {columns[-1]}"
 
 
 def _resolver(ast: exp.Expression, visible: dict[str, set[str]],

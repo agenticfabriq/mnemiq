@@ -74,3 +74,67 @@ def test_a_document_among_the_nearest_values_is_cut_in_the_refusal():
     assert isinstance(v, Refusal) and v.code == RefusalCode.VALUE_GROUNDING
     assert doc not in v.message and doc[:200] in v.message
     assert "never compare with it" in v.message and "short" in v.message
+
+
+# --- repair_hints: a value absent from its column, named where it does appear (fix 3a) ------------------------------
+#
+# Under `hints`, a refused value is looked up in the other indexed columns the caller may read (`locatable`, built by
+# `sql.locatable` from the caller's grants), and the refusal says where it is. Only `locatable`'s columns are ever
+# named: the index is unfiltered (M5), so a column outside it could disclose a value the caller cannot read.
+
+_HINT_VISIBLE = {"orders": {"id", "status", "region", "lane"}, "shipments": {"id", "state"}}
+_HINT_INDEX = _FakeIndex({("orders", "status"): {"open", "closed"}, ("orders", "region"): {"west", "east"},
+                          ("orders", "lane"): {"west"}, ("shipments", "state"): {"west", "pending"}})
+_ALL = tuple(sorted((t, c) for t, cs in _HINT_VISIBLE.items() for c in cs))
+_TODAY_WEST = "the value 'west' does not appear in orders.status; the real values include: closed, open. Use the intended one."
+
+
+def _hinted(sql, locatable=_ALL, **kw):
+    return check_values(_ast(sql), _HINT_VISIBLE, _HINT_INDEX, dialect="duckdb", hints=True, locatable=locatable, **kw)
+
+
+def test_a_value_in_another_column_of_the_same_table_is_named_first():
+    v = _hinted("SELECT id FROM orders WHERE status = 'west'")
+    assert v.message == (_TODAY_WEST + " It does appear in orders.lane, orders.region and shipments.state: if that "
+                         "column is the one meant, filter on it instead.")
+
+
+def test_a_value_in_another_table_is_named():
+    v = _hinted("SELECT id FROM orders WHERE status = 'pending'")
+    assert v.message.endswith(" It does appear in shipments.state: if that column is the one meant, filter on it "
+                              "instead.")
+
+
+def test_only_the_columns_the_caller_may_locate_are_named():
+    """A column the index holds the value in, left out of `locatable` (masked, row-filtered, denied or a view), is
+    never named, while one beside it is."""
+    v = _hinted("SELECT id FROM orders WHERE status = 'west'", locatable=(("orders", "region"), ("orders", "status")))
+    assert v.message.endswith(" It does appear in orders.region: if that column is the one meant, filter on it "
+                              "instead.")
+    assert "orders.lane" not in v.message and "shipments.state" not in v.message
+
+
+def test_at_most_three_columns_are_named():
+    many = _FakeIndex({("orders", "status"): {"open"}, **{("wide", f"c{i}"): {"west"} for i in range(5)}})
+    loc = tuple(("wide", f"c{i}") for i in range(5))
+    v = check_values(_ast("SELECT id FROM orders WHERE status = 'west'"),
+                     {"orders": {"id", "status"}, "wide": {f"c{i}" for i in range(5)}}, many, dialect="duckdb",
+                     hints=True, locatable=loc)
+    assert " It does appear in wide.c0, wide.c1 and wide.c2: " in v.message
+
+
+def test_no_sentence_where_no_other_column_holds_it():
+    v = _hinted("SELECT id FROM orders WHERE status = 'nowhere'")
+    assert "It does appear" not in v.message
+
+
+def test_a_row_filtered_refusal_is_unchanged():
+    sql = "SELECT id FROM orders WHERE status = 'west'"
+    assert _hinted(sql, row_filtered={"orders"}).message == check_values(
+        _ast(sql), _HINT_VISIBLE, _HINT_INDEX, dialect="duckdb", row_filtered={"orders"}).message
+
+
+def test_off_keeps_todays_message():
+    v = check_values(_ast("SELECT id FROM orders WHERE status = 'west'"), _HINT_VISIBLE, _HINT_INDEX, dialect="duckdb",
+                     locatable=_ALL)
+    assert v.message == _TODAY_WEST

@@ -123,7 +123,7 @@ def decide_statement(sql: str, *, adapter, snapshot: Snapshot, grants: GrantSet,
         types=column_types(snapshot), gregorian_calendar=getattr(adapter, "gregorian_calendar", False) is True,
         # The words a writer is repaired with, never what is refused: a past turn's SQL is not repaired, so its
         # refusal keeps the engine's plain wording.
-        repair_hints=False,
+        repair_hints=False, locatable=None,
     )
 
 

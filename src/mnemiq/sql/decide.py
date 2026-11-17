@@ -80,6 +80,16 @@ def _transpile_under_the_cap(shaped: exp.Expression, dialect: str, target: str) 
 
 
 @bounded
+def _without_computed(locatable, computed_columns) -> tuple[tuple[str, str], ...] | None:
+    """`locatable` less the columns the source computes on read. Only a set of them answers; None or Unanswered (the
+    catalogue could not say) leaves nothing to locate, never "nothing is computed" (`opaque_columns`)."""
+    if locatable is None:
+        return None
+    if not isinstance(computed_columns, frozenset):
+        return ()
+    return tuple(pair for pair in locatable if pair not in computed_columns)
+
+
 def decide(
     sql: str,
     visible: dict[str, set[str]],
@@ -95,6 +105,7 @@ def decide(
     types: dict[str, dict[str, str]] | None = None,
     gregorian_calendar: bool = False,
     repair_hints: bool = False,
+    locatable: tuple[tuple[str, str], ...] | None = None,
 ) -> Verdict:
     """The deterministic decider: shape, then access, then proof against the real source.
 
@@ -180,8 +191,8 @@ def decide(
     # Oracle, returning an SSN from an ungranted table while every check above passed it (M100).
     # Third shape of the same thing, after `count(*)` reaching `count_star` and `id + 1`
     # reaching a macro named `+`, and answered the same way: ask the source, do not enumerate.
-    computed = check_opaque_columns(shaped, opaque_columns(adapter, functions), target,
-                                    columns=known_columns(visible, policy))
+    computed_columns = opaque_columns(adapter, functions)
+    computed = check_opaque_columns(shaped, computed_columns, target, columns=known_columns(visible, policy))
     if computed is not None:
         return computed
 
@@ -220,7 +231,8 @@ def decide(
         # M5: the index is unfiltered and this runs before the RLS rewrite below, so the
         # refusal must know which tables this identity only sees a slice of.
         grounding = check_values(shaped, visible, values, row_filtered=set(policy.row_filters),
-                                 masks=policy.masks, dialect=target, hints=repair_hints)
+                                 masks=policy.masks, dialect=target, hints=repair_hints,
+                                 locatable=_without_computed(locatable, computed_columns))
         if grounding is not None:
             return grounding
 
