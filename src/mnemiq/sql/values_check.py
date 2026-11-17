@@ -1063,6 +1063,9 @@ class FilterValue:
     # (table, column) for a not_indexed value compared by equality or IN with a bare column, so the
     # source can be asked whether the column holds it; None for every other value.
     placed: tuple[str, str] | None = None
+    # `repair_hints`: for a value the source ruled out of its column, the other columns that hold it, as `table.column`
+    # (`locate_elsewhere`). Empty for every other value, and whenever the setting is off.
+    found_in: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1581,6 +1584,37 @@ def confirm_by_source(grounding: ValueGrounding, holds: Callable[[str, str, str]
         found = asked[key]
         values.append(value if found is None
                       else replace(value, outcome=GROUNDED if found else ABSENT, why="probed"))
+    return replace(grounding, values=tuple(values))
+
+
+def locate_elsewhere(grounding: ValueGrounding, candidates: list[tuple[str, str]],
+                     holds: Callable[[str, str, str], bool | None], in_index: Callable[[str, str, str], bool | None],
+                     limit: int) -> ValueGrounding:
+    """`grounding` with each value the source ruled out of its column (`ABSENT`, `probed`) given `found_in`: the
+    `candidates`, in order, that hold it, at most `ELSEWHERE_NAMED`, never its own column. `in_index` answers from the
+    value index where it can (True, False), else None, and then `holds` asks the source, at most `limit` times in all
+    here. A None from `holds` is not found."""
+    asked, values = 0, []
+    for value in grounding.values:
+        if value.outcome != ABSENT or value.why != "probed" or value.placed is None:
+            values.append(value)
+            continue
+        own = (value.placed[0].lower(), value.placed[1].lower())
+        found: list[str] = []
+        for table, column in candidates:
+            if len(found) == ELSEWHERE_NAMED:
+                break
+            if (table.lower(), column.lower()) == own:
+                continue
+            held = in_index(table, column, value.text)
+            if held is None:
+                if asked >= limit:
+                    continue
+                asked += 1
+                held = holds(table, column, value.text)
+            if held:
+                found.append(f"{table}.{column}")
+        values.append(replace(value, found_in=tuple(found)) if found else value)
     return replace(grounding, values=tuple(values))
 
 

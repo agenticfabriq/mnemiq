@@ -41,8 +41,14 @@ from mnemiq.execute.select import (
 from mnemiq.generate.generator import Generator, StrategyGenerator, temperature_floor
 from mnemiq.generate.plan_query import Deferred, Feedback, plan_query
 from mnemiq.semantic.retrieval import ContextPacket
+from mnemiq.sql.decide import decide
+from mnemiq.sql.locatable import locatable_columns
+from mnemiq.sql.policy import AccessPolicy, build_access_policy
+from mnemiq.sql.schema import visible_schema
 from mnemiq.sql.verdict import Approved
-from mnemiq.sql.values_check import confirm_by_source, source_holds
+from mnemiq.sql.values_check import (ABSENT, confirm_by_source, locate_elsewhere, probe_sql,
+                                     source_holds)
+from mnemiq.sql.views import ViewInventory, inventory_for
 from mnemiq.verify.sanity import answered_note, grounding_decides, sanity_check
 
 logger = logging.getLogger(__name__)
@@ -51,6 +57,24 @@ logger = logging.getLogger(__name__)
 # equality on a column the source has no index for can scan its table, and a probe not asked or
 # not answered only keeps its value unchecked, the empty result declined.
 PROBE_BUDGET_S = 10.0
+# `repair_hints`: the most source probes a turn spends looking for a missing value in other columns, inside the same
+# `PROBE_BUDGET_S`. The budget is read between probes, so one probe can overrun it, as the others can.
+ELSEWHERE_LIMIT = 6
+
+
+@dataclass(frozen=True)
+class Reach:
+    """What a turn may look into for a missing value (`repair_hints`), built from the caller's grants, never from the
+    snapshot alone: the columns it may be told about (`locatable_columns`, less every computed column), and what a
+    probe statement is decided under before it runs (`visible`, `policy`, `views`, `target`), and the tables of the
+    packet's cards, looked in after the statement's own."""
+
+    locatable: tuple[tuple[str, str], ...]
+    visible: dict[str, set[str]]
+    policy: AccessPolicy
+    views: ViewInventory
+    target: str
+    card_tables: tuple[str, ...]
 
 # Cycled across candidates in multi-candidate mode: engineered disagreement, so the
 # selector has something real to select over (uniform resampling measured 56% unanimous).
@@ -405,6 +429,8 @@ class Agent:
         # so the two together form a path back out for whatever the source said.
         feedback: Feedback | None = None
         held: dict = {"spent_s": 0.0}  # what the source said about a filter value, asked once a turn
+        # `repair_hints`: what this turn may look into for a missing value, built only when one is missing.
+        reach_for = (lambda: self._reach(packet, snapshot, grants)) if self.repair_hints else None
         failure: ExecutionError | None = None
         # An empty result tried again (`empty_retries`): each retry adds one try to the budget, so
         # `max_attempts` still counts what the database rejects. `standing` is the result before
@@ -518,7 +544,7 @@ class Agent:
             ran[key] = table
 
             with step(emit, Stage.VERIFY, **({"cached": True} if cached else {})):
-                approved = self._confirmed(approved, table, snapshot, held)
+                approved = self._confirmed(approved, table, snapshot, held, reach_for)
                 retry = self._empty_retry(packet, approved, table) if empties_left else None
                 if retry is None:
                     blocked, verdict = self._verified(packet, approved, table)
@@ -833,7 +859,7 @@ class Agent:
                 return approved, table
         return members[0]
 
-    def _confirmed(self, approved: Approved, table, snapshot: Snapshot, held: dict) -> Approved:
+    def _confirmed(self, approved: Approved, table, snapshot: Snapshot, held: dict, reach_for=None) -> Approved:
         """`approved` with each filter value the value index could not check asked of the source,
         where the sanity layer decides on the grounding: an empty result, or one NULL row from
         aggregates over nothing. Found is grounded and missing is absent; unanswered stays unchecked
@@ -860,7 +886,63 @@ class Agent:
                 logger.info("asked the source whether %s.%s holds a filter value: %s", table_name,
                             column, {True: "found", False: "missing", None: "no answer"}[held[key]])
             return held[key]
-        return replace(approved, value_grounding=confirm_by_source(grounding, holds))
+        confirmed = confirm_by_source(grounding, holds)
+        if reach_for is not None and any(v.outcome == ABSENT and v.why == "probed" for v in confirmed.values):
+            confirmed = self._located(confirmed, approved, reach_for, holds, held)
+        return replace(approved, value_grounding=confirmed)
+
+    def _reach(self, packet: ContextPacket, snapshot: Snapshot, grants: GrantSet) -> Reach | None:
+        """This turn's `Reach`, or None when the source cannot say which of its columns are computed: a column that
+        runs code on read is never probed, and not knowing which those are is never read as "none" (`opaque_columns`).
+        Every virtual column is left out, not only the ones whose expression calls a function: stricter, and it needs no
+        function inventory. Compared case folded, as Oracle reports them lower case."""
+        computed: set[tuple[str, str]] = set()
+        if self.adapter is not None and hasattr(self.adapter, "virtual_columns"):
+            try:
+                computed = {(t.lower(), c.lower()) for t, c, _ in self.adapter.virtual_columns()}
+            except Exception as exc:  # noqa: BLE001 -- the catalogue could not say: nothing is located this turn
+                logger.info("the source could not say which of its columns are computed (%s); no value is looked "
+                            "for in other columns this turn", type(exc).__name__)
+                return None
+        visible, policy, views = visible_schema(snapshot, grants), build_access_policy(snapshot, grants), \
+            inventory_for(snapshot)
+        return Reach(
+            locatable=tuple(pair for pair in locatable_columns(snapshot, visible, policy, views)
+                            if (pair[0].lower(), pair[1].lower()) not in computed),
+            visible=visible, policy=policy, views=views, target=self.dialect,
+            card_tables=tuple(dict.fromkeys(card.object_id for card in packet.cards)))
+
+    def _located(self, grounding, approved: Approved, reach_for, holds, held: dict):
+        """`grounding` with each value the source ruled out of its column looked for in the other columns this turn may
+        look into (`locate_elsewhere`): the statement's own tables first, then the cards'. A probe statement runs only
+        when the decider, with no source, approves it unchanged under the caller's own schema, policy and views, so a
+        gap in the allow-list fails closed (the plan's ruling 10); computed columns rest on the allow-list alone."""
+        if "reach" not in held:
+            held["reach"] = reach_for()
+        reach: Reach | None = held["reach"]
+        if reach is None:
+            return grounding
+        by_table: dict[str, list[tuple[str, str]]] = {}
+        for pair in reach.locatable:
+            by_table.setdefault(pair[0].lower(), []).append(pair)
+        order = dict.fromkeys(t.lower() for t in [*(getattr(approved, "tables", None) or []), *reach.card_tables])
+        candidates = [pair for table in order for pair in by_table.get(table, [])]
+
+        def in_index(table: str, column: str, text: str) -> bool | None:
+            if self.values is not None and self.values.has(table, column):
+                return self.values.contains(table, column, text)
+            return None
+
+        def locate(table: str, column: str, text: str) -> bool | None:
+            verdict = decide(probe_sql(table, column, text, self.dialect), reach.visible, dialect=self.dialect,
+                             target=reach.target, policy=reach.policy, views=reach.views)
+            if not isinstance(verdict, Approved) or verdict.narrowed != []:
+                return None
+            held["located"] = held.get("located", 0) + 1
+            return holds(table, column, text)
+
+        return locate_elsewhere(grounding, candidates, locate, in_index,
+                                max(0, ELSEWHERE_LIMIT - held.get("located", 0)))
 
     def _verified(self, packet: ContextPacket, approved: Approved, table):
         """The verifier's read, or None when none is wired. Returns (deferral, verdict).
