@@ -888,7 +888,14 @@ class Agent:
             return held[key]
         confirmed = confirm_by_source(grounding, holds)
         if reach_for is not None and any(v.outcome == ABSENT and v.why == "probed" for v in confirmed.values):
-            confirmed = self._located(confirmed, approved, reach_for, holds, held)
+            # Optional, so a fault anywhere in it (building what the turn may look into, the index, deciding a probe)
+            # leaves the decline as it would be with the setting off, never a failed turn (Codex's review). The kind
+            # of fault only: a source's or a store's words can quote the value.
+            try:
+                confirmed = self._located(confirmed, approved, reach_for, holds, held)
+            except Exception as exc:  # noqa: BLE001
+                logger.info("looking for a missing value in other columns failed (%s); the decline stands as it is",
+                            type(exc).__name__)
         return replace(approved, value_grounding=confirmed)
 
     def _reach(self, packet: ContextPacket, snapshot: Snapshot, grants: GrantSet) -> Reach | None:
@@ -906,9 +913,16 @@ class Agent:
                 return None
         visible, policy, views = visible_schema(snapshot, grants), build_access_policy(snapshot, grants), \
             inventory_for(snapshot)
+        # The catalogue names a computed column by the source's table, the allow-list by the snapshot's, which a
+        # binding can rename: a pair is left out under either name (Codex's review).
+        physical = {b.object_id: b.source_object for b in snapshot.source_bindings}
+
+        def computed_here(table: str, column: str) -> bool:
+            return any((name.lower(), column.lower()) in computed for name in (table, physical.get(table, table)))
+
         return Reach(
             locatable=tuple(pair for pair in locatable_columns(snapshot, visible, policy, views)
-                            if (pair[0].lower(), pair[1].lower()) not in computed),
+                            if not computed_here(*pair)),
             visible=visible, policy=policy, views=views, target=self.dialect,
             card_tables=tuple(dict.fromkeys(card.object_id for card in packet.cards)))
 

@@ -298,3 +298,37 @@ def test_off_asks_the_source_nothing_more(world):
     ans, _ = _ask(recording, snap, values, [MISSING_SQL])
     assert recording.probes() == ['SELECT 1 FROM "orders" WHERE "customer_ref" = \'B-0017\' LIMIT 1']
     assert ans.answer == TODAY, ans.answer
+
+
+def _bound(snap):
+    """`shipments` in the snapshot as `shipped`, bound to the source's `shipments`."""
+    renamed = [c.model_copy(update={"object_id": "shipped", "id": f"shipped.{c.name}"})
+               if c.object_id == "shipments" else c for c in snap.columns]
+    binding = SourceBinding(id="b1", source_id="src", object_id="shipped", source_object="shipments",
+                            binding_type="table")
+    return snap.model_copy(update={"columns": renamed, "source_bindings": [*snap.source_bindings, binding]})
+
+
+def test_a_computed_column_of_a_source_bound_table_is_never_probed(world):
+    """Codex's review: the catalogue names computed columns by the source's table, the allow-list by the snapshot's, so
+    a bound table's computed column passed. Compared by the source name, it is left out."""
+    adapter, snap, values = world
+    recording = _Recording(adapter, virtual=lambda: [("shipments", "batch_ref", "upper(id)")])
+    ans, _ = _ask(recording, _bound(snap), values, [MISSING_SQL], grants=GrantSet(frozenset({"orders", "shipped"})),
+                  cards=("orders", "shipped"), repair_hints=True)
+    assert recording.located() and not any('"shipments"' in s for s in recording.located())
+    assert "shipped.batch_ref" not in ans.answer and "orders.batch_ref" in ans.answer, ans.answer
+
+
+@pytest.mark.parametrize("where", ["locatable_columns", "locate_elsewhere", "decide"])
+def test_a_fault_while_looking_leaves_todays_decline(world, monkeypatch, where):
+    """Codex's review: the lookup is optional, so a fault in building what the turn may look into, in the lookup, or in
+    deciding a probe statement leaves the decline as it would be with the setting off, never a failed turn."""
+    adapter, snap, values = world
+
+    def fault(*args, **kwargs):
+        raise RuntimeError("the store went away")
+
+    monkeypatch.setattr(loop_mod, where, fault)
+    ans, _ = _ask(_Recording(adapter), snap, values, [MISSING_SQL], repair_hints=True)
+    assert ans.failed is False and ans.answer == TODAY, ans.answer
