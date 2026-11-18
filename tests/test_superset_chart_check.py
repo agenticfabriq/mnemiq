@@ -1726,3 +1726,15 @@ def test_all_null_on_the_chart_but_a_number_in_mnemiqs_is_a_mismatch():
     out = chart_check._compare(7, chart_check._Rows({(): [None]}, 1), chart_check._Rows({(): [3.0]}, 1), None,
                                source=chart_check._OWN_SQL)
     assert out.status is ChartStatus.MISMATCH
+
+
+def test_a_chart_with_groups_and_no_measures_still_checks():
+    chart = mine = chart_check._Rows({("a",): []}, 1)
+    out = chart_check._compare(7, chart, mine, None, source=chart_check._OWN_SQL)
+    assert out.status is ChartStatus.CHECKED
+
+
+def test_one_null_measure_beside_a_numbered_one_is_checked_not_empty():
+    chart = mine = chart_check._Rows({(): [None, 2.5]}, 1)
+    out = chart_check._compare(7, chart, mine, None, source=chart_check._OWN_SQL)
+    assert out.status is ChartStatus.CHECKED
