@@ -565,14 +565,10 @@ def percent_problem(kinds: dict[str, MeasureKind], labels: tuple[str, ...], rows
             value = values[i] if i < len(values) else None
             if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool) \
                     and math.isfinite(value) and abs(value) > 1:
-                return (f"the chart shows {label!r}, a percent, above 100%: the value {_plain_number(value)} is "
-                        "shown as a percent of itself times 100, so a percent measure must be a fraction from 0 to 1 "
-                        "(a 0 to 100 number shows 100 times too large)")
+                return (f"the chart shows {label!r} above 100% ({value}), as a measure on a 0 to 100 scale would "
+                        "under a percent format")
     return None
 
-
-def _plain_number(value) -> str:
-    return f"{float(value):,.4g}"
 
 
 def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, snapshot: Snapshot, grants: GrantSet,

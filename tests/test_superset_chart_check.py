@@ -1745,7 +1745,8 @@ def test_one_null_measure_beside_a_numbered_one_is_checked_not_empty():
 
 
 def test_a_percent_shown_above_100_is_format_wrong_in_the_helper():
-    assert "above 100%" in percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [54.97]})
+    assert percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [54.97]}) == (
+        "the chart shows 'Rate' above 100% (54.97), as a measure on a 0 to 100 scale would under a percent format")
     assert "above 100%" in percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [decimal.Decimal("-2")]})
 
 
