@@ -478,6 +478,9 @@ def _compare(chart_id: int, chart: _Rows, mine: _Rows, row_limit: int | None, *,
         return outcome(ChartStatus.MISMATCH, f"{source} finds a group the chart does not show")
     if not shown:
         return outcome(ChartStatus.EMPTY, f"the chart shows no rows, and {source} finds none")
+    if all(value is None for rows in (chart, mine) for values in rows.values.values() for value in values):
+        return outcome(ChartStatus.EMPTY, f"the chart's measures are NULL on every row it shows, and {source} "
+                                          "computes the same")
     return outcome(ChartStatus.CHECKED, f"the chart's numbers match {source}")
 
 

@@ -967,6 +967,27 @@ def test_a_funnel_is_made_through_the_extension_and_its_data_read(live, served, 
             check=final["checks"].get(str(chart_id)), message=run.last_step.get("message"))
 
 
+def test_a_measure_that_is_null_everywhere_is_empty(live, served, model, policy_id):
+    """A big number whose written measure is NULL on every row (`MAX` of a CASE no row satisfies). Expected: the premise
+    holds (the source's answer is one NULL), the build runs to `done`, and the chart's check is `empty`, never
+    `checked`: Superset shows it as "No data"."""
+    expression = "MAX(CASE WHEN premium < 0 THEN premium END)"
+    assert ground_truth(live, f"SELECT {expression} FROM policy") == [(None,)]
+    worst = Measure(name="worst_refund", label="Worst refund", expression=expression, kind=MeasureKind.NUMBER,
+                    dataset_id=policy_id, description="Largest negative premium", asked_by="")
+    big = ChartSpec(key="worst_refund", family=Family.BIG_NUMBER, title="Worst refund", dataset_id=policy_id,
+                    measures=(WrittenRef(worst),), dimensions=(), time_column=None, time_grain=None, filters=(),
+                    row_limit=None, source=None, target=None)
+    plan = BuildPlan(charts=(big,), measures=(worst,))
+    run = run_build(live, served, model, plan, "all null", goal="the worst refund")
+    found = summary(run, served, plan) if run.build_id else {"stopped": run.stopped}
+    record("all null", found)
+    assert_ran_to_the_end(run)
+    [chart_id] = [step["object_id"] for step in run.final["steps"] if step["key"] == big.key]
+    assert run.final["checks"].get(str(chart_id)) == "empty", run.final["checks"]
+    assert_no_model_call(run)
+
+
 # --- a histogram, made through the extension ------------------------------------------------------------------------
 
 

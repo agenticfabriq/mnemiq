@@ -1706,3 +1706,23 @@ def test_a_before_call_that_raises_stops_the_check_before_its_next_call(fake):
         check_chart(_adapter(fake), chart_id=CHART_ID, dataset_id=DATASET_ID, kinds=TOTAL["kinds"], saved={},
                     snapshot=SNAPSHOT, grants=GRANTS, guard_fanout=False, before_call=second_stops)
     assert [call.tool for call in fake.calls] == ["get_chart_info"]
+
+
+# --- a measure that is NULL on every row ----------------------------------------------------------------------------
+
+
+def test_a_chart_whose_measures_are_all_null_is_empty_not_checked():
+    chart = mine = chart_check._Rows({(): [None]}, 1)
+    out = chart_check._compare(7, chart, mine, None, source=chart_check._OWN_SQL)
+    assert out.status is ChartStatus.EMPTY and "NULL on every row" in out.reason
+
+
+def test_some_null_values_still_compare_and_check():
+    chart = mine = chart_check._Rows({("a",): [1.5], ("b",): [None]}, 2)
+    assert chart_check._compare(7, chart, mine, None, source=chart_check._OWN_SQL).status is ChartStatus.CHECKED
+
+
+def test_all_null_on_the_chart_but_a_number_in_mnemiqs_is_a_mismatch():
+    out = chart_check._compare(7, chart_check._Rows({(): [None]}, 1), chart_check._Rows({(): [3.0]}, 1), None,
+                               source=chart_check._OWN_SQL)
+    assert out.status is ChartStatus.MISMATCH
