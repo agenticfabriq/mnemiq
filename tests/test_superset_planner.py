@@ -1243,10 +1243,17 @@ def test_every_key_the_shape_declares_is_one_the_writer_writes():
 def test_a_percent_scaled_by_100_is_found():
     for text in ("100.0 * COUNT(*) FILTER (WHERE x) / COUNT(*)", "COUNT(*) * 100 / NULLIF(COUNT(*), 0)",
                  "SUM(a) / SUM(b) / 0.01", "SUM(a)::numeric * 100::numeric / COUNT(*)",
-                 "ROUND(100.0 * AVG(a), 1)"):
+                 "ROUND(100.0 * AVG(a), 1)", "AVG(x) * '100'::numeric", "AVG(x) * '100'", "AVG(x) / '0.01'::numeric",
+                 "AVG(x) * -100", "AVG(x) * (10 * 10)", "AVG(x) / (1.0 / 100)", "SUM(a) / (SUM(b) / 100.0)",
+                 "SUM(a) / SUM(b) / (1/100.0)", "SUM(a) / NULLIF(SUM(b) / 100.0, 0)",
+                 "AVG(CASE WHEN x THEN 100 ELSE 0 END)", "SUM(CASE WHEN x THEN 100.0 ELSE 0 END) / COUNT(*)",
+                 "SUM(a) / (SUM(b) * 0.01)", "AVG(CASE WHEN x THEN 0 ELSE 100 END)"):
         assert scales_by_100(text), text
     for text in ("COUNT(*) FILTER (WHERE x)::float / NULLIF(COUNT(*), 0)", "SUM(a) / 1000.0", "SUM(a) * 1000",
-                 "SUM(a) * 'x100'", "not sql ((", "SUM(a) / 100"):
+                 "SUM(a) * 'x100'", "not sql ((", "SUM(a) / 100", "ROUND(SUM(a), 100)",
+                 "COUNT(*) FILTER (WHERE n > 100) / COUNT(*)::float", "AVG(CASE WHEN n > 100 THEN 1 END)",
+                 "SUM(dollars) / SUM(cents / 100.0)", "SUM(a) * 'sNaN'", "SUM(a) / (1 / 0)",
+                 "AVG(CASE WHEN x THEN 1.0 ELSE 0 END)"):
         assert not scales_by_100(text), text
 
 
@@ -1277,3 +1284,16 @@ def test_the_prompt_says_a_percent_is_a_fraction():
     _plan(GOAL, LLMPlanner(model), _tools())
     system = model.sent[0]["system"]
     assert "a percent is a fraction from 0 to 1" in system and "never multiply it by 100" in system
+
+
+def test_a_saved_metric_on_a_0_to_100_scale_cannot_be_planned_as_a_percent():
+    metrics = {1: [_metric(1, "win_pct", "100.0 * AVG(premium)")]}
+    chart = _chart("rate", Family.BIG_NUMBER, [SavedRef("win_pct", K.PERCENT)])
+    refused = _plan(GOAL, FakePlanner(_valid_plan(measures=(), charts=(chart,))), _tools(metrics=metrics))
+    assert isinstance(refused, PlanRefused)
+    assert _parts(refused)["chart 'rate'"] == (
+        "the saved metric 'win_pct' is on a 0 to 100 scale, so it cannot be shown as a percent: plan it with kind "
+        "number, or write the fraction")
+    number = _chart("rate", Family.BIG_NUMBER, [SavedRef("win_pct", K.NUMBER)])
+    assert isinstance(_plan(GOAL, FakePlanner(_valid_plan(measures=(), charts=(number,))),
+                            _tools(metrics=metrics)), BuildPlan)

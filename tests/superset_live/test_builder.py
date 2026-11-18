@@ -1001,7 +1001,7 @@ def test_a_percent_on_a_0_to_100_scale_is_format_wrong(live, served, model, poli
     """A big number whose written percent measure is `SUM(premium) / 1000.0`, which is above 1 on the seed. Expected:
     the premise holds (the source's answer is above 1), the build runs to `done`, and the chart's check is
     `format_wrong`, never `checked`: Superset would show it under the percent format as a hundred times too large. The
-    build's message, as the store keeps it, says "above 100%". No model client is made or called."""
+    build's message, as the build's answer gives it, says "above 100%". No model client is made or called."""
     expression = "SUM(premium) / 1000.0"
     [(truth,)] = ground_truth(live, f"SELECT {expression} FROM policy")
     assert truth is not None and abs(truth) > 1, truth
@@ -1015,6 +1015,24 @@ def test_a_percent_on_a_0_to_100_scale_is_format_wrong(live, served, model, poli
     assert run.final["checks"].get(str(chart_id)) == "format_wrong", run.final["checks"]
     message = run.last_step.get("message") or ""
     assert "format_wrong" in message and "above 100%" in message, message
+    assert_no_model_call(run)
+
+
+def test_a_fraction_percent_checks(live, served, model, policy_id):
+    """The positive control: a big number whose written percent measure is `AVG(premium) / MAX(premium)`, a fraction.
+    Expected: the premise holds (the source's answer is at most 1), the build runs to `done`, and the chart's check is
+    `checked`. No model client is made or called."""
+    expression = "AVG(premium) / MAX(premium)"
+    [(truth,)] = ground_truth(live, f"SELECT {expression} FROM policy")
+    assert truth is not None and 0 <= truth <= 1, truth
+    rate, big = _percent_big_number(policy_id, "fraction_rate", expression)
+    plan = BuildPlan(charts=(big,), measures=(rate,))
+    run = run_build(live, served, model, plan, "fraction percent", goal="a rate")
+    found = summary(run, served, plan) if run.build_id else {"stopped": run.stopped}
+    record("fraction percent", found)
+    assert_ran_to_the_end(run)
+    [chart_id] = [step["object_id"] for step in run.final["steps"] if step["key"] == big.key]
+    assert run.final["checks"].get(str(chart_id)) == "checked", run.final["checks"]
     assert_no_model_call(run)
 
 

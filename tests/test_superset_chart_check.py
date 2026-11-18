@@ -30,6 +30,7 @@ from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Column, Snapshot
 from mnemiq.superset.adapter import SupersetSqlAdapter
 from mnemiq.superset.chart_check import (
+    ChartCheck,
     ChartStatus,
     DatasetFacts,
     Expectation,
@@ -1735,9 +1736,16 @@ def test_a_chart_with_groups_and_no_measures_still_checks():
     assert out.status is ChartStatus.CHECKED
 
 
-def test_one_null_measure_beside_a_numbered_one_is_checked_not_empty():
-    chart = mine = chart_check._Rows({(): [None, 2.5]}, 1)
-    out = chart_check._compare(7, chart, mine, None, source=chart_check._OWN_SQL)
+def test_one_null_measure_beside_a_numbered_one_is_empty_naming_it():
+    chart = mine = chart_check._Rows({(): [2.5, None, None]}, 1)
+    out = chart_check._compare(7, chart, mine, None, source=chart_check._OWN_SQL, labels=("A", "B", "C"))
+    assert out.status is ChartStatus.EMPTY
+    assert out.reason == "the chart's measure 'B' is NULL on every row it shows, and mnemiq's own SQL computes the same"
+
+
+def test_a_measure_null_on_some_rows_only_stays_checked():
+    chart = mine = chart_check._Rows({("a",): [2.5, None], ("b",): [3.5, 1.0]}, 2)
+    out = chart_check._compare(7, chart, mine, None, source=chart_check._OWN_SQL, labels=("A", "B"))
     assert out.status is ChartStatus.CHECKED
 
 
@@ -1756,6 +1764,8 @@ def test_a_fraction_percent_checks_and_a_count_is_not_judged_by_scale():
     assert percent_problem({"N": MeasureKind.COUNT}, ("N",), {(): [151]}) is None
     assert percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [None]}) is None
     assert percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [float("nan")]}) is None
+    assert percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [1.0000000000000002]}) is None
+    assert percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [1.001]}) is not None
 
 
 FLOAT_COLUMNS = (("region", "object"), ("m0", "float64"))
@@ -1770,6 +1780,7 @@ def _rate_chart(fake, value):
 def test_a_checked_chart_whose_percent_is_above_100_is_format_wrong(fake):
     _rate_chart(fake, 54.97)
     check = _check(fake, kinds={"Average premium": MeasureKind.PERCENT})
+    assert type(check) is ChartCheck, "the private subclass never leaves the module"
     assert check.status is ChartStatus.FORMAT_WRONG, check.reason
     assert "above 100%" in check.reason
     assert check.chart_values == check.mnemiq_values == (("east", 54.97),)
@@ -1777,7 +1788,8 @@ def test_a_checked_chart_whose_percent_is_above_100_is_format_wrong(fake):
 
 def test_a_checked_chart_whose_percent_is_a_fraction_stays_checked(fake):
     _rate_chart(fake, 0.5497)
-    assert _check(fake, kinds={"Average premium": MeasureKind.PERCENT}).status is ChartStatus.CHECKED
+    check = _check(fake, kinds={"Average premium": MeasureKind.PERCENT})
+    assert check.status is ChartStatus.CHECKED and type(check) is ChartCheck
 
 
 def test_a_number_above_one_is_not_a_percent_problem_for_a_non_percent_kind(fake):
@@ -1785,3 +1797,14 @@ def test_a_number_above_one_is_not_a_percent_problem_for_a_non_percent_kind(fake
     _serve(fake, form_data=form, chart=_chart_data(["region", "Average premium"], ("east", 54.97)),
            mnemiq=_result(("east", 54.97), columns=FLOAT_COLUMNS))
     assert _check(fake, kinds={"Average premium": MeasureKind.NUMBER}).status is ChartStatus.CHECKED
+
+
+def test_a_big_number_percent_above_100_is_format_wrong_through_check_chart(fake):
+    form = {"viz_type": "big_number_total", "metric": copy.deepcopy(PREMIUM), "adhoc_filters": [],
+            "y_axis_format": ",.1%", "currency_format": None}
+    _serve(fake, form_data=form, chart=_chart_data(["Total premium"], (54.97,)),
+           mnemiq=_result((54.97,), columns=(("m0", "float64"),)))
+    check = _check(fake, kinds={"Total premium": MeasureKind.PERCENT})
+    assert type(check) is ChartCheck and check.status is ChartStatus.FORMAT_WRONG, check
+    assert check.reason == ("the chart shows 'Total premium' above 100% (54.97), as a measure on a 0 to 100 scale "
+                            "would under a percent format")
