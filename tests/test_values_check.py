@@ -199,3 +199,55 @@ def test_a_fault_while_looking_elsewhere_leaves_todays_refusal():
     v = check_values(_ast("SELECT id FROM orders WHERE status = 'west'"), _HINT_VISIBLE, index, dialect="duckdb",
                      hints=True, locatable=_ALL)
     assert v.message == _TODAY_WEST
+
+
+# Every value a statement filters on that its column does not hold is named in ONE refusal. Naming only the first cost
+# a repair attempt per value: a writer that fixed the one it was told of met the next on its following attempt, and
+# with three attempts a statement holding three such values was declined before its last was named.
+PLANTS = _FakeIndex({("orders", "plant"): {"P1", "P2"}, ("shipments", "plant"): {"W1"}, ("orders", "kind"): {"K1"}})
+PLANT_VISIBLE = {"orders": {"id", "plant", "kind"}, "shipments": {"order_id", "plant"}}
+TWO_WRONG = ("SELECT * FROM orders o JOIN shipments s ON s.order_id = o.id "
+             "WHERE o.plant = 'X1' AND s.plant = 'X2'")
+
+
+def test_one_missing_literal_keeps_the_one_value_message():
+    v = check_values(_ast("SELECT Country FROM gasstations WHERE Country = 'CZE'"), VISIBLE, IDX, dialect="sqlite")
+    assert v.message == ("the value 'CZE' does not appear in gasstations.Country; the real values include: "
+                         "Czech Republic, Slovakia. Use the intended one.")
+
+
+def test_every_missing_literal_is_named_in_one_refusal():
+    v = check_values(_ast(TWO_WRONG), PLANT_VISIBLE, PLANTS, dialect="duckdb")
+    assert isinstance(v, Refusal) and v.code == RefusalCode.VALUE_GROUNDING
+    assert "the value 'X1' does not appear in orders.plant; the real values include: P1, P2." in v.message
+    assert "the value 'X2' does not appear in shipments.plant; the real values include: W1." in v.message
+    assert v.message.startswith("2 values do not appear in their columns:")
+
+
+def test_a_missing_member_of_an_in_list_is_named_beside_an_equality():
+    sql = "SELECT * FROM orders WHERE plant = 'X1' AND kind IN ('K1', 'X3')"
+    v = check_values(_ast(sql), PLANT_VISIBLE, PLANTS, dialect="duckdb")
+    assert "'X1'" in v.message and "orders.plant" in v.message
+    assert "'X3'" in v.message and "orders.kind" in v.message
+
+
+def test_the_same_missing_value_on_the_same_column_is_named_once():
+    sql = "SELECT * FROM orders WHERE plant = 'X1' OR plant IN ('X1', 'P1')"
+    v = check_values(_ast(sql), PLANT_VISIBLE, PLANTS, dialect="duckdb")
+    assert v.message.count("'X1'") == 1
+    assert not v.message.startswith("2 values")
+
+
+def test_at_most_five_missing_values_are_named_and_the_rest_counted():
+    wrong = ", ".join(f"'X{i}'" for i in range(7))
+    v = check_values(_ast(f"SELECT * FROM orders WHERE plant IN ({wrong})"), PLANT_VISIBLE, PLANTS, dialect="duckdb")
+    assert v.message.startswith("7 values do not appear in their columns:")
+    assert [f"'X{i}'" in v.message for i in range(7)] == [True] * 5 + [False] * 2
+    assert v.message.endswith("2 more are not named here.")
+
+
+def test_a_row_filtered_table_withholds_its_values_beside_another_tables():
+    v = check_values(_ast(TWO_WRONG), PLANT_VISIBLE, PLANTS, dialect="duckdb", row_filtered={"orders"})
+    assert "'X1'" in v.message and "P1" not in v.message and "P2" not in v.message
+    assert "row-filtered" in v.message
+    assert "the value 'X2' does not appear in shipments.plant; the real values include: W1." in v.message

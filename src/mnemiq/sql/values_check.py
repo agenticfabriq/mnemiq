@@ -818,7 +818,7 @@ def check_values(
     hints: bool = False,
     locatable: tuple[tuple[str, str], ...] | Callable[[], tuple[tuple[str, str], ...]] | None = None,
 ) -> Refusal | None:
-    """Flag an equality/IN filter whose string literal does not exist in its indexed column.
+    """Flag every equality/IN filter whose string literal does not exist in its indexed column, in one refusal.
 
     Fires only where the column resolves unambiguously to an indexed base column -- a bounded,
     non-key, non-PII string column whose full value set we hold. Anything we cannot resolve or
@@ -839,7 +839,8 @@ def check_values(
     row_filtered = row_filtered or set()
     resolve = _resolver(ast, visible, dialect)
 
-    def violation(column: exp.Column, literal: str) -> Refusal | None:
+    def violation(column: exp.Column, literal: str) -> tuple[str, str] | None:
+        """The base column `column` reads, when it is indexed and does not hold `literal`."""
         resolved = resolve(column)
         if resolved is None:
             return None
@@ -848,6 +849,12 @@ def check_values(
             return None
         if not values.has(table, name) or values.contains(table, name, literal):
             return None
+        return resolved
+
+    located: list[tuple[tuple[str, str], ...]] = []  # `locatable` read once, on the first value that needs it
+
+    def said(table: str, name: str, literal: str) -> str:
+        """The sentences that name one missing value."""
         # FOLDED, and folding is safe here for the reason it is not safe for the filter
         # lookup itself: this set decides whether to WITHHOLD, so matching more of it discloses
         # less. Measured before this, with `row_filters` keyed `CLAIM` against a snapshot keyed
@@ -856,14 +863,9 @@ def check_values(
         # exact-keyed control withheld it. So the fold that made the filter reach the query left
         # this branch still believing the table was unfiltered, and turned M5 back on.
         if names_one_object(table, row_filtered):
-            return Refusal(
-                code=RefusalCode.VALUE_GROUNDING,
-                message=(
-                    f"the value {literal!r} does not appear in {table}.{name}. "
+            return (f"the value {literal!r} does not appear in {table}.{name}. "
                     "The valid values are not listed because your access to this table is "
-                    "row-filtered and the value index is not."
-                ),
-            )
+                    "row-filtered and the value index is not.")
         near = values.nearest(table, name, literal)
         # `repair_hints`: where else the value is, among the columns this caller may be told about (`locatable`, a
         # factory built only here, on a refusal). Optional, so a fault in it leaves the refusal as it is with the setting
@@ -871,39 +873,51 @@ def check_values(
         elsewhere: list[str] = []
         if hints and locatable is not None:
             try:
-                pairs = locatable() if callable(locatable) else locatable
+                if not located:
+                    located.append(locatable() if callable(locatable) else locatable)
+                pairs = located[0]
                 elsewhere = elsewhere_in_index(values, literal, pairs, (table, name)) if pairs else []
             except Exception as exc:  # noqa: BLE001
                 logger.info("looking for a refused value in other columns failed (%s); the refusal stands as it is",
                             type(exc).__name__)
-        return Refusal(
-            code=RefusalCode.VALUE_GROUNDING,
-            message=(
-                f"the value {literal!r} does not appear in {table}.{name}; "
+        return (f"the value {literal!r} does not appear in {table}.{name}; "
                 f"the real values include: {', '.join(shown(v) for v in near)}. Use the intended one."
                 + (f" It does appear in {_listed_columns(elsewhere)}: if that column is the one meant, filter on it "
-                   "instead." if elsewhere else "")
-            ),
-        )
+                   "instead." if elsewhere else ""))
 
+    # Each (table, column, value) once, in the order the statement holds them: its equalities, then its IN lists.
+    missing: dict[tuple[str, str, str], None] = {}
     for eq in ast.find_all(exp.EQ):
         pair = _column_and_string(eq.left, eq.right)
-        if pair is not None:
-            found = violation(*pair)
-            if found is not None:
-                return found
+        if pair is not None and (placed := violation(*pair)) is not None:
+            missing.setdefault((*placed, pair[1]))
 
     for member in ast.find_all(exp.In):
         column = member.this
         if not isinstance(column, exp.Column):
             continue
         for item in member.expressions:
-            if isinstance(item, exp.Literal) and item.is_string:
-                found = violation(column, item.this)
-                if found is not None:
-                    return found
+            if isinstance(item, exp.Literal) and item.is_string and (placed := violation(column, item.this)) is not None:
+                missing.setdefault((*placed, item.this))
 
-    return None
+    if not missing:
+        return None
+    if len(missing) == 1:
+        return Refusal(code=RefusalCode.VALUE_GROUNDING, message=said(*next(iter(missing))))
+    # Every one in one refusal: named one at a time, a writer that fixed the value it was told of met the next on its
+    # following attempt, and a statement holding as many such values as it had attempts was declined before the last
+    # was named (measured: one site code fixed, then a second site's, then the first put back).
+    named = list(missing)[:VALUES_NAMED]
+    parts = [f"{len(missing)} values do not appear in their columns:"]
+    parts += [f"({i}) {said(*m)}" for i, m in enumerate(named, start=1)]
+    if len(missing) > len(named):
+        parts.append(f"{len(missing) - len(named)} more are not named here.")
+    return Refusal(code=RefusalCode.VALUE_GROUNDING, message=" ".join(parts))
+
+
+# At most this many missing values named in one refusal, each with its column's nearest real values: enough for a
+# statement's filters, short of an inventory. The rest are counted, and named once these are fixed.
+VALUES_NAMED = 5
 
 
 # At most this many columns named where a refused value does appear: a sentence to act on, not an inventory. Its own
