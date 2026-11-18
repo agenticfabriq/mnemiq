@@ -49,7 +49,7 @@ from mnemiq.sql.schema import column_types, visible_schema
 from mnemiq.superset.adapter import JINJA_DELIMITERS
 from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenRef, plan_refusal
 from mnemiq.superset.grants import UnreadableAnswer, read_datasets, table_bindings
-from mnemiq.superset.literals import Absent, absent_literals, filter_statement
+from mnemiq.superset.literals import Absent, Probes, absent_literals, filter_statement
 from mnemiq.superset.marker import format_marker
 from mnemiq.superset.measures import Measure, MeasureKind, MeasureRefused, check_measure, scales_by_100, \
     superset_text_problem
@@ -984,13 +984,20 @@ def _chart_columns(chart: ChartSpec) -> list[str]:
 
 def _absent_reason(absent: Absent) -> str:
     """Why a part that filters on a value no row the builder can read holds is refused, naming the values its column
-    holds where the source said."""
-    held = (f"{absent.column} holds: {', '.join(absent.held)}{' and more' if absent.more else ''}" if absent.held
-            else "the source did not say which values it holds")
+    holds where the source said. Each value is quoted (`repr`), so one holding ", " never reads as two, and one holding
+    a line break never starts a line of the repair's prompt that reads as another part's refusal."""
+    if absent.held is None:
+        held = "the source did not say which values it holds"
+    elif not absent.held:
+        held = f"no row the builder can read holds any value of {absent.column}"
+    else:
+        held = (f"{absent.column} holds: {', '.join(repr(value) for value in absent.held)}"
+                f"{' and more' if absent.more else ''}")
     return f"it filters {absent.column} on {absent.literal!r}, which no row the builder can read holds; {held}"
 
 
-def _filter_refusals(chart: ChartSpec, on: _Rows, *, adapter, snapshot: Snapshot, grants: GrantSet) -> list[str]:
+def _filter_refusals(chart: ChartSpec, on: _Rows, *, adapter, snapshot: Snapshot, grants: GrantSet,
+                     probes: Probes) -> list[str]:
     """The reasons `chart` is refused for a filter on a value no row the builder can read holds: each filter that
     compares a column with strings by `=`, `!=`, `IN` or `NOT IN`, asked of the table and column the chart's rows read
     it from (`_Rows.origins`), as the builder. A negated filter on such a value excludes nothing, so it is refused as
@@ -1002,7 +1009,7 @@ def _filter_refusals(chart: ChartSpec, on: _Rows, *, adapter, snapshot: Snapshot
         if sql is None:
             continue
         for absent in absent_literals(sql, adapter=adapter, snapshot=snapshot, grants=grants,
-                                      timeout_s=DEFAULT_TIMEOUT_S):
+                                      timeout_s=DEFAULT_TIMEOUT_S, probes=probes):
             reasons.setdefault(_absent_reason(absent))
     return list(reasons)
 
@@ -1012,6 +1019,8 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
     """The plan with its reusable measures replaced by the saved metrics that say the same, or every part refused, each
     with mnemiq's own reason."""
     refused: list[RefusedPart] = []
+    # Every probe of a filter's value this check makes, the measures' and the charts', shares one budget and one memo.
+    probes = Probes()
 
     def refuse(part: str, reason: str, *, repairable: bool = True) -> None:
         refused.append(RefusedPart(part, reason, repairable))
@@ -1126,7 +1135,7 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
                          "without multiplying by 100")
             continue
         absent = absent_literals(verdict.asked_sql, adapter=adapter, snapshot=snapshot, grants=grants,
-                                 timeout_s=DEFAULT_TIMEOUT_S) if verdict.asked_sql else []
+                                 timeout_s=DEFAULT_TIMEOUT_S, probes=probes) if verdict.asked_sql else []
         for reason in dict.fromkeys(_absent_reason(item) for item in absent):
             refuse(part, reason)
         if absent:
@@ -1223,7 +1232,8 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
             if why is not None:
                 refuse(part, why)
         if len(refused) == before:
-            for reason in _filter_refusals(spec, on, adapter=adapter, snapshot=snapshot, grants=grants):
+            for reason in _filter_refusals(spec, on, adapter=adapter, snapshot=snapshot, grants=grants,
+                                           probes=probes):
                 refuse(part, reason)
         charts.append(spec)
 

@@ -42,7 +42,7 @@ from mnemiq.server.superset_refusals import SIGN_IN_AGAIN
 from mnemiq.superset.build_store import BUILD_TABLE, MEASURE_TABLE
 from mnemiq.superset.builder import start_build
 from mnemiq.superset.chart_form import _NOT_CHECKED_TYPES
-from mnemiq.superset.charts import ChartSpec, Family, WrittenRef, generate_chart_request
+from mnemiq.superset.charts import ChartSpec, Family, Filter, WrittenRef, generate_chart_request
 from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetRefusedCaller, SupersetUnavailable
 from mnemiq.superset.extension import TOOL_PREFIX
 from mnemiq.superset.marker import Marker, format_marker, parse_marker
@@ -1102,7 +1102,7 @@ def test_a_value_no_row_holds_is_refused_and_the_repair_is_told_the_values(live,
     """A two-answer stub: its first plan's measure counts the policies of `region = 'West'`, which no row holds (the
     seed's regions are `west`, `east` and `central`, measured here); its repair counts `region = 'west'`. The builder is
     analyst, whom no row rule narrows. Expected: the stub is asked twice; its second prompt carries the measure's
-    refusal, which names the values the column holds, "central, east, west"; the first prompt names none of them; the
+    refusal, which names the values the column holds, "'central', 'east', 'west'"; the first prompt names none of them; the
     repaired build runs to `done` and its chart checks. No model client is made or called. Values from the data are
     compared as bools and kept out of the record, so a failure does not print them either."""
     seeded = sorted(row[0] for row in ground_truth(live, "SELECT DISTINCT region FROM policy")) == REGIONS
@@ -1112,7 +1112,7 @@ def test_a_value_no_row_holds_is_refused_and_the_repair_is_told_the_values(live,
     run = run_build(live, served, model, [first, repaired], "value-repaired", goal=goal)
     record("value-repaired", _no_values(summary(run, served, repaired) if run.build_id else {"stopped": run.stopped}))
     reason = ("it filters policy.region on 'West', which no row the builder can read holds; policy.region holds: "
-              "central, east, west")
+              "'central', 'east', 'west'")
     assert run.planner.goals == [goal] * 2
     opening, repair = _prompts(run, goal)
     told = f"- measure 'region_policies': {reason}" in repair
@@ -1143,7 +1143,7 @@ def test_a_row_rule_builder_is_told_only_the_values_it_may_read(live, served, mo
     record("value-row-rule", _no_values(summary(run, served)))
     [start] = run.requests
     reason = ("it filters policy.region on 'east', which no row the builder can read holds; policy.region holds: "
-              "west")
+              "'west'")
     assert start.status_code == 200, start.status_code
     parts = [part.get("part") for part in (start.body.get("refused") or {}).get("parts", [])]
     exact = start.body == {"refused": {
@@ -1163,6 +1163,43 @@ def test_a_row_rule_builder_is_told_only_the_values_it_may_read(live, served, mo
     observe("value row rule", status=start.status_code, parts=parts, exact=exact, told=told,
             calls=dict(Counter(short(call.tool) for call in start.calls)))
 
+
+def _filtered_count(policy_id: int, region: str) -> BuildPlan:
+    """A big number counting policies, filtered by the chart's own `region = <region>` filter."""
+    counted = Measure(name="filtered_policies", label="Filtered policies", expression="COUNT(id)",
+                      kind=MeasureKind.COUNT, dataset_id=policy_id, description="Policies of one region", asked_by="")
+    big = ChartSpec(key="filtered_policies", family=Family.BIG_NUMBER, title="Filtered policies", dataset_id=policy_id,
+                    measures=(WrittenRef(counted),), dimensions=(), time_column=None, time_grain=None,
+                    filters=(Filter("region", "=", region),), row_limit=None, source=None, target=None)
+    return BuildPlan(charts=(big,), measures=(counted,))
+
+
+def test_a_chart_filter_on_a_value_no_row_holds_is_refused_and_the_repair_is_told_the_values(live, served, model,
+                                                                                            policy_id):
+    """The chart-filter path, as the measure's above: a two-answer stub whose first plan's big number is filtered
+    `region = 'West'`, which no row holds, and whose repair filters `region = 'west'`. The builder is analyst. Expected:
+    the stub is asked twice; its second prompt carries the chart's refusal, naming the values the column holds,
+    "'central', 'east', 'west'"; the repaired build runs to `done` and its chart checks. No model client is made or
+    called. Values from the data are compared as bools and kept out of the record."""
+    seeded = sorted(row[0] for row in ground_truth(live, "SELECT DISTINCT region FROM policy")) == REGIONS
+    assert seeded, "the seed's regions are not the three this test expects"
+    goal = "policies in the west"
+    first, repaired = _filtered_count(policy_id, "West"), _filtered_count(policy_id, "west")
+    run = run_build(live, served, model, [first, repaired], "chart-value-repaired", goal=goal)
+    record("chart-value-repaired",
+           _no_values(summary(run, served, repaired) if run.build_id else {"stopped": run.stopped}))
+    reason = ("it filters policy.region on 'West', which no row the builder can read holds; policy.region holds: "
+              "'central', 'east', 'west'")
+    assert run.planner.goals == [goal] * 2
+    _, repair = _prompts(run, goal)
+    told = f"- chart 'filtered_policies': {reason}" in repair
+    assert told, [part.part for part in run.planner.contexts[1].repair.refused]
+    assert_ran_to_the_end(run)
+    [chart_id] = [step["object_id"] for step in run.final["steps"] if step["key"] == "filtered_policies"]
+    assert run.final["checks"].get(str(chart_id)) == "checked", run.final["checks"]
+    assert_no_model_call(run)
+    observe("chart value repaired", parts=[part.part for part in run.planner.contexts[1].repair.refused], told=told,
+            check=run.final["checks"].get(str(chart_id)))
 
 # --- a histogram, made through the extension ------------------------------------------------------------------------
 

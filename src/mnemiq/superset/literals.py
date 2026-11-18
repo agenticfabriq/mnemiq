@@ -15,16 +15,24 @@ nothing. Neither does a value the source does not answer for.
 For a value the source rules out, the values its column does hold are read the same way, as the builder, so a builder
 whose row rules narrow the column is told only the values they may read. Those are the only values a plan is ever told,
 and only through the refusal of its own part. A log line names a column at most, never a value.
+
+One check of a plan shares one `Probes`: the time every probe and read of the plan may take together, the ask path's
+`PROBE_BUDGET_S` for a turn's probes, since an equality on a column with no index, and a read of a column's distinct
+values, can each scan the table; and what the source already said, so a value two parts filter on is asked once and a
+column's values are read once. A value not asked once the time is spent stays unchecked, and refuses nothing.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 import sqlglot
 from sqlglot import exp
 
+from mnemiq.agent.loop import PROBE_BUDGET_S
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Snapshot
 from mnemiq.semantic.values import shown
@@ -40,7 +48,7 @@ from mnemiq.sql.values_check import (
     source_holds,
 )
 
-__all__ = ["HELD_NAMED", "Absent", "absent_literals", "filter_statement"]
+__all__ = ["HELD_NAMED", "Absent", "Probes", "absent_literals", "filter_statement"]
 
 logger = logging.getLogger(__name__)
 
@@ -56,12 +64,38 @@ _EQUALITY_OPERATORS = frozenset({"=", "!=", "IN", "NOT IN"})
 class Absent:
     """A value a statement filters `column` (`table.column`) on that no row the builder can read holds, with the first
     values the column does hold (`held`, at most `HELD_NAMED`, each as a prompt shows a value) and whether it holds
-    more. `held` is empty where the source did not say."""
+    more. `held` is empty where the source said the builder can read no value of the column, and None where it did not
+    say: the read failed, or the plan's probe time was spent before it."""
 
     column: str
     literal: str
-    held: tuple[str, ...]
+    held: tuple[str, ...] | None
     more: bool
+
+
+@dataclass
+class Probes:
+    """What one check of a plan's probes share: `budget_s`, the time they may take together, `spent_s` of it taken as
+    `clock` measures it, each probe's answer by `(table, column, text)` and each column's values by `(table, column)`.
+    A call is given at most the time left, and none is made once it is spent. The budget is read between calls, so one
+    call can overrun it by the transport's own margin, as a probe on the ask path can."""
+
+    budget_s: float = PROBE_BUDGET_S
+    clock: Callable[[], float] = time.monotonic
+    spent_s: float = 0.0
+    answers: dict[tuple[str, str, str], bool | None] = field(default_factory=dict)
+    held: dict[tuple[str, str], tuple[tuple[str, ...], bool] | None] = field(default_factory=dict)
+
+    def left_s(self) -> float:
+        return self.budget_s - self.spent_s
+
+    def timed(self, call: Callable[[float], object], timeout_s: float):
+        """`call(limit)` with `limit` the smaller of `timeout_s` and the time left, its time counted as spent."""
+        started = self.clock()
+        try:
+            return call(min(timeout_s, self.left_s()))
+        finally:
+            self.spent_s += self.clock() - started
 
 
 def filter_statement(table: str, column: str, op: str, operand, dialect: str | None) -> str | None:
@@ -80,12 +114,14 @@ def filter_statement(table: str, column: str, op: str, operand, dialect: str | N
             .sql(dialect=dialect))
 
 
-def absent_literals(sql: str, *, adapter, snapshot: Snapshot, grants: GrantSet, timeout_s: float) -> list[Absent]:
+def absent_literals(sql: str, *, adapter, snapshot: Snapshot, grants: GrantSet, timeout_s: float,
+                    probes: Probes | None = None) -> list[Absent]:
     """Each value `sql` filters a column on that the source, asked through `adapter`, says no row holds, in the order
     the statement holds them, once each. Grounded as the decider grounds a statement (`ground_values`, with what
     `grants` leave visible, their masks and row filters, the snapshot's column types and no value index), and asked of
-    the source as the ask path asks it (`confirm_by_source`, `source_holds`). A statement that does not parse, or a
-    grounding that cannot be read, refuses nothing."""
+    the source as the ask path asks it (`confirm_by_source`, `source_holds`), within `probes` (a plan's shared budget and
+    answers; a fresh one when None). A statement that does not parse, or a grounding that cannot be read, refuses
+    nothing, and nor does a value not asked once the time is spent."""
     if getattr(adapter, "terminal_refusal", None) is not None:
         return []  # Superset refused this request for good: every later call meets the same refusal
     dialect = adapter.dialect
@@ -103,13 +139,21 @@ def absent_literals(sql: str, *, adapter, snapshot: Snapshot, grants: GrantSet, 
         # The kind only: a parser's words quote the statement, values and all.
         logger.info("a plan's filter values could not be read (%s); none is checked", type(exc).__name__)
         return []
+    probes = Probes() if probes is None else probes
     physical = {binding.object_id: binding.source_object for binding in snapshot.source_bindings}
-    ask = source_holds(adapter, dialect, physical, timeout_s)
     asked: set[tuple[str, str, str]] = set()
+    late: set[tuple[str, str, str]] = set()
 
     def holds(table: str, column: str, text: str) -> bool | None:
-        asked.add((table, column, text))
-        return ask(table, column, text)
+        key = (table, column, text)
+        asked.add(key)
+        if key not in probes.answers:
+            if probes.left_s() <= 0:
+                late.add(key)
+                return None  # not kept: unasked is not unanswered
+            probes.answers[key] = probes.timed(lambda limit: source_holds(adapter, dialect, physical, limit)(*key),
+                                               timeout_s)
+        return probes.answers[key]
 
     confirmed = confirm_by_source(grounding, holds)
     probeable = {(*value.placed, value.text) for value in grounding.values
@@ -117,9 +161,11 @@ def absent_literals(sql: str, *, adapter, snapshot: Snapshot, grants: GrantSet, 
     if left := len(probeable - asked):
         logger.info("%d filter values were left unprobed past the limit of %d per statement; they stay unchecked and "
                     "refuse nothing", left, PROBE_LIMIT)
+    if late:
+        logger.info("%d filter values were left unprobed: the plan's %s s for probes was spent; they stay unchecked "
+                    "and refuse nothing", len(late), probes.budget_s)
     found: list[Absent] = []
     seen: set[tuple[str, str, str]] = set()
-    held: dict[tuple[str, str], tuple[tuple[str, ...], bool]] = {}
     for value in confirmed.values:
         if value.outcome != ABSENT or value.why != "probed" or value.placed is None:
             continue
@@ -127,17 +173,26 @@ def absent_literals(sql: str, *, adapter, snapshot: Snapshot, grants: GrantSet, 
         if key in seen:
             continue
         seen.add(key)
-        if value.placed not in held:
-            held[value.placed] = _held(adapter, physical, *value.placed, dialect=dialect, timeout_s=timeout_s)
-        values, more = held[value.placed]
+        if value.placed not in probes.held:
+            if probes.left_s() <= 0:
+                logger.info("the values %s.%s holds were not read: the plan's %s s for probes was spent",
+                            *value.placed, probes.budget_s)
+                read = None  # not kept, as an unasked probe is not
+            else:
+                read = probes.held[value.placed] = probes.timed(
+                    lambda limit, placed=value.placed: _held(adapter, physical, *placed, dialect=dialect,
+                                                             timeout_s=limit), timeout_s)
+        else:
+            read = probes.held[value.placed]
+        values, more = read if read is not None else (None, False)
         found.append(Absent(f"{value.placed[0]}.{value.placed[1]}", value.text, values, more))
     return found
 
 
 def _held(adapter, physical: dict[str, str], table: str, column: str, *, dialect: str | None,
-          timeout_s: float) -> tuple[tuple[str, ...], bool]:
+          timeout_s: float) -> tuple[tuple[str, ...], bool] | None:
     """The first `HELD_NAMED` values `table.column` holds, as text, and whether it holds more, read through `adapter`;
-    nothing where the read fails, which is logged by the failure's kind: a source's words can quote a value."""
+    None where the read fails, which is logged by the failure's kind: a source's words can quote a value."""
     sql = held_values_sql(physical.get(table, table), column, HELD_NAMED + 1, dialect)
     try:
         result = adapter.execute_arrow(sql, timeout_s=timeout_s)
@@ -145,5 +200,5 @@ def _held(adapter, physical: dict[str, str], table: str, column: str, *, dialect
     except Exception as exc:  # noqa: BLE001 -- the value stays absent; only the values it is told are lost
         logger.info("the values %s.%s holds could not be read (%s); the refusal does not name them", table, column,
                     type(exc).__name__)
-        return (), False
+        return None
     return tuple(shown(str(item)) for item in values[:HELD_NAMED]), len(values) > HELD_NAMED
