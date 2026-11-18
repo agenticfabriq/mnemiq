@@ -1645,6 +1645,20 @@ def probe_sql(table: str, column: str, text: str, dialect: str | None) -> str:
             .sql(dialect=dialect))
 
 
+def held_values_sql(table: str, column: str, limit: int, dialect: str | None) -> str:
+    """The first `limit` distinct values `table.column` holds, NULL left out, in order, in the source's dialect: the
+    names quoted as `probe_sql` quotes them, so the read reaches the column a probe asked about and no other."""
+    def named() -> exp.Column:
+        return exp.Column(this=exp.to_identifier(column, quoted=True))
+
+    return (exp.select(named()).distinct()
+            .from_(exp.Table(this=exp.to_identifier(table, quoted=True)))
+            .where(exp.Is(this=named(), expression=exp.Null(), negate=True))
+            .order_by(exp.Ordered(this=exp.Literal.number(1)))
+            .limit(limit)
+            .sql(dialect=dialect))
+
+
 def source_holds(adapter, dialect: str | None, physical: dict[str, str],
                  timeout_s: float) -> Callable[[str, str, str], bool | None]:
     """`holds` for `confirm_by_source`, asking `adapter`. `physical` maps a snapshot table to the

@@ -99,8 +99,32 @@ def _metric(dataset_id: int, name: str, expression: str, **more) -> dict:
             "compatible_dimensions": []}
 
 
-def _tools(*, metrics=None, extension=None, dashboards=(), execute=None, datasets=None) -> Tools:
-    """policy is dataset 1 and claim dataset 2; agent has none, and a virtual dataset over policy is never a table's."""
+# The plan check's two statements about a filter's value (`mnemiq.superset.literals`): whether a column holds it
+# (`probe_sql`), and the values the column holds (`held_values_sql`).
+_PROBE = re.compile(r'SELECT 1 FROM "(?P<table>[^"]+)" WHERE "(?P<column>[^"]+)" = \'(?P<value>(?:[^\']|\'\')*)\' '
+                    r'LIMIT 1')
+_HELD_READ = re.compile(r'SELECT DISTINCT "(?P<column>[^"]+)" FROM "(?P<table>[^"]+)" WHERE "[^"]+" IS NOT NULL '
+                        r'ORDER BY 1 LIMIT (?P<limit>\d+)')
+
+
+def _value_answer(sql: str, held: dict | None) -> dict | None:
+    """Superset's answer to a probe of a filter's value or a read of a column's values, from `held` (the values each
+    `(table, column)` holds; None: every probe finds its value), or None for any other statement."""
+    one = [{"name": "?column?", "type": "int64"}]
+    if (probe := _PROBE.fullmatch(sql)) is not None:
+        found = held is None or probe["value"].replace("''", "'") in held.get((probe["table"], probe["column"]), [])
+        return {"success": True, "columns": one, "rows": [{"?column?": 1}] if found else []}
+    if (read := _HELD_READ.fullmatch(sql)) is not None:
+        values = sorted((held or {}).get((read["table"], read["column"]), []))[:int(read["limit"])]
+        return {"success": True, "columns": [{"name": read["column"], "type": "object"}],
+                "rows": [{read["column"]: value} for value in values]}
+    return None
+
+
+def _tools(*, metrics=None, extension=None, dashboards=(), execute=None, datasets=None, held=None) -> Tools:
+    """policy is dataset 1 and claim dataset 2; agent has none, and a virtual dataset over policy is never a table's.
+    `held` gives the values each `(table, column)` holds, for the plan check's probes of a filter's values; without
+    it, every value probed is found."""
     metrics = metrics or {}
     extension = extension or {}
     datasets = datasets if datasets is not None else [_dataset(1, "policy"), _dataset(2, "claim"),
@@ -124,7 +148,7 @@ def _tools(*, metrics=None, extension=None, dashboards=(), execute=None, dataset
         "list_metrics": list_metrics,
         TOOL_PREFIX + "dataset_metrics": dataset_metrics,
         "list_dashboards": list_dashboards,
-        "execute_sql": execute or (lambda request: EMPTY),
+        "execute_sql": lambda request: _value_answer(request["sql"], held) or (execute or (lambda _: EMPTY))(request),
     })
 
 
@@ -1297,3 +1321,276 @@ def test_a_saved_metric_on_a_0_to_100_scale_cannot_be_planned_as_a_percent():
     number = _chart("rate", Family.BIG_NUMBER, [SavedRef("win_pct", K.NUMBER)])
     assert isinstance(_plan(GOAL, FakePlanner(_valid_plan(measures=(), charts=(number,))),
                             _tools(metrics=metrics)), BuildPlan)
+
+
+# ---------------------------------------------------------------- a filter's value no row holds
+
+# What a refusal for a value no row holds advises after the values it names, and after saying it names none.
+KEEP_THE_GOALS = "; filter on one of these only if it is the value the goal means, otherwise keep the goal's value"
+KEEP_IT = "; keep the goal's value"
+
+
+def _reason(column: str, literal: str, held: str) -> str:
+    """The refusal of a part that filters `column` on `literal`, no row the builder can read holding it; `held` is the
+    values the column holds as the reason quotes them."""
+    return (f"it filters {column} on {literal!r}, which no row the builder can read holds; {column} holds: {held}"
+            f"{KEEP_THE_GOALS}")
+
+
+def _won_plan(literal: str) -> BuildPlan:
+    won = _measure("won_amount", "Won amount", f"SUM(CASE WHEN status = '{literal}' THEN amount END)", K.CURRENCY,
+                   dataset_id=2)
+    return _valid_plan(measures=(won,), charts=(_chart("won", Family.BIG_NUMBER, [WrittenRef(won)], dataset_id=2),))
+
+
+def test_a_measure_filtering_a_value_no_row_holds_is_refused_with_the_held_values():
+    """The measure is decided, and then each value it filters on is asked of the source as the builder: 'Won' is held
+    by no row, so the measure is refused, repairably, and the repair is told the values `claim.status` holds. Only
+    then does the model see a value: the first prompt names none."""
+    from mnemiq.superset.planner import RefusedPart, plan_prompt
+
+    held = {("claim", "status"): ["WON", "LOST"]}
+    planner = FakePlanner(_won_plan("Won"))
+    refused = _plan(GOAL, planner, _tools(held=held))
+    assert isinstance(refused, PlanRefused), refused
+    reason = _reason("claim.status", "Won", "'LOST', 'WON'")
+    assert _parts(refused) == {"measure 'won_amount'": reason}
+    assert len(planner.contexts) == 2, "repairable: it went back once"
+    assert planner.contexts[1].repair.refused == (RefusedPart("measure 'won_amount'", reason, True),)
+    assert reason in plan_prompt(GOAL, planner.contexts[1])[1]
+    first = "\n".join(plan_prompt(GOAL, planner.contexts[0]))
+    assert "WON" not in first and "LOST" not in first
+    # The repair that filters a value the column holds passes, and so does the first plan where 'Won' is held.
+    fixed = FakePlanner([_won_plan("Won"), _won_plan("WON")])
+    assert isinstance(_plan(GOAL, fixed, _tools(held=held)), BuildPlan)
+    assert isinstance(_plan(GOAL, FakePlanner(_won_plan("Won")), _tools(held={("claim", "status"): ["Won"]})),
+                      BuildPlan)
+
+
+def test_a_measure_whose_column_holds_more_than_20_values_names_20_and_more():
+    held = {("claim", "status"): [f"S{i:02d}" for i in range(25)]}
+    refused = _plan(GOAL, FakePlanner(_won_plan("Won")), _tools(held=held))
+    assert _parts(refused) == {"measure 'won_amount'": _reason(
+        "claim.status", "Won", ", ".join(f"'S{i:02d}'" for i in range(20)) + " and more")}
+
+
+def test_a_value_the_source_does_not_answer_for_refuses_nothing():
+    """A probe Superset does not answer leaves the value unchecked, as on the ask path: nothing is refused for it."""
+    tools = _tools(held={})
+    tools.handlers["execute_sql"] = lambda request: (
+        {"success": False, "error": "relation does not exist", "error_type": "GENERIC_DB_ENGINE_ERROR"}
+        if _PROBE.fullmatch(request["sql"]) else _value_answer(request["sql"], {}) or EMPTY)
+    assert isinstance(_plan(GOAL, FakePlanner(_won_plan("Won")), tools), BuildPlan)
+    assert any(_PROBE.fullmatch(sql) for sql in tools.statements()), "the value was asked"
+    assert not any(_HELD_READ.fullmatch(sql) for sql in tools.statements()), "and no values were read"
+
+
+def test_a_failed_read_of_the_held_values_still_refuses():
+    """The source said no row holds the value, so the part is refused even when the read of the values the column
+    holds then fails; the reason says the source did not say which."""
+    held = {("claim", "status"): ["WON"]}
+    tools = _tools(held=held)
+    tools.handlers["execute_sql"] = lambda request: (
+        {"success": False, "error": "statement timeout", "error_type": "GENERIC_DB_ENGINE_ERROR"}
+        if _HELD_READ.fullmatch(request["sql"]) else _value_answer(request["sql"], held) or EMPTY)
+    refused = _plan(GOAL, FakePlanner(_won_plan("Won")), tools)
+    assert _parts(refused) == {"measure 'won_amount'": "it filters claim.status on 'Won', which no row the builder "
+                                                       "can read holds; the source did not say which values it holds"
+                                                       + KEEP_IT}
+
+
+def test_a_value_compared_with_an_expression_is_never_probed():
+    """`LOWER(status) = 'won'` is a value the grounding does not place, as on the ask path: nothing is asked or
+    refused for it."""
+    plan = _won_plan("x")
+    lowered = dataclasses.replace(plan.measures[0], expression="SUM(CASE WHEN LOWER(status) = 'won' THEN amount END)")
+    plan = _valid_plan(measures=(lowered,), charts=(_chart("won", Family.BIG_NUMBER, [WrittenRef(lowered)],
+                                                           dataset_id=2),))
+    tools = _tools(held={("claim", "status"): ["WON"]})
+    assert isinstance(_plan(GOAL, FakePlanner(plan), tools), BuildPlan)
+    assert not any(_PROBE.fullmatch(sql) or _HELD_READ.fullmatch(sql) for sql in tools.statements())
+
+
+def test_a_chart_filter_on_a_value_no_row_holds_is_refused():
+    """A chart's `NOT IN` filter on a value no row holds: the negation is vacuous, so it is refused as `=` and `IN`
+    are, naming the values the column holds. A value the column holds and a non-string operand are not refused."""
+    chart = _chart("premium_by_region", Family.BAR, [WrittenRef(PREMIUM)], dims=["region"],
+                   filters=[Filter("region", "NOT IN", ["West", "east"]), Filter("premium", ">", 100),
+                            Filter("region", "LIKE", "W%")])
+    held = {("policy", "region"): ["west", "east", "central"]}
+    planner = FakePlanner(_valid_plan(measures=(PREMIUM,), charts=(chart,)))
+    refused = _plan(GOAL, planner, _tools(held=held))
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused) == {"chart 'premium_by_region'": _reason("policy.region", "West", "'central', 'east', 'west'")}
+    assert len(planner.contexts) == 2 and planner.contexts[1].repair.refused[0].repairable
+    for op, operand in (("=", "west"), ("!=", "east"), ("IN", ["west", "central"])):
+        ok = _chart("premium_by_region", Family.BAR, [WrittenRef(PREMIUM)], dims=["region"],
+                    filters=[Filter("region", op, operand)])
+        assert isinstance(_plan(GOAL, FakePlanner(_valid_plan(measures=(PREMIUM,), charts=(ok,))),
+                                _tools(held=held)), BuildPlan), (op, operand)
+
+
+def test_a_chart_filter_on_a_joined_column_is_probed_on_its_own_table():
+    """On a join, the dataset names a column two tables share after its table (`claim_created_at`); a filter on one
+    the join names alone (`status`) is asked of the table it comes from, under that table's own name for it."""
+    paid = _measure("paid", "Paid", "SUM(amount)", K.CURRENCY, dataset_id=-1)
+    planned = PlannedDataset(key="dataset_1", placeholder=-1, join=JOIN)
+    chart = _chart("paid_by_region", Family.BAR, [WrittenRef(paid)], dataset_id=-1, dims=["region"],
+                   filters=[Filter("status", "=", "Open"), Filter("claim_policy_id", "IN", ["7"])])
+    plan = BuildPlan(charts=(chart,), measures=(paid,), reuse_candidates=(), datasets=(planned,))
+    tools = _tools(held={("claim", "status"): ["open", "closed"], ("claim", "policy_id"): ["7"]})
+    refused = _plan(GOAL, FakePlanner(plan), tools)
+    assert _parts(refused) == {"chart 'paid_by_region'": _reason("claim.status", "Open", "'closed', 'open'")}
+    probed = {(m["table"], m["column"]) for sql in tools.statements() if (m := _PROBE.fullmatch(sql))}
+    assert probed == {("claim", "status"), ("claim", "policy_id")}
+
+
+def test_a_filter_on_a_column_the_charts_rows_lack_is_never_probed():
+    """A chart refused for a filter on a column its rows lack is not probed: the column has no table to ask."""
+    chart = _chart("premium_by_region", Family.BAR, [WrittenRef(PREMIUM)], dims=["region"],
+                   filters=[Filter("salary", "=", "x")])
+    tools = _tools(held={})
+    refused = _plan(GOAL, FakePlanner(_valid_plan(measures=(PREMIUM,), charts=(chart,))), tools)
+    assert "not a column" in _parts(refused)["chart 'premium_by_region'"]
+    assert not any(_PROBE.fullmatch(sql) or _HELD_READ.fullmatch(sql) for sql in tools.statements())
+
+
+@pytest.mark.parametrize(("key", "title", "why"), [
+    ("Bad Key", "Premium", "a chart's key is 1 to 40 of a-z, 0-9 and _"),
+    ("premium_by_region", "", "a chart's title is 1 to"),
+])
+def test_a_chart_its_own_checks_refuse_is_never_probed(key, title, why):
+    """A chart that fails one of its own checks is not probed, even for a filter on a value no row holds: only a chart
+    whose own checks all pass costs the source a probe, and the refusal gives the chart's own reason alone."""
+    chart = dataclasses.replace(_chart(key, Family.BAR, [WrittenRef(PREMIUM)], dims=["region"],
+                                       filters=[Filter("region", "=", "West")]), title=title)
+    tools = _tools(held={("policy", "region"): ["central", "east", "west"]})
+    refused = _plan(GOAL, FakePlanner(_valid_plan(measures=(PREMIUM,), charts=(chart,))), tools)
+    [part] = refused.parts
+    assert part.part == f"chart {key!r}" and part.reason.startswith(why), part
+    assert not any(_PROBE.fullmatch(sql) or _HELD_READ.fullmatch(sql) for sql in tools.statements())
+
+
+def test_a_percent_scaled_by_100_and_filtering_a_value_no_row_holds_is_told_both_in_one_round():
+    """A measure the percent rule refuses is still checked for its filter values, so both reasons go back in its one
+    repair rather than the second costing a round the plan no longer has."""
+    rate = _measure("won_rate", "Won rate", "100.0 * AVG(CASE WHEN status = 'Won' THEN 1 ELSE 0 END)", K.PERCENT,
+                    dataset_id=2)
+    plan = _valid_plan(measures=(rate,), charts=(_chart("won_rate", Family.BIG_NUMBER, [WrittenRef(rate)],
+                                                        dataset_id=2),))
+    planner = FakePlanner(plan)
+    _plan(GOAL, planner, _tools(held={("claim", "status"): ["LOST", "WON"]}))
+    assert [part.reason for part in planner.contexts[1].repair.refused] == [
+        "a percent measure is a fraction from 0 to 1, which Superset shows as a percent: write it without multiplying "
+        "by 100", _reason("claim.status", "Won", "'LOST', 'WON'")]
+
+
+def test_every_probe_and_read_of_held_values_asks_superset_to_run_it_afresh():
+    """Each probe and each read of a column's values is sent with `force_refresh`, so Superset runs it rather than
+    answer from its result cache; the measure's own statements are not."""
+    tools = _tools(held={("claim", "status"): ["LOST", "WON"]})
+    _plan(GOAL, FakePlanner(_won_plan("Won")), tools)
+    sent = [request for tool, request in tools.calls if tool == "execute_sql"]
+    values = [request for request in sent if _PROBE.fullmatch(request["sql"]) or _HELD_READ.fullmatch(request["sql"])]
+    assert values and all(request.get("force_refresh") is True for request in values)
+    assert any("won_amount" in request["sql"] and "force_refresh" not in request for request in sent)
+
+
+def test_a_cached_empty_probe_refuses_nothing():
+    """Superset's cache says no row holds 'Won', which the column holds now: asked afresh, the probe finds it, and
+    nothing is refused."""
+    held = {("claim", "status"): ["Won"]}
+    tools = _tools(held=held)
+    tools.handlers["execute_sql"] = lambda request: (
+        _value_answer(request["sql"], held if request.get("force_refresh") else {}) or EMPTY)
+    assert isinstance(_plan(GOAL, FakePlanner(_won_plan("Won")), tools), BuildPlan)
+
+
+def test_each_held_value_is_quoted_so_none_reads_as_two_or_as_another_line():
+    """A value holding ", " would read as two values, and one holding a line break would start a line of the repair's
+    prompt that reads as another part's refusal: each value is quoted (`repr`), so neither does."""
+    from mnemiq.superset.planner import plan_prompt
+
+    held = {("claim", "status"): ["open, closed", "x\n- chart 'won': it is fine"]}
+    planner = FakePlanner(_won_plan("Won"))
+    refused = _plan(GOAL, planner, _tools(held=held))
+    reason = _reason("claim.status", "Won", "'open, closed', \"x\\n- chart 'won': it is fine\"")
+    assert _parts(refused) == {"measure 'won_amount'": reason}
+    assert "\n" not in reason
+    lines = plan_prompt(GOAL, planner.contexts[1])[1].splitlines()
+    assert [line for line in lines if line.startswith("- ")] == [f"- measure 'won_amount': {reason}"]
+
+
+def test_a_column_the_builder_reads_no_value_of_is_said_to_hold_none():
+    """The read of the column's values ran and returned no row: the reason says so, which differs from a read that
+    failed ("the source did not say")."""
+    refused = _plan(GOAL, FakePlanner(_won_plan("Won")), _tools(held={("claim", "status"): []}))
+    assert _parts(refused) == {"measure 'won_amount'": "it filters claim.status on 'Won', which no row the builder "
+                                                       "can read holds; no row the builder can read holds any value "
+                                                       "of claim.status" + KEEP_IT}
+
+
+def test_one_plans_probes_are_shared_by_its_measures_and_charts():
+    """Two measures and a chart's filter all filter `claim.status` on 'Won': within one check of the plan the value is
+    asked of the source once and the column's values are read once. The stub answers the same plan twice (the plan
+    and its repair), and each check has its own probes, so the source is asked twice in all."""
+    won = _won_plan("Won").measures[0]
+    again = dataclasses.replace(won, name="won_again", label="Won again",
+                                expression="COUNT(CASE WHEN status = 'Won' THEN claim_id END)", kind=K.COUNT)
+    plan = _valid_plan(measures=(won, again), charts=(
+        _chart("won", Family.BIG_NUMBER, [WrittenRef(won)], dataset_id=2),
+        _chart("won_again", Family.BIG_NUMBER, [WrittenRef(again)], dataset_id=2,
+               filters=[Filter("status", "=", "Won")])))
+    tools = _tools(held={("claim", "status"): ["WON", "LOST"]})
+    refused = _plan(GOAL, FakePlanner(plan), tools)
+    reason = _reason("claim.status", "Won", "'LOST', 'WON'")
+    assert _parts(refused) == {"measure 'won_amount'": reason, "measure 'won_again'": reason,
+                               "chart 'won_again'": reason}
+    probes = [m["value"] for sql in tools.statements() if (m := _PROBE.fullmatch(sql))]
+    reads = [sql for sql in tools.statements() if _HELD_READ.fullmatch(sql)]
+    assert probes == ["Won", "Won"] and len(reads) == 2, (probes, len(reads))
+
+
+def test_once_a_plans_probe_time_is_spent_nothing_more_is_asked_or_refused(monkeypatch):
+    """Each read takes 6 s on the plan's clock and the plan may spend `PROBE_BUDGET_S` (10 s): the first measure's
+    probe and its column's read spend it, so the second measure's value is never asked, and only the first is
+    refused."""
+    from mnemiq.superset import planner as planner_module
+    from mnemiq.superset.literals import Probes
+
+    clock = [0.0]
+    held = {("claim", "status"): ["WON"], ("policy", "region"): ["west"]}
+
+    def execute(request):
+        if _PROBE.fullmatch(request["sql"]) or _HELD_READ.fullmatch(request["sql"]):
+            clock[0] += 6.0
+        return _value_answer(request["sql"], held) or EMPTY
+
+    monkeypatch.setattr(planner_module, "Probes", lambda: Probes(clock=lambda: clock[0]))
+    won = _won_plan("Won").measures[0]
+    west = _measure("west_premium", "West premium", "SUM(CASE WHEN region = 'West' THEN premium END)")
+    plan = _valid_plan(measures=(won, west), charts=(
+        _chart("won", Family.BIG_NUMBER, [WrittenRef(won)], dataset_id=2),
+        _chart("west", Family.BIG_NUMBER, [WrittenRef(west)])))
+    tools = _tools(held=held)
+    tools.handlers["execute_sql"] = execute
+    refused = _plan(GOAL, FakePlanner(plan), tools)
+    assert set(_parts(refused)) == {"measure 'won_amount'"}
+    assert not any((m := _PROBE.fullmatch(sql)) and m["value"] == "West" for sql in tools.statements())
+
+
+# ---------------------------------------------------------------- the percent rule fails safe
+
+
+def test_a_constant_past_decimals_range_is_not_a_scale_and_raises_nothing():
+    for text in ("SUM(a) * 1e1000000", "SUM(a) * '1e1000000'", "AVG(CASE WHEN x THEN 1e1000000 END)",
+                 "SUM(a) * -1e1000000", "SUM(a) / 1e1000000", "SUM(a) * (1e1000000 * 1e1000000)",
+                 "SUM(a) / (SUM(b) / 1e1000000)", "SUM(a) * 1e99999999999999999999"):
+        assert scales_by_100(text) is False, text
+    # A real factor of 100 beside such a constant is still found.
+    assert scales_by_100("SUM(a) * 100 + SUM(b) * 1e1000000")
+
+
+def test_a_very_long_constant_chain_is_not_a_scale_and_raises_nothing():
+    chain = " + ".join(["1"] * 3000)
+    assert scales_by_100(f"SUM(a) * ({chain})") is False

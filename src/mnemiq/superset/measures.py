@@ -110,12 +110,16 @@ def aggregates(expression: str) -> Aggregation:
 
 def _folded(node: exp.Expression | None) -> Decimal | None:
     """The number a constant expression is (a literal, a string literal Postgres reads as a number in arithmetic, a
-    cast, a sign, and `+ - * /` of constants), else None."""
+    cast, a sign, and `+ - * /` of constants), else None: also where Decimal cannot hold the result (a constant past
+    its exponent range, `1e1000000`, overflows), so such a constant is never read as 100."""
     if isinstance(node, (exp.Cast, exp.TryCast, exp.Paren)):
         return _folded(node.this)
     if isinstance(node, exp.Neg):
         inner = _folded(node.this)
-        return None if inner is None else -inner
+        try:
+            return None if inner is None else -inner
+        except ArithmeticError:
+            return None
     if isinstance(node, exp.Literal):
         try:
             value = Decimal(node.this)
@@ -129,14 +133,17 @@ def _folded(node: exp.Expression | None) -> Decimal | None:
         try:
             return {exp.Add: left.__add__, exp.Sub: left.__sub__, exp.Mul: left.__mul__,
                     exp.Div: left.__truediv__}[type(node)](right)
-        except (InvalidOperation, ZeroDivisionError):
+        except ArithmeticError:  # InvalidOperation, a division by zero, Overflow
             return None
     return None
 
 
 def _is(node: exp.Expression | None, *numbers: str) -> bool:
     value = _folded(node)
-    return value is not None and abs(value) in {Decimal(n) for n in numbers}
+    try:
+        return value is not None and abs(value) in {Decimal(n) for n in numbers}
+    except ArithmeticError:  # `abs` rounds to the context, and a constant past its range overflows
+        return False
 
 
 def _bare(node: exp.Expression | None) -> exp.Expression | None:
@@ -159,7 +166,15 @@ def scales_by_100(expression: str) -> bool:
     """Whether `expression` puts its value on a 0 to 100 scale, where a percent measure is a fraction: it multiplies
     by a constant that is 100 (`100`, `100.0`, `100::numeric`, `'100'`, `-100`, `10 * 10`), divides by one that is
     0.01 or by a quotient over 100 (`a / (b / 100.0)`), or a CASE gives 100 as a branch's value, anywhere in its
-    tree. False when it does not parse (the measure's own check refuses that)."""
+    tree. False when it does not parse (the measure's own check refuses that), and when its constants are nested too
+    deep to fold (a chain of thousands of terms): the chart's check still refuses a percent shown above 100%."""
+    try:
+        return _scales_by_100(expression)
+    except RecursionError:
+        return False
+
+
+def _scales_by_100(expression: str) -> bool:
     try:
         tree = sqlglot.parse_one(f"SELECT {expression}", read="postgres")
     except sqlglot.errors.SqlglotError:

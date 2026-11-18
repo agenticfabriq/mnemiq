@@ -7,13 +7,16 @@ to the build, which runs it one step per request.
 **What the model sees** (`PlanContext`) is what the builder may: the tables and columns the grants leave visible
 (`visible_schema`), the saved metrics of those tables' datasets by name and expression, and the dashboards whose titles
 share a word with the goal, by id and title. Never an editor's name (a saved metric's certifier, a dashboard's owners),
-never Superset's error text, never a value: nothing a plan is made from is a number computed from the data. A part
-refused goes back to the model with mnemiq's own reason, which names what the model wrote and nothing Superset said.
+never Superset's error text, and no value in the plan's first prompt: nothing a plan is made from is a number computed
+from the data. A filter's literal that no row the builder can read holds is refused, and only then does the model see
+values: those of the column its own plan filtered on, read as the builder. A part refused goes back to the model with
+mnemiq's own reason, which names what the model wrote and nothing Superset said, those values aside.
 
 **What is checked.** Each written measure meets `check_measure`, its statement decided under the builder's grants as
-every ask-path statement is, and then `reusable`: a saved metric on its dataset that says the same thing replaces it.
-Each chart meets `plan_refusal` and the plan's own rules here (its key, its columns, its filters, the saved metrics it
-names). A refused part goes back to the model once; refused again, it refuses the plan, and the reason names it.
+every ask-path statement is, then the values it filters on (`absent_literals`), and then `reusable`: a saved metric on
+its dataset that says the same thing replaces it. Each chart meets `plan_refusal` and the plan's own rules here (its
+key, its columns, its filters, the saved metrics it names), and then the values its filters compare a column with. A
+refused part goes back to the model once; refused again, it refuses the plan, and the reason names it.
 
 **Datasets.** A chart on a table with no dataset gets a planned dataset over the table; a measure that needs a join
 gets a planned virtual dataset over the join's SQL, the join decided with the measure by `check_measure`. The builder
@@ -39,12 +42,14 @@ from sqlglot.errors import SqlglotError
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Snapshot
+from mnemiq.execute.runner import DEFAULT_TIMEOUT_S
 from mnemiq.llm.client import ContextTooLong, PromptCut
 from mnemiq.sql.identifiers import resolve_identifier
 from mnemiq.sql.schema import column_types, visible_schema
 from mnemiq.superset.adapter import JINJA_DELIMITERS
 from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenRef, plan_refusal
 from mnemiq.superset.grants import UnreadableAnswer, read_datasets, table_bindings
+from mnemiq.superset.literals import Absent, Probes, absent_literals, filter_statement
 from mnemiq.superset.marker import format_marker
 from mnemiq.superset.measures import Measure, MeasureKind, MeasureRefused, check_measure, scales_by_100, \
     superset_text_problem
@@ -735,7 +740,8 @@ class _Rows:
     """A dataset a part of the plan is on: the columns a chart may name and their types, the source its measures are
     decided over, its saved metrics, how the model named it, and the planned dataset when the build makes it. On a
     join, `measured` holds the columns a measure may name, `owners` each column's table, and `shared` the names the
-    dataset gives each column two joined tables share."""
+    dataset gives each column two joined tables share. `origins` gives each column a chart may name the snapshot's table
+    and column it reads, as a chart filter's value is asked of the source (`absent_literals`)."""
 
     columns: frozenset[str]
     source: str
@@ -746,6 +752,12 @@ class _Rows:
     measured: frozenset[str] | None = None
     owners: Mapping[str, str] = field(default_factory=dict)
     shared: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    origins: Mapping[str, tuple[str, str]] = field(default_factory=dict)
+
+
+def _own_columns(table: str, columns: frozenset[str]) -> dict[str, tuple[str, str]]:
+    """A table's columns, each read from itself: a physical dataset's `_Rows.origins`."""
+    return {column: (table, column) for column in columns}
 
 
 def _quoted(name: str) -> str:
@@ -843,6 +855,7 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
             having.setdefault(column, []).append(name)
     picked: list[exp.Expression] = []
     owners: dict[str, str] = {}
+    origins: dict[str, tuple[str, str]] = {}
     types: dict[str, str | None] = {}
     for node, name in zip(nodes, names):
         qualifier = node.args["alias"].this if node.args.get("alias") else node.this
@@ -853,6 +866,7 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
             if len(shown.encode()) > MAX_IDENTIFIER:
                 return f"the joined dataset's column {shown!r} is longer than the {MAX_IDENTIFIER} bytes of a name"
             owners[shown], types[shown] = name, catalogue.types[name].get(column)
+            origins[shown] = (name, column)
             picked.append(exp.alias_(exp.Column(this=exp.to_identifier(column, quoted=True), table=qualifier.copy()),
                                      exp.to_identifier(shown, quoted=True)))
     shared = {column: tuple(f"{table}_{column}" for table in tables) for column, tables in having.items()
@@ -865,7 +879,7 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
                           sql=select.sql(dialect=SUPERSET_DIALECT), name=_virtual_name(planned.key, names))
     return _Rows(frozenset(owners), planned.join, (_made_count(planned.placeholder),), f"the join {planned.join!r}",
                  types, made, measured=frozenset(c for c, tables in having.items() if len(tables) == 1),
-                 owners=owners, shared=shared)
+                 owners=owners, shared=shared, origins=origins)
 
 
 def _table_problem(node: exp.Table) -> str | None:
@@ -968,11 +982,53 @@ def _chart_columns(chart: ChartSpec) -> list[str]:
     return [*chart.dimensions, *(c for c in (chart.time_column, chart.source, chart.target) if c)]
 
 
+def _absent_reason(absent: Absent) -> str:
+    """Why a part that filters on a value no row the builder can read holds is refused, naming the values its column
+    holds where the source said. Each value is quoted (`repr`), so one holding ", " never reads as two, and one holding
+    a line break never starts a line of the repair's prompt that reads as another part's refusal. The reason ends with
+    what to do: a value the column holds replaces the plan's only where it is the value the goal means, and otherwise
+    the goal's own value is kept. A value swapped in, or the filter left out, would build a chart of a different
+    question that still checks; kept, a goal value the builder cannot read is refused again, and the plan is refused
+    naming what the builder can see."""
+    if absent.held is None:
+        held = "the source did not say which values it holds; " + _KEEP_IT
+    elif not absent.held:
+        held = f"no row the builder can read holds any value of {absent.column}; " + _KEEP_IT
+    else:
+        held = (f"{absent.column} holds: {', '.join(repr(value) for value in absent.held)}"
+                f"{' and more' if absent.more else ''}; filter on one of these only if it is the value the goal means, "
+                "otherwise " + _KEEP_IT)
+    return f"it filters {absent.column} on {absent.literal!r}, which no row the builder can read holds; {held}"
+
+
+_KEEP_IT = "keep the goal's value"
+
+
+def _filter_refusals(chart: ChartSpec, on: _Rows, *, adapter, snapshot: Snapshot, grants: GrantSet,
+                     probes: Probes) -> list[str]:
+    """The reasons `chart` is refused for a filter on a value no row the builder can read holds: each filter that
+    compares a column with strings by `=`, `!=`, `IN` or `NOT IN`, asked of the table and column the chart's rows read
+    it from (`_Rows.origins`), as the builder. A negated filter on such a value excludes nothing, so it is refused as
+    the others are."""
+    reasons: dict[str, None] = {}
+    for item in chart.filters:
+        origin = on.origins.get(item.column)
+        sql = filter_statement(*origin, item.op, item.value, adapter.dialect) if origin is not None else None
+        if sql is None:
+            continue
+        for absent in absent_literals(sql, adapter=adapter, snapshot=snapshot, grants=grants,
+                                      timeout_s=DEFAULT_TIMEOUT_S, probes=probes):
+            reasons.setdefault(_absent_reason(absent))
+    return list(reasons)
+
+
 def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adapter, snapshot: Snapshot,
            grants: GrantSet, settings, interactive_pivot_available: bool) -> BuildPlan | tuple[RefusedPart, ...]:
     """The plan with its reusable measures replaced by the saved metrics that say the same, or every part refused, each
     with mnemiq's own reason."""
     refused: list[RefusedPart] = []
+    # Every probe of a filter's value this check makes, the measures' and the charts', shares one budget and one memo.
+    probes = Probes()
 
     def refuse(part: str, reason: str, *, repairable: bool = True) -> None:
         refused.append(RefusedPart(part, reason, repairable))
@@ -993,7 +1049,8 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
     by_dataset = {dataset: table for table, dataset in catalogue.datasets.items()}
     rows: dict[int, _Rows] = {
         dataset: _Rows(catalogue.columns[table], _quoted(catalogue.stored[table]), catalogue.saved.get(dataset, ()),
-                       f"the table {table!r}", catalogue.types[table])
+                       f"the table {table!r}", catalogue.types[table],
+                       origins=_own_columns(table, catalogue.columns[table]))
         for dataset, table in by_dataset.items()}
     keys: set[str] = set()
     planned_tables: set[str] = set()
@@ -1034,7 +1091,8 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
             rows[planned.placeholder] = _Rows(catalogue.columns[planned.table],
                                               _quoted(catalogue.stored[planned.table]),
                                               (_made_count(planned.placeholder),), part,
-                                              catalogue.types[planned.table], made)
+                                              catalogue.types[planned.table], made,
+                                              origins=_own_columns(planned.table, catalogue.columns[planned.table]))
 
     # Each written measure: decided, then reused where a saved metric says the same, else held apart from every name
     # its chart would show beside it.
@@ -1080,9 +1138,16 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
         if isinstance(verdict, MeasureRefused):
             refuse(part, verdict.reason, repairable=verdict.repairable)
             continue
-        if measure.kind is MeasureKind.PERCENT and scales_by_100(measure.expression):
+        # Both checks, so a measure refused for both is told both in its one repair.
+        scaled = measure.kind is MeasureKind.PERCENT and scales_by_100(measure.expression)
+        if scaled:
             refuse(part, "a percent measure is a fraction from 0 to 1, which Superset shows as a percent: write it "
                          "without multiplying by 100")
+        absent = absent_literals(verdict.asked_sql, adapter=adapter, snapshot=snapshot, grants=grants,
+                                 timeout_s=DEFAULT_TIMEOUT_S, probes=probes) if verdict.asked_sql else []
+        for reason in dict.fromkeys(_absent_reason(item) for item in absent):
+            refuse(part, reason)
+        if scaled or absent:
             continue
         hit = reusable(measure, list(on.saved))
         if hit is not None:
@@ -1175,6 +1240,10 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
                                currency=settings.superset_currency)
             if why is not None:
                 refuse(part, why)
+        if len(refused) == before:
+            for reason in _filter_refusals(spec, on, adapter=adapter, snapshot=snapshot, grants=grants,
+                                           probes=probes):
+                refuse(part, reason)
         charts.append(spec)
 
     for placeholder, on in rows.items():
