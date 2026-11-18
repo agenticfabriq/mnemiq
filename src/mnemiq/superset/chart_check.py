@@ -41,7 +41,7 @@ import logging
 import math
 from collections.abc import Callable
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from enum import StrEnum
@@ -99,6 +99,19 @@ class ChartCheck:
     reason: str
     chart_values: tuple | None
     mnemiq_values: tuple | None
+
+
+@dataclass(frozen=True)
+class _Numbers(ChartCheck):
+    """What `_numbers` found, with the metric labels the chart's rows hold values for (in their order) and those rows,
+    for the checks that read the values themselves. Handed on only as a plain `ChartCheck`."""
+
+    labels: tuple[str, ...] = ()
+    rows: dict[tuple, list] = field(default_factory=dict)
+
+
+def _plain(found: ChartCheck) -> ChartCheck:
+    return ChartCheck(found.chart_id, found.status, found.reason, found.chart_values, found.mnemiq_values)
 
 
 # `get_chart_info` returns `form_data` only when asked for it (`DEFAULT_GET_CHART_INFO_COLUMNS` in
@@ -541,8 +554,29 @@ def _format_problem(viz_type: str, form: dict, kinds: dict[str, MeasureKind], sa
 # ---------------------------------------------------------------- the check
 
 
+def percent_problem(kinds: dict[str, MeasureKind], labels: tuple[str, ...], rows: dict[tuple, list]) -> str | None:
+    """Why a `percent` measure's number is shown wrongly: the first percent label holding a value above 1 in size. A
+    percent is a fraction, which the percent format shows times 100, so a value above 1 shows above 100%: a 0 to 100
+    number the format scaled again (a win rate of 55 shown as 5,500%), or a true rate above 100%."""
+    for i, label in enumerate(labels):
+        if kinds.get(label) is not MeasureKind.PERCENT:
+            continue
+        for values in rows.values():
+            value = values[i] if i < len(values) else None
+            if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool) \
+                    and math.isfinite(value) and abs(value) > 1:
+                return (f"the chart shows {label!r}, a percent, above 100%: the value {_plain_number(value)} is "
+                        "shown as a percent of itself times 100, so a percent measure must be a fraction from 0 to 1 "
+                        "(a 0 to 100 number shows 100 times too large)")
+    return None
+
+
+def _plain_number(value) -> str:
+    return f"{float(value):,.4g}"
+
+
 def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, snapshot: Snapshot, grants: GrantSet,
-             guard_fanout: bool | None, timeout_s: float, before_call: Callable[[], None] | None = None) -> ChartCheck:
+             guard_fanout: bool | None, timeout_s: float, before_call: Callable[[], None] | None = None) -> _Numbers | ChartCheck:
     """The chart's numbers against mnemiq's own: any status but `FORMAT_WRONG`."""
     def not_checked(reason: str) -> ChartCheck:
         return _outcome(chart_id, ChartStatus.NOT_CHECKED, reason)
@@ -595,6 +629,8 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
     if isinstance(mine, NotCheckable):
         return not_checked(mine.reason)
     found = _compare(chart_id, chart, mine, _row_limit(form), source=source)
+    found = _Numbers(found.chart_id, found.status, found.reason, found.chart_values, found.mnemiq_values,
+                     tuple(label for label, _ in expectation.metrics), chart.values)
     if found.status is ChartStatus.MISMATCH and expectation.time_grain and source is _OWN_SQL:
         plain = _own_rows(_statement(expectation, dataset, grained=False), expectation, chart_id=chart_id,
                           adapter=adapter, snapshot=snapshot, grants=grants, timeout_s=timeout_s,
@@ -651,8 +687,12 @@ def check_chart(adapter, *, chart_id: int, dataset_id: int, kinds: dict[str, Mea
     if problem is None and unjudged is not None and found.status is ChartStatus.CHECKED:
         return _outcome(chart_id, ChartStatus.NOT_CHECKED, f"{found.reason}, but {unjudged}", found.chart_values,
                         found.mnemiq_values)
+    if problem is None and unjudged is None and found.status is ChartStatus.CHECKED \
+            and isinstance(found, _Numbers) \
+            and (scale := percent_problem(kinds, found.labels, found.rows)) is not None:
+        return _outcome(chart_id, ChartStatus.FORMAT_WRONG, scale, found.chart_values, found.mnemiq_values)
     if problem is None or found.status in (ChartStatus.MISMATCH, ChartStatus.EMPTY):
-        return found
+        return _plain(found)
     reason = problem if found.status is ChartStatus.CHECKED else f"{problem}. Its numbers were not compared: " \
                                                                   f"{found.reason}"
     return _outcome(chart_id, ChartStatus.FORMAT_WRONG, reason, found.chart_values, found.mnemiq_values)

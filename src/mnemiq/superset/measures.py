@@ -26,7 +26,7 @@ from mnemiq.superset.history import Decided, decide_statement, run_decided
 from mnemiq.sql.verdict import Approved, Refusal
 
 __all__ = ["Aggregation", "Decided", "Measure", "MeasureKind", "MeasureRefused", "aggregates", "check_measure",
-           "display_format", "measure_statement", "measure_value", "run_decided", "superset_text_problem"]
+           "display_format", "measure_statement", "scales_by_100", "measure_value", "run_decided", "superset_text_problem"]
 
 _NAME = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _CURRENCY = re.compile(r"^[A-Z]{3}$")
@@ -104,6 +104,30 @@ def aggregates(expression: str) -> Aggregation:
     if any(not _is_windowed(agg) for agg in tree.find_all(exp.AggFunc)):
         return Aggregation.AGGREGATES
     return Aggregation.ROW_LEVEL
+
+
+def _is_hundred(node: exp.Expression, number: str) -> bool:
+    """A literal (or a cast of one, `100::numeric`) that is the number `number`."""
+    while isinstance(node, (exp.Cast, exp.TryCast, exp.Paren)):
+        node = node.this
+    if not isinstance(node, exp.Literal) or node.is_string:
+        return False
+    try:
+        return float(node.this) == float(number)
+    except ValueError:
+        return False
+
+
+def scales_by_100(expression: str) -> bool:
+    """Whether `expression` multiplies anything by the number 100 (`100`, `100.0`, `100::numeric`) or divides by 0.01,
+    anywhere in its tree: a 0 to 100 number, where a percent measure is a fraction. False when it does not parse (the
+    measure's own check refuses that)."""
+    try:
+        tree = sqlglot.parse_one(f"SELECT {expression}", read="postgres")
+    except sqlglot.errors.SqlglotError:
+        return False
+    return any(_is_hundred(node.left, "100") or _is_hundred(node.right, "100") for node in tree.find_all(exp.Mul)) \
+        or any(_is_hundred(node.right, "0.01") for node in tree.find_all(exp.Div))
 
 
 def display_format(kind: MeasureKind, currency: str | None) -> tuple[str, dict | None]:

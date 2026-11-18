@@ -36,6 +36,7 @@ from mnemiq.superset.chart_check import (
     NotCheckable,
     check_chart,
     expectation_from_form_data,
+    percent_problem,
 )
 from mnemiq.superset.charts import Filter
 from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetPermissionDenied
@@ -1738,3 +1739,48 @@ def test_one_null_measure_beside_a_numbered_one_is_checked_not_empty():
     chart = mine = chart_check._Rows({(): [None, 2.5]}, 1)
     out = chart_check._compare(7, chart, mine, None, source=chart_check._OWN_SQL)
     assert out.status is ChartStatus.CHECKED
+
+
+# --- a percent is a fraction --------------------------------------------------------------------------------------------
+
+
+def test_a_percent_shown_above_100_is_format_wrong_in_the_helper():
+    assert "above 100%" in percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [54.97]})
+    assert "above 100%" in percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [decimal.Decimal("-2")]})
+
+
+def test_a_fraction_percent_checks_and_a_count_is_not_judged_by_scale():
+    assert percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [0.5497]}) is None
+    assert percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [1]}) is None
+    assert percent_problem({"N": MeasureKind.COUNT}, ("N",), {(): [151]}) is None
+    assert percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [None]}) is None
+    assert percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [float("nan")]}) is None
+
+
+FLOAT_COLUMNS = (("region", "object"), ("m0", "float64"))
+
+
+def _rate_chart(fake, value):
+    form = _bar(metrics=[copy.deepcopy(AVERAGE)], y_axis_format=",.1%", currency_format=None)
+    _serve(fake, form_data=form, chart=_chart_data(["region", "Average premium"], ("east", value)),
+           mnemiq=_result(("east", value), columns=FLOAT_COLUMNS))
+
+
+def test_a_checked_chart_whose_percent_is_above_100_is_format_wrong(fake):
+    _rate_chart(fake, 54.97)
+    check = _check(fake, kinds={"Average premium": MeasureKind.PERCENT})
+    assert check.status is ChartStatus.FORMAT_WRONG, check.reason
+    assert "above 100%" in check.reason
+    assert check.chart_values == check.mnemiq_values == (("east", 54.97),)
+
+
+def test_a_checked_chart_whose_percent_is_a_fraction_stays_checked(fake):
+    _rate_chart(fake, 0.5497)
+    assert _check(fake, kinds={"Average premium": MeasureKind.PERCENT}).status is ChartStatus.CHECKED
+
+
+def test_a_number_above_one_is_not_a_percent_problem_for_a_non_percent_kind(fake):
+    form = _bar(metrics=[copy.deepcopy(AVERAGE)], y_axis_format=",.2f", currency_format=None)
+    _serve(fake, form_data=form, chart=_chart_data(["region", "Average premium"], ("east", 54.97)),
+           mnemiq=_result(("east", 54.97), columns=FLOAT_COLUMNS))
+    assert _check(fake, kinds={"Average premium": MeasureKind.NUMBER}).status is ChartStatus.CHECKED
