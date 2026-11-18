@@ -1326,8 +1326,8 @@ def test_a_saved_metric_on_a_0_to_100_scale_cannot_be_planned_as_a_percent():
 # ---------------------------------------------------------------- a filter's value no row holds
 
 # What a refusal for a value no row holds advises after the values it names, and after saying it names none.
-KEEP_THE_GOALS = "; filter on one of these only if it is the value the goal means, otherwise leave the filter out"
-LEAVE_IT_OUT = "; leave the filter out unless the goal names a value the column holds"
+KEEP_THE_GOALS = "; filter on one of these only if it is the value the goal means, otherwise keep the goal's value"
+KEEP_IT = "; keep the goal's value"
 
 
 def _reason(column: str, literal: str, held: str) -> str:
@@ -1396,7 +1396,7 @@ def test_a_failed_read_of_the_held_values_still_refuses():
     refused = _plan(GOAL, FakePlanner(_won_plan("Won")), tools)
     assert _parts(refused) == {"measure 'won_amount'": "it filters claim.status on 'Won', which no row the builder "
                                                        "can read holds; the source did not say which values it holds"
-                                                       + LEAVE_IT_OUT}
+                                                       + KEEP_IT}
 
 
 def test_a_value_compared_with_an_expression_is_never_probed():
@@ -1527,7 +1527,7 @@ def test_a_column_the_builder_reads_no_value_of_is_said_to_hold_none():
     refused = _plan(GOAL, FakePlanner(_won_plan("Won")), _tools(held={("claim", "status"): []}))
     assert _parts(refused) == {"measure 'won_amount'": "it filters claim.status on 'Won', which no row the builder "
                                                        "can read holds; no row the builder can read holds any value "
-                                                       "of claim.status" + LEAVE_IT_OUT}
+                                                       "of claim.status" + KEEP_IT}
 
 
 def test_one_plans_probes_are_shared_by_its_measures_and_charts():

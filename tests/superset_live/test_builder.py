@@ -1097,7 +1097,7 @@ def _no_values(found: dict) -> dict:
 # The regions the seed's `policy` holds (`seed.sql`), as each test below measures before it relies on them.
 REGIONS = ["central", "east", "west"]
 # What a refusal for a value no row holds advises after the values it names.
-KEEP_THE_GOALS = "; filter on one of these only if it is the value the goal means, otherwise leave the filter out"
+KEEP_THE_GOALS = "; filter on one of these only if it is the value the goal means, otherwise keep the goal's value"
 
 
 def test_a_value_no_row_holds_is_refused_and_the_repair_is_told_the_values(live, served, model, policy_id):
