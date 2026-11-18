@@ -19,6 +19,7 @@ import pytest
 
 from mnemiq.contract import Definition, Dimension, Example, HistoryTurn, MeasureExpr, Metric
 from mnemiq.generate.prompts import user_prompt
+from mnemiq.semantic.definition_codes import StaleCodes
 from mnemiq.semantic.retrieval import ContextPacket, ResolvedConcept, RetrievedCard
 from mnemiq.sql.verdict import Approved
 from mnemiq.verify.verifier import Verifier
@@ -137,7 +138,7 @@ def test_every_packet_field_is_judged_or_left_out_on_purpose():
     """Derived from the struct: a field added to `ContextPacket` fails this until it is placed on
     one side, and the placement is checked both ways -- a judged field, filled on its own, changes
     what the judge reads, and a field left out does not (M132 and M134 one field over)."""
-    judged = {"cards", "definitions", "metrics", "dimensions", "concepts", "history"}
+    judged = {"cards", "definitions", "metrics", "dimensions", "concepts", "history", "stale_codes"}
     left_out = {
         "question": "a different question",  # handed to the judge on its own
         "grant_fingerprint": "another-boundary",  # bookkeeping, not prompt text
@@ -148,10 +149,16 @@ def test_every_packet_field_is_judged_or_left_out_on_purpose():
     }
     assert {f.name for f in dataclasses.fields(ContextPacket)} == judged | set(left_out)
     filled = {**_meaning(), "history": [_TURN]}
-    assert set(filled) == judged - {"cards"}
+    assert set(filled) == judged - {"cards", "stale_codes"}   # a note is read only beside its definition: below
     unread = [name for name, value in filled.items()
               if _judged_schema(_packet(**{name: value})) == _CARD]
     assert unread == []
     leaked = [name for name, value in left_out.items()
               if _judged_schema(_packet(**{name: value})) != _CARD]
     assert leaked == []
+    (definition,) = _meaning()["definitions"]
+    stale = StaleCodes(definition.term, "payment_channel", ("payment_transaction",), ("ZZ",), ("WEB",),
+                       definition.definition)
+    alone = _judged_schema(_packet(definitions=[definition]))
+    noted = _judged_schema(_packet(definitions=[definition], stale_codes=[stale]))
+    assert noted != alone and "  Note: payment_channel holds none of the codes" in noted
