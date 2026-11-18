@@ -497,3 +497,33 @@ def test_a_pattern_is_never_read_as_an_absent_code():
     held = _index({("plants", "PLANT_CODE"): ["AB12", "xy98"]})
     for text in ["Rows of plant ab12: PLANT_CODE ILIKE 'ab12'.", "Rows of plant ab12: PLANT_CODE LIKE 'ab12'."]:
         assert stale_codes(_snapshot([("plant", text)], [("plants", "PLANT_CODE")]), held) == [], text
+
+
+def test_a_code_counts_only_where_exact_selection_is_shown():
+    """Where the words between the column and the code are SQL, the code counts only when they are an exact selecting
+    form (=, IN (, IS NOT DISTINCT FROM, then the list before it): a pattern behind a parenthesis or a comment, a
+    function around the column or the code, may match what exact membership says is absent, and the finding is an
+    instruction to the writer, so it abstains (Codex's second pass on the note)."""
+    held = _index({("plants", "PLANT_CODE"): ["AB12", "xy98"]})
+
+    def stale(text):
+        return [f.codes for f in stale_codes(_snapshot([("plant", text)], [("plants", "PLANT_CODE")]), held)]
+
+    for text in ["Rows of plant ab12: PLANT_CODE ILIKE ('ab12').", "Rows of plant ab12: PLANT_CODE ILIKE /* p */ 'ab12'.",
+                 "Rows of plant ab12: lower(PLANT_CODE) = 'ab12'.", "Rows of plant ab12: PLANT_CODE ILIKE lower('ab12').",
+                 "Rows of plant ab12: PLANT_CODE LIKE -- a pattern\n 'ab12'."]:
+        assert stale(text) == [], text
+    for text in ["Rows of plant zz99: PLANT_CODE = 'zz99'.", "Rows of plant zz99: PLANT_CODE IN ('zz99').",
+                 "Rows of plant zz99: PLANT_CODE IS NOT DISTINCT FROM 'zz99'.", "Rows of plant zz99: PLANT_CODE = ('zz99').",
+                 "Rows of plant zz99: PLANT_CODE /* the plant */ = 'zz99'."]:
+        assert stale(text) == [("zz99",)], text
+    assert stale("Rows of plants yy88 and zz99: PLANT_CODE IN ('yy88', 'zz99').") == [("yy88", "zz99")]
+    assert stale("Rows of plants yy88 and zz99: PLANT_CODE = 'yy88' or 'zz99'.") == [("yy88", "zz99")]
+
+
+def test_a_parenthesis_in_the_prose_before_a_code_is_not_sql():
+    held = _index({("plants", "PLANT_CODE"): ["XY98"]})
+    text = "The order tables (orders, returns) belong to plant AB12; PLANT_CODE carries it."
+    assert [f.codes for f in stale_codes(_snapshot([("plant", text)], [("plants", "PLANT_CODE")]), held)] == [("AB12",)]
+    text = "Rows of plant AB12: PLANT_CODE (the plant) is 'AB12'."
+    assert [f.codes for f in stale_codes(_snapshot([("plant", text)], [("plants", "PLANT_CODE")]), held)] == [("AB12",)]

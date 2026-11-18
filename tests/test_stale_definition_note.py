@@ -224,3 +224,36 @@ def test_the_eval_engine_hands_retrieval_the_same_finding(monkeypatch, tmp_path)
                                  grants=GrantSet(frozenset({"orders"})))
     ask("orders by plant")
     assert [(s.term, s.codes) for s in handed["stale"]] == [("plant", ("AB12",))]
+
+
+def test_a_swap_during_the_answer_leaves_its_record_on_the_snapshot_it_read(tmp_path, monkeypatch):
+    """`ask` reads the snapshot once; the trace's certified references come from that one, not from a snapshot swapped
+    in while the answer ran, which would name another version's hash under the same ids (Codex's second pass)."""
+    from types import SimpleNamespace
+
+    import mnemiq.runtime as runtime_module
+    from mnemiq.contract.semantic import CertifiedRef
+    from mnemiq.runtime import build_runtime
+    from mnemiq.semantic.retrieval import RetrievedCard
+    from tests.scripted_deployment import IDENTITY, SQL, deployment
+    from tests.sweep.stub_model import StubModel
+
+    def ref(version):
+        return [CertifiedRef(object_type="definition", object_id="d:plant", version_hash=version)]
+
+    with StubModel(sql=SQL) as stub:
+        runtime = build_runtime(deployment(tmp_path, stub.url))
+        runtime.snapshot = runtime.snapshot.model_copy(update={"certified_refs": ref("A")})
+        newer = runtime.snapshot.model_copy(update={"certified_refs": ref("B")})
+
+        def swapped_while_retrieving(con, question, identity, authz, embedder, **kwargs):
+            runtime.snapshot = newer
+            return ContextPacket(question=question, cards=[RetrievedCard(object_id="wide", card="wide (col_0 TEXT)",
+                                                                         score=1.0)],
+                                 grant_fingerprint="fp", enrichment_version=None)
+
+        monkeypatch.setattr(runtime_module, "retrieve", swapped_while_retrieving)
+        events = []
+        runtime.trace_sink = SimpleNamespace(record_answer=events.append)
+        runtime.ask("q", IDENTITY)
+    assert [r.version_hash for r in events[0].certified_refs] == ["A"]

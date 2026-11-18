@@ -71,6 +71,16 @@ _SQL_BEFORE = re.compile(
 _SQL_SELECTS = re.compile(
     r"(?:(?<![<>!])=|\bin\s*\((?:[^()]*,)?|\bis\s+not\s+distinct\s+from)\s*$", re.IGNORECASE)
 _SPACE = re.compile(r"\s+")
+# The words between a column and its code. Where they are SQL, the code counts only after an exact selecting form, and
+# the list it heads: a pattern behind a parenthesis or a comment, or a function around the column or the code, may
+# match what exact membership calls absent, and the finding reaches the writer as an instruction (Codex's second
+# pass on the note). Comments are read as space.
+_COMMENT = re.compile(r"/\*.*?\*/|--[^\n]*", re.DOTALL)
+# A comparison, a pattern word, or a parenthesis that opens on the code or closes on the column (a function around
+# either) is SQL; a parenthesis in the words between is prose ("the ingot tables (A, B) belong to plant X").
+_SQL_GAP = re.compile(r"[<>=!]|\b(?:i?like|similar\s+to|regexp|rlike|glob|between)\b|\(\s*$|^\s*\)", re.IGNORECASE)
+_LISTED = r"(?:(?:'[^']*'|\"[^\"]*\"|[A-Za-z0-9_-]+)\s*(?:,|\bor\b|\band\b)\s*)*"
+_EXACT_GAP = re.compile(rf"\s*(?:=|\bin\s*\(|\bis\s+not\s+distinct\s+from)\s*\(?\s*{_LISTED}", re.IGNORECASE)
 # A negation opening a parenthesised predicate, as SQL writes one.
 _NOT_PAREN = re.compile(r"\bnot\s*\(", re.IGNORECASE)
 # What may stand between two codes of one list: a comma, "and", "or", or both.
@@ -96,6 +106,12 @@ class StaleCodes:
 
 def _shape(text: str) -> str:
     return "".join("A" if c.isupper() else "a" if c.islower() else "9" if c.isdigit() else c for c in text)
+
+
+def _shows_exact(gap: str) -> bool:
+    """Whether `gap`, the words before a code, lets it count: prose, or SQL that selects it exactly (`_EXACT_GAP`)."""
+    gap = _COMMENT.sub(" ", gap)
+    return _SQL_GAP.search(gap) is None or _EXACT_GAP.fullmatch(gap) is not None
 
 
 def _identifier_like(name: str) -> bool:
@@ -197,12 +213,13 @@ def _attributed(text: str, judged: dict, names: set[str], unjudged: set[str]) ->
         clause = start - len(_CLAUSE_END.split(text[:start])[-1])
         before = [(at, key) for key, ats in (judged_at | other_at).items() for at in ats if clause <= at < start]
         if before:
-            key = max(before)[1]
-            if key in judged_at and _shape(code) in shapes[key]:
+            at, key = max(before)
+            if (key in judged_at and _shape(code) in shapes[key]
+                    and _shows_exact(text[at + len(judged[key][0]):start])):
                 out.setdefault(key, []).append(code)
             continue
         fits = [key for key in judged_at if _shape(code) in shapes[key]]
-        if len(fits) == 1 and not any(_identifier_like(key) for key in other_at):
+        if len(fits) == 1 and not any(_identifier_like(key) for key in other_at) and _shows_exact(text[clause:start]):
             out.setdefault(fits[0], []).append(code)
     return out
 

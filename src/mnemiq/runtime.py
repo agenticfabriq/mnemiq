@@ -404,11 +404,17 @@ class Runtime:
             logger.warning("Superset refused this request (%s) while it was answered; the request ends here",
                            type(refused).__name__)
             raise refused
-        return self._record(answer, name, grants, identity, packet.question, packet, started, picked)
+        return self._record(answer, name, grants, identity, packet.question, packet, started, picked,
+                            snapshot=snapshot)
 
     def _record(self, answer: AgentAnswer, name: str, grants, identity: IdentityContext, question: str,
-                packet, started: float, picked: LoadedProfile | None = None) -> AgentAnswer:
-        """Stamps the answer with its mode, grants and profile, and records it once in each sink."""
+                packet, started: float, picked: LoadedProfile | None = None, *,
+                snapshot: Snapshot | None = None) -> AgentAnswer:
+        """Stamps the answer with its mode, grants and profile, and records it once in each sink.
+
+        `snapshot` is the one the answer read (`ask` reads it once), so a swap while it ran cannot attribute it to
+        another version; None, for a decline before any was read, is the runtime's current one."""
+        snapshot = snapshot if snapshot is not None else self.snapshot
         answer.mode = name
         answer.grant_fingerprint = grants.fingerprint
         answer.engine_commit = self.engine_commit
@@ -435,7 +441,7 @@ class Runtime:
             )
             # What the SNAPSHOT holds; the emitter intersects it with what the PACKET selected, so
             # the trace names what the answer USED rather than what was available to it.
-            event.certified_refs = self.snapshot.certified_refs if self.snapshot else []
+            event.certified_refs = snapshot.certified_refs if snapshot else []
             try:
                 self.trace_sink.record_answer(event)
             except Exception as exc:  # never into the caller's answer
