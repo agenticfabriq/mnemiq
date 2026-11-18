@@ -278,6 +278,12 @@ still to come. In short:
 - **Values a plan's repair is told.** The planning prompt holds no value read from the data's rows. When a plan
   filters on a value no row the builder can read holds, up to 20 values of that column, one the plan itself filtered,
   read as the builder, go to the one repair prompt and to the refused plan's answer: a hosted planning model sees them.
+- **A negated filter on a column that holds NULL.** SQL reads a chart filter with `!=`, `NOT IN` or `NOT LIKE` as
+  leaving out every row where its column is NULL. When a row the builder can read holds NULL in that column, the chart
+  is refused, repairably, and the repair is told the three ways out: `IS NULL` if those are the rows the goal means,
+  `IS NOT NULL` beside the filter if leaving them out is meant, or a filter on another column. A chart that already
+  filters the column `IS NULL` or `IS NOT NULL` is not asked. The probe runs as the builder and says only whether such
+  a row exists: no value reaches the model.
 - **A token made for building.** Besides `db.read`, the two `POST`s need Superset's `superset:chart:write`,
   `superset:dashboard:write` and `superset:dataset:write` scopes. The extension's token route puts those in a token
   asked for with `{"purpose": "build"}`. A token made for asking is refused with a 403.

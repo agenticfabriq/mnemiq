@@ -15,8 +15,9 @@ mnemiq's own reason, which names what the model wrote and nothing Superset said,
 **What is checked.** Each written measure meets `check_measure`, its statement decided under the builder's grants as
 every ask-path statement is, then the values it filters on (`absent_literals`), and then `reusable`: a saved metric on
 its dataset that says the same thing replaces it. Each chart meets `plan_refusal` and the plan's own rules here (its
-key, its columns, its filters, the saved metrics it names), and then the values its filters compare a column with. A
-refused part goes back to the model once; refused again, it refuses the plan, and the reason names it.
+key, its columns, its filters, the saved metrics it names), then the values its filters compare a column with, and then
+whether a column it filters with `!=`, `NOT IN` or `NOT LIKE` holds NULL, which such a filter leaves out. A refused
+part goes back to the model once; refused again, it refuses the plan, and the reason names it.
 
 **Datasets.** A chart on a table with no dataset gets a planned dataset over the table; a measure that needs a join
 gets a planned virtual dataset over the join's SQL, the join decided with the measure by `check_measure`. The builder
@@ -49,7 +50,7 @@ from mnemiq.sql.schema import column_types, visible_schema
 from mnemiq.superset.adapter import JINJA_DELIMITERS
 from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenRef, plan_refusal
 from mnemiq.superset.grants import UnreadableAnswer, read_datasets, table_bindings
-from mnemiq.superset.literals import Absent, Probes, absent_literals, filter_statement
+from mnemiq.superset.literals import NEGATED_OPERATORS, Absent, Probes, absent_literals, filter_statement, holds_null
 from mnemiq.superset.marker import format_marker
 from mnemiq.superset.measures import Measure, MeasureKind, MeasureRefused, check_measure, scales_by_100, \
     superset_text_problem
@@ -1022,6 +1023,28 @@ def _filter_refusals(chart: ChartSpec, on: _Rows, *, adapter, snapshot: Snapshot
     return list(reasons)
 
 
+def _null_refusals(chart: ChartSpec, on: _Rows, *, adapter, snapshot: Snapshot, grants: GrantSet,
+                   probes: Probes) -> list[str]:
+    """The reasons `chart` is refused for a negated filter (`!=`, `NOT IN`, `NOT LIKE`) on a column a row the builder
+    can read holds NULL in: SQL reads NULL compared with anything as unknown, so the filter leaves those rows out
+    beside the ones it names, which the goal may not mean. A chart that also filters the column `IS NULL` or `IS NOT
+    NULL` has said what it does with them, and is not asked. Asked of the table and column the chart's rows read it
+    from (`_Rows.origins`), as the builder (`holds_null`); a column the source says nothing of refuses nothing."""
+    stated = {item.column for item in chart.filters if item.op in _NO_OPERAND}
+    reasons: dict[str, None] = {}
+    for item in chart.filters:
+        if item.op not in NEGATED_OPERATORS or item.column in stated:
+            continue
+        origin = on.origins.get(item.column)
+        if origin is not None and holds_null(*origin, adapter=adapter, snapshot=snapshot, grants=grants,
+                                             timeout_s=DEFAULT_TIMEOUT_S, probes=probes):
+            reasons.setdefault(f"it filters {item.column} with {item.op}, which leaves out every row where "
+                               f"{item.column} is NULL, and rows the builder can read hold NULL there; use IS NULL if "
+                               f"those are the rows the goal means, add {item.column} IS NOT NULL if leaving them out "
+                               "is meant, or filter on another column")
+    return list(reasons)
+
+
 def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adapter, snapshot: Snapshot,
            grants: GrantSet, settings, interactive_pivot_available: bool) -> BuildPlan | tuple[RefusedPart, ...]:
     """The plan with its reusable measures replaced by the saved metrics that say the same, or every part refused, each
@@ -1241,8 +1264,11 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
             if why is not None:
                 refuse(part, why)
         if len(refused) == before:
-            for reason in _filter_refusals(spec, on, adapter=adapter, snapshot=snapshot, grants=grants,
-                                           probes=probes):
+            # A chart's filter reasons go back together: a value no row holds, and the NULL rows a negation leaves out.
+            for reason in [*_filter_refusals(spec, on, adapter=adapter, snapshot=snapshot, grants=grants,
+                                             probes=probes),
+                           *_null_refusals(spec, on, adapter=adapter, snapshot=snapshot, grants=grants,
+                                           probes=probes)]:
                 refuse(part, reason)
         charts.append(spec)
 
