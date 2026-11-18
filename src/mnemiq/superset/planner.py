@@ -985,15 +985,22 @@ def _chart_columns(chart: ChartSpec) -> list[str]:
 def _absent_reason(absent: Absent) -> str:
     """Why a part that filters on a value no row the builder can read holds is refused, naming the values its column
     holds where the source said. Each value is quoted (`repr`), so one holding ", " never reads as two, and one holding
-    a line break never starts a line of the repair's prompt that reads as another part's refusal."""
+    a line break never starts a line of the repair's prompt that reads as another part's refusal. The reason ends with
+    what to do: a value the column holds replaces the plan's only where it is the value the goal means, since a goal
+    naming one the builder cannot read is answered by no value of the column, and a swapped one builds a chart of a
+    different question that checks."""
     if absent.held is None:
-        held = "the source did not say which values it holds"
+        held = "the source did not say which values it holds; " + _LEAVE_IT_OUT
     elif not absent.held:
-        held = f"no row the builder can read holds any value of {absent.column}"
+        held = f"no row the builder can read holds any value of {absent.column}; " + _LEAVE_IT_OUT
     else:
         held = (f"{absent.column} holds: {', '.join(repr(value) for value in absent.held)}"
-                f"{' and more' if absent.more else ''}")
+                f"{' and more' if absent.more else ''}; filter on one of these only if it is the value the goal means, "
+                "otherwise leave the filter out")
     return f"it filters {absent.column} on {absent.literal!r}, which no row the builder can read holds; {held}"
+
+
+_LEAVE_IT_OUT = "leave the filter out unless the goal names a value the column holds"
 
 
 def _filter_refusals(chart: ChartSpec, on: _Rows, *, adapter, snapshot: Snapshot, grants: GrantSet,
@@ -1130,15 +1137,16 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
         if isinstance(verdict, MeasureRefused):
             refuse(part, verdict.reason, repairable=verdict.repairable)
             continue
-        if measure.kind is MeasureKind.PERCENT and scales_by_100(measure.expression):
+        # Both checks, so a measure refused for both is told both in its one repair.
+        scaled = measure.kind is MeasureKind.PERCENT and scales_by_100(measure.expression)
+        if scaled:
             refuse(part, "a percent measure is a fraction from 0 to 1, which Superset shows as a percent: write it "
                          "without multiplying by 100")
-            continue
         absent = absent_literals(verdict.asked_sql, adapter=adapter, snapshot=snapshot, grants=grants,
                                  timeout_s=DEFAULT_TIMEOUT_S, probes=probes) if verdict.asked_sql else []
         for reason in dict.fromkeys(_absent_reason(item) for item in absent):
             refuse(part, reason)
-        if absent:
+        if scaled or absent:
             continue
         hit = reusable(measure, list(on.saved))
         if hit is not None:

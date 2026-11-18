@@ -14,11 +14,11 @@ import pytest
 import sqlglot
 from sqlglot import exp
 
+from mnemiq.agent.loop import PROBE_BUDGET_S
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Column, Snapshot
 from mnemiq.contract.semantic import SourceBinding
 from mnemiq.sql.values_check import PROBE_LIMIT
-from mnemiq.agent.loop import PROBE_BUDGET_S
 from mnemiq.superset.literals import Absent, Probes, absent_literals, filter_statement
 
 SNAPSHOT = Snapshot(version="v1", source_id="only", created_at="t", columns=[
@@ -34,23 +34,33 @@ ONE = pa.table({"?column?": [1]})
 
 class Source:
     """The request's adapter, faked: `answer(sql)` answers each statement (a table, or an exception it raises), and
-    every statement is recorded in the order sent."""
+    every statement is recorded in the order sent, with whether it asked to be run afresh (`execute_arrow_afresh`)
+    rather than answered from Superset's result cache (`execute_arrow`). `cached(sql)`, when given, is what the cache
+    answers a statement not run afresh with."""
 
     dialect = "postgres"
 
-    def __init__(self, answer, *, clock: list[float] | None = None, takes_s: float = 0.0) -> None:
-        self.answer = answer
+    def __init__(self, answer, *, clock: list[float] | None = None, takes_s: float = 0.0, cached=None) -> None:
+        self.answer, self.cached = answer, cached
         self.sent: list[str] = []
+        self.fresh: list[bool] = []
         self.timeouts: list[float | None] = []
         # A read takes `takes_s` on `clock` (a one-item list, the time now), the clock a `Probes` is given.
         self.clock, self.takes_s = clock, takes_s
 
     def execute_arrow(self, sql: str, timeout_s: float | None = None) -> pa.Table:
+        return self._run(sql, timeout_s, fresh=False)
+
+    def execute_arrow_afresh(self, sql: str, timeout_s: float | None = None) -> pa.Table:
+        return self._run(sql, timeout_s, fresh=True)
+
+    def _run(self, sql: str, timeout_s: float | None, *, fresh: bool) -> pa.Table:
         self.sent.append(sql)
+        self.fresh.append(fresh)
         self.timeouts.append(timeout_s)
         if self.clock is not None:
             self.clock[0] += self.takes_s
-        result = self.answer(sql)
+        result = self.answer(sql) if fresh or self.cached is None else self.cached(sql)
         if isinstance(result, Exception):
             raise result
         return result
@@ -309,3 +319,22 @@ def test_the_same_value_is_probed_once_and_a_columns_values_read_once():
     assert first == again == [Absent("t.status", "Won", ("LOST", "WON"), False)]
     assert other == [Absent("t.status", "Lost", ("LOST", "WON"), False)]
     assert sum(_probe(s) for s in source.sent) == 2 and sum(_held(s) for s in source.sent) == 1
+
+
+# ---------------------------------------------------------------- read afresh, never from Superset's result cache
+
+
+def test_every_probe_and_read_of_held_values_is_run_afresh():
+    """A cached answer may be older than the data: an empty one would refuse a value the column now holds, and cached
+    values would tell the repair what the column used to hold. So every statement asks Superset to run it afresh."""
+    source = _source(["LOST", "WON"], present=frozenset({"WON"}))
+    assert _absent("SELECT COUNT(*) FROM t WHERE status IN ('Won', 'WON')", source) == [
+        Absent("t.status", "Won", ("LOST", "WON"), False)]
+    assert len(source.sent) == 3 and source.fresh == [True, True, True]
+
+
+def test_a_cached_empty_answer_refuses_nothing_once_the_value_is_held():
+    """The cache still says no row holds 'Won' (it was added since); run afresh, the source finds it."""
+    source = _source(["WON", "Won"], present=frozenset({"Won"}), cached=lambda sql: NONE)
+    assert _absent("SELECT COUNT(*) FROM t WHERE status = 'Won'", source) == []
+    assert source.fresh == [True]

@@ -113,6 +113,11 @@ class SupersetSqlAdapter:
         """`sql`'s result. Raises `ResultCut` when Superset cut the result to size or would not send it at all."""
         return self._result(sql, timeout_s)
 
+    def execute_arrow_afresh(self, sql: str, timeout_s: float | None = None) -> pa.Table:
+        """`sql`'s result as the database answers it now: Superset is asked to run it (`force_refresh`) rather than
+        answer from its result cache, as the plan check's reads of a filter's value need. Raises as `execute_arrow`."""
+        return self._result(sql, timeout_s, force_refresh=True)
+
     def execute(self, sql: str) -> list[tuple]:
         return _tuples(self.execute_arrow(sql))
 

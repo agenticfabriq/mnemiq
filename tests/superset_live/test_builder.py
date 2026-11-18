@@ -1096,6 +1096,8 @@ def _no_values(found: dict) -> dict:
 
 # The regions the seed's `policy` holds (`seed.sql`), as each test below measures before it relies on them.
 REGIONS = ["central", "east", "west"]
+# What a refusal for a value no row holds advises after the values it names.
+KEEP_THE_GOALS = "; filter on one of these only if it is the value the goal means, otherwise leave the filter out"
 
 
 def test_a_value_no_row_holds_is_refused_and_the_repair_is_told_the_values(live, served, model, policy_id):
@@ -1112,7 +1114,7 @@ def test_a_value_no_row_holds_is_refused_and_the_repair_is_told_the_values(live,
     run = run_build(live, served, model, [first, repaired], "value-repaired", goal=goal)
     record("value-repaired", _no_values(summary(run, served, repaired) if run.build_id else {"stopped": run.stopped}))
     reason = ("it filters policy.region on 'West', which no row the builder can read holds; policy.region holds: "
-              "'central', 'east', 'west'")
+              f"'central', 'east', 'west'{KEEP_THE_GOALS}")
     assert run.planner.goals == [goal] * 2
     opening, repair = _prompts(run, goal)
     told = f"- measure 'region_policies': {reason}" in repair
@@ -1143,7 +1145,7 @@ def test_a_row_rule_builder_is_told_only_the_values_it_may_read(live, served, mo
     record("value-row-rule", _no_values(summary(run, served)))
     [start] = run.requests
     reason = ("it filters policy.region on 'east', which no row the builder can read holds; policy.region holds: "
-              "'west'")
+              f"'west'{KEEP_THE_GOALS}")
     assert start.status_code == 200, start.status_code
     parts = [part.get("part") for part in (start.body.get("refused") or {}).get("parts", [])]
     exact = start.body == {"refused": {
@@ -1189,7 +1191,7 @@ def test_a_chart_filter_on_a_value_no_row_holds_is_refused_and_the_repair_is_tol
     record("chart-value-repaired",
            _no_values(summary(run, served, repaired) if run.build_id else {"stopped": run.stopped}))
     reason = ("it filters policy.region on 'West', which no row the builder can read holds; policy.region holds: "
-              "'central', 'east', 'west'")
+              f"'central', 'east', 'west'{KEEP_THE_GOALS}")
     assert run.planner.goals == [goal] * 2
     _, repair = _prompts(run, goal)
     told = f"- chart 'filtered_policies': {reason}" in repair

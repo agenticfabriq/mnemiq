@@ -1325,10 +1325,16 @@ def test_a_saved_metric_on_a_0_to_100_scale_cannot_be_planned_as_a_percent():
 
 # ---------------------------------------------------------------- a filter's value no row holds
 
+# What a refusal for a value no row holds advises after the values it names, and after saying it names none.
+KEEP_THE_GOALS = "; filter on one of these only if it is the value the goal means, otherwise leave the filter out"
+LEAVE_IT_OUT = "; leave the filter out unless the goal names a value the column holds"
+
+
 def _reason(column: str, literal: str, held: str) -> str:
     """The refusal of a part that filters `column` on `literal`, no row the builder can read holding it; `held` is the
     values the column holds as the reason quotes them."""
-    return f"it filters {column} on {literal!r}, which no row the builder can read holds; {column} holds: {held}"
+    return (f"it filters {column} on {literal!r}, which no row the builder can read holds; {column} holds: {held}"
+            f"{KEEP_THE_GOALS}")
 
 
 def _won_plan(literal: str) -> BuildPlan:
@@ -1389,7 +1395,8 @@ def test_a_failed_read_of_the_held_values_still_refuses():
         if _HELD_READ.fullmatch(request["sql"]) else _value_answer(request["sql"], held) or EMPTY)
     refused = _plan(GOAL, FakePlanner(_won_plan("Won")), tools)
     assert _parts(refused) == {"measure 'won_amount'": "it filters claim.status on 'Won', which no row the builder "
-                                                       "can read holds; the source did not say which values it holds"}
+                                                       "can read holds; the source did not say which values it holds"
+                                                       + LEAVE_IT_OUT}
 
 
 def test_a_value_compared_with_an_expression_is_never_probed():
@@ -1438,8 +1445,8 @@ def test_a_chart_filter_on_a_joined_column_is_probed_on_its_own_table():
     assert probed == {("claim", "status"), ("claim", "policy_id")}
 
 
-def test_a_filter_value_on_a_table_the_builder_cannot_read_is_never_probed():
-    """A chart refused for a column its rows lack is not probed: only a chart whose own checks pass is."""
+def test_a_filter_on_a_column_the_charts_rows_lack_is_never_probed():
+    """A chart refused for a filter on a column its rows lack is not probed: the column has no table to ask."""
     chart = _chart("premium_by_region", Family.BAR, [WrittenRef(PREMIUM)], dims=["region"],
                    filters=[Filter("salary", "=", "x")])
     tools = _tools(held={})
@@ -1447,6 +1454,56 @@ def test_a_filter_value_on_a_table_the_builder_cannot_read_is_never_probed():
     assert "not a column" in _parts(refused)["chart 'premium_by_region'"]
     assert not any(_PROBE.fullmatch(sql) or _HELD_READ.fullmatch(sql) for sql in tools.statements())
 
+
+@pytest.mark.parametrize(("key", "title", "why"), [
+    ("Bad Key", "Premium", "a chart's key is 1 to 40 of a-z, 0-9 and _"),
+    ("premium_by_region", "", "a chart's title is 1 to"),
+])
+def test_a_chart_its_own_checks_refuse_is_never_probed(key, title, why):
+    """A chart that fails one of its own checks is not probed, even for a filter on a value no row holds: only a chart
+    whose own checks all pass costs the source a probe, and the refusal gives the chart's own reason alone."""
+    chart = dataclasses.replace(_chart(key, Family.BAR, [WrittenRef(PREMIUM)], dims=["region"],
+                                       filters=[Filter("region", "=", "West")]), title=title)
+    tools = _tools(held={("policy", "region"): ["central", "east", "west"]})
+    refused = _plan(GOAL, FakePlanner(_valid_plan(measures=(PREMIUM,), charts=(chart,))), tools)
+    [part] = refused.parts
+    assert part.part == f"chart {key!r}" and part.reason.startswith(why), part
+    assert not any(_PROBE.fullmatch(sql) or _HELD_READ.fullmatch(sql) for sql in tools.statements())
+
+
+def test_a_percent_scaled_by_100_and_filtering_a_value_no_row_holds_is_told_both_in_one_round():
+    """A measure the percent rule refuses is still checked for its filter values, so both reasons go back in its one
+    repair rather than the second costing a round the plan no longer has."""
+    rate = _measure("won_rate", "Won rate", "100.0 * AVG(CASE WHEN status = 'Won' THEN 1 ELSE 0 END)", K.PERCENT,
+                    dataset_id=2)
+    plan = _valid_plan(measures=(rate,), charts=(_chart("won_rate", Family.BIG_NUMBER, [WrittenRef(rate)],
+                                                        dataset_id=2),))
+    planner = FakePlanner(plan)
+    _plan(GOAL, planner, _tools(held={("claim", "status"): ["LOST", "WON"]}))
+    assert [part.reason for part in planner.contexts[1].repair.refused] == [
+        "a percent measure is a fraction from 0 to 1, which Superset shows as a percent: write it without multiplying "
+        "by 100", _reason("claim.status", "Won", "'LOST', 'WON'")]
+
+
+def test_every_probe_and_read_of_held_values_asks_superset_to_run_it_afresh():
+    """Each probe and each read of a column's values is sent with `force_refresh`, so Superset runs it rather than
+    answer from its result cache; the measure's own statements are not."""
+    tools = _tools(held={("claim", "status"): ["LOST", "WON"]})
+    _plan(GOAL, FakePlanner(_won_plan("Won")), tools)
+    sent = [request for tool, request in tools.calls if tool == "execute_sql"]
+    values = [request for request in sent if _PROBE.fullmatch(request["sql"]) or _HELD_READ.fullmatch(request["sql"])]
+    assert values and all(request.get("force_refresh") is True for request in values)
+    assert any("won_amount" in request["sql"] and "force_refresh" not in request for request in sent)
+
+
+def test_a_cached_empty_probe_refuses_nothing():
+    """Superset's cache says no row holds 'Won', which the column holds now: asked afresh, the probe finds it, and
+    nothing is refused."""
+    held = {("claim", "status"): ["Won"]}
+    tools = _tools(held=held)
+    tools.handlers["execute_sql"] = lambda request: (
+        _value_answer(request["sql"], held if request.get("force_refresh") else {}) or EMPTY)
+    assert isinstance(_plan(GOAL, FakePlanner(_won_plan("Won")), tools), BuildPlan)
 
 
 def test_each_held_value_is_quoted_so_none_reads_as_two_or_as_another_line():
@@ -1470,7 +1527,7 @@ def test_a_column_the_builder_reads_no_value_of_is_said_to_hold_none():
     refused = _plan(GOAL, FakePlanner(_won_plan("Won")), _tools(held={("claim", "status"): []}))
     assert _parts(refused) == {"measure 'won_amount'": "it filters claim.status on 'Won', which no row the builder "
                                                        "can read holds; no row the builder can read holds any value "
-                                                       "of claim.status"}
+                                                       "of claim.status" + LEAVE_IT_OUT}
 
 
 def test_one_plans_probes_are_shared_by_its_measures_and_charts():

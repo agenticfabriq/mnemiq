@@ -16,6 +16,10 @@ For a value the source rules out, the values its column does hold are read the s
 whose row rules narrow the column is told only the values they may read. Those are the only values a plan is ever told,
 and only through the refusal of its own part. A log line names a column at most, never a value.
 
+Every probe and read asks Superset to run it afresh (`SupersetSqlAdapter.execute_arrow_afresh`), never to answer from
+its result cache: a cached empty answer could refuse a value the column holds now, and cached values could tell the
+repair what the column used to hold.
+
 One check of a plan shares one `Probes`: the time every probe and read of the plan may take together, the ask path's
 `PROBE_BUDGET_S` for a turn's probes, since an equality on a column with no index, and a read of a column's distinct
 values, can each scan the table; and what the source already said, so a value two parts filter on is asked once and a
@@ -98,6 +102,17 @@ class Probes:
             self.spent_s += self.clock() - started
 
 
+class _Afresh:
+    """`adapter` as the ask path's `source_holds` and the read of a column's values use it, every statement run afresh
+    (`execute_arrow_afresh`). An adapter without that method fails each read, which leaves the value unchecked."""
+
+    def __init__(self, adapter) -> None:
+        self._adapter = adapter
+
+    def execute_arrow(self, sql: str, timeout_s: float | None = None):
+        return self._adapter.execute_arrow_afresh(sql, timeout_s=timeout_s)
+
+
 def filter_statement(table: str, column: str, op: str, operand, dialect: str | None) -> str | None:
     """A chart filter as a statement `absent_literals` reads: `SELECT 1 FROM <table> WHERE <column> IN (<its
     strings>)`, the names quoted as stored. None for an operator other than `=`, `!=`, `IN` and `NOT IN`, and for an
@@ -140,6 +155,7 @@ def absent_literals(sql: str, *, adapter, snapshot: Snapshot, grants: GrantSet, 
         logger.info("a plan's filter values could not be read (%s); none is checked", type(exc).__name__)
         return []
     probes = Probes() if probes is None else probes
+    afresh = _Afresh(adapter)
     physical = {binding.object_id: binding.source_object for binding in snapshot.source_bindings}
     asked: set[tuple[str, str, str]] = set()
     late: set[tuple[str, str, str]] = set()
@@ -151,7 +167,7 @@ def absent_literals(sql: str, *, adapter, snapshot: Snapshot, grants: GrantSet, 
             if probes.left_s() <= 0:
                 late.add(key)
                 return None  # not kept: unasked is not unanswered
-            probes.answers[key] = probes.timed(lambda limit: source_holds(adapter, dialect, physical, limit)(*key),
+            probes.answers[key] = probes.timed(lambda limit: source_holds(afresh, dialect, physical, limit)(*key),
                                                timeout_s)
         return probes.answers[key]
 
@@ -180,7 +196,7 @@ def absent_literals(sql: str, *, adapter, snapshot: Snapshot, grants: GrantSet, 
                 read = None  # not kept, as an unasked probe is not
             else:
                 read = probes.held[value.placed] = probes.timed(
-                    lambda limit, placed=value.placed: _held(adapter, physical, *placed, dialect=dialect,
+                    lambda limit, placed=value.placed: _held(afresh, physical, *placed, dialect=dialect,
                                                              timeout_s=limit), timeout_s)
         else:
             read = probes.held[value.placed]

@@ -275,6 +275,9 @@ still to come. In short:
     needs a large window.
   - `POST /v1/superset/builds/{id}/next` runs the build's next step.
   - `GET /v1/superset/builds/{id}` reads the build as it stands.
+- **Values a plan's repair is told.** The planning prompt holds no value from the data. When a plan filters on a
+  value no row the builder can read holds, up to 20 values of that column, one the plan itself filtered, read as the
+  builder, go to the one repair prompt and to the refused plan's answer: a hosted planning model sees them.
 - **A token made for building.** Besides `db.read`, the two `POST`s need Superset's `superset:chart:write`,
   `superset:dashboard:write` and `superset:dataset:write` scopes. The extension's token route puts those in a token
   asked for with `{"purpose": "build"}`. A token made for asking is refused with a 403.
