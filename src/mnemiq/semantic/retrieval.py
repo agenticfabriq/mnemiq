@@ -15,6 +15,7 @@ from mnemiq.contract import (
 from mnemiq.llm.embeddings import Embedder
 from mnemiq.semantic.cards import render_facts_block
 from mnemiq.semantic.embedding_width import refuse_if_mismatched
+from mnemiq.semantic.definition_codes import StaleCodes, noted_stale
 from mnemiq.semantic.glossary import select_definitions
 from mnemiq.semantic.measures import (
     expression_reads_raw,
@@ -64,6 +65,9 @@ class ContextPacket:
     # (sent, described) when `mnemiq.semantic.fit` withheld column descriptions to fit the window
     # (M127); None when every card is as retrieval rendered it.
     descriptions: tuple[int, int] | None = None
+    # Of `definitions`, those naming codes their column holds none of, as the load found them (`noted_stale`):
+    # each is noted beside its definition wherever the definitions are shown (`generate.prompts.meaning_sections`).
+    stale_codes: list[StaleCodes] = field(default_factory=list)
 
 
 def _rank(rows: list[tuple[str, float]]) -> dict[str, int]:
@@ -364,6 +368,7 @@ def retrieve(
     card_style: str = "cards",
     grants: GrantSet | None = None,
     dialect: str | None = None,
+    stale: Sequence[StaleCodes] = (),
 ) -> ContextPacket:
     """Hybrid retrieval, scoped to the identity's grants *before* anything is ranked.
 
@@ -486,6 +491,7 @@ def retrieve(
     # After the cards, not before: a bound definition rides with its table, so which tables were
     # retrieved has to be known first. It used to be selected before anything was ranked.
     packet.definitions = select_definitions(question, definitions, grants, table_ids)
+    packet.stale_codes = noted_stale(stale, packet.definitions, grants, columns)
     packet.metrics = select_metrics(table_ids, metrics, grants, columns=columns)
     packet.dimensions = select_dimensions(table_ids, dimensions, grants, columns=columns)
     not_raw = frozenset((c.object_id, c.name) for c in columns if not read_raw(c, grants))

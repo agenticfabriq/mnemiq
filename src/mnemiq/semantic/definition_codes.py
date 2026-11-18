@@ -36,9 +36,12 @@ The value index already leaves out keys, personal data and columns with too many
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
-from mnemiq.contract import Snapshot
+from mnemiq.authz.grants import GrantSet
+from mnemiq.contract import Column, Definition, Snapshot
+from mnemiq.semantic.measures import read_raw
 from mnemiq.semantic.textmatch import similarity
 
 # Opened after a non-word character, closed before one, never starting or ending in whitespace: "'AX' or 'AY'" yields AX
@@ -85,6 +88,8 @@ class StaleCodes:
     objects: tuple[str, ...]  # the objects whose column was read
     codes: tuple[str, ...]
     nearest: tuple[str, ...]  # the column's real values most like the first code, best first
+    # The text the codes were read from: a note rides only with a definition that still says it (`noted_stale`).
+    definition: str = ""
 
 
 def _shape(text: str) -> str:
@@ -200,21 +205,39 @@ def _attributed(text: str, judged: dict, names: set[str], unjudged: set[str]) ->
     return out
 
 
-def stale_codes(snapshot: Snapshot, values) -> list[StaleCodes]:
+def stale_codes(snapshot: Snapshot, values, definitions: Sequence[Definition] | None = None) -> list[StaleCodes]:
     """Each definition and indexed column where the definition names codes the column holds none of.
 
     `values` is the value index (`ValueIndex`), read through `has` and `values`; an index that holds nothing
-    (`NoValueIndex`) judges nothing."""
+    (`NoValueIndex`) judges nothing. `definitions` are the ones read, the snapshot's when None."""
     judged = _judged(snapshot, values)
     names = {col.name.lower() for col in snapshot.columns} | {col.object_id.lower() for col in snapshot.columns}
     unjudged = _unjudged(snapshot, judged)
     found: list[StaleCodes] = []
-    for definition in snapshot.definitions:
+    for definition in snapshot.definitions if definitions is None else definitions:
         for key, codes in sorted(_attributed(definition.definition, judged, names, unjudged).items()):
             column, objects, held = judged[key]
             named = sorted(set(codes))
             if any(c in held for c in named):
                 continue
             nearest = sorted(held, key=lambda v: (-similarity(named[0], v), v))[:NEAREST]
-            found.append(StaleCodes(definition.term, column, objects, tuple(named), tuple(nearest)))
+            found.append(StaleCodes(definition.term, column, objects, tuple(named), tuple(nearest),
+                                    definition.definition))
     return found
+
+
+def noted_stale(stale: Sequence[StaleCodes], definitions: Sequence[Definition], grants: GrantSet,
+                columns: Sequence[Column]) -> list[StaleCodes]:
+    """The findings to note beside `definitions` for this identity: each for a definition among them that still
+    reads as it did when checked, where the identity is granted every object holding the column and reads each of
+    those columns raw. The finding is about all of them, and a column of an object it cannot see, or one masked
+    for it, is not its to be told about. A column not among `columns` cannot be judged here, so it is not noted."""
+    shown = {(d.term, d.definition) for d in definitions}
+    noted = []
+    for found in stale:
+        if (found.term, found.definition) not in shown or not all(grants.allows(o) for o in found.objects):
+            continue
+        held = [c for c in columns if c.object_id in found.objects and c.name.lower() == found.column.lower()]
+        if held and all(read_raw(c, grants) for c in held):
+            noted.append(found)
+    return noted

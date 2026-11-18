@@ -308,7 +308,7 @@ def test_ask_threads_ontology_index_columns_and_definitions(monkeypatch):
 
     def fake_retrieve(con, question, identity, authz, embedder, k=5, table_facts=(),
                       definitions=(), metrics=(), dimensions=(), columns=(), ontology_index=None,
-                      snapshot=None, card_style="cards", grants=None, dialect=None):
+                      snapshot=None, card_style="cards", grants=None, dialect=None, stale=()):
         seen["definitions"] = list(definitions)
         # Certified metrics and dimensions were the next pair to reach the snapshot and stop
         # there -- five of the fs corpus's records, carrying the certified SQL for settled, gross
@@ -417,7 +417,7 @@ def test_the_eval_door_and_the_product_door_ground_identically():
     # certified measures would agree with each other and ground nothing -- the equality above
     # cannot tell that from two doors that are both right.
     assert {
-        "metrics", "dimensions", "snapshot", "definitions", "ontology_index", "card_style",
+        "metrics", "dimensions", "snapshot", "definitions", "ontology_index", "card_style", "stale",
     } <= eval_door
 
 

@@ -11,6 +11,7 @@ from mnemiq.config import Settings
 from mnemiq.contract import Definition, IdentityContext, Snapshot
 from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import LLMEmbedder
+from mnemiq.semantic.definition_codes import stale_codes
 from mnemiq.semantic.retrieval import retrieve
 from mnemiq.semantic.store import build_example_index, build_index
 from mnemiq.semantic.values import build_value_index
@@ -160,6 +161,9 @@ def build_engine(
     engine_grants = grants
 
     kit = build_components(settings, adapter, con)
+    # The definitions naming codes their column holds none of, from the index just built, noted beside them as the
+    # product door notes the ones it found at boot (`Runtime.stale`).
+    stale = stale_codes(snapshot, kit.values, definitions=definitions)
 
     verifier = None
     judge_client = None
@@ -241,7 +245,7 @@ def build_engine(
                           definitions=definitions, table_facts=snapshot.table_facts,
                           metrics=snapshot.metrics, dimensions=snapshot.dimensions,
                           columns=snapshot.columns, ontology_index=ontology_index,
-                          snapshot=snapshot, grants=scope)
+                          snapshot=snapshot, grants=scope, stale=stale)
         # The product door's fit, from the same kit: an eval must measure the prompt `ask` sends.
         packet = kit.fitter.fit(packet, snapshot, scope)
         return agent.answer(packet, snapshot, scope, IDENTITY)

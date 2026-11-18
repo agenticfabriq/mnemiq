@@ -30,7 +30,7 @@ from mnemiq.semantic.ontology_index import OntologyIndex
 from mnemiq.sql.decide_write import decide_write
 from mnemiq.semantic.cards import build_cards
 from mnemiq.semantic.starters import compose_starters
-from mnemiq.semantic.definition_codes import stale_codes
+from mnemiq.semantic.definition_codes import StaleCodes, stale_codes
 from mnemiq.semantic.values import NoValueIndex, ValueIndex, shown
 from mnemiq.sql.views import inventory_for
 from mnemiq.sql.policy import AccessPolicy, build_access_policy
@@ -149,6 +149,9 @@ class Runtime:
     default_profile: str = "default"
     answer_log: AnswerLog | None = None  # one line per answer, for a deployment with no sink
     engine_commit: str | None = None
+    # The snapshot's definitions naming codes their column holds none of, found when it loaded (`stale_codes`):
+    # retrieval notes each beside its definition for an identity that may be told (`noted_stale`).
+    stale: list = field(default_factory=list)
 
     @property
     def _superset_mode(self) -> bool:
@@ -241,7 +244,7 @@ class Runtime:
             # is a deployment property this repo cannot see.
             _warn_view_inventory(snapshot, _acknowledged(self.settings))
             _warn_cut_meaning(snapshot)
-            _warn_stale_codes(snapshot, self.con, self.authz, superset=self._superset_mode)
+            self.stale = _warn_stale_codes(snapshot, self.con, self.authz, superset=self._superset_mode)
             for settings, profile in ([(lp.settings, lp.profile) for lp in self.profiles.values()] if self.profiles
                                       else [(self.settings, None)]):
                 _warn_prompt_window(settings, self.con, snapshot, getattr(self, "adapter", None),
@@ -356,6 +359,8 @@ class Runtime:
                 # M4: lets retrieve re-render each card against this identity's column policy.
                 snapshot=self.snapshot,
                 grants=grants,
+                # Noted beside the definitions it found, as the eval door notes them.
+                stale=self.stale,
             )
         if superset:
             # No few-shot example is served, whatever the store holds, as no value index is (`NoValueIndex`): an
@@ -797,7 +802,8 @@ def _row_filtered_tables(authz: AuthzProvider | None) -> set[str] | str:
     return set(tables)
 
 
-def _warn_stale_codes(snapshot: Snapshot | None, con, authz: AuthzProvider | None, *, superset: bool) -> None:
+def _warn_stale_codes(snapshot: Snapshot | None, con, authz: AuthzProvider | None, *,
+                      superset: bool) -> list[StaleCodes]:
     """Say, at load, each definition that names codes its column holds none of (`stale_codes`).
 
     At boot and on a snapshot swap, beside the cut warning, because the snapshot's definitions are its subject. Not
@@ -810,15 +816,17 @@ def _warn_stale_codes(snapshot: Snapshot | None, con, authz: AuthzProvider | Non
     the line says why.
 
     Superset mode harvests no values, so it judges nothing (`NoValueIndex`), as its writer is given none. An index that
-    cannot be read is said and skipped: an advisory never stops a boot, or a swap on a user's request."""
+    cannot be read is said and skipped: an advisory never stops a boot, or a swap on a user's request.
+
+    Returns what it found, for retrieval to note beside each definition; nothing when it could not look."""
     if snapshot is None:
-        return
+        return []
     try:
         found = stale_codes(snapshot, NoValueIndex() if superset else ValueIndex(con))
         filtered = _row_filtered_tables(authz) if found else set()
     except Exception as exc:  # the index, the store or the policy unreadable: report and go on
         logger.warning("definitions were not checked against the value index (%s: %s)", type(exc).__name__, exc)
-        return
+        return []
     from mnemiq.sql.qualify import names_one_object
 
     for stale in found:
@@ -833,6 +841,7 @@ def _warn_stale_codes(snapshot: Snapshot | None, con, authz: AuthzProvider | Non
         logger.warning("definition %r names %s for %s, which holds none of them; %s. A query that follows the "
                        "definition filters on a value no row has: correct the definition",
                        stale.term, codes, stale.column, held)
+    return found
 
 
 def _warn_view_inventory(snapshot, acknowledged: frozenset[str]) -> None:
@@ -1379,7 +1388,7 @@ def build_runtime(settings: Settings) -> Runtime:
     # nothing to report, which is every deployment except a schema with no helpers.
     _warn_view_inventory(snapshot, _acknowledged(settings))
     _warn_cut_meaning(snapshot)
-    _warn_stale_codes(snapshot, con, _boot_authz, superset=superset)
+    stale = _warn_stale_codes(snapshot, con, _boot_authz, superset=superset)
     for profile_name, profile in profiles.items():
         if len(profiles) > 1:
             logger.info("the prompt window of profile %s:", profile_name)
@@ -1404,4 +1413,5 @@ def build_runtime(settings: Settings) -> Runtime:
         default_profile=default_profile,
         answer_log=answer_log,
         engine_commit=commit,
+        stale=stale,
     )

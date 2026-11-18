@@ -180,10 +180,15 @@ def meaning_sections(packet: ContextPacket) -> list[str]:
     parts: list[str] = []
     if packet.definitions:
         parts += ["", "DEFINITIONS (authoritative business meanings -- follow them exactly):"]
-        parts += [
-            f"- {sanitize(d.term, limit=NAME_LIMIT)}: {sanitize(d.definition, limit=DEFINITION_LIMIT)}"
-            for d in packet.definitions
-        ]
+        stale = getattr(packet, "stale_codes", ())
+        for d in packet.definitions:
+            parts.append(f"- {sanitize(d.term, limit=NAME_LIMIT)}: {sanitize(d.definition, limit=DEFINITION_LIMIT)}")
+            # A definition written for other data: told to follow it exactly, a writer put its code back after the
+            # value check named the real one, so the finding is said where the definition is.
+            parts += [f"  Note: {sanitize(s.column, limit=NAME_LIMIT)} holds none of the codes named here for it "
+                      f"({', '.join(repr(sanitize(c, limit=NAME_LIMIT)) for c in s.codes)}), so they do not match this "
+                      "data and a filter on them matches no row: do not filter on them as written."
+                      for s in stale if (s.term, s.definition) == (d.term, d.definition)]
     if packet.metrics:
         # The EXPRESSION is the payload. A section naming "Settled Payment Volume" without saying
         # how it is computed tells the model a phrase it already had; the certified SQL is the part
