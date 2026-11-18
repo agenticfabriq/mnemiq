@@ -527,3 +527,21 @@ def test_a_parenthesis_in_the_prose_before_a_code_is_not_sql():
     assert [f.codes for f in stale_codes(_snapshot([("plant", text)], [("plants", "PLANT_CODE")]), held)] == [("AB12",)]
     text = "Rows of plant AB12: PLANT_CODE (the plant) is 'AB12'."
     assert [f.codes for f in stale_codes(_snapshot([("plant", text)], [("plants", "PLANT_CODE")]), held)] == [("AB12",)]
+
+
+def test_a_finding_only_narrows_what_the_load_check_reported():
+    """The finding reaches the writer as a note, so the reading may withhold what #248 reported and never report what
+    it did not (Codex's third pass on the note): one value held in any case clears the column however the SQL around
+    it is written, a code after SQL that is not plainly an exact selection withholds the finding, and a listed code
+    that cannot be read cleanly never leaves another to report the column."""
+    held = _index({("plants", "PLANT_CODE"): ["AB12", "xy98"]})
+
+    def stale(text):
+        return [f.codes for f in stale_codes(_snapshot([("plant", text)], [("plants", "PLANT_CODE")]), held)]
+
+    for text in ["Rows of plant ab12: PLANT_CODE ILIKE /* case-insensitive: */ 'ab12'.",
+                 "Rows of the plants: PLANT_CODE IN ('ZZ99', ('AB12')).",
+                 "Rows of the plants: PLANT_CODE = 'ZZ99' or PLANT_CODE LIKE 'AB12'.",
+                 "Rows of plant zz99: PLANT_CODE LIKE 'zz99'.",
+                 "Rows of plant ab12: PLANT_CODE = 'ab12'."]:   # the cost: a case-sensitive mismatch goes unreported
+        assert stale(text) == [], text

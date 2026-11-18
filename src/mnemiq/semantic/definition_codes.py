@@ -21,9 +21,9 @@ What counts, kept narrow so prose is not read as codes:
   "... IN ('X')", "'X' ... are excluded") is filtered out by a query that follows the definition, which keeps every
   row whether or not the data holds it, so a definition that only excludes is never reported. A nearby negation that
   still selects ("not only 'X' but also", "do not omit ... 'X'", "do not exclude ... 'X'") is not an exclusion, and
-  "exclude" reaches only its own predicate. After an SQL operator a code counts only in a form that selects it
-  exactly (`=`, `IN (`, `IS NOT DISTINCT FROM`); after any other (`<`, `BETWEEN`, `IS DISTINCT FROM`, a pattern's
-  `LIKE` or `ILIKE`, ...) it does not.
+  "exclude" reaches only its own predicate. After an SQL operator a code counts only in a selecting form (`=`,
+  `IN (`, `LIKE`, `IS NOT DISTINCT FROM`); after any other (`<`, `BETWEEN`, `IS DISTINCT FROM`, `NOT LIKE`, ...) it
+  does not.
 - A code counts for a column only when it has the shape of one of the column's values: capitals, small letters and
   digits in the same places. `'from May to June'` is never a code for a column of `AB12`s. It counts for the column
   named last before it in its clause, indexed or not, and for no other; with no column before it, for the one judged
@@ -60,21 +60,19 @@ _EXCLUDED_BEFORE = re.compile(
 # ...or just after it. Both read a coordinated list ("'X', 'Y' and 'Z'") as one mention.
 _EXCLUDED_AFTER = re.compile(
     r"^\s*\)?\s*(?:rows?\s+)?(?:are|is)\s+(?:excluded|ignored|dropped|removed|left\s+out|filtered\s+out)\b", re.IGNORECASE)
-# An SQL operator just before the code. There a code counts only in a form that selects it exactly (=, IN (, IS NOT
-# DISTINCT FROM). A LIKE or ILIKE compares by pattern, ILIKE folding case and some engines' LIKE too, so exact
-# membership cannot say it matches nothing (`ILIKE 'ab12'` finds AB12), and the finding reaches the writer as a note
-# (Codex on the note). Any other (<, >, BETWEEN, IS DISTINCT FROM, NOT LIKE, SIMILAR TO, ...) may keep every row whether or
+# An SQL operator just before the code. There a code counts only in a form that selects it (=, IN (, LIKE, IS NOT
+# DISTINCT FROM); any other (<, >, BETWEEN, IS DISTINCT FROM, NOT LIKE, SIMILAR TO, ...) may keep every row whether or
 # not the data holds the code, so the code does not count. Prose before a code is read as prose.
 _SQL_BEFORE = re.compile(
     r"(?:<>|!=|<=|>=|[=<>]|\bin\s*\((?:[^()]*,)?|\b(?:i?like|from|between|similar\s+to|regexp|rlike|glob)"
     r"|\b(?:any|all)\s*\()\s*$", re.IGNORECASE)
 _SQL_SELECTS = re.compile(
-    r"(?:(?<![<>!])=|\bin\s*\((?:[^()]*,)?|\bis\s+not\s+distinct\s+from)\s*$", re.IGNORECASE)
+    r"(?:(?<![<>!])=|\bin\s*\((?:[^()]*,)?|\b(?<!not )i?like|\bis\s+not\s+distinct\s+from)\s*$", re.IGNORECASE)
 _SPACE = re.compile(r"\s+")
-# The words between a column and its code. Where they are SQL, the code counts only after an exact selecting form, and
-# the list it heads: a pattern behind a parenthesis or a comment, or a function around the column or the code, may
-# match what exact membership calls absent, and the finding reaches the writer as an instruction (Codex's second
-# pass on the note). Comments are read as space.
+# The words between a column and its code. Where they are SQL that is not plainly an exact selection and the list it
+# heads (a pattern, a parenthesis opening on the code or closing on the column, a function around either), the finding
+# the code is part of is withheld (`stale_codes`): it reaches the writer as a note, and a pattern may match what exact
+# membership calls absent (Codex's passes on the note). Comments are read as space.
 _COMMENT = re.compile(r"/\*.*?\*/|--[^\n]*", re.DOTALL)
 # A comparison, a pattern word, or a parenthesis that opens on the code or closes on the column (a function around
 # either) is SQL; a parenthesis in the words between is prose ("the ingot tables (A, B) belong to plant X").
@@ -196,7 +194,7 @@ def _unjudged(snapshot: Snapshot, judged: dict) -> set[str]:
     return out
 
 
-def _attributed(text: str, judged: dict, names: set[str], unjudged: set[str]) -> dict[str, list[str]]:
+def _credited(text: str, judged: dict, names: set[str], unjudged: set[str]) -> list[tuple[str, str, bool]]:
     """The codes `text` selects on, each credited to the judged column it is for, by column key.
 
     A code is for the column named last before it in its own clause, judged or not: credited when that column is judged
@@ -204,23 +202,32 @@ def _attributed(text: str, judged: dict, names: set[str], unjudged: set[str]) ->
     code with no column before it in its clause is credited to the one judged column the text names whose values share
     its shape, and skipped when several do or when the text names an identifier-like column that cannot be judged:
     which column it is for cannot be told, and a guess could report a column it was never about. A plain-word name
-    (`status`) takes the codes of its own predicate but stops no other, since the same word in prose names nothing."""
+    (`status`) takes the codes of its own predicate but stops no other, since the same word in prose names nothing.
+
+    Each as (column key, code, whether the words before it show exact selection, `_shows_exact`)."""
     judged_at = {key: at for key, (column, _, _) in judged.items() if (at := _named_at(column, text))}
     other_at = {key: at for key in unjudged if (at := _named_at(key, text))}
     shapes = {key: {_shape(v) for v in judged[key][2]} for key in judged_at}
-    out: dict[str, list[str]] = {}
+    out: list[tuple[str, str, bool]] = []
     for code, start in _codes(text, names):
         clause = start - len(_CLAUSE_END.split(text[:start])[-1])
         before = [(at, key) for key, ats in (judged_at | other_at).items() for at in ats if clause <= at < start]
         if before:
             at, key = max(before)
-            if (key in judged_at and _shape(code) in shapes[key]
-                    and _shows_exact(text[at + len(judged[key][0]):start])):
-                out.setdefault(key, []).append(code)
+            if key in judged_at and _shape(code) in shapes[key]:
+                out.append((key, code, _shows_exact(text[at + len(judged[key][0]):start])))
             continue
         fits = [key for key in judged_at if _shape(code) in shapes[key]]
-        if len(fits) == 1 and not any(_identifier_like(key) for key in other_at) and _shows_exact(text[clause:start]):
-            out.setdefault(fits[0], []).append(code)
+        if len(fits) == 1 and not any(_identifier_like(key) for key in other_at):
+            out.append((fits[0], code, _shows_exact(text[clause:start])))
+    return out
+
+
+def _attributed(text: str, judged: dict, names: set[str], unjudged: set[str]) -> dict[str, list[str]]:
+    """The codes `text` selects on, each credited to the judged column it is for, by column key (`_credited`)."""
+    out: dict[str, list[str]] = {}
+    for key, code, _ in _credited(text, judged, names, unjudged):
+        out.setdefault(key, []).append(code)
     return out
 
 
@@ -234,10 +241,21 @@ def stale_codes(snapshot: Snapshot, values, definitions: Sequence[Definition] | 
     unjudged = _unjudged(snapshot, judged)
     found: list[StaleCodes] = []
     for definition in snapshot.definitions if definitions is None else definitions:
-        for key, codes in sorted(_attributed(definition.definition, judged, names, unjudged).items()):
+        attributed: dict[str, list[str]] = {}
+        unclear: set[str] = set()
+        for key, code, exact in _credited(definition.definition, judged, names, unjudged):
+            attributed.setdefault(key, []).append(code)
+            if not exact:
+                unclear.add(key)
+        for key, codes in sorted(attributed.items()):
             column, objects, held = judged[key]
             named = sorted(set(codes))
-            if any(c in held for c in named):
+            # Narrower than #248, never wider, as the finding now reaches the writer as a note (Codex's passes on it):
+            # one value the column holds, in any case, clears it (`ILIKE 'ab12'` and `lower(col) = 'ab12'` find AB12,
+            # however the SQL around them is written), and a code that follows SQL not plainly an exact selection
+            # withholds the finding rather than leave the column's other codes to report it.
+            folded = {v.casefold() for v in held}
+            if any(c.casefold() in folded for c in named) or key in unclear:
                 continue
             nearest = sorted(held, key=lambda v: (-similarity(named[0], v), v))[:NEAREST]
             found.append(StaleCodes(definition.term, column, objects, tuple(named), tuple(nearest),
