@@ -1297,3 +1297,20 @@ def test_a_saved_metric_on_a_0_to_100_scale_cannot_be_planned_as_a_percent():
     number = _chart("rate", Family.BIG_NUMBER, [SavedRef("win_pct", K.NUMBER)])
     assert isinstance(_plan(GOAL, FakePlanner(_valid_plan(measures=(), charts=(number,))),
                             _tools(metrics=metrics)), BuildPlan)
+
+
+# ---------------------------------------------------------------- the percent rule fails safe
+
+
+def test_a_constant_past_decimals_range_is_not_a_scale_and_raises_nothing():
+    for text in ("SUM(a) * 1e1000000", "SUM(a) * '1e1000000'", "AVG(CASE WHEN x THEN 1e1000000 END)",
+                 "SUM(a) * -1e1000000", "SUM(a) / 1e1000000", "SUM(a) * (1e1000000 * 1e1000000)",
+                 "SUM(a) / (SUM(b) / 1e1000000)", "SUM(a) * 1e99999999999999999999"):
+        assert scales_by_100(text) is False, text
+    # A real factor of 100 beside such a constant is still found.
+    assert scales_by_100("SUM(a) * 100 + SUM(b) * 1e1000000")
+
+
+def test_a_very_long_constant_chain_is_not_a_scale_and_raises_nothing():
+    chain = " + ".join(["1"] * 3000)
+    assert scales_by_100(f"SUM(a) * ({chain})") is False
