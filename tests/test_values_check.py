@@ -199,3 +199,24 @@ def test_a_fault_while_looking_elsewhere_leaves_todays_refusal():
     v = check_values(_ast("SELECT id FROM orders WHERE status = 'west'"), _HINT_VISIBLE, index, dialect="duckdb",
                      hints=True, locatable=_ALL)
     assert v.message == _TODAY_WEST
+
+
+# --- a column's held values, read for a filter value no row holds ---------------------------------------------------
+
+
+def test_held_values_sql_quotes_like_probe_sql():
+    """The distinct values of one column, NULL left out, in order, at most `limit`: the names quoted in their stored
+    spelling as `probe_sql` quotes them, so the read reaches the column the probe asked about and no other. Compared
+    with sqlglot's own rendering of the statement, in each dialect."""
+    from mnemiq.sql.values_check import held_values_sql, probe_sql
+
+    expected = sqlglot.parse_one('SELECT DISTINCT "Status" FROM "t" WHERE "Status" IS NOT NULL ORDER BY 1 LIMIT 21',
+                                 read="postgres")
+    for dialect in ("postgres", "oracle", "duckdb", "mysql"):
+        assert held_values_sql("t", "Status", 21, dialect) == expected.sql(dialect=dialect), dialect
+    # The same quoting as the probe's: a dotted table stays one name, a mixed-case column keeps its case.
+    assert probe_sql("a.b", "Status", "x", "postgres").startswith('SELECT 1 FROM "a.b" WHERE "Status" = ')
+    assert held_values_sql("a.b", "Status", 5, "postgres") == (
+        'SELECT DISTINCT "Status" FROM "a.b" WHERE "Status" IS NOT NULL ORDER BY 1 LIMIT 5')
+    read = sqlglot.parse_one(held_values_sql("a.b", "Status", 5, "postgres"), read="postgres")
+    assert read.args.get("distinct") is not None and [t.name for t in read.find_all(sqlglot.exp.Table)] == ["a.b"]

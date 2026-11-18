@@ -99,8 +99,32 @@ def _metric(dataset_id: int, name: str, expression: str, **more) -> dict:
             "compatible_dimensions": []}
 
 
-def _tools(*, metrics=None, extension=None, dashboards=(), execute=None, datasets=None) -> Tools:
-    """policy is dataset 1 and claim dataset 2; agent has none, and a virtual dataset over policy is never a table's."""
+# The plan check's two statements about a filter's value (`mnemiq.superset.literals`): whether a column holds it
+# (`probe_sql`), and the values the column holds (`held_values_sql`).
+_PROBE = re.compile(r'SELECT 1 FROM "(?P<table>[^"]+)" WHERE "(?P<column>[^"]+)" = \'(?P<value>(?:[^\']|\'\')*)\' '
+                    r'LIMIT 1')
+_HELD_READ = re.compile(r'SELECT DISTINCT "(?P<column>[^"]+)" FROM "(?P<table>[^"]+)" WHERE "[^"]+" IS NOT NULL '
+                        r'ORDER BY 1 LIMIT (?P<limit>\d+)')
+
+
+def _value_answer(sql: str, held: dict | None) -> dict | None:
+    """Superset's answer to a probe of a filter's value or a read of a column's values, from `held` (the values each
+    `(table, column)` holds; None: every probe finds its value), or None for any other statement."""
+    one = [{"name": "?column?", "type": "int64"}]
+    if (probe := _PROBE.fullmatch(sql)) is not None:
+        found = held is None or probe["value"].replace("''", "'") in held.get((probe["table"], probe["column"]), [])
+        return {"success": True, "columns": one, "rows": [{"?column?": 1}] if found else []}
+    if (read := _HELD_READ.fullmatch(sql)) is not None:
+        values = sorted((held or {}).get((read["table"], read["column"]), []))[:int(read["limit"])]
+        return {"success": True, "columns": [{"name": read["column"], "type": "object"}],
+                "rows": [{read["column"]: value} for value in values]}
+    return None
+
+
+def _tools(*, metrics=None, extension=None, dashboards=(), execute=None, datasets=None, held=None) -> Tools:
+    """policy is dataset 1 and claim dataset 2; agent has none, and a virtual dataset over policy is never a table's.
+    `held` gives the values each `(table, column)` holds, for the plan check's probes of a filter's values; without
+    it, every value probed is found."""
     metrics = metrics or {}
     extension = extension or {}
     datasets = datasets if datasets is not None else [_dataset(1, "policy"), _dataset(2, "claim"),
@@ -124,7 +148,7 @@ def _tools(*, metrics=None, extension=None, dashboards=(), execute=None, dataset
         "list_metrics": list_metrics,
         TOOL_PREFIX + "dataset_metrics": dataset_metrics,
         "list_dashboards": list_dashboards,
-        "execute_sql": execute or (lambda request: EMPTY),
+        "execute_sql": lambda request: _value_answer(request["sql"], held) or (execute or (lambda _: EMPTY))(request),
     })
 
 
@@ -1297,6 +1321,129 @@ def test_a_saved_metric_on_a_0_to_100_scale_cannot_be_planned_as_a_percent():
     number = _chart("rate", Family.BIG_NUMBER, [SavedRef("win_pct", K.NUMBER)])
     assert isinstance(_plan(GOAL, FakePlanner(_valid_plan(measures=(), charts=(number,))),
                             _tools(metrics=metrics)), BuildPlan)
+
+
+# ---------------------------------------------------------------- a filter's value no row holds
+
+def _reason(column: str, literal: str, held: str) -> str:
+    return f"it filters {column} on {literal!r}, which no row the builder can read holds; {column} holds: {held}"
+
+
+def _won_plan(literal: str) -> BuildPlan:
+    won = _measure("won_amount", "Won amount", f"SUM(CASE WHEN status = '{literal}' THEN amount END)", K.CURRENCY,
+                   dataset_id=2)
+    return _valid_plan(measures=(won,), charts=(_chart("won", Family.BIG_NUMBER, [WrittenRef(won)], dataset_id=2),))
+
+
+def test_a_measure_filtering_a_value_no_row_holds_is_refused_with_the_held_values():
+    """The measure is decided, and then each value it filters on is asked of the source as the builder: 'Won' is held
+    by no row, so the measure is refused, repairably, and the repair is told the values `claim.status` holds. Only
+    then does the model see a value: the first prompt names none."""
+    from mnemiq.superset.planner import RefusedPart, plan_prompt
+
+    held = {("claim", "status"): ["WON", "LOST"]}
+    planner = FakePlanner(_won_plan("Won"))
+    refused = _plan(GOAL, planner, _tools(held=held))
+    assert isinstance(refused, PlanRefused), refused
+    reason = _reason("claim.status", "Won", "LOST, WON")
+    assert _parts(refused) == {"measure 'won_amount'": reason}
+    assert len(planner.contexts) == 2, "repairable: it went back once"
+    assert planner.contexts[1].repair.refused == (RefusedPart("measure 'won_amount'", reason, True),)
+    assert reason in plan_prompt(GOAL, planner.contexts[1])[1]
+    first = "\n".join(plan_prompt(GOAL, planner.contexts[0]))
+    assert "WON" not in first and "LOST" not in first
+    # The repair that filters a value the column holds passes, and so does the first plan where 'Won' is held.
+    fixed = FakePlanner([_won_plan("Won"), _won_plan("WON")])
+    assert isinstance(_plan(GOAL, fixed, _tools(held=held)), BuildPlan)
+    assert isinstance(_plan(GOAL, FakePlanner(_won_plan("Won")), _tools(held={("claim", "status"): ["Won"]})),
+                      BuildPlan)
+
+
+def test_a_measure_whose_column_holds_more_than_20_values_names_20_and_more():
+    held = {("claim", "status"): [f"S{i:02d}" for i in range(25)]}
+    refused = _plan(GOAL, FakePlanner(_won_plan("Won")), _tools(held=held))
+    assert _parts(refused) == {"measure 'won_amount'": _reason(
+        "claim.status", "Won", ", ".join(f"S{i:02d}" for i in range(20)) + " and more")}
+
+
+def test_a_value_the_source_does_not_answer_for_refuses_nothing():
+    """A probe Superset does not answer leaves the value unchecked, as on the ask path: nothing is refused for it."""
+    tools = _tools(held={})
+    tools.handlers["execute_sql"] = lambda request: (
+        {"success": False, "error": "relation does not exist", "error_type": "GENERIC_DB_ENGINE_ERROR"}
+        if _PROBE.fullmatch(request["sql"]) else _value_answer(request["sql"], {}) or EMPTY)
+    assert isinstance(_plan(GOAL, FakePlanner(_won_plan("Won")), tools), BuildPlan)
+    assert any(_PROBE.fullmatch(sql) for sql in tools.statements()), "the value was asked"
+    assert not any(_HELD_READ.fullmatch(sql) for sql in tools.statements()), "and no values were read"
+
+
+def test_a_failed_read_of_the_held_values_still_refuses():
+    """The source said no row holds the value, so the part is refused even when the read of the values the column
+    holds then fails; the reason says the source did not say which."""
+    held = {("claim", "status"): ["WON"]}
+    tools = _tools(held=held)
+    tools.handlers["execute_sql"] = lambda request: (
+        {"success": False, "error": "statement timeout", "error_type": "GENERIC_DB_ENGINE_ERROR"}
+        if _HELD_READ.fullmatch(request["sql"]) else _value_answer(request["sql"], held) or EMPTY)
+    refused = _plan(GOAL, FakePlanner(_won_plan("Won")), tools)
+    assert _parts(refused) == {"measure 'won_amount'": "it filters claim.status on 'Won', which no row the builder "
+                                                       "can read holds; the source did not say which values it holds"}
+
+
+def test_a_value_compared_with_an_expression_is_never_probed():
+    """`LOWER(status) = 'won'` is a value the grounding does not place, as on the ask path: nothing is asked or
+    refused for it."""
+    plan = _won_plan("x")
+    lowered = dataclasses.replace(plan.measures[0], expression="SUM(CASE WHEN LOWER(status) = 'won' THEN amount END)")
+    plan = _valid_plan(measures=(lowered,), charts=(_chart("won", Family.BIG_NUMBER, [WrittenRef(lowered)],
+                                                           dataset_id=2),))
+    tools = _tools(held={("claim", "status"): ["WON"]})
+    assert isinstance(_plan(GOAL, FakePlanner(plan), tools), BuildPlan)
+    assert not any(_PROBE.fullmatch(sql) or _HELD_READ.fullmatch(sql) for sql in tools.statements())
+
+
+def test_a_chart_filter_on_a_value_no_row_holds_is_refused():
+    """A chart's `NOT IN` filter on a value no row holds: the negation is vacuous, so it is refused as `=` and `IN`
+    are, naming the values the column holds. A value the column holds and a non-string operand are not refused."""
+    chart = _chart("premium_by_region", Family.BAR, [WrittenRef(PREMIUM)], dims=["region"],
+                   filters=[Filter("region", "NOT IN", ["West", "east"]), Filter("premium", ">", 100),
+                            Filter("region", "LIKE", "W%")])
+    held = {("policy", "region"): ["west", "east", "central"]}
+    planner = FakePlanner(_valid_plan(measures=(PREMIUM,), charts=(chart,)))
+    refused = _plan(GOAL, planner, _tools(held=held))
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused) == {"chart 'premium_by_region'": _reason("policy.region", "West", "central, east, west")}
+    assert len(planner.contexts) == 2 and planner.contexts[1].repair.refused[0].repairable
+    for op, operand in (("=", "west"), ("!=", "east"), ("IN", ["west", "central"])):
+        ok = _chart("premium_by_region", Family.BAR, [WrittenRef(PREMIUM)], dims=["region"],
+                    filters=[Filter("region", op, operand)])
+        assert isinstance(_plan(GOAL, FakePlanner(_valid_plan(measures=(PREMIUM,), charts=(ok,))),
+                                _tools(held=held)), BuildPlan), (op, operand)
+
+
+def test_a_chart_filter_on_a_joined_column_is_probed_on_its_own_table():
+    """On a join, the dataset names a column two tables share after its table (`claim_created_at`); a filter on one
+    the join names alone (`status`) is asked of the table it comes from, under that table's own name for it."""
+    paid = _measure("paid", "Paid", "SUM(amount)", K.CURRENCY, dataset_id=-1)
+    planned = PlannedDataset(key="dataset_1", placeholder=-1, join=JOIN)
+    chart = _chart("paid_by_region", Family.BAR, [WrittenRef(paid)], dataset_id=-1, dims=["region"],
+                   filters=[Filter("status", "=", "Open"), Filter("claim_policy_id", "IN", ["7"])])
+    plan = BuildPlan(charts=(chart,), measures=(paid,), reuse_candidates=(), datasets=(planned,))
+    tools = _tools(held={("claim", "status"): ["open", "closed"], ("claim", "policy_id"): ["7"]})
+    refused = _plan(GOAL, FakePlanner(plan), tools)
+    assert _parts(refused) == {"chart 'paid_by_region'": _reason("claim.status", "Open", "closed, open")}
+    probed = {(m["table"], m["column"]) for sql in tools.statements() if (m := _PROBE.fullmatch(sql))}
+    assert probed == {("claim", "status"), ("claim", "policy_id")}
+
+
+def test_a_filter_value_on_a_table_the_builder_cannot_read_is_never_probed():
+    """A chart refused for a column its rows lack is not probed: only a chart whose own checks pass is."""
+    chart = _chart("premium_by_region", Family.BAR, [WrittenRef(PREMIUM)], dims=["region"],
+                   filters=[Filter("salary", "=", "x")])
+    tools = _tools(held={})
+    refused = _plan(GOAL, FakePlanner(_valid_plan(measures=(PREMIUM,), charts=(chart,))), tools)
+    assert "not a column" in _parts(refused)["chart 'premium_by_region'"]
+    assert not any(_PROBE.fullmatch(sql) or _HELD_READ.fullmatch(sql) for sql in tools.statements())
 
 
 # ---------------------------------------------------------------- the percent rule fails safe
