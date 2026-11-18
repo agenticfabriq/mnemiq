@@ -30,12 +30,14 @@ from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Column, Snapshot
 from mnemiq.superset.adapter import SupersetSqlAdapter
 from mnemiq.superset.chart_check import (
+    ChartCheck,
     ChartStatus,
     DatasetFacts,
     Expectation,
     NotCheckable,
     check_chart,
     expectation_from_form_data,
+    percent_problem,
 )
 from mnemiq.superset.charts import Filter
 from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetPermissionDenied
@@ -1706,3 +1708,103 @@ def test_a_before_call_that_raises_stops_the_check_before_its_next_call(fake):
         check_chart(_adapter(fake), chart_id=CHART_ID, dataset_id=DATASET_ID, kinds=TOTAL["kinds"], saved={},
                     snapshot=SNAPSHOT, grants=GRANTS, guard_fanout=False, before_call=second_stops)
     assert [call.tool for call in fake.calls] == ["get_chart_info"]
+
+
+# --- a measure that is NULL on every row ----------------------------------------------------------------------------
+
+
+def test_a_chart_whose_measures_are_all_null_is_empty_not_checked():
+    chart = mine = chart_check._Rows({(): [None]}, 1)
+    out = chart_check._compare(7, chart, mine, None, source=chart_check._OWN_SQL)
+    assert out.status is ChartStatus.EMPTY and "NULL on every row" in out.reason
+
+
+def test_some_null_values_still_compare_and_check():
+    chart = mine = chart_check._Rows({("a",): [1.5], ("b",): [None]}, 2)
+    assert chart_check._compare(7, chart, mine, None, source=chart_check._OWN_SQL).status is ChartStatus.CHECKED
+
+
+def test_all_null_on_the_chart_but_a_number_in_mnemiqs_is_a_mismatch():
+    out = chart_check._compare(7, chart_check._Rows({(): [None]}, 1), chart_check._Rows({(): [3.0]}, 1), None,
+                               source=chart_check._OWN_SQL)
+    assert out.status is ChartStatus.MISMATCH
+
+
+def test_a_chart_with_groups_and_no_measures_still_checks():
+    chart = mine = chart_check._Rows({("a",): []}, 1)
+    out = chart_check._compare(7, chart, mine, None, source=chart_check._OWN_SQL)
+    assert out.status is ChartStatus.CHECKED
+
+
+def test_one_null_measure_beside_a_numbered_one_is_empty_naming_it():
+    chart = mine = chart_check._Rows({(): [2.5, None, None]}, 1)
+    out = chart_check._compare(7, chart, mine, None, source=chart_check._OWN_SQL, labels=("A", "B", "C"))
+    assert out.status is ChartStatus.EMPTY
+    assert out.reason == "the chart's measure 'B' is NULL on every row it shows, and mnemiq's own SQL computes the same"
+
+
+def test_a_measure_null_on_some_rows_only_stays_checked():
+    chart = mine = chart_check._Rows({("a",): [2.5, None], ("b",): [3.5, 1.0]}, 2)
+    out = chart_check._compare(7, chart, mine, None, source=chart_check._OWN_SQL, labels=("A", "B"))
+    assert out.status is ChartStatus.CHECKED
+
+
+# --- a percent is a fraction --------------------------------------------------------------------------------------------
+
+
+def test_a_percent_shown_above_100_is_format_wrong_in_the_helper():
+    assert percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [54.97]}) == (
+        "the chart shows 'Rate' above 100% (54.97), as a measure on a 0 to 100 scale would under a percent format")
+    assert "above 100%" in percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [decimal.Decimal("-2")]})
+
+
+def test_a_fraction_percent_checks_and_a_count_is_not_judged_by_scale():
+    assert percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [0.5497]}) is None
+    assert percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [1]}) is None
+    assert percent_problem({"N": MeasureKind.COUNT}, ("N",), {(): [151]}) is None
+    assert percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [None]}) is None
+    assert percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [float("nan")]}) is None
+    assert percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [1.0000000000000002]}) is None
+    assert percent_problem({"Rate": MeasureKind.PERCENT}, ("Rate",), {(): [1.001]}) is not None
+
+
+FLOAT_COLUMNS = (("region", "object"), ("m0", "float64"))
+
+
+def _rate_chart(fake, value):
+    form = _bar(metrics=[copy.deepcopy(AVERAGE)], y_axis_format=",.1%", currency_format=None)
+    _serve(fake, form_data=form, chart=_chart_data(["region", "Average premium"], ("east", value)),
+           mnemiq=_result(("east", value), columns=FLOAT_COLUMNS))
+
+
+def test_a_checked_chart_whose_percent_is_above_100_is_format_wrong(fake):
+    _rate_chart(fake, 54.97)
+    check = _check(fake, kinds={"Average premium": MeasureKind.PERCENT})
+    assert type(check) is ChartCheck, "the private subclass never leaves the module"
+    assert check.status is ChartStatus.FORMAT_WRONG, check.reason
+    assert "above 100%" in check.reason
+    assert check.chart_values == check.mnemiq_values == (("east", 54.97),)
+
+
+def test_a_checked_chart_whose_percent_is_a_fraction_stays_checked(fake):
+    _rate_chart(fake, 0.5497)
+    check = _check(fake, kinds={"Average premium": MeasureKind.PERCENT})
+    assert check.status is ChartStatus.CHECKED and type(check) is ChartCheck
+
+
+def test_a_number_above_one_is_not_a_percent_problem_for_a_non_percent_kind(fake):
+    form = _bar(metrics=[copy.deepcopy(AVERAGE)], y_axis_format=",.2f", currency_format=None)
+    _serve(fake, form_data=form, chart=_chart_data(["region", "Average premium"], ("east", 54.97)),
+           mnemiq=_result(("east", 54.97), columns=FLOAT_COLUMNS))
+    assert _check(fake, kinds={"Average premium": MeasureKind.NUMBER}).status is ChartStatus.CHECKED
+
+
+def test_a_big_number_percent_above_100_is_format_wrong_through_check_chart(fake):
+    form = {"viz_type": "big_number_total", "metric": copy.deepcopy(PREMIUM), "adhoc_filters": [],
+            "y_axis_format": ",.1%", "currency_format": None}
+    _serve(fake, form_data=form, chart=_chart_data(["Total premium"], (54.97,)),
+           mnemiq=_result((54.97,), columns=(("m0", "float64"),)))
+    check = _check(fake, kinds={"Total premium": MeasureKind.PERCENT})
+    assert type(check) is ChartCheck and check.status is ChartStatus.FORMAT_WRONG, check
+    assert check.reason == ("the chart shows 'Total premium' above 100% (54.97), as a measure on a 0 to 100 scale "
+                            "would under a percent format")

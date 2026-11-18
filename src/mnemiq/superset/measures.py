@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from enum import Enum, StrEnum
 
 import sqlglot
@@ -26,7 +27,8 @@ from mnemiq.superset.history import Decided, decide_statement, run_decided
 from mnemiq.sql.verdict import Approved, Refusal
 
 __all__ = ["Aggregation", "Decided", "Measure", "MeasureKind", "MeasureRefused", "aggregates", "check_measure",
-           "display_format", "measure_statement", "measure_value", "run_decided", "superset_text_problem"]
+           "display_format", "measure_statement", "measure_value", "run_decided", "scales_by_100",
+           "superset_text_problem"]
 
 _NAME = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _CURRENCY = re.compile(r"^[A-Z]{3}$")
@@ -104,6 +106,73 @@ def aggregates(expression: str) -> Aggregation:
     if any(not _is_windowed(agg) for agg in tree.find_all(exp.AggFunc)):
         return Aggregation.AGGREGATES
     return Aggregation.ROW_LEVEL
+
+
+def _folded(node: exp.Expression | None) -> Decimal | None:
+    """The number a constant expression is (a literal, a string literal Postgres reads as a number in arithmetic, a
+    cast, a sign, and `+ - * /` of constants), else None."""
+    if isinstance(node, (exp.Cast, exp.TryCast, exp.Paren)):
+        return _folded(node.this)
+    if isinstance(node, exp.Neg):
+        inner = _folded(node.this)
+        return None if inner is None else -inner
+    if isinstance(node, exp.Literal):
+        try:
+            value = Decimal(node.this)
+        except InvalidOperation:
+            return None
+        return value if value.is_finite() else None
+    if isinstance(node, (exp.Add, exp.Sub, exp.Mul, exp.Div)):
+        left, right = _folded(node.left), _folded(node.right)
+        if left is None or right is None:
+            return None
+        try:
+            return {exp.Add: left.__add__, exp.Sub: left.__sub__, exp.Mul: left.__mul__,
+                    exp.Div: left.__truediv__}[type(node)](right)
+        except (InvalidOperation, ZeroDivisionError):
+            return None
+    return None
+
+
+def _is(node: exp.Expression | None, *numbers: str) -> bool:
+    value = _folded(node)
+    return value is not None and abs(value) in {Decimal(n) for n in numbers}
+
+
+def _bare(node: exp.Expression | None) -> exp.Expression | None:
+    while isinstance(node, (exp.Cast, exp.TryCast, exp.Paren)):
+        node = node.this
+    return node
+
+
+def _divides_by_100(node: exp.Expression | None) -> bool:
+    """`y / 100` or `y * 0.01` (through parentheses, casts and NULLIF): a divisor that makes a division by it a
+    multiplication by 100."""
+    node = _bare(node)
+    if isinstance(node, exp.Nullif):
+        node = _bare(node.this)
+    return (isinstance(node, exp.Div) and _is(node.right, "100")) \
+        or (isinstance(node, exp.Mul) and (_is(node.left, "0.01") or _is(node.right, "0.01")))
+
+
+def scales_by_100(expression: str) -> bool:
+    """Whether `expression` puts its value on a 0 to 100 scale, where a percent measure is a fraction: it multiplies
+    by a constant that is 100 (`100`, `100.0`, `100::numeric`, `'100'`, `-100`, `10 * 10`), divides by one that is
+    0.01 or by a quotient over 100 (`a / (b / 100.0)`), or a CASE gives 100 as a branch's value, anywhere in its
+    tree. False when it does not parse (the measure's own check refuses that)."""
+    try:
+        tree = sqlglot.parse_one(f"SELECT {expression}", read="postgres")
+    except sqlglot.errors.SqlglotError:
+        return False
+    if any(_is(node.left, "100") or _is(node.right, "100") for node in tree.find_all(exp.Mul)):
+        return True
+    if any(_is(node.right, "0.01") or _divides_by_100(node.right) for node in tree.find_all(exp.Div)):
+        return True
+    for case in tree.find_all(exp.Case):
+        branches = [item.args.get("true") for item in case.args.get("ifs") or []] + [case.args.get("default")]
+        if any(_is(branch, "100") for branch in branches):
+            return True
+    return False
 
 
 def display_format(kind: MeasureKind, currency: str | None) -> tuple[str, dict | None]:

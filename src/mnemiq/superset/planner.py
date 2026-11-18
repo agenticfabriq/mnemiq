@@ -46,7 +46,8 @@ from mnemiq.superset.adapter import JINJA_DELIMITERS
 from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenRef, plan_refusal
 from mnemiq.superset.grants import UnreadableAnswer, read_datasets, table_bindings
 from mnemiq.superset.marker import format_marker
-from mnemiq.superset.measures import Measure, MeasureKind, MeasureRefused, check_measure, superset_text_problem
+from mnemiq.superset.measures import Measure, MeasureKind, MeasureRefused, check_measure, scales_by_100, \
+    superset_text_problem
 from mnemiq.superset.saved_metrics import SavedMetric, read_saved_metrics, reusable
 from mnemiq.superset.settings import SUPERSET_DIALECT
 
@@ -285,8 +286,10 @@ shown. Answer with one JSON object and nothing else:
 
 Measures are the numbers the charts show. Each is either
 - written: {"name": lower case letters, digits and _, "label": the name shown on the chart, "expression": one SQL \
-aggregate expression in PostgreSQL over the measure's rows, "kind": one of currency, percent, count, number, "table": \
-a table's name, or "join": "a JOIN b ON ...", "description": optional, "currency": an ISO 4217 code, optional}; or
+aggregate expression in PostgreSQL over the measure's rows, "kind": one of currency, percent, count, number \
+(a percent is a fraction from 0 to 1, which Superset shows as a percent: 0.25 shows as 25%; never multiply it by \
+100), "table": a table's name, or "join": "a JOIN b ON ...", "description": optional, "currency": an ISO 4217 \
+code, optional}; or
 - a saved metric of a table's dataset: {"name": the plan's own name for it, "saved_metric": the saved metric's name, \
 "kind": ..., "table": ...}. The same saved metric on two tables is two measures, each with a name of its own.
 Use a saved metric where one says what a measure needs. Write a join only where the charts need columns of more than \
@@ -1077,6 +1080,10 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
         if isinstance(verdict, MeasureRefused):
             refuse(part, verdict.reason, repairable=verdict.repairable)
             continue
+        if measure.kind is MeasureKind.PERCENT and scales_by_100(measure.expression):
+            refuse(part, "a percent measure is a fraction from 0 to 1, which Superset shows as a percent: write it "
+                         "without multiplying by 100")
+            continue
         hit = reusable(measure, list(on.saved))
         if hit is not None:
             reused[measure.name] = SavedRef(hit.name, measure.kind)
@@ -1139,6 +1146,9 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
                 refuse(part, f"{on.part} has no saved metric named {ref.name!r} this builder can reach")
             elif ref.name.casefold() in folded:
                 refuse(part, f"the saved metric {ref.name!r} is also the name of a dimension of the chart")
+            elif ref.kind is MeasureKind.PERCENT and scales_by_100(saved[ref.name].expression):
+                refuse(part, f"the saved metric {ref.name!r} is on a 0 to 100 scale, so it cannot be shown as a "
+                             "percent: plan it with kind number, or write the fraction")
         shown = [(ref.name if isinstance(ref, SavedRef) else ref.measure.label.strip()).casefold() for ref in refs]
         if len(set(shown)) < len(shown):
             refuse(part, "it plots one metric twice")

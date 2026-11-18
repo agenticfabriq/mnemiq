@@ -967,6 +967,97 @@ def test_a_funnel_is_made_through_the_extension_and_its_data_read(live, served, 
             check=final["checks"].get(str(chart_id)), message=run.last_step.get("message"))
 
 
+def test_a_measure_that_is_null_everywhere_is_empty(live, served, model, policy_id):
+    """A big number whose written measure is NULL on every row (`MAX` of a CASE no row satisfies). Expected: the premise
+    holds (the source's answer is one NULL), the build runs to `done`, and the chart's check is `empty`, never
+    `checked`: Superset shows it as "No data"."""
+    expression = "MAX(CASE WHEN premium < 0 THEN premium END)"
+    assert ground_truth(live, f"SELECT {expression} FROM policy") == [(None,)]
+    worst = Measure(name="worst_refund", label="Worst refund", expression=expression, kind=MeasureKind.NUMBER,
+                    dataset_id=policy_id, description="Largest negative premium", asked_by="")
+    big = ChartSpec(key="worst_refund", family=Family.BIG_NUMBER, title="Worst refund", dataset_id=policy_id,
+                    measures=(WrittenRef(worst),), dimensions=(), time_column=None, time_grain=None, filters=(),
+                    row_limit=None, source=None, target=None)
+    plan = BuildPlan(charts=(big,), measures=(worst,))
+    run = run_build(live, served, model, plan, "all null", goal="the worst refund")
+    found = summary(run, served, plan) if run.build_id else {"stopped": run.stopped}
+    record("all null", found)
+    assert_ran_to_the_end(run)
+    [chart_id] = [step["object_id"] for step in run.final["steps"] if step["key"] == big.key]
+    assert run.final["checks"].get(str(chart_id)) == "empty", run.final["checks"]
+    assert_no_model_call(run)
+
+
+def _percent_big_number(policy_id: int, key: str, expression: str) -> tuple[Measure, ChartSpec]:
+    rate = Measure(name=key, label="Rate", expression=expression, kind=MeasureKind.PERCENT, dataset_id=policy_id,
+                   description="A rate", asked_by="")
+    big = ChartSpec(key=key, family=Family.BIG_NUMBER, title="Rate", dataset_id=policy_id,
+                    measures=(WrittenRef(rate),), dimensions=(), time_column=None, time_grain=None, filters=(),
+                    row_limit=None, source=None, target=None)
+    return rate, big
+
+
+def test_a_percent_on_a_0_to_100_scale_is_format_wrong(live, served, model, policy_id):
+    """A big number whose written percent measure is `SUM(premium) / 1000.0`, which is above 1 on the seed. Expected:
+    the premise holds (the source's answer is above 1), the build runs to `done`, and the chart's check is
+    `format_wrong`, never `checked`: Superset would show it under the percent format as a hundred times too large. The
+    build's message, as the build's answer gives it, says "above 100%". No model client is made or called."""
+    expression = "SUM(premium) / 1000.0"
+    [(truth,)] = ground_truth(live, f"SELECT {expression} FROM policy")
+    assert truth is not None and abs(truth) > 1, truth
+    rate, big = _percent_big_number(policy_id, "scaled_rate", expression)
+    plan = BuildPlan(charts=(big,), measures=(rate,))
+    run = run_build(live, served, model, plan, "scaled percent", goal="a rate")
+    found = summary(run, served, plan) if run.build_id else {"stopped": run.stopped}
+    record("scaled percent", found)
+    assert_ran_to_the_end(run)
+    [chart_id] = [step["object_id"] for step in run.final["steps"] if step["key"] == big.key]
+    assert run.final["checks"].get(str(chart_id)) == "format_wrong", run.final["checks"]
+    message = run.last_step.get("message") or ""
+    assert "format_wrong" in message and "above 100%" in message, message
+    assert_no_model_call(run)
+
+
+def test_a_fraction_percent_checks(live, served, model, policy_id):
+    """The positive control: a big number whose written percent measure is `AVG(premium) / MAX(premium)`, a fraction.
+    Expected: the premise holds (the source's answer is at most 1), the build runs to `done`, and the chart's check is
+    `checked`. No model client is made or called."""
+    expression = "AVG(premium) / MAX(premium)"
+    [(truth,)] = ground_truth(live, f"SELECT {expression} FROM policy")
+    assert truth is not None and 0 <= truth <= 1, truth
+    rate, big = _percent_big_number(policy_id, "fraction_rate", expression)
+    plan = BuildPlan(charts=(big,), measures=(rate,))
+    run = run_build(live, served, model, plan, "fraction percent", goal="a rate")
+    found = summary(run, served, plan) if run.build_id else {"stopped": run.stopped}
+    record("fraction percent", found)
+    assert_ran_to_the_end(run)
+    [chart_id] = [step["object_id"] for step in run.final["steps"] if step["key"] == big.key]
+    assert run.final["checks"].get(str(chart_id)) == "checked", run.final["checks"]
+    assert_no_model_call(run)
+
+
+def test_a_percent_multiplied_by_100_is_refused_before_anything_is_made(live, served, model, policy_id):
+    """A written percent measure `100.0 * AVG(premium) / MAX(premium)`. Expected: the start answers 200 with the
+    refused plan and nothing else: its one part is the measure, with mnemiq's reason (a percent is a fraction from 0 to
+    1; write it without multiplying by 100). The planner was asked twice (the plan and its one repair). No build is
+    kept, no write call is made, and analyst has made nothing new in Superset. No model client is made or called."""
+    rate, big = _percent_big_number(policy_id, "scaled_rate", "100.0 * AVG(premium) / MAX(premium)")
+    before, builds_before = made_by(BUILDER), served.builds()
+    run = run_build(live, served, model, BuildPlan(charts=(big,), measures=(rate,)), "percent-refused", goal="a rate")
+    record("percent-refused", summary(run, served))
+    [start] = run.requests
+    reason = ("a percent measure is a fraction from 0 to 1, which Superset shows as a percent: write it without "
+              "multiplying by 100")
+    assert start.status_code == 200, (start.status_code, start.body)
+    assert start.body == {"refused": {
+        "reason": f"mnemiq could not plan this dashboard: measure 'scaled_rate': {reason}",
+        "parts": [{"part": "measure 'scaled_rate'", "reason": reason}]}}, start.body
+    assert run.planner.goals == ["a rate"] * 2
+    assert writes(start.calls) == []
+    assert served.builds() == builds_before and made_by(BUILDER) == before
+    assert_no_model_call(run)
+
+
 # --- a histogram, made through the extension ------------------------------------------------------------------------
 
 

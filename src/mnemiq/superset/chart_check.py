@@ -41,7 +41,7 @@ import logging
 import math
 from collections.abc import Callable
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from enum import StrEnum
@@ -75,7 +75,7 @@ from mnemiq.superset.measures import Measure, MeasureKind, measure_statement, ru
 from mnemiq.superset.saved_metrics import SavedMetric
 
 __all__ = ["ChartCheck", "ChartStatus", "DatasetFacts", "Expectation", "NotCheckable", "check_chart",
-           "expectation_from_form_data", "read_dataset_facts"]
+           "expectation_from_form_data", "percent_problem", "read_dataset_facts"]
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +99,19 @@ class ChartCheck:
     reason: str
     chart_values: tuple | None
     mnemiq_values: tuple | None
+
+
+@dataclass(frozen=True)
+class _Numbers(ChartCheck):
+    """What `_numbers` found, with the metric labels the chart's rows hold values for (in their order) and those rows,
+    for the checks that read the values themselves. Handed on only as a plain `ChartCheck`."""
+
+    labels: tuple[str, ...] = ()
+    rows: dict[tuple, list] = field(default_factory=dict)
+
+
+def _plain(found: ChartCheck) -> ChartCheck:
+    return ChartCheck(found.chart_id, found.status, found.reason, found.chart_values, found.mnemiq_values)
 
 
 # `get_chart_info` returns `form_data` only when asked for it (`DEFAULT_GET_CHART_INFO_COLUMNS` in
@@ -455,7 +468,8 @@ _OWN_SQL = "mnemiq's own SQL"
 _QUERY_DATASET = "Superset's own query of the dataset's saved metrics (query_dataset)"
 
 
-def _compare(chart_id: int, chart: _Rows, mine: _Rows, row_limit: int | None, *, source: str) -> ChartCheck:
+def _compare(chart_id: int, chart: _Rows, mine: _Rows, row_limit: int | None, *, source: str,
+             labels: tuple[str, ...] = ()) -> ChartCheck:
     shown = list(chart.values)
     order = [key for key in shown if key in mine.values] + [key for key in mine.values if key not in chart.values]
     both = (_values(chart.values, shown), _values(mine.values, order))
@@ -478,6 +492,19 @@ def _compare(chart_id: int, chart: _Rows, mine: _Rows, row_limit: int | None, *,
         return outcome(ChartStatus.MISMATCH, f"{source} finds a group the chart does not show")
     if not shown:
         return outcome(ChartStatus.EMPTY, f"the chart shows no rows, and {source} finds none")
+    # A measure that is NULL on every row it shows, on both sides (the values matched above), is no number the chart
+    # shows: the chart reads "No data" for it, which a check must not report as checked.
+    width = max((len(values) for rows in (chart, mine) for values in rows.values.values()), default=0)
+    empty = [i for i in range(width) if all(values[i] is None for rows in (chart, mine)
+                                            for values in rows.values.values() if i < len(values))
+             and any(i < len(values) for rows in (chart, mine) for values in rows.values.values())]
+    if empty:
+        if len(empty) == width:
+            return outcome(ChartStatus.EMPTY, f"the chart's measures are NULL on every row it shows, and {source} "
+                                              "computes the same")
+        first = labels[empty[0]] if empty[0] < len(labels) else f"number {empty[0] + 1}"
+        return outcome(ChartStatus.EMPTY, f"the chart's measure {first!r} is NULL on every row it shows, and {source} "
+                                          "computes the same")
     return outcome(ChartStatus.CHECKED, f"the chart's numbers match {source}")
 
 
@@ -537,8 +564,29 @@ def _format_problem(viz_type: str, form: dict, kinds: dict[str, MeasureKind], sa
 # ---------------------------------------------------------------- the check
 
 
+# A fraction of exactly 1 can come out a float's width above it; that is 100%, not past it.
+_SCALE_NOISE = 1e-9
+
+
+def percent_problem(kinds: dict[str, MeasureKind], labels: tuple[str, ...], rows: dict[tuple, list]) -> str | None:
+    """Why a `percent` measure's number is shown wrongly: the first percent label holding a value above 1 in size. A
+    percent is a fraction, which the percent format shows times 100, so a value above 1 shows above 100%: a 0 to 100
+    number the format scaled again (a win rate of 55 shown as 5,500%), or a true rate above 100%."""
+    for i, label in enumerate(labels):
+        if kinds.get(label) is not MeasureKind.PERCENT:
+            continue
+        for values in rows.values():
+            value = values[i] if i < len(values) else None
+            if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool) \
+                    and math.isfinite(value) and abs(value) > 1 + _SCALE_NOISE:
+                return (f"the chart shows {label!r} above 100% ({value}), as a measure on a 0 to 100 scale would "
+                        "under a percent format")
+    return None
+
+
 def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, snapshot: Snapshot, grants: GrantSet,
-             guard_fanout: bool | None, timeout_s: float, before_call: Callable[[], None] | None = None) -> ChartCheck:
+             guard_fanout: bool | None, timeout_s: float,
+             before_call: Callable[[], None] | None = None) -> _Numbers | ChartCheck:
     """The chart's numbers against mnemiq's own: any status but `FORMAT_WRONG`."""
     def not_checked(reason: str) -> ChartCheck:
         return _outcome(chart_id, ChartStatus.NOT_CHECKED, reason)
@@ -590,7 +638,10 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
                                  timeout_s=timeout_s, guard_fanout=guard_fanout, before_call=before_call), _OWN_SQL
     if isinstance(mine, NotCheckable):
         return not_checked(mine.reason)
-    found = _compare(chart_id, chart, mine, _row_limit(form), source=source)
+    labels = tuple(label for label, _ in expectation.metrics)
+    found = _compare(chart_id, chart, mine, _row_limit(form), source=source, labels=labels)
+    found = _Numbers(found.chart_id, found.status, found.reason, found.chart_values, found.mnemiq_values, labels,
+                     chart.values)
     if found.status is ChartStatus.MISMATCH and expectation.time_grain and source is _OWN_SQL:
         plain = _own_rows(_statement(expectation, dataset, grained=False), expectation, chart_id=chart_id,
                           adapter=adapter, snapshot=snapshot, grants=grants, timeout_s=timeout_s,
@@ -626,6 +677,9 @@ def check_chart(adapter, *, chart_id: int, dataset_id: int, kinds: dict[str, Mea
     each metric mnemiq knows, by the label Superset names its values by; `saved` the dataset's saved metrics mnemiq
     read, by name.
 
+    A percent measure is a fraction, shown by the format times 100: a checked chart whose percent value is above 1 is
+    `FORMAT_WRONG` (`percent_problem`), its values kept.
+
     A wrong format is reported whatever the numbers, unless they are a mismatch or the chart is empty. A chart is
     checked only when the format of every metric mnemiq knows the kind of was judged: numbers that match beside a
     format mnemiq could not judge are not checked, their values kept. `every_kind_known` says `kinds` holds every
@@ -647,8 +701,12 @@ def check_chart(adapter, *, chart_id: int, dataset_id: int, kinds: dict[str, Mea
     if problem is None and unjudged is not None and found.status is ChartStatus.CHECKED:
         return _outcome(chart_id, ChartStatus.NOT_CHECKED, f"{found.reason}, but {unjudged}", found.chart_values,
                         found.mnemiq_values)
+    if problem is None and unjudged is None and found.status is ChartStatus.CHECKED \
+            and isinstance(found, _Numbers) \
+            and (scale := percent_problem(kinds, found.labels, found.rows)) is not None:
+        return _outcome(chart_id, ChartStatus.FORMAT_WRONG, scale, found.chart_values, found.mnemiq_values)
     if problem is None or found.status in (ChartStatus.MISMATCH, ChartStatus.EMPTY):
-        return found
+        return _plain(found)
     reason = problem if found.status is ChartStatus.CHECKED else f"{problem}. Its numbers were not compared: " \
                                                                   f"{found.reason}"
     return _outcome(chart_id, ChartStatus.FORMAT_WRONG, reason, found.chart_values, found.mnemiq_values)
