@@ -119,6 +119,16 @@ class Usage:
     completion_tokens: int
 
 
+@dataclass(frozen=True)
+class SnapshotFindings:
+    """What the load found of one snapshot, held with it: a question uses `stale` only while it reads that same
+    snapshot, so a swap that publishes the next snapshot before its findings, or two swaps finishing out of order,
+    can pair a question with no notes, never with another snapshot's (Codex on the note)."""
+
+    snapshot: Snapshot | None
+    stale: tuple[StaleCodes, ...] = ()
+
+
 @dataclass
 class Runtime:
     """The engine assembled once for product use (CLI, MCP). Distinct from eval's in-memory
@@ -149,9 +159,9 @@ class Runtime:
     default_profile: str = "default"
     answer_log: AnswerLog | None = None  # one line per answer, for a deployment with no sink
     engine_commit: str | None = None
-    # The snapshot's definitions naming codes their column holds none of, found when it loaded (`stale_codes`):
-    # retrieval notes each beside its definition for an identity that may be told (`noted_stale`).
-    stale: list = field(default_factory=list)
+    # The snapshot's definitions naming codes their column holds none of, found when it loaded (`stale_codes`), with
+    # the snapshot they are of: retrieval notes each beside its definition for an identity that may be told.
+    findings: SnapshotFindings | None = None
 
     @property
     def _superset_mode(self) -> bool:
@@ -244,7 +254,8 @@ class Runtime:
             # is a deployment property this repo cannot see.
             _warn_view_inventory(snapshot, _acknowledged(self.settings))
             _warn_cut_meaning(snapshot)
-            self.stale = _warn_stale_codes(snapshot, self.con, self.authz, superset=self._superset_mode)
+            self.findings = SnapshotFindings(snapshot, tuple(_warn_stale_codes(snapshot, self.con, self.authz,
+                                                                            superset=self._superset_mode)))
             for settings, profile in ([(lp.settings, lp.profile) for lp in self.profiles.values()] if self.profiles
                                       else [(self.settings, None)]):
                 _warn_prompt_window(settings, self.con, snapshot, getattr(self, "adapter", None),
@@ -333,6 +344,10 @@ class Runtime:
                                     time.perf_counter(), picked)
             self.reload_if_stale()
             started = time.perf_counter()
+        # Read once, after any swap, and used throughout: a swap during the answer cannot hand retrieval one
+        # snapshot's definitions and the agent another's, and the findings ride only with the snapshot they are of.
+        snapshot, findings = self.snapshot, self.findings
+        stale = findings.stale if findings is not None and findings.snapshot is snapshot else ()
         with step(emit, Stage.RETRIEVE, mode=name):
             packet = retrieve(
                 self.con, question, identity, authz, self.embedder,
@@ -340,27 +355,27 @@ class Runtime:
                 # literal 12 and silently kept the old value when the measured default moved
                 # to 24 -- a second copy of a number is a second thing to forget.
                 k=settings.retrieval_k if settings else DEFAULT_RETRIEVAL_K,
-                table_facts=self.snapshot.table_facts if self.snapshot else (),
+                table_facts=snapshot.table_facts if snapshot else (),
                 # Both doors pass this or the eval measures a prompt form `ask` cannot emit
                 # -- the M81 shape the two-doors guard exists to catch, which it did.
                 card_style=self._card_style(name, picked),
                 dialect=getattr(self.adapter, "dialect", None),
                 # Definitions ride with the snapshot: the glossary channel had no runtime
                 # producer until the ontology digest, so this stayed unfed from Plan 08 until SP1.
-                definitions=self.snapshot.definitions if self.snapshot else (),
+                definitions=snapshot.definitions if snapshot else (),
                 # Certified metrics and dimensions were appended to the snapshot by
                 # `apply_certified` and passed to nothing -- five of the fs corpus's twenty-eight
                 # records reaching the model not at all, and the five carrying the most explicit
                 # meaning.
-                metrics=self.snapshot.metrics if self.snapshot else (),
-                dimensions=self.snapshot.dimensions if self.snapshot else (),
-                columns=self.snapshot.columns if self.snapshot else (),
+                metrics=snapshot.metrics if snapshot else (),
+                dimensions=snapshot.dimensions if snapshot else (),
+                columns=snapshot.columns if snapshot else (),
                 ontology_index=self.ontology,
                 # M4: lets retrieve re-render each card against this identity's column policy.
-                snapshot=self.snapshot,
+                snapshot=snapshot,
                 grants=grants,
                 # Noted beside the definitions it found, as the eval door notes them.
-                stale=self.stale,
+                stale=stale,
             )
         if superset:
             # No few-shot example is served, whatever the store holds, as no value index is (`NoValueIndex`): an
@@ -370,7 +385,7 @@ class Runtime:
             # No row the client sent back is kept. The newest turn with SQL is decided again under these grants, with
             # the answering agent's own value index and fan-out setting, and run again through this request's adapter
             # within the answer statement's time limit, so "it" in a follow-up names rows this person may read now.
-            packet.history = superset_history(history, grants=grants, snapshot=self.snapshot, adapter=adapter,
+            packet.history = superset_history(history, grants=grants, snapshot=snapshot, adapter=adapter,
                                               timeout_s=agent.timeout_s, values=agent.values,
                                               guard_fanout=agent.guard_fanout)
         else:
@@ -379,8 +394,8 @@ class Runtime:
         # After the history, which the prompt carries too; before the agent, so the generator, the
         # corrector and the judge all read the cards the window has room for (M127).
         if fitter is not None:
-            packet = fitter.fit(packet, self.snapshot, grants, card_style=self._card_style(name, picked))
-        answer = agent.answer(packet, self.snapshot, grants, identity, emit=emit)
+            packet = fitter.fit(packet, snapshot, grants, card_style=self._card_style(name, picked))
+        answer = agent.answer(packet, snapshot, grants, identity, emit=emit)
         if superset and (refused := adapter.terminal_refusal) is not None:
             # Superset refused the person during the answer, reading the function inventory, at the proof, or running
             # the statement: their token, their roles, or without saying why. The agent read that as a source that did
@@ -1413,5 +1428,5 @@ def build_runtime(settings: Settings) -> Runtime:
         default_profile=default_profile,
         answer_log=answer_log,
         engine_commit=commit,
-        stale=stale,
+        findings=SnapshotFindings(snapshot, tuple(stale)),
     )

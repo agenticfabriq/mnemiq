@@ -66,6 +66,9 @@ def test_the_note_follows_its_definition_and_names_no_real_value():
     at = next(i for i, line in enumerate(lines) if line.startswith("- plant: "))
     note = lines[at + 1]
     assert note.startswith("  Note:") and "PLANT_CODE" in note and "'AB12'" in note
+    # Never "drop the filter": the constraint stands, on the column's code of the same meaning, or the question is
+    # declined (Codex on the note).
+    assert "same meaning" in note and "rather than guess" in note and "do not filter" not in note
     assert "XY98" not in "\n".join(lines)
 
 
@@ -139,6 +142,7 @@ def test_the_product_boots_with_the_finding_and_its_writer_reads_the_note(tmp_pa
     handed = {}
 
     def one_table(con, question, identity, authz, embedder, **kwargs):
+        handed.setdefault("first", kwargs.get("stale"))
         handed["stale"] = kwargs.get("stale")
         definitions = list(kwargs["definitions"])
         return ContextPacket(question=question, cards=[RetrievedCard(object_id="wide", card="wide (col_0 TEXT)",
@@ -161,9 +165,15 @@ def test_the_product_boots_with_the_finding_and_its_writer_reads_the_note(tmp_pa
         ValueIndex(con)._con.execute("INSERT INTO value_index VALUES ('only', 'wide', 'col_0', 'XY98')")
         con.close()
         runtime = build_runtime(settings)
-        assert [s.codes for s in runtime.stale] == [("AB12",)]
+        assert runtime.findings.snapshot is runtime.snapshot
+        assert [s.codes for s in runtime.findings.stale] == [("AB12",)]
         runtime.ask("rows of plant AB12", IDENTITY)
-    assert handed["stale"] == runtime.stale
+        # Findings made for another snapshot (a swap's, published before or after this one) reach no question.
+        found = runtime.findings
+        runtime.findings = type(found)(snapshot=runtime.snapshot.model_copy(), stale=found.stale)
+        runtime.ask("rows of plant AB12", IDENTITY)
+    assert handed["stale"] == ()
+    assert handed["first"] == found.stale
     sent = [json.dumps(request) for request in stub.requests]
     assert any("Note:" in body and "'AB12'" in body and "XY98" not in body for body in sent)
 

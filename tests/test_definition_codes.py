@@ -475,7 +475,8 @@ def test_an_sql_operator_selects_a_code_only_in_a_known_selecting_form():
     # Exclusions and comparisons whose selection is uncertain: never counted.
     for text in ["Count shipments where SHIP_MODE IS DISTINCT FROM 'X'.", "Count shipments where SHIP_MODE NOT LIKE 'X'.",
                  "Count shipments where SHIP_MODE NOT ILIKE 'X'.", "Count shipments where SHIP_MODE < 'X'.",
-                 "Count shipments where SHIP_MODE BETWEEN 'B' AND 'X'."]:
+                 "Count shipments where SHIP_MODE BETWEEN 'B' AND 'X'.", "Count shipments where SHIP_MODE LIKE 'X'.",
+                 "Count shipments where SHIP_MODE ILIKE 'X'."]:
         assert stale(text) == [], text
     # However the SQL is spaced.
     for text in ["Count shipments where SHIP_MODE NOT  LIKE 'X'.", "Count shipments where SHIP_MODE NOT\n  LIKE 'X'.",
@@ -483,7 +484,16 @@ def test_an_sql_operator_selects_a_code_only_in_a_known_selecting_form():
         assert stale(text) == [], text
     assert stale("Do not  exclude rows where SHIP_MODE = 'X'.") == [("X",)]
     # Forms that select the code: counted.
-    for text in ["Count shipments where SHIP_MODE IS NOT DISTINCT FROM 'X'.", "Count shipments where SHIP_MODE LIKE 'X'.",
+    for text in ["Count shipments where SHIP_MODE IS NOT DISTINCT FROM 'X'.",
                  "Count shipments where SHIP_MODE = 'X'.", "Count shipments where SHIP_MODE IN ('X').",
                  "Count shipments whose SHIP_MODE is 'X'."]:
         assert stale(text) == [("X",)], text
+
+
+def test_a_pattern_is_never_read_as_an_absent_code():
+    """A LIKE or ILIKE compares by pattern, ILIKE folding case and some engines' LIKE too, so a code missing from the
+    exact values may still match: `ILIKE 'ab12'` finds AB12 on DuckDB. Exact membership cannot say it matches nothing,
+    and the finding now reaches the writer as an instruction, so a pattern is never counted (Codex on the note)."""
+    held = _index({("plants", "PLANT_CODE"): ["AB12", "xy98"]})
+    for text in ["Rows of plant ab12: PLANT_CODE ILIKE 'ab12'.", "Rows of plant ab12: PLANT_CODE LIKE 'ab12'."]:
+        assert stale_codes(_snapshot([("plant", text)], [("plants", "PLANT_CODE")]), held) == [], text

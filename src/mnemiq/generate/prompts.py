@@ -185,9 +185,12 @@ def meaning_sections(packet: ContextPacket) -> list[str]:
             parts.append(f"- {sanitize(d.term, limit=NAME_LIMIT)}: {sanitize(d.definition, limit=DEFINITION_LIMIT)}")
             # A definition written for other data: told to follow it exactly, a writer put its code back after the
             # value check named the real one, so the finding is said where the definition is.
+            # Never "drop the filter": the constraint the definition sets stands, on the code of the same meaning, or
+            # the question is declined (Codex on the note).
             parts += [f"  Note: {sanitize(s.column, limit=NAME_LIMIT)} holds none of the codes named here for it "
-                      f"({', '.join(repr(sanitize(c, limit=NAME_LIMIT)) for c in s.codes)}), so they do not match this "
-                      "data and a filter on them matches no row: do not filter on them as written."
+                      f"({', '.join(repr(sanitize(c, limit=NAME_LIMIT)) for c in s.codes)}), so a filter on them as "
+                      "written matches no row. Keep the condition, on the code of the same meaning that the column "
+                      "holds; if none clearly has that meaning, say so rather than guess."
                       for s in stale if (s.term, s.definition) == (d.term, d.definition)]
     if packet.metrics:
         # The EXPRESSION is the payload. A section naming "Settled Payment Volume" without saying
