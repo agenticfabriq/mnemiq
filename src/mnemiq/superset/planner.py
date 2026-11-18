@@ -15,9 +15,10 @@ mnemiq's own reason, which names what the model wrote and nothing Superset said,
 **What is checked.** Each written measure meets `check_measure`, its statement decided under the builder's grants as
 every ask-path statement is, then the values it filters on (`absent_literals`), and then `reusable`: a saved metric on
 its dataset that says the same thing replaces it. Each chart meets `plan_refusal` and the plan's own rules here (its
-key, its columns, its filters, the saved metrics it names), then the values its filters compare a column with, and then
-whether a column it filters with `!=`, `NOT IN` or `NOT LIKE` holds NULL, which such a filter leaves out. A refused
-part goes back to the model once; refused again, it refuses the plan, and the reason names it.
+key, its columns, its filters, the saved metrics it names, no negated filter beside `IS NULL` on one column), then the
+values its filters compare a column with, and then whether a column it filters with `!=`, `NOT IN` or `NOT LIKE` holds
+NULL, which such a filter leaves out. A refused part goes back to the model once; refused again, it refuses the plan,
+and the reason names it.
 
 **Datasets.** A chart on a table with no dataset gets a planned dataset over the table; a measure that needs a join
 gets a planned virtual dataset over the join's SQL, the join decided with the measure by `check_measure`. The builder
@@ -1023,14 +1024,29 @@ def _filter_refusals(chart: ChartSpec, on: _Rows, *, adapter, snapshot: Snapshot
     return list(reasons)
 
 
+def _null_contradictions(chart: ChartSpec) -> list[str]:
+    """The reasons `chart` is refused for a negated filter (`!=`, `NOT IN`, `NOT LIKE`) beside `IS NULL` on the same
+    column: a chart's filters all apply, and a NULL never meets a negation, so no row meets both. Decided from the plan
+    alone, among the chart's own checks, so nothing is asked of the source for it."""
+    nulls = {item.column for item in chart.filters if item.op == "IS NULL"}
+    reasons: dict[str, None] = {}
+    for item in chart.filters:
+        if item.op in NEGATED_OPERATORS and item.column in nulls:
+            reasons.setdefault(f"it filters {item.column} with both {item.op} and IS NULL, and no row can meet both; "
+                               f"keep IS NULL alone if the rows where {item.column} is NULL are meant, otherwise drop "
+                               "it")
+    return list(reasons)
+
+
 def _null_refusals(chart: ChartSpec, on: _Rows, *, adapter, snapshot: Snapshot, grants: GrantSet,
                    probes: Probes) -> list[str]:
     """The reasons `chart` is refused for a negated filter (`!=`, `NOT IN`, `NOT LIKE`) on a column a row the builder
     can read holds NULL in: SQL reads NULL compared with anything as unknown, so the filter leaves those rows out
-    beside the ones it names, which the goal may not mean. A chart that also filters the column `IS NULL` or `IS NOT
-    NULL` has said what it does with them, and is not asked. Asked of the table and column the chart's rows read it
-    from (`_Rows.origins`), as the builder (`holds_null`); a column the source says nothing of refuses nothing."""
-    stated = {item.column for item in chart.filters if item.op in _NO_OPERAND}
+    beside the ones it names, which the goal may not mean. A chart that also filters the column `IS NOT NULL` has said
+    those rows are left out, and is not asked; one that filters it `IS NULL` beside the negation never reaches here
+    (`_null_contradictions`). Asked of the table and column the chart's rows read it from (`_Rows.origins`), as the
+    builder (`holds_null`); a column the source says nothing of refuses nothing."""
+    stated = {item.column for item in chart.filters if item.op == "IS NOT NULL"}
     reasons: dict[str, None] = {}
     for item in chart.filters:
         if item.op not in NEGATED_OPERATORS or item.column in stated:
@@ -1039,9 +1055,9 @@ def _null_refusals(chart: ChartSpec, on: _Rows, *, adapter, snapshot: Snapshot, 
         if origin is not None and holds_null(*origin, adapter=adapter, snapshot=snapshot, grants=grants,
                                              timeout_s=DEFAULT_TIMEOUT_S, probes=probes):
             reasons.setdefault(f"it filters {item.column} with {item.op}, which leaves out every row where "
-                               f"{item.column} is NULL, and rows the builder can read hold NULL there; use IS NULL if "
-                               f"those are the rows the goal means, add {item.column} IS NOT NULL if leaving them out "
-                               "is meant, or filter on another column")
+                               f"{item.column} is NULL, and rows the builder can read hold NULL there; replace the "
+                               f"filter with IS NULL if only those rows are meant, add {item.column} IS NOT NULL if "
+                               "leaving them out is meant, or filter on another column")
     return list(reasons)
 
 
@@ -1257,6 +1273,8 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
         for item in spec.filters:
             if (problem := _filter_problem(item)) is not None:
                 refuse(part, problem)
+        for reason in _null_contradictions(spec):
+            refuse(part, reason)
         if len(refused) == before:
             why = plan_refusal(spec, interactive_pivot_available=interactive_pivot_available,
                                saved={ref.name: saved[ref.name] for ref in refs if isinstance(ref, SavedRef)},

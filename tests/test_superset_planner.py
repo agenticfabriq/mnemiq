@@ -443,7 +443,8 @@ def test_every_filterconfig_operator_is_accepted():
     assert set(FILTER_OPERATORS) == {"=", ">", "<", ">=", "<=", "!=", "LIKE", "ILIKE", "NOT LIKE", "IN", "NOT IN",
                                      "IS NULL", "IS NOT NULL"}
     operand = {"IN": ["a"], "NOT IN": ["a"], "IS NULL": None, "IS NOT NULL": None}
-    filters = [Filter("region", op, operand.get(op, "a")) for op in FILTER_OPERATORS]
+    # IS NULL filters another column: beside a negated filter on one column it selects no row, and is refused.
+    filters = [Filter("premium" if op == "IS NULL" else "region", op, operand.get(op, "a")) for op in FILTER_OPERATORS]
     plan = _valid_plan(charts=(_chart("by_region", Family.BAR, [WrittenRef(PREMIUM)], dims=["region"],
                                       filters=filters),), measures=(PREMIUM,))
     assert _plan(GOAL, FakePlanner(plan), _tools()) == plan
@@ -1600,8 +1601,14 @@ def _null_reason(column: str, op: str) -> str:
     """The refusal of a chart that filters `column` with the negated `op`, a row the builder can read holding NULL
     there."""
     return (f"it filters {column} with {op}, which leaves out every row where {column} is NULL, and rows the builder "
-            f"can read hold NULL there; use IS NULL if those are the rows the goal means, add {column} IS NOT NULL if "
-            "leaving them out is meant, or filter on another column")
+            f"can read hold NULL there; replace the filter with IS NULL if only those rows are meant, add {column} IS NOT "
+            "NULL if leaving them out is meant, or filter on another column")
+
+
+def _both_reason(column: str, op: str) -> str:
+    """The refusal of a chart that filters `column` with the negated `op` and with IS NULL."""
+    return (f"it filters {column} with both {op} and IS NULL, and no row can meet both; keep IS NULL alone if the rows "
+            f"where {column} is NULL are meant, otherwise drop it")
 
 
 # Each negated operator, with an operand the column holds, so no value of it is refused.
@@ -1649,18 +1656,78 @@ def test_a_negated_filter_on_a_column_holding_no_null_is_built(op, operand):
     assert _null_probes(tools) == [("policy", "region")]
 
 
-@pytest.mark.parametrize("stated", ["IS NOT NULL", "IS NULL"])
-def test_a_chart_that_states_its_null_handling_is_not_probed(stated):
-    """`region != 'west' AND region IS NOT NULL` says the NULL rows are meant to be left out (and with `IS NULL`, the
-    chart asks for them by name): nothing to ask, nothing refused. Said of another column, it says nothing of
-    region's."""
+def test_a_chart_that_states_its_null_handling_is_not_probed():
+    """`region != 'west' AND region IS NOT NULL` says the NULL rows are meant to be left out: nothing to ask, nothing
+    refused. Said of another column, `IS NOT NULL` or `IS NULL` says nothing of region's, which is asked."""
     tools = _tools(held=REGIONS_HELD, nulls={("policy", "region")})
-    plan = _region_filtered(Filter("region", "!=", "west"), Filter("region", stated, None))
+    plan = _region_filtered(Filter("region", "!=", "west"), Filter("region", "IS NOT NULL", None))
     assert isinstance(_plan(GOAL, FakePlanner(plan), tools), BuildPlan)
     assert _null_probes(tools) == []
-    elsewhere = _region_filtered(Filter("region", "!=", "west"), Filter("premium", stated, None))
-    refused = _plan(GOAL, FakePlanner(elsewhere), tools)
-    assert _parts(refused) == {"chart 'premium_by_region'": _null_reason("region", "!=")}
+    for stated in ("IS NOT NULL", "IS NULL"):
+        elsewhere = _region_filtered(Filter("region", "!=", "west"), Filter("premium", stated, None))
+        refused = _plan(GOAL, FakePlanner(elsewhere), tools)
+        assert _parts(refused) == {"chart 'premium_by_region'": _null_reason("region", "!=")}, stated
+
+
+@pytest.mark.parametrize(("op", "operand"), NEGATED)
+def test_a_negated_filter_beside_is_null_on_its_column_is_refused_without_a_probe(op, operand):
+    """A chart's filters all apply, and a NULL never meets a negation, so `region != 'west' AND region IS NULL`
+    selects no row. The chart is refused, repairably, from the plan alone: nothing is asked of the source, neither the
+    column's NULLs nor the filter's values."""
+    from mnemiq.superset.planner import RefusedPart
+
+    planner = FakePlanner(_region_filtered(Filter("region", op, operand), Filter("region", "IS NULL", None)))
+    tools = _tools(held=REGIONS_HELD, nulls={("policy", "region")})
+    refused = _plan(GOAL, planner, tools)
+    assert isinstance(refused, PlanRefused), refused
+    assert refused.parts == (RefusedPart("chart 'premium_by_region'", _both_reason("region", op), True),)
+    assert len(planner.contexts) == 2 and planner.contexts[1].repair.refused == refused.parts
+    assert not any(_NULL_PROBE.fullmatch(sql) or _PROBE.fullmatch(sql) or _HELD_READ.fullmatch(sql)
+                   for sql in tools.statements())
+
+
+def test_one_plans_charts_share_one_null_probe_per_column():
+    """Two charts negate region, which holds NULL: within one check of the plan the column is asked once. The stub
+    answers the same plan twice (the plan and its repair), and each check has its own probes, so twice in all."""
+    first = _chart("premium_by_region", Family.BAR, [WrittenRef(PREMIUM)], dims=["region"],
+                   filters=[Filter("region", "!=", "west")])
+    second = _chart("premium_outside_east", Family.BAR, [WrittenRef(PREMIUM)], dims=["region"],
+                    filters=[Filter("region", "NOT IN", ["east"])])
+    tools = _tools(held=REGIONS_HELD, nulls={("policy", "region")})
+    refused = _plan(GOAL, FakePlanner(_valid_plan(measures=(PREMIUM,), charts=(first, second))), tools)
+    assert _parts(refused) == {"chart 'premium_by_region'": _null_reason("region", "!="),
+                               "chart 'premium_outside_east'": _null_reason("region", "NOT IN")}
+    assert _null_probes(tools) == [("policy", "region")] * 2
+
+
+def test_once_a_plans_probe_time_is_spent_no_null_probe_is_sent(monkeypatch):
+    """Each read takes 6 s on the plan's clock and the plan may spend `PROBE_BUDGET_S` (10 s): the measure's probe
+    and its column's read spend it, so the chart that then negates region is never asked whether region holds NULL,
+    and is not refused for it."""
+    from mnemiq.superset import planner as planner_module
+    from mnemiq.superset.literals import Probes
+
+    clock = [0.0]
+    held = {("claim", "status"): ["WON"], **REGIONS_HELD}
+    nulls = {("policy", "region")}
+
+    def execute(request):
+        sql = request["sql"]
+        if _PROBE.fullmatch(sql) or _HELD_READ.fullmatch(sql) or _NULL_PROBE.fullmatch(sql):
+            clock[0] += 6.0
+        return _null_answer(sql, nulls) or _value_answer(sql, held) or EMPTY
+
+    monkeypatch.setattr(planner_module, "Probes", lambda: Probes(clock=lambda: clock[0]))
+    won = _won_plan("Won").measures[0]
+    plan = _valid_plan(measures=(won, PREMIUM), charts=(
+        _chart("won", Family.BIG_NUMBER, [WrittenRef(won)], dataset_id=2),
+        _chart("premium_by_region", Family.BAR, [WrittenRef(PREMIUM)], dims=["region"],
+               filters=[Filter("region", "!=", "west")])))
+    tools = _tools()
+    tools.handlers["execute_sql"] = execute
+    refused = _plan(GOAL, FakePlanner(plan), tools)
+    assert set(_parts(refused)) == {"measure 'won_amount'"}
+    assert _null_probes(tools) == []
 
 
 POSITIVE = {"=": "west", "IN": ["west"], ">": "m", "<": "m", ">=": "m", "<=": "m", "LIKE": "w%", "ILIKE": "W%",
