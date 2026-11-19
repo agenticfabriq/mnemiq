@@ -995,6 +995,13 @@ def _unread(*tables: str) -> dict[str, str]:
      _unread("trx", "customer")),
     # A table `visible` does not hold.
     ("SELECT 1 FROM trx t JOIN ledger l ON l.trx_id = t.trx_id", _SALES_VISIBLE, _unread("trx", "ledger")),
+    # One table twice under one alias: two sources, one read.
+    ("SELECT 1 FROM customer c JOIN customer c ON c.customer_id = c.customer_id", _SALES_VISIBLE,
+     _unread("customer")),
+    # Two aliases that fold to one beside a parenthesized join, so as many sources are read as the tree has.
+    ('SELECT 1 FROM trx "T" JOIN customer "t" ON "t".customer_id = "T".customer_id '
+     "JOIN (region r CROSS JOIN region r2) ON r.region_id = \"t\".region_id", _SALES_VISIBLE,
+     _unread("trx", "customer", "region")),
 ])
 def test_own_grain_fails_closed_on_a_source_it_cannot_read(sql, visible, off):
     """Own grain is the stricter reading: where the join's FROM tree holds a source the walk does not read, nothing

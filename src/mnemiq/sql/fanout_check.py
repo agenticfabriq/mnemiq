@@ -349,13 +349,7 @@ def tables_off_their_grain(
     sources = _sources(scope, visible)
     frm = scope.expression.args.get("from_")
     nodes = ([frm.this] if frm else []) + [j.this for j in scope.expression.args.get("joins") or []]
-    # Each source of the FROM tree must be a table the walk reads under its own alias: a derived
-    # table left unmerged, a table `visible` names twice or not at all, or two aliases that fold to
-    # one would otherwise leave the tables beside it on their grain, with nothing to say so.
-    if len(nodes) != len(sources) or any(
-            not isinstance(node, exp.Table)
-            or sources.get(node.alias_or_name.lower()) != _visible_table(node, visible)
-            for node in nodes):
+    if not _reads_every_source(nodes, sources, visible):
         unread: dict[str, str] = {}
         for node in nodes:
             for found in node.find_all(exp.Table):  # in a derived table or a parenthesized join too
@@ -437,6 +431,21 @@ def _sources(scope, visible: dict[str, set[str]]) -> dict[str, str]:
         if isinstance(source, exp.Table) and (table := _visible_table(source, visible)) is not None:
             sources[alias.lower()] = table
     return sources
+
+
+def _reads_every_source(nodes: list[exp.Expression], sources: dict[str, str],
+                        visible: dict[str, set[str]]) -> bool:
+    """Whether the walk's sources are exactly the FROM tree's, `nodes`: each a table `visible`
+    names once, under an alias no other source has. A derived table left unmerged, a table
+    `visible` names twice or not at all, or two aliases that fold to one would otherwise leave the
+    tables beside it read as on their grain."""
+    expected: dict[str, str | None] = {}
+    for node in nodes:
+        alias = node.alias_or_name.lower()
+        if alias in expected:
+            return False  # two sources under one alias: `_sources` folds them as this does, to one
+        expected[alias] = _visible_table(node, visible) if isinstance(node, exp.Table) else None
+    return expected == sources  # `sources` holds no None: a source it lacks is unread
 
 
 def _visible_table(table: exp.Table, visible: dict[str, set[str]]) -> str | None:
