@@ -327,10 +327,11 @@ def tables_off_their_grain(
       expression join): `T is joined by no key to every other table`, since nothing the profile
       holds says how often its rows meet the others'.
 
-    Keyed by the table's object id in `visible`. As `check_fanout` reads a join: a key whose
-    uniqueness the profile never measured repeats nothing; the join is the outermost SELECT's FROM
-    tree, a pass-through derived table merged into it where sqlglot can (`_merged`, which reads
-    `dialect`); a table `visible` does not name exactly once is not read.
+    A key pair is read only from an equality that is a top-level conjunct of an ON or WHERE: an
+    equality under OR, NOT, CASE or COALESCE is no key. A key whose uniqueness the profile never
+    measured repeats nothing. The join is the outermost SELECT's FROM tree, a pass-through derived
+    table merged into it where sqlglot can (`_merged`, which reads `dialect`); a table `visible`
+    does not name exactly once is not read. Keyed by the table's object id in `visible`.
     """
     if ast.find(exp.Subquery) or ast.find(exp.CTE):
         merged = _merged(ast, visible, dialect)
@@ -342,7 +343,7 @@ def tables_off_their_grain(
     sources = _sources(scope, visible)
     if len(sources) < 2:
         return {}
-    walk = _walk(scope.expression, sources, visible, facts)
+    walk = _walk(scope.expression, sources, visible, facts, conjunct_keys=True)
     off: dict[str, str] = {}
     for alias, table in walk.sources.items():
         if alias in walk.dup:
@@ -436,7 +437,10 @@ class _Walk:
     keyed: frozenset[str]
 
 
-def _walk(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts) -> _Walk:
+def _walk(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts, *,
+          conjunct_keys: bool = False) -> _Walk:
+    """The join of `select`, walked. With `conjunct_keys`, a key pair is read only from an equality
+    that is a top-level conjunct of an ON or WHERE."""
     sources = dict(sources)  # a SEMI/ANTI right side is dropped from it below
 
     def owner(col: exp.Column) -> str | None:
@@ -504,8 +508,16 @@ def _walk(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts)
             earlier.append(right)
     if select.args.get("where") is not None:
         conditions.append((select.args["where"].this, None, None))
+
+    def conjuncts(e: exp.Expression):
+        e = e.unnest()  # flatten() unwraps parentheses inside the AND chain itself
+        return e.flatten() if isinstance(e, exp.And) else [e]
+
     for condition, asof, _ in conditions:
-        for eq in condition.find_all(exp.EQ):
+        # With `conjunct_keys` (own grain), a key pair is read only from a top-level conjunct.
+        equalities = ([c for c in conjuncts(condition) if isinstance(c, exp.EQ)] if conjunct_keys
+                      else condition.find_all(exp.EQ))
+        for eq in equalities:
             if eq.find_ancestor(exp.Select) is not select:
                 continue  # inside a subquery: its columns belong to another scope
             left, right_col = eq.left, eq.right
@@ -530,10 +542,6 @@ def _walk(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts)
     # still repeats and nothing is recorded. A snapshot without partitions pins nothing.
     partitions = getattr(facts, "partitions", {})
     pinned: dict[str, set[str]] = {}
-
-    def conjuncts(e: exp.Expression):
-        e = e.unnest()  # flatten() unwraps parentheses inside the AND chain itself
-        return e.flatten() if isinstance(e, exp.And) else [e]
 
     for condition, _, filters in conditions:
         for c in conjuncts(condition):

@@ -864,7 +864,8 @@ def test_subtotal_forms_are_found_where_newer_sqlglot_keeps_them(form, arg):
 # repeated table unless every table repeats, so this is read on the same facts and walk, and
 # stricter. Many trx rows per customer; one customer row per customer, one region per region.
 _SALES = {
-    "trx": {"trx_id": (1000, 1000, 0), "customer_id": (1000, 200, 0), "amount": (1000, 900, 0)},
+    "trx": {"trx_id": (1000, 1000, 0), "customer_id": (1000, 200, 0), "amount": (1000, 900, 0),
+            "region_id": (1000, 10, 0)},
     "customer": {"customer_id": (200, 200, 0), "status": (200, 3, 0), "region_id": (200, 10, 0),
                  "credit_limit": (200, 50, 0)},
     "region": {"region_id": (10, 10, 0), "name": (10, 10, 0)},
@@ -951,3 +952,26 @@ def test_a_pass_through_derived_table_is_read_flat():
     """As the guard reads it: a derived table that only passes the join's rows through is merged."""
     assert _off(f"SELECT COUNT(j.status) FROM (SELECT c.status {_SALES_JOIN}) AS j") \
         == {"customer": _CUSTOMER_REPEATED}
+
+
+def _no_key(*tables: str) -> dict[str, str]:
+    return {t: f"{t} is joined by no key to every other table" for t in tables}
+
+
+@pytest.mark.parametrize("join, off", [
+    # An equality under OR, NOT or IS NOT FALSE is no key for own grain.
+    ("trx t JOIN customer c ON c.customer_id = t.customer_id OR c.region_id = t.region_id",
+     _no_key("trx", "customer")),
+    ("trx t JOIN customer c ON c.customer_id = t.customer_id OR TRUE", _no_key("trx", "customer")),
+    ("trx t JOIN customer c ON NOT (c.customer_id = t.customer_id)", _no_key("trx", "customer")),
+    ("trx t JOIN customer c ON (c.customer_id = t.customer_id) IS NOT FALSE", _no_key("trx", "customer")),
+    ("trx t, customer c WHERE c.customer_id = t.customer_id OR t.amount > 0", _no_key("trx", "customer")),
+    # The key beside an OR is still the key, and the equality inside the OR is not a second one.
+    ("trx t JOIN customer c ON c.customer_id = t.customer_id AND (c.region_id = t.region_id OR t.amount > 0)",
+     {"customer": _CUSTOMER_REPEATED}),
+    ("trx t JOIN customer c ON (c.customer_id = t.customer_id) AND (c.status = 'A')",
+     {"customer": _CUSTOMER_REPEATED}),
+])
+def test_own_grain_keys_a_join_only_on_an_equality_every_row_meets(join, off):
+    """Own grain reads a key pair only from an equality that is a top-level conjunct of an ON or WHERE."""
+    assert _off(f"SELECT 1 FROM {join}") == off
