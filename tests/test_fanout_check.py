@@ -1086,11 +1086,13 @@ def test_a_key_read_through_is_not_false_still_refuses_an_inflated_sum():
     assert _CUSTOMER_REPEATED in verdict.message
 
 
-def test_an_outer_joins_on_joins_only_the_table_it_brings_in():
-    """The LEFT JOIN keeps every row of trx and customer's product, matched or not, so its ON cannot join trx to
-    customer: it joins region to them, and trx and customer are joined by no key."""
-    assert _off("SELECT 1 FROM trx t JOIN customer c ON TRUE "
-                "LEFT JOIN region r ON t.trx_id = c.customer_id AND c.customer_id = r.region_id") \
+@pytest.mark.parametrize("side", ["LEFT", "RIGHT", "FULL"])
+def test_an_outer_joins_on_joins_only_the_table_it_brings_in(side):
+    """A LEFT or FULL JOIN keeps every row of trx and customer's product, matched or not, so its ON cannot join trx to
+    customer: it joins region to them, and trx and customer are joined by no key. Own grain reads every outer join's
+    ON so."""
+    assert _off(f"SELECT 1 FROM trx t JOIN customer c ON TRUE "
+                f"{side} JOIN region r ON t.trx_id = c.customer_id AND c.customer_id = r.region_id") \
         == _no_key("trx", "customer", "region")
 
 
