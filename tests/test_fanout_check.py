@@ -877,8 +877,16 @@ _CUSTOMER_REPEATED = ("each customer row is repeated once per matching trx row "
                       "(trx.customer_id is not unique)")
 
 
-def _off(sql: str, keys=_SALES_KEYS, visible=_SALES_VISIBLE) -> dict[str, str]:
+def _grain(sql: str, keys=_SALES_KEYS, visible=_SALES_VISIBLE):
     return tables_off_their_grain(sqlglot.parse_one(sql, read="postgres"), visible, keys, "postgres")
+
+
+def _off(sql: str, keys=_SALES_KEYS, visible=_SALES_VISIBLE) -> dict[str, str]:
+    return {table: off.reason for table, off in _grain(sql, keys, visible).items()}
+
+
+def _kinds(sql: str, keys=_SALES_KEYS, visible=_SALES_VISIBLE) -> dict[str, bool]:
+    return {table: off.repeats for table, off in _grain(sql, keys, visible).items()}
 
 
 @pytest.mark.parametrize("aggregate", [
@@ -1092,3 +1100,27 @@ def test_an_outer_join_on_the_table_it_brings_in_keys_it_as_an_inner_join_does()
     assert _off(f"SELECT 1 {_SALES_JOIN} LEFT JOIN region r ON r.region_id = c.region_id") == {
         "customer": _CUSTOMER_REPEATED,
         "region": "each region row is repeated once per matching customer row (customer.region_id is not unique)"}
+
+
+def test_a_repeat_the_join_makes_is_told_from_one_mnemiq_cannot_tell():
+    """`repeats` where the join's own facts say its rows repeat: a key it meets is known not unique, or it is joined by
+    no key to every other table. Not where mnemiq cannot tell: a key with no profile, a key a range narrows, a source
+    it cannot read."""
+    assert _kinds(f"SELECT 1 {_SALES_JOIN}") == {"customer": True}
+    assert _kinds("SELECT 1 FROM trx t CROSS JOIN customer c") == {"trx": True, "customer": True}
+    assert _kinds(f"SELECT 1 {_SALES_JOIN}", keys={}) == {"trx": False, "customer": False}
+    assert _kinds("SELECT 1 FROM orders o JOIN dim_customer d ON d.customer_id = o.customer_id "
+                  "AND o.order_date BETWEEN d.valid_from AND d.valid_to",
+                  keys=key_facts(_snapshot(_SCD)), visible={t: set(c) for t, c in _SCD.items()}) \
+        == {"orders": False, "dim_customer": True}
+    assert _kinds("SELECT 1 FROM trx t JOIN ledger l ON l.trx_id = t.trx_id") == {"trx": False, "ledger": False}
+
+
+def test_a_key_of_two_columns_whose_pair_is_not_known_unique_is_named_as_such():
+    """Each column repeats, so the profile cannot say whether the two together are unique."""
+    profile = {"a": {"k1": (100, 50, 0), "k2": (100, 20, 0), "v": (100, 90, 0)},
+               "b": {"k1": (100, 50, 0), "k2": (100, 20, 0), "w": (100, 90, 0)}}
+    off = _off("SELECT 1 FROM a JOIN b ON a.k1 = b.k1 AND a.k2 = b.k2", keys=key_facts(_snapshot(profile)),
+               visible={t: set(c) for t, c in profile.items()})
+    assert off == {"a": "mnemiq cannot tell whether this join repeats a's rows: b.k1, k2 is not known to be unique",
+                   "b": "mnemiq cannot tell whether this join repeats b's rows: a.k1, k2 is not known to be unique"}

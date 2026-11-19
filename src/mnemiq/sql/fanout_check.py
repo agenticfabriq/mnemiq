@@ -306,13 +306,24 @@ def check_fanout(
     return found
 
 
+@dataclass(frozen=True)
+class OffGrain:
+    """Why a join leaves a table off its own grain. `repeats` where that is a fact about the join, read from its keys:
+    a key the table meets is known not unique, or the table is joined by no key to every other table. Not where
+    mnemiq cannot tell: a key with no uniqueness profile or not known to be unique, a key a range narrows, a source
+    it cannot read."""
+
+    reason: str
+    repeats: bool
+
+
 def tables_off_their_grain(
     ast: exp.Expression,
     visible: dict[str, set[str]],
     facts: KeyFacts,
     dialect: str | None = None,
-) -> dict[str, str]:
-    """Each table of a join that the join does not leave at its own grain, with why.
+) -> dict[str, OffGrain]:
+    """Each table of a join that the join does not leave at its own grain, with why (`OffGrain`).
 
     A table is at its own grain when each of its rows appears at most once in the join: every walk
     outward from it enters each other table by a key known unique there, and it is keyed to every
@@ -326,9 +337,10 @@ def tables_off_their_grain(
       words `check_fanout` refuses with;
     - a table that meets another by a key not known unique there, so that nothing says how often
       its rows meet that table's: `mnemiq cannot tell whether this join repeats T's rows: W.k has
-      no uniqueness profile` (or, where a range of W's own columns narrows the join on a key that
-      repeats, that mnemiq cannot read whether the range leaves one row per key). A key is known
-      unique where the profile says so, or a profiled partition a filter picks pins it;
+      no uniqueness profile` (a key of several columns `is not known to be unique`; where a range of
+      W's own columns narrows the join on a key that repeats, mnemiq cannot read whether the range
+      leaves one row per key). A key is known unique where the profile says so, or a profiled
+      partition a filter picks pins it;
     - a table joined by no key to every other table (a CROSS JOIN, a comma, a range or an
       expression join): `T is joined by no key to every other table`, since nothing the profile
       holds says how often its rows meet the others'.
@@ -356,31 +368,37 @@ def tables_off_their_grain(
     frm = scope.expression.args.get("from_")
     nodes = ([frm.this] if frm else []) + [j.this for j in scope.expression.args.get("joins") or []]
     if not _reads_every_source(nodes, sources, visible):
-        unread: dict[str, str] = {}
+        unread: dict[str, OffGrain] = {}
         for node in nodes:
             for found in node.find_all(exp.Table):  # in a derived table or a parenthesized join too
                 # Unresolved, as the engine reads its name: the name the planner gives a joined table.
                 table = (_visible_table(found, visible) or resolve_identifier(found.this, dialect)
                          or object_key(found))
-                unread[table] = f"mnemiq cannot read how this join meets {table}'s rows"
+                unread[table] = OffGrain(f"mnemiq cannot read how this join meets {table}'s rows", repeats=False)
         return unread
     if len(sources) < 2:
         return {}
     walk = _walk(scope.expression, sources, visible, facts, conjunct_keys=True)
-    off: dict[str, str] = {}
+    off: dict[str, OffGrain] = {}
     for alias, table in walk.sources.items():
         if alias in walk.dup:
             entered, key = walk.dup[alias]
-            off[table] = _repeated(table, walk.sources[entered], key)
+            off[table] = OffGrain(_repeated(table, walk.sources[entered], key), repeats=True)
         elif alias in walk.unsure:
             entered, key, profiled = walk.unsure[alias]
             other = walk.sources[entered]
-            why = (f"{other}.{', '.join(key)} has no uniqueness profile" if profiled is None else
-                   f"{other}.{', '.join(key)} is not unique, and mnemiq cannot read whether the join's range on "
-                   f"{other} leaves one row per key")
-            off[table] = f"mnemiq cannot tell whether this join repeats {table}'s rows: {why}"
+            named = f"{other}.{', '.join(key)}"
+            if len(key) > 1:  # each column may be profiled; the profile cannot say whether they are unique together
+                why = f"{named} is not known to be unique"
+            elif profiled is None:
+                why = f"{named} has no uniqueness profile"
+            else:
+                why = (f"{named} is not unique, and mnemiq cannot read whether the join's range on {other} leaves "
+                       "one row per key")
+            off[table] = OffGrain(f"mnemiq cannot tell whether this join repeats {table}'s rows: {why}",
+                                  repeats=False)
         elif alias not in walk.keyed:
-            off[table] = f"{table} is joined by no key to every other table"
+            off[table] = OffGrain(f"{table} is joined by no key to every other table", repeats=True)
     return off
 
 

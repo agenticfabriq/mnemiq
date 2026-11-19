@@ -1992,8 +1992,10 @@ def test_a_carried_metric_names_a_table_the_builder_reads_and_one_join(change, w
     assert why in _parts(refused)["measure 'open_paid_by_region'"]
 
 
-def _own_grain(metric: str, table: str, reason: str) -> str:
-    return (f"the saved metric {metric!r} is defined on {table}'s own rows, and this join repeats them: {reason}; join "
+def _own_grain(metric: str, table: str, reason: str, *, may: bool = False) -> str:
+    """The own-grain refusal: `may` where mnemiq cannot tell whether the join repeats the table's rows."""
+    repeats = "may repeat" if may else "repeats"
+    return (f"the saved metric {metric!r} is defined on {table}'s own rows, and this join {repeats} them: {reason}; join "
             f"{table} only to tables it meets at most once per row, or plan the chart on {table} alone")
 
 
@@ -2040,7 +2042,8 @@ def test_a_metric_on_a_join_whose_key_has_no_uniqueness_profile_is_refused_with_
     assert isinstance(refused, PlanRefused), refused
     assert _parts(refused) == {"measure 'carried_metric'": _own_grain(
         "policies", "policy",
-        "mnemiq cannot tell whether this join repeats policy's rows: claim.policy_id has no uniqueness profile")}
+        "mnemiq cannot tell whether this join repeats policy's rows: claim.policy_id has no uniqueness profile",
+        may=True)}
     checked = _carried(OPEN_PAID_REF, snapshot=CLAIM_KEY_UNMEASURED)
     assert isinstance(checked, BuildPlan), checked
     assert [m.expression for m in checked.measures] == [OPEN_PAID_SHOWN]
@@ -2141,7 +2144,7 @@ FOLDED = 'policy "P" JOIN claim p ON p.policy_id = "P".policy_id'
     (SavedRef("open_paid", K.CURRENCY, table="claim", handle="m"), {"join": NO_KEY},
      _own_grain("open_paid", "claim", "claim is joined by no key to every other table")),
     (SavedRef("open_paid", K.CURRENCY, table="claim", handle="m"), {"join": FOLDED},
-     _own_grain("open_paid", "claim", "mnemiq cannot read how this join meets claim's rows")
+     _own_grain("open_paid", "claim", "mnemiq cannot read how this join meets claim's rows", may=True)
      + "; give the joined tables aliases that differ by more than letter case"),
     (SavedRef("open_share", K.PERCENT, table="claim", handle="m"), {},
      "the saved metric 'open_share' is on a 0 to 100 scale, so it cannot be shown as a percent: plan it with kind "

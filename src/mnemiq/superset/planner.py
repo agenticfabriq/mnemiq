@@ -56,7 +56,7 @@ from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Snapshot
 from mnemiq.execute.runner import DEFAULT_TIMEOUT_S
 from mnemiq.llm.client import ContextTooLong, PromptCut
-from mnemiq.sql.fanout_check import guard_on, key_facts, tables_off_their_grain
+from mnemiq.sql.fanout_check import OffGrain, guard_on, key_facts, tables_off_their_grain
 from mnemiq.sql.identifiers import resolve_identifier
 from mnemiq.sql.schema import column_types, visible_schema
 from mnemiq.superset.adapter import JINJA_DELIMITERS
@@ -1018,7 +1018,7 @@ _ISO_CODE = re.compile(r"[A-Z]{3}")
 
 
 def _carried(ref: SavedRef, on: _Rows, catalogue: _Catalogue,
-             off_grain: Mapping[str, str] | None) -> tuple[SavedMetric, Carried] | str:
+             off_grain: Mapping[str, OffGrain] | None) -> tuple[SavedMetric, Carried] | str:
     """`ref`, a saved metric of `ref.table`, one of the join `on`'s tables, carried onto the join as its table defines
     it (`carry`), or why it cannot be: the table has no such metric the builder can reach; it is on a side an outer
     join may fill with NULL, where the metric is not defined; the join does not leave its rows at their own grain
@@ -1031,12 +1031,14 @@ def _carried(ref: SavedRef, on: _Rows, catalogue: _Catalogue,
     if table in on.nullable:
         return (f"{table} is on a side the join may fill with NULL, where its saved metric {ref.name!r} is not "
                 f"defined: put {table} on the side the join keeps every row of, or join with JOIN")
-    if off_grain is not None and (reason := off_grain.get(table)) is not None:
+    if off_grain is not None and (off := off_grain.get(table)) is not None:
         # Folded as the own-grain reading folds an alias, to lower case.
         folded = len({qualifier.name.lower() for qualifier in on.qualifiers.values()}) < len(on.qualifiers)
-        return (f"the saved metric {ref.name!r} is defined on {table}'s own rows, and this join repeats them: "
-                f"{reason}; join {table} only to tables it meets at most once per row, or plan the chart on {table} "
-                f"alone{_FOLDED_ALIASES if folded else ''}")
+        # "may repeat" where mnemiq cannot tell (`OffGrain.repeats`): it never says the join does what it cannot read.
+        repeats = "repeats" if off.repeats else "may repeat"
+        return (f"the saved metric {ref.name!r} is defined on {table}'s own rows, and this join {repeats} them: "
+                f"{off.reason}; join {table} only to tables it meets at most once per row, or plan the chart on "
+                f"{table} alone{_FOLDED_ALIASES if folded else ''}")
     if ref.kind is MeasureKind.PERCENT and scales_by_100(metric.expression):
         return _scaled_saved(ref.name)
     carried = carry(metric, table=table, stored=catalogue.stored[table], columns=catalogue.columns[table],
