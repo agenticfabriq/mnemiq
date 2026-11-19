@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import numbers
+from collections.abc import Callable
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 
@@ -348,12 +350,7 @@ def _check_scopes(ast: exp.Expression, visible: dict[str, set[str]],
         select = scope.expression
         if not isinstance(select, exp.Select):
             continue
-        sources: dict[str, str] = {}  # alias (lowercased) -> visible object id
-        for alias, source in scope.sources.items():
-            if isinstance(source, exp.Table):
-                hits = [t for t in visible if names_one_object(object_key(source), [t])]
-                if len(hits) == 1:
-                    sources[alias.lower()] = hits[0]
+        sources = _sources(scope, visible)
         if len(sources) < 2:
             continue
         found = _check_scope(select, sources, visible, facts)
@@ -362,7 +359,36 @@ def _check_scopes(ast: exp.Expression, visible: dict[str, set[str]],
     return None
 
 
-def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts):
+def _sources(scope, visible: dict[str, set[str]]) -> dict[str, str]:
+    """A scope's base tables: alias (lowercased) -> visible object id, for each table `visible`
+    names exactly once."""
+    sources: dict[str, str] = {}
+    for alias, source in scope.sources.items():
+        if isinstance(source, exp.Table):
+            hits = [t for t in visible if names_one_object(object_key(source), [t])]
+            if len(hits) == 1:
+                sources[alias.lower()] = hits[0]
+    return sources
+
+
+@dataclass(frozen=True)
+class _Walk:
+    """One SELECT's join, read for which of its tables it repeats: the walk `check_fanout` and
+    `tables_off_their_grain` share.
+
+    `sources` is the scope's tables (alias -> object id) less a SEMI/ANTI right side; `owner` the
+    alias a column belongs to, or None where it cannot tell; `dup` each alias a walk outward from
+    it finds repeated, with the alias it is repeated by and that table's key; `keyed` the aliases
+    keyed to every other table.
+    """
+
+    sources: dict[str, str]
+    owner: Callable[[exp.Column], str | None]
+    dup: dict[str, tuple[str, tuple[str, ...]]]
+    keyed: frozenset[str]
+
+
+def _walk(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts) -> _Walk:
     sources = dict(sources)  # a SEMI/ANTI right side is dropped from it below
 
     def owner(col: exp.Column) -> str | None:
@@ -439,8 +465,6 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
                 lo, ro = owner(left), owner(right_col)
                 if lo and ro:
                     add(lo, left.name, ro, right_col.name, asof)
-    if not pairs:
-        return None
 
     # alias -> the columns an as-of filter in this scope narrows it by. Uniqueness is read
     # table-wide, so a versioned table joined as of the fact's date (`o.day BETWEEN d.valid_from
@@ -529,8 +553,6 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
         return None
 
     dup = {a: m for a in sources if (m := multiplier(a)) is not None}
-    if not dup:
-        return None
 
     def keyed_to_all(t: str) -> bool:
         seen, stack = {t}, [t]
@@ -541,13 +563,22 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
                     stack.append(w)
         return len(seen) == len(sources)
 
+    return _Walk(sources, owner, dup, frozenset(a for a in sources if keyed_to_all(a)))
+
+
+def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts):
+    walk = _walk(select, sources, visible, facts)
+    if not walk.dup:
+        return None
+    sources, owner, dup = walk.sources, walk.owner, walk.dup
+
     # A table carries a term at its own grain only if it appears at most once per join row:
     # repeated by no walk AND keyed to every other table. Absence from `dup` alone proves nothing
     # for a table no key reaches -- CROSS JOIN, a comma, a range or an expression join -- and read
     # as proof, such a table excused an inflated term. An owner `owner()` cannot resolve -- a CTE's
     # or derived table's column, an ambiguous bare name, any qualifier that is not a base table of
     # this scope -- counts as single: the pinned opaque limit.
-    single = {a for a in sources if a not in dup and keyed_to_all(a)}
+    single = {a for a in sources if a not in dup and a in walk.keyed}
 
     def of_this_row(col: exp.Column) -> bool:
         # A nested scope's own columns -- `(SELECT MAX(rate) FROM fx)` -- are not values of this
@@ -686,14 +717,18 @@ def _subtotal_forms(group: exp.Group) -> list[exp.Expression]:
     return found
 
 
+def _repeated(table: str, by: str, key: tuple[str, ...]) -> str:
+    """Why `table`'s rows repeat: it meets `by` on `key`, which repeats in `by`."""
+    return (f"each {table} row is repeated once per matching {by} row "
+            f"({by}.{', '.join(key)} is not unique)")
+
+
 def _inflated(aliases: list[str], sources: dict[str, str], dup, select: exp.Select,
               windowed: bool = False) -> Refusal:
     because, keys = [], {}
     for a in aliases:
         entered, key = dup[a]
-        t, w = sources[a], sources[entered]
-        because.append(f"each {t} row is repeated once per matching {w} row "
-                       f"({w}.{', '.join(key)} is not unique)")
+        because.append(_repeated(sources[a], sources[entered], key))
         keys.update(dict.fromkeys(key))
     tables = " and ".join(dict.fromkeys(sources[a] for a in aliases))
     key = ", ".join(keys)
