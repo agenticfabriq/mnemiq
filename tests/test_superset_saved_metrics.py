@@ -1,5 +1,5 @@
 """The saved-metric catalogue: read as the builder over Superset's MCP service, with the extension's certification
-beside it, and reused when a planned measure says what a saved metric already says.
+beside it, reused when a planned measure says what a saved metric already says, and carried onto a join.
 
 Runs against `FakeSuperset`, a real MCP server over streamable HTTP, through the real client.
 """
@@ -7,11 +7,21 @@ Runs against `FakeSuperset`, a real MCP server over streamable HTTP, through the
 from __future__ import annotations
 
 import pytest
+import sqlglot
+from sqlglot import exp
 
 from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetResponseTooLarge
 from mnemiq.superset.extension import TOOL_PREFIX, ExtensionMissing, call_tool
 from mnemiq.superset.measures import Measure, MeasureKind
-from mnemiq.superset.saved_metrics import UNKNOWN, SavedMetric, normalized, read_saved_metrics, reusable
+from mnemiq.superset.saved_metrics import (
+    UNKNOWN,
+    Carried,
+    SavedMetric,
+    carry,
+    normalized,
+    read_saved_metrics,
+    reusable,
+)
 from tests.superset_fake import FakeSuperset
 
 DATASET_METRICS = TOOL_PREFIX + "dataset_metrics"
@@ -285,3 +295,141 @@ def test_a_dataset_the_extension_marked_too_large_is_unknown_not_none(fake):
     by_name = {(s.dataset_id, s.name): s for s in read_saved_metrics(_client(fake), dataset_ids=(1, 2))}
     assert by_name[(2, "z")].currency is UNKNOWN and by_name[(2, "z")].certified_by is UNKNOWN
     assert by_name[(1, "a")].currency == USD
+
+
+# ---------------------------------------------------------------- carried onto a join
+
+# claim, joined to policy as `c`: policy_id and created_at are in both tables, so the joined dataset names claim's
+# `claim_policy_id` and `claim_created_at`, and the rest as they are.
+CLAIM = frozenset({"claim_id", "policy_id", "amount", "status", "created_at"})
+CLAIM_SHOWN = {"claim_id": "claim_id", "policy_id": "claim_policy_id", "amount": "amount", "status": "status",
+               "created_at": "claim_created_at"}
+NOT_ONE = "mnemiq cannot read its expression as one SQL expression"
+OTHER_ROWS = "it reads more than its own table's rows: a subquery, EXISTS or another table"
+NO_COLUMN = "it names no column of claim, so on a join it would count the join's rows"
+
+
+def _carry(expression: str, *, table: str = "claim", stored: str = "claim", columns=CLAIM,
+           qualifier: exp.Identifier | None = None, shown=None):
+    return carry(_saved("m", expression), table=table, stored=stored, columns=columns,
+                 qualifier=exp.to_identifier("c") if qualifier is None else qualifier,
+                 shown=CLAIM_SHOWN if shown is None else shown)
+
+
+@pytest.mark.parametrize("expression, decided, superset", [
+    ("SUM(amount)", 'SUM(c."amount")', 'SUM("amount")'),
+    # Written with its table's name, which the join knows by its alias.
+    ("SUM(claim.amount)", 'SUM(c."amount")', 'SUM("amount")'),
+    ("SUM(Claim.Amount)", 'SUM(c."amount")', 'SUM("amount")'),
+    ('SUM("claim"."amount")', 'SUM(c."amount")', 'SUM("amount")'),
+    # A column the joined tables share is the joined dataset's `<table>_<column>`.
+    ("MAX(created_at)", 'MAX(c."created_at")', 'MAX("claim_created_at")'),
+    ("COUNT(DISTINCT policy_id)", 'COUNT(DISTINCT c."policy_id")', 'COUNT(DISTINCT "claim_policy_id")'),
+    ("SUM(amount) FILTER (WHERE status = 'open')",
+     'SUM(c."amount") FILTER(WHERE c."status" = \'open\')', 'SUM("amount") FILTER(WHERE "status" = \'open\')'),
+    ("SUM(amount::numeric)", 'SUM(CAST(c."amount" AS DECIMAL))', 'SUM(CAST("amount" AS DECIMAL))'),
+    ("COUNT(CASE WHEN created_at >= TIMESTAMPTZ '2024-01-01 00:00:00+00' THEN claim_id END)",
+     'COUNT(CASE WHEN c."created_at" >= CAST(\'2024-01-01 00:00:00+00\' AS TIMESTAMPTZ) THEN c."claim_id" END)',
+     'COUNT(CASE WHEN "claim_created_at" >= CAST(\'2024-01-01 00:00:00+00\' AS TIMESTAMPTZ) THEN "claim_id" END)'),
+    ("SUM(CASE WHEN created_at > CURRENT_DATE - INTERVAL '30 days' THEN amount ELSE 0 END)",
+     'SUM(CASE WHEN c."created_at" > CURRENT_DATE - INTERVAL \'30 DAYS\' THEN c."amount" ELSE 0 END)',
+     'SUM(CASE WHEN "claim_created_at" > CURRENT_DATE - INTERVAL \'30 DAYS\' THEN "amount" ELSE 0 END)'),
+])
+def test_a_carried_metric_names_each_column_as_the_join_and_as_the_joined_dataset(expression, decided, superset):
+    """One parse, printed twice: the decided rendering qualifies each column by the table's join qualifier, the
+    Superset rendering names it as the joined dataset does; they differ only in column references."""
+    assert _carry(expression) == Carried(decided=decided, superset=superset)
+
+
+def test_a_quoted_table_is_qualified_with_its_quoting():
+    lines = frozenset({"line_id", "policy_id", "amount"})
+    shown = {"line_id": "line_id", "policy_id": "Policy Lines_policy_id", "amount": "Policy Lines_amount"}
+    carried = _carry('SUM("Policy Lines".amount) FILTER (WHERE line_id > 0)', table="Policy Lines",
+                     stored="Policy Lines", columns=lines, qualifier=exp.to_identifier("Policy Lines", quoted=True),
+                     shown=shown)
+    assert carried == Carried(decided='SUM("Policy Lines"."amount") FILTER(WHERE "Policy Lines"."line_id" > 0)',
+                              superset='SUM("Policy Lines_amount") FILTER(WHERE "line_id" > 0)')
+
+
+def test_a_column_may_be_qualified_by_the_table_as_superset_stores_it():
+    """A table the snapshot names `party` and Superset stores as `Party`: a metric of its dataset may name either."""
+    party = frozenset({"party_id", "policy_id"})
+    shown = {"party_id": "party_id", "policy_id": "party_policy_id"}
+    for written in ('COUNT("Party".party_id)', "COUNT(party.party_id)", 'COUNT("party".party_id)'):
+        assert _carry(written, table="party", stored="Party", columns=party, shown=shown) \
+            == Carried(decided='COUNT(c."party_id")', superset='COUNT("party_id")'), written
+    assert _carry('COUNT("PARTY".party_id)', table="party", stored="Party", columns=party, shown=shown) \
+        == 'it names "PARTY".party_id, a column of another table'
+
+
+@pytest.mark.parametrize("expression, reason", [
+    ("SUM({{ amount }})", "it holds {{, which Superset reads as a template marker"),
+    ("SUM(amount) {% if 1 %}{% endif %}", "it holds {%, which Superset reads as a template marker"),
+    ("SUM(amount) {# note #}", "it holds {#, which Superset reads as a template marker"),
+    ("SUM((", NOT_ONE),
+    ("", NOT_ONE),
+    ("SUM(amount), SUM(claim_id)", NOT_ONE),
+    ("SUM(amount) FROM claim", NOT_ONE),
+    ("DISTINCT amount", NOT_ONE),
+    ("SUM(amount); SELECT 1", NOT_ONE),
+    ("SUM(amount) AS total", NOT_ONE),
+    ("SUM(amount) AS (a, b)", NOT_ONE),
+    ("SUM(amount) + (SELECT MAX(premium) FROM policy)", OTHER_ROWS),
+    ("CASE WHEN EXISTS (SELECT 1 FROM policy) THEN SUM(amount) END", OTHER_ROWS),
+    ("SUM(amount) FILTER (WHERE policy_id IN (SELECT policy_id FROM policy))", OTHER_ROWS),
+    ("SUM(amount) * (VALUES (2))", OTHER_ROWS),
+    # sqlglot reads `(TABLE policy)` as a column named TABLE, aliased policy.
+    ("SUM(amount) * (TABLE policy)", OTHER_ROWS),
+    ("COUNT(claim.*)", "it names *"),
+    ("SUM(public.claim.amount)", "it names a column with a schema"),
+    ("SUM(policy.premium)", "it names policy.premium, a column of another table"),
+    # The join's alias is not the table's name: a saved metric is defined on the table alone.
+    ("SUM(c.amount)", "it names c.amount, a column of another table"),
+    ("SUM(premium)", "it names premium, which claim does not have or the builder cannot read"),
+    ('SUM("Amount")', 'it names "Amount", which claim does not have or the builder cannot read'),
+    ("COUNT(*)", NO_COLUMN),
+    ("SUM(1)", NO_COLUMN),
+    ("COUNT(1)", NO_COLUMN),
+])
+def test_a_metric_that_cannot_be_carried_is_refused_with_mnemiqs_reason(expression, reason):
+    assert _carry(expression) == reason
+
+
+def test_a_column_the_builder_cannot_read_is_refused():
+    assert _carry("SUM(amount)", columns=CLAIM - {"amount"}) \
+        == "it names amount, which claim does not have or the builder cannot read"
+
+
+_TABLES = {"policy": ("policy_id", "region", "premium", "start_date", "created_at"),
+           "claim": ("claim_id", "policy_id", "amount", "status", "created_at"),
+           "Policy Lines": ("line_id", "policy_id", "amount")}
+_FILTERED = "SUM(amount) FILTER (WHERE created_at >= TIMESTAMPTZ '2024-01-01 00:00:00+00' AND policy_id > 0)"
+
+
+@pytest.mark.parametrize("join, table, expression", [
+    ("policy p JOIN claim c ON c.policy_id = p.policy_id", "claim", _FILTERED),
+    ("policy JOIN claim ON claim.policy_id = policy.policy_id", "claim", _FILTERED),
+    ('"Policy Lines" JOIN claim c ON c.policy_id = "Policy Lines".policy_id', "Policy Lines",
+     'SUM("Policy Lines".amount) FILTER (WHERE line_id > 0 AND policy_id > 0)'),
+])
+def test_the_joined_dataset_reads_the_superset_rendering_as_the_decided_one(join, table, expression):
+    """The joined dataset's SELECT, as the planner makes it, maps each column of the Superset rendering back to the
+    joined column it projects; the result is the decided rendering, character for character."""
+    from mnemiq.superset.planner import PlannedDataset, _Catalogue, _joined
+
+    catalogue = _Catalogue(columns={t: frozenset(c) for t, c in _TABLES.items()}, stored={t: t for t in _TABLES},
+                           datasets={}, saved={}, types={t: {} for t in _TABLES})
+    rows = _joined(PlannedDataset(key="dataset_1", placeholder=-1, join=join), catalogue)
+    assert not isinstance(rows, str), rows
+    node = next(n for n in sqlglot.parse_one(f"SELECT 1 FROM {join}", read="postgres").find_all(exp.Table)
+                if n.name == table)
+    qualifier = node.args["alias"].this if node.args.get("alias") else node.this
+    shown = {column: name for name, (owner, column) in rows.origins.items() if owner == table}
+    carried = carry(_saved("m", expression), table=table, stored=table, columns=catalogue.columns[table],
+                    qualifier=qualifier, shown=shown)
+    assert isinstance(carried, Carried), carried
+    assert carried.decided != carried.superset
+    projected = {item.alias: item.this for item in sqlglot.parse_one(rows.planned.sql, read="postgres").expressions}
+    back = sqlglot.parse_one(f"SELECT {carried.superset}", read="postgres").expressions[0].transform(
+        lambda n: projected[n.name].copy() if isinstance(n, exp.Column) else n)
+    assert back.sql(dialect="postgres") == carried.decided
