@@ -10,7 +10,7 @@ from types import MappingProxyType
 from sqlglot import exp
 from sqlglot.optimizer.merge_subqueries import merge_subqueries
 from sqlglot.optimizer.qualify import qualify
-from sqlglot.optimizer.scope import traverse_scope
+from sqlglot.optimizer.scope import build_scope, traverse_scope
 
 from mnemiq.contract import Snapshot
 from mnemiq.sql.qualify import names_one_object, object_key
@@ -303,6 +303,54 @@ def check_fanout(
         if merged is not None:
             found = _check_scopes(merged, visible, facts)
     return found
+
+
+def tables_off_their_grain(
+    ast: exp.Expression,
+    visible: dict[str, set[str]],
+    facts: KeyFacts,
+    dialect: str | None = None,
+) -> dict[str, str]:
+    """Each table of a join that the join does not leave at its own grain, with why.
+
+    A table is at its own grain when each of its rows appears at most once in the join: no walk
+    outward from it enters another table by a key that repeats there, and it is keyed to every
+    other table. Any aggregate over its columns -- a count or a SUM of constants as much as a SUM
+    or AVG -- then reads each of its rows at most once. `check_fanout` excuses a count over a
+    repeated table unless every table repeats, since it may be a count of the finer table, which
+    may be what was asked; a measure defined on one table's own rows has no such reading, so this
+    reports every such table, on the same facts and the same walk:
+
+    - a repeated table: `each T row is repeated once per matching W row (W.k is not unique)`, the
+      words `check_fanout` refuses with;
+    - a table joined by no key to every other table (a CROSS JOIN, a comma, a range or an
+      expression join): `T is joined by no key to every other table`, since nothing the profile
+      holds says how often its rows meet the others'.
+
+    Keyed by the table's object id in `visible`. As `check_fanout` reads a join: a key whose
+    uniqueness the profile never measured repeats nothing; the join is the outermost SELECT's FROM
+    tree, a pass-through derived table merged into it where sqlglot can (`_merged`, which reads
+    `dialect`); a table `visible` does not name exactly once is not read.
+    """
+    if ast.find(exp.Subquery) or ast.find(exp.CTE):
+        merged = _merged(ast, visible, dialect)
+        if merged is not None:
+            ast = merged
+    scope = build_scope(ast)
+    if scope is None or not isinstance(scope.expression, exp.Select):
+        raise ValueError("tables_off_their_grain reads the join of one SELECT")
+    sources = _sources(scope, visible)
+    if len(sources) < 2:
+        return {}
+    walk = _walk(scope.expression, sources, visible, facts)
+    off: dict[str, str] = {}
+    for alias, table in walk.sources.items():
+        if alias in walk.dup:
+            entered, key = walk.dup[alias]
+            off[table] = _repeated(table, walk.sources[entered], key)
+        elif alias not in walk.keyed:
+            off[table] = f"{table} is joined by no key to every other table"
+    return off
 
 
 def _merged(ast: exp.Expression, visible: dict[str, set[str]],

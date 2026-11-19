@@ -11,7 +11,7 @@ import sqlglot
 from sqlglot import exp
 
 from mnemiq.contract import Column, Snapshot
-from mnemiq.sql.fanout_check import check_fanout, key_facts, value_terms
+from mnemiq.sql.fanout_check import check_fanout, key_facts, tables_off_their_grain, value_terms
 from mnemiq.sql.verdict import RefusalCode
 
 # The acme_syn shapes, profiled the way the glossary arm found them: 30,000 claims over 23,322
@@ -855,3 +855,99 @@ def test_subtotal_forms_are_found_where_newer_sqlglot_keeps_them(form, arg):
     group.set("expressions", list(nodes))
     assert [type(n) for n in _subtotal_forms(group)] == [type(n) for n in nodes]
     assert _grouping(select) == ["d.region"], "named by its column, not as the subtotal form itself"
+
+
+# -- own grain: which tables a join repeats ------------------------------------------------------
+#
+# A measure defined on one table's own rows (a saved metric carried onto a join) is right only
+# where the join leaves that table's rows each once. `check_fanout` excuses a count over a
+# repeated table unless every table repeats, so this is read on the same facts and walk, and
+# stricter. Many trx rows per customer; one customer row per customer, one region per region.
+_SALES = {
+    "trx": {"trx_id": (1000, 1000, 0), "customer_id": (1000, 200, 0), "amount": (1000, 900, 0)},
+    "customer": {"customer_id": (200, 200, 0), "status": (200, 3, 0), "region_id": (200, 10, 0),
+                 "credit_limit": (200, 50, 0)},
+    "region": {"region_id": (10, 10, 0), "name": (10, 10, 0)},
+}
+_SALES_VISIBLE = {t: set(c) for t, c in _SALES.items()}
+_SALES_KEYS = key_facts(_snapshot(_SALES))
+_SALES_JOIN = "FROM trx t JOIN customer c ON c.customer_id = t.customer_id"
+_CUSTOMER_REPEATED = ("each customer row is repeated once per matching trx row "
+                      "(trx.customer_id is not unique)")
+
+
+def _off(sql: str, keys=_SALES_KEYS, visible=_SALES_VISIBLE) -> dict[str, str]:
+    return tables_off_their_grain(sqlglot.parse_one(sql, read="postgres"), visible, keys, "postgres")
+
+
+@pytest.mark.parametrize("aggregate", [
+    "COUNT(c.customer_id)", "SUM(CASE WHEN c.status = 'A' THEN 1 ELSE 0 END)", "COUNT(*)",
+])
+def test_a_count_over_the_repeated_side_is_off_its_own_grain(aggregate):
+    """The guard approves these, reading a count over a one-to-many as a count of the finer
+    table; a measure defined on customer's own rows counts each customer once per trx row."""
+    sql = f"SELECT {aggregate} {_SALES_JOIN}"
+    assert _check(sql, keys=_SALES_KEYS, visible=_SALES_VISIBLE) is None
+    assert _off(sql) == {"customer": _CUSTOMER_REPEATED}
+
+
+def test_the_reason_is_the_guards_own_words():
+    """Where the guard refuses (an AVG over the repeated side), it says why in the same words."""
+    sql = f"SELECT AVG(c.credit_limit) {_SALES_JOIN}"
+    verdict = _check(sql, keys=_SALES_KEYS, visible=_SALES_VISIBLE)
+    assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
+    assert _CUSTOMER_REPEATED in verdict.message
+    assert _off(sql) == {"customer": _CUSTOMER_REPEATED}
+
+
+def test_the_side_the_join_does_not_repeat_is_on_its_own_grain():
+    """Each trx row meets one customer: trx's rows are each read once, whatever is aggregated."""
+    for aggregate in ("SUM(t.amount)", "COUNT(t.trx_id)", "COUNT(*)"):
+        assert "trx" not in _off(f"SELECT {aggregate} {_SALES_JOIN}"), aggregate
+
+
+def test_an_outer_join_repeats_its_preserved_side_as_an_inner_join_does():
+    assert _off("SELECT 1 FROM customer c LEFT JOIN trx t ON t.customer_id = c.customer_id") \
+        == {"customer": _CUSTOMER_REPEATED}
+
+
+def test_a_table_repeated_two_hops_away_names_the_table_it_meets_first():
+    off = _off(f"SELECT 1 {_SALES_JOIN} JOIN region r ON r.region_id = c.region_id")
+    assert off == {"customer": _CUSTOMER_REPEATED,
+                   "region": "each region row is repeated once per matching customer row "
+                             "(customer.region_id is not unique)"}
+
+
+def test_unknown_keys_never_repeat_a_table():
+    """Unknown is not non-unique, as the guard reads it: a join no profile measured is on grain."""
+    assert _off(f"SELECT COUNT(c.customer_id) {_SALES_JOIN}", keys={}) == {}
+
+
+@pytest.mark.parametrize("join", [
+    "FROM trx t JOIN customer c ON t.amount > c.credit_limit",
+    "FROM trx t CROSS JOIN customer c",
+    "FROM trx t, customer c",
+])
+def test_a_table_joined_by_no_key_is_off_its_own_grain(join):
+    """With no key, nothing the profile holds says how often a row meets the other table."""
+    assert _off(f"SELECT 1 {join}") == {
+        "trx": "trx is joined by no key to every other table",
+        "customer": "customer is joined by no key to every other table"}
+
+
+def test_a_table_keyed_to_only_part_of_the_join_is_off_its_own_grain():
+    """trx meets one customer per row, but region is joined to neither by a key."""
+    assert _off(f"SELECT 1 {_SALES_JOIN} CROSS JOIN region r") == {
+        "trx": "trx is joined by no key to every other table",
+        "customer": _CUSTOMER_REPEATED,
+        "region": "region is joined by no key to every other table"}
+
+
+def test_one_table_is_at_its_own_grain():
+    assert _off("SELECT COUNT(*) FROM customer") == {}
+
+
+def test_a_pass_through_derived_table_is_read_flat():
+    """As the guard reads it: a derived table that only passes the join's rows through is merged."""
+    assert _off(f"SELECT COUNT(j.status) FROM (SELECT c.status {_SALES_JOIN}) AS j") \
+        == {"customer": _CUSTOMER_REPEATED}
