@@ -297,8 +297,13 @@ still to come. In short:
   - its expression reads anything but its own table's columns, or names none of them, so `count` is never carried;
   - its table is on a side an outer join may fill with NULL: the right of a `LEFT JOIN`, every table before a
     `RIGHT JOIN`, any table of a `FULL JOIN`;
-  - with the fan-out guard on (`MNEMIQ_GUARD_FANOUT`), the join repeats its table's rows, or joins it by no key to
-    every other table, whatever the metric aggregates.
+  - with the fan-out guard on (`MNEMIQ_GUARD_FANOUT`), the join repeats its table's rows, meets another table by a
+    key not known to be unique there (one with no uniqueness profile, say), or joins it by no key to every other
+    table, whatever the metric aggregates.
+
+  With `JOIN`, the rows of the metric's table that no other table matches are left out of it, as they are of every
+  chart over the join; on the side a `LEFT JOIN` or `RIGHT JOIN` keeps every row of (the left of a `LEFT JOIN`, the
+  right of a `RIGHT JOIN`), they are kept.
 
   Its chart, like every chart on a dataset a build makes over a join, is not checked against mnemiq's own SQL
   (`not_checked`).
