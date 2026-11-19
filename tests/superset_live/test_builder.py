@@ -1603,7 +1603,8 @@ def test_a_joined_tables_saved_metric_is_carried_onto_the_join_and_adds_up(live,
       the joined dataset's `"policy_status"`, and no saved-metric reference; the chart's create sent that expression,
       and Superset saved it; read back through the joined dataset's SQL as Superset stores it, it is the decided one;
     - the chart's three bars, read as the builder through `get_chart_data`, add up to `active_premium` read as the
-      builder on policy's own dataset through `query_dataset` (the source's own total);
+      builder on policy's own dataset through `query_dataset` (the source's own total), and each bar is its region's
+      `active_premium`, read the same way by region, the region named by the bar's manager (`REGION_ROWS`);
     - the chart's check status is `not_checked`: a dataset the build made over a join is not checked against mnemiq's
       own SQL, so the numbers are held here instead;
     - no request called MCP's creates, a claim or `patch_chart`; no model client is made or called.
@@ -1661,11 +1662,21 @@ def test_a_joined_tables_saved_metric_is_carried_onto_the_join_and_adds_up(live,
     bars = builder.call("get_chart_data", {"identifier": chart_id}).get("data") or []
     own = builder.call("query_dataset", {"dataset_id": policy_id, "metrics": ["active_premium"], "columns": [],
                                          "filters": [], "row_limit": 10}).get("data") or []
+    by_region = builder.call("query_dataset", {"dataset_id": policy_id, "metrics": ["active_premium"],
+                                               "columns": ["region"], "filters": [], "row_limit": 10}).get("data") or []
     cents = Decimal("0.01")
     shown = sum((Decimal(str(row["Active premium"])) for row in bars), Decimal(0)).quantize(cents)
     read = [Decimal(str(row["active_premium"])).quantize(cents) for row in own]
+
+    def in_cents(value) -> Decimal | None:  # a region with no active policy has no sum
+        return None if value is None else Decimal(str(value)).quantize(cents)
+
+    # Each bar against its own region's value: a total alone would not see two bars' values exchanged.
+    per_region = {row.get("region"): in_cents(row.get("active_premium")) for row in by_region}
+    per_bar = {row.get("manager"): in_cents(row.get("Active premium")) for row in bars}
     same = {"three bars": sorted(row.get("manager") for row in bars) == sorted(m for _, m, _ in REGION_ROWS),
-            "adds up": read == [shown], "the source's": read == [own_total.quantize(cents)]}
+            "adds up": read == [shown], "the source's": read == [own_total.quantize(cents)],
+            "each bar its region's": per_bar == {manager: per_region.get(region) for region, manager, _ in REGION_ROWS}}
     assert all(same.values()), same
     assert run.final["checks"] == {str(chart_id): "not_checked"}, (run.final["checks"], run.last_step.get("message"))
     assert_no_model_call(run)
