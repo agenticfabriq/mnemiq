@@ -2092,6 +2092,26 @@ def test_a_metric_naming_its_tables_columns_with_the_table_names_its_alias_on_th
     assert any('SUM(c."amount") AS paid_total FROM policy AS p JOIN claim AS c' in sql for sql in tools.statements())
 
 
+@pytest.mark.parametrize("join", [
+    "claim c JOIN policy p ON p.policy_id = c.policy_id JOIN agent a ON a.agent_id = p.policy_id",
+    # The FULL JOIN may fill agent and policy with NULL; claim is joined after it with JOIN, which keeps its rows whole.
+    "agent a FULL JOIN policy p ON p.policy_id = a.agent_id JOIN claim c ON c.policy_id = p.policy_id",
+])
+def test_a_metric_is_carried_onto_a_join_of_three_tables(join):
+    """claim's metric, on a chart by agent's office: each claim row meets one policy row by policy's key, and each
+    policy row one agent row by agent's, both keys known unique, so claim's rows are each read once. Decided with
+    claim's columns qualified by its alias, and read back through the three-table dataset's SELECT as decided."""
+    tools = _tools(metrics=SAVED_ON_TABLES, extension=CERTIFIED)
+    checked = _carried(OPEN_PAID_REF, join=join, dims=("office",), tools=tools)
+    assert isinstance(checked, BuildPlan), checked
+    assert [m.expression for m in checked.measures] == [OPEN_PAID_SHOWN]
+    decided = OPEN_PAID_DECIDED.replace("claim.", "c.")
+    assert any(f"{decided} AS open_paid_by_region FROM " in sql for sql in tools.statements())
+    (made,) = checked.datasets
+    assert _read_through(made.sql, OPEN_PAID_SHOWN) == decided
+    assert 'a."office" AS "office"' in made.sql
+
+
 NO_KEY = "policy JOIN claim ON claim.policy_id > policy.policy_id"
 FOLDED = 'policy "P" JOIN claim p ON p.policy_id = "P".policy_id'
 
