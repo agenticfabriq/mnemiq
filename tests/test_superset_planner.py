@@ -2096,6 +2096,8 @@ def test_a_metric_naming_its_tables_columns_with_the_table_names_its_alias_on_th
     "claim c JOIN policy p ON p.policy_id = c.policy_id JOIN agent a ON a.agent_id = p.policy_id",
     # The FULL JOIN may fill agent and policy with NULL; claim is joined after it with JOIN, which keeps its rows whole.
     "agent a FULL JOIN policy p ON p.policy_id = a.agent_id JOIN claim c ON c.policy_id = p.policy_id",
+    # The LEFT JOIN's ON joins agent, the table it brings in, to policy on agent's key.
+    "claim c JOIN policy p ON p.policy_id = c.policy_id LEFT JOIN agent a ON a.agent_id = p.policy_id",
 ])
 def test_a_metric_is_carried_onto_a_join_of_three_tables(join):
     """claim's metric, on a chart by agent's office: each claim row meets one policy row by policy's key, and each
@@ -2110,6 +2112,17 @@ def test_a_metric_is_carried_onto_a_join_of_three_tables(join):
     (made,) = checked.datasets
     assert _read_through(made.sql, OPEN_PAID_SHOWN) == decided
     assert 'a."office" AS "office"' in made.sql
+
+
+def test_a_metric_whose_tables_only_an_outer_joins_on_joins_is_refused_with_the_guard_on():
+    """The LEFT JOIN keeps every row of claim and policy's product, matched or not, so its ON does not join claim to
+    policy: claim is joined by no key to every other table, and its metric is not carried."""
+    join = ("claim c JOIN policy p ON TRUE "
+            "LEFT JOIN agent a ON c.policy_id = p.policy_id AND p.policy_id = a.agent_id")
+    refused = _carried(OPEN_PAID_REF, join=join, dims=("office",))
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused) == {"measure 'open_paid_by_region'": _own_grain(
+        "open_paid", "claim", "claim is joined by no key to every other table")}
 
 
 NO_KEY = "policy JOIN claim ON claim.policy_id > policy.policy_id"

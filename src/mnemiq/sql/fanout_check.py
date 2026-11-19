@@ -334,7 +334,8 @@ def tables_off_their_grain(
       holds says how often its rows meet the others'.
 
     A key pair is read only from an equality that is a top-level conjunct of an ON or WHERE: an
-    equality under OR, NOT, CASE or COALESCE is no key. The join is the outermost SELECT's FROM
+    equality under OR, NOT, CASE or COALESCE is no key. An outer join's ON (LEFT, RIGHT or FULL)
+    keys only the table it brings in to the tables before it, never two of those to each other. The join is the outermost SELECT's FROM
     tree, a pass-through derived table merged into it where sqlglot can (`_merged`, which reads
     `dialect`). Keyed by the table's object id in `visible`.
 
@@ -528,6 +529,10 @@ def _walk(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts,
     # approved an inflated sum. WHERE and an inner ON filter every alias; a LEFT JOIN's ON only
     # its right side; a RIGHT or FULL JOIN's ON none.
     conditions: list[tuple[exp.Expression, str | None, set[str] | None]] = []
+    # conditions' index -> the aliases a key read from that outer join's ON must include, under
+    # `conjunct_keys`: the table the join brings in. The ON cannot filter the tables it keeps, so an
+    # equality between two of them joins nothing.
+    keys_with: dict[int, set[str]] = {}
     # USING binds to the tables LEFT of the join, and after `a JOIN b USING (k)` the merged `k`
     # equals both `a.k` and `b.k` -- so a later `JOIN c USING (k)` is an edge to each of them.
     # Binding to "the one other table with that column" instead refuses nothing on a three-way
@@ -548,6 +553,8 @@ def _walk(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts,
         if join.args.get("on") is not None:
             side = str(join.args.get("side") or "").upper()
             filters = None if not side else {right} if side == "LEFT" and right else set()
+            if side:
+                keys_with[len(conditions)] = {right} if right else set()
             conditions.append((join.args["on"], asof, filters))
         for ident in join.args.get("using") or []:
             if right not in sources:
@@ -564,8 +571,9 @@ def _walk(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts,
         e = e.unnest()  # flatten() unwraps parentheses inside the AND chain itself
         return e.flatten() if isinstance(e, exp.And) else [e]
 
-    for condition, asof, _ in conditions:
-        # With `conjunct_keys` (own grain), a key pair is read only from a top-level conjunct.
+    for at, (condition, asof, _) in enumerate(conditions):
+        # With `conjunct_keys` (own grain), a key pair is read only from a top-level conjunct, and
+        # from an outer join's ON only where it joins the table that join brings in.
         equalities = ([c for c in conjuncts(condition) if isinstance(c, exp.EQ)] if conjunct_keys
                       else condition.find_all(exp.EQ))
         for eq in equalities:
@@ -574,6 +582,8 @@ def _walk(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts,
             left, right_col = eq.left, eq.right
             if isinstance(left, exp.Column) and isinstance(right_col, exp.Column):
                 lo, ro = owner(left), owner(right_col)
+                if conjunct_keys and at in keys_with and not {lo, ro} & keys_with[at]:
+                    continue
                 if lo and ro:
                     add(lo, left.name, ro, right_col.name, asof)
 
