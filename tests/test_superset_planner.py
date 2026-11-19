@@ -20,6 +20,8 @@ from sqlglot import exp
 from mnemiq.authz.grants import GrantSet
 from mnemiq.config import Settings
 from mnemiq.contract import Column, Snapshot
+from mnemiq.contract.semantic import Job
+from mnemiq.sql.fanout_check import PARTITIONS_JOB
 from mnemiq.superset import build_store
 from mnemiq.superset.adapter import SupersetSqlAdapter
 from mnemiq.superset.chart_form import _GRAINS
@@ -1889,7 +1891,9 @@ SAVED_ON_TABLES = {
         _metric(2, "by_status", "COUNT(claim_id)", verbose_name="status"),
         _metric(2, "tally", "COUNT(claim_id)", verbose_name="COUNT"),
         _metric(2, "flagged", "COUNT(claim_id)", verbose_name="Open & flagged"),
-        _metric(2, "marked", "COUNT(claim_id)", verbose_name="Claims {{ period }}")],
+        _metric(2, "marked", "COUNT(claim_id)", verbose_name="Claims {{ period }}"),
+        _metric(2, "blank", "COUNT(claim_id)", verbose_name=""),
+        _metric(2, "long_named", "COUNT(claim_id)", verbose_name="Claims " + "x" * 114)],
 }
 CERTIFIED = {2: [{"metric_name": "open_paid", "currency": {"symbol": "EUR", "symbolPosition": "prefix"},
                   "certified_by": "finance"}]}
@@ -1905,9 +1909,9 @@ def _carried_plan(*refs, join: str = JOIN, dims=("region",), filters=()) -> Buil
                      datasets=(PlannedDataset(key="dataset_1", placeholder=-1, join=join),))
 
 
-def _carried(*refs, tools: Tools | None = None, settings: Settings = GUARDED, **plan):
+def _carried(*refs, tools: Tools | None = None, settings: Settings = GUARDED, snapshot: Snapshot = KEYED, **plan):
     tools = tools or _tools(metrics=SAVED_ON_TABLES, extension=CERTIFIED)
-    return _plan(GOAL, FakePlanner(_carried_plan(*refs, **plan)), tools, snapshot=KEYED, settings=settings)
+    return _plan(GOAL, FakePlanner(_carried_plan(*refs, **plan)), tools, snapshot=snapshot, settings=settings)
 
 
 def _seen(tools: Tools):
@@ -1993,16 +1997,27 @@ def _own_grain(metric: str, table: str, reason: str) -> str:
             f"{table} only to tables it meets at most once per row, or plan the chart on {table} alone")
 
 
+# KEYED as enrichment leaves a snapshot whose partitions it profiled, where an unset guard is on.
+PROFILED = KEYED.model_copy(update={"jobs": [Job(id=PARTITIONS_JOB, source_id="only", kind="profile:partitions",
+                                                  status="done")]})
+
+
 @pytest.mark.parametrize("metric", ["premium_total", "policies"])
 def test_a_metric_on_a_join_that_repeats_its_tables_rows_is_refused_with_the_guard_on(metric):
     """policy's SUM(premium), and its COUNT(policy_id), on `policy JOIN claim`, which repeats each policy row once per
-    claim: with the guard on, each is refused, the count as the sum. With the guard off, or unset on a snapshot whose
-    partitions were never profiled, neither is checked for it, as no written measure is."""
+    claim: with the guard on, each is refused, the count as the sum, and so with it unset (the default) on a snapshot
+    whose partitions were profiled. With the guard off, or unset on a snapshot whose partitions were never profiled,
+    neither is checked for it, as no written measure is."""
     ref = SavedRef(metric, K.NUMBER, table="policy", handle="carried_metric")
+    repeated = {"measure 'carried_metric'": _own_grain(
+        metric, "policy", "each policy row is repeated once per matching claim row (claim.policy_id is not unique)")}
     refused = _carried(ref, dims=("status",))
     assert isinstance(refused, PlanRefused), refused
-    assert _parts(refused) == {"measure 'carried_metric'": _own_grain(
-        metric, "policy", "each policy row is repeated once per matching claim row (claim.policy_id is not unique)")}
+    assert _parts(refused) == repeated
+    unset = Settings(guard_fanout=None, superset_currency="USD")
+    refused = _carried(ref, dims=("status",), settings=unset, snapshot=PROFILED)
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused) == repeated
     for settings in (_settings(), Settings(guard_fanout=None, superset_currency="USD")):
         carried = _carried(ref, dims=("status",), settings=settings)
         assert isinstance(carried, BuildPlan), carried
@@ -2083,8 +2098,6 @@ FOLDED = 'policy "P" JOIN claim p ON p.policy_id = "P".policy_id'
      "it reads more than its own table's rows: a subquery, EXISTS or another table"),
     (SavedRef("each_amount", K.NUMBER, table="claim", handle="m"), {},
      "the expression does not aggregate: it gives one value per row, not one per group"),
-    (SavedRef("by_status", K.COUNT, table="claim", handle="m"), {"dims": ("region", "status")},
-     "the label 'status' is also the name of a dimension; name the measure differently"),
     (SavedRef("paid", K.CURRENCY, table="claim", handle="count"), {},
      "its name 'count' is also a saved metric's on its dataset (Superset gives every dataset it makes one named "
      "count); Superset would show two metrics of one name, so name it differently"),
@@ -2092,7 +2105,7 @@ FOLDED = 'policy "P" JOIN claim p ON p.policy_id = "P".policy_id'
      "the measure name 'Paid' must be lower case letters, digits and _, starting with a letter, at most 63 "
      "characters"),
 ], ids=["not-joined", "no-such-metric", "no-dataset", "no-key", "aliases-fold", "percent-100", "count", "subquery",
-        "row-level", "label-is-a-dimension", "name-is-count", "name-not-a-name"])
+        "row-level", "name-is-count", "name-not-a-name"])
 def test_a_saved_metric_that_cannot_be_carried_is_refused_with_mnemiqs_reason(ref, plan, reason):
     refused = _carried(ref, **plan)
     assert isinstance(refused, PlanRefused), refused
@@ -2123,6 +2136,9 @@ def test_a_joined_tables_saved_metric_on_a_tables_chart_is_refused():
     # A verbose name Superset would save as other text, or read as a template: its name.
     ("flagged", "flagged"),
     ("marked", "marked"),
+    # A blank verbose name, or one longer than a label: its name.
+    ("blank", "blank"),
+    ("long_named", "long_named"),
     # The joined dataset's own saved metric is count: its table is appended.
     ("tally", "COUNT (claim)"),
 ])
@@ -2166,12 +2182,51 @@ def test_one_carried_metric_on_two_charts_is_one_measure_decided_against_both_ch
     (measure,) = checked.measures
     assert [chart.measures for chart in checked.charts] == [(WrittenRef(measure),)] * 2
     assert sum(f"AS open_paid_by_region FROM {JOIN}" in sql for sql in tools.statements()) == 1
-    # Its label is held apart from the columns of every chart that plots it.
+    # Its label is held apart from the columns of every chart that plots it: 'status' is the second chart's.
     labelled = SavedRef("by_status", K.COUNT, table="claim", handle="m")
-    refused = _plan(GOAL, FakePlanner(plan(labelled)), tools, snapshot=KEYED, settings=GUARDED)
+    checked = _plan(GOAL, FakePlanner(plan(labelled)), tools, snapshot=KEYED, settings=GUARDED)
+    assert isinstance(checked, BuildPlan), checked
+    assert [m.label for m in checked.measures] == ["status (claim)"]
+
+
+def test_a_carried_label_a_charts_dimension_has_takes_its_table_and_is_refused_when_that_is_taken_too():
+    """A carried metric's label is its metric's own, so where it is a dimension of a chart that plots it, the table is
+    appended, as for a label another measure has; and where that is taken too, the reason says what the plan can
+    change."""
+    labelled = SavedRef("by_status", K.COUNT, table="claim", handle="m")
+    checked = _carried(labelled, dims=("region", "status"))
+    assert isinstance(checked, BuildPlan), checked
+    assert [m.label for m in checked.measures] == ["status (claim)"]
+    other = _measure("other", "status (claim)", "MAX(amount)", K.NUMBER, dataset_id=-1)
+    plan = BuildPlan(charts=(_chart("carried", Family.BAR, [labelled], dataset_id=-1, dims=["region", "status"]),
+                             _chart("other", Family.BAR, [WrittenRef(other)], dataset_id=-1, dims=["region"])),
+                     measures=(other,), reuse_candidates=(),
+                     datasets=(PlannedDataset(key="dataset_1", placeholder=-1, join=JOIN),))
+    refused = _plan(GOAL, FakePlanner(plan), _tools(metrics=SAVED_ON_TABLES), snapshot=KEYED, settings=GUARDED)
     assert isinstance(refused, PlanRefused), refused
-    assert _parts(refused) == {"measure 'm'": "the label 'status' is also the name of a dimension; name the measure "
-                                              "differently"}
+    assert _parts(refused) == {"measure 'm'": (
+        "the saved metric 'by_status''s label 'status' is also a dimension of a chart that plots it; drop that "
+        "dimension or plan the chart on claim alone")}
+
+
+@pytest.mark.parametrize("symbol", ["$", "eur", "EURO"])
+def test_a_carried_metrics_currency_is_its_symbol_only_where_that_is_an_iso_code(symbol):
+    certified = {2: [{"metric_name": "open_paid", "currency": {"symbol": symbol, "symbolPosition": "prefix"},
+                      "certified_by": "finance"}]}
+    checked = _carried(OPEN_PAID_REF, tools=_tools(metrics=SAVED_ON_TABLES, extension=certified))
+    assert isinstance(checked, BuildPlan), checked
+    assert [(m.expression, m.currency) for m in checked.measures] == [(OPEN_PAID_SHOWN, None)]
+
+
+def test_only_aliases_postgres_folds_to_one_get_the_alias_advice():
+    """`"ß"` and `ss` are two aliases to Postgres (which folds by lower case), so the own-grain reading reads the join,
+    and policy's repeated rows are refused for what they are, with no word about aliases."""
+    join = 'policy "ß" JOIN claim ss ON ss.policy_id = "ß".policy_id'
+    refused = _carried(SavedRef("premium_total", K.NUMBER, table="policy", handle="m"), join=join, dims=("status",))
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused) == {"measure 'm'": _own_grain(
+        "premium_total", "policy", "each policy row is repeated once per matching claim row (claim.policy_id is not "
+        "unique)")}
 
 
 def test_a_carried_metrics_chart_has_its_filters_checked_as_any_charts():

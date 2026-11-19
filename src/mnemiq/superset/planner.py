@@ -1032,7 +1032,8 @@ def _carried(ref: SavedRef, on: _Rows, catalogue: _Catalogue,
         return (f"{table} is on a side the join may fill with NULL, where its saved metric {ref.name!r} is not "
                 f"defined: put {table} on the side the join keeps every row of, or join with JOIN")
     if off_grain is not None and (reason := off_grain.get(table)) is not None:
-        folded = len({qualifier.name.casefold() for qualifier in on.qualifiers.values()}) < len(on.qualifiers)
+        # Folded as the own-grain reading folds an alias, to lower case.
+        folded = len({qualifier.name.lower() for qualifier in on.qualifiers.values()}) < len(on.qualifiers)
         return (f"the saved metric {ref.name!r} is defined on {table}'s own rows, and this join repeats them: "
                 f"{reason}; join {table} only to tables it meets at most once per row, or plan the chart on {table} "
                 f"alone{_FOLDED_ALIASES if folded else ''}")
@@ -1360,16 +1361,24 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
             refuse(part, found)
             continue
         metric, rendered = found
-        label = _carried_label(metric)
+        # Its label is its metric's own, so where that is another measure's label, a saved metric's name on the join,
+        # or a dimension of a chart that plots it, its table is appended; where that meets one too, it is refused.
+        base = _carried_label(metric)
         saved_names = {m.name.casefold() for m in on.saved}
         taken = set(labels) | saved_names
-        if label.casefold() in taken:
-            own = f"{label} ({ref.table})"
-            if own.casefold() in taken:
-                refuse(part, f"its label {label!r} is another measure's, or a saved metric's on the join, and so is "
-                             f"{own!r}; give the other measure a label of its own")
+        dimensions = {column.casefold() for column in carried_columns[key]}
+        label = base
+        if base.casefold() in taken or base.casefold() in dimensions:
+            label = f"{base} ({ref.table})"
+            if label.casefold() in dimensions or (base.casefold() in dimensions and label.casefold() in taken):
+                clashing = base if base.casefold() in dimensions else label
+                refuse(part, f"the saved metric {metric.name!r}'s label {clashing!r} is also a dimension of a chart "
+                             f"that plots it; drop that dimension or plan the chart on {ref.table} alone")
                 continue
-            label = own
+            if label.casefold() in taken:
+                refuse(part, f"its label {base!r} is another measure's, or a saved metric's on the join, and so is "
+                             f"{label!r}; give the other measure a label of its own")
+                continue
         if name.casefold() in names:
             refuse(part, "two measures have this name")
             continue
