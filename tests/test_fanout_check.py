@@ -1158,3 +1158,12 @@ def test_a_table_a_left_join_brings_in_is_walked_on_from_a_table_joined_after_it
     off = _off("SELECT 1 FROM trx t JOIN customer c ON TRUE LEFT JOIN region r "
                "ON r.region_id = t.trx_id AND r.region_id = c.customer_id JOIN payment p ON p.region_id = r.region_id")
     assert "payment" not in off, off
+
+
+def test_a_table_a_walk_first_meets_as_a_dead_end_is_walked_on_when_met_from_a_table_after_it():
+    """trx reaches region, which the LEFT JOIN brings in, only as a dead end; payment, joined after it on payment's
+    unique key, meets region again and goes on through it to customer. Each trx row meets one region row, one payment
+    row and one customer row: trx and customer are at their own grain."""
+    off = _off("SELECT 1 FROM trx t JOIN customer c ON TRUE LEFT JOIN region r "
+               "ON r.region_id = t.trx_id AND r.region_id = c.customer_id JOIN payment p ON p.payment_id = r.region_id")
+    assert "trx" not in off and "customer" not in off, off
