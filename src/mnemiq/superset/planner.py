@@ -987,23 +987,27 @@ def _chart_columns(chart: ChartSpec) -> list[str]:
 def _absent_reason(absent: Absent) -> str:
     """Why a part that filters on a value no row the builder can read holds is refused, naming the values its column
     holds where the source said. Each value is quoted (`repr`), so one holding ", " never reads as two, and one holding
-    a line break never starts a line of the repair's prompt that reads as another part's refusal. The reason ends with
-    what to do: a value the column holds replaces the plan's only where it is the value the goal means, and otherwise
-    the goal's own value is kept. A value swapped in, or the filter left out, would build a chart of a different
-    question that still checks; kept, a goal value the builder cannot read is refused again, and the plan is refused
-    naming what the builder can see."""
+    a line break never starts a line of the repair's prompt that reads as another part's refusal. A named value that
+    differs from the plan's only in letter case (`casefold`, so 'STRASSE' matches 'straße') is called out, one clause
+    each in the order named, among the named values only: no further read is made. The reason ends with what to do: a
+    value the column holds replaces the plan's only where it is the value the goal means, and the plan's own value is
+    kept only where the goal itself names it. A value swapped in, or the filter left out, would build a chart of a
+    different question that still checks; kept, a goal value the builder cannot read is refused again, and the plan is
+    refused naming what the builder can see."""
+    literal = absent.literal
+    keep = f"keep {literal!r} only if the goal itself names it"
     if absent.held is None:
-        held = "the source did not say which values it holds; " + _KEEP_IT
+        held = f"the source did not say which values it holds; {keep}"
     elif not absent.held:
-        held = f"no row the builder can read holds any value of {absent.column}; " + _KEEP_IT
+        held = f"no row the builder can read holds any value of {absent.column}; {keep}"
     else:
+        folded = literal.casefold()
+        case = "".join(f"; {value!r} differs from {literal!r} only in letter case"
+                       for value in absent.held if value != literal and value.casefold() == folded)
         held = (f"{absent.column} holds: {', '.join(repr(value) for value in absent.held)}"
-                f"{' and more' if absent.more else ''}; filter on one of these only if it is the value the goal means, "
-                "otherwise " + _KEEP_IT)
-    return f"it filters {absent.column} on {absent.literal!r}, which no row the builder can read holds; {held}"
-
-
-_KEEP_IT = "keep the goal's value"
+                f"{' and more' if absent.more else ''}{case}; filter on one of these if it is the value the goal "
+                f"means, and {keep}")
+    return f"it filters {absent.column} on {literal!r}, which no row the builder can read holds; {held}"
 
 
 def _filter_refusals(chart: ChartSpec, on: _Rows, *, adapter, snapshot: Snapshot, grants: GrantSet,
