@@ -20,8 +20,18 @@ values its filters compare a column with, and then whether a column it filters w
 NULL, which such a filter leaves out. A refused part goes back to the model once; refused again, it refuses the plan,
 and the reason names it.
 
-**Datasets.** A chart on a table with no dataset gets a planned dataset over the table; a measure that needs a join
-gets a planned virtual dataset over the join's SQL, the join decided with the measure by `check_measure`. The builder
+**A joined table's saved metric on a join** is carried onto it as its table defines it (`carry`), once for each
+metric, kind, table and join. It is refused where its table is on a side an outer join may fill with NULL, where the
+fan-out guard is on and the join does not leave its table's rows at their own grain (`tables_off_their_grain`),
+whatever it aggregates, and where its expression reads anything but its own table's columns. Otherwise its expression
+is printed twice from one parse: each column qualified as the join names its table, decided by `check_measure` over
+the join, and each column named as the joined dataset names it, which the chart sends. It is then a written measure
+of the plan, under the plan's name for it and its metric's verbose name, but for its values, which are its table's
+and never probed.
+
+**Datasets.** A chart on a table with no dataset gets a planned dataset over the table; a measure that needs a join,
+written or carried, gets a planned virtual dataset over the join's SQL, the join decided with the measure by
+`check_measure`. The builder
 makes each with the extension's `create_dataset`, a virtual one with its `sql`. A planned dataset has no id
 until it is made, so the plan's charts and measures carry its negative `placeholder` until `with_made_datasets` puts
 the made id in its place. Every dataset Superset makes carries a saved metric `count` (`COUNT_METRIC`), which is
@@ -46,6 +56,7 @@ from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Snapshot
 from mnemiq.execute.runner import DEFAULT_TIMEOUT_S
 from mnemiq.llm.client import ContextTooLong, PromptCut
+from mnemiq.sql.fanout_check import guard_on, key_facts, tables_off_their_grain
 from mnemiq.sql.identifiers import resolve_identifier
 from mnemiq.sql.schema import column_types, visible_schema
 from mnemiq.superset.adapter import JINJA_DELIMITERS
@@ -53,9 +64,9 @@ from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenR
 from mnemiq.superset.grants import UnreadableAnswer, read_datasets, table_bindings
 from mnemiq.superset.literals import NEGATED_OPERATORS, Absent, Probes, absent_literals, filter_statement, holds_null
 from mnemiq.superset.marker import format_marker
-from mnemiq.superset.measures import Measure, MeasureKind, MeasureRefused, check_measure, scales_by_100, \
+from mnemiq.superset.measures import MAX_LABEL, Measure, MeasureKind, MeasureRefused, check_measure, scales_by_100, \
     superset_text_problem
-from mnemiq.superset.saved_metrics import SavedMetric, read_saved_metrics, reusable
+from mnemiq.superset.saved_metrics import Carried, SavedMetric, carry, read_saved_metrics, reusable
 from mnemiq.superset.settings import SUPERSET_DIALECT
 
 __all__ = ["COUNT_METRIC", "FILTER_OPERATORS", "GRAINS", "PLANNER_MAX_TOKENS", "PLAN_JSON_SHAPE", "SCALAR",
@@ -298,14 +309,21 @@ aggregate expression in PostgreSQL over the measure's rows, "kind": one of curre
 100), "table": a table's name, or "join": "a JOIN b ON ...", "description": optional, "currency": an ISO 4217 \
 code, optional}; or
 - a saved metric of a table's dataset: {"name": the plan's own name for it, "saved_metric": the saved metric's name, \
-"kind": ..., "table": ...}. The same saved metric on two tables is two measures, each with a name of its own.
-Use a saved metric where one says what a measure needs. Write a join only where the charts need columns of more than \
-one table. A join is tables joined with JOIN, LEFT JOIN, RIGHT JOIN or FULL JOIN, each ON a condition on their \
-columns, each table named alone or with an alias. On a join, a measure names each column alone (amount, not \
-claim.amount), and only a column one joined table alone has. A column two joined tables share is in the joined \
-dataset as <table>_<column> (claim_created_at), for dimensions, filters, time columns, source and target only. A \
-written measure's name and label are never a saved metric's name on its table, and no two measures share a label. A \
-table with no dataset gets one, with Superset's saved metric count (COUNT(*)).
+"kind": ..., "table": ...}, or, on a join, {"name", "saved_metric", "kind", "table": the joined table whose saved \
+metric it is, "join": "a JOIN b ON ..."}. The same saved metric on two tables, or on two joins, is two measures, each \
+with a name of its own.
+Use a saved metric where one says what a measure needs, on a join too: never write your own measure for what a joined \
+table's saved metric says. Write a join only where the charts need columns of more than one table. A join is tables \
+joined with JOIN, LEFT JOIN, RIGHT JOIN or FULL JOIN, each ON a condition on their columns, each table named alone or \
+with an alias. On a join, a written measure names each column alone (amount, not claim.amount), and only a column one \
+joined table alone has. A column two joined tables share is in the joined dataset as <table>_<column> \
+(claim_created_at), for dimensions, filters, time columns, source and target only. A saved metric goes onto a join as \
+its table defines it, mnemiq naming its columns as the join names them, and only where the join repeats none of its \
+table's rows: its table joined to tables with at most one row for each of its rows, with JOIN (which leaves out its \
+rows no other table matches) or on the side a LEFT or RIGHT JOIN keeps every row of (the left of a LEFT JOIN, the \
+right of a RIGHT JOIN), never in a FULL JOIN; and only a saved metric that names a column of its own table, so never \
+count (COUNT(*)). A written measure's name and label are never a saved metric's name on its table, and no two \
+measures share a label. A table with no dataset gets one, with Superset's saved metric count (COUNT(*)).
 
 Charts: {"key": lower case letters, digits and _, at most 40, one per chart, "family": one of FAMILIES, "title", \
 "measures": [measure names], "dimensions": [columns], "time_column": a date or timestamp column, or omitted, \
@@ -471,13 +489,21 @@ def plan_from_draft(draft: Mapping[str, Any], context: PlanContext) -> BuildPlan
         except ValueError:
             refuse(part, f"its kind {item.get('kind')!r} is not one of {', '.join(_KINDS)}")
             kind = None
-        dataset = dataset_of(item, part)
+        # A saved metric named with both its table and a join is that table's, carried onto the join: its rows are the
+        # join's, and its table one the builder can read. Which of the join's tables it is, the plan check reads.
+        carried = "saved_metric" in item and item.get("table") is not None and item.get("join") is not None
+        table = item.get("table") if carried else None
+        dataset = dataset_of({"join": item.get("join")} if carried else item, part)
+        if carried and (not isinstance(table, str) or table not in tables):
+            refuse(part, f"{table!r} is not a table this builder can read")
+            table = None
         if "saved_metric" in item:
             metric = _text(item.get("saved_metric"))
             if metric is None:
                 refuse(part, "its saved_metric is the name of a saved metric on its table")
-            elif kind is not None and dataset is not None:
-                saved[name] = (SavedRef(metric, kind), dataset)
+            elif kind is not None and dataset is not None and (table is not None or not carried):
+                saved[name] = (SavedRef(metric, kind, table=table, handle=name) if carried else SavedRef(metric, kind),
+                               dataset)
             continue
         label, expression = item.get("label"), item.get("expression")
         description, currency = item.get("description", ""), item.get("currency")
@@ -599,22 +625,30 @@ def draft_of(plan: BuildPlan, context: PlanContext) -> dict:
             doc["currency"] = measure.currency
         measures.append(doc)
     # A saved metric is a measure of the plan once for each table and kind it is plotted with, under a handle of its
-    # own: the metric's name where that is free, else the metric's name and its table's.
+    # own: the metric's name where that is free, else the metric's name and its table's. A joined table's metric,
+    # carried onto a join, is named with its table and the join, under the plan's own name for it.
     taken = {measure.name for measure in plan.measures}
-    handles: dict[tuple[str, MeasureKind, int], str] = {}
+    handles: dict[tuple[str, MeasureKind, int, str | None, str | None], str] = {}
+
+    def slug(text: str) -> str:
+        return re.sub(r"[^a-z0-9_]+", "_", text.casefold()).strip("_")
 
     def handle(ref: SavedRef, dataset_id: int) -> str:
-        key = (ref.name, ref.kind, dataset_id)
+        key = (ref.name, ref.kind, dataset_id, ref.table, ref.handle)
         if key not in handles:
-            where = next(iter(rows(dataset_id).values())) or ""
-            base = [ref.name, f"{ref.name}_{re.sub(r'[^a-z0-9_]+', '_', where.casefold()).strip('_')}"]
+            where = rows(dataset_id)
+            if ref.table is not None:
+                base = [ref.handle] if ref.handle else [ref.name, f"{ref.name}_{slug(ref.table)}"]
+                where = {"table": ref.table, **({"join": where["join"]} if "join" in where else {})}
+            else:
+                base = [ref.name, f"{ref.name}_{slug(next(iter(where.values())) or '')}"]
             name, n = next((b for b in base if b not in taken), None), 2
             while name is None:
                 name = None if f"{base[-1]}_{n}" in taken else f"{base[-1]}_{n}"
                 n += 1
             taken.add(name)
             handles[key] = name
-            measures.append({"name": name, "saved_metric": ref.name, "kind": ref.kind.value, **rows(dataset_id)})
+            measures.append({"name": name, "saved_metric": ref.name, "kind": ref.kind.value, **where})
         return handles[key]
 
     charts: list[dict] = []
@@ -743,7 +777,11 @@ class _Rows:
     decided over, its saved metrics, how the model named it, and the planned dataset when the build makes it. On a
     join, `measured` holds the columns a measure may name, `owners` each column's table, and `shared` the names the
     dataset gives each column two joined tables share. `origins` gives each column a chart may name the snapshot's table
-    and column it reads, as a chart filter's value is asked of the source (`absent_literals`)."""
+    and column it reads, as a chart filter's value is asked of the source (`absent_literals`), and `shown` the other way:
+    each joined table's column, by table and column, to the name the dataset gives it. `qualifiers` gives each joined
+    table its qualifier in the join (its alias, else its name, as written there, quoting and all), and `nullable` the
+    joined tables an outer join may fill with NULL: in join order from the FROM's table, a LEFT JOIN's table, every
+    table before a RIGHT JOIN, and every table up to a FULL JOIN's."""
 
     columns: frozenset[str]
     source: str
@@ -755,6 +793,9 @@ class _Rows:
     owners: Mapping[str, str] = field(default_factory=dict)
     shared: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     origins: Mapping[str, tuple[str, str]] = field(default_factory=dict)
+    shown: Mapping[tuple[str, str], str] = field(default_factory=dict)
+    qualifiers: Mapping[str, exp.Identifier] = field(default_factory=dict)
+    nullable: frozenset[str] = frozenset()
 
 
 def _own_columns(table: str, columns: frozenset[str]) -> dict[str, tuple[str, str]]:
@@ -838,6 +879,7 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
                 "anywhere in it")
     names: list[str] = []
     qualifiers: dict[str | None, str] = {}
+    qualifier_of: dict[str, exp.Identifier] = {}
     for node in nodes:
         if (problem := _table_problem(node)) is not None:
             return problem
@@ -849,8 +891,19 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
         names.append(name)
         alias = node.args.get("alias")
         qualifiers[resolve_identifier(alias.this if alias else node.this, SUPERSET_DIALECT)] = name
+        qualifier_of[name] = (alias.this if alias else node.this).copy()
     if (problem := _condition_problem(tree, qualifiers, catalogue)) is not None:
         return problem
+    # `names[index]` is the table the join at `index` (from 1) brings in, and `names[:index]` every table before it.
+    nullable: set[str] = set()
+    for index, join in enumerate(joins, 1):
+        side = (join.args.get("side") or "").upper()
+        if side == "LEFT":
+            nullable.add(names[index])
+        elif side == "RIGHT":
+            nullable.update(names[:index])
+        elif side == "FULL":
+            nullable.update(names[:index + 1])
     having: dict[str, list[str]] = {}
     for name in names:
         for column in catalogue.columns[name]:
@@ -858,6 +911,7 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
     picked: list[exp.Expression] = []
     owners: dict[str, str] = {}
     origins: dict[str, tuple[str, str]] = {}
+    shown_as: dict[tuple[str, str], str] = {}
     types: dict[str, str | None] = {}
     for node, name in zip(nodes, names):
         qualifier = node.args["alias"].this if node.args.get("alias") else node.this
@@ -869,6 +923,7 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
                 return f"the joined dataset's column {shown!r} is longer than the {MAX_IDENTIFIER} bytes of a name"
             owners[shown], types[shown] = name, catalogue.types[name].get(column)
             origins[shown] = (name, column)
+            shown_as[(name, column)] = shown
             picked.append(exp.alias_(exp.Column(this=exp.to_identifier(column, quoted=True), table=qualifier.copy()),
                                      exp.to_identifier(shown, quoted=True)))
     shared = {column: tuple(f"{table}_{column}" for table in tables) for column, tables in having.items()
@@ -881,7 +936,8 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
                           sql=select.sql(dialect=SUPERSET_DIALECT), name=_virtual_name(planned.key, names))
     return _Rows(frozenset(owners), planned.join, (_made_count(planned.placeholder),), f"the join {planned.join!r}",
                  types, made, measured=frozenset(c for c, tables in having.items() if len(tables) == 1),
-                 owners=owners, shared=shared, origins=origins)
+                 owners=owners, shared=shared, origins=origins, shown=shown_as, qualifiers=qualifier_of,
+                 nullable=frozenset(nullable))
 
 
 def _table_problem(node: exp.Table) -> str | None:
@@ -948,6 +1004,59 @@ def _column_problem(columns: list[exp.Column], rows: _Rows) -> str | None:
             return (f"{column.name!r} is not a column a measure on the join may name: only a column one joined table "
                     "alone has, named alone")
     return None
+
+
+def _scaled_saved(name: str) -> str:
+    return (f"the saved metric {name!r} is on a 0 to 100 scale, so it cannot be shown as a percent: plan it with kind "
+            "number, or write the fraction")
+
+
+# Where a join's tables are named by aliases that differ only in letter case, which the own-grain reading cannot tell
+# apart (`tables_off_their_grain` reads no such join), the refusal says so.
+_FOLDED_ALIASES = "; give the joined tables aliases that differ by more than letter case"
+_ISO_CODE = re.compile(r"[A-Z]{3}")
+
+
+def _carried(ref: SavedRef, on: _Rows, catalogue: _Catalogue,
+             off_grain: Mapping[str, str] | None) -> tuple[SavedMetric, Carried] | str:
+    """`ref`, a saved metric of `ref.table`, one of the join `on`'s tables, carried onto the join as its table defines
+    it (`carry`), or why it cannot be: the table has no such metric the builder can reach; it is on a side an outer
+    join may fill with NULL, where the metric is not defined; the join does not leave its rows at their own grain
+    (`off_grain`, the tables `tables_off_their_grain` names, given only when the fan-out guard is on); the metric is
+    on a 0 to 100 scale and planned as a percent; or `carry` refuses its expression."""
+    table = ref.table
+    metric = next((m for m in catalogue.saved.get(catalogue.datasets.get(table), ()) if m.name == ref.name), None)
+    if metric is None:
+        return f"{table} has no saved metric named {ref.name!r} this builder can reach"
+    if table in on.nullable:
+        return (f"{table} is on a side the join may fill with NULL, where its saved metric {ref.name!r} is not "
+                f"defined: put {table} on the side the join keeps every row of, or join with JOIN")
+    if off_grain is not None and (reason := off_grain.get(table)) is not None:
+        folded = len({qualifier.name.casefold() for qualifier in on.qualifiers.values()}) < len(on.qualifiers)
+        return (f"the saved metric {ref.name!r} is defined on {table}'s own rows, and this join repeats them: "
+                f"{reason}; join {table} only to tables it meets at most once per row, or plan the chart on {table} "
+                f"alone{_FOLDED_ALIASES if folded else ''}")
+    if ref.kind is MeasureKind.PERCENT and scales_by_100(metric.expression):
+        return _scaled_saved(ref.name)
+    carried = carry(metric, table=table, stored=catalogue.stored[table], columns=catalogue.columns[table],
+                    qualifier=on.qualifiers[table],
+                    shown={column: on.shown[(table, column)] for column in catalogue.columns[table]})
+    return carried if isinstance(carried, str) else (metric, carried)
+
+
+def _carried_label(metric: SavedMetric) -> str:
+    """A carried metric's label: its verbose name where that is one Superset keeps as written, else its name."""
+    text = metric.verbose_name
+    if isinstance(text, str) and text.strip() and len(text) <= MAX_LABEL and not any(
+            marker in text for marker in JINJA_DELIMITERS) and superset_text_problem(text, "a label") is None:
+        return text
+    return metric.name
+
+
+def _carried_currency(metric: SavedMetric) -> str | None:
+    """A carried metric's currency: its own symbol where that is an ISO 4217 code, else none."""
+    symbol = metric.currency.get("symbol") if isinstance(metric.currency, dict) else None
+    return symbol if isinstance(symbol, str) and _ISO_CODE.fullmatch(symbol) else None
 
 
 def _column_refusal(column: str, rows: _Rows) -> str:
@@ -1067,8 +1176,9 @@ def _null_refusals(chart: ChartSpec, on: _Rows, *, adapter, snapshot: Snapshot, 
 
 def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adapter, snapshot: Snapshot,
            grants: GrantSet, settings, interactive_pivot_available: bool) -> BuildPlan | tuple[RefusedPart, ...]:
-    """The plan with its reusable measures replaced by the saved metrics that say the same, or every part refused, each
-    with mnemiq's own reason."""
+    """The plan with its reusable measures replaced by the saved metrics that say the same, and each joined table's
+    saved metric carried onto its join as a measure written from its expression, or every part refused, each with
+    mnemiq's own reason."""
     refused: list[RefusedPart] = []
     # Every probe of a filter's value this check makes, the measures' and the charts', shares one budget and one memo.
     probes = Probes()
@@ -1084,8 +1194,19 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
     # Only what a chart plots is built: a measure or a dataset no chart uses is left out.
     plotted = {ref.measure.name for chart in plan.charts for ref in chart.measures if isinstance(ref, WrittenRef)}
     measures = [m for m in plan.measures if m.name in plotted]
-    if len(measures) > MAX_MEASURES:
-        refuse("the plan", f"it writes {len(measures)} measures; a plan writes at most {MAX_MEASURES}")
+    # Each joined table's saved metric a chart carries onto its join: one measure for each metric, kind, table and
+    # join, decided against the columns of every chart that plots it.
+    to_carry: dict[tuple[str, MeasureKind, str, int], SavedRef] = {}
+    carried_columns: dict[tuple[str, MeasureKind, str, int], set[str]] = {}
+    for chart in plan.charts:
+        for ref in chart.measures:
+            if isinstance(ref, SavedRef) and ref.table is not None:
+                key = (ref.name, ref.kind, ref.table, chart.dataset_id)
+                to_carry.setdefault(key, ref)
+                carried_columns.setdefault(key, set()).update(_chart_columns(chart))
+    if len(measures) + len(to_carry) > MAX_MEASURES:
+        refuse("the plan", f"it writes {len(measures) + len(to_carry)} measures; a plan writes at most "
+                           f"{MAX_MEASURES}")
     used = {m.dataset_id for m in measures} | {chart.dataset_id for chart in plan.charts}
 
     # The datasets parts can be on: each visible table's existing one, and each planned one the plan uses.
@@ -1116,8 +1237,10 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
             if isinstance(joined, str):
                 refuse(part, joined)
                 continue
-            if not any(m.dataset_id == planned.placeholder for m in measures):
-                refuse(part, "a joined dataset is made only for a written measure that needs the join")
+            if not any(m.dataset_id == planned.placeholder for m in measures) \
+                    and not any(key[3] == planned.placeholder for key in to_carry):
+                refuse(part, "a joined dataset is made only for a written measure, or a joined table's saved metric, "
+                             "that needs the join")
                 continue
             rows[planned.placeholder] = joined
         elif planned.table not in catalogue.columns:
@@ -1207,6 +1330,66 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
             kept.append(measure)
     by_name = {measure.name: measure for measure in measures}
 
+    # Each joined table's saved metric on a join: carried as its table defines it (`_carried`), held apart from every
+    # name and label of the plan, decided over the join as a written measure is (its values are its table's, so none is
+    # probed), and kept as the measure its charts write, its expression naming the joined dataset's columns.
+    carried: dict[tuple[str, MeasureKind, str, int], WrittenRef] = {}
+    guarded = bool(to_carry) and guard_on(settings.guard_fanout, snapshot)
+    grains: dict[int, Mapping[str, str]] = {}
+    for key, ref in to_carry.items():
+        # A reference with no handle, which only a planner other than the model's channel makes, goes by its metric's
+        # name.
+        name, placeholder = ref.handle or ref.name, key[3]
+        part = f"measure {name!r}"
+        on = rows.get(placeholder)
+        if on is None:  # the chart's own check refuses its rows
+            continue
+        if on.measured is None:
+            refuse(part, f"a joined table's saved metric goes onto a join only, and its chart's rows are {on.part}")
+            continue
+        if ref.table not in on.qualifiers:
+            refuse(part, f"{ref.table} is not one of the tables of {on.part}")
+            continue
+        reads.setdefault(placeholder, set()).add(ref.table)
+        if guarded and placeholder not in grains:
+            grains[placeholder] = tables_off_their_grain(
+                sqlglot.parse_one(f"{_JOIN_PREFIX}{on.source}", read=SUPERSET_DIALECT),
+                visible_schema(snapshot, grants), key_facts(snapshot), SUPERSET_DIALECT)
+        found = _carried(ref, on, catalogue, grains.get(placeholder))
+        if isinstance(found, str):
+            refuse(part, found)
+            continue
+        metric, rendered = found
+        label = _carried_label(metric)
+        saved_names = {m.name.casefold() for m in on.saved}
+        taken = set(labels) | saved_names
+        if label.casefold() in taken:
+            own = f"{label} ({ref.table})"
+            if own.casefold() in taken:
+                refuse(part, f"its label {label!r} is another measure's, or a saved metric's on the join, and so is "
+                             f"{own!r}; give the other measure a label of its own")
+                continue
+            label = own
+        if name.casefold() in names:
+            refuse(part, "two measures have this name")
+            continue
+        if name.casefold() in saved_names:
+            refuse(part, f"its name {name!r} is also a saved metric's on its dataset (Superset gives every dataset it "
+                         "makes one named count); Superset would show two metrics of one name, so name it differently")
+            continue
+        names[name.casefold()], labels[label.casefold()] = name, name
+        decided = Measure(name=name, label=label, expression=rendered.decided, kind=ref.kind, dataset_id=placeholder,
+                          description=f"The saved metric {metric.name!r} of {ref.table!r}, carried onto the join.",
+                          asked_by="", currency=_carried_currency(metric))
+        verdict = check_measure(decided, source=on.source, dimension_names=tuple(sorted(carried_columns[key])),
+                                adapter=adapter, snapshot=snapshot, grants=grants, guard_fanout=settings.guard_fanout)
+        if isinstance(verdict, MeasureRefused):
+            refuse(part, verdict.reason, repairable=verdict.repairable)
+            continue
+        measure = replace(decided, expression=rendered.superset)
+        kept.append(measure)
+        carried[key] = WrittenRef(measure)
+
     # Each chart, with the measures it plots as the build will send them.
     charts: list[ChartSpec] = []
     chart_keys: set[str] = set()
@@ -1241,6 +1424,10 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
                     refuse(part, f"it plots {measure.name!r}, whose rows are not the chart's")
                 else:
                     refs.append(reused.get(measure.name, WrittenRef(measure)))
+            elif ref.table is not None:
+                # The measure the carried pass wrote for it; refused there, the reference as planned, with the reason
+                # the measure was given, so the chart's own checks still run.
+                refs.append(carried.get((ref.name, ref.kind, ref.table, chart.dataset_id), ref))
             else:
                 refs.append(ref)
         spec = replace(chart, measures=tuple(refs))
@@ -1248,15 +1435,14 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
         folded = {c.casefold() for c in columns}
         saved = {metric.name: metric for metric in on.saved}
         for ref in refs:
-            if not isinstance(ref, SavedRef):
+            if not isinstance(ref, SavedRef) or ref.table is not None:
                 continue
             if ref.name not in saved:
                 refuse(part, f"{on.part} has no saved metric named {ref.name!r} this builder can reach")
             elif ref.name.casefold() in folded:
                 refuse(part, f"the saved metric {ref.name!r} is also the name of a dimension of the chart")
             elif ref.kind is MeasureKind.PERCENT and scales_by_100(saved[ref.name].expression):
-                refuse(part, f"the saved metric {ref.name!r} is on a 0 to 100 scale, so it cannot be shown as a "
-                             "percent: plan it with kind number, or write the fraction")
+                refuse(part, _scaled_saved(ref.name))
         shown = [(ref.name if isinstance(ref, SavedRef) else ref.measure.label.strip()).casefold() for ref in refs]
         if len(set(shown)) < len(shown):
             refuse(part, "it plots one metric twice")
@@ -1281,7 +1467,8 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
             refuse(part, reason)
         if len(refused) == before:
             why = plan_refusal(spec, interactive_pivot_available=interactive_pivot_available,
-                               saved={ref.name: saved[ref.name] for ref in refs if isinstance(ref, SavedRef)},
+                               saved={ref.name: saved[ref.name] for ref in refs
+                                      if isinstance(ref, SavedRef) and ref.table is None},
                                currency=settings.superset_currency)
             if why is not None:
                 refuse(part, why)
@@ -1308,6 +1495,8 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
 
     if refused:
         return tuple(refused)
+    if any(isinstance(ref, SavedRef) and ref.table is not None for chart in charts for ref in chart.measures):
+        raise AssertionError("a joined table's saved metric reached a checked plan without being carried")
     still = {m.dataset_id for m in kept} | {chart.dataset_id for chart in charts}
     return BuildPlan(charts=tuple(charts), measures=tuple(kept), reuse_candidates=plan.reuse_candidates,
                      reuse_reason=plan.reuse_reason,

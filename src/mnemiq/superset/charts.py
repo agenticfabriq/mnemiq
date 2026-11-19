@@ -66,10 +66,16 @@ _XY_KINDS = {Family.LINE: "line", Family.BAR: "bar", Family.AREA: "area", Family
 
 @dataclass(frozen=True)
 class SavedRef:
-    """A saved metric the chart reuses, with the kind the planner gave it."""
+    """A saved metric the chart reuses, with the kind the planner gave it.
+
+    On a join, `table` names the joined table whose saved metric it is, and `handle` the plan's own name for it: the
+    plan check carries such a metric onto the join as a measure written from its expression, so a checked plan holds
+    none, and no build is sent one."""
 
     name: str
     kind: MeasureKind
+    table: str | None = None
+    handle: str | None = None
 
 
 @dataclass(frozen=True)
