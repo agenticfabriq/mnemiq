@@ -869,6 +869,7 @@ _SALES = {
     "customer": {"customer_id": (200, 200, 0), "status": (200, 3, 0), "region_id": (200, 10, 0),
                  "credit_limit": (200, 50, 0)},
     "region": {"region_id": (10, 10, 0), "name": (10, 10, 0)},
+    "payment": {"payment_id": (500, 500, 0), "region_id": (500, 10, 0)},
 }
 _SALES_VISIBLE = {t: set(c) for t, c in _SALES.items()}
 _SALES_KEYS = key_facts(_snapshot(_SALES))
@@ -1149,3 +1150,11 @@ def test_a_table_a_left_join_brings_in_still_joins_the_tables_after_it():
                 "LEFT JOIN region r ON r.region_id = c.region_id") == {
         "customer": _CUSTOMER_REPEATED,
         "region": "each region row is repeated once per matching customer row (customer.region_id is not unique)"}
+
+
+def test_a_table_a_left_join_brings_in_is_walked_on_from_a_table_joined_after_it():
+    """payment, joined with JOIN on region's key after the LEFT JOIN, keeps only the rows where region was met, and
+    each region row is met by one trx and customer pair: a walk from payment goes on through region to both."""
+    off = _off("SELECT 1 FROM trx t JOIN customer c ON TRUE LEFT JOIN region r "
+               "ON r.region_id = t.trx_id AND r.region_id = c.customer_id JOIN payment p ON p.region_id = r.region_id")
+    assert "payment" not in off, off
