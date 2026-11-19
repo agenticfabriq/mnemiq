@@ -287,6 +287,26 @@ still to come. In short:
   that already filters the column `IS NOT NULL` is not asked. One that filters it `IS NULL` beside the negation selects
   no row, since a chart's filters all apply, and is refused without asking. The probe runs as the builder and says
   only whether such a row exists: no value reaches the model.
+- **A joined table's saved metrics, on a join.** When a chart needs another table's columns, the plan may name a
+  joined table's saved metric on the join instead of writing its own measure, and mnemiq carries it as the table
+  defines it. It prints the metric's expression twice from one parse: once with each column named by its table's
+  place in the join, which it decides under the builder's grants as it decides every measure, and once naming each
+  column as the joined dataset does (`<table>_<column>` for a column two joined tables share), which the chart sends
+  as its SQL metric, labelled with the metric's verbose name. Its values are its table's, so none is probed. It is
+  refused, and the repair told why, where it would not mean what its table defines:
+  - its expression reads anything but its own table's columns, or names none of them, so `count` is never carried;
+  - its table is on a side an outer join may fill with NULL: the right of a `LEFT JOIN`, every table before a
+    `RIGHT JOIN`, any table of a `FULL JOIN`;
+  - with the fan-out guard on (`MNEMIQ_GUARD_FANOUT`), the join repeats its table's rows, meets another table by a
+    key not known to be unique there (one with no uniqueness profile, say), or joins it by no key to every other
+    table, whatever the metric aggregates.
+
+  With `JOIN`, the rows of the metric's table that no other table matches are left out of it, as they are of every
+  chart over the join; on the side a `LEFT JOIN` or `RIGHT JOIN` keeps every row of (the left of a `LEFT JOIN`, the
+  right of a `RIGHT JOIN`), they are kept.
+
+  Its chart, like every chart on a dataset a build makes over a join, is not checked against mnemiq's own SQL
+  (`not_checked`).
 - **A token made for building.** Besides `db.read`, the two `POST`s need Superset's `superset:chart:write`,
   `superset:dashboard:write` and `superset:dataset:write` scopes. The extension's token route puts those in a token
   asked for with `{"purpose": "build"}`. A token made for asking is refused with a 403.

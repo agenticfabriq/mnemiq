@@ -8,9 +8,9 @@ is made or called while a build runs, and the stub model is asked nothing. Every
 own: the plan check (a written measure a saved metric says the same as is replaced by it), the build's steps, each
 made by the extension's create carrying its step's marker, the layout and the value check.
 
-The module makes a table of its own in the live source database, of a name no run has used, before it enriches: so
-the snapshot holds a table no Superset dataset exists for, which a build makes one for. The module removes what that
-build made, and the table, once it is done.
+The module makes two tables of its own in the live source database, each of a name no run has used, before it
+enriches: so the snapshot holds tables no Superset dataset exists for, one a build makes a dataset for, the other one
+a build joins to `policy`. The module removes what those builds made, and the tables, once it is done.
 
 Each test states its expectation in its docstring. A build's record (each request's step, its key, kind and status,
 the Superset calls it made and its latency; each step's id and whether what it made carries its marker; each chart's
@@ -43,7 +43,8 @@ from mnemiq.server.superset_refusals import SIGN_IN_AGAIN
 from mnemiq.superset.build_store import BUILD_TABLE, MEASURE_TABLE
 from mnemiq.superset.builder import start_build
 from mnemiq.superset.chart_form import _NOT_CHECKED_TYPES
-from mnemiq.superset.charts import ChartSpec, Family, Filter, WrittenRef, generate_chart_request
+from mnemiq.sql.fanout_check import guard_on, key_facts
+from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenRef, generate_chart_request
 from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetRefusedCaller, SupersetUnavailable
 from mnemiq.superset.executor import superset_executor
 from mnemiq.superset.extension import TOOL_PREFIX
@@ -251,8 +252,9 @@ def store_dsn(live) -> Iterator[str]:
 
 
 @dataclass
-class SalesTable:
-    """The module's own table in the live source database, and what a build made on it, which teardown removes."""
+class ModuleTable:
+    """A table of the module's own in the live source database, and what a build made on it, which teardown
+    removes."""
 
     name: str
     dataset_id: int | None = None
@@ -260,23 +262,20 @@ class SalesTable:
     chart_ids: list[int] = field(default_factory=list)
 
 
-@pytest.fixture(scope="module")
-def sales_table(live) -> Iterator[SalesTable]:
-    """A table of a name no run has used (`live_sales_<random>`) in the live source database's `public` schema: twelve
-    synthetic sales, each a region and an amount with cents. Made before the module enriches, so its snapshot holds
-    it, and no Superset dataset exists for it. Once the module is done, what a build made on it is removed as its
-    builder removes it (each chart through MCP's `delete_chart`, then the dataset through the extension's
-    `delete_dataset`, which moves it to Superset's trash), and the table is dropped."""
+@contextmanager
+def module_table(live, prefix: str, columns: str, rows: str) -> Iterator[ModuleTable]:
+    """A table of a name no run has used (`<prefix>_<random>`) in the live source database's `public` schema, of
+    `columns` and filled by the `rows` query. Once the block ends, what a build made on it is removed as its builder
+    removes it (each chart through MCP's `delete_chart`, then the dataset through the extension's `delete_dataset`,
+    which moves it to Superset's trash), and the table is dropped."""
     import psycopg
     from psycopg import sql
 
-    table = SalesTable(f"live_sales_{uuid.uuid4().hex[:8]}")
+    table = ModuleTable(f"{prefix}_{uuid.uuid4().hex[:8]}")
     name = sql.Identifier("public", table.name)
     with psycopg.connect(live.pg_dsn, autocommit=True, connect_timeout=10) as con:
-        con.execute(sql.SQL("CREATE TABLE {} (id integer PRIMARY KEY, region text NOT NULL, "
-                            "amount numeric(10, 2) NOT NULL)").format(name))
-        con.execute(sql.SQL("INSERT INTO {} (id, region, amount) SELECT g, (ARRAY['west', 'east', 'central'])"
-                            "[1 + g % 3], round(12.5 + g * 7.31, 2) FROM generate_series(1, 12) AS g").format(name))
+        con.execute(sql.SQL(f"CREATE TABLE {{}} ({columns})").format(name))
+        con.execute(sql.SQL(f"INSERT INTO {{}} {rows}").format(name))
         con.execute(sql.SQL("ANALYZE {}").format(name))
     problems: list = []
     try:
@@ -298,8 +297,36 @@ def sales_table(live) -> Iterator[SalesTable]:
 
 
 @pytest.fixture(scope="module")
-def enriched(live, model, tmp_path_factory, sales_table):
-    """The suite's `enriched` (`conftest.py`), with the module's own table made first, so the snapshot holds it: the
+def sales_table(live) -> Iterator[ModuleTable]:
+    """`live_sales_<random>`: twelve synthetic sales, each a region and an amount with cents. Made before the module
+    enriches, so its snapshot holds it, and no Superset dataset exists for it; removed once the module is done
+    (`module_table`)."""
+    with module_table(live, "live_sales", "id integer PRIMARY KEY, region text NOT NULL, amount numeric(10, 2) NOT NULL",
+                      "(id, region, amount) SELECT g, (ARRAY['west', 'east', 'central'])[1 + g % 3], "
+                      "round(12.5 + g * 7.31, 2) FROM generate_series(1, 12) AS g") as table:
+        yield table
+
+
+# Each of the seed's three regions with its manager and a status of its own: `status` is a column `policy` has too, so
+# on a join of the two the joined dataset names policy's `policy_status`. Only west's is 'active', so a metric that read
+# the region's status where it means the policy's would add up all of west's premium instead.
+REGION_ROWS = (("west", "Ash", "active"), ("east", "Birch", "paused"), ("central", "Cedar", "paused"))
+
+
+@pytest.fixture(scope="module")
+def region_table(live) -> Iterator[ModuleTable]:
+    """`live_region_<random>`: the seed's three regions, each with a manager and a status (`REGION_ROWS`), the region
+    its key. Made before the module enriches, so its snapshot holds it, and no Superset dataset exists for it; what a
+    build made on it, and the table, are removed once the module is done (`module_table`)."""
+    values = ", ".join(f"('{region}', '{manager}', '{status}')" for region, manager, status in REGION_ROWS)
+    with module_table(live, "live_region", "region text PRIMARY KEY, manager text NOT NULL, status text NOT NULL",
+                      f"(region, manager, status) VALUES {values}") as table:
+        yield table
+
+
+@pytest.fixture(scope="module")
+def enriched(live, model, tmp_path_factory, sales_table, region_table):
+    """The suite's `enriched` (`conftest.py`), with the module's own tables made first, so the snapshot holds them: the
     store every test here answers from, enriched through Superset as the service user and built."""
     settings = superset_settings(live, model, tmp_path_factory.mktemp("superset-store") / "store.duckdb")
     return settings, enrich_and_build(settings, live.service_key_file)
@@ -349,18 +376,23 @@ def planted(live, policy_id) -> Iterator[str]:
     run_setup("drop-metric", str(policy_id), name)
     others = [n for n, e in saved_metrics(policy_id).items() if normalized(e) == normalized(expression)]
     assert not others, f"the policy dataset already has saved metrics of {expression}: {others}; remove them first"
-    admin = as_user(live, "admin")
-    changed_on = admin.call("get_dataset_info", {"identifier": policy_id, "select_columns": ["id", "changed_on"]})
-    answer = admin.call(TOOL_PREFIX + "add_saved_metric", {
-        "dataset_id": policy_id, "metric": {"metric_name": name, "expression": expression},
-        "expect_changed_on": changed_on["changed_on"]})
-    assert answer == {"ok": True}, answer
-    assert saved_metrics(policy_id).get(name) == expression
+    plant(live, policy_id, {"metric_name": name, "expression": expression})
     try:
         yield name
     finally:
         assert run_setup("drop-metric", str(policy_id), name) == "dropped 1"
         assert name not in saved_metrics(policy_id)
+
+
+def plant(live, dataset_id: int, metric: dict) -> None:
+    """`metric` added to the dataset by an admin through the extension's `add_saved_metric`, against the dataset's
+    `changed_on` as Superset answers it then, and read back from the metadata database."""
+    admin = as_user(live, "admin")
+    changed_on = admin.call("get_dataset_info", {"identifier": dataset_id, "select_columns": ["id", "changed_on"]})
+    answer = admin.call(TOOL_PREFIX + "add_saved_metric", {"dataset_id": dataset_id, "metric": metric,
+                                                           "expect_changed_on": changed_on["changed_on"]})
+    assert answer == {"ok": True}, answer
+    assert saved_metrics(dataset_id).get(metric["metric_name"]) == metric["expression"]
 
 
 # --- a build, run through the routes -------------------------------------------------------------------------------
@@ -1490,6 +1522,216 @@ def test_a_dataset_the_build_makes_carries_its_marker_and_its_chart_checks(live,
     assert_no_model_call(run)
     observe("dataset step", dataset_id=dataset_id, chart_id=chart_id, check=run.final["checks"],
             message=run.last_step.get("message"))
+
+
+# --- a joined table's saved metric, carried onto a join ------------------------------------------------------------
+
+# Saved metrics of policy's own rows, planted on the `policy` dataset for the tests below.
+CARRIED_METRICS = (
+    {"metric_name": "active_premium", "expression": "SUM(CASE WHEN status = 'active' THEN premium END)",
+     "verbose_name": "Active premium"},
+    {"metric_name": "active_policies", "expression": "COUNT(CASE WHEN status = 'active' THEN id END)",
+     "verbose_name": "Active policies"},
+)
+# `active_premium` as mnemiq decides it over `policy p JOIN <region table> r`, each column qualified by policy's alias,
+# and as the chart sends it, naming the joined dataset's columns: `status` is in both tables, so policy's is
+# `policy_status` there, while `premium` is policy's alone.
+CARRIED_DECIDED = 'SUM(CASE WHEN p."status" = \'active\' THEN p."premium" END)'
+CARRIED_SHOWN = 'SUM(CASE WHEN "policy_status" = \'active\' THEN "premium" END)'
+
+
+@pytest.fixture(scope="module")
+def carried_metrics(live, policy_id) -> Iterator[dict[str, str]]:
+    """`CARRIED_METRICS`, planted on the `policy` dataset by an admin (`plant`) and removed by Superset's own command
+    once the module is done (`setup_superset.py drop-metric`); one left by an earlier run is removed first."""
+    names = [metric["metric_name"] for metric in CARRIED_METRICS]
+    for name in names:
+        run_setup("drop-metric", str(policy_id), name)
+    planted_here: list[str] = []
+    try:
+        for metric in CARRIED_METRICS:
+            plant(live, policy_id, metric)
+            planted_here.append(metric["metric_name"])
+        yield {metric["metric_name"]: metric["expression"] for metric in CARRIED_METRICS}
+    finally:
+        dropped = [run_setup("drop-metric", str(policy_id), name) for name in names]
+        assert dropped == ["dropped 1" if name in planted_here else "dropped 0" for name in names], dropped
+        assert not set(names) & set(saved_metrics(policy_id))
+
+
+def assert_guard_on(served: Served) -> None:
+    """The premise of the tests below: the fan-out guard is on for the live snapshot. The build's profile leaves it
+    unset, so it is on exactly when enrichment profiled the snapshot's partitions (`guard_on`)."""
+    profile = served.runtime.profiles[served.runtime.default_profile]
+    assert profile.settings.guard_fanout is None, profile.settings.guard_fanout
+    assert guard_on(None, served.runtime.snapshot), "the live snapshot's partitions were not profiled"
+
+
+def read_through(dataset_sql: str, expression: str) -> str:
+    """`expression`, a measure on a joined dataset, with each column it names replaced by the joined column the
+    dataset's SELECT projects under that name: what the measure computes over the join."""
+    import sqlglot
+    from sqlglot import exp
+
+    projected = {item.alias: item.this for item in sqlglot.parse_one(dataset_sql, read="postgres").expressions}
+    return sqlglot.parse_one(f"SELECT {expression}", read="postgres").expressions[0].transform(
+        lambda node: projected[node.name].copy() if isinstance(node, exp.Column) else node).sql(dialect="postgres")
+
+
+def _carried_bar(key: str, title: str, ref: SavedRef, dimension: str) -> ChartSpec:
+    """A bar of `ref` by `dimension` on the plan's one join."""
+    return ChartSpec(key=key, family=Family.BAR, title=title, dataset_id=-1, measures=(ref,), dimensions=(dimension,),
+                     time_column=None, time_grain=None, filters=(), row_limit=None, source=None, target=None)
+
+
+def _on_join(join: str, *charts: ChartSpec) -> BuildPlan:
+    """`charts`, each on `join`, a dataset the build makes, and no written measure."""
+    return BuildPlan(charts=charts, measures=(), datasets=(PlannedDataset(key="dataset_1", placeholder=-1, join=join),))
+
+
+def test_a_joined_tables_saved_metric_is_carried_onto_the_join_and_adds_up(live, served, model, policy_id,
+                                                                            region_table, carried_metrics):
+    """policy's saved metric `active_premium` (`SUM(CASE WHEN status = 'active' THEN premium END)`), planned by the
+    stub on `policy p JOIN <region table> r ON r.region = p.region` for a bar by `manager`, a column the region table
+    alone has. The premises, measured first: the fan-out guard is on for the live snapshot; the region table's key is
+    unique there, so the join meets each policy row once; and the region table's own `status` would give another
+    total than policy's. Expected:
+    - the build runs to `done`: dashboard, the joined dataset, the chart, layout, check;
+    - the start decided the metric over the join with policy's columns qualified by its alias (`p."status"`), and sent
+      no statement asking whether a column holds 'active': the metric's values are the data team's;
+    - the plan kept holds it as a measure of the join, labelled with the metric's verbose name, its expression naming
+      the joined dataset's `"policy_status"`, and no saved-metric reference; the chart's create sent that expression,
+      and Superset saved it; read back through the joined dataset's SQL as Superset stores it, it is the decided one;
+    - the chart's three bars, read as the builder through `get_chart_data`, add up to `active_premium` read as the
+      builder on policy's own dataset through `query_dataset` (the source's own total), and each bar is its region's
+      `active_premium`, read the same way by region, the region named by the bar's manager (`REGION_ROWS`);
+    - the chart's check status is `not_checked`: a dataset the build made over a join is not checked against mnemiq's
+      own SQL, so the numbers are held here instead;
+    - no request called MCP's creates, a claim or `patch_chart`; no model client is made or called.
+    Values from the data are compared as bools and kept out of the record."""
+    assert_guard_on(served)
+    region = region_table.name
+    facts = key_facts(served.runtime.snapshot)
+    keyed = (facts.get((region, "region")), facts.get(("policy", "region")))
+    assert keyed == (True, False), keyed
+    [(own_total,)] = ground_truth(live, "SELECT sum(premium) FILTER (WHERE status = 'active') FROM policy")
+    [(misread,)] = ground_truth(live, f"SELECT sum(p.premium) FILTER (WHERE r.status = 'active') FROM policy p "
+                                      f"JOIN public.{region} r ON r.region = p.region")
+    apart = own_total is not None and misread is not None and own_total != misread
+    assert apart, "the region table's status does not tell the two readings apart"
+    ref = SavedRef("active_premium", MeasureKind.CURRENCY, table="policy", handle="active_premium")
+    chart = _carried_bar("active_premium_by_manager", "Active premium by manager", ref, "manager")
+    plan = _on_join(f"policy p JOIN {region} r ON r.region = p.region", chart)
+    run = run_build(live, served, model, plan, "carried-metric", goal="active premium by manager")
+    record("carried-metric", summary(run, served, plan) if run.build_id else {"stopped": run.stopped})
+    raw = {step["key"]: step for step in served.raw_steps(run.build_id)} if run.build_id else {}
+    # What the build made, for the table's teardown, before anything is asserted.
+    region_table.dashboard_id = run.final.get("dashboard_id")
+    region_table.dataset_id = (raw.get("dataset_1") or {}).get("object_id")
+    region_table.chart_ids = [made for made in [(raw.get(chart.key) or {}).get("object_id")] if made is not None]
+    assert_ran_to_the_end(run)
+    assert [step["key"] for step in run.final["steps"]] == ["dashboard", "dataset_1", chart.key, "layout", "check"]
+    dataset_id, chart_id = raw["dataset_1"]["object_id"], raw[chart.key]["object_id"]
+
+    # Decided over the join, qualified by policy's alias; its value never probed.
+    start = run.requests[0]
+    statements = [call.sql for call in start.calls if call.tool == "execute_sql"]
+    assert any(f"{CARRIED_DECIDED} AS active_premium FROM " in sql for sql in statements), statements
+    assert [sql for sql in statements if "'active'" in sql and CARRIED_DECIDED not in sql] == []
+
+    # Kept, sent and saved as a measure of the joined dataset.
+    kept = served.raw_plan(run.build_id)
+    [measure] = kept["measures"]
+    assert {key: measure[key] for key in ("name", "label", "expression", "kind", "description", "currency")} == {
+        "name": "active_premium", "label": "Active premium", "expression": CARRIED_SHOWN, "kind": "currency",
+        "description": "The saved metric 'active_premium' of 'policy', carried onto the join.", "currency": None}
+    assert [c["measures"] for c in kept["charts"]] == [[{"written": "active_premium"}]]
+    [create] = [call for request in run.requests for call in request.calls if call.tool == CREATE_CHART]
+    assert create.request["dataset_id"] == dataset_id
+    assert create.request["config"]["y"] == [{"sql_expression": CARRIED_SHOWN, "label": "Active premium"}]
+    saved = [(m.get("sqlExpression"), m.get("label")) for m in chart_metrics(stored_chart(chart_id)["params"])
+             if isinstance(m, dict)]
+    assert saved == [(CARRIED_SHOWN, "Active premium")], saved
+    [(dataset_sql,)] = metadata("SELECT sql FROM tables WHERE id = %s", (dataset_id,))
+    assert 'p."status" AS "policy_status"' in dataset_sql and f'r."status" AS "{region}_status"' in dataset_sql
+    assert read_through(dataset_sql, CARRIED_SHOWN) == CARRIED_DECIDED
+    assert never_called(run) == []
+
+    # The chart's bars add up to the metric on policy's own dataset, each read as the builder.
+    builder = SupersetMcp(live.mcp_url, DelegatedToken(live.minted(BUILDER, "build")), timeout_s=90)
+    bars = builder.call("get_chart_data", {"identifier": chart_id}).get("data") or []
+    own = builder.call("query_dataset", {"dataset_id": policy_id, "metrics": ["active_premium"], "columns": [],
+                                         "filters": [], "row_limit": 10}).get("data") or []
+    by_region = builder.call("query_dataset", {"dataset_id": policy_id, "metrics": ["active_premium"],
+                                               "columns": ["region"], "filters": [], "row_limit": 10}).get("data") or []
+    cents = Decimal("0.01")
+    shown = sum((Decimal(str(row["Active premium"])) for row in bars), Decimal(0)).quantize(cents)
+    read = [Decimal(str(row["active_premium"])).quantize(cents) for row in own]
+
+    def in_cents(value) -> Decimal | None:  # a region with no active policy has no sum
+        return None if value is None else Decimal(str(value)).quantize(cents)
+
+    # Each bar against its own region's value: a total alone would not see two bars' values exchanged.
+    per_region = {row.get("region"): in_cents(row.get("active_premium")) for row in by_region}
+    per_bar = {row.get("manager"): in_cents(row.get("Active premium")) for row in bars}
+    same = {"three bars": sorted(row.get("manager") for row in bars) == sorted(m for _, m, _ in REGION_ROWS),
+            "adds up": read == [shown], "the source's": read == [own_total.quantize(cents)],
+            "each bar its region's": per_bar == {manager: per_region.get(region) for region, manager, _ in REGION_ROWS}}
+    assert all(same.values()), same
+    assert run.final["checks"] == {str(chart_id): "not_checked"}, (run.final["checks"], run.last_step.get("message"))
+    assert_no_model_call(run)
+    observe("carried metric", dataset_id=dataset_id, chart_id=chart_id, same=same, check=run.final["checks"],
+            message=run.last_step.get("message"))
+
+
+def test_a_saved_metric_on_a_join_that_repeats_its_rows_is_refused_before_anything_is_made(live, served, model,
+                                                                                           carried_metrics):
+    """Both of policy's planted metrics, `active_premium` (a SUM) and `active_policies` (a COUNT), planned by the stub
+    on `policy JOIN "Policy Lines" ON "Policy Lines".policy_id = policy.id`, each for a bar of its own by the lines'
+    `policy_id`, a column that table alone has. A policy holds one or two lines, so the join repeats policy rows. The
+    premises, measured first: the fan-out guard is on for the live snapshot; its profile reads
+    `"Policy Lines".policy_id` as repeating and `policy.id` as unique; and the join holds more rows than policy.
+    Expected: the start answers 200 with the refused plan and nothing else: its two parts are the two measures, each
+    refused because the metric is defined on policy's own rows and this join repeats them (the COUNT as much as the
+    SUM). The planner was asked twice (the plan and its one repair, the same plan again). Neither metric was decided:
+    no statement names 'active'. No build is kept, no write call is made, and analyst has made no dataset, chart or
+    dashboard. No model client is made or called."""
+    assert_guard_on(served)
+    facts = key_facts(served.runtime.snapshot)
+    keyed = (facts.get(("Policy Lines", "policy_id")), facts.get(("policy", "id")))
+    assert keyed == (False, True), keyed
+    [(joined, policies)] = ground_truth(live, 'SELECT (SELECT count(*) FROM policy JOIN "Policy Lines" ON '
+                                              '"Policy Lines".policy_id = policy.id), (SELECT count(*) FROM policy)')
+    assert joined > policies, (joined, policies)
+    refs = (SavedRef("active_premium", MeasureKind.CURRENCY, table="policy", handle="active_premium"),
+            SavedRef("active_policies", MeasureKind.COUNT, table="policy", handle="active_policies"))
+    plan = _on_join('policy JOIN "Policy Lines" ON "Policy Lines".policy_id = policy.id',
+                    _carried_bar("active_premium_by_policy", "Active premium by policy", refs[0], "policy_id"),
+                    _carried_bar("active_policies_by_policy", "Active policies by policy", refs[1], "policy_id"))
+    goal = "active premium and policies by policy, from its lines"
+    before, builds_before = made_by(BUILDER), served.builds()
+    run = run_build(live, served, model, plan, "carried-refused", goal=goal)
+    record("carried-refused", summary(run, served))
+    [start] = run.requests
+    repeated = ("each policy row is repeated once per matching Policy Lines row (Policy Lines.policy_id is not "
+                "unique)")
+
+    def own_grain(metric: str) -> str:
+        return (f"the saved metric {metric!r} is defined on policy's own rows, and this join repeats them: {repeated}; "
+                "join policy only to tables it meets at most once per row, or plan the chart on policy alone")
+
+    parts = [{"part": f"measure {ref.handle!r}", "reason": own_grain(ref.name)} for ref in refs]
+    assert start.status_code == 200, (start.status_code, start.body)
+    assert start.body == {"refused": {
+        "reason": "mnemiq could not plan this dashboard: " + "; ".join(f"{p['part']}: {p['reason']}" for p in parts),
+        "parts": parts}}, start.body
+    assert run.planner.goals == [goal] * 2
+    assert [call.sql for call in start.calls if call.tool == "execute_sql" and "'active'" in call.sql] == []
+    assert writes(start.calls) == []
+    assert served.builds() == builds_before and made_by(BUILDER) == before
+    assert_no_model_call(run)
+    observe("carried refused", status=start.status_code, parts=[p["part"] for p in parts],
+            calls=dict(Counter(short(call.tool) for call in start.calls)))
 
 
 # --- a create whose answer is lost ---------------------------------------------------------------------------------

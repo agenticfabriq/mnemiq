@@ -1178,6 +1178,42 @@ def test_a_virtual_dataset_is_named_for_its_build(fake, world, store):
     assert len(set(names)) == 2
 
 
+def test_a_joined_tables_saved_metric_is_built_as_the_join_names_its_columns(fake, world, store):
+    """The planner carries policy's saved metric onto a join with claim, and the build sends it as written: the chart's
+    SQL metric is the metric's expression naming the joined dataset's columns, on the dataset the build made over the
+    join, under the metric's verbose name, and the dashboard keeps it as one of its measures. Superset's numbers on a
+    dataset the build made are not checked against mnemiq's own SQL."""
+    from mnemiq.superset.planner import FakePlanner, plan_build
+
+    world.datasets[POLICY_DATASET]["metrics"].append(
+        {"metric_name": "active_premium", "expression": "SUM(CASE WHEN status = 'active' THEN premium END)",
+         "verbose_name": "Active premium", "d3format": None, "currency": None, "certified_by": "finance",
+         "certification_details": None, "warning_text": None, "description": None})
+    join = "policy JOIN claim ON claim.claim_id = policy.policy_id"
+    ref = SavedRef("active_premium", MeasureKind.CURRENCY, table="policy", handle="active_premium")
+    planned = BuildPlan(charts=(_chart("active_by_claim_region", Family.BAR, "Active premium by claim region", -1, (ref,),
+                                       dimensions=("claim_region",)),),
+                        measures=(), datasets=(PlannedDataset(key="dataset_1", placeholder=-1, join=join),))
+    adapter = _adapter(fake)
+    plan = plan_build(GOAL, planner=FakePlanner(planned), client=adapter.client, adapter=adapter, snapshot=SNAPSHOT,
+                      grants=GRANTS, settings=SETTINGS)
+    assert isinstance(plan, BuildPlan), plan
+    rendered = 'SUM(CASE WHEN "status" = \'active\' THEN "premium" END)'
+    [measure] = plan.measures
+    assert measure.expression == rendered and plan.charts[0].measures == (WrittenRef(measure),)
+    final = _run(store, _start(store, plan).build_id, _adapter(fake))[-1]
+    assert final.status == "done", final
+    [request] = [call.request for call in world.calls("create_chart")]
+    made = _step(final, "dataset_1").object_id
+    assert request["dataset_id"] == made and world.datasets[made]["sql"] == plan.datasets[0].sql
+    assert request["config"]["y"] == [{"sql_expression": rendered, "label": "Active premium"}]
+    chart_id = _step(final, "active_by_claim_region").object_id
+    assert final.checks == {chart_id: ChartStatus.NOT_CHECKED}, final.message
+    [kept] = store.measures_for(TENANT, final.dashboard_id)
+    assert kept.measure == dataclasses.replace(measure, dataset_id=made, asked_by=PRINCIPAL)
+    assert kept.measure.description == "The saved metric 'active_premium' of 'policy', carried onto the join."
+
+
 # --- The same build on the Postgres store: the builder joined to the store it runs on in a deployment, with
 # Superset's clock the real one, so a step's window compares Postgres's `now()` with it as a deployment does. Gated
 # as the store's own tests are (`MNEMIQ_TEST_BUILD_STORE_DSN`, and `MNEMIQ_TEST_BUILD_STORE_REQUIRED` in the job that
