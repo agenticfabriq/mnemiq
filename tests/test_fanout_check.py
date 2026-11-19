@@ -1021,3 +1021,12 @@ def test_a_table_own_grain_cannot_resolve_is_named_as_the_engine_reads_it(writte
     visible = {**_SALES_VISIBLE, "Customer": {"customer_id"}}
     assert _off(f"SELECT 1 FROM trx t JOIN {written} c ON c.customer_id = t.customer_id", visible=visible) \
         == _unread("trx", read)
+
+
+def test_a_key_read_through_is_not_false_still_refuses_an_inflated_sum():
+    """`ON (c.customer_id = t.customer_id) IS NOT FALSE` meets each customer row once per matching trx row: the sum
+    over customer's rows is inflated, and refused."""
+    verdict = _check("SELECT SUM(c.credit_limit) FROM trx t JOIN customer c "
+                     "ON (c.customer_id = t.customer_id) IS NOT FALSE", keys=_SALES_KEYS, visible=_SALES_VISIBLE)
+    assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
+    assert _CUSTOMER_REPEATED in verdict.message
