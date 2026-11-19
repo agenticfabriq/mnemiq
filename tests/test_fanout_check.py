@@ -975,3 +975,33 @@ def _no_key(*tables: str) -> dict[str, str]:
 def test_own_grain_keys_a_join_only_on_an_equality_every_row_meets(join, off):
     """Own grain reads a key pair only from an equality that is a top-level conjunct of an ON or WHERE."""
     assert _off(f"SELECT 1 FROM {join}") == off
+
+
+def _unread(*tables: str) -> dict[str, str]:
+    return {t: f"mnemiq cannot read how this join meets {t}'s rows" for t in tables}
+
+
+@pytest.mark.parametrize("sql, visible, off", [
+    # A derived table that aggregates is not merged, so its rows are not read; the table it reads is named too.
+    ("SELECT 1 FROM trx t JOIN (SELECT customer_id, COUNT(*) AS n FROM customer GROUP BY customer_id) d "
+     "ON d.customer_id = t.customer_id", _SALES_VISIBLE, _unread("trx", "customer")),
+    # A parenthesized join is one source the walk does not read; each table in it is named.
+    ("SELECT 1 FROM trx t JOIN (customer c JOIN region r ON r.region_id = c.region_id) "
+     "ON c.customer_id = t.customer_id", _SALES_VISIBLE, _unread("trx", "customer", "region")),
+    # A table `visible` names twice, by case.
+    (f"SELECT 1 {_SALES_JOIN}", {**_SALES_VISIBLE, "Customer": {"customer_id"}}, _unread("trx", "customer")),
+    # Two quoted aliases that fold to one.
+    ('SELECT 1 FROM trx "T" JOIN customer "t" ON "t".customer_id = "T".customer_id', _SALES_VISIBLE,
+     _unread("trx", "customer")),
+    # A table `visible` does not hold.
+    ("SELECT 1 FROM trx t JOIN ledger l ON l.trx_id = t.trx_id", _SALES_VISIBLE, _unread("trx", "ledger")),
+])
+def test_own_grain_fails_closed_on_a_source_it_cannot_read(sql, visible, off):
+    """Own grain is the stricter reading: where the join's FROM tree holds a source the walk does not read, nothing
+    says how often that source meets the others' rows, so every table is off its grain."""
+    assert _off(sql, visible=visible) == off
+
+
+def test_own_grain_reads_the_join_of_one_select():
+    with pytest.raises(ValueError):
+        _off("SELECT 1 FROM trx UNION SELECT 1 FROM customer")

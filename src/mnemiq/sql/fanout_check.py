@@ -330,8 +330,14 @@ def tables_off_their_grain(
     A key pair is read only from an equality that is a top-level conjunct of an ON or WHERE: an
     equality under OR, NOT, CASE or COALESCE is no key. A key whose uniqueness the profile never
     measured repeats nothing. The join is the outermost SELECT's FROM tree, a pass-through derived
-    table merged into it where sqlglot can (`_merged`, which reads `dialect`); a table `visible`
-    does not name exactly once is not read. Keyed by the table's object id in `visible`.
+    table merged into it where sqlglot can (`_merged`, which reads `dialect`). Keyed by the
+    table's object id in `visible`.
+
+    Being the stricter reading, it fails closed: where the FROM tree holds a source the walk does
+    not read -- a derived table it cannot merge, a table `visible` names twice or not at all, two
+    aliases that fold to one -- every table in the tree is off its grain, a derived table's and a
+    parenthesized join's included: `mnemiq cannot read how this join meets T's rows`, keyed by its
+    object id or, unresolved, its name as written.
     """
     if ast.find(exp.Subquery) or ast.find(exp.CTE):
         merged = _merged(ast, visible, dialect)
@@ -341,6 +347,21 @@ def tables_off_their_grain(
     if scope is None or not isinstance(scope.expression, exp.Select):
         raise ValueError("tables_off_their_grain reads the join of one SELECT")
     sources = _sources(scope, visible)
+    frm = scope.expression.args.get("from_")
+    nodes = ([frm.this] if frm else []) + [j.this for j in scope.expression.args.get("joins") or []]
+    # Each source of the FROM tree must be a table the walk reads under its own alias: a derived
+    # table left unmerged, a table `visible` names twice or not at all, or two aliases that fold to
+    # one would otherwise leave the tables beside it on their grain, with nothing to say so.
+    if len(nodes) != len(sources) or any(
+            not isinstance(node, exp.Table)
+            or sources.get(node.alias_or_name.lower()) != _visible_table(node, visible)
+            for node in nodes):
+        unread: dict[str, str] = {}
+        for node in nodes:
+            for found in node.find_all(exp.Table):  # in a derived table or a parenthesized join too
+                table = _visible_table(found, visible) or object_key(found)
+                unread[table] = f"mnemiq cannot read how this join meets {table}'s rows"
+        return unread
     if len(sources) < 2:
         return {}
     walk = _walk(scope.expression, sources, visible, facts, conjunct_keys=True)
@@ -413,11 +434,15 @@ def _sources(scope, visible: dict[str, set[str]]) -> dict[str, str]:
     names exactly once."""
     sources: dict[str, str] = {}
     for alias, source in scope.sources.items():
-        if isinstance(source, exp.Table):
-            hits = [t for t in visible if names_one_object(object_key(source), [t])]
-            if len(hits) == 1:
-                sources[alias.lower()] = hits[0]
+        if isinstance(source, exp.Table) and (table := _visible_table(source, visible)) is not None:
+            sources[alias.lower()] = table
     return sources
+
+
+def _visible_table(table: exp.Table, visible: dict[str, set[str]]) -> str | None:
+    """The object id of the one table in `visible` a table node names, or None."""
+    hits = [t for t in visible if names_one_object(object_key(table), [t])]
+    return hits[0] if len(hits) == 1 else None
 
 
 @dataclass(frozen=True)
