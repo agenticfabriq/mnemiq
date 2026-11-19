@@ -13,6 +13,7 @@ from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.scope import build_scope, traverse_scope
 
 from mnemiq.contract import Snapshot
+from mnemiq.sql.identifiers import resolve_identifier
 from mnemiq.sql.qualify import names_one_object, object_key
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
@@ -337,7 +338,7 @@ def tables_off_their_grain(
     not read -- a derived table it cannot merge, a table `visible` names twice or not at all, two
     aliases that fold to one -- every table in the tree is off its grain, a derived table's and a
     parenthesized join's included: `mnemiq cannot read how this join meets T's rows`, keyed by its
-    object id or, unresolved, its name as written.
+    object id or, unresolved, its name as `dialect` reads it (folded unless quoted).
     """
     if ast.find(exp.Subquery) or ast.find(exp.CTE):
         merged = _merged(ast, visible, dialect)
@@ -353,7 +354,9 @@ def tables_off_their_grain(
         unread: dict[str, str] = {}
         for node in nodes:
             for found in node.find_all(exp.Table):  # in a derived table or a parenthesized join too
-                table = _visible_table(found, visible) or object_key(found)
+                # Unresolved, as the engine reads its name: the name the planner gives a joined table.
+                table = (_visible_table(found, visible) or resolve_identifier(found.this, dialect)
+                         or object_key(found))
                 unread[table] = f"mnemiq cannot read how this join meets {table}'s rows"
         return unread
     if len(sources) < 2:

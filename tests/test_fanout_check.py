@@ -1012,3 +1012,12 @@ def test_own_grain_fails_closed_on_a_source_it_cannot_read(sql, visible, off):
 def test_own_grain_reads_the_join_of_one_select():
     with pytest.raises(ValueError):
         _off("SELECT 1 FROM trx UNION SELECT 1 FROM customer")
+
+
+@pytest.mark.parametrize("written, read", [("CUSTOMER", "customer"), ('"Customer"', "Customer")])
+def test_a_table_own_grain_cannot_resolve_is_named_as_the_engine_reads_it(written, read):
+    """`visible` holds `customer` and `Customer`, so neither spelling resolves to one table: the table is named as
+    Postgres reads the name, folded unless quoted, as the planner names a joined table."""
+    visible = {**_SALES_VISIBLE, "Customer": {"customer_id"}}
+    assert _off(f"SELECT 1 FROM trx t JOIN {written} c ON c.customer_id = t.customer_id", visible=visible) \
+        == _unread("trx", read)
