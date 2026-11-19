@@ -38,13 +38,16 @@ from pathlib import Path
 
 import pytest
 
+from mnemiq.execute.runner import DEFAULT_TIMEOUT_S
 from mnemiq.server.superset_refusals import SIGN_IN_AGAIN
 from mnemiq.superset.build_store import BUILD_TABLE, MEASURE_TABLE
 from mnemiq.superset.builder import start_build
 from mnemiq.superset.chart_form import _NOT_CHECKED_TYPES
 from mnemiq.superset.charts import ChartSpec, Family, Filter, WrittenRef, generate_chart_request
 from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetRefusedCaller, SupersetUnavailable
+from mnemiq.superset.executor import superset_executor
 from mnemiq.superset.extension import TOOL_PREFIX
+from mnemiq.superset.literals import Probes, holds_null
 from mnemiq.superset.marker import Marker, format_marker, parse_marker
 from mnemiq.superset.measures import Measure, MeasureKind
 from mnemiq.superset.planner import BuildPlan, FakePlanner, PlannedDataset
@@ -1202,6 +1205,42 @@ def test_a_chart_filter_on_a_value_no_row_holds_is_refused_and_the_repair_is_tol
     assert_no_model_call(run)
     observe("chart value repaired", parts=[part.part for part in run.planner.contexts[1].repair.refused], told=told,
             check=run.final["checks"].get(str(chart_id)))
+
+# --- a negated filter on a column that holds NULL ---------------------------------------------------------------------
+
+def test_the_null_probe_reads_the_source_as_the_builder(live, served, enriched, recorder):
+    """Through the adapter a build's request makes (`superset_executor`), carrying a token Superset's mint route made
+    for analyst, under the grants Superset gives analyst (`builder_grants`): the seed's `policy.doc` holds NULL in 12
+    of its 300 rows and `policy.region` in none, as measured here first. Expected: `holds_null` says True for doc and
+    False for region, each with one statement to Superset, run afresh (`force_refresh`) and carrying the builder's
+    own token, so Superset applies the builder's row rules to it; asked again in the same plan check, neither is sent
+    again. The probe reads whether a row comes back, never a value."""
+    seeded = [ground_truth(live, f"SELECT count(*) FROM policy WHERE {column} IS NULL")[0][0]
+              for column in ("doc", "region")] == [12, 0]
+    assert seeded, "the seed's NULLs in policy are not what this test expects"
+    settings, _ = enriched
+    minted = live.minted(BUILDER, "build")
+    adapter = superset_executor(settings, DelegatedToken(minted))
+    grants = served.runtime.builder_grants(adapter)
+    probes = Probes()
+
+    def asked(column: str) -> bool | None:
+        return holds_null("policy", column, adapter=adapter, snapshot=served.runtime.snapshot, grants=grants,
+                          timeout_s=DEFAULT_TIMEOUT_S, probes=probes)
+
+    mark = recorder.mark()
+    answers = {column: asked(column) for column in ("doc", "region")}
+    again = {column: asked(column) for column in ("doc", "region")}
+    calls = recorder.since(mark)
+    sent = [(call.tool, call.sql, call.request.get("force_refresh")) for call in calls]
+    assert answers == again == {"doc": True, "region": False}, (answers, again)
+    assert sent == [("execute_sql", 'SELECT 1 FROM "policy" WHERE "doc" IS NULL LIMIT 1', True),
+                    ("execute_sql", 'SELECT 1 FROM "policy" WHERE "region" IS NULL LIMIT 1', True)], sent
+    assert all(call.raised is None for call in calls)
+    assert {call.credential for call in calls} == {f"DelegatedToken:{fingerprint_of(minted)}"}
+    observe("null probe", answers=answers, statements=[sql for _, sql, _ in sent],
+            seconds=[round(call.seconds, 3) for call in calls])
+
 
 # --- a histogram, made through the extension ------------------------------------------------------------------------
 

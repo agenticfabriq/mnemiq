@@ -24,6 +24,13 @@ One check of a plan shares one `Probes`: the time every probe and read of the pl
 `PROBE_BUDGET_S` for a turn's probes, since an equality on a column with no index, and a read of a column's distinct
 values, can each scan the table; and what the source already said, so a value two parts filter on is asked once and a
 column's values are read once. A value not asked once the time is spent stays unchecked, and refuses nothing.
+
+**Whether a column holds NULL** is asked the same way (`holds_null`), for a chart filter that negates (`!=`, `NOT IN`,
+`NOT LIKE`): SQL reads a comparison with NULL as unknown, never true, so such a filter leaves out every row where its
+column is NULL as well as the rows it names. The probe answers only whether one row the builder can read holds NULL
+there, never a value; it shares the plan's `Probes`, once per column, and is asked of no column the grounding would not
+place: one masked or denied, one on a table the grants hide or filter by row. A probe that fails, or is not sent, says
+nothing, and refuses nothing.
 """
 
 from __future__ import annotations
@@ -52,7 +59,8 @@ from mnemiq.sql.values_check import (
     source_holds,
 )
 
-__all__ = ["HELD_NAMED", "Absent", "Probes", "absent_literals", "filter_statement"]
+__all__ = ["HELD_NAMED", "NEGATED_OPERATORS", "Absent", "Probes", "absent_literals", "filter_statement", "holds_null",
+           "null_statement"]
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +70,11 @@ HELD_NAMED = 20
 # A chart filter's operators whose string operand is a value the column must hold for the filter to mean anything: `=`
 # and `IN` select no row otherwise, and `!=` and `NOT IN` select every row, which is no filter at all.
 _EQUALITY_OPERATORS = frozenset({"=", "!=", "IN", "NOT IN"})
+
+# A chart filter's operators that leave out the rows where the column is NULL beside the rows they name: SQL reads
+# `NULL != 'x'`, `NULL NOT IN (...)` and `NULL NOT LIKE '...'` as unknown, never true. The planner's operators have no
+# `NOT ILIKE`.
+NEGATED_OPERATORS: frozenset[str] = frozenset({"!=", "NOT IN", "NOT LIKE"})
 
 
 @dataclass(frozen=True)
@@ -80,15 +93,17 @@ class Absent:
 @dataclass
 class Probes:
     """What one check of a plan's probes share: `budget_s`, the time they may take together, `spent_s` of it taken as
-    `clock` measures it, each probe's answer by `(table, column, text)` and each column's values by `(table, column)`.
-    A call is given at most the time left, and none is made once it is spent. The budget is read between calls, so one
-    call can overrun it by the transport's own margin, as a probe on the ask path can."""
+    `clock` measures it, each probe's answer by `(table, column, text)`, each column's values by `(table, column)`, and
+    whether each column holds NULL by `(table, column)`. A call is given at most the time left, and none is made once
+    it is spent. The budget is read between calls, so one call can overrun it by the transport's own margin, as a
+    probe on the ask path can."""
 
     budget_s: float = PROBE_BUDGET_S
     clock: Callable[[], float] = time.monotonic
     spent_s: float = 0.0
     answers: dict[tuple[str, str, str], bool | None] = field(default_factory=dict)
     held: dict[tuple[str, str], tuple[tuple[str, ...], bool] | None] = field(default_factory=dict)
+    nulls: dict[tuple[str, str], bool | None] = field(default_factory=dict)
 
     def left_s(self) -> float:
         return self.budget_s - self.spent_s
@@ -203,6 +218,55 @@ def absent_literals(sql: str, *, adapter, snapshot: Snapshot, grants: GrantSet, 
         values, more = read if read is not None else (None, False)
         found.append(Absent(f"{value.placed[0]}.{value.placed[1]}", value.text, values, more))
     return found
+
+
+def null_statement(table: str, column: str, dialect: str | None) -> str:
+    """Whether `table.column` holds NULL in a row the reader can read: `SELECT 1 FROM <table> WHERE <column> IS NULL
+    LIMIT 1`, the names quoted as stored, as a probe of a value quotes them (`probe_sql`)."""
+    return (exp.select(exp.Literal.number(1))
+            .from_(exp.Table(this=exp.to_identifier(table, quoted=True)))
+            .where(exp.Is(this=exp.Column(this=exp.to_identifier(column, quoted=True)), expression=exp.Null()))
+            .limit(1)
+            .sql(dialect=dialect))
+
+
+def holds_null(table: str, column: str, *, adapter, snapshot: Snapshot, grants: GrantSet, timeout_s: float,
+               probes: Probes) -> bool | None:
+    """Whether a row the builder can read holds NULL in `table.column` (a snapshot table and column), asked of the
+    source through `adapter`, afresh, within `probes`, once per column: True for a row back, False for none.
+
+    None where the source said nothing. Not asked, and not remembered: a column the builder's grants hide, mask or
+    deny, a table they filter by row (or any table while a row filter names one the snapshot does not hold, which may
+    be this one misspelled), a request Superset refused for good, and a plan whose probe time is spent. Asked and
+    failed, which is remembered, so the plan does not ask again, and logged by the failure's kind alone: a source's
+    words can quote a value."""
+    if getattr(adapter, "terminal_refusal", None) is not None:
+        return None  # Superset refused this request for good: every later call meets the same refusal
+    policy = build_access_policy(snapshot, grants)
+    if column not in visible_schema(snapshot, grants).get(table, ()) or policy.masks(table, column) \
+            or policy.denies(table, column) or policy.row_filter_for(table) is not None \
+            or policy.unknown_filter_targets:
+        return None
+    key = (table, column)
+    if key in probes.nulls:
+        return probes.nulls[key]
+    if probes.left_s() <= 0:
+        logger.info("whether %s.%s holds NULL was not asked: the plan's %s s for probes was spent", table, column,
+                    probes.budget_s)
+        return None  # not kept: unasked is not unanswered
+    physical = {binding.object_id: binding.source_object for binding in snapshot.source_bindings}
+    sql = null_statement(physical.get(table, table), column, adapter.dialect)
+
+    def ask(limit: float) -> bool | None:
+        try:
+            return _Afresh(adapter).execute_arrow(sql, timeout_s=limit).num_rows > 0
+        except Exception as exc:  # noqa: BLE001 -- unanswered, the column's negated filters refuse nothing
+            logger.info("whether %s.%s holds NULL could not be read (%s); its negated filters refuse nothing", table,
+                        column, type(exc).__name__)
+            return None
+
+    probes.nulls[key] = probes.timed(ask, timeout_s)
+    return probes.nulls[key]
 
 
 def _held(adapter, physical: dict[str, str], table: str, column: str, *, dialect: str | None,

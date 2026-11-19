@@ -19,7 +19,7 @@ from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Column, Snapshot
 from mnemiq.contract.semantic import SourceBinding
 from mnemiq.sql.values_check import PROBE_LIMIT
-from mnemiq.superset.literals import Absent, Probes, absent_literals, filter_statement
+from mnemiq.superset.literals import Absent, Probes, absent_literals, filter_statement, holds_null, null_statement
 
 SNAPSHOT = Snapshot(version="v1", source_id="only", created_at="t", columns=[
     Column(id="t.status", object_id="t", name="status", data_type="VARCHAR"),
@@ -338,3 +338,100 @@ def test_a_cached_empty_answer_refuses_nothing_once_the_value_is_held():
     source = _source(["WON", "Won"], present=frozenset({"Won"}), cached=lambda sql: NONE)
     assert _absent("SELECT COUNT(*) FROM t WHERE status = 'Won'", source) == []
     assert source.fresh == [True]
+
+
+# ---------------------------------------------------------------- whether a column holds NULL
+
+
+def _nulls(found) -> Source:
+    """A source whose every statement finds a row (`found` True), none (False), or raises `found`."""
+    return Source(lambda sql: found if isinstance(found, Exception) else ONE if found else NONE)
+
+
+def _holds_null(column: str, source: Source, *, table: str = "t", snapshot=SNAPSHOT, grants=GRANTS,
+                probes: Probes | None = None) -> bool | None:
+    return holds_null(table, column, adapter=source, snapshot=snapshot, grants=grants, timeout_s=5.0,
+                      probes=Probes() if probes is None else probes)
+
+
+def test_null_statement_is_one_quoted_is_null_probe():
+    assert null_statement("t", "Status", "postgres") == 'SELECT 1 FROM "t" WHERE "Status" IS NULL LIMIT 1'
+
+
+def test_holds_null_reads_afresh_and_answers_from_the_rows():
+    """One row back is a NULL the builder can read; none back is none. Each is one statement, run afresh, naming the
+    table as the source stores it (`Snapshot.source_bindings`), as a probe of a value does."""
+    bound = SNAPSHOT.model_copy(update={"source_bindings": [
+        SourceBinding(id="b", source_id="only", object_id="t", source_object="t_stored", binding_type="table")]})
+    found, none = _nulls(True), _nulls(False)
+    assert _holds_null("status", found, snapshot=bound) is True
+    assert _holds_null("status", none, snapshot=bound) is False
+    for source in (found, none):
+        assert source.sent == ['SELECT 1 FROM "t_stored" WHERE "status" IS NULL LIMIT 1']
+        assert source.fresh == [True] and source.timeouts == [5.0]
+
+
+def test_holds_null_asks_once_per_column_per_plan():
+    """One plan's checks share what the source said: a column asked twice is asked once. Another column, and another
+    plan's probes, are asked afresh."""
+    probes = Probes()
+    source = _nulls(True)
+    assert _holds_null("status", source, probes=probes) is True
+    assert _holds_null("status", source, probes=probes) is True
+    assert len(source.sent) == 1 and probes.nulls == {("t", "status"): True}
+    assert _holds_null("amount", source, probes=probes) is True
+    assert _holds_null("status", source) is True
+    assert len(source.sent) == 3
+
+
+@pytest.mark.parametrize(("table", "column", "snapshot", "grants", "refused"), [
+    ("t", "owner", POLICED, GrantSet(frozenset({"t"}), pii_mask=frozenset({"pii"})), False),
+    ("t", "owner", POLICED, GrantSet(frozenset({"t"})), False),
+    ("u", "secret", SNAPSHOT, GRANTS, False),
+    ("t", "status", SNAPSHOT, GrantSet(frozenset({"t"}), row_filters={"t": "owner = 'me'"}), False),
+    ("t", "status", SNAPSHOT, GrantSet(frozenset({"t"}), row_filters={"public.t": "owner = 'me'"}), False),
+    ("t", "status", SNAPSHOT, GRANTS, True),
+], ids=["masked", "denied", "ungranted table", "row-filtered table", "unknown row-filter target",
+        "terminal refusal"])
+def test_holds_null_asks_nothing_for_a_withheld_column_or_a_row_filtered_table_or_after_a_terminal_refusal(
+        table, column, snapshot, grants, refused):
+    """Whether a column holds NULL is what a mask withholds, a denied column and a table the grants hide are not the
+    builder's to ask about, and a probe runs outside mnemiq's own row filter, so a table under one is never asked;
+    nor is one while a row filter names a table the snapshot does not hold, which may be this one misspelled. Once
+    Superset refused the request for good (`terminal_refusal`), nothing more is sent. Each is None, not asked, and not
+    remembered."""
+    source = _nulls(True)
+    if refused:
+        source.terminal_refusal = RuntimeError("Superset refused this caller")
+    probes = Probes()
+    assert _holds_null(column, source, table=table, snapshot=snapshot, grants=grants, probes=probes) is None
+    assert source.sent == [] and probes.nulls == {}
+    if column == "owner":  # a column beside it the builder reads raw still is asked
+        assert _holds_null("status", source, snapshot=snapshot, grants=grants) is True
+
+
+def test_holds_null_is_none_when_the_budget_is_spent_and_does_not_remember_it(caplog):
+    """The probe shares the plan's budget: given 3 s of 10 left, it is sent with a 3 s limit, and the 4 s it takes are
+    spent; past the budget the next column is not asked, not remembered, and logged by its name alone."""
+    clock = [0.0]
+    probes = Probes(budget_s=10.0, clock=lambda: clock[0], spent_s=7.0)
+    source = Source(lambda sql: ONE, clock=clock, takes_s=4.0)
+    assert _holds_null("status", source, probes=probes) is True
+    assert source.timeouts == [3.0] and probes.spent_s == 11.0
+    with caplog.at_level(logging.INFO):
+        assert _holds_null("amount", source, probes=probes) is None
+    assert len(source.sent) == 1 and probes.nulls == {("t", "status"): True}
+    assert "t.amount" in caplog.text
+
+
+def test_a_failed_null_probe_is_none_and_logs_no_value(caplog):
+    """A probe Superset does not answer says nothing, and is remembered so: the column is not asked again in the plan.
+    Its log line names the column and the failure's kind; a source's words can quote a value, so never them."""
+    probes = Probes()
+    source = _nulls(RuntimeError("invalid input syntax: 'Ann Smith'"))
+    with caplog.at_level(logging.INFO, logger="mnemiq.superset.literals"):
+        assert _holds_null("status", source, probes=probes) is None
+    assert probes.nulls == {("t", "status"): None}
+    assert _holds_null("status", source, probes=probes) is None and len(source.sent) == 1
+    [line] = [r.getMessage() for r in caplog.records if r.name == "mnemiq.superset.literals"]
+    assert "t.status" in line and "RuntimeError" in line and "Ann" not in line and "invalid" not in line
