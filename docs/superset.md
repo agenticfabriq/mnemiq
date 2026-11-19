@@ -278,6 +278,8 @@ still to come. In short:
 - **Values a plan's repair is told.** The planning prompt holds no value read from the data's rows. When a plan
   filters on a value no row the builder can read holds, up to 20 values of that column, one the plan itself filtered,
   read as the builder, go to the one repair prompt and to the refused plan's answer: a hosted planning model sees them.
+  A named value that differs from the plan's only in letter case is called out, and the advice is to filter on one of
+  the values only if it is the one the goal means, and to keep the plan's own value only if the goal itself names it.
 - **A negated filter on a column that holds NULL.** SQL reads a chart filter with `!=`, `NOT IN` or `NOT LIKE` as
   leaving out every row where its column is NULL. When a row the builder can read holds NULL in that column, the chart
   is refused, repairably, and the repair is told the three ways out: the filter replaced with `IS NULL` if only those
