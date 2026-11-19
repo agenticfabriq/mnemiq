@@ -2025,6 +2025,27 @@ def test_a_metric_on_a_join_that_repeats_its_tables_rows_is_refused_with_the_gua
                                                         "policies": 'COUNT("policy_policy_id")'}[metric]]
 
 
+# KEYED with claim.policy_id's distinct count unmeasured, as profiling leaves a column it could not count.
+CLAIM_KEY_UNMEASURED = KEYED.model_copy(update={"columns": [
+    column.model_copy(update={"distinct_count": None}) if column.id == "claim.policy_id" else column
+    for column in KEYED.columns]})
+
+
+def test_a_metric_on_a_join_whose_key_has_no_uniqueness_profile_is_refused_with_the_guard_on():
+    """policy's COUNT(policy_id) on `policy JOIN claim`, where claim.policy_id's uniqueness was never measured: nothing
+    says each policy row meets one claim, so with the guard on it is refused. claim's own metric on the same join is
+    carried: the key it meets, policy.policy_id, is known unique."""
+    ref = SavedRef("policies", K.NUMBER, table="policy", handle="carried_metric")
+    refused = _carried(ref, dims=("status",), snapshot=CLAIM_KEY_UNMEASURED)
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused) == {"measure 'carried_metric'": _own_grain(
+        "policies", "policy",
+        "mnemiq cannot tell whether this join repeats policy's rows: claim.policy_id has no uniqueness profile")}
+    checked = _carried(OPEN_PAID_REF, snapshot=CLAIM_KEY_UNMEASURED)
+    assert isinstance(checked, BuildPlan), checked
+    assert [m.expression for m in checked.measures] == [OPEN_PAID_SHOWN]
+
+
 NULL_SIDE = ("claim is on a side the join may fill with NULL, where its saved metric 'open_paid' is not defined: put "
              "claim on the side the join keeps every row of, or join with JOIN")
 

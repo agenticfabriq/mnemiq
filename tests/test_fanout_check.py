@@ -11,7 +11,7 @@ import sqlglot
 from sqlglot import exp
 
 from mnemiq.contract import Column, Snapshot
-from mnemiq.sql.fanout_check import check_fanout, key_facts, tables_off_their_grain, value_terms
+from mnemiq.sql.fanout_check import KeyFacts, check_fanout, key_facts, tables_off_their_grain, value_terms
 from mnemiq.sql.verdict import RefusalCode
 
 # The acme_syn shapes, profiled the way the glossary arm found them: 30,000 claims over 23,322
@@ -919,9 +919,55 @@ def test_a_table_repeated_two_hops_away_names_the_table_it_meets_first():
                              "(customer.region_id is not unique)"}
 
 
-def test_unknown_keys_never_repeat_a_table():
-    """Unknown is not non-unique, as the guard reads it: a join no profile measured is on grain."""
-    assert _off(f"SELECT COUNT(c.customer_id) {_SALES_JOIN}", keys={}) == {}
+def _cannot_tell(table: str, key: str) -> str:
+    return f"mnemiq cannot tell whether this join repeats {table}'s rows: {key} has no uniqueness profile"
+
+
+def test_a_key_with_no_uniqueness_profile_leaves_the_tables_it_joins_off_their_own_grain():
+    """A table is at its own grain only where every key it meets on another table is known unique: with no profile,
+    each side may meet many rows of the other."""
+    assert _off(f"SELECT COUNT(c.customer_id) {_SALES_JOIN}", keys={}) == {
+        "trx": _cannot_tell("trx", "customer.customer_id"),
+        "customer": _cannot_tell("customer", "trx.customer_id")}
+
+
+def test_a_key_known_unique_leaves_the_table_meeting_it_at_its_own_grain():
+    """customer's key is known unique, so each trx row meets one customer; trx's key has no profile, so whether each
+    customer row meets one trx row is not known."""
+    assert _off(f"SELECT 1 {_SALES_JOIN}", keys={("customer", "customer_id"): True}) == {
+        "customer": _cannot_tell("customer", "trx.customer_id")}
+
+
+def test_a_key_with_no_uniqueness_profile_two_hops_away_leaves_the_table_off_its_own_grain():
+    """trx meets one customer, but each customer may meet many region rows: region's key has no profile."""
+    keys = {("customer", "customer_id"): True, ("trx", "customer_id"): False, ("customer", "region_id"): False}
+    assert _off(f"SELECT 1 {_SALES_JOIN} JOIN region r ON r.region_id = c.region_id", keys=keys) == {
+        "trx": _cannot_tell("trx", "region.region_id"),
+        "customer": _CUSTOMER_REPEATED,
+        "region": "each region row is repeated once per matching customer row (customer.region_id is not unique)"}
+
+
+def test_a_key_a_range_narrows_leaves_the_table_meeting_it_off_its_own_grain():
+    """dim_customer's key repeats, once per version, and the join narrows it by a range of its own columns: whether
+    that leaves one version per order is not known."""
+    off = _off("SELECT 1 FROM orders o JOIN dim_customer d ON d.customer_id = o.customer_id "
+               "AND o.order_date BETWEEN d.valid_from AND d.valid_to",
+               keys=key_facts(_snapshot(_SCD)), visible={t: set(c) for t, c in _SCD.items()})
+    assert off == {
+        "orders": "mnemiq cannot tell whether this join repeats orders's rows: dim_customer.customer_id is not unique, "
+                  "and mnemiq cannot read whether the join's range on dim_customer leaves one row per key",
+        "dim_customer": "each dim_customer row is repeated once per matching orders row "
+                        "(orders.customer_id is not unique)"}
+
+
+def test_a_key_a_profiled_partition_pins_is_known_unique():
+    """Among dim_customer's current rows customer_id is unique, a fact the profile holds: each order meets one."""
+    facts = KeyFacts(key_facts(_snapshot(_SCD)))
+    facts.partitions = {("dim_customer", "is_current", "=1"): frozenset({"customer_id"})}
+    off = _off("SELECT 1 FROM orders o JOIN dim_customer d ON d.customer_id = o.customer_id AND d.is_current = 1",
+               keys=facts, visible={t: set(c) for t, c in _SCD.items()})
+    assert off == {"dim_customer": "each dim_customer row is repeated once per matching orders row "
+                                   "(orders.customer_id is not unique)"}
 
 
 @pytest.mark.parametrize("join", [

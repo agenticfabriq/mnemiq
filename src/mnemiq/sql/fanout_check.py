@@ -314,8 +314,8 @@ def tables_off_their_grain(
 ) -> dict[str, str]:
     """Each table of a join that the join does not leave at its own grain, with why.
 
-    A table is at its own grain when each of its rows appears at most once in the join: no walk
-    outward from it enters another table by a key that repeats there, and it is keyed to every
+    A table is at its own grain when each of its rows appears at most once in the join: every walk
+    outward from it enters each other table by a key known unique there, and it is keyed to every
     other table. Any aggregate over its columns -- a count or a SUM of constants as much as a SUM
     or AVG -- then reads each of its rows at most once. `check_fanout` excuses a count over a
     repeated table unless every table repeats, since it may be a count of the finer table, which
@@ -324,15 +324,19 @@ def tables_off_their_grain(
 
     - a repeated table: `each T row is repeated once per matching W row (W.k is not unique)`, the
       words `check_fanout` refuses with;
+    - a table that meets another by a key not known unique there, so that nothing says how often
+      its rows meet that table's: `mnemiq cannot tell whether this join repeats T's rows: W.k has
+      no uniqueness profile` (or, where a range of W's own columns narrows the join on a key that
+      repeats, that mnemiq cannot read whether the range leaves one row per key). A key is known
+      unique where the profile says so, or a profiled partition a filter picks pins it;
     - a table joined by no key to every other table (a CROSS JOIN, a comma, a range or an
       expression join): `T is joined by no key to every other table`, since nothing the profile
       holds says how often its rows meet the others'.
 
     A key pair is read only from an equality that is a top-level conjunct of an ON or WHERE: an
-    equality under OR, NOT, CASE or COALESCE is no key. A key whose uniqueness the profile never
-    measured repeats nothing. The join is the outermost SELECT's FROM tree, a pass-through derived
-    table merged into it where sqlglot can (`_merged`, which reads `dialect`). Keyed by the
-    table's object id in `visible`.
+    equality under OR, NOT, CASE or COALESCE is no key. The join is the outermost SELECT's FROM
+    tree, a pass-through derived table merged into it where sqlglot can (`_merged`, which reads
+    `dialect`). Keyed by the table's object id in `visible`.
 
     Being the stricter reading, it fails closed: where the FROM tree holds a source the walk does
     not read -- a derived table it cannot merge, a table `visible` names twice or not at all, two
@@ -367,6 +371,13 @@ def tables_off_their_grain(
         if alias in walk.dup:
             entered, key = walk.dup[alias]
             off[table] = _repeated(table, walk.sources[entered], key)
+        elif alias in walk.unsure:
+            entered, key, profiled = walk.unsure[alias]
+            other = walk.sources[entered]
+            why = (f"{other}.{', '.join(key)} has no uniqueness profile" if profiled is None else
+                   f"{other}.{', '.join(key)} is not unique, and mnemiq cannot read whether the join's range on "
+                   f"{other} leaves one row per key")
+            off[table] = f"mnemiq cannot tell whether this join repeats {table}'s rows: {why}"
         elif alias not in walk.keyed:
             off[table] = f"{table} is joined by no key to every other table"
     return off
@@ -465,13 +476,16 @@ class _Walk:
     `sources` is the scope's tables (alias -> object id) less a SEMI/ANTI right side; `owner` the
     alias a column belongs to, or None where it cannot tell; `dup` each alias a walk outward from
     it finds repeated, with the alias it is repeated by and that table's key; `keyed` the aliases
-    keyed to every other table.
+    keyed to every other table; `unsure` each alias a walk outward from it finds entering another
+    table by a key not known to be unique there, with that table and key, and whether the key has
+    a uniqueness profile at all (its `_unique`, None or False).
     """
 
     sources: dict[str, str]
     owner: Callable[[exp.Column], str | None]
     dup: dict[str, tuple[str, tuple[str, ...]]]
     keyed: frozenset[str]
+    unsure: dict[str, tuple[str, tuple[str, ...], bool | None]]
 
 
 def _walk(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts, *,
@@ -629,7 +643,23 @@ def _walk(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts,
         if repeats(a, a_cols) and (b, a) not in at_most_one:
             fans_into[b][a] = a_cols
 
-    def multiplier(t: str) -> tuple[str, tuple[str, ...]] | None:
+    # a -> {b: b's key columns}: whether each `a` row meets at most one `b` row is not known, since
+    # b's key is neither shown to repeat nor known unique (no profile, or a range narrows it). A key
+    # is known unique where the profile says so, or a profiled partition pins it.
+    unsure_into: dict[str, dict[str, tuple[str, ...]]] = {a: {} for a in sources}
+
+    def known_unique(alias: str, key: tuple[str, ...]) -> bool:
+        return (_unique(facts, sources[alias], key) is True
+                or {k.lower() for k in key} <= pinned.get(alias, set()))
+
+    for (a, b), cols in pairs.items():
+        a_cols, b_cols = tuple(c[0] for c in cols), tuple(c[1] for c in cols)
+        if b not in fans_into[a] and (a, b) not in at_most_one and not known_unique(b, b_cols):
+            unsure_into[a][b] = b_cols
+        if a not in fans_into[b] and (b, a) not in at_most_one and not known_unique(a, a_cols):
+            unsure_into[b][a] = a_cols
+
+    def multiplier(t: str, into=fans_into) -> tuple[str, tuple[str, ...]] | None:
         # Walk OUTWARD, asking of each edge only in the direction it is traversed. Testing every
         # visited table's edges -- including the one pointing back toward `t` -- charged the
         # policy row repeated per claim to the claim, and fired on a plain many-to-one AVG.
@@ -639,13 +669,18 @@ def _walk(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts,
             for w in adj[u]:
                 if w in seen:
                     continue
-                if w in fans_into[u]:
-                    return w, fans_into[u][w]
+                if w in into[u]:
+                    return w, into[u][w]
                 seen.add(w)
                 stack.append(w)
         return None
 
     dup = {a: m for a in sources if (m := multiplier(a)) is not None}
+    unsure: dict[str, tuple[str, tuple[str, ...], bool | None]] = {}
+    for a in sources:
+        if (met := multiplier(a, unsure_into)) is not None:
+            w, key = met
+            unsure[a] = (w, key, _unique(facts, sources[w], key))
 
     def keyed_to_all(t: str) -> bool:
         seen, stack = {t}, [t]
@@ -656,7 +691,7 @@ def _walk(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts,
                     stack.append(w)
         return len(seen) == len(sources)
 
-    return _Walk(sources, owner, dup, frozenset(a for a in sources if keyed_to_all(a)))
+    return _Walk(sources, owner, dup, frozenset(a for a in sources if keyed_to_all(a)), unsure)
 
 
 def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts):
