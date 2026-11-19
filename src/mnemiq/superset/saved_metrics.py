@@ -137,6 +137,9 @@ class Carried:
 
 
 _NOT_ONE = "mnemiq cannot read its expression as one SQL expression"
+# Names sqlglot reads as a column where Postgres, unquoted and unqualified, reads a function of the session: carried
+# as `c."user"`, a metric of `MAX(user)` would read a column named user instead.
+_POSTGRES_FUNCTIONS = frozenset({"user", "current_role", "system_user"})
 
 
 def carry(metric: SavedMetric, *, table: str, stored: str, columns: Collection[str], qualifier: exp.Identifier,
@@ -175,6 +178,10 @@ def carry(metric: SavedMetric, *, table: str, stored: str, columns: Collection[s
         if column.args.get("table") is not None \
                 and resolve_identifier(column.args["table"], SUPERSET_DIALECT) not in (table, stored):
             return f"it names {column.sql(dialect=SUPERSET_DIALECT)}, a column of another table"
+        if column.args.get("table") is None and not column.this.args.get("quoted") \
+                and resolve_identifier(column.this, SUPERSET_DIALECT) in _POSTGRES_FUNCTIONS:
+            return (f"it names {column.this.sql(dialect=SUPERSET_DIALECT)}, which Postgres reads as a function, not a "
+                    "column")
         if resolve_identifier(column.this, SUPERSET_DIALECT) not in columns:
             return (f"it names {column.this.sql(dialect=SUPERSET_DIALECT)}, which {table} does not have or the "
                     "builder cannot read")

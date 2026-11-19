@@ -433,3 +433,55 @@ def test_the_joined_dataset_reads_the_superset_rendering_as_the_decided_one(join
     back = sqlglot.parse_one(f"SELECT {carried.superset}", read="postgres").expressions[0].transform(
         lambda n: projected[n.name].copy() if isinstance(n, exp.Column) else n)
     assert back.sql(dialect="postgres") == carried.decided
+
+
+# A table with columns named as Postgres's niladic functions: only quoted, or qualified, is such a name the column.
+NILADIC = frozenset({"user", "current_role", "system_user", "amount"})
+NILADIC_SHOWN = {name: name for name in NILADIC}
+
+
+@pytest.mark.parametrize("expression, name", [
+    ("MAX(user)", "user"), ("MAX(USER)", "USER"), ("MAX(current_role)", "current_role"),
+    ("MAX(system_user)", "system_user"),
+])
+def test_a_name_postgres_reads_as_a_function_is_refused(expression, name):
+    """sqlglot reads these unquoted names as columns, where Postgres reads the session's user or role: carried as
+    `c."user"`, the metric would read the column instead."""
+    assert _carry(expression, columns=NILADIC, shown=NILADIC_SHOWN) \
+        == f"it names {name}, which Postgres reads as a function, not a column"
+
+
+@pytest.mark.parametrize("expression", ['MAX("user")', "MAX(claim.user)"])
+def test_a_quoted_or_qualified_niladic_name_is_the_column(expression):
+    assert _carry(expression, columns=NILADIC, shown=NILADIC_SHOWN) \
+        == Carried(decided='MAX(c."user")', superset='MAX("user")')
+
+
+@pytest.mark.parametrize("expression", [
+    # Each trips one check alone: a second SELECT (no subquery node), and EXISTS (over VALUES, no second SELECT).
+    "SUM(amount) * ARRAY_LENGTH(ARRAY(SELECT 1), 1)",
+    "CASE WHEN EXISTS (VALUES (1)) THEN SUM(amount) END",
+    "CASE WHEN EXISTS (SELECT 1) THEN SUM(amount) END",
+])
+def test_a_second_select_or_exists_alone_is_refused(expression):
+    assert _carry(expression) == OTHER_ROWS
+
+
+def test_a_table_node_alone_is_refused(monkeypatch):
+    """No Postgres text sqlglot parses to a table node without a subquery or a second SELECT around it (probed:
+    `IN ROWS FROM (f())`, `ANY (TABLE t)`, `EXISTS (VALUES ...)`, ...), so the tree is built: a table node alone
+    still refuses the metric."""
+    import mnemiq.superset.saved_metrics as module
+
+    tree = exp.select(exp.Mul(this=exp.Sum(this=exp.column("amount")), expression=exp.to_table("policy")))
+    assert len(list(tree.find_all(exp.Select))) == 1 and not tree.find(exp.Subquery, exp.Exists, exp.Alias)
+    monkeypatch.setattr(module.sqlglot, "parse_one", lambda *args, **kwargs: tree)
+    assert _carry("SUM(amount)") == OTHER_ROWS
+
+
+def test_the_qualifier_passed_in_is_left_as_it_was():
+    qualifier = exp.to_identifier("c")
+    assert _carry("SUM(amount) FILTER (WHERE status = 'open')", qualifier=qualifier) \
+        == Carried(decided='SUM(c."amount") FILTER(WHERE c."status" = \'open\')',
+                   superset='SUM("amount") FILTER(WHERE "status" = \'open\')')
+    assert qualifier.parent is None and qualifier.sql(dialect="postgres") == "c"
