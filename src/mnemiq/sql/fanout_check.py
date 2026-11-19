@@ -309,9 +309,9 @@ def check_fanout(
 @dataclass(frozen=True)
 class OffGrain:
     """Why a join leaves a table off its own grain. `repeats` where that is a fact about the join, read from its keys:
-    a key the table meets is known not unique, or the table is joined by no key to every other table. Not where
-    mnemiq cannot tell: a key with no uniqueness profile or not known to be unique, a key a range narrows, a source
-    it cannot read."""
+    a key the table meets is known not unique. Not where mnemiq cannot tell: a key with no uniqueness profile or not
+    known to be unique, a key a range narrows, a source it cannot read, a table joined by no key to every other table
+    (whose rows a range or an expression join may still meet once each)."""
 
     reason: str
     repeats: bool
@@ -347,9 +347,12 @@ def tables_off_their_grain(
 
     A key pair is read only from an equality that is a top-level conjunct of an ON or WHERE: an
     equality under OR, NOT, CASE or COALESCE is no key. An outer join's ON (LEFT, RIGHT or FULL)
-    keys only the table it brings in to the tables before it, never two of those to each other. The join is the outermost SELECT's FROM
-    tree, a pass-through derived table merged into it where sqlglot can (`_merged`, which reads
-    `dialect`). Keyed by the table's object id in `visible`.
+    keys only the table it brings in to the tables before it, never two of those to each other;
+    and a table a LEFT or FULL JOIN brings in joins no two tables before it either: a walk reaching
+    it from one of them stops there toward the others, since the join keeps every row of their
+    product, matched or not. The join is the outermost SELECT's FROM tree, a pass-through derived
+    table merged into it where sqlglot can (`_merged`, which reads `dialect`). Keyed by the
+    table's object id in `visible`.
 
     Being the stricter reading, it fails closed: where the FROM tree holds a source the walk does
     not read -- a derived table it cannot merge, a table `visible` names twice or not at all, two
@@ -398,7 +401,7 @@ def tables_off_their_grain(
             off[table] = OffGrain(f"mnemiq cannot tell whether this join repeats {table}'s rows: {why}",
                                   repeats=False)
         elif alias not in walk.keyed:
-            off[table] = OffGrain(f"{table} is joined by no key to every other table", repeats=True)
+            off[table] = OffGrain(f"{table} is joined by no key to every other table", repeats=False)
     return off
 
 
@@ -551,6 +554,11 @@ def _walk(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts,
     # `conjunct_keys`: the table the join brings in. The ON cannot filter the tables it keeps, so an
     # equality between two of them joins nothing.
     keys_with: dict[int, set[str]] = {}
+    # Under `conjunct_keys`: the tables a LEFT or FULL JOIN brings in. Such a join keeps every row of
+    # the tables before it, matched or not, so its ON bounds how many of the new table's rows each
+    # of theirs meets, but joins none of them to another: a walk reaching the new table from one of
+    # them stops there toward the others (`reached`). A RIGHT JOIN's ON filters the tables before it.
+    kept_whole: set[str] = set()
     # USING binds to the tables LEFT of the join, and after `a JOIN b USING (k)` the merged `k`
     # equals both `a.k` and `b.k` -- so a later `JOIN c USING (k)` is an edge to each of them.
     # Binding to "the one other table with that column" instead refuses nothing on a three-way
@@ -573,6 +581,8 @@ def _walk(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts,
             filters = None if not side else {right} if side == "LEFT" and right else set()
             if side:
                 keys_with[len(conditions)] = {right} if right else set()
+            if conjunct_keys and side in ("LEFT", "FULL") and right:
+                kept_whole.add(right)
             conditions.append((join.args["on"], asof, filters))
         for ident in join.args.get("using") or []:
             if right not in sources:
@@ -687,21 +697,30 @@ def _walk(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts,
         if a not in fans_into[b] and (b, a) not in at_most_one and not known_unique(a, a_cols):
             unsure_into[b][a] = a_cols
 
+    place = {alias: at for at, alias in enumerate(earlier)}
+
+    def reached(t: str):
+        # Each edge (u, w) a walk outward from `t` takes, in order. A table in `kept_whole`, reached
+        # from a table before it, is a dead end toward the tables before it; a table first reached
+        # so, and later reached another way, is walked on from again.
+        visited, stack = {t: False}, [(t, False)]  # alias -> reached only as such a dead end
+        while stack:
+            u, dead_end = stack.pop()
+            for w in adj[u]:
+                if dead_end and place[w] < place[u]:
+                    continue
+                w_dead_end = w in kept_whole and place[u] < place[w]
+                if w in visited and (not visited[w] or w_dead_end):
+                    continue
+                yield u, w
+                visited[w] = w_dead_end
+                stack.append((w, w_dead_end))
+
     def multiplier(t: str, into=fans_into) -> tuple[str, tuple[str, ...]] | None:
         # Walk OUTWARD, asking of each edge only in the direction it is traversed. Testing every
         # visited table's edges -- including the one pointing back toward `t` -- charged the
         # policy row repeated per claim to the claim, and fired on a plain many-to-one AVG.
-        seen, stack = {t}, [t]
-        while stack:
-            u = stack.pop()
-            for w in adj[u]:
-                if w in seen:
-                    continue
-                if w in into[u]:
-                    return w, into[u][w]
-                seen.add(w)
-                stack.append(w)
-        return None
+        return next(((w, into[u][w]) for u, w in reached(t) if w in into[u]), None)
 
     dup = {a: m for a in sources if (m := multiplier(a)) is not None}
     unsure: dict[str, tuple[str, tuple[str, ...], bool | None]] = {}
@@ -711,13 +730,7 @@ def _walk(select: exp.Select, sources: dict[str, str], visible, facts: KeyFacts,
             unsure[a] = (w, key, _unique(facts, sources[w], key))
 
     def keyed_to_all(t: str) -> bool:
-        seen, stack = {t}, [t]
-        while stack:
-            for w in adj[stack.pop()]:
-                if w not in seen:
-                    seen.add(w)
-                    stack.append(w)
-        return len(seen) == len(sources)
+        return len({t} | {w for _, w in reached(t)}) == len(sources)
 
     return _Walk(sources, owner, dup, frozenset(a for a in sources if keyed_to_all(a)), unsure)
 

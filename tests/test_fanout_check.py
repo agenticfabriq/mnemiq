@@ -1105,11 +1105,11 @@ def test_an_outer_join_on_the_table_it_brings_in_keys_it_as_an_inner_join_does()
 
 
 def test_a_repeat_the_join_makes_is_told_from_one_mnemiq_cannot_tell():
-    """`repeats` where the join's own facts say its rows repeat: a key it meets is known not unique, or it is joined by
-    no key to every other table. Not where mnemiq cannot tell: a key with no profile, a key a range narrows, a source
-    it cannot read."""
+    """`repeats` where the join's own facts say its rows repeat: a key it meets is known not unique. Not where mnemiq
+    cannot tell: a key with no profile, a key a range narrows, a source it cannot read, a table joined by no key to
+    every other table (whose rows a range or an expression join may still meet once each)."""
     assert _kinds(f"SELECT 1 {_SALES_JOIN}") == {"customer": True}
-    assert _kinds("SELECT 1 FROM trx t CROSS JOIN customer c") == {"trx": True, "customer": True}
+    assert _kinds("SELECT 1 FROM trx t CROSS JOIN customer c") == {"trx": False, "customer": False}
     assert _kinds(f"SELECT 1 {_SALES_JOIN}", keys={}) == {"trx": False, "customer": False}
     assert _kinds("SELECT 1 FROM orders o JOIN dim_customer d ON d.customer_id = o.customer_id "
                   "AND o.order_date BETWEEN d.valid_from AND d.valid_to",
@@ -1126,3 +1126,26 @@ def test_a_key_of_two_columns_whose_pair_is_not_known_unique_is_named_as_such():
                visible={t: set(c) for t, c in profile.items()})
     assert off == {"a": "mnemiq cannot tell whether this join repeats a's rows: b.k1, k2 is not known to be unique",
                    "b": "mnemiq cannot tell whether this join repeats b's rows: a.k1, k2 is not known to be unique"}
+
+
+@pytest.mark.parametrize("side, off", [
+    ("LEFT", _no_key("trx", "customer")),
+    ("FULL", _no_key("trx", "customer")),
+    # A RIGHT JOIN's ON does filter trx and customer's product: only the pairs region meets are kept.
+    ("RIGHT", {}),
+])
+def test_a_table_a_left_or_full_join_brings_in_joins_no_two_tables_before_it(side, off):
+    """region, brought in on trx's key and on customer's, bounds how many region rows each of them meets. A LEFT or
+    FULL JOIN still keeps every row of trx and customer's product, matched or not, so region does not join trx to
+    customer: a walk from either reaches region and stops there."""
+    assert _off(f"SELECT 1 FROM trx t JOIN customer c ON TRUE {side} JOIN region r "
+                "ON r.region_id = t.trx_id AND r.region_id = c.customer_id") == off
+
+
+def test_a_table_a_left_join_brings_in_still_joins_the_tables_after_it():
+    """customer, brought in with LEFT JOIN, is a dead end only toward trx; region, joined after it on its key, is
+    reached through it, so trx is at its own grain."""
+    assert _off("SELECT 1 FROM trx t LEFT JOIN customer c ON c.customer_id = t.customer_id "
+                "LEFT JOIN region r ON r.region_id = c.region_id") == {
+        "customer": _CUSTOMER_REPEATED,
+        "region": "each region row is repeated once per matching customer row (customer.region_id is not unique)"}

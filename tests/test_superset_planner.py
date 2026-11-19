@@ -2101,6 +2101,13 @@ def test_a_metric_naming_its_tables_columns_with_the_table_names_its_alias_on_th
     "agent a FULL JOIN policy p ON p.policy_id = a.agent_id JOIN claim c ON c.policy_id = p.policy_id",
     # The LEFT JOIN's ON joins agent, the table it brings in, to policy on agent's key.
     "claim c JOIN policy p ON p.policy_id = c.policy_id LEFT JOIN agent a ON a.agent_id = p.policy_id",
+    # Two LEFT JOINs: policy is reached from claim, and agent, joined after policy, through it.
+    "claim c LEFT JOIN policy p ON p.policy_id = c.policy_id LEFT JOIN agent a ON a.agent_id = p.policy_id",
+    # A conjunct on the table the LEFT JOIN brings in narrows its rows only.
+    "claim c JOIN policy p ON p.policy_id = c.policy_id LEFT JOIN agent a ON a.agent_id = p.policy_id "
+    "AND a.office = 'west'",
+    # A RIGHT JOIN's ON filters the tables before it: claim, the table it keeps, meets one policy and one agent.
+    "agent a JOIN policy p ON p.policy_id = a.agent_id RIGHT JOIN claim c ON c.policy_id = p.policy_id",
 ])
 def test_a_metric_is_carried_onto_a_join_of_three_tables(join):
     """claim's metric, on a chart by agent's office: each claim row meets one policy row by policy's key, and each
@@ -2125,7 +2132,20 @@ def test_a_metric_whose_tables_only_an_outer_joins_on_joins_is_refused_with_the_
     refused = _carried(OPEN_PAID_REF, join=join, dims=("office",))
     assert isinstance(refused, PlanRefused), refused
     assert _parts(refused) == {"measure 'open_paid_by_region'": _own_grain(
-        "open_paid", "claim", "claim is joined by no key to every other table")}
+        "open_paid", "claim", "claim is joined by no key to every other table", may=True)}
+
+
+@pytest.mark.parametrize("inner", ["TRUE", "a.office = 'west'"])
+def test_a_metric_whose_table_meets_another_only_through_a_table_a_left_join_brings_in_is_refused(inner):
+    """policy, brought in with LEFT JOIN on claim's key and on agent's, bounds how many policy rows each of them meets;
+    the join still keeps every row of claim and agent's product, so policy does not join claim to agent, and claim is
+    joined by no key to every other table."""
+    join = (f"claim c JOIN agent a ON {inner} "
+            "LEFT JOIN policy p ON p.policy_id = c.policy_id AND p.policy_id = a.agent_id")
+    refused = _carried(OPEN_PAID_REF, join=join, dims=("office",))
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused) == {"measure 'open_paid_by_region'": _own_grain(
+        "open_paid", "claim", "claim is joined by no key to every other table", may=True)}
 
 
 NO_KEY = "policy JOIN claim ON claim.policy_id > policy.policy_id"
@@ -2142,7 +2162,7 @@ FOLDED = 'policy "P" JOIN claim p ON p.policy_id = "P".policy_id'
      {"join": "policy JOIN agent ON agent.agent_id = policy.policy_id"},
      "agent has no saved metric named 'count' this builder can reach"),
     (SavedRef("open_paid", K.CURRENCY, table="claim", handle="m"), {"join": NO_KEY},
-     _own_grain("open_paid", "claim", "claim is joined by no key to every other table")),
+     _own_grain("open_paid", "claim", "claim is joined by no key to every other table", may=True)),
     (SavedRef("open_paid", K.CURRENCY, table="claim", handle="m"), {"join": FOLDED},
      _own_grain("open_paid", "claim", "mnemiq cannot read how this join meets claim's rows", may=True)
      + "; give the joined tables aliases that differ by more than letter case"),
