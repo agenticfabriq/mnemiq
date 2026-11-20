@@ -467,11 +467,12 @@ def _send(served: Served, recorder: Recorder, run: BuildRun, label: str, method:
 
 
 def run_build(live, served: Served, model, plan: BuildPlan, name: str, *, builder: str = BUILDER, goal: str = GOAL,
-              stop_after: int | None = None, before_next=None, **body) -> BuildRun:
+              stop_after: int | None = None, before_next=None, before_step=None, **body) -> BuildRun:
     """The build of `plan` started and run one step per `/next` until it ends (or `stop_after` steps), each request
     with a token minted for it, every Superset call recorded, and the model's clients counted. `before_next`, when
-    given, runs once the start has answered 201 and before the first `/next`. Bounded: one `/next` per step and three
-    more; a step left to its lease (409 on the next request) stops the loop and says so."""
+    given, runs once the start has answered 201 and before the first `/next`; `before_step`, when given, before each
+    `/next`, with the build as the last answer gave it. Bounded: one `/next` per step and three more; a step left to
+    its lease (409 on the next request) stops the loop and says so."""
     from mnemiq.llm.client import LLMClient
 
     run = BuildRun(name=name, started=datetime.now(UTC).isoformat(timespec="seconds"))
@@ -514,7 +515,10 @@ def run_build(live, served: Served, model, plan: BuildPlan, name: str, *, builde
             if before_next is not None:
                 before_next()
             limit = len(start.build["steps"]) + 3 if stop_after is None else stop_after
+            state = start.build
             for _ in range(limit):
+                if before_step is not None:
+                    before_step(state)
                 step = _send(served, recorder, run, "next", "POST", f"/v1/superset/builds/{build_id}/next",
                              live.minted(builder, "build"))
                 if step.status_code == 409:
@@ -525,6 +529,7 @@ def run_build(live, served: Served, model, plan: BuildPlan, name: str, *, builde
                 if "left to run out" in (step.build.get("message") or ""):
                     run.stopped = f"step {step.build.get('ran')!r} left to its lease: {step.build.get('message')}"
                     break
+                state = step.build
             else:
                 if stop_after is None:
                     run.stopped = f"the build had not ended after {limit} requests"
@@ -1605,8 +1610,9 @@ def test_a_joined_tables_saved_metric_is_carried_onto_the_join_and_adds_up(live,
     - the chart's three bars, read as the builder through `get_chart_data`, add up to `active_premium` read as the
       builder on policy's own dataset through `query_dataset` (the source's own total), and each bar is its region's
       `active_premium`, read the same way by region, the region named by the bar's manager (`REGION_ROWS`);
-    - the chart's check status is `not_checked`: a dataset the build made over a join is not checked against mnemiq's
-      own SQL, so the numbers are held here instead;
+    - the chart's check status is `checked`: the check asked the extension's `row_rules` whether a row rule applies to
+      the builder on the dataset the build made, and compared the chart with mnemiq's own statement over that
+      dataset's SQL, read as Superset reads a virtual dataset;
     - no request called MCP's creates, a claim or `patch_chart`; no model client is made or called.
     Values from the data are compared as bools and kept out of the record."""
     assert_guard_on(served)
@@ -1678,10 +1684,118 @@ def test_a_joined_tables_saved_metric_is_carried_onto_the_join_and_adds_up(live,
             "adds up": read == [shown], "the source's": read == [own_total.quantize(cents)],
             "each bar its region's": per_bar == {manager: per_region.get(region) for region, manager, _ in REGION_ROWS}}
     assert all(same.values()), same
-    assert run.final["checks"] == {str(chart_id): "not_checked"}, (run.final["checks"], run.last_step.get("message"))
+    assert run.final["checks"] == {str(chart_id): "checked"}, (run.final["checks"], run.last_step.get("message"))
+    [check] = [request for request in run.requests if request.build.get("ran") == "check"]
+    assert [call.request for call in check.calls if call.tool == ROW_RULES] == [{"dataset_ids": [dataset_id]}]
+    assert any('AS "virtual_table"' in call.sql for call in check.calls if call.tool == "execute_sql")
     assert_no_model_call(run)
     observe("carried metric", dataset_id=dataset_id, chart_id=chart_id, same=same, check=run.final["checks"],
             message=run.last_step.get("message"))
+
+
+ROW_RULES = TOOL_PREFIX + "row_rules"
+
+
+def _carried_build_changed_before_its_check(live, served, model, region_table, name: str, change) -> tuple:
+    """The carried bar of `test_a_joined_tables_saved_metric_is_carried_onto_the_join_and_adds_up`, built step by
+    step; once its dataset is made and only the check is left, `change(dataset_id)` runs as an admin would. Returns
+    the run, the dataset's id and the chart's id; what the build made is removed after (`_remove_made`)."""
+    ref = SavedRef("active_premium", MeasureKind.CURRENCY, table="policy", handle="active_premium")
+    chart = _carried_bar("active_premium_by_manager", "Active premium by manager", ref, "manager")
+    plan = _on_join(f"policy p JOIN {region_table.name} r ON r.region = p.region", chart)
+    changed: list = []
+
+    def before_step(state: dict) -> None:
+        left = [step["key"] for step in state.get("steps", []) if step.get("status") != "done"]
+        if left == ["check"] and not changed:
+            dataset = next(step for step in state["steps"] if step["key"] == "dataset_1")
+            changed.append(change(dataset["object_id"]))
+
+    run = run_build(live, served, model, plan, name, goal="active premium by manager", before_step=before_step)
+    record(name, summary(run, served, plan) if run.build_id else {"stopped": run.stopped})
+    raw = {step["key"]: step for step in served.raw_steps(run.build_id)} if run.build_id else {}
+    return run, raw, chart, changed
+
+
+def _remove_made(live, raw: dict, chart_key: str, dashboard_id: int | None) -> None:
+    """What a build made, removed as its builder removes it: the chart, the dataset through the extension, the
+    dashboard."""
+    builder = as_user(live, BUILDER)
+    problems = []
+    if (chart_id := (raw.get(chart_key) or {}).get("object_id")) is not None:
+        if builder.call("delete_chart", {"identifier": chart_id}).get("success") is False:
+            problems.append(("delete_chart", chart_id))
+    if (dataset_id := (raw.get("dataset_1") or {}).get("object_id")) is not None:
+        answer = builder.call(TOOL_PREFIX + "delete_dataset", {"dataset_id": dataset_id, "dashboard_id": dashboard_id})
+        if answer != {"ok": True, "soft_deleted": True}:
+            problems.append(("delete_dataset", dataset_id, answer))
+    if dashboard_id is not None:
+        if builder.call("delete_dashboard", {"identifier": dashboard_id}).get("success") is False:
+            problems.append(("delete_dashboard", dashboard_id))
+    assert not problems, problems
+
+
+def test_a_row_rule_on_the_dataset_a_build_made_keeps_its_chart_from_being_compared(live, served, model, region_table,
+                                                                                     carried_metrics):
+    """Once the joined dataset is made and only the check is left, an admin attaches a Base row rule to it that keeps
+    no row (`setup_superset.py rule-on`): Superset's chart now reads no rows through the dataset, while mnemiq's own
+    SQL over the tables beneath it would find three. The extension's `row_rules` tells the check that a rule applies
+    to the builder, so the chart is `not_checked` for that reason and mnemiq's statement over the dataset's SQL is
+    never sent (the builder's own access probe still is). The rule and what the build made are removed after."""
+    rules: list[int] = []
+
+    def attach(dataset_id: int) -> int:
+        rules.append(int(run_setup("rule-on", str(dataset_id)).split()[-1]))
+        return dataset_id
+
+    run = raw = chart = None
+    try:
+        run, raw, chart, changed = _carried_build_changed_before_its_check(live, served, model, region_table,
+                                                                           "carried-row-rule", attach)
+        assert_ran_to_the_end(run)
+        assert changed and len(rules) == 1, (changed, rules)
+        dataset_id, chart_id = raw["dataset_1"]["object_id"], raw[chart.key]["object_id"]
+        assert run.final["checks"] == {str(chart_id): "not_checked"}, run.last_step.get("message")
+        assert "a row rule applies to you on the chart's dataset" in (run.last_step.get("message") or "")
+        [check] = [request for request in run.requests if request.build.get("ran") == "check"]
+        assert [call.request for call in check.calls if call.tool == ROW_RULES] == [{"dataset_ids": [dataset_id]}]
+        # The builder's access probe still runs; mnemiq's statement over the dataset's SQL never does.
+        assert [call.sql for call in check.calls if call.tool == "execute_sql" and "virtual_table" in call.sql] == []
+        observe("carried row rule", dataset_id=dataset_id, chart_id=chart_id, message=run.last_step.get("message"))
+    finally:
+        for rule in rules:
+            run_setup("rule-off", str(rule))
+        if raw:
+            _remove_made(live, raw, chart.key, run.final.get("dashboard_id"))
+
+
+def test_a_dataset_a_build_made_whose_sql_changed_before_its_check_is_not_compared(live, served, model, region_table,
+                                                                                    carried_metrics):
+    """Once the joined dataset is made and only the check is left, an admin changes its SQL (`setup_superset.py
+    set-sql`, the same join with `WHERE 1 = 1` added): the dataset is no longer what the build made, so the chart is
+    `not_checked` for that reason, the extension is not asked about row rules, and mnemiq's statement over the
+    dataset's SQL is never sent."""
+    def change(dataset_id: int) -> str:
+        [(sql,)] = metadata("SELECT sql FROM tables WHERE id = %s", (dataset_id,))
+        run_setup("set-sql", str(dataset_id), f"{sql} WHERE 1 = 1")
+        return sql
+
+    run = raw = chart = None
+    try:
+        run, raw, chart, changed = _carried_build_changed_before_its_check(live, served, model, region_table,
+                                                                           "carried-sql-changed", change)
+        assert_ran_to_the_end(run)
+        assert changed, "the dataset was never changed"
+        chart_id = raw[chart.key]["object_id"]
+        assert run.final["checks"] == {str(chart_id): "not_checked"}, run.last_step.get("message")
+        assert "its SQL is no longer the SQL the build made it with" in (run.last_step.get("message") or "")
+        [check] = [request for request in run.requests if request.build.get("ran") == "check"]
+        assert [call for call in check.calls if call.tool == ROW_RULES] == []
+        assert [call.sql for call in check.calls if call.tool == "execute_sql" and "virtual_table" in call.sql] == []
+        observe("carried sql changed", chart_id=chart_id, message=run.last_step.get("message"))
+    finally:
+        if raw:
+            _remove_made(live, raw, chart.key, run.final.get("dashboard_id"))
 
 
 def test_a_saved_metric_on_a_join_that_repeats_its_rows_is_refused_before_anything_is_made(live, served, model,
