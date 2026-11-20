@@ -491,14 +491,21 @@ def _ranking_problem(chart: _Rows, mine: _Rows, ranking: Ranking, label: str) ->
         return (0, -value if ranking.descending else value)
 
     ordered = sorted(values.values(), key=rank)
-    nth = rank(ordered[min(limit, len(ordered)) - 1])
+    nth = ordered[min(limit, len(ordered)) - 1]
+
+    def place(value) -> int:
+        """-1 before the cut, 0 tied with it (equal as `_same` compares, so float noise is a tie), 1 after it."""
+        if _same(value, nth):
+            return 0
+        return -1 if rank(value) < rank(nth) else 1
+
     shown = set(chart.values)
     order = "largest" if ranking.descending else "smallest"
     if any(values[key] is None for key in shown) and any(values[key] is not None for key in values if key not in shown):
         return (f"the chart's row limit ({limit:,}) keeps groups with no value for {label!r} and leaves out groups that "
                 f"have one, so they are not the {limit:,} {order}")
-    if any(rank(values[key]) < nth for key in values if key not in shown) or any(rank(values[key]) > nth
-                                                                                 for key in shown):
+    if any(place(values[key]) < 0 for key in values if key not in shown) or any(place(values[key]) > 0
+                                                                                for key in shown):
         return f"the chart's row limit ({limit:,}) keeps groups that are not the {limit:,} {order} by {label!r}"
     return None
 
@@ -540,10 +547,11 @@ def _compare(chart_id: int, chart: _Rows, mine: _Rows, row_limit: int | None, *,
         return outcome(ChartStatus.EMPTY, f"the chart shows no rows, and {source} finds none")
     # A measure that is NULL on every row it shows, on both sides (the values matched above), is no number the chart
     # shows: the chart reads "No data" for it, which a check must not report as checked.
-    width = max((len(values) for rows in (chart, mine) for values in rows.values.values()), default=0)
-    empty = [i for i in range(width) if all(values[i] is None for rows in (chart, mine)
-                                            for values in rows.values.values() if i < len(values))
-             and any(i < len(values) for rows in (chart, mine) for values in rows.values.values())]
+    # Over the groups the chart shows: mnemiq's other groups, those a ranked row limit left out, are on no screen.
+    sides = (list(chart.values.values()), [mine.values[key] for key in shown if key in mine.values])
+    width = max((len(values) for rows in sides for values in rows), default=0)
+    empty = [i for i in range(width) if all(values[i] is None for rows in sides for values in rows if i < len(values))
+             and any(i < len(values) for rows in sides for values in rows)]
     if empty:
         if len(empty) == width:
             return outcome(ChartStatus.EMPTY, f"the chart's measures are NULL on every row it shows, and {source} "

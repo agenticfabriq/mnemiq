@@ -394,6 +394,11 @@ def _saved_flag(value, *, absent: bool) -> bool | None:
 _ABSENT = object()
 
 
+def _is_form_metric(item) -> bool:
+    """`isQueryFormMetric` (`superset-ui-core`): a saved metric's name, any string, or a SIMPLE or SQL ad hoc one."""
+    return isinstance(item, str) or (isinstance(item, dict) and item.get("expressionType") in ("SIMPLE", "SQL"))
+
+
 def _ranked_metric(item, expectation: Expectation, dataset: DatasetFacts) -> int | None:
     found = _metric(item, dataset)
     if isinstance(found, NotCheckable) or found not in expectation.metrics:
@@ -406,21 +411,27 @@ def ranking_of(form: dict, expectation: Expectation, *, dataset: DatasetFacts) -
     mnemiq does not read one: a type whose query does not rank by its measure (mixed, pivot, funnel, sankey,
     waterfall), a sort mnemiq does not read, or a ranking metric the chart does not show.
 
-    - The time-series types: `normalizeOrderBy` (`superset-ui-core`), by `series_limit_metric` (or
-      `timeseries_limit_metric`) else `metrics[0]`, descending unless `order_desc` is false (`buildQueryObject` reads
-      it absent as true); a valid `order_by_cols` would take precedence, so any is not read.
+    - The time-series types: `normalizeOrderBy` (`superset-ui-core`), by the series limit metric `buildQueryObject`
+      picks (`series_limit_metric` when it is a metric, a string included, else `timeseries_limit_metric`), else, when
+      that is empty, `metrics[0]`; descending unless `order_desc` is false (`buildQueryObject` reads it absent as
+      true). A valid `order_by_cols` or `orderby` (both reach the query through `extractQueryFields`) would take
+      precedence, so any is not read.
     - A table (`plugin-chart-table` `buildQuery`): `timeseries_limit_metric`, ascending unless `order_desc` is true,
       else `metrics[0]` descending whatever `order_desc` says.
-    - A pie, gauge or treemap: its `metric`, descending, unless `sort_by_metric` is false."""
+    - A pie, gauge or treemap: its `metric`, descending, only when `sort_by_metric` is on: each plugin's `buildQuery`
+      orders by the metric only then, and the treemap breaks ties by its groups, which mnemiq accepts either way."""
     limit = _row_limit(form)
     viz_type = str(form.get("viz_type") or "")
     if limit is None:
         return None
     if viz_type in _TIMESERIES:
-        if form.get("order_by_cols"):
+        if form.get("order_by_cols") or form.get("orderby"):
             return None
-        item = form.get("series_limit_metric") or form.get("timeseries_limit_metric") or \
-            (_as_list(form.get("metrics")) or [None])[0]
+        item = form.get("series_limit_metric")
+        if not _is_form_metric(item):
+            item = form.get("timeseries_limit_metric")
+        if item is None or item in ("", {}, []):
+            item = (_as_list(form.get("metrics")) or [None])[0]
         descending = _saved_flag(form.get("order_desc", _ABSENT), absent=True)
     elif viz_type == "table":
         item = form.get("timeseries_limit_metric")
@@ -429,7 +440,7 @@ def ranking_of(form: dict, expectation: Expectation, *, dataset: DatasetFacts) -
         else:
             item, descending = (_as_list(form.get("metrics")) or [None])[0], True
     elif viz_type in ("pie", "gauge_chart", "treemap_v2"):
-        if _saved_flag(form.get("sort_by_metric", _ABSENT), absent=True) is not True:
+        if _saved_flag(form.get("sort_by_metric", _ABSENT), absent=False) is not True:
             return None
         item, descending = form.get("metric"), True
     else:

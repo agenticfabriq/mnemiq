@@ -1985,11 +1985,12 @@ def test_a_table_ranks_by_its_first_metric_descending_whatever_order_desc_says()
 
 
 @pytest.mark.parametrize("viz", ["pie", "gauge_chart", "treemap_v2"])
-def test_a_one_metric_chart_ranks_by_its_metric_unless_sort_by_metric_is_off(viz):
+def test_a_one_metric_chart_ranks_by_its_metric_only_when_sort_by_metric_is_on(viz):
     form = {"viz_type": viz, "groupby": ["region"], "metric": copy.deepcopy(PREMIUM), "row_limit": 10}
-    assert _ranked(form) == Ranking(0, True, 10)
     assert _ranked(form | {"sort_by_metric": True}) == Ranking(0, True, 10)
     assert _ranked(form | {"sort_by_metric": False}) is None
+    # Each plugin's buildQuery, and the extension's query context, orders by the metric only when the flag is set.
+    assert _ranked(form) is None
 
 
 def test_a_chart_with_no_positive_row_limit_has_no_ranking():
@@ -2090,3 +2091,37 @@ def test_a_read_at_its_cap_is_never_ranked(fake):
     rows = [(f"g{i:04}", float(i)) for i in range(1000)]
     check = _cut(fake, [("g0999", 999.0), ("g0998", 998.0)], rows, row_limit=2)
     assert check.status is ChartStatus.NOT_CHECKED and "returns in one read" in check.reason
+
+
+
+def test_an_empty_series_limit_metric_ranks_by_the_first_metric_not_the_timeseries_limit_metric():
+    """rc2's `buildQueryObject` keeps an empty `series_limit_metric` (a string is a metric to `isQueryFormMetric`), and
+    `normalizeOrderBy` then reads it as unset and orders by `metrics[0]`."""
+    form = _bar(metrics=[copy.deepcopy(PREMIUM), copy.deepcopy(SECOND)], series_limit_metric="",
+                timeseries_limit_metric=copy.deepcopy(SECOND))
+    assert _ranked(form) == Ranking(0, True, 100)
+
+
+def test_a_bar_with_a_raw_orderby_is_no_ranking_mnemiq_reads():
+    """`extractQueryFields` sends a form's own `orderby` to the query, as it sends `order_by_cols`."""
+    assert _ranked(_bar(orderby=[["region", True]])) is None
+
+
+@pytest.mark.parametrize("kept", [("d", 30.0), ("e", 30.000000000000004)], ids=["one", "the other"])
+def test_groups_tied_but_for_float_noise_at_the_cut_may_stand_in_for_each_other(fake, kept):
+    check = _cut(fake, [("c", 50.0), kept], [("c", 50.0), ("d", 30.0), ("e", 30.000000000000004), ("f", 5.0)],
+                 row_limit=2)
+    assert check.status is ChartStatus.CHECKED, check.reason
+
+
+def test_a_second_measure_with_no_value_on_every_kept_group_is_empty_though_a_cut_group_has_one(fake):
+    """The empty rule looks at the groups the chart shows: a measure NULL on every bar is "No data" on screen, whatever
+    the groups the row limit left out hold."""
+    other = PREMIUM | {"label": "Overdue", "sqlExpression": "SUM(CASE WHEN premium < 0 THEN premium END)",
+                       "optionName": "metric_sql_3"}
+    _serve(fake, form_data=_bar(row_limit=2, metrics=[copy.deepcopy(PREMIUM), copy.deepcopy(other)]),
+           chart=_chart_data(["region", "Total premium", "Overdue"], ("c", 50.0, None), ("d", 30.0, None)),
+           mnemiq=_result(("c", 50.0, None), ("d", 30.0, None), ("e", 10.0, 7.0),
+                          columns=(("region", "object"), ("m0", "float64"), ("m1", "float64"))))
+    check = _check(fake, kinds={"Total premium": MeasureKind.CURRENCY, "Overdue": MeasureKind.CURRENCY})
+    assert check.status is ChartStatus.EMPTY and "'Overdue'" in check.reason, check.reason
