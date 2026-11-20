@@ -1,7 +1,9 @@
-"""What the Oracle dictionary says about a table's size, read with no table data: `OracleAdapter.table_size`.
+"""What the Oracle dictionary says about a table, read with no table data: `OracleAdapter.table_size`,
+`column_statistics`, `histogram` and `unique_columns`.
 
 The dictionary is stubbed (`_rows` answered by SQL shape, as `test_oracle_resolve_called_functions.py` does); the live
-read against Oracle is `test_oracle_adapter.py::test_table_size_live`.
+reads against Oracle are `test_oracle_adapter.py::test_table_size_reads_the_statistics_oracle_gathered` and
+`test_dictionary_reads_live`.
 """
 from __future__ import annotations
 
@@ -9,7 +11,7 @@ import datetime
 
 import pytest
 
-from mnemiq.adapters.dictionary import TableSize
+from mnemiq.adapters.dictionary import ColumnStatistics, HistogramEndpoint, TableSize
 from mnemiq.adapters.oracle import OracleAdapter
 from mnemiq.adapters.scoped import TableScopedAdapter, TablesNotFound
 
@@ -44,8 +46,8 @@ ANALYZED = datetime.datetime(2026, 11, 1, 6, 0, 15)
 def test_table_size_reads_the_table_row_only():
     stats = _Statistics([("APP", "ORDERS", "TABLE", 1000, 80, ANALYZED, "NO"),
                          ("APP", "ORDERS", "PARTITION", 400, 80, ANALYZED, "NO")])
-    assert _adapter(stats).table_size("ORDERS") == TableSize(rows=1000, avg_row_len=80, analyzed="2026-11-01",
-                                                             stale=False)
+    assert _adapter(stats).table_size("ORDERS") == TableSize(rows=1000, avg_row_len=80,
+                                                             analyzed="2026-11-01T06:00:15", stale=False)
     assert "object_type = 'table'" in stats.sql[-1].lower()
 
 
@@ -83,6 +85,18 @@ class _Inner:
         self.asked.append(table)
         return TableSize(10, 8, "2026-11-01", False)
 
+    def column_statistics(self, table):
+        self.asked.append(table)
+        return []
+
+    def histogram(self, table, column):
+        self.asked.append(table)
+        return []
+
+    def unique_columns(self, table):
+        self.asked.append(table)
+        return frozenset()
+
 
 def test_scoped_adapter_reads_a_table_in_scope():
     inner = _Inner()
@@ -95,3 +109,144 @@ def test_scoped_adapter_refuses_a_table_out_of_scope():
     with pytest.raises(TablesNotFound, match="PAYROLL"):
         TableScopedAdapter(inner, ("orders",), "src").table_size("PAYROLL")
     assert inner.asked == []
+
+
+# --- a column's statistics, its histogram, and the keys the table declares ------------------------
+
+class _Dictionary:
+    """The four dictionary views the statistics profile reads, keyed by (owner, table), answered by which view the SQL
+    names. Constraint and index rows come back unfiltered, so the adapter's own filter is what the tests read."""
+
+    def __init__(self, columns=(), histograms=None, constraints=(), indexes=()):
+        self.columns = list(columns)          # (column, ndv, nulls, histogram, buckets, sample, analyzed, low, high)
+        self.histograms = histograms or {}    # column -> [(number, value, actual, raw)]
+        self.constraints = list(constraints)  # (name, type, status, validated, column)
+        self.indexes = list(indexes)          # (name, uniqueness, status, index_type, column)
+        self.sql: list[str] = []
+        self.binds: list[dict] = []
+
+    def rows(self, sql, **binds):
+        self.sql.append(sql)
+        self.binds.append(binds)
+        if (binds.get("owner"), binds.get("table_name")) != ("APP", "ORDERS"):
+            return []
+        text = sql.lower()
+        if "all_tab_col_statistics" in text:
+            return list(self.columns)
+        if "all_tab_histograms" in text:
+            return list(self.histograms.get(binds["column_name"], []))
+        if "all_constraints" in text:
+            return list(self.constraints)
+        if "all_indexes" in text:
+            return list(self.indexes)
+        raise AssertionError(f"unexpected dictionary read: {sql}")
+
+
+def _over(dictionary: _Dictionary) -> OracleAdapter:
+    a = OracleAdapter.__new__(OracleAdapter)
+    a._schema = "APP"
+    a._rows = dictionary.rows
+    return a
+
+
+def test_column_statistics_maps_each_column():
+    d = _Dictionary(columns=[
+        ("STATUS", 3, 0, "FREQUENCY", 3, 1000, ANALYZED, b"A", b"C", None),
+        ("NOTE", None, None, "NONE", None, None, None, None, None, None),
+        ("RATE", 4, 0, "NONE", None, 1000, ANALYZED, None, None, 2),
+    ])
+    assert _over(d).column_statistics("ORDERS") == [
+        ColumnStatistics(column="STATUS", distinct=3, nulls=0, histogram="FREQUENCY", buckets=3, sample_size=1000,
+                         analyzed="2026-11-01T06:00:15", low=b"A", high=b"C", scale=None),
+        ColumnStatistics(column="NOTE", distinct=None, nulls=None, histogram="NONE", buckets=None, sample_size=None,
+                         analyzed=None, low=None, high=None, scale=None),
+        ColumnStatistics(column="RATE", distinct=4, nulls=0, histogram="NONE", buckets=None, sample_size=1000,
+                         analyzed="2026-11-01T06:00:15", low=None, high=None, scale=2),
+    ]
+    assert "all_tab_columns" in d.sql[-1].lower() and "data_scale" in d.sql[-1].lower()
+
+
+def test_analyzed_keeps_the_time_of_day():
+    """A later gather on the same day that names other columns moves the table's time and leaves a column's histogram
+    as it was, still marked not stale (measured on 23.26): only the time of day tells the two apart."""
+    later = datetime.datetime(2026, 11, 1, 18, 0, 0)
+    table = _adapter(_Statistics([("APP", "ORDERS", "TABLE", 1000, 80, later, "NO")])).table_size("ORDERS")
+    column = _over(_Dictionary(columns=[("STATUS", 3, 0, "FREQUENCY", 3, 1000, ANALYZED, b"A", b"C", None)]))
+    assert (table.analyzed, column.column_statistics("ORDERS")[0].analyzed) == ("2026-11-01T18:00:00",
+                                                                                "2026-11-01T06:00:15")
+
+
+def test_database_charset_reads_the_database_character_set():
+    asked = []
+
+    def rows(sql, **binds):
+        asked.append((sql.lower(), binds))
+        return [("WE8MSWIN1252",)]
+
+    a = OracleAdapter.__new__(OracleAdapter)
+    a._rows = rows
+    assert a.database_charset() == "WE8MSWIN1252"
+    sql, binds = asked[0]
+    assert "nls_database_parameters" in sql and "nls_characterset" in sql and binds == {}
+
+
+def test_database_charset_the_dictionary_does_not_show_is_none():
+    a = OracleAdapter.__new__(OracleAdapter)
+    a._rows = lambda sql, **binds: []
+    assert a.database_charset() is None
+
+
+def test_column_statistics_of_a_table_the_dictionary_does_not_show_is_empty():
+    assert _over(_Dictionary()).column_statistics("PAYMENTS") == []
+
+
+def test_histogram_endpoints_in_order_with_raw_bytes():
+    d = _Dictionary(histograms={"STATUS": [(3000, 404999154965717 * 10**21, None, None),
+                                           (10000, 462114420409600 * 10**21, "Y", b"Y")]})
+    assert _over(d).histogram("ORDERS", "STATUS") == [
+        HistogramEndpoint(number=3000, value=404999154965717 * 10**21, actual=None, actual_raw=None),
+        HistogramEndpoint(number=10000, value=462114420409600 * 10**21, actual="Y", actual_raw=b"Y"),
+    ]
+    assert "order by endpoint_number" in d.sql[-1].lower()
+    assert d.binds[-1] == {"owner": "APP", "table_name": "ORDERS", "column_name": "STATUS"}
+
+
+def test_unique_columns_reads_only_enabled_validated_single_column_keys():
+    d = _Dictionary(
+        constraints=[("PK_ORDERS", "P", "ENABLED", "VALIDATED", "ID"),
+                     ("UK_AB", "U", "ENABLED", "VALIDATED", "A"), ("UK_AB", "U", "ENABLED", "VALIDATED", "B"),
+                     ("UK_C", "U", "DISABLED", "NOT VALIDATED", "C"),
+                     ("UK_F", "U", "ENABLED", "NOT VALIDATED", "F")],
+        indexes=[("IX_D", "UNIQUE", "VALID", "NORMAL", "D"),
+                 ("IX_E", "UNIQUE", "UNUSABLE", "NORMAL", "E"),
+                 ("IX_G", "NONUNIQUE", "VALID", "NORMAL", "G"),
+                 ("IX_H", "UNIQUE", "VALID", "FUNCTION-BASED NORMAL", "SYS_NC00009$")],
+    )
+    assert _over(d).unique_columns("ORDERS") == frozenset({"ID", "D"})
+
+
+def test_every_dictionary_read_binds_the_owner_and_the_table():
+    d = _Dictionary()
+    a = _over(d)
+    a.column_statistics("Orders")
+    a.histogram("Orders", "Status")
+    a.unique_columns("Orders")
+    assert all(b["owner"] == "APP" and b["table_name"] == "Orders" for b in d.binds)
+    assert all("Orders" not in sql and "Status" not in sql for sql in d.sql)
+
+
+@pytest.mark.parametrize(("method", "args"), [("column_statistics", ()), ("histogram", ("ID",)),
+                                              ("unique_columns", ())])
+def test_scoped_adapter_refuses_every_dictionary_read_out_of_scope(method, args):
+    inner = _Inner()
+    with pytest.raises(TablesNotFound, match="PAYROLL"):
+        getattr(TableScopedAdapter(inner, ("orders",), "src"), method)("PAYROLL", *args)
+    assert inner.asked == []
+
+
+@pytest.mark.parametrize(("method", "args"), [("column_statistics", ()), ("histogram", ("ID",)),
+                                              ("unique_columns", ())])
+def test_scoped_adapter_passes_every_dictionary_read_in_scope(method, args):
+    inner = _Inner()
+    getattr(TableScopedAdapter(inner, ("orders",), "src"), method)("ORDERS", *args)
+    assert inner.asked == ["ORDERS"]

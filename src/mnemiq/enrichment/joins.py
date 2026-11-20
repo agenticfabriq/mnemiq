@@ -153,13 +153,17 @@ def relationships_from_foreign_keys(adapter, catalog: list[TableInfo]) -> list[R
 
 
 def build_relationships(adapter, catalog: list[TableInfo], *, harvest_values: bool = True,
-                        failures: list[str] | None = None) -> list[Relationship]:
+                        failures: list[str] | None = None,
+                        estimated: frozenset[str] = frozenset()) -> list[Relationship]:
     """Declared-first, inference-fallback, per child table. A table that declares any FK is
     described by the catalog; inference runs only for tables the catalog is silent on. Each
-    candidate whose check could not run is appended to `failures`, when given."""
+    candidate whose check could not run is appended to `failures`, when given. A table in
+    `estimated` (profiled from the source's statistics) is left out of inference on both sides,
+    since checking a candidate reads both tables' rows; its declared keys are kept."""
     declared = relationships_from_foreign_keys(adapter, catalog)
     covered = {r.from_ for r in declared}
-    inferred = [r for r in infer_relationships(adapter, catalog, **unharvested(harvest_values),
+    measured = [t for t in catalog if t.name not in estimated]
+    inferred = [r for r in infer_relationships(adapter, measured, **unharvested(harvest_values),
                                                failures=failures)
                 if r.from_ not in covered]
     return declared + inferred
