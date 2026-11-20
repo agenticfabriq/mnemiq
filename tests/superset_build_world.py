@@ -929,8 +929,17 @@ class World:
         sql = f"SELECT {', '.join(selected)} FROM {source}"
         if where:
             sql += " WHERE " + " AND ".join(where)
+        # The query's own order, as rc2's `get_sqla_query` writes it (`sa.desc`/`sa.asc`, no NULLS clause), with
+        # Postgres's NULL placement spelled out, since DuckDB's differs: NULL first under DESC, last under ASC.
+        order = []
+        for item, ascending in query.get("orderby") or []:
+            expression = saved[item] if isinstance(item, str) and item in saved else \
+                f'"{item}"' if isinstance(item, str) else item["sqlExpression"]
+            order.append(f"{expression} {'ASC NULLS LAST' if ascending else 'DESC NULLS FIRST'}")
         if groups:
-            sql += " GROUP BY " + ", ".join(groups) + " ORDER BY " + ", ".join(groups)
+            sql += " GROUP BY " + ", ".join(groups)
+        if order or groups:
+            sql += " ORDER BY " + ", ".join(order or groups)
         if query.get("row_limit"):
             sql += f" LIMIT {int(query['row_limit'])}"
         found = self.db.execute(sql).fetchall()

@@ -332,6 +332,12 @@ still to come. In short:
 - **One build of a dashboard at a time.** While a build of a dashboard is building, starting another build of it is
   refused with a 409. A build left untouched for 20 minutes (twice the lease), with no step running, no longer holds
   its dashboard: the next build of that dashboard stops it, as abandoned, and takes the dashboard over.
+- **A chart whose row limit keeps only some of its groups is checked as a ranking** when it is a bar, line, area or
+  scatter chart, a table, a pie, a gauge or a treemap. The check reads from the chart's saved settings which measure
+  its query ranks by, and in which direction, as Superset orders it. It then asks whether the groups shown are the ones
+  that ranking puts first among all of mnemiq's own groups. A group with no value for that measure counts after every
+  group with one, and groups tied at the cut may stand in for each other. Any other chart a row limit cuts is not
+  checked: a mixed chart, a pivot table, a funnel, a sankey or a waterfall, or one sorted by a column.
 - **Builds are kept in the control Postgres (`MNEMIQ_CONTROL_DSN`).** It holds plans, measure definitions, Superset
   ids and statuses, never a value or a row. Without it the build routes answer 503.
 - **Without the extension, the build routes answer 503** with a sentence that names it, before anything is planned. An
