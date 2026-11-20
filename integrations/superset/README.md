@@ -194,4 +194,4 @@ JSON, inside Superset's MCP response size guard: an entry of a list that does no
 | `dataset_metrics` | Dataset | Every saved metric of up to 20 datasets, with its currency and certification. |
 | `editors_of` | Chart | The editors' labels of up to 100 charts, 20 datasets and 20 dashboards, for whom to ask for access, and for each dashboard whether the caller edits it. |
 | `get_layout` | Dashboard | A dashboard's stored layout, as text, with the `changed_on` that `set_layout` takes back. |
-| `row_rules` | Dataset | For each of up to 20 datasets, whether any row rule applies to the caller on it, as Superset works it out for the caller's own queries through that dataset; never which rule, its clause or its roles. |
+| `row_rules` | Dataset | For each of up to 20 datasets, whether a row rule attached to it applies to the caller, as Superset's `get_rls_filters` finds it (an embedded dashboard's guest rules are not counted); never which rule, its clause or its roles. |

@@ -14,7 +14,8 @@ itself, which mnemiq passes to the person's panel; no label goes into a log line
 
 Superset's MCP response size guard (`superset/mcp_service/middleware.py`, `ResponseSizeGuardMiddleware`) does not
 truncate an extension tool's answer: over its limit (50,000 bytes by default) the call fails with Superset's own text.
-So every read tool keeps its answer under `MAX_ANSWER_BYTES` itself, by one helper (`fit`): `get_layout` refuses a
+So every read tool keeps its answer under `MAX_ANSWER_BYTES` itself: `row_rules`, whose at most 20 entries are a few
+bytes each, by its size alone, and the rest by one helper (`fit`): `get_layout` refuses a
 layout over it with `{"too_large": True}`, and the tools that answer a list keep their envelope and answer each entry
 that does not fit as `{<id field>: N, "too_large": True}` (entries fill in request order, and once one does not fit
 the rest are marked). A caller treats a marked entry as unanswered.
@@ -180,9 +181,9 @@ def get_layout(found: dict) -> dict:
 @writes._answering("row_rules", REQUESTS)
 def row_rules(found: dict) -> dict:
     """Whether any row rule applies to the caller on each dataset the caller may access (`can_access_datasource`), in
-    the order asked, as Superset itself works it out for the caller's queries through that dataset
-    (`security_manager.get_rls_filters`). Only whether: never a rule's clause, name or roles, which an Alpha may not
-    list. A dataset the caller may not access, or that does not exist, is left out, so nothing tells the two apart.
+    the order asked: whether Superset's `security_manager.get_rls_filters` finds a rule attached to the dataset that
+    applies to the caller. The guest rules of an embedded dashboard are not counted; a guest is never the caller of
+    an MCP tool. Only whether: never a rule's clause, name or roles, which an Alpha may not list. A dataset the caller may not access, or that does not exist, is left out, so nothing tells the two apart.
     At most `MAX_DATASETS` short entries, so the answer is far under `MAX_ANSWER_BYTES`."""
     datasets = []
     for dataset_id in found["dataset_ids"]:

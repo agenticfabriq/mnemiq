@@ -595,6 +595,8 @@ _SQL_CHANGED = ("the chart's dataset is one this build made, but its SQL is no l
                 "so mnemiq does not check it with its own SQL")
 _RULE_APPLIES = ("a row rule applies to you on the chart's dataset, and mnemiq's own SQL reads the tables beneath it, "
                  "which that rule does not narrow, so mnemiq does not compare")
+_SQL_UNSHOWN = ("Superset did not show the SQL of the chart's dataset, which this build made, so mnemiq does not check "
+                "it with its own SQL")
 _RULES_UNKNOWN = ("mnemiq could not tell whether a row rule applies to you on the chart's dataset, so it does not "
                   "check it with its own SQL")
 
@@ -634,6 +636,8 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
         return not_checked(expectation.reason)
     sql, source = "", None
     if dataset.is_virtual and dataset.dataset_id in made:
+        if not isinstance(dataset.sql, str) or not dataset.sql:
+            return not_checked(_SQL_UNSHOWN)
         if dataset.sql != made[dataset.dataset_id]:
             return not_checked(_SQL_CHANGED)
         applies = _row_rule_applies(client, dataset.dataset_id)

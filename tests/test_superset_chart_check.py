@@ -1915,3 +1915,16 @@ def test_a_template_marker_in_a_made_datasets_sql_is_never_sent(fake):
     check = _check(fake, made={DATASET_ID: marked})
     assert check.status is ChartStatus.NOT_CHECKED and "template marker" in check.reason
     assert _statements(fake) == []
+
+
+def test_a_made_dataset_whose_sql_superset_does_not_show_is_not_called_changed(fake):
+    """Superset answers a made dataset with no SQL: nobody changed it, so the reason says mnemiq could not read it, and
+    nothing is run."""
+    _serve(fake, form_data=_bar(), chart=_chart_data(["region", "Total premium"], ("east", 1200)),
+           mnemiq=_result(("east", 1200)), dataset=_dataset(virtual=True) | {"sql": None})
+    _rules(fake, _no_rule)
+    check = _check(fake, made={DATASET_ID: MADE_SQL})
+    assert check.status is ChartStatus.NOT_CHECKED
+    assert check.reason == ("Superset did not show the SQL of the chart's dataset, which this build made, so mnemiq "
+                            "does not check it with its own SQL")
+    assert _statements(fake) == [] and ROW_RULES not in _tools(fake)

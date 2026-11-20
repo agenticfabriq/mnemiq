@@ -1699,7 +1699,8 @@ ROW_RULES = TOOL_PREFIX + "row_rules"
 def _carried_build_changed_before_its_check(live, served, model, region_table, name: str, change) -> tuple:
     """The carried bar of `test_a_joined_tables_saved_metric_is_carried_onto_the_join_and_adds_up`, built step by
     step; once its dataset is made and only the check is left, `change(dataset_id)` runs as an admin would. Returns
-    the run, the dataset's id and the chart's id; what the build made is removed after (`_remove_made`)."""
+    the run, its steps by key as the store holds them, the chart's spec and what `change` returned; the caller
+    removes what the build made (`_remove_made`)."""
     ref = SavedRef("active_premium", MeasureKind.CURRENCY, table="policy", handle="active_premium")
     chart = _carried_bar("active_premium_by_manager", "Active premium by manager", ref, "manager")
     plan = _on_join(f"policy p JOIN {region_table.name} r ON r.region = p.region", chart)
