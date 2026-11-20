@@ -74,3 +74,10 @@ class TableScopedAdapter:
 
     def view_definitions(self) -> list[tuple[str, str, str]]:
         return [view for view in self._inner.view_definitions() if self.in_scope(view[0])]
+
+    def table_size(self, table: str):
+        """The source's dictionary read for one table, refused for a table out of scope: without this, `__getattr__`
+        would hand any table's statistics through."""
+        if not self.in_scope(table):
+            raise TablesNotFound(f"source {self._source_id!r} does not list table {table!r} in its \"tables\"")
+        return self._inner.table_size(table)

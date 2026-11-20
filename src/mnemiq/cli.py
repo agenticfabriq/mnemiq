@@ -421,6 +421,24 @@ def _cmd_enrich(settings: Settings) -> int:
     from mnemiq.ontology.records import load_records, merge_records
 
     from mnemiq.adapters.scoped import TablesNotFound
+    from mnemiq.enrichment.size_check import exact_profile_refusal, statistics_refusal
+
+    # Before any table is read: an Oracle source whose manifest does not say how to profile it is
+    # checked for tables too large to read in full (`size_check`). Every other source reads nothing
+    # extra here.
+    if not superset:
+        refusal = statistics_refusal(spec)
+        if refusal is None:
+            try:
+                refusal, warning = exact_profile_refusal(spec, adapter)
+            except TablesNotFound as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            if warning:
+                print(f"WARNING: {warning}", file=sys.stderr)
+        if refusal:
+            print(refusal, file=sys.stderr)
+            return 1
 
     try:
         if superset:

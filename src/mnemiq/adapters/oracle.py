@@ -10,6 +10,7 @@ from typing import Any
 import pyarrow as pa
 
 from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
+from mnemiq.adapters.dictionary import TableSize
 
 logger = logging.getLogger(__name__)
 
@@ -1306,6 +1307,27 @@ class OracleAdapter:
                 owner=self._schema,
             )
         ]
+
+    def table_size(self, table: str) -> TableSize:
+        """`table`'s size from Oracle's optimizer statistics, reading no table data.
+
+        Only the row whose `OBJECT_TYPE` is `TABLE`: a partitioned table also has a row per partition (and
+        subpartition), and a table with partition statistics but no global ones reads as not analysed. A table the
+        dictionary does not show, or has never analysed, gives all None. `STALE_STATS` is read three ways, so a NULL is
+        unknown rather than fresh. The bind is `table_name`, since Oracle reserves `TABLE`."""
+        rows = self._rows(
+            "SELECT num_rows, avg_row_len, last_analyzed, stale_stats FROM all_tab_statistics "
+            "WHERE owner = :owner AND table_name = :table_name AND object_type = 'TABLE'",
+            owner=self._schema, table_name=table,
+        )
+        if not rows:
+            return TableSize(rows=None, avg_row_len=None, analyzed=None, stale=None)
+        num_rows, avg_row_len, analyzed, stale = rows[0]
+        return TableSize(
+            rows=num_rows, avg_row_len=avg_row_len,
+            analyzed=analyzed.date().isoformat() if analyzed is not None else None,
+            stale={"YES": True, "NO": False}.get(stale),
+        )
 
     def view_definitions(self) -> list[tuple[str, str, str]]:
         """(view, body, dialect). A failure RAISES, and that is load-bearing.
