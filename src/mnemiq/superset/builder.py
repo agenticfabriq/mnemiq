@@ -421,6 +421,10 @@ def _refused(answer: Mapping, what: str) -> _Stop:
         return _Stop("not_found", f"{what}: Superset has no such {answer['not_found']} that this builder can read")
     if answer.get("too_large"):
         return _Stop("too_large", f"{what} is larger than the extension sends")
+    if answer.get("refused") == "request" and answer.get("unknown"):
+        # An extension older than this mnemiq refuses a field it does not know (`create_chart`'s `having`, say).
+        return _Stop("extension_refused", f"Superset's mnemiq extension is older than this mnemiq and does not take "
+                                           f"what it asks for {what}: update the extension installed there")
     if "refused" in answer:
         return _Stop("extension_refused", f"the extension refused the request for {what} ({answer['refused']})")
     return _Stop("not_saved", f"Superset could not save {what}; its log says why")
