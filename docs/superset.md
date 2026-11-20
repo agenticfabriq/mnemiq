@@ -338,11 +338,16 @@ still to come. In short:
   that ranking puts first among all of mnemiq's own groups. A group with no value for that measure counts after every
   group with one, and groups tied at the cut may stand in for each other. Any other chart a row limit cuts is not
   checked: a mixed chart, a pivot table, a funnel, a sankey or a waterfall, or one sorted by a column.
+- **A chart the builder makes with a row limit leaves out the groups its measure has no value for**, when it is one of
+  those types and is not over a time axis. Its query gets `HAVING (<measure>) IS NOT NULL`, so the groups the limit
+  keeps are the largest with a value, and the check leaves the same groups out of its own rows. A chart over a time
+  axis gets no such HAVING: there it would drop points from a series and join the line across them.
 - **Builds are kept in the control Postgres (`MNEMIQ_CONTROL_DSN`).** It holds plans, measure definitions, Superset
   ids and statuses, never a value or a row. Without it the build routes answer 503.
 - **Without the extension, the build routes answer 503** with a sentence that names it, before anything is planned. An
   extension older than mnemiq, without the creates a build sends, is answered 503 too, with a sentence saying to
-  update it.
+  update it. One that has them but does not take a field a chart needs (`create_chart`'s `leave_out_no_value`, for a
+  chart made with a row limit) stops the build at that chart's step, with a sentence saying to update it.
 
 ## What each refusal returns
 

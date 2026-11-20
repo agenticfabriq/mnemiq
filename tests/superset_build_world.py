@@ -31,6 +31,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import duckdb
@@ -326,6 +327,9 @@ class World:
         self.datasets: dict[int, dict] = {}
         # The datasets on which a row rule applies to every caller, as the extension's `row_rules` answers.
         self.row_ruled: set[int] = set()
+        # An extension older than `create_chart`'s `leave_out_no_value`: it refuses the field, as the extension
+        # refuses a field it does not know.
+        self.without_leave_out = False
         self.charts: dict[int, dict] = {}
         self.dashboards: dict[int, dict] = {}
         self.hooks: dict[str, Hook] = {}
@@ -754,6 +758,8 @@ class World:
         """The extension's `create_chart`, in its two shapes: `{viz_type, params}` (a funnel or a sankey), or MCP's
         chart config as `{config, set?}`, mapped as MCP maps it (`form_data`) with `set` merged over it, the chart's
         name and labels as rc2's validators leave them; a config they refuse is refused as the extension refuses it."""
+        if self.without_leave_out and "leave_out_no_value" in request:
+            return {"refused": "request", "unknown": ["leave_out_no_value"]}
         found = extension_writes.read("create_chart", request)
         if extension_writes.claim_marker(found["marker"], found["dashboard_id"]) is None:
             return {"refused": "marker"}
@@ -761,7 +767,8 @@ class World:
         if from_config:
             shaped = found["viz_type"] is None and found["params"] is None
         else:
-            shaped = found["viz_type"] is not None and found["params"] is not None and found["set"] is None
+            shaped = found["viz_type"] is not None and found["params"] is not None and found["set"] is None \
+                and not found["leave_out_no_value"]
         if not shaped:
             return {"refused": "request"}
         if from_config and set(found["set"] or ()) & {"datasource", "datasource_id", "datasource_type", "viz_type"}:
@@ -780,6 +787,15 @@ class World:
             if any(isinstance(text, ValueError) for text in (name, *labels)):
                 return {"refused": "config"}
             form = {**self.form_data(dataset_id, found["config"]), **(found["set"] or {})}
+            if found["leave_out_no_value"]:
+                # As the extension writes it: from the ranked metric as the mapping saved it.
+                held = SimpleNamespace(metrics=[SimpleNamespace(metric_name=m["metric_name"], expression=m["expression"])
+                                                for m in dataset["metrics"]])
+                ranked = extension_writes.ranked_metric_sql(form, held)
+                if ranked is None:
+                    return {"refused": "leave_out_no_value"}
+                form["adhoc_filters"] = [*(form.get("adhoc_filters") or []),
+                                         extension_writes._having_filter(extension_writes.not_null_condition(ranked))]
             viz_type = form["viz_type"]
         else:
             name, viz_type, form = found["slice_name"], found["viz_type"], found["params"]
@@ -938,6 +954,8 @@ class World:
             order.append(f"{expression} {'ASC NULLS LAST' if ascending else 'DESC NULLS FIRST'}")
         if groups:
             sql += " GROUP BY " + ", ".join(groups)
+        if having := (query.get("extras") or {}).get("having"):
+            sql += f" HAVING {having}"
         if order or groups:
             sql += " ORDER BY " + ", ".join(order or groups)
         if query.get("row_limit"):

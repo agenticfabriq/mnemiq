@@ -1028,17 +1028,13 @@ def test_a_measure_that_is_null_everywhere_is_empty(live, served, model, policy_
     assert_no_model_call(run)
 
 
-@pytest.mark.parametrize("ending, status, said", [
-    ("END", "mismatch", "keeps groups with no value for 'Cancelled premium' and leaves out groups that have one"),
-    ("ELSE 0 END", "checked", None),
-], ids=["no value is NULL", "no value is 0"])
-def test_a_bar_whose_row_limit_cuts_groups_is_checked_as_a_ranking(live, served, model, policy_id, ending, status,
-                                                                    said):
+@pytest.mark.parametrize("ending", ["END", "ELSE 0 END"], ids=["no value is NULL", "no value is 0"])
+def test_a_bar_whose_row_limit_cuts_groups_is_checked_as_a_ranking(live, served, model, policy_id, ending):
     """The ten largest cancelled premiums by policy: a bar by `id` of `SUM(CASE WHEN status = 'cancelled' THEN premium
-    <ending>)` with row limit 10, checked as a ranking. The premise, measured first: more than ten policies are not
-    cancelled and more than ten are. With no ELSE, the bars the chart's query keeps are not the ten largest (a group
-    with no value counts after every group with one): a mismatch, for that reason. Ending ELSE 0, they are: checked.
-    No model client is made or called."""
+    <ending>)` with row limit 10. The premise, measured first: more than ten policies are not cancelled and more than
+    ten are. The chart is made with HAVING (<measure>) IS NOT NULL, so with no ELSE the policies with no value are left
+    out and the ten bars, read as the builder, all have one: checked as a ranking. Ending ELSE 0, the ten largest are
+    kept: checked. No model client is made or called."""
     expression = f"SUM(CASE WHEN status = 'cancelled' THEN premium {ending})"
     [(cancelled, other)] = ground_truth(live, "SELECT count(*) FILTER (WHERE status = 'cancelled'), "
                                               "count(*) FILTER (WHERE status <> 'cancelled') FROM policy")
@@ -1055,11 +1051,44 @@ def test_a_bar_whose_row_limit_cuts_groups_is_checked_as_a_ranking(live, served,
     record(name, summary(run, served, plan) if run.build_id else {"stopped": run.stopped})
     assert_ran_to_the_end(run)
     [chart_id] = [step["object_id"] for step in run.final["steps"] if step["key"] == bar.key]
-    assert run.final["checks"].get(str(chart_id)) == status, (run.final["checks"], run.last_step.get("message"))
-    if said is not None:
-        assert said in (run.last_step.get("message") or ""), run.last_step.get("message")
+    assert run.final["checks"].get(str(chart_id)) == "checked", (run.final["checks"], run.last_step.get("message"))
+    builder = SupersetMcp(live.mcp_url, DelegatedToken(live.minted(BUILDER, "build")), timeout_s=90)
+    bars = builder.call("get_chart_data", {"identifier": chart_id}).get("data") or []
+    assert len(bars) == 10 and all(row.get("Cancelled premium") is not None for row in bars), len(bars)
     assert_no_model_call(run)
-    observe(name, chart_id=chart_id, check=run.final["checks"], message=run.last_step.get("message"))
+    observe(name, chart_id=chart_id, check=run.final["checks"], bars=len(bars))
+
+
+RANKED_FAMILIES = (Family.BAR, Family.LINE, Family.AREA, Family.SCATTER, Family.TABLE, Family.PIE, Family.GAUGE,
+                   Family.TREEMAP)
+
+
+def test_every_ranked_type_leaves_out_groups_with_no_value(live, served, model, policy_id):
+    """One build of eight charts, one of each type the builder gives the HAVING (a bar, line, area and scatter over
+    a category, a table, a pie, a gauge and a treemap), each of cancelled premium with no ELSE by policy, row limit
+    10 (a gauge's most): Superset applies the HAVING for each, so every chart's rows, read as the builder, hold no
+    policy with no value, and every chart is checked."""
+    measure = Measure(name="cancelled_premium", label="Cancelled premium",
+                      expression="SUM(CASE WHEN status = 'cancelled' THEN premium END)", kind=MeasureKind.CURRENCY,
+                      dataset_id=policy_id, description="Premium of cancelled policies", asked_by="")
+    charts = tuple(ChartSpec(key=f"cancelled_{family.name.lower()}", family=family,
+                             title=f"Cancelled premium ({family.name.lower()})", dataset_id=policy_id,
+                             measures=(WrittenRef(measure),), dimensions=("id",), time_column=None, time_grain=None,
+                             filters=(), row_limit=10, source=None, target=None) for family in RANKED_FAMILIES)
+    plan = BuildPlan(charts=charts, measures=(measure,))
+    run = run_build(live, served, model, plan, "every ranked type", goal="cancelled premium every way")
+    record("every ranked type", summary(run, served, plan) if run.build_id else {"stopped": run.stopped})
+    assert_ran_to_the_end(run)
+    ids = {step["key"]: step["object_id"] for step in run.final["steps"]}
+    builder = SupersetMcp(live.mcp_url, DelegatedToken(live.minted(BUILDER, "build")), timeout_s=90)
+    seen = {}
+    for chart in charts:
+        rows = builder.call("get_chart_data", {"identifier": ids[chart.key]}).get("data") or []
+        seen[chart.family.name] = (len(rows), sum(1 for row in rows if row.get("Cancelled premium") is None))
+    assert all(nulls == 0 and count > 0 for count, nulls in seen.values()), seen
+    assert set(run.final["checks"].values()) == {"checked"}, (run.final["checks"], run.last_step.get("message"))
+    assert_no_model_call(run)
+    observe("every ranked type", seen=seen, checks=run.final["checks"])
 
 
 def _percent_big_number(policy_id: int, key: str, expression: str) -> tuple[Measure, ChartSpec]:

@@ -1372,6 +1372,33 @@ def test_create_dataset_physical_and_virtual_carry_the_marker(live, extension, m
 BOTH_REFUSE = {"interactive_pivot"}
 
 
+def test_create_chart_leaves_out_no_value_from_the_metric_as_superset_saved_it(live, extension, policy_id, made):
+    """A bar of `policies` by region with a row limit, as a build sends it (`config_request`, which asks to leave out
+    groups with no value): saved with a SQL HAVING filter last among its filters whose condition is built from the
+    metric as Superset saved it, and in its query context's `extras.having`, wrapped as Superset's frontend wraps a
+    clause. A big number asked the same, which ranks by no one metric, is refused and nothing carrying its marker is
+    saved."""
+    from mnemiq.superset.charts import not_null_condition
+
+    client = as_user(live, BUILDER)
+    build = new_build(client, "leave_out")
+    chart = spec(Family.BAR, policy_id, dimensions=("region",), row_limit=10)
+    request = config_request(build, chart, build.marker("leave_out"))
+    assert request.get("leave_out_no_value") is True, request
+    answer = made.chart(call(client, "create_chart", **request))
+    assert set(answer) == {"chart_id"}, answer
+    stored = stored_chart(answer["chart_id"])
+    condition = not_null_condition(stored["params"]["metrics"][0]["sqlExpression"])
+    last = stored["params"]["adhoc_filters"][-1]
+    assert (last["clause"], last["expressionType"], last["sqlExpression"]) == ("HAVING", "SQL", condition)
+    assert stored["query_context"]["queries"][0]["extras"]["having"] == f"({condition})"
+    big_marker = build.marker("big_number")
+    big = {**config_request(build, spec(Family.BIG_NUMBER, policy_id), big_marker), "leave_out_no_value": True}
+    assert made.chart(call(client, "create_chart", **big)) == {"refused": "leave_out_no_value"}
+    assert carrying("slices", big_marker) == []
+    observe("leave out", chart_id=answer["chart_id"], having=stored["query_context"]["queries"][0]["extras"]["having"])
+
+
 def test_a_config_chart_saves_what_generate_chart_saves(live, extension, policy_id, made):
     """For every one of MCP's chart families, one chart spec sent both ways, each request built by mnemiq: to MCP's
     `generate_chart` (`generate_chart_request`) and to the extension's `create_chart` (`config_chart_request`). The

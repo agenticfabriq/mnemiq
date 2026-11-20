@@ -28,7 +28,7 @@ from mnemiq.superset.adapter import SupersetSqlAdapter
 from mnemiq.superset.build_store import DashboardBusy, StepState
 from mnemiq.superset.builder import BuildBusy, BuildState, build_state, build_steps, next_step, start_build
 from mnemiq.superset.chart_check import ChartStatus
-from mnemiq.superset.charts import Family, SavedRef, WrittenRef, extension_chart_request
+from mnemiq.superset.charts import ChartSpec, Family, SavedRef, WrittenRef, extension_chart_request
 from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetRefusedCaller, SupersetToolError
 from mnemiq.superset.extension import TOOL_PREFIX
 from mnemiq.superset.marker import Marker, format_marker, parse_marker
@@ -1413,20 +1413,64 @@ def test_the_workflows_run_this_module(workflow):
 
 
 
-@pytest.mark.parametrize("ending, status, said", [
-    ("END", ChartStatus.MISMATCH, "keeps groups with no value for 'Lapsed premium' and leaves out groups that have one"),
-    ("ELSE 0 END", ChartStatus.CHECKED, "its row limit keeps the 2 largest groups by 'Lapsed premium'"),
-], ids=["no value is NULL", "no value is 0"])
-def test_a_ranked_bar_whose_row_limit_cuts_groups_is_checked_as_a_ranking(fake, world, store, ending, status, said):
-    """Lapsed premium by region, two bars of three, east having no lapsed policy, checked as a ranking: written with
-    no ELSE, the bars the chart's query keeps are not the two largest (a group with no value counts after every group
-    with one), a mismatch; written to give 0 where nothing lapsed, they are, checked."""
+def _lapsed_bar(ending: str) -> tuple[Measure, ChartSpec]:
     lapsed = Measure(name="lapsed_premium", label="Lapsed premium",
                      expression=f"SUM(CASE WHEN status = 'lapsed' THEN premium {ending})", kind=MeasureKind.CURRENCY,
                      dataset_id=POLICY_DATASET, description="", asked_by="", currency="USD")
     chart = dataclasses.replace(_chart("lapsed_by_region", Family.BAR, "Lapsed premium by region", POLICY_DATASET,
                                        (WrittenRef(lapsed),), dimensions=("region",)), row_limit=2)
+    return lapsed, chart
+
+
+@pytest.mark.parametrize("ending", ["END", "ELSE 0 END"], ids=["no value is NULL", "no value is 0"])
+def test_a_ranked_bar_whose_row_limit_cuts_groups_is_checked_as_a_ranking(fake, world, store, ending):
+    """Lapsed premium by region, two bars of three, east having no lapsed policy. The chart is made with the HAVING
+    that leaves out the groups with no value, so written with no ELSE east is left out and the two bars are the two
+    regions that have one, checked; written to give 0 there, the two largest of three are kept, checked as a
+    ranking."""
+    lapsed, chart = _lapsed_bar(ending)
     final = _run(store, _start(store, BuildPlan(charts=(chart,), measures=(lapsed,))).build_id, _adapter(fake))[-1]
     chart_id = _step(final, "lapsed_by_region").object_id
-    assert final.status == "done" and final.checks == {chart_id: status}, final.message
-    assert said in final.message or status is ChartStatus.CHECKED, final.message
+    assert final.status == "done" and final.checks == {chart_id: ChartStatus.CHECKED}, final.message
+    [having] = [f for f in world.charts[chart_id]["params"]["adhoc_filters"] if f.get("clause") == "HAVING"]
+    assert having["sqlExpression"] == f"({lapsed.expression}) IS NOT NULL"
+
+
+def test_an_extension_without_leave_out_no_value_stops_the_chart_step_and_makes_no_chart(fake, world, store):
+    world.without_leave_out = True
+    lapsed, chart = _lapsed_bar("END")
+    states = _run(store, _start(store, BuildPlan(charts=(chart,), measures=(lapsed,))).build_id, _adapter(fake))
+    final = states[-1]
+    assert final.status == "failed", final
+    assert "older than this mnemiq" in final.message and "update the extension" in final.message, final.message
+    assert world.charts == {}
+
+
+def test_a_carried_metric_ranked_on_a_join_the_build_made_carries_its_having_on_the_joins_columns(fake, world, store):
+    """Policy's saved metric carried onto a join with claim, by claim region, one bar: the chart is made with the
+    HAVING of the metric as the joined dataset names its columns, and the check over the dataset the build made reads
+    the cut as a ranking."""
+    from mnemiq.superset.planner import FakePlanner, plan_build
+
+    world.datasets[POLICY_DATASET]["metrics"].append(
+        {"metric_name": "active_premium", "expression": "SUM(CASE WHEN status = 'active' THEN premium END)",
+         "verbose_name": "Active premium", "d3format": None, "currency": None, "certified_by": "finance",
+         "certification_details": None, "warning_text": None, "description": None})
+    join = "policy JOIN claim ON claim.claim_id = policy.policy_id"
+    ref = SavedRef("active_premium", MeasureKind.CURRENCY, table="policy", handle="active_premium")
+    chart = dataclasses.replace(_chart("active_by_claim_region", Family.BAR, "Active premium by claim region", -1,
+                                       (ref,), dimensions=("claim_region",)), row_limit=1)
+    planned = BuildPlan(charts=(chart,), measures=(), datasets=(PlannedDataset(key="dataset_1", placeholder=-1,
+                                                                                join=join),))
+    adapter = _adapter(fake)
+    plan = plan_build(GOAL, planner=FakePlanner(planned), client=adapter.client, adapter=adapter, snapshot=SNAPSHOT,
+                      grants=GRANTS, settings=SETTINGS)
+    assert isinstance(plan, BuildPlan), plan
+    [measure] = plan.measures
+    final = _run(store, _start(store, plan).build_id, _adapter(fake))[-1]
+    [request] = [call.request for call in world.calls("create_chart")]
+    assert request["leave_out_no_value"] is True and '"status"' in measure.expression
+    chart_id = _step(final, "active_by_claim_region").object_id
+    [left_out] = [f for f in world.charts[chart_id]["params"]["adhoc_filters"] if f.get("clause") == "HAVING"]
+    assert left_out["sqlExpression"] == f"({measure.expression}) IS NOT NULL"
+    assert final.status == "done" and final.checks == {chart_id: ChartStatus.CHECKED}, final.message

@@ -2156,3 +2156,88 @@ def test_a_row_offset_is_no_ranking_mnemiq_reads(offset):
 @pytest.mark.parametrize("offset", [None, 0])
 def test_no_row_offset_keeps_the_ranking(offset):
     assert _ranked(_bar(row_offset=offset)) == Ranking(0, True, 100)
+
+
+# ---------------------------------------------------------------- the builder's HAVING: groups with no value left out
+
+from mnemiq.superset.charts import not_null_condition  # noqa: E402
+
+
+def _having(condition: str) -> dict:
+    return {"clause": "HAVING", "expressionType": "SQL", "sqlExpression": condition, "subject": None,
+            "operator": None, "comparator": None, "isExtra": False, "isNew": False,
+            "filterOptionName": "mnemiq_having_0"}
+
+
+LEFT_OUT = _having(not_null_condition("SUM(premium)"))
+
+
+def test_the_builders_having_is_read_as_leaving_out_groups_with_no_value():
+    form = _bar(adhoc_filters=[copy.deepcopy(WEB_ONLY), copy.deepcopy(NO_TIME_FILTER), LEFT_OUT])
+    assert expectation_from_form_data(form, dataset=PHYSICAL) == Expectation(
+        metrics=(("Total premium", "SUM(premium)"),), dimensions=("region",), time_grain=None,
+        filters=(Filter("channel", "IN", ["web"]),), not_null=(0,))
+
+
+def test_mnemiqs_groups_with_no_value_are_left_out_as_the_having_leaves_them_out(fake):
+    """The chart's query leaves out the groups with no value; mnemiq's own rows hold them, and drops them the same way,
+    so a ranked cut of what is left is checked."""
+    _serve(fake, form_data=_bar(row_limit=2, adhoc_filters=[copy.deepcopy(WEB_ONLY), LEFT_OUT]),
+           chart=_chart_data(["region", "Total premium"], ("c", 50.0), ("d", 30.0)),
+           mnemiq=_result(("a", None), ("b", None), ("c", 50.0), ("d", 30.0), ("e", 10.0),
+                          columns=(("region", "object"), ("m0", "float64"))))
+    check = _check(fake)
+    assert check.status is ChartStatus.CHECKED and check.reason == RANKED.format(n=2, order="largest")
+    assert check.mnemiq_values == (("c", 50.0), ("d", 30.0), ("e", 10.0))
+
+
+def test_a_saved_metrics_having_is_its_expression(fake):
+    rows = (("c", 50.0), ("d", 30.0))
+    _serve(fake, form_data=_bar(metrics=[M_SAVED], adhoc_filters=[_having(not_null_condition("SUM(premium)"))]),
+           chart=_chart_data(["region", M_SAVED], *rows),
+           mnemiq=_result(("a", None), *rows, columns=(("region", "object"), ("m0", "float64"))),
+           dataset=_dataset(metrics=[(M_SAVED, "SUM(premium)")]))
+    record = SavedMetric(dataset_id=DATASET_ID, name=M_SAVED, expression="SUM(premium)", verbose_name=None,
+                         d3format=None, currency=None, certified_by=None, warning_text=None)
+    check = _check(fake, kinds={M_SAVED: MeasureKind.CURRENCY}, saved={M_SAVED: record})
+    assert check.status is ChartStatus.CHECKED, check.reason
+
+
+def test_the_having_on_a_dataset_this_build_made_leaves_out_the_same_groups(fake):
+    _serve(fake, form_data=_bar(row_limit=2, adhoc_filters=[LEFT_OUT]),
+           chart=_chart_data(["region", "Total premium"], ("c", 50.0), ("d", 30.0)),
+           mnemiq=_result(("a", None), ("c", 50.0), ("d", 30.0), ("e", 1.0),
+                          columns=(("region", "object"), ("m0", "float64"))),
+           dataset=_dataset(virtual=True))
+    _rules(fake, _no_rule)
+    check = _check(fake, made={DATASET_ID: MADE_SQL})
+    assert check.status is ChartStatus.CHECKED, check.reason
+
+
+@pytest.mark.parametrize("filters", [
+    [_having(not_null_condition("MAX(premium)"))],
+    [_having("(SUM(premium)) > 0")],
+    [LEFT_OUT, copy.deepcopy(LEFT_OUT)],
+    [_having(not_null_condition("SUM(premium)") + " OR 1 = 1")],
+], ids=["a metric the chart does not show", "another condition", "twice on one metric", "more after it"])
+def test_any_other_sql_having_keeps_todays_reason(filters):
+    form = _bar(adhoc_filters=[copy.deepcopy(WEB_ONLY), *filters])
+    assert expectation_from_form_data(form, dataset=PHYSICAL) == NotCheckable(chart_form._SQL_FILTER)
+
+
+def test_a_simple_having_keeps_todays_reason():
+    simple = {"clause": "HAVING", "expressionType": "SIMPLE", "subject": "Total premium", "operator": "IS NOT NULL",
+              "comparator": None}
+    assert expectation_from_form_data(_bar(adhoc_filters=[simple]), dataset=PHYSICAL) == NotCheckable(
+        "the chart filters its aggregated values (HAVING), which mnemiq does not translate")
+
+
+@pytest.mark.parametrize("viz", ["mixed_timeseries", "pivot_table_v2", "big_number_total"])
+def test_the_builders_having_on_a_type_it_never_gives_one_keeps_todays_reason(viz):
+    """The builder gives the HAVING only to the types the check ranks; on any other type (a mixed chart, whose second
+    query has filters of its own, say) it is read as any other SQL filter, never as leaving out mnemiq's rows."""
+    form = {"viz_type": viz, "x_axis": "region", "groupby": [], "groupbyRows": ["region"],
+            "metrics": [copy.deepcopy(PREMIUM)], "metric": copy.deepcopy(PREMIUM), "metrics_b": [copy.deepcopy(SECOND)],
+            "adhoc_filters": [LEFT_OUT], "adhoc_filters_b": [], "row_limit": 10}
+    found = expectation_from_form_data(form, dataset=PHYSICAL)
+    assert not isinstance(found, Expectation) or found.not_null == (), found

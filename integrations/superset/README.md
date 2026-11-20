@@ -68,7 +68,7 @@ from them what it already may do through Superset's own tools.
 |---|---|---|
 | `create_dashboard` | Dashboard | An unpublished, empty dashboard with the caller as its editor and a build marker. |
 | `create_dataset` | Dataset | A dataset over a table, or over `sql` when given, made with its build marker and, as editors, the caller and the dashboard's users whose grants reach it. |
-| `create_chart` | Chart | A chart of any family, from MCP's own chart config (and format keys to merge) or a funnel's or a sankey's form data, made with the dashboard's editors, a build marker and its query context, and saved only once its query runs. |
+| `create_chart` | Chart | A chart of any family, from MCP's own chart config (and format keys to merge, and up to 5 SQL HAVING conditions to add to its filters) or a funnel's or a sankey's form data, made with the dashboard's editors, a build marker and its query context, and saved only once its query runs. |
 | `patch_chart` | Chart | Sets and unsets named params keys, keeping every other key. |
 | `add_saved_metric` | Dataset | Adds one aggregating saved metric, keeping the others. |
 | `delete_dataset` | Dataset | Moves a dataset a build made to the trash once no chart uses it. |
