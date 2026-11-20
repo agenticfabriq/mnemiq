@@ -1808,3 +1808,123 @@ def test_a_big_number_percent_above_100_is_format_wrong_through_check_chart(fake
     assert type(check) is ChartCheck and check.status is ChartStatus.FORMAT_WRONG, check
     assert check.reason == ("the chart shows 'Total premium' above 100% (54.97), as a measure on a 0 to 100 scale "
                             "would under a percent format")
+
+
+# ---------------------------------------------------------------- a dataset this build made
+
+MADE_SQL = "SELECT * FROM policy"
+ROW_RULES = "extensions.agenticfabriq.mnemiq.row_rules"
+SQL_CHANGED = ("the chart's dataset is one this build made, but its SQL is no longer the SQL the build made it with, "
+               "so mnemiq does not check it with its own SQL")
+RULE_APPLIES = ("a row rule applies to you on the chart's dataset, and mnemiq's own SQL reads the tables beneath it, "
+                "which that rule does not narrow, so mnemiq does not compare")
+CANNOT_TELL_RULES = ("mnemiq could not tell whether a row rule applies to you on the chart's dataset, so it does not "
+                     "check it with its own SQL")
+
+
+def _rules(fake, answer) -> None:
+    """The extension's `row_rules` answering `answer`: a payload, an exception, or a function of the request."""
+    fake.reply(ROW_RULES, lambda request, authorization: answer(request) if callable(answer) else
+               (_raise(answer) if isinstance(answer, Exception) else answer))
+
+
+def _raise(failure: Exception):
+    raise failure
+
+
+def _no_rule(request) -> dict:
+    return {"datasets": [{"dataset_id": i, "applies": False} for i in request["dataset_ids"]]}
+
+
+def _made(fake, *, chart_rows=(("east", 1200), ("west", 800)), mnemiq_rows=(("east", 1200), ("west", 800)),
+          rules=_no_rule, form_data=None):
+    _serve(fake, form_data=form_data or _bar(), chart=_chart_data(["region", "Total premium"], *chart_rows),
+           mnemiq=_result(*mnemiq_rows), dataset=_dataset(virtual=True))
+    _rules(fake, rules)
+
+
+def test_a_chart_on_a_dataset_this_build_made_is_checked_with_its_own_sql(fake):
+    """The build made the virtual dataset with this SQL, the SQL is unchanged, and no row rule applies to the builder
+    on it: mnemiq's statement reads the dataset's SQL as Superset reads a virtual dataset, and the chart is checked."""
+    _made(fake)
+    check = _check(fake, made={DATASET_ID: MADE_SQL})
+    assert check.status is ChartStatus.CHECKED, check.reason
+    assert check.chart_values == check.mnemiq_values == (("east", 1200), ("west", 800))
+    [sql] = _statements(fake)
+    assert f'FROM ({MADE_SQL}) AS "virtual_table"' in sql and "SUM(premium)" in sql and "'web'" in sql
+    [asked] = [call for call in fake.calls if call.tool == ROW_RULES]
+    assert asked.request == {"dataset_ids": [DATASET_ID]} and asked.authorization == f"Bearer {TOKEN}"
+    assert "query_dataset" not in _tools(fake)
+
+
+def test_a_made_datasets_sql_changed_since_is_not_checked_and_nothing_is_run(fake):
+    _made(fake)
+    check = _check(fake, made={DATASET_ID: MADE_SQL + " "})
+    assert check.status is ChartStatus.NOT_CHECKED and check.reason == SQL_CHANGED
+    assert check.chart_values is None and check.mnemiq_values is None
+    assert _statements(fake) == [] and "query_dataset" not in _tools(fake)
+
+
+def test_a_row_rule_on_a_made_dataset_means_no_comparison_and_no_values(fake):
+    _made(fake, rules=lambda request: {"datasets": [{"dataset_id": DATASET_ID, "applies": True}]})
+    check = _check(fake, made={DATASET_ID: MADE_SQL})
+    assert check.status is ChartStatus.NOT_CHECKED and check.reason == RULE_APPLIES
+    assert check.chart_values is None and check.mnemiq_values is None
+    assert _statements(fake) == [] and "get_chart_data" not in _tools(fake)
+
+
+@pytest.mark.parametrize("rules", [
+    RuntimeError(f"Internal error in {ROW_RULES}: An unexpected error occurred. Error ID: 3f9c0a1b."),
+    RuntimeError("boom"),
+    {"datasets": []},
+    {"datasets": [{"dataset_id": DATASET_ID, "applies": "no"}]},
+    {"datasets": [{"dataset_id": DATASET_ID + 1, "applies": False}]},
+    {"refused": "request", "field": "dataset_ids"},
+    ["not", "an", "object"],
+], ids=["not offered", "failed", "left out", "not a boolean", "another dataset", "refused", "not an object"])
+def test_a_made_dataset_whose_row_rules_cannot_be_told_is_not_checked(fake, rules):
+    _made(fake, rules=rules)
+    check = _check(fake, made={DATASET_ID: MADE_SQL})
+    assert check.status is ChartStatus.NOT_CHECKED and check.reason == CANNOT_TELL_RULES
+    assert check.chart_values is None and check.mnemiq_values is None
+    assert _statements(fake) == []
+
+
+def test_a_virtual_dataset_the_build_did_not_make_is_read_as_before(fake):
+    _made(fake)
+    before = _check(fake)
+    fake.calls.clear()
+    check = _check(fake, made={DATASET_ID + 1: MADE_SQL})
+    assert check.status is ChartStatus.NOT_CHECKED and check.reason == before.reason
+    assert "virtual dataset" in check.reason
+    assert _statements(fake) == [] and ROW_RULES not in _tools(fake)
+
+
+def test_a_written_measure_off_on_a_made_dataset_is_a_mismatch(fake):
+    _made(fake, mnemiq_rows=(("east", 1200), ("west", 801)))
+    check = _check(fake, made={DATASET_ID: MADE_SQL})
+    assert check.status is ChartStatus.MISMATCH, check.reason
+    assert check.mnemiq_values == (("east", 1200), ("west", 801))
+
+
+def test_a_template_marker_in_a_made_datasets_sql_is_never_sent(fake):
+    marked = "SELECT * FROM policy WHERE '{{' = '{{'"
+    _serve(fake, form_data=_bar(), chart=_chart_data(["region", "Total premium"], ("east", 1200)),
+           mnemiq=_result(("east", 1200)), dataset=_dataset(virtual=True) | {"sql": marked})
+    _rules(fake, _no_rule)
+    check = _check(fake, made={DATASET_ID: marked})
+    assert check.status is ChartStatus.NOT_CHECKED and "template marker" in check.reason
+    assert _statements(fake) == []
+
+
+def test_a_made_dataset_whose_sql_superset_does_not_show_is_not_called_changed(fake):
+    """Superset answers a made dataset with no SQL: nobody changed it, so the reason says mnemiq could not read it, and
+    nothing is run."""
+    _serve(fake, form_data=_bar(), chart=_chart_data(["region", "Total premium"], ("east", 1200)),
+           mnemiq=_result(("east", 1200)), dataset=_dataset(virtual=True) | {"sql": None})
+    _rules(fake, _no_rule)
+    check = _check(fake, made={DATASET_ID: MADE_SQL})
+    assert check.status is ChartStatus.NOT_CHECKED
+    assert check.reason == ("Superset did not show the SQL of the chart's dataset, which this build made, so mnemiq "
+                            "does not check it with its own SQL")
+    assert _statements(fake) == [] and ROW_RULES not in _tools(fake)

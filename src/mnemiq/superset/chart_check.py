@@ -26,8 +26,12 @@ Superset 7.0.0rc2 decide most of it:
 - Superset's text never enters a reason: a refusal can name a table or a user the caller may not see. It goes to the
   log, as the client logs it.
 
-A virtual dataset is never checked with mnemiq's own SQL: a row rule attached to the virtual dataset alone applies to
-queries of that dataset, not to SQL over its tables. A saved metric on one is checked through `query_dataset`
+A virtual dataset is never checked with mnemiq's own SQL, except one this build made (`check_chart`'s `made`) whose
+SQL is still the SQL the build made it with and on which no row rule applies to the builder: a row rule attached to
+the virtual dataset alone applies to queries of that dataset, not to SQL over its tables. Whether one applies is the
+extension's `row_rules`, which asks Superset as the builder and answers only whether; when one does, or mnemiq cannot
+tell, mnemiq's statement is not run. Such a made dataset is read as Superset reads a virtual one,
+`FROM (<its SQL>) AS "virtual_table"`. Any other virtual dataset's saved metric is checked through `query_dataset`
 (`superset/mcp_service/dataset/tool/query_dataset.py`), which takes saved metric names only, and a measure written on
 the chart is not checked.
 
@@ -39,7 +43,7 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
@@ -70,6 +74,7 @@ from mnemiq.superset.chart_form import (
 )
 from mnemiq.superset.charts import Filter
 from mnemiq.superset.client import SupersetToolError, SupersetUnavailable
+from mnemiq.superset.extension import TOOL_PREFIX
 from mnemiq.superset.display_format import CANNOT_TELL, Displayed, displayed, fits, metric_label, shows_currency
 from mnemiq.superset.measures import Measure, MeasureKind, measure_statement, run_decided
 from mnemiq.superset.saved_metrics import SavedMetric
@@ -349,9 +354,10 @@ def _filter_sql(item: Filter) -> str:
     return f"{column} {operator} {_literal(item.value)}"
 
 
-def _statement(expectation: Expectation, dataset: DatasetFacts, *, grained: bool) -> str:
+def _statement(expectation: Expectation, dataset: DatasetFacts, *, grained: bool, source: str | None = None) -> str:
     """mnemiq's statement for the chart's query, through `measure_statement`: each metric aliased by position, the
-    x-axis grouped by the grain when `grained`, as Postgres's grain expression writes it."""
+    x-axis grouped by the grain when `grained`, as Postgres's grain expression writes it. It reads `source` when given
+    (a made dataset's SQL as Superset reads a virtual one), else the dataset's table."""
     saved = dict(dataset.saved_metric_sql)
     measures = tuple(Measure(name=f"m{i}", label=label,
                              expression=saved[label] if label in dataset.saved_metric_names else expression,
@@ -360,7 +366,7 @@ def _statement(expectation: Expectation, dataset: DatasetFacts, *, grained: bool
     columns = [_quoted(name) for name in expectation.dimensions]
     if grained and expectation.time_grain:
         columns[0] = f"DATE_TRUNC('{_GRAINS[expectation.time_grain]}', {columns[0]}) AS {columns[0]}"
-    return measure_statement(measures, _quoted(dataset.table), tuple(columns),
+    return measure_statement(measures, source or _quoted(dataset.table), tuple(columns),
                              tuple(_filter_sql(item) for item in expectation.filters))
 
 
@@ -584,8 +590,36 @@ def percent_problem(kinds: dict[str, MeasureKind], labels: tuple[str, ...], rows
     return None
 
 
+# Why a dataset this build made is not checked with mnemiq's own SQL after all.
+_SQL_CHANGED = ("the chart's dataset is one this build made, but its SQL is no longer the SQL the build made it with, "
+                "so mnemiq does not check it with its own SQL")
+_RULE_APPLIES = ("a row rule applies to you on the chart's dataset, and mnemiq's own SQL reads the tables beneath it, "
+                 "which that rule does not narrow, so mnemiq does not compare")
+_SQL_UNSHOWN = ("Superset did not show the SQL of the chart's dataset, which this build made, so mnemiq does not check "
+                "it with its own SQL")
+_RULES_UNKNOWN = ("mnemiq could not tell whether a row rule applies to you on the chart's dataset, so it does not "
+                  "check it with its own SQL")
+
+
+def _row_rule_applies(client, dataset_id: int) -> bool | NotCheckable:
+    """Whether a row rule applies to the caller on the dataset, as the extension's `row_rules` answers it. Anything
+    but one entry for the dataset with a boolean, or a failure of the call, is that mnemiq cannot tell. A refusal of
+    the caller is raised, as for every other call of the check."""
+    try:
+        answer = client.call(TOOL_PREFIX + "row_rules", {"dataset_ids": [dataset_id]})
+    except (SupersetUnavailable, SupersetToolError) as failure:
+        logger.warning("the value check: the extension's row_rules for dataset %s failed: %s", dataset_id, failure)
+        return NotCheckable(_RULES_UNKNOWN)
+    entries = answer.get("datasets") if isinstance(answer, dict) else None
+    found = [entry for entry in entries if isinstance(entry, dict) and entry.get("dataset_id") == dataset_id] \
+        if isinstance(entries, list) else []
+    if len(found) != 1 or not isinstance(found[0].get("applies"), bool):
+        return NotCheckable(_RULES_UNKNOWN)
+    return found[0]["applies"]
+
+
 def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, snapshot: Snapshot, grants: GrantSet,
-             guard_fanout: bool | None, timeout_s: float,
+             guard_fanout: bool | None, timeout_s: float, made: Mapping[int, str],
              before_call: Callable[[], None] | None = None) -> _Numbers | ChartCheck:
     """The chart's numbers against mnemiq's own: any status but `FORMAT_WRONG`."""
     def not_checked(reason: str) -> ChartCheck:
@@ -600,8 +634,20 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
     expectation = expectation_from_form_data(form, dataset=dataset)
     if isinstance(expectation, NotCheckable):
         return not_checked(expectation.reason)
-    sql = ""
-    if dataset.is_virtual:
+    sql, source = "", None
+    if dataset.is_virtual and dataset.dataset_id in made:
+        if not isinstance(dataset.sql, str) or not dataset.sql:
+            return not_checked(_SQL_UNSHOWN)
+        if dataset.sql != made[dataset.dataset_id]:
+            return not_checked(_SQL_CHANGED)
+        applies = _row_rule_applies(client, dataset.dataset_id)
+        if isinstance(applies, NotCheckable):
+            return not_checked(applies.reason)
+        if applies:
+            return not_checked(_RULE_APPLIES)
+        source = f'({dataset.sql}) AS "virtual_table"'
+    own = source is not None or not dataset.is_virtual
+    if not own:
         written = [label for label, _ in expectation.metrics if label not in dataset.saved_metric_names]
         if written:
             return not_checked(f"the measure {written[0]!r} is written on the chart over a virtual dataset: mnemiq "
@@ -617,12 +663,12 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
         if dataset.database_id != getattr(adapter, "database_id", dataset.database_id) \
                 or (dataset.schema or None) != getattr(adapter, "schema", dataset.schema):
             return not_checked("the chart's dataset is on another database or schema than the one mnemiq reads")
-        if not dataset.table:
+        if source is None and not dataset.table:
             return not_checked("the chart's dataset names no table")
         saved = dict(dataset.saved_metric_sql)
         if empty := [label for label, _ in expectation.metrics if label in saved and not saved[label].strip()]:
             return not_checked(f"Superset gave no expression for the saved metric {empty[0]!r}")
-        sql = _statement(expectation, dataset, grained=True)
+        sql = _statement(expectation, dataset, grained=True, source=source)
         # Checked on the statement itself, so a saved metric's own expression is covered too: `execute_sql` renders a
         # statement as a template, and the adapter would refuse it later in words about the statement, not the chart.
         if (marker := next((m for m in JINJA_DELIMITERS if m in sql), None)) is not None:
@@ -631,19 +677,20 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
     chart = _chart_rows(client, chart_id, expectation)
     if isinstance(chart, ChartCheck):
         return chart
-    if dataset.is_virtual:
-        mine, source = _dataset_rows(client, expectation, dataset), _QUERY_DATASET
+    if not own:
+        mine, compared = _dataset_rows(client, expectation, dataset), _QUERY_DATASET
     else:
-        mine, source = _own_rows(sql, expectation, chart_id=chart_id, adapter=adapter, snapshot=snapshot, grants=grants,
-                                 timeout_s=timeout_s, guard_fanout=guard_fanout, before_call=before_call), _OWN_SQL
+        mine, compared = _own_rows(sql, expectation, chart_id=chart_id, adapter=adapter, snapshot=snapshot,
+                                   grants=grants, timeout_s=timeout_s, guard_fanout=guard_fanout,
+                                   before_call=before_call), _OWN_SQL
     if isinstance(mine, NotCheckable):
         return not_checked(mine.reason)
     labels = tuple(label for label, _ in expectation.metrics)
-    found = _compare(chart_id, chart, mine, _row_limit(form), source=source, labels=labels)
+    found = _compare(chart_id, chart, mine, _row_limit(form), source=compared, labels=labels)
     found = _Numbers(found.chart_id, found.status, found.reason, found.chart_values, found.mnemiq_values, labels,
                      chart.values)
-    if found.status is ChartStatus.MISMATCH and expectation.time_grain and source is _OWN_SQL:
-        plain = _own_rows(_statement(expectation, dataset, grained=False), expectation, chart_id=chart_id,
+    if found.status is ChartStatus.MISMATCH and expectation.time_grain and compared is _OWN_SQL:
+        plain = _own_rows(_statement(expectation, dataset, grained=False, source=source), expectation, chart_id=chart_id,
                           adapter=adapter, snapshot=snapshot, grants=grants, timeout_s=timeout_s,
                           guard_fanout=guard_fanout, before_call=before_call)
         # The chart's rows sit on the grain (`_line_up`), yet rows rebuilt without it can too, under a row limit that
@@ -670,7 +717,7 @@ class _BeforeEachCall:
 def check_chart(adapter, *, chart_id: int, dataset_id: int, kinds: dict[str, MeasureKind],
                 saved: dict[str, SavedMetric], snapshot: Snapshot, grants: GrantSet, guard_fanout: bool | None,
                 timeout_s: float = DEFAULT_TIMEOUT_S, before_call: Callable[[], None] | None = None,
-                every_kind_known: bool = False) -> ChartCheck:
+                every_kind_known: bool = False, made: Mapping[int, str] | None = None) -> ChartCheck:
     """Check chart `chart_id` as the caller `adapter` acts for, the builder: Superset is read through `adapter.client`
     and no other, and `adapter` runs mnemiq's own statement under `grants` and `snapshot`. `dataset_id` is the dataset
     mnemiq built the chart on, which a chart saved since in Explore overrides with its own. `kinds` gives the kind of
@@ -688,7 +735,12 @@ def check_chart(adapter, *, chart_id: int, dataset_id: int, kinds: dict[str, Mea
     caller (`SupersetRefusal`) is raised: it stays the same for every later call the request makes.
 
     `before_call`, when given, runs before each Superset call the check makes itself, and once before mnemiq's own
-    decided statement (whose catalogue reads, probe and run the adapter makes); whatever it raises ends the check."""
+    decided statement (whose catalogue reads, probe and run the adapter makes); whatever it raises ends the check.
+
+    `made` holds each virtual dataset the caller's build made, by id, with the SQL it made it with. A virtual dataset is
+    never checked with mnemiq's own SQL, except one in `made` whose SQL is unchanged and on which no row rule applies
+    to the caller (the extension's `row_rules`); when one applies, or mnemiq cannot tell, its statement is not run and
+    the chart is not checked."""
     client = adapter.client if before_call is None else _BeforeEachCall(adapter.client, before_call)
     read = _read_chart(client, chart_id)
     if isinstance(read, NotCheckable):
@@ -696,7 +748,7 @@ def check_chart(adapter, *, chart_id: int, dataset_id: int, kinds: dict[str, Mea
     viz_type, form = read
     problem, unjudged = _format_problem(viz_type, form, kinds, saved, every_kind_known=every_kind_known)
     found = _numbers(client, adapter, chart_id=chart_id, form=form, dataset_id=dataset_id, snapshot=snapshot,
-                     before_call=before_call,
+                     before_call=before_call, made=made or {},
                      grants=grants, guard_fanout=guard_fanout, timeout_s=timeout_s)
     if problem is None and unjudged is not None and found.status is ChartStatus.CHECKED:
         return _outcome(chart_id, ChartStatus.NOT_CHECKED, f"{found.reason}, but {unjudged}", found.chart_values,

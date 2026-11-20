@@ -73,7 +73,7 @@ BUILD = " ".join(BUILD_SCOPES)
 ASK = " ".join(ASK_SCOPES)
 WRITE_TOOLS = ("create_dashboard", "create_dataset", "create_chart", "patch_chart", "add_saved_metric",
                "delete_dataset", "set_layout")
-READ_TOOLS = ("dataset_metrics", "editors_of", "get_layout")
+READ_TOOLS = ("dataset_metrics", "editors_of", "get_layout", "row_rules")
 # The builder in most tests: Alpha and sql_lab, narrowed by no row rule.
 BUILDER = "analyst"
 MONTHLY = ("SELECT date_trunc('month', issued)::date AS month, count(*) FROM policy GROUP BY 1 ORDER BY 1")
@@ -1818,6 +1818,21 @@ def test_dataset_metrics_leaves_out_an_unreachable_dataset_without_naming_it(liv
     assert call(as_user(live, "gamma_only"), "dataset_metrics", dataset_ids=[hidden, missing, policy_id]) == {
         "datasets": []}
     observe("unreachable", answered=[d["dataset_id"] for d in asked["datasets"]])
+
+
+def test_row_rules_says_only_whether_a_rule_applies_to_the_caller(live, extension, policy_id):
+    """`policy` carries west's and east's Regular rules (`setup_superset.py`). Asked by `west`, `row_rules` answers that
+    a rule applies on `policy`; asked by `analyst`, whom no rule narrows, that none does; the answer is exactly
+    `{datasets: [{dataset_id, applies}]}`, never a rule's clause or name. A dataset out of the caller's reach and one
+    that does not exist are both left out: `gamma_only` is answered `{datasets: []}`."""
+    missing = 2_000_000_000
+    west = call(as_user(live, "west"), "row_rules", dataset_ids=[policy_id, missing])
+    analyst = call(as_user(live, BUILDER), "row_rules", dataset_ids=[policy_id])
+    assert west == {"datasets": [{"dataset_id": policy_id, "applies": True}]}, west
+    assert analyst == {"datasets": [{"dataset_id": policy_id, "applies": False}]}, analyst
+    assert "west" not in json.dumps(west) and "region" not in json.dumps(west)
+    assert call(as_user(live, "gamma_only"), "row_rules", dataset_ids=[policy_id, missing]) == {"datasets": []}
+    observe("row_rules", west=west, analyst=analyst)
 
 
 def test_editors_of_names_editors_of_readable_objects_only(live, extension, policy_id):

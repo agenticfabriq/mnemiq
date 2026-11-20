@@ -201,8 +201,9 @@ def display_format(kind: MeasureKind, currency: str | None) -> tuple[str, dict |
 
 def measure_statement(measure: Measure | tuple[Measure, ...], source: str, dimensions: tuple[str, ...] = (),
                       filters: tuple[str, ...] = ()) -> str:
-    """The statement that computes `measure` over `source` (a quoted table name or an unparenthesized join,
-    `a JOIN b ON ...`: the deciders refuse a parenthesized one as an unmodelled source), grouped by
+    """The statement that computes `measure` over `source` (a quoted table name, an unparenthesized join,
+    `a JOIN b ON ...`: the deciders refuse a parenthesized join as an unmodelled source, or a derived table, a dataset
+    the build made read as Superset reads a virtual one, `(<its SQL>) AS "virtual_table"`), grouped by
     `dimensions` and narrowed by `filters`. A tuple of measures computes each, in order, after the dimensions, as a
     chart that plots several does."""
     measures = measure if isinstance(measure, tuple) else (measure,)

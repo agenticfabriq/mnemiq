@@ -324,6 +324,8 @@ class World:
         self.fake, self.clock = fake, clock
         self.lock = threading.RLock()
         self.datasets: dict[int, dict] = {}
+        # The datasets on which a row rule applies to every caller, as the extension's `row_rules` answers.
+        self.row_ruled: set[int] = set()
         self.charts: dict[int, dict] = {}
         self.dashboards: dict[int, dict] = {}
         self.hooks: dict[str, Hook] = {}
@@ -459,7 +461,8 @@ class World:
                      "create_chart": self._create_chart, "patch_chart": self._patch_chart,
                      "add_saved_metric": self._add_saved_metric,
                      "set_layout": self._set_layout, "dataset_metrics": self._dataset_metrics,
-                     "get_layout": self._get_layout, "editors_of": self._editors_of}
+                     "get_layout": self._get_layout, "editors_of": self._editors_of,
+                     "row_rules": self._row_rules}
         return {**plain, **{TOOL_PREFIX + name: handler for name, handler in extension.items()}}
 
     # --- listing, as `ModelListCore` lists: filters, `created_by_me`, the columns asked for, a page
@@ -528,6 +531,11 @@ class World:
                                              "certification_details", "warning_text")}
                     for m in self.datasets[dataset_id]["metrics"]]})
         return {"datasets": found}
+
+    def _row_rules(self, request: dict, user: str) -> dict:
+        found = extension_reads.read("row_rules", request)
+        return {"datasets": [{"dataset_id": i, "applies": i in self.row_ruled}
+                             for i in found["dataset_ids"] if i in self.datasets]}
 
     def _chart_shown(self, row: dict) -> dict:
         return {"id": row["id"], "slice_name": row["slice_name"], "viz_type": row["viz_type"],

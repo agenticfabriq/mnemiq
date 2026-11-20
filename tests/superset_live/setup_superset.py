@@ -18,6 +18,12 @@ it reads):
     python setup_superset.py drop-metric DATASET NAME
                                            as admin, the dataset's saved metric NAME removed, when it has one; prints
                                            how many it removed
+    python setup_superset.py rule-on DATASET
+                                           as admin, a Base row rule on the dataset that keeps no row and that applies
+                                           to everyone; prints its id
+    python setup_superset.py rule-off RULE as admin, that rule removed
+    python setup_superset.py set-sql DATASET SQL
+                                           as admin, a virtual dataset's SQL replaced
 
 Everything is made through Superset's commands and its security manager, never by writing a model, wherever Superset
 has one: a dataset built from the model directly carries no catalog, and the access check then matches it to nothing.
@@ -338,6 +344,54 @@ def drop_metric(dataset_id: int, name: str) -> None:
         print(f"dropped {0 if found is None else 1}")
 
 
+def rule_on(dataset_id: int) -> None:
+    """As admin, a Base row rule on the dataset whose clause keeps no row, with no subject, so it applies to everyone,
+    through Superset's own command; prints its id."""
+    from superset import security_manager
+    from superset.app import create_app
+
+    app = create_app()
+    with app.app_context(), app.test_request_context():
+        from superset.commands.security.create import CreateRLSRuleCommand
+        from superset.utils.core import override_user
+
+        with override_user(security_manager.find_user(username="admin")):
+            rule = CreateRLSRuleCommand({"name": f"mnemiq live rule on dataset {dataset_id} {secrets.token_hex(4)}",
+                                         "filter_type": "Base", "clause": "1 = 0", "tables": [dataset_id],
+                                         "subjects": [], "description": "mnemiq live contract suite"}).run()
+        print(f"rule {rule.id}")
+
+
+def rule_off(rule_id: int) -> None:
+    """As admin, the row rule removed through Superset's own command."""
+    from superset import security_manager
+    from superset.app import create_app
+
+    app = create_app()
+    with app.app_context(), app.test_request_context():
+        from superset.commands.security.delete import DeleteRLSRuleCommand
+        from superset.utils.core import override_user
+
+        with override_user(security_manager.find_user(username="admin")):
+            DeleteRLSRuleCommand([rule_id]).run()
+        print(f"removed rule {rule_id}")
+
+
+def set_sql(dataset_id: int, sql: str) -> None:
+    """As admin, a virtual dataset's SQL replaced through Superset's own command (`UpdateDatasetCommand`)."""
+    from superset import security_manager
+    from superset.app import create_app
+
+    app = create_app()
+    with app.app_context(), app.test_request_context():
+        from superset.commands.dataset.update import UpdateDatasetCommand
+        from superset.utils.core import override_user
+
+        with override_user(security_manager.find_user(username="admin")):
+            UpdateDatasetCommand(dataset_id, {"sql": sql}).run()
+        print(f"dataset {dataset_id}: sql replaced")
+
+
 def _report(database, policy) -> None:
     from superset import db, security_manager
     from superset.connectors.sqla.models import RowLevelSecurityFilter
@@ -361,6 +415,12 @@ def main(argv: list[str]) -> None:
         filter_and_report(int(argv[1]), argv[2])
     elif len(argv) == 3 and argv[0] == "drop-metric":
         drop_metric(int(argv[1]), argv[2])
+    elif len(argv) == 2 and argv[0] == "rule-on":
+        rule_on(int(argv[1]))
+    elif len(argv) == 2 and argv[0] == "rule-off":
+        rule_off(int(argv[1]))
+    elif len(argv) == 3 and argv[0] == "set-sql":
+        set_sql(int(argv[1]), argv[2])
     elif not argv:
         provision()
     elif len(argv) == 2 and argv[0] in ("narrow", "widen"):

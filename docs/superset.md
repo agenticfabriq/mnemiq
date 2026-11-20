@@ -141,6 +141,11 @@ requests these scopes too. Open WebUI's own endpoint is not served in Superset m
   statements, like a SQL Lab query, read physical tables. A rule attached only to a virtual dataset applies through that
   dataset, as in SQL Lab: it narrows what is read through that dataset, not a statement that reads the tables beneath
   it.
+- **So a chart on a virtual dataset is never checked against mnemiq's own SQL, with one exception:** a dataset the
+  build itself made, whose SQL is still the SQL the build made it with, and on which no row rule applies to the builder.
+  The extension's `row_rules` asks Superset whether one applies, as the builder, and answers only whether. When one
+  does, or mnemiq cannot tell (an extension older than the tool, say), mnemiq's statement is not run and the chart is
+  not checked. A saved metric on any other virtual dataset is checked through Superset's own query of that dataset.
 - **`RLS_IN_SQLLAB`.** At its default, off, SQL Lab's own screen applies no row rules. A builder holds the sql_lab
   role, so in SQL Lab they read the rows the rules keep out of their answers through mnemiq. Superset's MCP service
   applies row rules to every statement whatever the flag says. Turning it on is the deployment's call; Superset's own
@@ -305,8 +310,9 @@ still to come. In short:
   chart over the join; on the side a `LEFT JOIN` or `RIGHT JOIN` keeps every row of (the left of a `LEFT JOIN`, the
   right of a `RIGHT JOIN`), they are kept.
 
-  Its chart, like every chart on a dataset a build makes over a join, is not checked against mnemiq's own SQL
-  (`not_checked`).
+  Its chart, like every chart on a dataset a build makes over a join, is checked against mnemiq's own SQL over the
+  dataset's SQL, read as Superset reads a virtual dataset, while that SQL is unchanged and no row rule applies to the
+  builder on the dataset (see [Row rules](#row-rules)).
 - **A token made for building.** Besides `db.read`, the two `POST`s need Superset's `superset:chart:write`,
   `superset:dashboard:write` and `superset:dataset:write` scopes. The extension's token route puts those in a token
   asked for with `{"purpose": "build"}`. A token made for asking is refused with a 403.
@@ -384,8 +390,9 @@ the builder can do about it, or that nothing they can do is known to help. None 
 - **No policy file and no column masks of mnemiq's own.** Superset's roles and row rules govern, and Superset has no
   column rules for SQL.
 - **No asking with access to datasets alone** (see [Roles in Superset](#roles-in-superset)).
-- **A row rule attached only to a virtual dataset** applies through that dataset, not to the tables beneath it (see
-  [Row rules](#row-rules)).
+- **A row rule attached only to a virtual dataset** applies through that dataset, not to the tables beneath it, so a
+  chart on one is not checked against mnemiq's own SQL, except on a dataset the build made, where no rule applies to
+  the builder (see [Row rules](#row-rules)).
 - **No writes to the source database.** Asking writes nothing at all. A build writes only Superset's own charts,
   datasets and dashboards, through the extension, as the builder (see [Building](#building)).
 - **No `deep` mode, no MCP door and no Open WebUI endpoint.**

@@ -195,7 +195,7 @@ WRITE_CLASSES = {"create_dashboard": "Dashboard", "create_dataset": "Dataset", "
                  "patch_chart": "Chart", "add_saved_metric": "Dataset", "delete_dataset": "Dataset",
                  "set_layout": "Dashboard"}
 # The class permission each read tool is gated by; its method is `read`.
-READ_CLASSES = {"dataset_metrics": "Dataset", "editors_of": "Chart", "get_layout": "Dashboard"}
+READ_CLASSES = {"dataset_metrics": "Dataset", "editors_of": "Chart", "get_layout": "Dashboard", "row_rules": "Dataset"}
 ALL_CLASSES = {**WRITE_CLASSES, **READ_CLASSES}
 
 
@@ -237,7 +237,7 @@ def registration_problems(source: str) -> list[str]:
 def test_the_tools_are_mnemiqs_names_with_stock_permissions():
     from mnemiq.superset.extension import EXTENSION_TOOLS
 
-    assert set(EXTENSION_TOOLS) == set(ALL_CLASSES) and len(EXTENSION_TOOLS) == 10
+    assert set(EXTENSION_TOOLS) == set(ALL_CLASSES) and len(EXTENSION_TOOLS) == 11
     assert set(writes.REQUESTS) == set(WRITE_CLASSES)
     assert registration_problems(TOOLS_SOURCE.read_text()) == []
 
@@ -306,7 +306,7 @@ def _extension_sources() -> list[str]:
 
 def test_the_readme_documents_every_tool_and_setting():
     assert readme_problems(README.read_text(), TOOLS_SOURCE.read_text(), _extension_sources()) == []
-    assert len(registered(TOOLS_SOURCE.read_text())) == 10
+    assert len(registered(TOOLS_SOURCE.read_text())) == 11
 
 
 @pytest.mark.parametrize(("old", "new", "flagged"), [
@@ -3071,12 +3071,12 @@ def test_create_dataset_checks_the_marker_and_the_dashboard_before_anything(lock
     assert commands(superset) == []
 
 
-def test_the_extension_offers_exactly_the_ten_tools():
+def test_the_extension_offers_exactly_the_eleven_tools():
     from mnemiq.superset.extension import EXTENSION_TOOLS
 
     assert EXTENSION_TOOLS == (
         "create_dashboard", "create_dataset", "create_chart", "patch_chart", "add_saved_metric", "delete_dataset",
-        "set_layout", "dataset_metrics", "editors_of", "get_layout")
+        "set_layout", "dataset_metrics", "editors_of", "get_layout", "row_rules")
     assert registered(TOOLS_SOURCE.read_text()).keys() == set(EXTENSION_TOOLS)
 
 
