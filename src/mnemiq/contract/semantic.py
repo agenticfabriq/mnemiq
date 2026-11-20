@@ -26,6 +26,21 @@ class CodeScheme(BaseModel):
     label: str
 
 
+class ColumnEstimate(BaseModel):
+    """What the source's optimizer statistics say about a column, read from its dictionary, never from its rows.
+
+    Approximate by nature: a distinct count may be off by a few percent, and the whole is as old as `analyzed`.
+    `sampled` says the statistics were read from part of the rows; `stale` is the source's own flag, None when it
+    cannot say. Every field None means the source holds that statistic for no column of this table.
+    """
+    rows: int | None = None
+    distinct: int | None = None
+    nulls: int | None = None
+    analyzed: str | None = None
+    sampled: bool | None = None
+    stale: bool | None = None
+
+
 class Column(BaseModel):
     id: str
     object_id: str
@@ -51,6 +66,15 @@ class Column(BaseModel):
     # -> the other columns that repeat table-wide but are unique among that partition's rows.
     # A type-2 dimension's `is_current` says `{"=1": ["customer_id"]}`. None: not measured.
     unique_within: dict[str, list[str]] | None = None
+    # A column profiled from the source's statistics rather than its rows. The counts above stay None
+    # for it: every reader that needs an exact count (the ENTIRELY NULL banner, the value index, join
+    # inference, the fan-out guard's "unique") reads them, so none can be handed an estimate by
+    # accident, and an engine predating this field reads "not profiled", as it should. A reader that
+    # can use an estimate reads this field by name.
+    estimate: ColumnEstimate | None = None
+    # A single-column key the source declares and enforces (an enabled, validated primary key or
+    # unique constraint, or a valid unique index). None: not read, as on every exactly profiled column.
+    declared_unique: bool | None = None
 
     def pii_levels(self) -> frozenset[str]:
         """Every level this column is read under, its own and its dimensions', `none` aside.

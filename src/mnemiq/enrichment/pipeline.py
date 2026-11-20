@@ -15,6 +15,18 @@ from mnemiq.superset.settings import SUPERSET_SOURCE_JOB
 logger = logging.getLogger(__name__)
 
 
+# Column fields hashed only when set, so a snapshot written before they existed keeps its version.
+_HASHED_WHEN_SET = ("estimate", "declared_unique")
+
+
+def _column_content(column: Column) -> dict:
+    dumped = column.model_dump(by_alias=True)
+    for field in _HASHED_WHEN_SET:
+        if dumped[field] is None:
+            del dumped[field]
+    return dumped
+
+
 def content_version(snapshot: Snapshot) -> str:
     """Hash what the snapshot asserts, not when it was built.
 
@@ -32,7 +44,7 @@ def content_version(snapshot: Snapshot) -> str:
     """
     body: dict = {
         "source_id": snapshot.source_id,
-        "columns": [c.model_dump(by_alias=True) for c in snapshot.columns],
+        "columns": [_column_content(c) for c in snapshot.columns],
         "relationships": [r.model_dump(by_alias=True) for r in snapshot.relationships],
         "source_bindings": [b.model_dump(by_alias=True) for b in snapshot.source_bindings],
     }
