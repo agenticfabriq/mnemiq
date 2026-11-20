@@ -1325,7 +1325,7 @@ class OracleAdapter:
         num_rows, avg_row_len, analyzed, stale = rows[0]
         return TableSize(
             rows=num_rows, avg_row_len=avg_row_len,
-            analyzed=analyzed.date().isoformat() if analyzed is not None else None,
+            analyzed=analyzed.isoformat(timespec="seconds") if analyzed is not None else None,
             stale={"YES": True, "NO": False}.get(stale),
         )
 
@@ -1344,10 +1344,16 @@ class OracleAdapter:
         return [
             ColumnStatistics(column=column, distinct=distinct, nulls=nulls, histogram=histogram or "NONE",
                              buckets=buckets, sample_size=sample_size,
-                             analyzed=analyzed.date().isoformat() if analyzed is not None else None,
+                             analyzed=analyzed.isoformat(timespec="seconds") if analyzed is not None else None,
                              low=low, high=high, scale=scale)
             for column, distinct, nulls, histogram, buckets, sample_size, analyzed, low, high, scale in rows
         ]
+
+    def database_charset(self) -> str | None:
+        """The database character set (`NLS_CHARACTERSET`), which every user may read; None where it is not shown. It
+        decides whether a histogram endpoint without stored text can be read back as a code (`statistics._decoded`)."""
+        rows = self._rows("SELECT value FROM nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET'")
+        return rows[0][0] if rows else None
 
     def histogram(self, table: str, column: str) -> list[HistogramEndpoint]:
         """The endpoints of `column`'s histogram, in endpoint order, reading no table data."""

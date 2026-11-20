@@ -46,8 +46,8 @@ ANALYZED = datetime.datetime(2026, 11, 1, 6, 0, 15)
 def test_table_size_reads_the_table_row_only():
     stats = _Statistics([("APP", "ORDERS", "TABLE", 1000, 80, ANALYZED, "NO"),
                          ("APP", "ORDERS", "PARTITION", 400, 80, ANALYZED, "NO")])
-    assert _adapter(stats).table_size("ORDERS") == TableSize(rows=1000, avg_row_len=80, analyzed="2026-11-01",
-                                                             stale=False)
+    assert _adapter(stats).table_size("ORDERS") == TableSize(rows=1000, avg_row_len=80,
+                                                             analyzed="2026-11-01T06:00:15", stale=False)
     assert "object_type = 'table'" in stats.sql[-1].lower()
 
 
@@ -157,13 +157,43 @@ def test_column_statistics_maps_each_column():
     ])
     assert _over(d).column_statistics("ORDERS") == [
         ColumnStatistics(column="STATUS", distinct=3, nulls=0, histogram="FREQUENCY", buckets=3, sample_size=1000,
-                         analyzed="2026-11-01", low=b"A", high=b"C", scale=None),
+                         analyzed="2026-11-01T06:00:15", low=b"A", high=b"C", scale=None),
         ColumnStatistics(column="NOTE", distinct=None, nulls=None, histogram="NONE", buckets=None, sample_size=None,
                          analyzed=None, low=None, high=None, scale=None),
         ColumnStatistics(column="RATE", distinct=4, nulls=0, histogram="NONE", buckets=None, sample_size=1000,
-                         analyzed="2026-11-01", low=None, high=None, scale=2),
+                         analyzed="2026-11-01T06:00:15", low=None, high=None, scale=2),
     ]
     assert "all_tab_columns" in d.sql[-1].lower() and "data_scale" in d.sql[-1].lower()
+
+
+def test_analyzed_keeps_the_time_of_day():
+    """A later gather on the same day that names other columns moves the table's time and leaves a column's histogram
+    as it was, still marked not stale (measured on 23.26): only the time of day tells the two apart."""
+    later = datetime.datetime(2026, 11, 1, 18, 0, 0)
+    table = _adapter(_Statistics([("APP", "ORDERS", "TABLE", 1000, 80, later, "NO")])).table_size("ORDERS")
+    column = _over(_Dictionary(columns=[("STATUS", 3, 0, "FREQUENCY", 3, 1000, ANALYZED, b"A", b"C", None)]))
+    assert (table.analyzed, column.column_statistics("ORDERS")[0].analyzed) == ("2026-11-01T18:00:00",
+                                                                                "2026-11-01T06:00:15")
+
+
+def test_database_charset_reads_the_database_character_set():
+    asked = []
+
+    def rows(sql, **binds):
+        asked.append((sql.lower(), binds))
+        return [("WE8MSWIN1252",)]
+
+    a = OracleAdapter.__new__(OracleAdapter)
+    a._rows = rows
+    assert a.database_charset() == "WE8MSWIN1252"
+    sql, binds = asked[0]
+    assert "nls_database_parameters" in sql and "nls_characterset" in sql and binds == {}
+
+
+def test_database_charset_the_dictionary_does_not_show_is_none():
+    a = OracleAdapter.__new__(OracleAdapter)
+    a._rows = lambda sql, **binds: []
+    assert a.database_charset() is None
 
 
 def test_column_statistics_of_a_table_the_dictionary_does_not_show_is_empty():

@@ -216,10 +216,13 @@ def test_dictionary_reads_live():
             status = stats["STATUS"]
             assert (status.distinct, status.nulls, status.histogram, status.buckets, status.sample_size) == (
                 2, 0, "FREQUENCY", 2, 1000)
-            assert (status.low, status.high) == (b"N", b"Y") and status.analyzed
+            assert (status.low, status.high) == (b"N", b"Y")
+            assert status.analyzed == a.table_size("T_STATS_ORDERS").analyzed, "one gather, one time to the second"
+            assert "T" in status.analyzed
+            assert a.database_charset() == "AL32UTF8"
             endpoints = a.histogram("T_STATS_ORDERS", "STATUS")
             assert [e.number for e in endpoints] == [300, 1000]
-            assert frequency_codes(status, 1000, False, endpoints, "VARCHAR2") == ["Y", "N"]
+            assert frequency_codes(status, 1000, False, endpoints, "VARCHAR2", charset="AL32UTF8") == ["Y", "N"]
             # A scaled NUMBER is spelled as the driver returns the column's values, as the exact profile writes them.
             rate = stats["RATE"]
             assert rate.scale == 2

@@ -28,15 +28,19 @@ _NON_ASCII_TEXT_MAY_BE_CUT_AT = _TEXT_BYTES_KEPT - 3
 # On a character column without text, ENDPOINT_VALUE is the value's first 15 bytes as a big-endian integer, rounded to
 # 15 significant digits (measured on 23.26). For a printable ASCII first byte the integer has 36 digits, so a rounding
 # step is 10**21. Two texts of at most 5 bytes differ by at least 256**10 and never round alike, and a longer text with
-# the same first 5 bytes adds at least 256**9 (~4.7e21, several steps), so it cannot round onto the shorter one (text
-# holds no NUL). One value can: a sixth byte of 0xFF, with large bytes after it, sits just below the next 5-byte value
-# and rounds onto it ('ABCDD' + 0xFF 0xEF 0xFF... onto 'ABCDE'). 0xFF is no character in AL32UTF8; in a single-byte set
-# it is one ('ÿ' in WE8MSWIN1252), which no code holds in that place. The first and last values are also checked against
-# LOW_VALUE and HIGH_VALUE. A sixth byte is never decoded: a seventh can hide below a step, so 'ABCDEF' and 'ABCDEF1'
-# may round alike.
+# the same first 5 bytes adds at least 256**9 (~4.7e21, several steps) unless its sixth byte is NUL, so it cannot round
+# onto the shorter one. Two kinds of value can:
+# - a sixth byte of 0xFF, with large bytes after it, sits just below the next 5-byte value and rounds onto it ('ABCDD'
+#   + 0xFF 0xEF 0xFF... onto 'ABCDE'). 0xFF is a character in a single-byte set ('ÿ' in WE8MSWIN1252) and never occurs
+#   in UTF-8, so nothing is decoded unless the database's character set is UTF-8 (`_DECODABLE_CHARSETS`);
+# - a NUL (CHR(0)) sixth byte, with small bytes after it, rounds onto the 5 bytes before it, in any character set. No
+#   dictionary view says whether a column holds a NUL, so this one stays: a code list then names the code without it.
+# The first and last values are also checked against LOW_VALUE and HIGH_VALUE. A sixth byte is never decoded: a seventh
+# can hide below a step, so 'ABCDEF' and 'ABCDEF1' may round alike.
 _ENCODED_BYTES = 15
 _SIGNIFICANT_DIGITS = 15
 _DECODED_MAX_BYTES = 5
+_DECODABLE_CHARSETS = frozenset({"AL32UTF8", "UTF8"})
 
 _TEXT_TYPES = frozenset({"VARCHAR2", "VARCHAR", "CHAR"})
 _NUMBER_TYPES = frozenset({"NUMBER", "FLOAT", "INTEGER"})
@@ -58,12 +62,13 @@ def estimated_tables(snapshot) -> frozenset[str]:
 
 
 def estimate_table(adapter, table: TableInfo, key_columns: set[str] | None = None,
-                   code_max_distinct: int = 25) -> list[EstimatedColumn]:
+                   code_max_distinct: int = 25, charset: str | None = None) -> list[EstimatedColumn]:
     """Each column of `table` as the dictionary describes it. Reads the table's size, its columns' statistics and its
     declared keys, and a histogram only for a column that can be a code list, so a wide table costs one more read per
     candidate, not per column. Excludes from code lists what the exact profile excludes: key-like names, declared
     foreign-key children (`key_columns`), sensitive names, and a column with as many values as rows; and a column
-    whose statistics were gathered on another day than the table's, whose histogram can lack codes added since."""
+    whose statistics were gathered at another time than the table's, whose histogram can lack codes added since.
+    `charset` is the database's character set (`database_charset`), None when unknown (see `frequency_codes`)."""
     size = adapter.table_size(table.name)
     statistics = {s.column: s for s in adapter.column_statistics(table.name)}
     unique = adapter.unique_columns(table.name)
@@ -84,21 +89,22 @@ def estimate_table(adapter, table: TableInfo, key_columns: set[str] | None = Non
                 and st.analyzed is not None and st.analyzed == size.analyzed
                 and _may_be_complete(st, size.rows, size.stale, code_max_distinct)):
             codes = frequency_codes(st, size.rows, size.stale, adapter.histogram(table.name, col.name),
-                                    col.data_type, code_max_distinct)
+                                    col.data_type, code_max_distinct, charset)
         columns.append(EstimatedColumn(col.name, estimate, codes, col.name in unique))
     return columns
 
 
 def frequency_codes(stats: ColumnStatistics, rows: int | None, stale: bool | None,
-                    endpoints: list[HistogramEndpoint], data_type: str, code_max_distinct: int = 25) -> list[str]:
+                    endpoints: list[HistogramEndpoint], data_type: str, code_max_distinct: int = 25,
+                    charset: str | None = None) -> list[str]:
     """The column's codes, most rows first and then by value (as the exact profile orders them), or [] whenever the
     list cannot be shown complete and exact.
 
     Complete: a FREQUENCY histogram with one endpoint per distinct value, built from every non-null row, on statistics
     the database does not call stale (unknown counts as stale). Exact: a numeric column's values as the driver returns
-    them; a character column's text where Oracle stores it, short of where it cuts text; otherwise each value decoded
-    from its ENDPOINT_VALUE, at most 5 printable ASCII bytes, re-encoding exactly, the first and last equal to the
-    column's lowest and highest values."""
+    them; a character column's text where Oracle stores it, short of where it cuts text; otherwise, on a database whose
+    `charset` is UTF-8, each value decoded from its ENDPOINT_VALUE, at most 5 printable ASCII bytes, re-encoding
+    exactly, the first and last equal to the column's lowest and highest values."""
     if not _may_be_complete(stats, rows, stale, code_max_distinct) or len(endpoints) != stats.distinct:
         return []
     counts: list[int] = []
@@ -114,7 +120,7 @@ def frequency_codes(stats: ColumnStatistics, rows: int | None, stale: bool | Non
         as_float = _base(data_type) == "FLOAT" or (stats.scale or 0) > 0
         values = [_number_code(ep, as_float) for ep in endpoints]
     elif kind == "text":
-        values = _text_codes(endpoints, stats)
+        values = _text_codes(endpoints, stats, decode=charset in _DECODABLE_CHARSETS)
     else:
         return []
     if values is None or any(v is None for v in values) or len(set(values)) != len(values):
@@ -232,12 +238,13 @@ def _number_code(ep: HistogramEndpoint, as_float: bool = False) -> str | None:
     return code
 
 
-def _text_codes(endpoints: list[HistogramEndpoint], stats: ColumnStatistics) -> list[str | None] | None:
+def _text_codes(endpoints: list[HistogramEndpoint], stats: ColumnStatistics,
+                decode: bool) -> list[str | None] | None:
     stored = [ep.actual is not None or ep.actual_raw is not None for ep in endpoints]
     if all(stored):
         return [_stored_text(ep) for ep in endpoints]
-    if any(stored):
-        return None  # never seen; read as neither
+    if any(stored) or not decode:
+        return None  # a mix was never seen; read as neither
     decoded = [_decoded(ep.value) for ep in endpoints]
     if any(d is None for d in decoded) or stats.low is None or stats.high is None:
         return None

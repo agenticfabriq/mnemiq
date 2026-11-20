@@ -45,9 +45,22 @@ def _ep(number, value, actual=None, raw=None):
 YN = [_ep(3000, N), _ep(10_000, Y)]
 
 
-def _codes(stats=None, endpoints=YN, data_type="VARCHAR2", rows=10_000, stale=False, **kw):
+def _codes(stats=None, endpoints=YN, data_type="VARCHAR2", rows=10_000, stale=False, charset="AL32UTF8", **kw):
     stats = stats or _stats(low=b"N", high=b"Y")
-    return frequency_codes(stats, rows, stale, endpoints, data_type, **kw)
+    return frequency_codes(stats, rows, stale, endpoints, data_type, charset=charset, **kw)
+
+
+def _endpoint_value(raw: bytes) -> int:
+    """ENDPOINT_VALUE as Oracle 23.26 writes it for a character value: its first 15 bytes as a big-endian integer,
+    rounded half up to 15 significant digits."""
+    whole = int.from_bytes(raw[:15].ljust(15, b"\0"), "big")
+    step = 10 ** (len(str(whole)) - 15)
+    return (whole + step // 2) // step * step
+
+
+# 'ABCDD' then 0xFF 0xEF and eight more 0xFF: text in a single-byte character set ('ÿï...' in WE8MSWIN1252), never in
+# UTF-8. Its ENDPOINT_VALUE is the one 'ABCDE' has (Codex on #265).
+COLLIDING = b"ABCDD\xff\xef" + b"\xff" * 8
 
 
 # --- frequency_codes: the code list, only where it is complete and exact --------------------------
@@ -67,6 +80,28 @@ def test_frequency_codes_decode_short_codes_from_the_endpoint_value():
     assert _codes(_stats(distinct=1, low=b"A", high=b"A", rows=10_000), [_ep(10_000, A)]) == ["A"]
     assert _codes(_stats(distinct=2, low=b"OFF", high=b"ON", rows=3000), [_ep(1500, OFF), _ep(3000, ON)],
                   rows=3000) == ["OFF", "ON"]
+
+
+def test_the_colliding_value_has_another_codes_endpoint_value():
+    assert _endpoint_value(b"A") == A and _endpoint_value(b"Y") == Y  # the helper writes what Oracle wrote
+    assert _endpoint_value(COLLIDING) == _endpoint_value(b"ABCDE")
+
+
+@pytest.mark.parametrize("charset", ["WE8MSWIN1252", "WE8ISO8859P1", None])
+def test_frequency_codes_decode_nothing_outside_utf8(charset):
+    """In a single-byte character set 0xFF is a character, so a value can sit on another code's ENDPOINT_VALUE and
+    decode to a code the column does not hold; an unknown character set may be one. Text Oracle stores is still read."""
+    colliding = [_ep(1000, A), _ep(2000, _endpoint_value(COLLIDING)), _ep(10_000, _endpoint_value(b"Z"))]
+    assert _codes(_stats(distinct=3, low=b"A", high=b"Z"), colliding, charset=charset) == []
+    assert _codes(charset=charset) == []
+    stored = [_ep(1000, None, "A", b"A"), _ep(1700, None, "B", b"B"), _ep(10_000, None, "C", b"C")]
+    assert _codes(_stats(distinct=3), stored, charset=charset) == ["C", "A", "B"]
+
+
+@pytest.mark.parametrize("charset", ["AL32UTF8", "UTF8"])
+def test_frequency_codes_decode_on_a_utf8_database(charset):
+    """No UTF-8 text holds the byte 0xFF, so there the collision cannot occur."""
+    assert _codes(charset=charset) == ["Y", "N"]
 
 
 def test_frequency_codes_refuse_a_decode_longer_than_five_bytes():
@@ -242,8 +277,13 @@ def test_declared_unique_from_unique_columns():
 
 def test_codes_from_the_histogram_of_a_code_column():
     source = _orders_source()
-    assert estimate_table(source, ORDERS)[1].codes == ["Y", "N"]
+    assert estimate_table(source, ORDERS, charset="AL32UTF8")[1].codes == ["Y", "N"]
     assert source.histograms_read == ["STATUS"], "a histogram is read only for a column that can be a code list"
+
+
+def test_estimate_table_decodes_only_with_a_utf8_charset():
+    assert estimate_table(_orders_source(), ORDERS, charset="WE8MSWIN1252")[1].codes == []
+    assert estimate_table(_orders_source(), ORDERS)[1].codes == [], "an unknown character set decodes nothing"
 
 
 def test_no_codes_for_a_key_like_fk_child_or_sensitive_column():
@@ -253,7 +293,7 @@ def test_no_codes_for_a_key_like_fk_child_or_sensitive_column():
                               for c in ("CUSTOMER_ID", "REGION", "CUSTOMER_NAME", "STATUS")],
                      histograms={c: [_ep(300, N), _ep(1000, Y)]
                                  for c in ("CUSTOMER_ID", "REGION", "CUSTOMER_NAME", "STATUS")})
-    cols = estimate_table(source, table, key_columns={"REGION"})
+    cols = estimate_table(source, table, key_columns={"REGION"}, charset="AL32UTF8")
     assert [c.codes for c in cols] == [[], [], [], ["Y", "N"]]
     assert source.histograms_read == ["STATUS"]
 
@@ -264,7 +304,7 @@ def test_no_codes_where_every_row_is_distinct():
                      columns=[_stats("STATUS", distinct=2, rows=2, low=b"N", high=b"Y")],
                      histograms={"STATUS": [_ep(1, N), _ep(2, Y)]})
     table = TableInfo(name="ORDERS", columns=[ColumnInfo("STATUS", "VARCHAR2")])
-    assert estimate_table(source, table)[0].codes == []
+    assert estimate_table(source, table, charset="AL32UTF8")[0].codes == []
 
 
 def test_a_histogram_with_fewer_buckets_than_values_is_not_read():
@@ -272,7 +312,7 @@ def test_a_histogram_with_fewer_buckets_than_values_is_not_read():
     source = _Source(columns=[_stats("STATUS", distinct=3, buckets=1, rows=1000)],
                      histograms={"STATUS": [_ep(1000, 1, "X" * 64, None)]})
     table = TableInfo(name="ORDERS", columns=[ColumnInfo("STATUS", "VARCHAR2")])
-    assert estimate_table(source, table)[0].codes == [] and source.histograms_read == []
+    assert estimate_table(source, table, charset="AL32UTF8")[0].codes == [] and source.histograms_read == []
 
 
 
@@ -298,6 +338,6 @@ def test_no_codes_from_column_statistics_older_than_the_table():
                            analyzed="2026-10-01", low=b"N", high=b"Y")
     source = _Source(columns=[old], histograms={"STATUS": [_ep(300, N), _ep(1000, Y)]})
     table = TableInfo(name="ORDERS", columns=[ColumnInfo("STATUS", "VARCHAR2")])
-    col = estimate_table(source, table)[0]
+    col = estimate_table(source, table, charset="AL32UTF8")[0]
     assert col.codes == [] and source.histograms_read == []
     assert col.estimate.analyzed == "2026-10-01"

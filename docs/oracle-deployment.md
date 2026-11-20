@@ -248,11 +248,15 @@ cannot fall back to reading every table.
   dimension in `"exact_tables"` to have its partitions profiled.
 - **Code lists come only from complete frequency histograms.** A column gets a list only where
   the histogram is `FREQUENCY` with one endpoint per distinct value, was built from every non-null
-  row on the same day as the table's statistics, and Oracle says the table's statistics are not
+  row in the same gather as the table's statistics, and Oracle says the table's statistics are not
   stale; and only where every value reads back exactly.
-  Measured on 23ai Free: Oracle stores no text for short `VARCHAR2` values, only a numeric
-  encoding of their first bytes. mnemiq reads a value back from that encoding only when it is at
-  most 5 printable ASCII bytes and agrees with the column's lowest and highest values. Oracle
+  Measured on 23ai Free: Oracle often stores no text for short `VARCHAR2` values, only a numeric
+  encoding of their first bytes. mnemiq reads a value back from that encoding only on a database
+  whose character set is UTF-8 (`AL32UTF8` or `UTF8`), and only when the value is at most 5
+  printable ASCII bytes and agrees with the column's lowest and highest values. In a single-byte
+  character set a longer value can share a short one's encoding, so there such a column gets no
+  list. A value holding a NUL character can share one in any character set; no statistic shows
+  it. Oracle
   keeps 64 bytes of a value's text, so values of 64 bytes or more give no list. Otherwise the column gets no
   list, never a partial one. A dictionary's code meanings attach only to codes in a column's
   list, so for a column without one only the dictionary's description is kept: name the codes

@@ -60,6 +60,8 @@ class _Recording:
         self._inner = inner
         self.dictionary = DICTIONARY if dictionary is None else dictionary
         self.sql: list[str] = []
+        self.charset: str | Exception | None = "AL32UTF8"
+        self.charset_reads = 0
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -83,6 +85,12 @@ class _Recording:
 
     def unique_columns(self, table):
         return self.dictionary[table][3]
+
+    def database_charset(self):
+        self.charset_reads += 1
+        if isinstance(self.charset, Exception):
+            raise self.charset
+        return self.charset
 
 
 @pytest.fixture
@@ -262,3 +270,42 @@ def test_the_steps_after_the_structural_pass_read_no_estimated_table(tmp_path):
     build_value_index(source, snap, duckdb.connect())
     assert any(_touches(sql, "orders") for sql in source.sql), "control: the exact table is still read"
     assert not any(_touches(sql, "order_status") for sql in source.sql), source.sql
+
+
+def _endpoint_value(raw: bytes) -> int:
+    """ENDPOINT_VALUE as Oracle 23.26 writes it for a character value with no stored text."""
+    whole = int.from_bytes(raw[:15].ljust(15, b"\0"), "big")
+    step = 10 ** (len(str(whole)) - 15)
+    return (whole + step // 2) // step * step
+
+
+def _status_without_text(shop):
+    size, stats, _histograms, unique = DICTIONARY["orders"]
+    endpoints = [HistogramEndpoint(3, _endpoint_value(b"A"), None, None),
+                 HistogramEndpoint(4, _endpoint_value(b"B"), None, None)]
+    shop.dictionary = {**DICTIONARY, "orders": (size, stats, {"status": endpoints}, unique)}
+
+
+@pytest.mark.parametrize(("charset", "codes"), [("AL32UTF8", ["A", "B"]), ("WE8MSWIN1252", []), (None, [])])
+def test_statistics_mode_decodes_codes_only_on_a_utf8_database(shop, charset, codes):
+    """Codes Oracle stores no text for are decoded only where the database's character set is UTF-8, read once."""
+    _status_without_text(shop)
+    shop.charset = charset
+    status = _columns(enrich_structural(shop, "shop", statistics=()), "orders")["status"]
+    assert [cv.code for cv in status.coded_values] == codes
+    assert shop.charset_reads == 1
+
+
+def test_a_failed_character_set_read_decodes_nothing(shop):
+    _status_without_text(shop)
+    shop.charset = RuntimeError("ORA-00942: table or view does not exist")
+    snap = enrich_structural(shop, "shop", statistics=())
+    assert _columns(snap, "orders")["status"].coded_values == []
+    assert {j.status for j in snap.jobs if j.kind == "profile"} == {"done"}
+
+
+def test_no_character_set_read_without_values_or_estimated_tables(shop):
+    enrich_structural(shop, "shop", statistics=(), harvest_values=False)
+    enrich_structural(shop, "shop", statistics=("*",))
+    enrich_structural(shop, "shop")
+    assert shop.charset_reads == 0

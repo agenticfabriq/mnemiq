@@ -201,9 +201,21 @@ def _exactly_profiled(catalog: list, statistics: tuple[str, ...] | None, source_
     return {n for n in names if any(fnmatchcase(n.casefold(), p) for _raw, p in patterns)}
 
 
-def _estimated_columns(adapter, table, key_columns: set[str] | None, harvest_values: bool) -> list[Column]:
+def _database_charset(adapter) -> str | None:
+    """The source's character set, or None when it cannot be read: then no code is decoded from a histogram."""
+    try:
+        return adapter.database_charset()
+    except Exception as exc:
+        logger.warning("could not read the database character set, so no code is read from a histogram endpoint "
+                       "without text: %s", exc)
+        return None
+
+
+def _estimated_columns(adapter, table, key_columns: set[str] | None, harvest_values: bool,
+                       charset: str | None) -> list[Column]:
     """`table`'s columns from the source's dictionary. Without values harvested no histogram is read, so no codes."""
-    estimates = estimate_table(adapter, table, key_columns=key_columns, code_max_distinct=25 if harvest_values else 0)
+    estimates = estimate_table(adapter, table, key_columns=key_columns, code_max_distinct=25 if harvest_values else 0,
+                               charset=charset)
     return [
         Column(id=f"{table.name}.{col.name}", object_id=table.name, name=col.name, data_type=col.data_type,
                coded_values=[CodedValue(code=code) for code in e.codes],
@@ -238,6 +250,7 @@ def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
     catalog = introspect(adapter)
     exact = _exactly_profiled(catalog, statistics, source_id)
     estimated = frozenset(t.name for t in catalog if exact is not None and t.name not in exact)
+    charset = _database_charset(adapter) if estimated and harvest_values else None
     columns: list[Column] = []
     source_bindings: list[SourceBinding] = []
     jobs: list[Job] = []
@@ -257,7 +270,8 @@ def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
             if table.name in estimated:
                 # From the dictionary, reading no row; nothing measured, so nothing below to record.
                 stats = {}
-                table_columns = _estimated_columns(adapter, table, fk_children.get(table.name), harvest_values)
+                table_columns = _estimated_columns(adapter, table, fk_children.get(table.name), harvest_values,
+                                                   charset)
             else:
                 stats = {
                     s.column: s

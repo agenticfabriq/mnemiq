@@ -15,7 +15,9 @@ class TableSize:
 
     rows: int | None
     avg_row_len: int | None  # bytes
-    analyzed: str | None  # the date its statistics were gathered, ISO
+    # When its statistics were gathered, ISO, to the second: one gather stamps the table and its columns alike, and a
+    # later gather the same day can leave a column's histogram behind, which only the time of day shows.
+    analyzed: str | None
     # True when the dictionary says the statistics are stale, False when it says they are not, None when it does not
     # say: unknown is never "not stale".
     stale: bool | None
@@ -31,7 +33,7 @@ class ColumnStatistics:
     histogram: str  # NONE, FREQUENCY, TOP-FREQUENCY, HEIGHT BALANCED or HYBRID
     buckets: int | None
     sample_size: int | None  # the rows the statistics were read from
-    analyzed: str | None  # ISO date
+    analyzed: str | None  # ISO, to the second, as `TableSize.analyzed`
     # The lowest and highest values, as the source stores them (raw bytes; Oracle cuts them at 64 bytes).
     low: bytes | None
     high: bytes | None
