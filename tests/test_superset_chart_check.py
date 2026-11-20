@@ -2125,3 +2125,26 @@ def test_a_second_measure_with_no_value_on_every_kept_group_is_empty_though_a_cu
                           columns=(("region", "object"), ("m0", "float64"), ("m1", "float64"))))
     check = _check(fake, kinds={"Total premium": MeasureKind.CURRENCY, "Overdue": MeasureKind.CURRENCY})
     assert check.status is ChartStatus.EMPTY and "'Overdue'" in check.reason, check.reason
+
+
+@pytest.mark.parametrize("alias", ["metric", "metric_2", "secondary_metric", "left_metric", "right_metric", "x", "y",
+                                   "size"])
+def test_a_second_metric_alias_on_a_ranked_chart_is_no_ranking_mnemiq_reads(alias):
+    """`extractQueryFields` gathers every metric alias in the form's key order, so another alias holding a value can
+    come first in the query's metrics, and the query then ranks by it, not by `metrics[0]`."""
+    form = {"viz_type": "echarts_timeseries_bar", alias: copy.deepcopy(SECOND), **_bar()}
+    assert _ranked(form) is None
+    table = {"viz_type": "table", "query_mode": "aggregate", "groupby": ["region"], alias: copy.deepcopy(SECOND),
+             "metrics": [copy.deepcopy(PREMIUM), copy.deepcopy(SECOND)], "row_limit": 10}
+    assert _ranked(table) is None
+
+
+@pytest.mark.parametrize("offset", [1, 5, "2"])
+def test_a_row_offset_is_no_ranking_mnemiq_reads(offset):
+    """The query skips its first `row_offset` rows, so the rows it keeps are not its first N."""
+    assert _ranked(_bar(row_offset=offset)) is None
+
+
+@pytest.mark.parametrize("offset", [None, 0])
+def test_no_row_offset_keeps_the_ranking(offset):
+    assert _ranked(_bar(row_offset=offset)) == Ranking(0, True, 100)

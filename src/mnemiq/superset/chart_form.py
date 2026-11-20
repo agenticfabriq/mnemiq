@@ -406,6 +406,11 @@ def _ranked_metric(item, expectation: Expectation, dataset: DatasetFacts) -> int
     return expectation.metrics.index(found)
 
 
+# The form keys `extractQueryFields` (`superset-ui-core`) gathers into a query's metrics besides `metrics`, in the
+# form's key order: one holding a value can come first in the query's metrics, and the query then ranks by it.
+_OTHER_METRIC_ALIASES = ("metric", "metric_2", "secondary_metric", "left_metric", "right_metric", "x", "y", "size")
+
+
 def ranking_of(form: dict, expectation: Expectation, *, dataset: DatasetFacts) -> Ranking | None:
     """The ranking the chart's query cuts its rows by, read from its saved form exactly as rc2 orders it, or None where
     mnemiq does not read one: a type whose query does not rank by its measure (mixed, pivot, funnel, sankey,
@@ -419,10 +424,16 @@ def ranking_of(form: dict, expectation: Expectation, *, dataset: DatasetFacts) -
     - A table (`plugin-chart-table` `buildQuery`): `timeseries_limit_metric`, ascending unless `order_desc` is true,
       else `metrics[0]` descending whatever `order_desc` says.
     - A pie, gauge or treemap: its `metric`, descending, only when `sort_by_metric` is on: each plugin's `buildQuery`
-      orders by the metric only then, and the treemap breaks ties by its groups, which mnemiq accepts either way."""
+      orders by the metric only then, and the treemap breaks ties by its groups, which mnemiq accepts either way.
+
+    A query that skips rows (`row_offset`, which `buildQueryObject` passes on) keeps rows that are not its first N,
+    and a time-series chart or table with another metric alias holding a value may rank by that alias: neither is
+    read."""
     limit = _row_limit(form)
     viz_type = str(form.get("viz_type") or "")
-    if limit is None:
+    if limit is None or form.get("row_offset") not in (None, 0):
+        return None
+    if (viz_type in _TIMESERIES or viz_type == "table") and any(form.get(alias) for alias in _OTHER_METRIC_ALIASES):
         return None
     if viz_type in _TIMESERIES:
         if form.get("order_by_cols") or form.get("orderby"):
