@@ -39,6 +39,7 @@ from mnemiq.superset.chart_check import (
     expectation_from_form_data,
     percent_problem,
 )
+from mnemiq.superset.chart_form import Ranking, ranking_of
 from mnemiq.superset.charts import Filter
 from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetPermissionDenied
 from mnemiq.superset.measures import MeasureKind
@@ -1928,3 +1929,84 @@ def test_a_made_dataset_whose_sql_superset_does_not_show_is_not_called_changed(f
     assert check.reason == ("Superset did not show the SQL of the chart's dataset, which this build made, so mnemiq "
                             "does not check it with its own SQL")
     assert _statements(fake) == [] and ROW_RULES not in _tools(fake)
+
+
+
+# ---------------------------------------------------------------- the ranking a row limit cuts by
+
+SECOND = PREMIUM | {"label": "Average premium", "sqlExpression": "AVG(premium)", "optionName": "metric_sql_2"}
+
+
+def _ranked(form: dict):
+    expectation = expectation_from_form_data(form, dataset=PHYSICAL)
+    assert not isinstance(expectation, NotCheckable), expectation
+    return ranking_of(form, expectation, dataset=PHYSICAL)
+
+
+@pytest.mark.parametrize("viz", ["echarts_timeseries_bar", "echarts_timeseries_line", "echarts_area",
+                                 "echarts_timeseries_scatter", "echarts_timeseries_smooth", "echarts_timeseries_step"])
+def test_a_timeseries_chart_ranks_by_its_first_metric_descending(viz):
+    assert _ranked(_bar(viz_type=viz, row_limit=10)) == Ranking(metric_index=0, descending=True, limit=10)
+
+
+def test_a_bar_ranks_ascending_only_when_order_desc_is_false():
+    assert _ranked(_bar(order_desc=False)) == Ranking(0, False, 100)
+    assert _ranked(_bar(order_desc=True)) == Ranking(0, True, 100)
+    assert _ranked(_bar(order_desc=None)) is None  # the frontend would read it as ascending, the backend as given
+
+
+def test_a_bar_ranks_by_its_series_limit_metric_when_one_is_set():
+    form = _bar(metrics=[copy.deepcopy(PREMIUM), copy.deepcopy(SECOND)])
+    assert _ranked(form | {"series_limit_metric": copy.deepcopy(SECOND)}) == Ranking(1, True, 100)
+    assert _ranked(form | {"timeseries_limit_metric": copy.deepcopy(SECOND)}) == Ranking(1, True, 100)
+
+
+def test_a_ranking_metric_the_chart_does_not_show_is_no_ranking():
+    other = PREMIUM | {"label": "Most premium", "sqlExpression": "MAX(premium)"}
+    assert _ranked(_bar(series_limit_metric=other)) is None
+
+
+def test_a_bar_with_an_order_by_column_is_no_ranking_mnemiq_reads():
+    assert _ranked(_bar(order_by_cols=['["region", true]'])) is None
+
+
+def test_a_table_ranks_by_its_first_metric_descending_whatever_order_desc_says():
+    form = {"viz_type": "table", "query_mode": "aggregate", "groupby": ["region"],
+            "metrics": [copy.deepcopy(PREMIUM), copy.deepcopy(SECOND)], "row_limit": 10}
+    assert _ranked(form) == Ranking(0, True, 10)
+    assert _ranked(form | {"order_desc": False}) == Ranking(0, True, 10)
+    assert _ranked(form | {"timeseries_limit_metric": copy.deepcopy(SECOND)}) == Ranking(1, False, 10)
+    assert _ranked(form | {"timeseries_limit_metric": copy.deepcopy(SECOND), "order_desc": True}) == Ranking(1, True, 10)
+
+
+@pytest.mark.parametrize("viz", ["pie", "gauge_chart", "treemap_v2"])
+def test_a_one_metric_chart_ranks_by_its_metric_unless_sort_by_metric_is_off(viz):
+    form = {"viz_type": viz, "groupby": ["region"], "metric": copy.deepcopy(PREMIUM), "row_limit": 10}
+    assert _ranked(form) == Ranking(0, True, 10)
+    assert _ranked(form | {"sort_by_metric": True}) == Ranking(0, True, 10)
+    assert _ranked(form | {"sort_by_metric": False}) is None
+
+
+def test_a_chart_with_no_positive_row_limit_has_no_ranking():
+    for limit in (None, 0, -1, "ten"):
+        assert _ranked(_bar(row_limit=limit)) is None
+
+
+@pytest.mark.parametrize("form", [
+    {"viz_type": "funnel", "groupby": ["region"], "metric": PREMIUM, "row_limit": 10},
+    {"viz_type": "sankey_v2", "source": "region", "target": "channel", "metric": PREMIUM, "row_limit": 10},
+    {"viz_type": "waterfall", "x_axis": "region", "metric": PREMIUM, "row_limit": 10},
+], ids=["funnel", "sankey", "waterfall"])
+def test_a_type_whose_query_does_not_rank_by_its_measure_has_no_ranking(form):
+    assert _ranked(copy.deepcopy(form)) is None
+
+
+@pytest.mark.parametrize("form", [
+    {"viz_type": "mixed_timeseries", "x_axis": "region", "metrics": [PREMIUM], "metrics_b": [PREMIUM],
+     "row_limit": 10},
+    {"viz_type": "pivot_table_v2", "groupbyRows": ["region"], "metrics": [PREMIUM], "row_limit": 10},
+], ids=["mixed", "pivot"])
+def test_a_mixed_or_pivot_chart_has_no_ranking_mnemiq_reads(form):
+    expectation = Expectation(metrics=(("Total premium", "SUM(premium)"),), dimensions=("region",), time_grain=None,
+                              filters=())
+    assert ranking_of(copy.deepcopy(form), expectation, dataset=PHYSICAL) is None
