@@ -179,20 +179,63 @@ class SourceSpec:
     # The tables enrichment may see, exact names or shell patterns, without regard to case (M110);
     # empty means every table the source reports. See `mnemiq.adapters.scoped`.
     tables: tuple[str, ...] = ()
+    # How enrichment profiles the source: "" when the manifest says nothing (exact, and on Oracle
+    # only after `mnemiq.enrichment.size_check` finds no large table), "exact", or "statistics"
+    # (Oracle's optimizer statistics, reading no table data).
+    profile: str = ""
+    # Under "statistics", the tables still profiled exactly: names or shell patterns, as `tables`.
+    exact_tables: tuple[str, ...] = ()
+
+
+# Every key a source entry may carry. Any other is refused: an unknown key used to be ignored
+# without a word, so a misspelled "profile" fell back to exact profiling, which on a production
+# database reads every table in full many times.
+MANIFEST_KEYS = frozenset({"id", "kind", "target", "catalog", "schema", "tables", "profile",
+                           "exact_tables"})
+
+
+def _manifest_names(entry: dict, key: str) -> tuple[str, ...]:
+    """A source's optional list of table names or patterns under `key`, refused unless it is
+    non-empty strings: a bare string would iterate as one-letter patterns, and an empty list would
+    read as 'no tables'."""
+    names = entry.get(key)
+    if names is None:
+        return ()
+    if (not isinstance(names, list) or not names
+            or not all(isinstance(t, str) and t.strip() for t in names)):
+        raise ValueError(
+            f"source {entry.get('id')!r}: \"{key}\" must be a non-empty list of table names or "
+            f"patterns, got {names!r}")
+    return tuple(t.strip() for t in names)
 
 
 def _manifest_tables(entry: dict) -> tuple[str, ...]:
-    """A source's optional `tables` list, refused unless it is non-empty strings: a bare string
-    would iterate as one-letter patterns, and an empty list would read as 'no tables'."""
-    tables = entry.get("tables")
-    if tables is None:
-        return ()
-    if (not isinstance(tables, list) or not tables
-            or not all(isinstance(t, str) and t.strip() for t in tables)):
+    return _manifest_names(entry, "tables")
+
+
+def _manifest_profile(entry: dict) -> dict:
+    """A source's `profile` and `exact_tables`, refused unless they agree with each other and with
+    the source's kind; and the entry refused if it carries a key no source takes."""
+    source = entry.get("id")
+    unknown = sorted(set(entry) - MANIFEST_KEYS)
+    if unknown:
         raise ValueError(
-            f"source {entry.get('id')!r}: \"tables\" must be a non-empty list of table names or "
-            f"patterns, got {tables!r}")
-    return tuple(t.strip() for t in tables)
+            f"source {source!r}: unknown key{'s' if len(unknown) > 1 else ''} "
+            f"{', '.join(repr(k) for k in unknown)}; a source entry takes "
+            + ", ".join(f'"{k}"' for k in sorted(MANIFEST_KEYS)))
+    profile = entry.get("profile", "")
+    if "profile" in entry and profile not in ("exact", "statistics"):
+        raise ValueError(
+            f'source {source!r}: "profile" must be "exact" or "statistics", got {profile!r}')
+    if profile == "statistics" and entry.get("kind") != "oracle":
+        raise ValueError(
+            f'source {source!r}: "profile": "statistics" reads Oracle\'s optimizer statistics, and '
+            f'this source is {entry.get("kind")!r}; leave "profile" out, or set it to "exact"')
+    if "exact_tables" in entry and profile != "statistics":
+        raise ValueError(
+            f'source {source!r}: "exact_tables" names the tables a source profiled from its '
+            f'statistics still counts exactly; it needs "profile": "statistics"')
+    return {"profile": profile, "exact_tables": _manifest_names(entry, "exact_tables")}
 
 
 class ModeSettings(BaseModel):
@@ -601,7 +644,7 @@ class Settings(BaseSettings):
                 raw = json.load(fh)
             return [SourceSpec(id=d["id"], kind=d["kind"], target=d["target"],
                                catalog=d["catalog"], schema=d["schema"],
-                               tables=_manifest_tables(d)) for d in raw]
+                               tables=_manifest_tables(d), **_manifest_profile(d)) for d in raw]
         return [SourceSpec(id=self.source_id or "acme", kind="postgres",
                            target=self.pg_dsn or "", catalog="src", schema="public")]
 
