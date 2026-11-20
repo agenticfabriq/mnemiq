@@ -35,6 +35,9 @@ class ColumnStatistics:
     # The lowest and highest values, as the source stores them (raw bytes; Oracle cuts them at 64 bytes).
     low: bytes | None
     high: bytes | None
+    # The column's declared scale (`ALL_TAB_COLUMNS.DATA_SCALE`): a NUMBER with a scale above 0 comes from the driver as
+    # a float, which decides how its values are written.
+    scale: int | None = None
 
 
 @dataclass(frozen=True)

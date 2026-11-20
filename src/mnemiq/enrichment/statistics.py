@@ -27,9 +27,13 @@ _NON_ASCII_TEXT_MAY_BE_CUT_AT = _TEXT_BYTES_KEPT - 3
 
 # On a character column without text, ENDPOINT_VALUE is the value's first 15 bytes as a big-endian integer, rounded to
 # 15 significant digits (measured on 23.26). For a printable ASCII first byte the integer has 36 digits, so a rounding
-# step is 10**21. A byte in position 6 moves it by at least 256**9 (~4.7e21), more than a step, so a value of at most
-# 5 bytes is read back exactly and cannot hide a longer one (text holds no NUL). Position 7 moves it by less than a
-# step, which is why a sixth byte is never trusted: 'ABCDEF' and 'ABCDEF1' may round alike.
+# step is 10**21. Two texts of at most 5 bytes differ by at least 256**10 and never round alike, and a longer text with
+# the same first 5 bytes adds at least 256**9 (~4.7e21, several steps), so it cannot round onto the shorter one (text
+# holds no NUL). One value can: a sixth byte of 0xFF, with large bytes after it, sits just below the next 5-byte value
+# and rounds onto it ('ABCDD' + 0xFF 0xEF 0xFF... onto 'ABCDE'). 0xFF is no character in AL32UTF8; in a single-byte set
+# it is one ('ÿ' in WE8MSWIN1252), which no code holds in that place. The first and last values are also checked against
+# LOW_VALUE and HIGH_VALUE. A sixth byte is never decoded: a seventh can hide below a step, so 'ABCDEF' and 'ABCDEF1'
+# may round alike.
 _ENCODED_BYTES = 15
 _SIGNIFICANT_DIGITS = 15
 _DECODED_MAX_BYTES = 5
@@ -46,12 +50,20 @@ class EstimatedColumn:
     declared_unique: bool = False
 
 
+def estimated_tables(snapshot) -> frozenset[str]:
+    """The tables of `snapshot` profiled from the source's statistics: nothing after the structural pass may read their
+    rows. Read from their profile jobs, so a column without statistics in such a table counts too."""
+    return frozenset(j.id.removeprefix("profile:") for j in snapshot.jobs
+                     if j.kind == "profile" and j.status == "done" and j.detail == "estimated")
+
+
 def estimate_table(adapter, table: TableInfo, key_columns: set[str] | None = None,
                    code_max_distinct: int = 25) -> list[EstimatedColumn]:
     """Each column of `table` as the dictionary describes it. Reads the table's size, its columns' statistics and its
     declared keys, and a histogram only for a column that can be a code list, so a wide table costs one more read per
     candidate, not per column. Excludes from code lists what the exact profile excludes: key-like names, declared
-    foreign-key children (`key_columns`), sensitive names, and a column with as many values as rows."""
+    foreign-key children (`key_columns`), sensitive names, and a column with as many values as rows; and a column
+    whose statistics were gathered on another day than the table's, whose histogram can lack codes added since."""
     size = adapter.table_size(table.name)
     statistics = {s.column: s for s in adapter.column_statistics(table.name)}
     unique = adapter.unique_columns(table.name)
@@ -69,6 +81,7 @@ def estimate_table(adapter, table: TableInfo, key_columns: set[str] | None = Non
         if (not is_key_like(col.name) and col.name not in keys and not is_sensitive_name(col.name)
                 and _kind(col.data_type) is not None
                 and st.distinct is not None and size.rows is not None and st.distinct < size.rows
+                and st.analyzed is not None and st.analyzed == size.analyzed
                 and _may_be_complete(st, size.rows, size.stale, code_max_distinct)):
             codes = frequency_codes(st, size.rows, size.stale, adapter.histogram(table.name, col.name),
                                     col.data_type, code_max_distinct)
@@ -97,7 +110,9 @@ def frequency_codes(stats: ColumnStatistics, rows: int | None, stale: bool | Non
         previous = ep.number
     kind = _kind(data_type)
     if kind == "number":
-        values = [_number_code(ep) for ep in endpoints]
+        # The driver returns a FLOAT or a NUMBER with a scale above 0 as a float (2.0), its ENDPOINT_VALUE as an int (2).
+        as_float = _base(data_type) == "FLOAT" or (stats.scale or 0) > 0
+        values = [_number_code(ep, as_float) for ep in endpoints]
     elif kind == "text":
         values = _text_codes(endpoints, stats)
     else:
@@ -112,8 +127,7 @@ def profile_report(snapshot) -> tuple[str | None, str | None]:
     """(summary, warning) for an operator after statistics mode: how many tables were profiled each way, and which
     estimated tables the source holds no statistics for, or statistics it marks stale or does not say are current.
     (None, None) when no table was estimated."""
-    estimated = sorted(j.id.removeprefix("profile:") for j in snapshot.jobs
-                       if j.kind == "profile" and j.status == "done" and j.detail == "estimated")
+    estimated = sorted(estimated_tables(snapshot))
     if not estimated:
         return None, None
     exact = sum(1 for j in snapshot.jobs if j.kind == "profile" and j.status == "done" and j.detail != "estimated")
@@ -121,18 +135,25 @@ def profile_report(snapshot) -> tuple[str | None, str | None]:
     by_table: dict[str, list] = {}
     for column in snapshot.columns:
         by_table.setdefault(column.object_id, []).append(column.estimate)
-    unread, stale = [], []
+    unread, partial, stale = [], [], []
     for table in estimated:
-        estimates = [e for e in by_table.get(table, []) if e is not None and e.rows is not None]
+        everything = by_table.get(table, [])
+        estimates = [e for e in everything if e is not None and e.rows is not None]
         if not estimates:
             unread.append(table)
-        elif any(e.stale is not False for e in estimates):
+            continue
+        if len(estimates) < len(everything):
+            partial.append(f"{table} ({len(everything) - len(estimates)} of {len(everything)} columns)")
+        if any(e.stale is not False for e in estimates):
             analyzed = max((e.analyzed for e in estimates if e.analyzed), default=None)
             stale.append(f"{table} (as of {analyzed})" if analyzed else table)
     parts = []
     if unread:
         parts.append(f"{len(unread)} table(s) of source {snapshot.source_id!r} have no optimizer statistics, so no "
                      f"counts or code lists were read for them: {', '.join(unread)}.")
+    if partial:
+        parts.append(f"{len(partial)} table(s) of source {snapshot.source_id!r} have columns without statistics, so no "
+                     f"counts or code lists were read for those columns: {', '.join(partial)}.")
     if stale:
         parts.append(f"{len(stale)} table(s) of source {snapshot.source_id!r} have statistics Oracle marks stale or "
                      f"does not say are current, so their counts may be out of date and no code list was read from "
@@ -142,6 +163,23 @@ def profile_report(snapshot) -> tuple[str | None, str | None]:
     parts.append("Gather their statistics (DBMS_STATS.GATHER_TABLE_STATS) and run enrich again, or name them in the "
                  "source's \"exact_tables\" to profile them in full.")
     return summary, " ".join(parts)
+
+
+def unapplied_code_meanings(snapshot, dictionary) -> list[str]:
+    """Columns of estimated tables for which the operator's dictionary gives code meanings that `apply_dictionary` will
+    not apply, since it attaches a meaning only to a code in the column's list, and an estimated column has a list only
+    where a histogram allowed one. Each as "TABLE.COLUMN (n of m codes)". Exactly profiled tables are not looked at."""
+    estimated = estimated_tables(snapshot)
+    unapplied = []
+    for column in snapshot.columns:
+        entry = dictionary.columns.get(column.id) if column.object_id in estimated else None
+        if entry is None or not entry.codes:
+            continue
+        listed = {cv.code for cv in column.coded_values}
+        missing = [code for code in entry.codes if code not in listed]
+        if missing:
+            unapplied.append(f"{column.id} ({len(missing)} of {len(entry.codes)} codes)")
+    return unapplied
 
 
 def _may_be_complete(stats: ColumnStatistics, rows: int | None, stale: bool | None, code_max_distinct: int) -> bool:
@@ -157,8 +195,12 @@ def _sampled(stats: ColumnStatistics, rows: int | None) -> bool | None:
     return stats.sample_size < rows - stats.nulls
 
 
+def _base(data_type: str) -> str:
+    return (data_type or "").upper().split("(")[0].strip()
+
+
 def _kind(data_type: str) -> str | None:
-    base = (data_type or "").upper().split("(")[0].strip()
+    base = _base(data_type)
     if base in _NUMBER_TYPES:
         return "number"
     if base in _TEXT_TYPES:
@@ -166,11 +208,16 @@ def _kind(data_type: str) -> str | None:
     return None  # a date's endpoint is a day number; NVARCHAR2/NCHAR are encoded otherwise; the rest are not codes
 
 
-def _number_code(ep: HistogramEndpoint) -> str | None:
+def _number_code(ep: HistogramEndpoint, as_float: bool = False) -> str | None:
     value = ep.value
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if isinstance(value, float):
+    if as_float:
+        value = float(value)
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        code = str(value)
+    elif isinstance(value, float):
         if value != value or value in (float("inf"), float("-inf")):
             return None
         code = str(int(value)) if value.is_integer() else str(value)

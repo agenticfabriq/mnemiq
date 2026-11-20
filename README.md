@@ -315,6 +315,13 @@ of tables instead of copying the few you need. A name or pattern that matches no
 `mnemiq enrich` with a message saying which, so a typo cannot shrink the model unnoticed. Without
 `tables`, every table the source reports is enriched, as before.
 
+**Profile a production Oracle source from its statistics.** Before profiling an Oracle source,
+enrich reads each table's size from the optimizer statistics, and stops before reading a table
+larger than 1 GiB until the source's entry says how to profile it: `"profile": "exact"` reads every
+table in full, and `"profile": "statistics"` reads only the data dictionary, with `"exact_tables"`
+naming tables to read in full anyway. [Enriching a production
+database](docs/oracle-deployment.md#6-enriching-a-production-database) says what each gives up.
+
 ### Deploying against Oracle
 
 The Oracle read plane refuses writes, but that refusal is partly a property of your **deployment**

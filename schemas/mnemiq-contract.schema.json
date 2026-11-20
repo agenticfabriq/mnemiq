@@ -231,7 +231,7 @@
         "type": "object"
       },
       "ColumnEstimate": {
-        "description": "What the source's optimizer statistics say about a column, read from its dictionary, never from its rows.\n\nApproximate by nature: a distinct count may be off by a few percent, and the whole is as old as `analyzed`.\n`sampled` says the statistics were read from part of the rows; `stale` is the source's own flag, None when it\ncannot say. Every field None means the source holds that statistic for no column of this table.",
+        "description": "What the source's optimizer statistics say about a column, read from its dictionary, never from its rows.\n\nApproximate by nature: a distinct count may be off by a few percent, and the whole is as old as `analyzed`.\n`sampled` says the statistics were read from part of the rows; `stale` is the source's own flag, None when it\ncannot say. A field is None where the source holds no such statistic.",
         "properties": {
           "analyzed": {
             "anyOf": [
@@ -1349,7 +1349,7 @@
         "type": "object"
       },
       "ColumnEstimate": {
-        "description": "What the source's optimizer statistics say about a column, read from its dictionary, never from its rows.\n\nApproximate by nature: a distinct count may be off by a few percent, and the whole is as old as `analyzed`.\n`sampled` says the statistics were read from part of the rows; `stale` is the source's own flag, None when it\ncannot say. Every field None means the source holds that statistic for no column of this table.",
+        "description": "What the source's optimizer statistics say about a column, read from its dictionary, never from its rows.\n\nApproximate by nature: a distinct count may be off by a few percent, and the whole is as old as `analyzed`.\n`sampled` says the statistics were read from part of the rows; `stale` is the source's own flag, None when it\ncannot say. A field is None where the source holds no such statistic.",
         "properties": {
           "analyzed": {
             "anyOf": [

@@ -151,15 +151,19 @@ def _over(dictionary: _Dictionary) -> OracleAdapter:
 
 def test_column_statistics_maps_each_column():
     d = _Dictionary(columns=[
-        ("STATUS", 3, 0, "FREQUENCY", 3, 1000, ANALYZED, b"A", b"C"),
-        ("NOTE", None, None, "NONE", None, None, None, None, None),
+        ("STATUS", 3, 0, "FREQUENCY", 3, 1000, ANALYZED, b"A", b"C", None),
+        ("NOTE", None, None, "NONE", None, None, None, None, None, None),
+        ("RATE", 4, 0, "NONE", None, 1000, ANALYZED, None, None, 2),
     ])
     assert _over(d).column_statistics("ORDERS") == [
         ColumnStatistics(column="STATUS", distinct=3, nulls=0, histogram="FREQUENCY", buckets=3, sample_size=1000,
-                         analyzed="2026-11-01", low=b"A", high=b"C"),
+                         analyzed="2026-11-01", low=b"A", high=b"C", scale=None),
         ColumnStatistics(column="NOTE", distinct=None, nulls=None, histogram="NONE", buckets=None, sample_size=None,
-                         analyzed=None, low=None, high=None),
+                         analyzed=None, low=None, high=None, scale=None),
+        ColumnStatistics(column="RATE", distinct=4, nulls=0, histogram="NONE", buckets=None, sample_size=1000,
+                         analyzed="2026-11-01", low=None, high=None, scale=2),
     ]
+    assert "all_tab_columns" in d.sql[-1].lower() and "data_scale" in d.sql[-1].lower()
 
 
 def test_column_statistics_of_a_table_the_dictionary_does_not_show_is_empty():

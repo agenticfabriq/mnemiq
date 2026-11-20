@@ -1212,7 +1212,8 @@ def test_exact_counts_win_over_an_estimate():
 
 
 def test_a_join_through_a_repeating_estimated_key_is_refused():
-    """The loss-ratio shape again, both facts estimated: policy_id repeats in each by the dictionary's count."""
+    """The loss-ratio shape again, both facts estimated. By the dictionary's counts policy_id repeats in fact_premium
+    (50,000 of 125,000) and is unknown in fact_claim (23,322 of 30,000, more than half): one repeating side is enough."""
     snap = Snapshot(version="v", source_id="s", created_at="t", columns=[
         Column(id="fact_claim.policy_id", object_id="fact_claim", name="policy_id", **_estimated(30000, 23322)),
         Column(id="fact_claim.paid_amount_cents", object_id="fact_claim", name="paid_amount_cents",

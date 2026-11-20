@@ -1334,17 +1334,19 @@ class OracleAdapter:
         for is absent, and a table it does not show gives []. Table-level rows only: partition statistics live in
         another view."""
         rows = self._rows(
-            "SELECT column_name, num_distinct, num_nulls, histogram, num_buckets, sample_size, last_analyzed, "
-            "low_value, high_value FROM all_tab_col_statistics "
-            "WHERE owner = :owner AND table_name = :table_name",
+            "SELECT s.column_name, s.num_distinct, s.num_nulls, s.histogram, s.num_buckets, s.sample_size, "
+            "s.last_analyzed, s.low_value, s.high_value, c.data_scale FROM all_tab_col_statistics s "
+            "LEFT JOIN all_tab_columns c "
+            "ON c.owner = s.owner AND c.table_name = s.table_name AND c.column_name = s.column_name "
+            "WHERE s.owner = :owner AND s.table_name = :table_name",
             owner=self._schema, table_name=table,
         )
         return [
             ColumnStatistics(column=column, distinct=distinct, nulls=nulls, histogram=histogram or "NONE",
                              buckets=buckets, sample_size=sample_size,
                              analyzed=analyzed.date().isoformat() if analyzed is not None else None,
-                             low=low, high=high)
-            for column, distinct, nulls, histogram, buckets, sample_size, analyzed, low, high in rows
+                             low=low, high=high, scale=scale)
+            for column, distinct, nulls, histogram, buckets, sample_size, analyzed, low, high, scale in rows
         ]
 
     def histogram(self, table: str, column: str) -> list[HistogramEndpoint]:

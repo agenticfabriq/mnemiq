@@ -422,6 +422,13 @@ def _cmd_enrich(settings: Settings) -> int:
 
     from mnemiq.adapters.scoped import TablesNotFound
     from mnemiq.enrichment.size_check import exact_profile_refusal
+    from mnemiq.enrichment.statistics import profile_report, unapplied_code_meanings
+
+    if spec.profile == "statistics" and settings.enrich_examples:
+        print(f'source {spec.id!r}: MNEMIQ_ENRICH_EXAMPLES must be off with "profile": "statistics": the examples '
+              "phase runs the queries it writes against the source's tables, and statistics mode reads none of their "
+              "rows", file=sys.stderr)
+        return 1
 
     # Before any table is read: an Oracle source whose manifest does not say how to profile it is
     # checked for tables too large to read in full (`size_check`). Every other source reads nothing
@@ -456,8 +463,6 @@ def _cmd_enrich(settings: Settings) -> int:
     # saved the snapshot whatever they said, so a run in which every table failed persisted a
     # zero-column model and the engine then answered "I don't know about any tables" when the truth
     # was "I could not read them".
-    from mnemiq.enrichment.statistics import profile_report
-
     summary, warning = profile_report(snap)  # (None, None) unless a table was profiled from statistics
     if summary:
         print(summary)
@@ -477,6 +482,12 @@ def _cmd_enrich(settings: Settings) -> int:
     # "N table(s) FAILED to profile and were EXCLUDED -- the semantic model is INCOMPLETE",
     # and it did so before this change. Saying it twice in one run is worse than saying it once.
     _dict = load_dictionary(settings.dictionary_path) if settings.dictionary_path else None
+    unapplied = unapplied_code_meanings(snap, _dict) if _dict else []
+    if unapplied:
+        print(f"WARNING: the dictionary gives code meanings for {len(unapplied)} column(s) profiled from Oracle's "
+              f"statistics that have no code list, or a list without those codes, so they will not be applied: "
+              f"{', '.join(unapplied)}. Name their tables in the source's \"exact_tables\" to read their codes from "
+              "the data.", file=sys.stderr)
     _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
     _certified_set = fetch_certified_records(settings)
     require_certified(_certified_set, settings)

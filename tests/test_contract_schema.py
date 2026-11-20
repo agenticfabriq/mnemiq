@@ -123,8 +123,9 @@ def test_declared_unique_moves_the_version():
     assert len(versions) == 3
 
 
-def test_an_estimate_round_trips_and_an_older_reader_ignores_it():
-    """Ruling 1: an engine without the field (pydantic ignores unknown keys) reads the exact counts it had."""
+def test_an_estimate_round_trips_beside_empty_exact_counts():
+    """Ruling 1: an estimate survives a save and a load, and leaves the exact counts None, which every reader of them,
+    and an engine predating the field, reads as "not profiled"."""
     from mnemiq.contract.semantic import Column, ColumnEstimate
 
     col = Column(id="orders.id", object_id="orders", name="id",

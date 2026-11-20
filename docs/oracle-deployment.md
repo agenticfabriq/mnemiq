@@ -242,13 +242,18 @@ cannot fall back to reading every table.
   column, declares it. An approximate distinct count can never prove a key. It can show that a
   column repeats, though, and the fan-out guard uses that. No join is inferred to or from an
   estimated table, because checking a candidate reads its rows. Declared foreign keys are kept.
+- **The fan-out guard runs.** It refuses a sum through a join that repeats rows, reading declared
+  keys and estimates. With no partition facts, it also refuses a join to the current rows of a
+  type-2 dimension (`is_current = 1`), which an exact profile would show is safe: name that
+  dimension in `"exact_tables"` to have its partitions profiled.
 - **Code lists come only from complete frequency histograms.** A column gets a list only where
   the histogram is `FREQUENCY` with one endpoint per distinct value, was built from every non-null
-  row, and the table's statistics are not stale; and only where every value reads back exactly.
+  row on the same day as the table's statistics, and Oracle says the table's statistics are not
+  stale; and only where every value reads back exactly.
   Measured on 23ai Free: Oracle stores no text for short `VARCHAR2` values, only a numeric
   encoding of their first bytes. mnemiq reads a value back from that encoding only when it is at
   most 5 printable ASCII bytes and agrees with the column's lowest and highest values. Oracle
-  keeps 64 bytes of a value's text, so longer values give no list. Otherwise the column gets no
+  keeps 64 bytes of a value's text, so values of 64 bytes or more give no list. Otherwise the column gets no
   list, never a partial one. A dictionary's code meanings attach only to codes in a column's
   list, so for a column without one only the dictionary's description is kept: name the codes
   there, or in your definitions.
@@ -256,4 +261,8 @@ cannot fall back to reading every table.
   (`DBMS_STATS.GATHER_TABLE_STATS`, or let Oracle's maintenance job do it), and re-enrich when
   codes change. A code added since the statistics were gathered is missing from the column's list,
   and the dictionary's meaning for it is dropped. Enrich reports how many tables it profiled each
-  way, and names the estimated tables that have no statistics or stale ones.
+  way, and names the estimated tables that have no statistics, columns without them, or stale ones,
+  and the dictionary's code meanings it cannot apply.
+- **Nothing else reads an estimated table either.** Grounding skips joins to it, it has no value
+  index, and the examples phase (`MNEMIQ_ENRICH_EXAMPLES`), which runs the queries it writes, is
+  refused with `"statistics"`.

@@ -199,11 +199,11 @@ def test_dictionary_reads_live():
             except oracledb.DatabaseError:
                 pass
         cur.execute("CREATE TABLE t_stats_orders (id NUMBER PRIMARY KEY, status VARCHAR2(10), "
-                    "a NUMBER, b NUMBER, CONSTRAINT uk_stats_ab UNIQUE (a, b))")
+                    "a NUMBER, b NUMBER, rate NUMBER(5,2), CONSTRAINT uk_stats_ab UNIQUE (a, b))")
         cur.execute("CREATE TABLE t_stats_lines (line_no NUMBER, sku VARCHAR2(10))")
         cur.execute("CREATE UNIQUE INDEX ix_stats_line ON t_stats_lines (line_no)")
-        cur.executemany("INSERT INTO t_stats_orders VALUES (:1, :2, :3, :4)",
-                        [(i, "Y" if i % 10 < 7 else "N", i % 7, i) for i in range(1, 1001)])
+        cur.executemany("INSERT INTO t_stats_orders VALUES (:1, :2, :3, :4, :5)",
+                        [(i, "Y" if i % 10 < 7 else "N", i % 7, i, 2 if i % 10 < 6 else 2.5) for i in range(1, 1001)])
         cur.executemany("INSERT INTO t_stats_lines VALUES (:1, :2)", [(i, f"S{i % 3}") for i in range(1, 101)])
         con.commit()
         try:
@@ -212,7 +212,7 @@ def test_dictionary_reads_live():
                             " END;", t=t)
             a = _adapter()
             stats = {s.column: s for s in a.column_statistics("T_STATS_ORDERS")}
-            assert set(stats) == {"ID", "STATUS", "A", "B"}
+            assert set(stats) == {"ID", "STATUS", "A", "B", "RATE"}
             status = stats["STATUS"]
             assert (status.distinct, status.nulls, status.histogram, status.buckets, status.sample_size) == (
                 2, 0, "FREQUENCY", 2, 1000)
@@ -220,6 +220,13 @@ def test_dictionary_reads_live():
             endpoints = a.histogram("T_STATS_ORDERS", "STATUS")
             assert [e.number for e in endpoints] == [300, 1000]
             assert frequency_codes(status, 1000, False, endpoints, "VARCHAR2") == ["Y", "N"]
+            # A scaled NUMBER is spelled as the driver returns the column's values, as the exact profile writes them.
+            rate = stats["RATE"]
+            assert rate.scale == 2
+            driver = [str(r[0]) for r in cur.execute(
+                "SELECT rate FROM t_stats_orders GROUP BY rate ORDER BY COUNT(*) DESC, rate")]
+            assert frequency_codes(rate, 1000, False, a.histogram("T_STATS_ORDERS", "RATE"), "NUMBER") == driver
+            assert driver == ["2.0", "2.5"]
             assert a.unique_columns("T_STATS_ORDERS") == frozenset({"ID"}), "the (A, B) key makes neither unique"
             assert a.unique_columns("T_STATS_LINES") == frozenset({"LINE_NO"})
             assert a.column_statistics("NO_SUCH_TABLE") == [] and a.unique_columns("NO_SUCH_TABLE") == frozenset()

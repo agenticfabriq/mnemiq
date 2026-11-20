@@ -56,8 +56,9 @@ DICTIONARY = {
 class _Recording:
     """SQLite plus the four dictionary reads, recording every statement sent for data."""
 
-    def __init__(self, inner):
+    def __init__(self, inner, dictionary=None):
         self._inner = inner
+        self.dictionary = DICTIONARY if dictionary is None else dictionary
         self.sql: list[str] = []
 
     def __getattr__(self, name):
@@ -72,16 +73,16 @@ class _Recording:
         return self._inner.execute_arrow(sql, *args, **kwargs)
 
     def table_size(self, table):
-        return DICTIONARY[table][0]
+        return self.dictionary[table][0]
 
     def column_statistics(self, table):
-        return DICTIONARY[table][1]
+        return self.dictionary[table][1]
 
     def histogram(self, table, column):
-        return DICTIONARY[table][2].get(column, [])
+        return self.dictionary[table][2].get(column, [])
 
     def unique_columns(self, table):
-        return DICTIONARY[table][3]
+        return self.dictionary[table][3]
 
 
 @pytest.fixture
@@ -216,3 +217,48 @@ def test_absent_setting_sends_todays_queries(shop):
     digest = hashlib.sha256("\n".join(shop.sql).encode()).hexdigest()[:16]
     assert (digest, len(shop.sql)) == TODAYS_STATEMENTS, "\n".join(shop.sql)
     assert snap.version == TODAYS_VERSION
+
+
+# --- after the structural pass: nothing enrich runs next reads an estimated table -----------------
+
+STATUS_SHOP = """
+CREATE TABLE order_status (status_id INTEGER PRIMARY KEY, status_name VARCHAR2(10));
+CREATE TABLE orders (id INTEGER PRIMARY KEY, status_id INTEGER REFERENCES order_status(status_id), note VARCHAR2(10));
+INSERT INTO order_status VALUES (1, 'open'), (2, 'shipped');
+INSERT INTO orders VALUES (1, 1, 'x'), (2, 2, 'y'), (3, 1, 'x');
+"""
+STATUS_DICTIONARY = {
+    "order_status": (TableSize(2, 10, "2026-11-01", False),
+                     [_stats("status_id", 2, rows=2), _stats("status_name", 2, rows=2)], {},
+                     frozenset({"status_id"})),
+    "orders": (TableSize(3, 10, "2026-11-01", False),
+               [_stats("id", 3, rows=3), _stats("status_id", 2, rows=3), _stats("note", 2, rows=3)], {},
+               frozenset({"id"})),
+}
+
+
+def test_the_steps_after_the_structural_pass_read_no_estimated_table(tmp_path):
+    """Grounding and the value index run on every enrich. Lookup grounding joined an exactly profiled child to its
+    parent's label column, and so read the rows of a parent profiled from statistics."""
+    import duckdb
+
+    from mnemiq.enrichment.grounding import ground_codes
+    from mnemiq.semantic.values import build_value_index
+
+    path = tmp_path / "status.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript(STATUS_SHOP)
+    con.commit()
+    con.close()
+    source = _Recording(SQLiteAdapter(str(path)), STATUS_DICTIONARY)
+
+    exact = ground_codes(source, enrich_structural(source, "shop"))
+    assert any(_touches(sql, "order_status") and _touches(sql, "orders") for sql in source.sql), \
+        "control: exactly profiled, the label is looked up across the join"
+    assert {cv.meaning for c in exact.columns if c.id == "orders.status_id" for cv in c.coded_values} >= {"open"}
+
+    source.sql.clear()
+    snap = ground_codes(source, enrich_structural(source, "shop", statistics=("orders",)))
+    build_value_index(source, snap, duckdb.connect())
+    assert any(_touches(sql, "orders") for sql in source.sql), "control: the exact table is still read"
+    assert not any(_touches(sql, "order_status") for sql in source.sql), source.sql

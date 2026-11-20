@@ -31,7 +31,7 @@ class ColumnEstimate(BaseModel):
 
     Approximate by nature: a distinct count may be off by a few percent, and the whole is as old as `analyzed`.
     `sampled` says the statistics were read from part of the rows; `stale` is the source's own flag, None when it
-    cannot say. Every field None means the source holds that statistic for no column of this table.
+    cannot say. A field is None where the source holds no such statistic.
     """
     rows: int | None = None
     distinct: int | None = None

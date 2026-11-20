@@ -273,3 +273,31 @@ def test_a_histogram_with_fewer_buckets_than_values_is_not_read():
                      histograms={"STATUS": [_ep(1000, 1, "X" * 64, None)]})
     table = TableInfo(name="ORDERS", columns=[ColumnInfo("STATUS", "VARCHAR2")])
     assert estimate_table(source, table)[0].codes == [] and source.histograms_read == []
+
+
+
+@pytest.mark.parametrize(("data_type", "scale"), [("NUMBER", 2), ("FLOAT", None)])
+def test_frequency_codes_spell_numbers_the_driver_returns_as_floats(data_type, scale):
+    """Measured on 23.26: a NUMBER(5,2) or FLOAT column's values come from the driver as floats (2.0), while its
+    ENDPOINT_VALUE is an int (2). The exact profile writes str() of the column's value, so "2.0"."""
+    stats = ColumnStatistics(column="RATE", distinct=2, nulls=0, histogram="FREQUENCY", buckets=2, sample_size=10_000,
+                             analyzed="2026-11-01", low=None, high=None, scale=scale)
+    endpoints = [_ep(5000, 2, "2", None), _ep(10_000, 2.5, "2.5", None)]
+    assert frequency_codes(stats, 10_000, False, endpoints, data_type) == ["2.0", "2.5"]
+
+
+def test_an_integer_number_column_is_spelled_as_today():
+    stats = ColumnStatistics(column="QTY", distinct=2, nulls=0, histogram="FREQUENCY", buckets=2, sample_size=10_000,
+                             analyzed="2026-11-01", low=None, high=None, scale=0)
+    assert frequency_codes(stats, 10_000, False, [_ep(5000, 7), _ep(10_000, 8)], "NUMBER") == ["7", "8"]
+
+
+def test_no_codes_from_column_statistics_older_than_the_table():
+    """Gathered for the table later than for the column, the histogram can lack codes added since: no list."""
+    old = ColumnStatistics(column="STATUS", distinct=2, nulls=0, histogram="FREQUENCY", buckets=2, sample_size=1000,
+                           analyzed="2026-10-01", low=b"N", high=b"Y")
+    source = _Source(columns=[old], histograms={"STATUS": [_ep(300, N), _ep(1000, Y)]})
+    table = TableInfo(name="ORDERS", columns=[ColumnInfo("STATUS", "VARCHAR2")])
+    col = estimate_table(source, table)[0]
+    assert col.codes == [] and source.histograms_read == []
+    assert col.estimate.analyzed == "2026-10-01"
