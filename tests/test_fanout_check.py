@@ -1167,3 +1167,78 @@ def test_a_table_a_walk_first_meets_as_a_dead_end_is_walked_on_when_met_from_a_t
     off = _off("SELECT 1 FROM trx t JOIN customer c ON TRUE LEFT JOIN region r "
                "ON r.region_id = t.trx_id AND r.region_id = c.customer_id JOIN payment p ON p.payment_id = r.region_id")
     assert "trx" not in off and "customer" not in off, off
+
+
+# -- a source profiled from its statistics: declared keys and estimates ----------------------------
+
+def _estimated(rows, distinct, nulls=0, declared_unique=False):
+    from mnemiq.contract.semantic import ColumnEstimate
+
+    return {"estimate": ColumnEstimate(rows=rows, distinct=distinct, nulls=nulls, analyzed="2026-11-01",
+                                       sampled=False, stale=False),
+            "declared_unique": declared_unique}
+
+
+def _facts(**columns):
+    return key_facts(Snapshot(version="v", source_id="s", created_at="t", columns=[
+        Column(id=f"t.{name}", object_id="t", name=name, **kw) for name, kw in columns.items()]))
+
+
+def test_declared_unique_is_unique():
+    assert _facts(id=_estimated(1000, 990, declared_unique=True)) == {("t", "id"): True}
+    assert _facts(id={"declared_unique": True}) == {("t", "id"): True}, "a declaration needs no counts"
+
+
+def test_an_estimate_far_below_the_rows_repeats():
+    assert _facts(customer_id=_estimated(1000, 400)) == {("t", "customer_id"): False}
+    assert _facts(customer_id=_estimated(1100, 500, nulls=100)) == {("t", "customer_id"): False}, "of non-null rows"
+
+
+def test_an_estimate_near_the_rows_is_unknown():
+    """An approximate distinct count can never prove a key, and 990 of 1,000 says nothing either way."""
+    assert _facts(code=_estimated(1000, 990)) == {}
+    assert _facts(code=_estimated(1000, 501)) == {}
+    assert _facts(code=_estimated(1000, 500)) == {("t", "code"): False}
+
+
+def test_an_estimate_without_its_counts_is_unknown():
+    assert _facts(code=_estimated(None, 10)) == {}
+    assert _facts(code=_estimated(0, 0)) == {}
+
+
+def test_exact_counts_win_over_an_estimate():
+    both = {**_estimated(1000, 400), "row_count": 1000, "distinct_count": 1000, "null_count": 0}
+    assert _facts(id=both) == {("t", "id"): True}
+
+
+def test_a_join_through_a_repeating_estimated_key_is_refused():
+    """The loss-ratio shape again, both facts estimated: policy_id repeats in each by the dictionary's count."""
+    snap = Snapshot(version="v", source_id="s", created_at="t", columns=[
+        Column(id="fact_claim.policy_id", object_id="fact_claim", name="policy_id", **_estimated(30000, 23322)),
+        Column(id="fact_claim.paid_amount_cents", object_id="fact_claim", name="paid_amount_cents",
+               **_estimated(30000, 29000)),
+        Column(id="fact_premium.policy_id", object_id="fact_premium", name="policy_id", **_estimated(125000, 50000)),
+        Column(id="fact_premium.earned_premium_cents", object_id="fact_premium", name="earned_premium_cents",
+               **_estimated(125000, 90000)),
+    ])
+    sql = ("SELECT SUM(fact_claim.paid_amount_cents) / SUM(fact_premium.earned_premium_cents) "
+           "FROM fact_claim JOIN fact_premium ON fact_claim.policy_id = fact_premium.policy_id")
+    visible = {"fact_claim": {"policy_id", "paid_amount_cents"},
+               "fact_premium": {"policy_id", "earned_premium_cents"}}
+    verdict = _check(sql, keys=key_facts(snap), visible=visible)
+    assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
+
+
+def test_a_join_to_a_declared_key_is_answered():
+    snap = Snapshot(version="v", source_id="s", created_at="t", columns=[
+        Column(id="fact_claim.policy_id", object_id="fact_claim", name="policy_id", **_estimated(30000, 23322)),
+        Column(id="fact_claim.paid_amount_cents", object_id="fact_claim", name="paid_amount_cents",
+               **_estimated(30000, 29000)),
+        Column(id="dim_policy.policy_id", object_id="dim_policy", name="policy_id",
+               **_estimated(50000, 49100, declared_unique=True)),
+        Column(id="dim_policy.region", object_id="dim_policy", name="region", **_estimated(50000, 4)),
+    ])
+    sql = ("SELECT dim_policy.region, SUM(fact_claim.paid_amount_cents) FROM fact_claim "
+           "JOIN dim_policy ON fact_claim.policy_id = dim_policy.policy_id GROUP BY dim_policy.region")
+    visible = {"fact_claim": {"policy_id", "paid_amount_cents"}, "dim_policy": {"policy_id", "region"}}
+    assert _check(sql, keys=key_facts(snap), visible=visible) is None

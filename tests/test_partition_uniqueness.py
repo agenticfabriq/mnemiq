@@ -410,3 +410,16 @@ def test_a_snapshot_predating_the_job_keeps_its_version():
         Job(id=PARTITIONS_JOB, source_id="shop", kind="profile:partitions", status=status)]}))
         for status in ("done", "partial", "failed")}
     assert len(versions) == 3, "the STATUS is hashed: a repaired snapshot must swap in"
+
+
+def test_auto_runs_the_guard_on_an_estimated_snapshot():
+    """Decision B: a source profiled from its statistics has no partition facts, and its partitions job says
+    `estimated`; auto counts it as profiled, so the guard runs on declared keys and estimates."""
+    from mnemiq.contract import Job, Snapshot
+    from mnemiq.sql.fanout_check import guard_on
+
+    snap = Snapshot(version="v", source_id="shop", created_at="t", jobs=[
+        Job(id=PARTITIONS_JOB, source_id="shop", kind="profile:partitions", status="estimated")])
+    assert partitions_profiled(snap) and guard_on(None, snap)
+    failed = snap.model_copy(update={"jobs": [snap.jobs[0].model_copy(update={"status": "failed"})]})
+    assert not partitions_profiled(failed)
