@@ -86,7 +86,25 @@ def test_tables_without_statistics_warn_and_go_on():
     source = _Dictionary({"ORDERS": TableSize(None, None, None, None), "CUSTOMERS": _size(1_000)})
     refusal, warning = exact_profile_refusal(_spec(), source)
     assert refusal is None
-    assert "1 table(s) of source 'erp' have no optimizer statistics" in warning and "ORDERS" in warning
+    assert "1 table(s) of source 'erp' have no table-level optimizer statistics" in warning and "ORDERS" in warning
+    assert "DBMS_STATS.GATHER_TABLE_STATS" in warning and '"tables"' in warning
+
+
+def test_stale_tables_are_named_in_the_warning():
+    """A table measured small and since grown passes the line on its old size; Oracle's stale flag is the only sign.
+    It is named, with the size its statistics give, and what to do."""
+    source = _Dictionary({"ORDERS": TableSize(rows=4_000_000, avg_row_len=100, analyzed="2026-01-01", stale=True),
+                          "CUSTOMERS": _size(1_000)})
+    refusal, warning = exact_profile_refusal(_spec(), source)
+    assert refusal is None
+    assert "1 table(s) of source 'erp' have statistics Oracle marks stale" in warning
+    assert "ORDERS (~0.4 GiB as of 2026-01-01)" in warning and "CUSTOMERS" not in warning
+    assert "DBMS_STATS.GATHER_TABLE_STATS" in warning
+
+
+def test_unknown_staleness_is_not_warned_as_stale():
+    source = _Dictionary({"ORDERS": TableSize(rows=1_000, avg_row_len=100, analyzed="2026-01-01", stale=None)})
+    assert exact_profile_refusal(_spec(), source) == (None, None)
 
 
 def test_size_check_reads_each_table_once():
@@ -153,4 +171,4 @@ def test_enrich_prints_the_warning_and_goes_on(monkeypatch, tmp_path, capsys):
     with pytest.raises(_Profiled):
         _cmd_enrich(_settings(tmp_path))
     assert len(profiled) == 1
-    assert "WARNING: 1 table(s) of source 'erp' have no optimizer statistics" in capsys.readouterr().err
+    assert "WARNING: 1 table(s) of source 'erp' have no table-level optimizer statistics" in capsys.readouterr().err

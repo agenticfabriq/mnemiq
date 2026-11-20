@@ -32,21 +32,36 @@ def exact_profile_refusal(spec, adapter) -> tuple[str | None, str | None]:
 
     Only an Oracle source whose manifest names no "profile" is checked, and only then is anything read: the table list
     and each table's size from the dictionary. The refusal names every table above `LARGE_TABLE_BYTES` and how to go
-    on. A table with no statistics has an unknown size: it is named in the warning, and enrich goes on as before."""
+    on. Two kinds of table can be large without the statistics saying so, and the warning names both while enrich goes
+    on as before: one with no table-level statistics, whose size is unknown, and one whose statistics Oracle marks
+    stale, which may have grown since they were gathered."""
     if spec.kind != "oracle" or spec.profile:
         return None, None
     large: list[tuple[str, int]] = []
     unknown: list[str] = []
+    stale: list[str] = []
     for table in adapter.introspect():
         size = adapter.table_size(table)
         if size.rows is None or size.avg_row_len is None:
             unknown.append(table)
-        elif size.rows * size.avg_row_len > LARGE_TABLE_BYTES:
-            large.append((table, size.rows * size.avg_row_len))
-    warning = None
+            continue
+        estimate = size.rows * size.avg_row_len
+        if estimate > LARGE_TABLE_BYTES:
+            large.append((table, estimate))
+        elif size.stale is True:
+            stale.append(f"{table} (~{_gib(estimate)} GiB as of {size.analyzed})")
+    parts = []
     if unknown:
-        warning = (f"{len(unknown)} table(s) of source {spec.id!r} have no optimizer statistics, so their size is "
-                   f"unknown and exact profiling reads them in full: {', '.join(unknown)}")
+        parts.append(f"{len(unknown)} table(s) of source {spec.id!r} have no table-level optimizer statistics, so "
+                     f"their size is unknown: {', '.join(unknown)}")
+    if stale:
+        parts.append(f"{len(stale)} table(s) of source {spec.id!r} have statistics Oracle marks stale, so they may "
+                     f"have grown since: {', '.join(stale)}")
+    warning = None
+    if parts:
+        warning = ("; ".join(parts) + ". Exact profiling reads each of them in full; to check their size first, "
+                   "gather their statistics (DBMS_STATS.GATHER_TABLE_STATS) and run enrich again, or leave them out "
+                   'of the source\'s "tables".')
     if not large:
         return None, warning
     listed = ", ".join(f"{table} (~{_gib(size)} GiB)" for table, size in large)
