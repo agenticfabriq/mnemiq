@@ -48,7 +48,8 @@ def ground_from_correlated(adapter, snapshot: Snapshot) -> dict[str, dict[str, s
     out: dict[str, dict[str, str]] = {}
     for table, cols in _columns_by_table(snapshot).items():
         for col in cols:
-            if not col.coded_values:
+            # A code list read from the source's statistics: checking a label sibling reads the rows.
+            if not col.coded_values or col.estimate is not None:
                 continue
             candidates = [
                 d.name for d in cols

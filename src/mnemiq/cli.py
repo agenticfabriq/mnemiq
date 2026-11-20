@@ -421,21 +421,19 @@ def _cmd_enrich(settings: Settings) -> int:
     from mnemiq.ontology.records import load_records, merge_records
 
     from mnemiq.adapters.scoped import TablesNotFound
-    from mnemiq.enrichment.size_check import exact_profile_refusal, statistics_refusal
+    from mnemiq.enrichment.size_check import exact_profile_refusal
 
     # Before any table is read: an Oracle source whose manifest does not say how to profile it is
     # checked for tables too large to read in full (`size_check`). Every other source reads nothing
     # extra here.
     if not superset:
-        refusal = statistics_refusal(spec)
-        if refusal is None:
-            try:
-                refusal, warning = exact_profile_refusal(spec, adapter)
-            except TablesNotFound as exc:
-                print(str(exc), file=sys.stderr)
-                return 1
-            if warning:
-                print(f"WARNING: {warning}", file=sys.stderr)
+        try:
+            refusal, warning = exact_profile_refusal(spec, adapter)
+        except TablesNotFound as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if warning:
+            print(f"WARNING: {warning}", file=sys.stderr)
         if refusal:
             print(refusal, file=sys.stderr)
             return 1
@@ -444,9 +442,12 @@ def _cmd_enrich(settings: Settings) -> int:
         if superset:
             snap = enrich_structural(adapter, spec.id, harvest_values=False,
                                      superset_source=(adapter.database_id, adapter.schema))
+        elif spec.profile == "statistics":
+            # Each table from the source's dictionary, except the ones "exact_tables" names.
+            snap = enrich_structural(adapter, spec.id, statistics=spec.exact_tables)
         else:
             snap = enrich_structural(adapter, spec.id)
-    except TablesNotFound as exc:  # a manifest "tables" entry matching nothing: say which (M110)
+    except TablesNotFound as exc:  # a "tables" or "exact_tables" entry matching nothing: say which (M110)
         print(str(exc), file=sys.stderr)
         return 1
     # Read what the profile jobs say BEFORE spending LLM calls on the result or saving it. M59,

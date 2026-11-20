@@ -4,8 +4,9 @@ Exact profiling reads each table in full many times: one count over every column
 to eight partition counts, the grounding and join checks, the value index. On a production database's large tables
 one such read was measured at hours, so a whole profile is days of load on the database. When the manifest has not
 said how to profile an Oracle source, enrich therefore reads each table's size from the dictionary first, which reads
-no table data, and stops before any table is read if one is large. `"profile": "exact"` on the source is how an
-operator says to read them anyway.
+no table data, and stops before any table is read if one is large. `"profile": "statistics"` on the source profiles
+it from those statistics instead (`enrichment.statistics`), and `"profile": "exact"` is how an operator says to read
+the tables in full anyway.
 """
 from __future__ import annotations
 
@@ -15,16 +16,6 @@ LARGE_TABLE_BYTES = 1 << 30
 
 def _gib(n: int) -> str:
     return f"{n / (1 << 30):.1f}"
-
-
-def statistics_refusal(spec) -> str | None:
-    """Why `spec` cannot be enriched as it stands, when its manifest asks for statistics profiling, which this version
-    does not have. Taking it as "skip the size check" would profile every table in full, the harm the check exists
-    for."""
-    if spec.profile != "statistics":
-        return None
-    return (f'source {spec.id!r}: "profile": "statistics" is not available in this version of mnemiq; leave '
-            '"profile" out, or set it to "exact"')
 
 
 def exact_profile_refusal(spec, adapter) -> tuple[str | None, str | None]:
@@ -67,6 +58,8 @@ def exact_profile_refusal(spec, adapter) -> tuple[str | None, str | None]:
     listed = ", ".join(f"{table} (~{_gib(size)} GiB)" for table, size in large)
     refusal = (f"enrich stopped before reading any table: {len(large)} table(s) of source {spec.id!r} hold about "
                f"{_gib(sum(size for _, size in large))} GiB by Oracle's statistics, and exact profiling reads each of "
-               f"them in full many times: {listed}. To profile them in full anyway, set \"profile\": \"exact\" on this "
-               f"source in the manifest; to leave them out, list the tables to enrich in its \"tables\".")
+               f"them in full many times: {listed}. On this source in the manifest, set \"profile\": \"statistics\" to "
+               "read Oracle's optimizer statistics and no table data (\"exact_tables\" names tables to count exactly), "
+               "or \"profile\": \"exact\" to profile them in full anyway; or list the tables to enrich in its "
+               "\"tables\".")
     return refusal, warning

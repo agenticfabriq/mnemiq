@@ -4,11 +4,14 @@ import hashlib
 import json
 import logging
 from datetime import UTC, datetime
+from fnmatch import fnmatchcase
 
+from mnemiq.adapters.scoped import TablesNotFound
 from mnemiq.catalog import introspect
 from mnemiq.contract import CodedValue, Column, Job, Snapshot, SourceBinding, ViewDefinition
 from mnemiq.enrichment.joins import build_relationships
 from mnemiq.enrichment.profiling import FAILED, profile_table, unharvested
+from mnemiq.enrichment.statistics import estimate_table
 from mnemiq.sql.fanout_check import PARTITIONS_JOB
 from mnemiq.superset.settings import SUPERSET_SOURCE_JOB
 
@@ -183,8 +186,35 @@ def _listed(items: list[str], shown: int = 10) -> str | None:
     return "; ".join(items[:shown]) + more
 
 
+def _exactly_profiled(catalog: list, statistics: tuple[str, ...] | None, source_id: str) -> set[str] | None:
+    """The tables statistics mode profiles exactly, or None when it is off (every table is). Each pattern must name a
+    table: a typo would otherwise estimate the table the operator meant to count exactly."""
+    if statistics is None:
+        return None
+    names = [t.name for t in catalog]
+    patterns = [(raw, raw.casefold()) for raw in statistics]
+    missing = [raw for raw, p in patterns if not any(fnmatchcase(n.casefold(), p) for n in names)]
+    if missing:
+        raise TablesNotFound(
+            f"source {source_id!r}: \"exact_tables\" names no table it enriches: {', '.join(missing)} -- check the "
+            "names (matched without regard to case; * and ? are patterns)")
+    return {n for n in names if any(fnmatchcase(n.casefold(), p) for _raw, p in patterns)}
+
+
+def _estimated_columns(adapter, table, key_columns: set[str] | None, harvest_values: bool) -> list[Column]:
+    """`table`'s columns from the source's dictionary. Without values harvested no histogram is read, so no codes."""
+    estimates = estimate_table(adapter, table, key_columns=key_columns, code_max_distinct=25 if harvest_values else 0)
+    return [
+        Column(id=f"{table.name}.{col.name}", object_id=table.name, name=col.name, data_type=col.data_type,
+               coded_values=[CodedValue(code=code) for code in e.codes],
+               estimate=e.estimate, declared_unique=e.declared_unique)
+        for col, e in zip(table.columns, estimates, strict=True)
+    ]
+
+
 def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
-                      superset_source: tuple[int, str] | None = None) -> Snapshot:
+                      superset_source: tuple[int, str] | None = None,
+                      statistics: tuple[str, ...] | None = None) -> Snapshot:
     """The no-LLM enrichment pass: discover, profile, infer joins.
 
     Produces a Snapshot stating what the source *contains*. What any of it *means* is
@@ -194,11 +224,20 @@ def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
     so no column carries `coded_values`. `superset_source`, the Superset database id and schema
     the adapter reads, records them as the `superset:source` job a server in Superset mode looks
     for; it is given only where no value is harvested, which the job says.
+
+    `statistics` set is statistics mode (the manifest's `"profile": "statistics"`): each table is described from the
+    source's dictionary (`estimate_table`), reading none of its rows, except the tables its patterns name (the
+    manifest's `"exact_tables"`, matched without regard to case), which are profiled exactly. A pattern naming no table
+    raises `TablesNotFound` before any is read. An estimated table's columns carry `estimate` and `declared_unique` and
+    no exact counts, its job says `estimated`, and no join is inferred to or from it, since checking one reads rows; its
+    declared foreign keys are kept. None: every table exactly, as before.
     """
     if superset_source is not None and harvest_values:
         raise ValueError("a snapshot enriched through Superset harvests no values: pass "
                          "harvest_values=False with superset_source")
     catalog = introspect(adapter)
+    exact = _exactly_profiled(catalog, statistics, source_id)
+    estimated = frozenset(t.name for t in catalog if exact is not None and t.name not in exact)
     columns: list[Column] = []
     source_bindings: list[SourceBinding] = []
     jobs: list[Job] = []
@@ -215,29 +254,34 @@ def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
 
     for table in catalog:
         try:
-            stats = {
-                s.column: s
-                for s in profile_table(adapter, table, key_columns=fk_children.get(table.name),
-                                       **unharvested(harvest_values))
-            }
-            table_columns = [
-                Column(
-                    id=f"{table.name}.{col.name}",
-                    object_id=table.name,
-                    name=col.name,
-                    data_type=col.data_type,
-                    # codes now, meanings later
-                    coded_values=[
-                        CodedValue(code=str(value))
-                        for value, _count in (stats[col.name].top_k if col.name in stats else [])
-                    ],
-                    row_count=stats[col.name].row_count if col.name in stats else None,
-                    distinct_count=stats[col.name].distinct_count if col.name in stats else None,
-                    null_count=stats[col.name].null_count if col.name in stats else None,
-                    unique_within=stats[col.name].unique_within if col.name in stats else None,
-                )
-                for col in table.columns
-            ]
+            if table.name in estimated:
+                # From the dictionary, reading no row; nothing measured, so nothing below to record.
+                stats = {}
+                table_columns = _estimated_columns(adapter, table, fk_children.get(table.name), harvest_values)
+            else:
+                stats = {
+                    s.column: s
+                    for s in profile_table(adapter, table, key_columns=fk_children.get(table.name),
+                                           **unharvested(harvest_values))
+                }
+                table_columns = [
+                    Column(
+                        id=f"{table.name}.{col.name}",
+                        object_id=table.name,
+                        name=col.name,
+                        data_type=col.data_type,
+                        # codes now, meanings later
+                        coded_values=[
+                            CodedValue(code=str(value))
+                            for value, _count in (stats[col.name].top_k if col.name in stats else [])
+                        ],
+                        row_count=stats[col.name].row_count if col.name in stats else None,
+                        distinct_count=stats[col.name].distinct_count if col.name in stats else None,
+                        null_count=stats[col.name].null_count if col.name in stats else None,
+                        unique_within=stats[col.name].unique_within if col.name in stats else None,
+                    )
+                    for col in table.columns
+                ]
             # A column that FAILED to measure is recorded as its own job, and the TABLE's job
             # stays `done` deliberately (**M73**). Two reasons it is not a table-level status:
             # the table really was profiled and its other columns carry real statistics, and
@@ -276,7 +320,8 @@ def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
                 )
             )
         jobs.append(
-            Job(id=f"profile:{table.name}", source_id=source_id, kind="profile", status=status)
+            Job(id=f"profile:{table.name}", source_id=source_id, kind="profile", status=status,
+                detail="estimated" if table.name in estimated and status == "done" else None)
         )
 
     # A candidate whose check could not run is skipped, and recorded here as well as logged: a
@@ -284,7 +329,7 @@ def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
     inference_failures: list[str] = []
     try:
         relationships = build_relationships(adapter, catalog, **unharvested(harvest_values),
-                                            failures=inference_failures)
+                                            failures=inference_failures, estimated=estimated)
         status = "partial" if inference_failures else "done"
     except Exception:
         relationships, status = [], "failed"
@@ -311,8 +356,11 @@ def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
     # partition facts, so only its table's current-row joins refuse -- visibly. Counting the whole
     # snapshot unprofiled instead would leave every other table's sums unguarded. A table that
     # failed outright is not in the model at all. Not kind "profile": that string counts tables.
+    # In statistics mode with no table profiled exactly there are no partition facts at all: `estimated`, which the
+    # guard's auto setting counts as profiled, reading declared keys and estimates instead (`fanout_check.key_facts`).
     jobs.append(Job(id=PARTITIONS_JOB, source_id=source_id, kind="profile:partitions",
-                    status="partial" if partition_failures else "done",
+                    status="estimated" if exact is not None and not exact
+                    else "partial" if partition_failures else "done",
                     detail="; ".join(partition_failures)[:2000] or None))
     if superset_source is not None:
         database_id, schema = superset_source

@@ -58,8 +58,7 @@ def test_a_large_table_stops_enrich_before_any_table_is_read():
     assert refusal.startswith("enrich stopped before reading any table: 1 table(s) of source 'erp'")
     assert "ORDERS (~1.9 GiB)" in refusal and "CUSTOMERS" not in refusal
     assert '"profile": "exact"' in refusal and '"tables"' in refusal
-    # statistics mode is not in this version: the message must not send anyone to it
-    assert "statistics\"" not in refusal
+    assert '"profile": "statistics"' in refusal and '"exact_tables"' in refusal
     assert warning is None
 
 
@@ -136,7 +135,7 @@ def _wire(monkeypatch, source):
     profiled: list = []
 
     def profile(*a, **k):
-        profiled.append(a)
+        profiled.append((a, k))
         raise _Profiled
 
     monkeypatch.setattr("mnemiq.adapters.resolve.adapter_for", lambda *a, **k: source)
@@ -153,15 +152,30 @@ def test_enrich_exits_1_and_reads_no_table_on_refusal(monkeypatch, tmp_path, cap
     assert "enrich stopped before reading any table" in capsys.readouterr().err
 
 
-def test_enrich_refuses_statistics_until_it_is_built(monkeypatch, tmp_path, capsys):
-    """Taking "statistics" as "skip the check" would profile every table in full: the harm the check exists for."""
+def test_enrich_passes_the_statistics_scope(monkeypatch, tmp_path):
+    """"statistics" skips the size check, which exists for exact profiling, and reaches the profile with the tables the
+    manifest names exact."""
     from mnemiq.cli import _cmd_enrich
 
     source = _Dictionary({"ORDERS": _size(20_000_000)})
     profiled = _wire(monkeypatch, source)
-    assert _cmd_enrich(_settings(tmp_path, profile="statistics")) == 1
-    assert profiled == [] and source.asked == []
-    assert '"profile": "statistics" is not available in this version' in capsys.readouterr().err
+    with pytest.raises(_Profiled):
+        _cmd_enrich(_settings(tmp_path, profile="statistics", exact_tables=["orders", "dim_*"]))
+    assert profiled[0][1]["statistics"] == ("orders", "dim_*") and source.asked == []
+    profiled.clear()
+    with pytest.raises(_Profiled):
+        _cmd_enrich(_settings(tmp_path, profile="statistics"))
+    assert profiled[0][1]["statistics"] == ()
+
+
+@pytest.mark.parametrize("entry", [{}, {"profile": "exact"}])
+def test_enrich_profiles_exactly_unless_statistics_is_named(monkeypatch, tmp_path, entry):
+    from mnemiq.cli import _cmd_enrich
+
+    profiled = _wire(monkeypatch, _Dictionary({"ORDERS": _size(1_000)}))
+    with pytest.raises(_Profiled):
+        _cmd_enrich(_settings(tmp_path, **entry))
+    assert profiled[0][1].get("statistics") is None
 
 
 def test_enrich_prints_the_warning_and_goes_on(monkeypatch, tmp_path, capsys):
