@@ -725,12 +725,17 @@ def test_grain_mismatch_either_way_is_a_mismatch(fake):
     assert check.mnemiq_values == MONTHS
 
 
-def test_rows_cut_by_the_charts_row_limit_are_not_checked(fake):
-    """No order is fixed for a chart's rows, so which groups its row limit keeps is Superset's choice."""
-    _serve(fake, form_data=_bar(row_limit=2), chart=_chart_data(["region", "Total premium"], ("east", 1), ("west", 2)),
+ROW_LIMIT_CUT = "the chart's row limit (2) keeps only some of its groups, so not all of them were compared"
+
+
+def test_rows_cut_by_a_row_limit_mnemiq_reads_no_ranking_for_are_not_checked(fake):
+    """A bar sorted by a column (`order_by_cols`): mnemiq reads no ranking for it, so which groups its row limit keeps
+    is not checked."""
+    _serve(fake, form_data=_bar(row_limit=2, order_by_cols=['["region", true]']),
+           chart=_chart_data(["region", "Total premium"], ("east", 1), ("west", 2)),
            mnemiq=_result(("east", 1), ("west", 2), ("north", 3)))
     check = _check(fake)
-    assert check.status is ChartStatus.NOT_CHECKED and "row limit" in check.reason
+    assert check.status is ChartStatus.NOT_CHECKED and check.reason == ROW_LIMIT_CUT
 
 
 def test_chart_data_without_the_named_columns_is_not_checked(fake):
@@ -2010,3 +2015,78 @@ def test_a_mixed_or_pivot_chart_has_no_ranking_mnemiq_reads(form):
     expectation = Expectation(metrics=(("Total premium", "SUM(premium)"),), dimensions=("region",), time_grain=None,
                               filters=())
     assert ranking_of(copy.deepcopy(form), expectation, dataset=PHYSICAL) is None
+
+
+
+# ---------------------------------------------------------------- a row limit, checked as a ranking
+
+def _cut(fake, chart_rows, mnemiq_rows, **form):
+    _serve(fake, form_data=_bar(**form), chart=_chart_data(["region", "Total premium"], *chart_rows),
+           mnemiq=_result(*mnemiq_rows, columns=(("region", "object"), ("m0", "float64"))))
+    return _check(fake)
+
+
+NULL_KEPT = ("the chart's row limit ({n}) keeps groups with no value for 'Total premium' and leaves out groups that "
+             "have one, so they are not the {n} {order}")
+NOT_FIRST = "the chart's row limit ({n}) keeps groups that are not the {n} {order} by 'Total premium'"
+RANKED = ("the chart's numbers match mnemiq's own SQL, and its row limit keeps the {n} {order} groups by "
+          "'Total premium'")
+
+
+def test_groups_with_no_value_kept_ahead_of_larger_ones_are_a_mismatch(fake):
+    """The shape of a top 10 whose measure is NULL for most groups: Postgres puts NULL first under DESC, so the chart
+    keeps the groups with no value and leaves out the largest."""
+    check = _cut(fake, [("a", None), ("b", None)], [("a", None), ("b", None), ("c", 50.0), ("d", 30.0)], row_limit=2)
+    assert check.status is ChartStatus.MISMATCH and check.reason == NULL_KEPT.format(n=2, order="largest")
+    assert check.mnemiq_values is not None
+
+
+def test_the_true_top_n_is_checked_as_a_ranking(fake):
+    check = _cut(fake, [("c", 50.0), ("d", 30.0)], [("a", None), ("c", 50.0), ("d", 30.0), ("e", 10.0)], row_limit=2)
+    assert check.status is ChartStatus.CHECKED and check.reason == RANKED.format(n=2, order="largest")
+
+
+@pytest.mark.parametrize("kept", [("d", 30.0), ("e", 30.0)], ids=["one tie", "the other"])
+def test_either_group_tied_at_the_cut_may_be_kept(fake, kept):
+    check = _cut(fake, [("c", 50.0), kept], [("c", 50.0), ("d", 30.0), ("e", 30.0), ("f", 5.0)], row_limit=2)
+    assert check.status is ChartStatus.CHECKED, check.reason
+
+
+def test_a_group_above_the_cut_left_out_is_a_mismatch(fake):
+    check = _cut(fake, [("c", 50.0), ("e", 10.0)], [("c", 50.0), ("d", 30.0), ("e", 10.0)], row_limit=2)
+    assert check.status is ChartStatus.MISMATCH and check.reason == NOT_FIRST.format(n=2, order="largest")
+
+
+def test_an_ascending_chart_keeps_the_smallest(fake):
+    rows = [("c", 50.0), ("d", 30.0), ("e", 10.0)]
+    check = _cut(fake, [("e", 10.0), ("d", 30.0)], rows, row_limit=2, order_desc=False)
+    assert check.status is ChartStatus.CHECKED and check.reason == RANKED.format(n=2, order="smallest")
+    fake.calls.clear()
+    check = _cut(fake, [("c", 50.0), ("d", 30.0)], rows, row_limit=2, order_desc=False)
+    assert check.status is ChartStatus.MISMATCH and check.reason == NOT_FIRST.format(n=2, order="smallest")
+
+
+def test_groups_with_no_value_may_fill_a_cut_once_every_group_with_one_is_kept(fake):
+    rows = [("c", 50.0), ("a", None), ("b", None), ("z", None)]
+    check = _cut(fake, [("c", 50.0), ("a", None), ("b", None)], rows, row_limit=3)
+    assert check.status is ChartStatus.CHECKED, check.reason
+    fake.calls.clear()
+    check = _cut(fake, [("a", None), ("b", None), ("z", None)], rows, row_limit=3)
+    assert check.status is ChartStatus.MISMATCH and check.reason == NULL_KEPT.format(n=3, order="largest")
+
+
+def test_a_ranked_cut_on_a_dataset_this_build_made_is_ranked_too(fake):
+    _serve(fake, form_data=_bar(row_limit=2), chart=_chart_data(["region", "Total premium"], ("a", None), ("b", None)),
+           mnemiq=_result(("a", None), ("b", None), ("c", 5.0), columns=(("region", "object"), ("m0", "float64"))),
+           dataset=_dataset(virtual=True))
+    _rules(fake, _no_rule)
+    check = _check(fake, made={DATASET_ID: MADE_SQL})
+    assert check.status is ChartStatus.MISMATCH and check.reason == NULL_KEPT.format(n=2, order="largest")
+
+
+def test_a_read_at_its_cap_is_never_ranked(fake):
+    """A pin, not a new behaviour: mnemiq's own read stopped at its cap, so its groups are not all there to rank, and
+    the cap's reason stands before any ranking is read."""
+    rows = [(f"g{i:04}", float(i)) for i in range(1000)]
+    check = _cut(fake, [("g0999", 999.0), ("g0998", 998.0)], rows, row_limit=2)
+    assert check.status is ChartStatus.NOT_CHECKED and "returns in one read" in check.reason

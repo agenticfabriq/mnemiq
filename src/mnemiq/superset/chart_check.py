@@ -67,10 +67,12 @@ from mnemiq.superset.chart_form import (
     DatasetFacts,
     Expectation,
     NotCheckable,
+    Ranking,
     _metric_items,
     _quoted,
     _row_limit,
     expectation_from_form_data,
+    ranking_of,
 )
 from mnemiq.superset.charts import Filter
 from mnemiq.superset.client import SupersetToolError, SupersetUnavailable
@@ -474,8 +476,35 @@ _OWN_SQL = "mnemiq's own SQL"
 _QUERY_DATASET = "Superset's own query of the dataset's saved metrics (query_dataset)"
 
 
+def _ranking_problem(chart: _Rows, mine: _Rows, ranking: Ranking, label: str) -> str | None | NotCheckable:
+    """Whether the chart's rows are the first `ranking.limit` of mnemiq's, ranked as the chart's query ranks them, a
+    group whose ranking value is NULL counted after every group with a value, groups tied at the cut standing in for
+    each other: None when they are, else why not. A ranking value that is not a number cannot be ranked."""
+    index, limit = ranking.metric_index, ranking.limit
+    values = {key: row[index] if index < len(row) else None for key, row in mine.values.items()}
+    if any(v is not None and (isinstance(v, bool) or not isinstance(v, (int, float, Decimal))) for v in values.values()):
+        return NotCheckable("the chart's ranking measure holds values mnemiq cannot rank")
+
+    def rank(value) -> tuple:
+        if value is None:
+            return (1, 0)
+        return (0, -value if ranking.descending else value)
+
+    ordered = sorted(values.values(), key=rank)
+    nth = rank(ordered[min(limit, len(ordered)) - 1])
+    shown = set(chart.values)
+    order = "largest" if ranking.descending else "smallest"
+    if any(values[key] is None for key in shown) and any(values[key] is not None for key in values if key not in shown):
+        return (f"the chart's row limit ({limit:,}) keeps groups with no value for {label!r} and leaves out groups that "
+                f"have one, so they are not the {limit:,} {order}")
+    if any(rank(values[key]) < nth for key in values if key not in shown) or any(rank(values[key]) > nth
+                                                                                 for key in shown):
+        return f"the chart's row limit ({limit:,}) keeps groups that are not the {limit:,} {order} by {label!r}"
+    return None
+
+
 def _compare(chart_id: int, chart: _Rows, mine: _Rows, row_limit: int | None, *, source: str,
-             labels: tuple[str, ...] = ()) -> ChartCheck:
+             labels: tuple[str, ...] = (), ranking: Ranking | None = None) -> ChartCheck:
     shown = list(chart.values)
     order = [key for key in shown if key in mine.values] + [key for key in mine.values if key not in chart.values]
     both = (_values(chart.values, shown), _values(mine.values, order))
@@ -491,11 +520,22 @@ def _compare(chart_id: int, chart: _Rows, mine: _Rows, row_limit: int | None, *,
                                                 f"({mine.cap:,}), so not all of them were compared")
     if any(key not in mine.values for key in shown):
         return outcome(ChartStatus.MISMATCH, f"the chart shows a group {source} does not find")
+    checked = f"the chart's numbers match {source}"
     if len(mine.values) > len(shown):
-        if row_limit is not None and chart.largest >= row_limit:
-            return outcome(ChartStatus.NOT_CHECKED, f"the chart's row limit ({row_limit:,}) keeps only some of its "
-                                                    "groups, so not all of them were compared")
-        return outcome(ChartStatus.MISMATCH, f"{source} finds a group the chart does not show")
+        if row_limit is None or chart.largest < row_limit:
+            return outcome(ChartStatus.MISMATCH, f"{source} finds a group the chart does not show")
+        cut = (f"the chart's row limit ({row_limit:,}) keeps only some of its groups, so not all of them were "
+               "compared")
+        if ranking is None or ranking.limit != row_limit:
+            return outcome(ChartStatus.NOT_CHECKED, cut)
+        label = labels[ranking.metric_index] if ranking.metric_index < len(labels) else f"number {ranking.metric_index + 1}"
+        problem = _ranking_problem(chart, mine, ranking, label)
+        if isinstance(problem, NotCheckable):
+            return outcome(ChartStatus.NOT_CHECKED, f"{cut}: {problem.reason}")
+        if problem is not None:
+            return outcome(ChartStatus.MISMATCH, problem)
+        checked = (f"{checked}, and its row limit keeps the {row_limit:,} "
+                   f"{'largest' if ranking.descending else 'smallest'} groups by {label!r}")
     if not shown:
         return outcome(ChartStatus.EMPTY, f"the chart shows no rows, and {source} finds none")
     # A measure that is NULL on every row it shows, on both sides (the values matched above), is no number the chart
@@ -511,7 +551,7 @@ def _compare(chart_id: int, chart: _Rows, mine: _Rows, row_limit: int | None, *,
         first = labels[empty[0]] if empty[0] < len(labels) else f"number {empty[0] + 1}"
         return outcome(ChartStatus.EMPTY, f"the chart's measure {first!r} is NULL on every row it shows, and {source} "
                                           "computes the same")
-    return outcome(ChartStatus.CHECKED, f"the chart's numbers match {source}")
+    return outcome(ChartStatus.CHECKED, checked)
 
 
 def _all_found(chart: _Rows, mine: _Rows) -> bool:
@@ -686,7 +726,8 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
     if isinstance(mine, NotCheckable):
         return not_checked(mine.reason)
     labels = tuple(label for label, _ in expectation.metrics)
-    found = _compare(chart_id, chart, mine, _row_limit(form), source=compared, labels=labels)
+    found = _compare(chart_id, chart, mine, _row_limit(form), source=compared, labels=labels,
+                     ranking=ranking_of(form, expectation, dataset=dataset))
     found = _Numbers(found.chart_id, found.status, found.reason, found.chart_values, found.mnemiq_values, labels,
                      chart.values)
     if found.status is ChartStatus.MISMATCH and expectation.time_grain and compared is _OWN_SQL:
