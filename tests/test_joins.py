@@ -214,3 +214,70 @@ def test_keys_of_one_name_on_two_tables_are_two_relationships():
         ("invoices.cust->customers", "invoices", "customers", [("cust", "id")]),
         ("orders.customer_id->customers", "orders", "customers", [("customer_id", "id")]),
     ]
+
+
+class _KeyRecorder:
+    """Records every statement and answers as a source whose parent keys are unique and whose child values all exist:
+    `count(*), count(DISTINCT), count()` gives 10, 10, 10 and the orphan count gives 0. `fail_on` names a column whose
+    orphan query raises, as Oracle raised ORA-00906 on `CAST(... AS VARCHAR)` (measured on 23.26, 2026-11-19)."""
+
+    def __init__(self, dialect: str | None, fks=(), fail_on: str | None = None):
+        if dialect is not None:
+            self.dialect = dialect
+        self.sql: list[str] = []
+        self._fks = list(fks)
+        self._fail_on = fail_on
+
+    def foreign_keys(self):
+        return self._fks
+
+    def execute(self, sql):
+        self.sql.append(sql)
+        if "NOT EXISTS" in sql:
+            if self._fail_on and f'"{self._fail_on}"' in sql:
+                raise RuntimeError("ORA-00906: missing left parenthesis")
+            return [(0,)]
+        return [(10, 10, 10)]
+
+
+def _invoices() -> list[TableInfo]:
+    return [
+        TableInfo("customer", [ColumnInfo("customer_id", "NUMBER")]),
+        TableInfo("invoice", [ColumnInfo("invoice_id", "NUMBER"), ColumnInfo("customer_id", "NUMBER")]),
+        TableInfo("invoice_line", [ColumnInfo("line_id", "NUMBER"), ColumnInfo("invoice_id", "NUMBER")]),
+    ]
+
+
+def test_orphan_query_casts_with_to_char_on_oracle():
+    """Oracle refuses `CAST(x AS VARCHAR)` (ORA-00906) and sqlglot's transpile gives `CAST(x AS CLOB)`, which Oracle
+    cannot compare with `=`; `TO_CHAR(x)` is what it accepts."""
+    recorder = _KeyRecorder("oracle")
+    rels = infer_relationships(recorder, _invoices())
+    orphan = next(sql for sql in recorder.sql if "NOT EXISTS" in sql and '"customer_id"' in sql)
+    assert "AS VARCHAR" not in orphan
+    assert 'TO_CHAR(p."customer_id") = TO_CHAR(c."customer_id")' in orphan
+    assert ("invoice", "customer") in {(r.from_, r.to) for r in rels}
+
+
+def test_orphan_query_unchanged_on_duckdb():
+    recorder = _KeyRecorder(None)
+    infer_relationships(recorder, _invoices())
+    orphan = next(sql for sql in recorder.sql if "NOT EXISTS" in sql and '"customer_id"' in sql)
+    assert orphan == (
+        'SELECT count(*) FROM "invoice" c '
+        'WHERE c."customer_id" IS NOT NULL AND NOT EXISTS ('
+        '  SELECT 1 FROM "customer" p '
+        '  WHERE CAST(p."customer_id" AS VARCHAR) = CAST(c."customer_id" AS VARCHAR))'
+    )
+
+
+def test_a_candidate_that_cannot_be_checked_costs_only_itself(caplog):
+    """One candidate's failed check used to raise out of `infer_relationships`, and `enrich_structural` then kept NO
+    relationship, the declared ones included, logging nothing. Now that candidate is skipped and said."""
+    recorder = _KeyRecorder("oracle", fks=[("invoice_line", "invoice_id", "invoice", "invoice_id", "fk_line")],
+                            fail_on="customer_id")
+    with caplog.at_level("WARNING"):
+        rels = build_relationships(recorder, _invoices())
+    assert ("invoice_line", "invoice") in {(r.from_, r.to) for r in rels}
+    assert ("invoice", "customer") not in {(r.from_, r.to) for r in rels}
+    assert "customer_id" in caplog.text and "ORA-00906" in caplog.text
