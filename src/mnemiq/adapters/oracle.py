@@ -10,7 +10,7 @@ from typing import Any
 import pyarrow as pa
 
 from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
-from mnemiq.adapters.dictionary import TableSize
+from mnemiq.adapters.dictionary import ColumnStatistics, HistogramEndpoint, TableSize
 
 logger = logging.getLogger(__name__)
 
@@ -1328,6 +1328,63 @@ class OracleAdapter:
             analyzed=analyzed.date().isoformat() if analyzed is not None else None,
             stale={"YES": True, "NO": False}.get(stale),
         )
+
+    def column_statistics(self, table: str) -> list[ColumnStatistics]:
+        """Each column's optimizer statistics for `table`, reading no table data. A column the dictionary holds nothing
+        for is absent, and a table it does not show gives []. Table-level rows only: partition statistics live in
+        another view."""
+        rows = self._rows(
+            "SELECT column_name, num_distinct, num_nulls, histogram, num_buckets, sample_size, last_analyzed, "
+            "low_value, high_value FROM all_tab_col_statistics "
+            "WHERE owner = :owner AND table_name = :table_name",
+            owner=self._schema, table_name=table,
+        )
+        return [
+            ColumnStatistics(column=column, distinct=distinct, nulls=nulls, histogram=histogram or "NONE",
+                             buckets=buckets, sample_size=sample_size,
+                             analyzed=analyzed.date().isoformat() if analyzed is not None else None,
+                             low=low, high=high)
+            for column, distinct, nulls, histogram, buckets, sample_size, analyzed, low, high in rows
+        ]
+
+    def histogram(self, table: str, column: str) -> list[HistogramEndpoint]:
+        """The endpoints of `column`'s histogram, in endpoint order, reading no table data."""
+        rows = self._rows(
+            "SELECT endpoint_number, endpoint_value, endpoint_actual_value, endpoint_actual_value_raw "
+            "FROM all_tab_histograms WHERE owner = :owner AND table_name = :table_name AND column_name = :column_name "
+            "ORDER BY endpoint_number",
+            owner=self._schema, table_name=table, column_name=column,
+        )
+        return [HistogramEndpoint(number=n, value=v, actual=a, actual_raw=r) for n, v, a, r in rows]
+
+    def unique_columns(self, table: str) -> frozenset[str]:
+        """The columns of `table` that a single-column key declares and enforces: an `ENABLED`, `VALIDATED` primary key
+        or unique constraint, or a `VALID` unique index on a plain column. A composite key makes no one of its columns
+        unique; a disabled, unvalidated (`RELY`) or unusable one enforces nothing; a function-based index keys an
+        expression. The dictionary rows come back unfiltered and are read here, so one place decides."""
+        constraints = self._rows(
+            "SELECT c.constraint_name, c.constraint_type, c.status, c.validated, cc.column_name "
+            "FROM all_constraints c JOIN all_cons_columns cc "
+            "ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name AND cc.table_name = c.table_name "
+            "WHERE c.owner = :owner AND c.table_name = :table_name AND c.constraint_type IN ('P', 'U')",
+            owner=self._schema, table_name=table,
+        )
+        indexes = self._rows(
+            "SELECT i.index_name, i.uniqueness, i.status, i.index_type, ic.column_name "
+            "FROM all_indexes i JOIN all_ind_columns ic ON ic.index_owner = i.owner AND ic.index_name = i.index_name "
+            "WHERE i.table_owner = :owner AND i.table_name = :table_name AND i.uniqueness = 'UNIQUE'",
+            owner=self._schema, table_name=table,
+        )
+        keys: dict[tuple[str, str], list[str]] = {}
+        for name, kind, status, validated, column in constraints:
+            if kind in ("P", "U") and status == "ENABLED" and validated == "VALIDATED":
+                keys.setdefault(("constraint", name), []).append(column)
+            else:
+                keys.setdefault(("constraint", name), []).append("")  # makes the key unusable, whatever its width
+        for name, uniqueness, status, index_type, column in indexes:
+            usable = uniqueness == "UNIQUE" and status == "VALID" and not (index_type or "").startswith("FUNCTION")
+            keys.setdefault(("index", name), []).append(column if usable else "")
+        return frozenset(columns[0] for columns in keys.values() if len(columns) == 1 and columns[0])
 
     def view_definitions(self) -> list[tuple[str, str, str]]:
         """(view, body, dialect). A failure RAISES, and that is load-bearing.

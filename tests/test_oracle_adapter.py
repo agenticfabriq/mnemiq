@@ -183,6 +183,51 @@ def test_table_size_reads_the_statistics_oracle_gathered():
     assert _adapter().table_size("NO_SUCH_TABLE") == TableSize(None, None, None, None)
 
 
+def test_dictionary_reads_live():
+    """The statistics profile's three other reads, on two tables gathered with a histogram on every column: each column's
+    statistics, a frequency histogram's endpoints (a short VARCHAR2 code has no text, only its encoded value, which
+    `frequency_codes` reads back), and the single-column keys the tables declare and enforce."""
+    import oracledb
+
+    from mnemiq.enrichment.statistics import frequency_codes
+
+    with oracledb.connect(user=USER, password=PASSWORD, dsn=DSN) as con:
+        cur = con.cursor()
+        for t in ("T_STATS_ORDERS", "T_STATS_LINES"):
+            try:
+                cur.execute(f"DROP TABLE {t} PURGE")
+            except oracledb.DatabaseError:
+                pass
+        cur.execute("CREATE TABLE t_stats_orders (id NUMBER PRIMARY KEY, status VARCHAR2(10), "
+                    "a NUMBER, b NUMBER, CONSTRAINT uk_stats_ab UNIQUE (a, b))")
+        cur.execute("CREATE TABLE t_stats_lines (line_no NUMBER, sku VARCHAR2(10))")
+        cur.execute("CREATE UNIQUE INDEX ix_stats_line ON t_stats_lines (line_no)")
+        cur.executemany("INSERT INTO t_stats_orders VALUES (:1, :2, :3, :4)",
+                        [(i, "Y" if i % 10 < 7 else "N", i % 7, i) for i in range(1, 1001)])
+        cur.executemany("INSERT INTO t_stats_lines VALUES (:1, :2)", [(i, f"S{i % 3}") for i in range(1, 101)])
+        con.commit()
+        try:
+            for t in ("T_STATS_ORDERS", "T_STATS_LINES"):
+                cur.execute("BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, :t, method_opt => 'FOR ALL COLUMNS SIZE 254');"
+                            " END;", t=t)
+            a = _adapter()
+            stats = {s.column: s for s in a.column_statistics("T_STATS_ORDERS")}
+            assert set(stats) == {"ID", "STATUS", "A", "B"}
+            status = stats["STATUS"]
+            assert (status.distinct, status.nulls, status.histogram, status.buckets, status.sample_size) == (
+                2, 0, "FREQUENCY", 2, 1000)
+            assert (status.low, status.high) == (b"N", b"Y") and status.analyzed
+            endpoints = a.histogram("T_STATS_ORDERS", "STATUS")
+            assert [e.number for e in endpoints] == [300, 1000]
+            assert frequency_codes(status, 1000, False, endpoints, "VARCHAR2") == ["Y", "N"]
+            assert a.unique_columns("T_STATS_ORDERS") == frozenset({"ID"}), "the (A, B) key makes neither unique"
+            assert a.unique_columns("T_STATS_LINES") == frozenset({"LINE_NO"})
+            assert a.column_statistics("NO_SUCH_TABLE") == [] and a.unique_columns("NO_SUCH_TABLE") == frozenset()
+        finally:
+            for t in ("T_STATS_ORDERS", "T_STATS_LINES"):
+                cur.execute(f"DROP TABLE {t} PURGE")
+
+
 def test_view_definitions_reads_the_long_body():
     """`ALL_VIEWS.TEXT` is a LONG column, which cannot be filtered or read after another LONG in
     the same fetch. This is the wrinkle that looks trivial and is not."""
