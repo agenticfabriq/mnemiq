@@ -1028,6 +1028,40 @@ def test_a_measure_that_is_null_everywhere_is_empty(live, served, model, policy_
     assert_no_model_call(run)
 
 
+@pytest.mark.parametrize("ending, status, said", [
+    ("END", "mismatch", "keeps groups with no value for 'Cancelled premium' and leaves out groups that have one"),
+    ("ELSE 0 END", "checked", None),
+], ids=["no value is NULL", "no value is 0"])
+def test_a_bar_whose_row_limit_cuts_groups_is_checked_as_a_ranking(live, served, model, policy_id, ending, status,
+                                                                    said):
+    """The ten largest cancelled premiums by policy: a bar by `id` of `SUM(CASE WHEN status = 'cancelled' THEN premium
+    <ending>)` with row limit 10, checked as a ranking. The premise, measured first: more than ten policies are not
+    cancelled and more than ten are. With no ELSE, the bars the chart's query keeps are not the ten largest (a group
+    with no value counts after every group with one): a mismatch, for that reason. Ending ELSE 0, they are: checked.
+    No model client is made or called."""
+    expression = f"SUM(CASE WHEN status = 'cancelled' THEN premium {ending})"
+    [(cancelled, other)] = ground_truth(live, "SELECT count(*) FILTER (WHERE status = 'cancelled'), "
+                                              "count(*) FILTER (WHERE status <> 'cancelled') FROM policy")
+    assert cancelled > 10 and other > 10, (cancelled, other)
+    measure = Measure(name="cancelled_premium", label="Cancelled premium", expression=expression,
+                      kind=MeasureKind.CURRENCY, dataset_id=policy_id, description="Premium of cancelled policies",
+                      asked_by="")
+    bar = ChartSpec(key="cancelled_by_policy", family=Family.BAR, title="Largest cancelled premiums",
+                    dataset_id=policy_id, measures=(WrittenRef(measure),), dimensions=("id",), time_column=None,
+                    time_grain=None, filters=(), row_limit=10, source=None, target=None)
+    plan = BuildPlan(charts=(bar,), measures=(measure,))
+    name = "ranked " + ("null" if ending == "END" else "zero")
+    run = run_build(live, served, model, plan, name, goal="the largest cancelled premiums")
+    record(name, summary(run, served, plan) if run.build_id else {"stopped": run.stopped})
+    assert_ran_to_the_end(run)
+    [chart_id] = [step["object_id"] for step in run.final["steps"] if step["key"] == bar.key]
+    assert run.final["checks"].get(str(chart_id)) == status, (run.final["checks"], run.last_step.get("message"))
+    if said is not None:
+        assert said in (run.last_step.get("message") or ""), run.last_step.get("message")
+    assert_no_model_call(run)
+    observe(name, chart_id=chart_id, check=run.final["checks"], message=run.last_step.get("message"))
+
+
 def _percent_big_number(policy_id: int, key: str, expression: str) -> tuple[Measure, ChartSpec]:
     rate = Measure(name=key, label="Rate", expression=expression, kind=MeasureKind.PERCENT, dataset_id=policy_id,
                    description="A rate", asked_by="")
