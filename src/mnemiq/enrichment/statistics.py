@@ -108,6 +108,42 @@ def frequency_codes(stats: ColumnStatistics, rows: int | None, stale: bool | Non
     return [values[i] for i in order]
 
 
+def profile_report(snapshot) -> tuple[str | None, str | None]:
+    """(summary, warning) for an operator after statistics mode: how many tables were profiled each way, and which
+    estimated tables the source holds no statistics for, or statistics it marks stale or does not say are current.
+    (None, None) when no table was estimated."""
+    estimated = sorted(j.id.removeprefix("profile:") for j in snapshot.jobs
+                       if j.kind == "profile" and j.status == "done" and j.detail == "estimated")
+    if not estimated:
+        return None, None
+    exact = sum(1 for j in snapshot.jobs if j.kind == "profile" and j.status == "done" and j.detail != "estimated")
+    summary = f"profiled {exact} table(s) exactly, {len(estimated)} from Oracle's statistics"
+    by_table: dict[str, list] = {}
+    for column in snapshot.columns:
+        by_table.setdefault(column.object_id, []).append(column.estimate)
+    unread, stale = [], []
+    for table in estimated:
+        estimates = [e for e in by_table.get(table, []) if e is not None and e.rows is not None]
+        if not estimates:
+            unread.append(table)
+        elif any(e.stale is not False for e in estimates):
+            analyzed = max((e.analyzed for e in estimates if e.analyzed), default=None)
+            stale.append(f"{table} (as of {analyzed})" if analyzed else table)
+    parts = []
+    if unread:
+        parts.append(f"{len(unread)} table(s) of source {snapshot.source_id!r} have no optimizer statistics, so no "
+                     f"counts or code lists were read for them: {', '.join(unread)}.")
+    if stale:
+        parts.append(f"{len(stale)} table(s) of source {snapshot.source_id!r} have statistics Oracle marks stale or "
+                     f"does not say are current, so their counts may be out of date and no code list was read from "
+                     f"them: {', '.join(stale)}.")
+    if not parts:
+        return summary, None
+    parts.append("Gather their statistics (DBMS_STATS.GATHER_TABLE_STATS) and run enrich again, or name them in the "
+                 "source's \"exact_tables\" to profile them in full.")
+    return summary, " ".join(parts)
+
+
 def _may_be_complete(stats: ColumnStatistics, rows: int | None, stale: bool | None, code_max_distinct: int) -> bool:
     return (stats.histogram == "FREQUENCY" and stale is False
             and stats.distinct is not None and 0 < stats.distinct <= code_max_distinct

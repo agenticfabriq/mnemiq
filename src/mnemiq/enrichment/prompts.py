@@ -43,6 +43,10 @@ class ColumnFacts:
     distinct_count: int | None = None
     null_count: int | None = None
     foreign_key: str | None = None  # "to_table.to_column" when this column is a declared FK
+    # The source's estimate, for a column profiled from its statistics; shown as an estimate, never as a count.
+    estimated_rows: int | None = None
+    estimated_distinct: int | None = None
+    estimated_nulls: int | None = None
 
 
 def render_table_facts(table: str, columns: list[ColumnFacts]) -> str:
@@ -56,6 +60,11 @@ def render_table_facts(table: str, columns: list[ColumnFacts]) -> str:
             stats.append(f"distinct={c.distinct_count}")
         if c.null_count is not None:
             stats.append(f"nulls={c.null_count}")
+        estimated = [f"{label}~{value}" for label, value in (("rows", c.estimated_rows),
+                                                             ("distinct", c.estimated_distinct),
+                                                             ("nulls", c.estimated_nulls)) if value is not None]
+        if estimated:
+            stats.append(f"{', '.join(estimated)} (estimated)")
 
         line = f"- {sanitize(c.name)} ({', '.join(stats)})"
         if c.foreign_key:

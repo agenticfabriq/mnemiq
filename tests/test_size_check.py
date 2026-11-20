@@ -186,3 +186,72 @@ def test_enrich_prints_the_warning_and_goes_on(monkeypatch, tmp_path, capsys):
         _cmd_enrich(_settings(tmp_path))
     assert len(profiled) == 1
     assert "WARNING: 1 table(s) of source 'erp' have no table-level optimizer statistics" in capsys.readouterr().err
+
+
+# --- after the profile: how each table was profiled, and which lack statistics ---------------------
+
+def _profiled_snapshot():
+    """Two tables profiled exactly, three from statistics: one current, one with none, one stale."""
+    from mnemiq.contract import Column, Job, Snapshot
+    from mnemiq.contract.semantic import ColumnEstimate
+
+    def est(rows, stale=False, analyzed="2026-11-01"):
+        return ColumnEstimate(rows=rows, distinct=2, nulls=0, analyzed=analyzed, sampled=False, stale=stale)
+
+    columns = [
+        Column(id="ORDERS.ID", object_id="ORDERS", name="ID", row_count=10, distinct_count=10, null_count=0),
+        Column(id="CUSTOMERS.ID", object_id="CUSTOMERS", name="ID", row_count=5, distinct_count=5, null_count=0),
+        Column(id="ORDER_LINES.ID", object_id="ORDER_LINES", name="ID", estimate=est(1000)),
+        Column(id="PAYMENTS.ID", object_id="PAYMENTS", name="ID"),
+        Column(id="RETURNS.ID", object_id="RETURNS", name="ID", estimate=est(400, stale=True, analyzed="2026-01-01")),
+    ]
+    jobs = [Job(id=f"profile:{t}", source_id="erp", kind="profile", status="done", detail=d)
+            for t, d in (("ORDERS", None), ("CUSTOMERS", None), ("ORDER_LINES", "estimated"),
+                         ("PAYMENTS", "estimated"), ("RETURNS", "estimated"))]
+    return Snapshot(version="v", source_id="erp", created_at="t", columns=columns, jobs=jobs)
+
+
+def test_the_report_counts_each_way_and_names_what_lacks_statistics():
+    from mnemiq.enrichment.statistics import profile_report
+
+    summary, warning = profile_report(_profiled_snapshot())
+    assert summary == "profiled 2 table(s) exactly, 3 from Oracle's statistics"
+    assert "1 table(s) of source 'erp' have no optimizer statistics" in warning and "PAYMENTS" in warning
+    assert "1 table(s) of source 'erp' have statistics Oracle marks stale" in warning
+    assert "RETURNS (as of 2026-01-01)" in warning and "ORDER_LINES" not in warning
+    assert "DBMS_STATS.GATHER_TABLE_STATS" in warning and '"exact_tables"' in warning
+
+
+def test_no_report_when_every_table_was_profiled_exactly():
+    from mnemiq.contract import Job, Snapshot
+    from mnemiq.enrichment.statistics import profile_report
+
+    snap = Snapshot(version="v", source_id="erp", created_at="t",
+                    jobs=[Job(id="profile:ORDERS", source_id="erp", kind="profile", status="done")])
+    assert profile_report(snap) == (None, None)
+
+
+def _enrich_reporting(monkeypatch, tmp_path, snapshot):
+    from mnemiq.cli import _cmd_enrich
+
+    monkeypatch.setattr("mnemiq.adapters.resolve.adapter_for", lambda *a, **k: _Dictionary({}))
+    monkeypatch.setattr("mnemiq.enrichment.pipeline.enrich_structural", lambda *a, **k: snapshot)
+
+    def stop(*a, **k):
+        raise _Profiled
+
+    monkeypatch.setattr("mnemiq.enrichment.certified.fetch_certified_records", stop)
+    with pytest.raises(_Profiled):
+        _cmd_enrich(_settings(tmp_path, profile="statistics"))
+
+
+def test_enrich_reports_how_each_table_was_profiled(monkeypatch, tmp_path, capsys):
+    _enrich_reporting(monkeypatch, tmp_path, _profiled_snapshot())
+    assert "profiled 2 table(s) exactly, 3 from Oracle's statistics" in capsys.readouterr().out
+
+
+def test_enrich_names_tables_without_statistics(monkeypatch, tmp_path, capsys):
+    _enrich_reporting(monkeypatch, tmp_path, _profiled_snapshot())
+    err = capsys.readouterr().err
+    assert "WARNING: 1 table(s) of source 'erp' have no optimizer statistics" in err and "PAYMENTS" in err
+    assert "Gather their statistics" in err

@@ -456,6 +456,13 @@ def _cmd_enrich(settings: Settings) -> int:
     # saved the snapshot whatever they said, so a run in which every table failed persisted a
     # zero-column model and the engine then answered "I don't know about any tables" when the truth
     # was "I could not read them".
+    from mnemiq.enrichment.statistics import profile_report
+
+    summary, warning = profile_report(snap)  # (None, None) unless a table was profiled from statistics
+    if summary:
+        print(summary)
+    if warning:
+        print(f"WARNING: {warning}", file=sys.stderr)
     outcome, detail = profile_outcome(snap)
     if outcome in ("unread", "empty"):
         # Both mean the snapshot describes NOTHING, and saving one is the harm: the next `build`
