@@ -134,6 +134,19 @@ def _a_string(value: Any) -> str:
     return value
 
 
+# A chart's SQL HAVING conditions (`create_chart`'s `having`): how many, and how long each may be.
+MAX_HAVING = 5
+MAX_HAVING_CHARS = 2000
+
+
+def _conditions(value: Any) -> list[str]:
+    """`create_chart`'s `having`: a list of at most `MAX_HAVING` SQL conditions, each non-blank text of at most
+    `MAX_HAVING_CHARS` characters."""
+    if not isinstance(value, list) or len(value) > MAX_HAVING:
+        raise ValueError("not a list of conditions")
+    return [_text(MAX_HAVING_CHARS)(item) for item in value]
+
+
 def _an_object(value: Any) -> dict:
     """A JSON object with text keys, as a copy that shares nothing with the request."""
     if not isinstance(value, Mapping) or not all(isinstance(key, str) for key in value):
@@ -215,7 +228,7 @@ REQUESTS: dict[str, dict[str, _Field]] = {
     "create_chart": {"dataset_id": _Field(_an_id), "viz_type": _Field(_one_of(EXTENSION_MADE), False),
                      "slice_name": _Field(_text(250)), "params": _Field(_an_object, False),
                      "config": _Field(_an_object, False), "set": _Field(_an_object, False),
-                     "dashboard_id": _DASHBOARD_ID, "marker": _MARKER},
+                     "having": _Field(_conditions, False), "dashboard_id": _DASHBOARD_ID, "marker": _MARKER},
     "patch_chart": {"chart_id": _Field(_an_id), "set": _Field(_an_object, False, {}),
                     "unset": _Field(_names, False, []), "expect_changed_on": _EXPECT_CHANGED_ON},
     "add_saved_metric": {"dataset_id": _Field(_an_id), "metric": _Field(_a_metric),
@@ -1308,6 +1321,14 @@ def _funnel_form(found: dict) -> tuple[str, dict, dict] | dict:
     return viz_type, form_data, context
 
 
+def _having_filter(condition: str, index: int) -> dict:
+    """One of `create_chart`'s `having` conditions as the SQL HAVING adhoc filter rc2's filter editor saves, which
+    rc2's frontend (`processFilters`) and the query context (`params._filters_and_extras`) read into `extras.having`."""
+    return {"clause": "HAVING", "expressionType": "SQL", "sqlExpression": condition, "subject": None,
+            "operator": None, "comparator": None, "isExtra": False, "isNew": False,
+            "filterOptionName": f"mnemiq_having_{index}"}
+
+
 def _config_form(found: dict, dataset: Any) -> tuple[str, dict, dict | None] | dict:
     """MCP's chart config made into a chart as its `generate_chart` saves one: the config validated
     (`ValidationPipeline`), mapped to form data (`map_config_to_form_data`, whose warnings key is dropped), the
@@ -1331,7 +1352,10 @@ def _config_form(found: dict, dataset: Any) -> tuple[str, dict, dict | None] | d
     except ValueError:
         return {"refused": "config"}
     form_data.pop("_mcp_warnings", None)
-    form_data.update(found["set"])
+    form_data.update(found["set"] or {})
+    if found["having"]:
+        form_data["adhoc_filters"] = [*(form_data.get("adhoc_filters") or []),
+                                      *(_having_filter(condition, index) for index, condition in enumerate(found["having"]))]
     viz_type = form_data.get("viz_type")
     if not isinstance(viz_type, str) or not viz_type:
         return {"refused": "config"}
@@ -1397,7 +1421,8 @@ def create_chart(found: dict) -> dict:
     if from_config:
         shaped = found["viz_type"] is None and found["params"] is None
     else:
-        shaped = found["viz_type"] is not None and found["params"] is not None and found["set"] is None
+        shaped = found["viz_type"] is not None and found["params"] is not None and found["set"] is None \
+            and found["having"] is None
     if not shaped:
         return {"refused": "request"}
     if from_config and not set(found["set"] or ()) <= _CREATE_SET_KEYS:
