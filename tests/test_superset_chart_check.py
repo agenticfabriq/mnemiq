@@ -1881,7 +1881,15 @@ def test_a_row_rule_on_a_made_dataset_means_no_comparison_and_no_values(fake):
     {"datasets": [{"dataset_id": DATASET_ID + 1, "applies": False}]},
     {"refused": "request", "field": "dataset_ids"},
     ["not", "an", "object"],
-], ids=["not offered", "failed", "left out", "not a boolean", "another dataset", "refused", "not an object"])
+    {"refused": "request", "datasets": [{"dataset_id": DATASET_ID, "applies": False}]},
+    {"datasets": [{"dataset_id": DATASET_ID, "applies": False}, "malformed"]},
+    {"datasets": [{"dataset_id": DATASET_ID, "applies": False}, {"dataset_id": DATASET_ID, "applies": False}]},
+    {"datasets": [{"dataset_id": DATASET_ID, "applies": False, "clause": "region = 'west'"}]},
+    {"datasets": [{"dataset_id": DATASET_ID, "applies": False}], "_response_truncated": True},
+    {"datasets": [{"dataset_id": True, "applies": False}]},
+], ids=["not offered", "failed", "left out", "not a boolean", "another dataset", "refused", "not an object",
+        "refused beside an entry", "a malformed entry beside it", "twice", "an entry with more than asked",
+        "cut for size", "an id that is a boolean"])
 def test_a_made_dataset_whose_row_rules_cannot_be_told_is_not_checked(fake, rules):
     _made(fake, rules=rules)
     check = _check(fake, made={DATASET_ID: MADE_SQL})
