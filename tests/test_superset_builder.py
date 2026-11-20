@@ -1161,6 +1161,29 @@ def test_the_steps_follow_the_plan():
                                 ("check", "check")]
 
 
+@pytest.mark.parametrize("plan, virtual", [(ONE_VIRTUAL, True), (ONE_TABLE, False)], ids=["joined", "physical"])
+def test_the_check_is_handed_each_virtual_dataset_the_build_made_with_its_sql(fake, world, store, monkeypatch, plan,
+                                                                              virtual):
+    """The check reads a virtual dataset with mnemiq's own SQL only when it knows the build made it and with which
+    SQL: the build hands it exactly the virtual datasets it made, each with the SQL it sent, and no physical one."""
+    import mnemiq.superset.builder as builder_module
+
+    handed: list = []
+    real = builder_module.check_chart
+
+    def check(*args, **kwargs):
+        handed.append(kwargs.get("made"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(builder_module, "check_chart", check)
+    final = _run(store, _start(store, plan).build_id, _adapter(fake))[-1]
+    assert final.status == "done", final
+    made = _step(final, "dataset_1").object_id
+    assert handed == [{made: plan.datasets[0].sql} if virtual else {}]
+    if virtual:
+        assert world.datasets[made]["sql"] == plan.datasets[0].sql
+
+
 def test_a_virtual_dataset_is_named_for_its_build(fake, world, store):
     """Two builds that join the same tables make two datasets: each is named for its build, so neither collides with
     the other's name, and each carries its marker after a line saying mnemiq made it for the dashboard."""
@@ -1181,8 +1204,8 @@ def test_a_virtual_dataset_is_named_for_its_build(fake, world, store):
 def test_a_joined_tables_saved_metric_is_built_as_the_join_names_its_columns(fake, world, store):
     """The planner carries policy's saved metric onto a join with claim, and the build sends it as written: the chart's
     SQL metric is the metric's expression naming the joined dataset's columns, on the dataset the build made over the
-    join, under the metric's verbose name, and the dashboard keeps it as one of its measures. Superset's numbers on a
-    dataset the build made are not checked against mnemiq's own SQL."""
+    join, under the metric's verbose name, and the dashboard keeps it as one of its measures. Superset's numbers on
+    the dataset the build made are checked against mnemiq's own SQL over the dataset's SQL."""
     from mnemiq.superset.planner import FakePlanner, plan_build
 
     world.datasets[POLICY_DATASET]["metrics"].append(
@@ -1208,7 +1231,7 @@ def test_a_joined_tables_saved_metric_is_built_as_the_join_names_its_columns(fak
     assert request["dataset_id"] == made and world.datasets[made]["sql"] == plan.datasets[0].sql
     assert request["config"]["y"] == [{"sql_expression": rendered, "label": "Active premium"}]
     chart_id = _step(final, "active_by_claim_region").object_id
-    assert final.checks == {chart_id: ChartStatus.NOT_CHECKED}, final.message
+    assert final.checks == {chart_id: ChartStatus.CHECKED}, final.message
     [kept] = store.measures_for(TENANT, final.dashboard_id)
     assert kept.measure == dataclasses.replace(measure, dataset_id=made, asked_by=PRINCIPAL)
     assert kept.measure.description == "The saved metric 'active_premium' of 'policy', carried onto the join."

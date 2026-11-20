@@ -289,6 +289,13 @@ class _Run:
     def made_dataset_ids(self) -> set[int]:
         return {step.object_id for step in self.build.steps if step.kind == "dataset" and step.object_id is not None}
 
+    def made_virtual_sql(self) -> dict[int, str]:
+        """Each virtual dataset this build made, by its id, with the SQL its step sent to `create_dataset`: what the
+        check needs to read one with mnemiq's own SQL (`check_chart`'s `made`)."""
+        sent = {planned.key: planned.sql for planned in self.plan.datasets if planned.virtual and planned.sql}
+        return {step.object_id: sent[step.key] for step in self.build.steps
+                if step.kind == "dataset" and step.object_id is not None and step.key in sent}
+
 
 def next_step(build: StoredBuild, *, client, adapter, store, snapshot, grants, settings,
               lease_s: int = DEFAULT_LEASE_S) -> BuildState:
@@ -676,6 +683,7 @@ def _run_check(run: _Run) -> _Outcome:
     chart's status with the dashboard's measures. A chart that does not check is reported as what it is; the build
     still ends."""
     ids = run.chart_ids()
+    made = run.made_virtual_sql()
     statuses: dict[int, ChartStatus] = {}
     off: list[str] = []
     for spec in run.plan.charts:
@@ -684,7 +692,8 @@ def _run_check(run: _Run) -> _Outcome:
         # nobody judged (Superset saved its label as other text, or someone added it since), never one to pass over.
         found = check_chart(run.adapter, chart_id=chart_id, dataset_id=spec.dataset_id, kinds=_kinds(spec),
                             saved=run.saved(spec.dataset_id), snapshot=run.snapshot, grants=run.grants,
-                            guard_fanout=run.settings.guard_fanout, before_call=run.renew, every_kind_known=True)
+                            guard_fanout=run.settings.guard_fanout, before_call=run.renew, every_kind_known=True,
+                            made=made)
         statuses[chart_id] = found.status
         if found.status is not ChartStatus.CHECKED:
             off.append(f"{spec.title!r} ({found.status.value}: {found.reason})")
