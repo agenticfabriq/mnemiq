@@ -3222,7 +3222,7 @@ def test_only_a_histogram_bypasses_rc2s_compile_check(creating):
     assert "compile" not in _kinds(creating.superset) and "chart_data" in _kinds(creating.superset)
 
 
-# ---------------------------------------------------------------- create_chart's having, on the config route only
+# ---------------------------------------------------------------- create_chart's leave_out_no_value, config route only
 
 PREMIUM_SQL = {"expressionType": "SQL", "sqlExpression": "SUM(premium)", "label": "Total premium",
                "hasCustomLabel": True, "optionName": "metric_sql_1"}
@@ -3231,44 +3231,70 @@ NO_TIME = {"clause": "WHERE", "expressionType": "SIMPLE", "subject": "issued", "
            "comparator": "No filter"}
 BAR_FORM = {"viz_type": "echarts_timeseries_bar", "x_axis": "channel", "groupby": [], "metrics": [PREMIUM_SQL],
             "adhoc_filters": [WEST, NO_TIME], "row_limit": 10}
-NOT_NULL = "(SUM(premium)) IS NOT NULL"
 
 
-@pytest.mark.parametrize("having", [[], [NOT_NULL], [NOT_NULL] * 5, ["x" * 2000]])
-def test_create_chart_reads_up_to_five_having_conditions(having):
-    found = writes.read("create_chart", {"dataset_id": 7, "slice_name": "Premium", "dashboard_id": 12,
-                                         "marker": STEP, "config": CONFIG, "having": having})
-    assert found["having"] == having
+def _leave_out(condition: str) -> dict:
+    return {"clause": "HAVING", "expressionType": "SQL", "sqlExpression": condition, "subject": None,
+            "operator": None, "comparator": None, "isExtra": False, "isNew": False,
+            "filterOptionName": "mnemiq_leave_out_no_value"}
 
 
-@pytest.mark.parametrize("having", ["(x) IS NOT NULL", [NOT_NULL] * 6, [""], ["  "], [3], ["x" * 2001], None],
-                         ids=["not a list", "six", "empty", "blank", "not text", "too long", "null"])
-def test_create_chart_refuses_a_having_of_another_shape(having):
+def test_the_extensions_condition_is_the_text_mnemiqs_check_recognises():
+    from mnemiq.superset.charts import not_null_condition
+
+    for sql in ("SUM(premium)", "SUM(CASE WHEN status = 'R&D' THEN premium END)"):
+        assert writes.not_null_condition(sql) == not_null_condition(sql)
+
+
+@pytest.mark.parametrize("flag", ["yes", 1, None, [True]])
+def test_create_chart_refuses_a_leave_out_no_value_that_is_not_a_boolean(flag):
     with pytest.raises(writes.Refused) as caught:
         writes.read("create_chart", {"dataset_id": 7, "slice_name": "Premium", "dashboard_id": 12, "marker": STEP,
-                                     "config": CONFIG, "having": having})
-    assert caught.value.answer == {"refused": "request", "field": "having"}
+                                     "config": CONFIG, "leave_out_no_value": flag})
+    assert caught.value.answer == {"refused": "request", "field": "leave_out_no_value"}
 
 
-def test_having_is_saved_last_among_the_filters_and_in_the_querys_having(creating):
-    """Appended after rc2's mapped filters and `set`, before the query context is made, so the saved form ends with
-    the SQL HAVING filters and the saved query context carries them as its `extras.having`."""
-    creating.superset.mapped = copy.deepcopy(BAR_FORM)
-    made = make_from_config(set={"number_format": ",.2f"}, having=[NOT_NULL])
+def test_the_condition_is_built_from_the_metric_as_mcp_saved_it_and_saved_last(creating):
+    """The HAVING is derived from the ranked metric in the mapped form, after MCP's own sanitising (here the mapped
+    metric holds '&' where the plan's text might have held an entity), so the saved filter, the query's extras and
+    the chart's own metric agree."""
+    mapped = copy.deepcopy(BAR_FORM)
+    mapped["metrics"][0]["sqlExpression"] = "SUM(CASE WHEN dept = 'R&D' THEN premium END)"
+    creating.superset.mapped = mapped
+    made = make_from_config(set={"number_format": ",.2f"}, leave_out_no_value=True)
     assert set(made) == {"chart_id"}, made
     ((_, properties),) = commands(creating.superset)
     saved = json.loads(properties["params"])
-    assert saved["adhoc_filters"][:2] == [WEST, NO_TIME] and saved["number_format"] == ",.2f"
-    [having] = saved["adhoc_filters"][2:]
-    assert having == {"clause": "HAVING", "expressionType": "SQL", "sqlExpression": NOT_NULL, "subject": None,
-                      "operator": None, "comparator": None, "isExtra": False, "isNew": False,
-                      "filterOptionName": "mnemiq_having_0"}
+    condition = "(SUM(CASE WHEN dept = 'R&D' THEN premium END)) IS NOT NULL"
+    assert saved["adhoc_filters"] == [WEST, NO_TIME, _leave_out(condition)] and saved["number_format"] == ",.2f"
     context = json.loads(properties["query_context"])
     assert context == params.query_context("echarts_timeseries_bar", saved, 7)
-    assert context["queries"][0]["extras"]["having"] == f"({NOT_NULL})"  # `sanitizeClause` wraps each clause
+    assert context["queries"][0]["extras"]["having"] == f"({condition})"  # `sanitizeClause` wraps each clause
 
 
-def test_without_having_the_saved_chart_is_as_before(creating):
+def test_a_saved_metrics_condition_is_its_expression_on_the_dataset(creating):
+    creating.superset.mapped = {**copy.deepcopy(BAR_FORM), "metrics": ["revenue"]}
+    creating.superset.datasets[7].metrics = [SimpleNamespace(metric_name="revenue", expression="SUM(net_amount)")]
+    assert set(make_from_config(leave_out_no_value=True)) == {"chart_id"}
+    ((_, properties),) = commands(creating.superset)
+    assert json.loads(properties["params"])["adhoc_filters"][-1] == _leave_out("(SUM(net_amount)) IS NOT NULL")
+
+
+@pytest.mark.parametrize("mapped", [
+    {**BAR_FORM, "metrics": [{"expressionType": "SIMPLE", "aggregate": "SUM", "column": {"column_name": "premium"},
+                              "label": "Premium"}]},
+    {**BAR_FORM, "metrics": ["no_such_metric"]},
+    {**BAR_FORM, "metrics": []},
+    {"viz_type": "big_number_total", "metric": "count"},
+], ids=["a SIMPLE metric", "a saved metric the dataset does not hold", "no metric", "a type ranked by no metric"])
+def test_a_chart_whose_ranked_metric_cannot_be_read_is_refused_and_not_saved(creating, mapped):
+    creating.superset.mapped = copy.deepcopy(mapped)
+    creating.superset.datasets[7].metrics = []
+    assert make_from_config(leave_out_no_value=True) == {"refused": "leave_out_no_value"}
+    assert commands(creating.superset) == []
+
+
+def test_without_leave_out_no_value_the_saved_chart_is_as_before(creating):
     creating.superset.mapped = copy.deepcopy(BAR_FORM)
     made = make_from_config()
     assert set(made) == {"chart_id"}, made
@@ -3276,9 +3302,9 @@ def test_without_having_the_saved_chart_is_as_before(creating):
     assert json.loads(properties["params"]) == BAR_FORM
 
 
-def test_a_funnel_or_sankey_with_having_is_refused(creating):
+def test_a_funnel_or_sankey_asked_to_leave_out_no_value_is_refused(creating):
     found = {"dataset_id": 7, "viz_type": "funnel", "slice_name": "Stages",
              "params": {"groupby": ["status"], "metric": "count"}, "dashboard_id": 12, "marker": STEP,
-             "having": [NOT_NULL]}
+             "leave_out_no_value": True}
     assert writes.create_chart(found) == {"refused": "request"}
     assert commands(creating.superset) == []

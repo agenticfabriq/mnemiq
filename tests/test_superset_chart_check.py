@@ -2222,3 +2222,14 @@ def test_a_simple_having_keeps_todays_reason():
               "comparator": None}
     assert expectation_from_form_data(_bar(adhoc_filters=[simple]), dataset=PHYSICAL) == NotCheckable(
         "the chart filters its aggregated values (HAVING), which mnemiq does not translate")
+
+
+@pytest.mark.parametrize("viz", ["mixed_timeseries", "pivot_table_v2", "big_number_total"])
+def test_the_builders_having_on_a_type_it_never_gives_one_keeps_todays_reason(viz):
+    """The builder gives the HAVING only to the types the check ranks; on any other type (a mixed chart, whose second
+    query has filters of its own, say) it is read as any other SQL filter, never as leaving out mnemiq's rows."""
+    form = {"viz_type": viz, "x_axis": "region", "groupby": [], "groupbyRows": ["region"],
+            "metrics": [copy.deepcopy(PREMIUM)], "metric": copy.deepcopy(PREMIUM), "metrics_b": [copy.deepcopy(SECOND)],
+            "adhoc_filters": [LEFT_OUT], "adhoc_filters_b": [], "row_limit": 10}
+    found = expectation_from_form_data(form, dataset=PHYSICAL)
+    assert not isinstance(found, Expectation) or found.not_null == (), found

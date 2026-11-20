@@ -11,7 +11,7 @@ import pytest
 
 from mnemiq.superset.charts import (HANDLEBARS_TEMPLATE, MCP_FAMILIES, ChartSpec, Family, Filter, SavedRef, WrittenRef,
                                     config_chart_request, extension_chart_request, generate_chart_request,
-                                    owed_format_params, plan_refusal, ranked_having)
+                                    leaves_out_no_value, owed_format_params, plan_refusal)
 from mnemiq.superset.measures import Measure, MeasureKind
 from mnemiq.superset.saved_metrics import UNKNOWN, SavedMetric
 
@@ -419,22 +419,8 @@ RANKED = [Family.BAR, Family.LINE, Family.AREA, Family.SCATTER, Family.TABLE, Fa
 @pytest.mark.parametrize("family", RANKED)
 def test_a_chart_ranked_under_a_planned_row_limit_leaves_out_groups_with_no_value(family):
     spec = _spec(family, dimensions=("region",), row_limit=10)
-    assert ranked_having(spec, {}, {}) == ["(SUM(amount)) IS NOT NULL"]
-    assert config_chart_request(spec, {}, {}, currency="USD")["having"] == ["(SUM(amount)) IS NOT NULL"]
-
-
-def test_a_saved_metrics_having_is_its_expression_on_the_dataset():
-    ref = SavedRef("revenue", K.CURRENCY)
-    metric = SavedMetric(dataset_id=7, name="revenue", expression="SUM(net_amount)", verbose_name=None, d3format=None,
-                         currency=None, certified_by=None, warning_text=None)
-    spec = _spec(Family.BAR, measures=[ref], dimensions=("region",), row_limit=10)
-    assert ranked_having(spec, {}, {"revenue": metric}) == ["(SUM(net_amount)) IS NOT NULL"]
-
-
-def test_a_written_measures_having_is_its_expression_as_the_plan_holds_it():
-    planned = _measure(expression="SUM(CASE WHEN status = 'open' THEN amount END)")
-    spec = _spec(Family.BAR, measures=[WrittenRef(_measure())], dimensions=("region",), row_limit=10)
-    assert ranked_having(spec, {"revenue": planned}, {}) == ["(SUM(CASE WHEN status = 'open' THEN amount END)) IS NOT NULL"]
+    assert leaves_out_no_value(spec) is True
+    assert config_chart_request(spec, {}, {}, currency="USD")["leave_out_no_value"] is True
 
 
 @pytest.mark.parametrize("spec", [
@@ -452,7 +438,7 @@ def test_a_written_measures_having_is_its_expression_as_the_plan_holds_it():
     _spec(Family.SANKEY, dimensions=(), source="a", target="b", row_limit=10),
 ], ids=["no row limit", "bar over time", "line over time", "area over time", "scatter over time", "mixed",
         "waterfall", "histogram", "box plot", "big number", "funnel", "sankey"])
-def test_no_other_chart_is_sent_a_having(spec):
-    assert ranked_having(spec, {}, {}) == []
+def test_no_other_chart_is_asked_to_leave_out_groups(spec):
+    assert leaves_out_no_value(spec) is False
     if spec.family not in (Family.FUNNEL, Family.SANKEY, Family.MIXED):  # no config of their own here
-        assert "having" not in config_chart_request(spec, {}, {}, currency="USD")
+        assert "leave_out_no_value" not in config_chart_request(spec, {}, {}, currency="USD")

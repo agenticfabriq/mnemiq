@@ -1436,8 +1436,8 @@ def test_a_ranked_bar_whose_row_limit_cuts_groups_is_checked_as_a_ranking(fake, 
     assert having["sqlExpression"] == f"({lapsed.expression}) IS NOT NULL"
 
 
-def test_an_extension_without_having_stops_the_chart_step_and_makes_no_chart(fake, world, store):
-    world.without_having = True
+def test_an_extension_without_leave_out_no_value_stops_the_chart_step_and_makes_no_chart(fake, world, store):
+    world.without_leave_out = True
     lapsed, chart = _lapsed_bar("END")
     states = _run(store, _start(store, BuildPlan(charts=(chart,), measures=(lapsed,))).build_id, _adapter(fake))
     final = states[-1]
@@ -1469,6 +1469,8 @@ def test_a_carried_metric_ranked_on_a_join_the_build_made_carries_its_having_on_
     [measure] = plan.measures
     final = _run(store, _start(store, plan).build_id, _adapter(fake))[-1]
     [request] = [call.request for call in world.calls("create_chart")]
-    assert request["having"] == [f"({measure.expression}) IS NOT NULL"] and '"status"' in measure.expression
+    assert request["leave_out_no_value"] is True and '"status"' in measure.expression
     chart_id = _step(final, "active_by_claim_region").object_id
+    [left_out] = [f for f in world.charts[chart_id]["params"]["adhoc_filters"] if f.get("clause") == "HAVING"]
+    assert left_out["sqlExpression"] == f"({measure.expression}) IS NOT NULL"
     assert final.status == "done" and final.checks == {chart_id: ChartStatus.CHECKED}, final.message

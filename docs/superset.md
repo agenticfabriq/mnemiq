@@ -346,7 +346,8 @@ still to come. In short:
   ids and statuses, never a value or a row. Without it the build routes answer 503.
 - **Without the extension, the build routes answer 503** with a sentence that names it, before anything is planned. An
   extension older than mnemiq, without the creates a build sends, is answered 503 too, with a sentence saying to
-  update it.
+  update it. One that has them but does not take a field a chart needs (`create_chart`'s `leave_out_no_value`, for a
+  chart made with a row limit) stops the build at that chart's step, with a sentence saying to update it.
 
 ## What each refusal returns
 

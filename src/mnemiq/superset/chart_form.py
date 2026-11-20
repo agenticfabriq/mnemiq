@@ -611,12 +611,18 @@ def expectation_from_form_data(form_data: dict, *, dataset: DatasetFacts) -> Exp
         if label.casefold() in {name.casefold() for name in dimensions}:
             return NotCheckable(f"the metric label {label!r} is also the name of a grouping column, so their values "
                                 "cannot be told apart")
-    not_null, others = _not_null(form, metrics, dataset)
+    # Only on the types the builder gives the HAVING to, those it ranks; on any other it is a SQL filter as before.
+    not_null, others = _not_null(form, metrics, dataset) if viz_type in _LEFT_OUT_TYPES else ((), [])
     filters = _filters({**form, "adhoc_filters": others} if not_null else form)
     if isinstance(filters, NotCheckable):
         return filters
     return Expectation(metrics=tuple(metrics), dimensions=tuple(dimensions), time_grain=grain, filters=filters,
                        not_null=not_null)
+
+
+# The chart types the builder makes with a HAVING that leaves out groups with no value (`charts.leaves_out_no_value`).
+_LEFT_OUT_TYPES = frozenset({"echarts_timeseries_line", "echarts_timeseries_bar", "echarts_area",
+                             "echarts_timeseries_scatter", "table", "pie", "gauge_chart", "treemap_v2"})
 
 
 def _not_null(form: dict, metrics: list[tuple[str, str]], dataset: DatasetFacts) -> tuple[tuple[int, ...], list]:

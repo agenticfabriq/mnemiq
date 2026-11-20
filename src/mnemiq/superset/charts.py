@@ -29,7 +29,8 @@ __all__ = ["ChartSpec", "Family", "Filter", "MCP_FAMILIES", "MeasureRef", "Saved
 
 def not_null_condition(expression: str) -> str:
     """The SQL HAVING condition that leaves out the groups whose `expression` (a measure's SQL) has no value: the one
-    text the builder sends a ranked chart (`create_chart`'s `having`) and the value check recognises."""
+    text the extension writes on a chart made with `create_chart`'s `leave_out_no_value` (its own
+    `not_null_condition`, held equal by a test) and the value check recognises."""
     return f"({expression}) IS NOT NULL"
 
 
@@ -379,9 +380,8 @@ def config_chart_request(spec: ChartSpec, measures: dict[str, Measure], saved: d
     owed = owed_format_params(spec, measures, saved, currency=currency)
     if owed:
         request["set"] = owed
-    having = ranked_having(spec, measures, saved)
-    if having:
-        request["having"] = having
+    if leaves_out_no_value(spec):
+        request["leave_out_no_value"] = True
     return request
 
 
@@ -390,19 +390,13 @@ _RANKED = frozenset({Family.BAR, Family.LINE, Family.AREA, Family.SCATTER, Famil
                      Family.TREEMAP})
 
 
-def ranked_having(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, SavedMetric]) -> list[str]:
-    """The SQL HAVING conditions a chart is made with: for a chart whose plan sets a row limit, of a family whose query
-    ranks by its first measure, over no time axis, the one that leaves out the groups that measure has no value for
-    (`not_null_condition` of its SQL: a written measure's expression, a saved metric's on its dataset), so the rows
-    the limit keeps are the largest. A chart over a time axis gets none: there it would drop points from a series and
-    join the line across them. Every other chart gets none."""
-    if spec.row_limit is None or spec.time_column is not None or spec.family not in _RANKED or not spec.measures:
-        return []
-    held = _resolve(spec.measures[0], measures)
-    if isinstance(held, SavedRef):
-        metric = saved.get(held.name)
-        return [not_null_condition(metric.expression)] if metric is not None and metric.expression else []
-    return [not_null_condition(held.expression)]
+def leaves_out_no_value(spec: ChartSpec) -> bool:
+    """Whether the chart is made leaving out the groups its ranking measure has no value for: one whose plan sets a
+    row limit, of a family whose query ranks by its first measure, over no time axis. The extension writes the
+    condition from that measure as Superset saved it (`create_chart`'s `leave_out_no_value`), and the value check
+    recognises it (`not_null_condition`), so the rows the limit keeps are the largest with a value. A chart over a
+    time axis is left alone: there it would drop points from a series and join the line across them."""
+    return spec.row_limit is not None and spec.time_column is None and spec.family in _RANKED and bool(spec.measures)
 
 
 def owed_format_params(spec: ChartSpec, measures: dict[str, Measure], saved: dict[str, SavedMetric], *,

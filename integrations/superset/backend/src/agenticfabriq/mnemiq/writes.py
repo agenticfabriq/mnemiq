@@ -134,17 +134,10 @@ def _a_string(value: Any) -> str:
     return value
 
 
-# A chart's SQL HAVING conditions (`create_chart`'s `having`): how many, and how long each may be.
-MAX_HAVING = 5
-MAX_HAVING_CHARS = 2000
-
-
-def _conditions(value: Any) -> list[str]:
-    """`create_chart`'s `having`: a list of at most `MAX_HAVING` SQL conditions, each non-blank text of at most
-    `MAX_HAVING_CHARS` characters."""
-    if not isinstance(value, list) or len(value) > MAX_HAVING:
-        raise ValueError("not a list of conditions")
-    return [_text(MAX_HAVING_CHARS)(item) for item in value]
+def _a_flag(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError("not a boolean")
+    return value
 
 
 def _an_object(value: Any) -> dict:
@@ -228,7 +221,8 @@ REQUESTS: dict[str, dict[str, _Field]] = {
     "create_chart": {"dataset_id": _Field(_an_id), "viz_type": _Field(_one_of(EXTENSION_MADE), False),
                      "slice_name": _Field(_text(250)), "params": _Field(_an_object, False),
                      "config": _Field(_an_object, False), "set": _Field(_an_object, False),
-                     "having": _Field(_conditions, False), "dashboard_id": _DASHBOARD_ID, "marker": _MARKER},
+                     "leave_out_no_value": _Field(_a_flag, False, False), "dashboard_id": _DASHBOARD_ID,
+                     "marker": _MARKER},
     "patch_chart": {"chart_id": _Field(_an_id), "set": _Field(_an_object, False, {}),
                     "unset": _Field(_names, False, []), "expect_changed_on": _EXPECT_CHANGED_ON},
     "add_saved_metric": {"dataset_id": _Field(_an_id), "metric": _Field(_a_metric),
@@ -1321,12 +1315,45 @@ def _funnel_form(found: dict) -> tuple[str, dict, dict] | dict:
     return viz_type, form_data, context
 
 
-def _having_filter(condition: str, index: int) -> dict:
-    """One of `create_chart`'s `having` conditions as the SQL HAVING adhoc filter rc2's filter editor saves, which
-    rc2's frontend (`processFilters`) and the query context (`params._filters_and_extras`) read into `extras.having`."""
+# The chart types whose query ranks its rows by one metric under a row limit, with where that metric is in the form:
+# `metrics[0]` for a time-series chart or a table, `metric` for a pie, gauge or treemap.
+_RANKED_BY_FIRST = frozenset({"echarts_timeseries_line", "echarts_timeseries_bar", "echarts_area",
+                              "echarts_timeseries_scatter", "table"})
+_RANKED_BY_METRIC = frozenset({"pie", "gauge_chart", "treemap_v2"})
+
+
+def not_null_condition(sql: str) -> str:
+    """The SQL HAVING condition that leaves out the groups whose metric `sql` has no value. mnemiq's value check
+    recognises exactly this text (`mnemiq.superset.charts.not_null_condition`, which a test holds equal)."""
+    return f"({sql}) IS NOT NULL"
+
+
+def ranked_metric_sql(form_data: dict, dataset: Any) -> str | None:
+    """The SQL of the metric the chart's query ranks by, as the chart holds it once MCP's mapping has saved it (an ad
+    hoc metric's `sqlExpression` after rc2's own sanitising; a saved metric's expression on the dataset): None for a
+    type that ranks by no one metric, a SIMPLE metric, or a saved metric the dataset does not hold."""
+    viz_type = form_data.get("viz_type")
+    if viz_type in _RANKED_BY_FIRST:
+        metrics = form_data.get("metrics")
+        item = metrics[0] if isinstance(metrics, list) and metrics else None
+    elif viz_type in _RANKED_BY_METRIC:
+        item = form_data.get("metric")
+    else:
+        return None
+    if isinstance(item, Mapping) and item.get("expressionType") == "SQL" and isinstance(item.get("sqlExpression"), str):
+        return item["sqlExpression"].strip() or None
+    if isinstance(item, str):
+        found = [m.expression for m in getattr(dataset, "metrics", None) or [] if m.metric_name == item]
+        return found[0] if len(found) == 1 and isinstance(found[0], str) and found[0].strip() else None
+    return None
+
+
+def _having_filter(condition: str) -> dict:
+    """The SQL HAVING adhoc filter rc2's filter editor saves for `condition`, which rc2's frontend (`processFilters`)
+    and the query context (`params._filters_and_extras`) read into `extras.having`."""
     return {"clause": "HAVING", "expressionType": "SQL", "sqlExpression": condition, "subject": None,
             "operator": None, "comparator": None, "isExtra": False, "isNew": False,
-            "filterOptionName": f"mnemiq_having_{index}"}
+            "filterOptionName": "mnemiq_leave_out_no_value"}
 
 
 def _config_form(found: dict, dataset: Any) -> tuple[str, dict, dict | None] | dict:
@@ -1353,9 +1380,11 @@ def _config_form(found: dict, dataset: Any) -> tuple[str, dict, dict | None] | d
         return {"refused": "config"}
     form_data.pop("_mcp_warnings", None)
     form_data.update(found["set"] or {})
-    if found["having"]:
-        form_data["adhoc_filters"] = [*(form_data.get("adhoc_filters") or []),
-                                      *(_having_filter(condition, index) for index, condition in enumerate(found["having"]))]
+    if found["leave_out_no_value"]:
+        ranked = ranked_metric_sql(form_data, dataset)
+        if ranked is None:
+            return {"refused": "leave_out_no_value"}
+        form_data["adhoc_filters"] = [*(form_data.get("adhoc_filters") or []), _having_filter(not_null_condition(ranked))]
     viz_type = form_data.get("viz_type")
     if not isinstance(viz_type, str) or not viz_type:
         return {"refused": "config"}
@@ -1422,7 +1451,7 @@ def create_chart(found: dict) -> dict:
         shaped = found["viz_type"] is None and found["params"] is None
     else:
         shaped = found["viz_type"] is not None and found["params"] is not None and found["set"] is None \
-            and found["having"] is None
+            and not found["leave_out_no_value"]
     if not shaped:
         return {"refused": "request"}
     if from_config and not set(found["set"] or ()) <= _CREATE_SET_KEYS:
