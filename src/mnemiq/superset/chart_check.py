@@ -733,6 +733,7 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
                                    before_call=before_call), _OWN_SQL
     if isinstance(mine, NotCheckable):
         return not_checked(mine.reason)
+    mine = _left_out(mine, expectation.not_null)
     labels = tuple(label for label, _ in expectation.metrics)
     found = _compare(chart_id, chart, mine, _row_limit(form), source=compared, labels=labels,
                      ranking=ranking_of(form, expectation, dataset=dataset))
@@ -746,9 +747,19 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
         # keeps only first-of-month days. Only on positive evidence: every one of the chart's rows found among mnemiq's
         # ungrouped ones, with equal values. An ungrouped read at its row cap, or an empty chart, proves nothing, and
         # the grouped finding stands.
-        if not isinstance(plain, NotCheckable) and _all_found(chart, plain):
+        if not isinstance(plain, NotCheckable) and _all_found(chart, _left_out(plain, expectation.not_null)):
             return not_checked(_NO_GRAIN)
     return found
+
+
+def _left_out(rows: _Rows, not_null: tuple[int, ...]) -> _Rows:
+    """`rows` without the groups whose value at any of `not_null` is NULL: what the chart's HAVING
+    `(<metric>) IS NOT NULL` leaves out of its query. A read at its cap stays one."""
+    if not not_null:
+        return rows
+    kept = {key: values for key, values in rows.values.items()
+            if all(index < len(values) and values[index] is not None for index in not_null)}
+    return _Rows(kept, len(kept), cap=rows.cap)
 
 
 class _BeforeEachCall:

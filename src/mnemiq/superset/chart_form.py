@@ -18,7 +18,7 @@ from sqlglot import exp
 from sqlglot.errors import SqlglotError
 
 from mnemiq.superset.adapter import JINJA_DELIMITERS
-from mnemiq.superset.charts import Filter
+from mnemiq.superset.charts import Filter, not_null_condition
 from mnemiq.superset.display_format import metric_label
 
 __all__ = ["DatasetFacts", "Expectation", "NotCheckable", "expectation_from_form_data"]
@@ -50,6 +50,9 @@ class Expectation:
     dimensions: tuple[str, ...]
     time_grain: str | None
     filters: tuple[Filter, ...]
+    # The metrics, by index, whose groups with no value the chart's query leaves out: the builder's own SQL HAVING
+    # `(<the metric's SQL>) IS NOT NULL` (`not_null_condition`), and no other.
+    not_null: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -608,7 +611,29 @@ def expectation_from_form_data(form_data: dict, *, dataset: DatasetFacts) -> Exp
         if label.casefold() in {name.casefold() for name in dimensions}:
             return NotCheckable(f"the metric label {label!r} is also the name of a grouping column, so their values "
                                 "cannot be told apart")
-    filters = _filters(form)
+    not_null, others = _not_null(form, metrics, dataset)
+    filters = _filters({**form, "adhoc_filters": others} if not_null else form)
     if isinstance(filters, NotCheckable):
         return filters
-    return Expectation(metrics=tuple(metrics), dimensions=tuple(dimensions), time_grain=grain, filters=filters)
+    return Expectation(metrics=tuple(metrics), dimensions=tuple(dimensions), time_grain=grain, filters=filters,
+                       not_null=not_null)
+
+
+def _not_null(form: dict, metrics: list[tuple[str, str]], dataset: DatasetFacts) -> tuple[tuple[int, ...], list]:
+    """The metrics whose groups with no value the chart leaves out by the builder's own SQL HAVING, exactly
+    `not_null_condition(<the metric's SQL>)` (a saved metric's SQL as the dataset holds it), at most one per metric;
+    and every other filter, which `_filters` reads as before."""
+    saved = dict(dataset.saved_metric_sql)
+    conditions = {not_null_condition(saved.get(label, sql) if label in dataset.saved_metric_names else sql): index
+                  for index, (label, sql) in enumerate(metrics)}
+    found: list[int] = []
+    others = []
+    for item in form.get("adhoc_filters") or []:
+        text = item.get("sqlExpression") if isinstance(item, dict) else None
+        index = conditions.get(text.strip()) if isinstance(text, str) else None
+        if isinstance(item, dict) and item.get("clause") == "HAVING" and item.get("expressionType") == "SQL" \
+                and index is not None and index not in found:
+            found.append(index)
+        else:
+            others.append(item)
+    return tuple(sorted(found)), others

@@ -27,6 +27,12 @@ __all__ = ["ChartSpec", "Family", "Filter", "MCP_FAMILIES", "MeasureRef", "Saved
            "plan_refusal"]
 
 
+def not_null_condition(expression: str) -> str:
+    """The SQL HAVING condition that leaves out the groups whose `expression` (a measure's SQL) has no value: the one
+    text the builder sends a ranked chart (`create_chart`'s `having`) and the value check recognises."""
+    return f"({expression}) IS NOT NULL"
+
+
 class Family(StrEnum):
     """A chart family and its Superset `viz_type`. MCP's one `xy` chart type is split into its four kinds."""
 
