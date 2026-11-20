@@ -9,13 +9,15 @@ from mnemiq.enrichment.profiling import ColumnStats, profile_column, unharvested
 logger = logging.getLogger(__name__)
 
 
-def _as_text(expr: str, dialect: str) -> str:
-    """`expr` as text, in a form `dialect` accepts on both sides of `=`.
+def _comparable(expr: str, dialect: str) -> str:
+    """`expr` as the orphan check compares it.
 
-    Oracle refuses `CAST(x AS VARCHAR)` with ORA-00906 (a VARCHAR2 needs a length), and sqlglot's transpile of it
-    gives `CAST(x AS CLOB)`, which Oracle cannot compare with `=`. `TO_CHAR(x)` is what Oracle takes, measured on
-    23.26. Every other dialect keeps the cast it always had."""
-    return f"TO_CHAR({expr})" if dialect == "oracle" else f"CAST({expr} AS VARCHAR)"
+    Elsewhere as text, because a catalog can mix typed and CSV-inferred all-text tables, where INTEGER 1 and TEXT '1'
+    must still match. Oracle natively, as the join the relationship describes will compare: it refuses
+    `CAST(x AS VARCHAR)` with ORA-00906 (a VARCHAR2 needs a length, measured on 23.26), sqlglot's transpile gives
+    `CAST(x AS CLOB)`, which it cannot compare with `=`, and `TO_CHAR` of a DATE follows the session's format, which
+    can drop the time and make two different keys one. Types that do not compare raise, and the candidate is skipped."""
+    return expr if dialect == "oracle" else f"CAST({expr} AS VARCHAR)"
 
 
 def _stem(column: str) -> str:
@@ -37,8 +39,8 @@ def _stem(column: str) -> str:
     return column
 
 
-def infer_relationships(adapter, catalog: list[TableInfo], *,
-                        harvest_values: bool = True) -> list[Relationship]:
+def infer_relationships(adapter, catalog: list[TableInfo], *, harvest_values: bool = True,
+                        failures: list[str] | None = None) -> list[Relationship]:
     """Infer foreign keys: naming gives direction, data gives the verdict. Key detection reads counts only, and with
     `harvest_values` False each profile is told so too.
 
@@ -88,12 +90,11 @@ def infer_relationships(adapter, catalog: list[TableInfo], *,
                 if not is_key_of(parent.name, col.name):
                     continue  # parent side is not unique: a join here would fan out
 
-                # inclusion dependency. Compared as text because the catalog mixes typed and
-                # CSV-inferred all-text tables, so INTEGER 1 and TEXT '1' must still match.
-                # A NULL child value means "no parent", not a broken reference.
+                # inclusion dependency, compared as `_comparable` says. A NULL child value means "no
+                # parent", not a broken reference.
                 dialect = getattr(adapter, "dialect", "duckdb")
-                in_parent = _as_text(f'p."{col.name}"', dialect)
-                in_child = _as_text(f'c."{col.name}"', dialect)
+                in_parent = _comparable(f'p."{col.name}"', dialect)
+                in_child = _comparable(f'c."{col.name}"', dialect)
                 orphans = adapter.execute(
                     f'SELECT count(*) FROM "{child.name}" c '
                     f'WHERE c."{col.name}" IS NOT NULL AND NOT EXISTS ('
@@ -104,6 +105,8 @@ def infer_relationships(adapter, catalog: list[TableInfo], *,
                 first = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
                 logger.warning("relationship %s.%s -> %s not inferred: its check failed: %s",
                                child.name, col.name, parent.name, first)
+                if failures is not None:
+                    failures.append(f"{child.name}.{col.name} -> {parent.name}: {first}")
                 continue
             if orphans == 0:
                 rels.append(
@@ -149,12 +152,14 @@ def relationships_from_foreign_keys(adapter, catalog: list[TableInfo]) -> list[R
     return rels
 
 
-def build_relationships(adapter, catalog: list[TableInfo], *,
-                        harvest_values: bool = True) -> list[Relationship]:
+def build_relationships(adapter, catalog: list[TableInfo], *, harvest_values: bool = True,
+                        failures: list[str] | None = None) -> list[Relationship]:
     """Declared-first, inference-fallback, per child table. A table that declares any FK is
-    described by the catalog; inference runs only for tables the catalog is silent on."""
+    described by the catalog; inference runs only for tables the catalog is silent on. Each
+    candidate whose check could not run is appended to `failures`, when given."""
     declared = relationships_from_foreign_keys(adapter, catalog)
     covered = {r.from_ for r in declared}
-    inferred = [r for r in infer_relationships(adapter, catalog, **unharvested(harvest_values))
+    inferred = [r for r in infer_relationships(adapter, catalog, **unharvested(harvest_values),
+                                               failures=failures)
                 if r.from_ not in covered]
     return declared + inferred

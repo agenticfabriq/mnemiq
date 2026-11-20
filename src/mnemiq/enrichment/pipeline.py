@@ -163,6 +163,14 @@ def partition_warning(snapshot: Snapshot) -> str | None:
             "succeeds")
 
 
+def _listed(items: list[str], shown: int = 10) -> str | None:
+    """`items` for a job's detail: the first `shown`, then how many more. None when there are none."""
+    if not items:
+        return None
+    more = f"; and {len(items) - shown} more" if len(items) > shown else ""
+    return "; ".join(items[:shown]) + more
+
+
 def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
                       superset_source: tuple[int, str] | None = None) -> Snapshot:
     """The no-LLM enrichment pass: discover, profile, infer joins.
@@ -259,12 +267,17 @@ def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
             Job(id=f"profile:{table.name}", source_id=source_id, kind="profile", status=status)
         )
 
+    # A candidate whose check could not run is skipped, and recorded here as well as logged: a
+    # warning alone left an incomplete inference looking like a complete one on the snapshot.
+    inference_failures: list[str] = []
     try:
-        relationships = build_relationships(adapter, catalog, **unharvested(harvest_values))
-        status = "done"
+        relationships = build_relationships(adapter, catalog, **unharvested(harvest_values),
+                                            failures=inference_failures)
+        status = "partial" if inference_failures else "done"
     except Exception:
         relationships, status = [], "failed"
-    jobs.append(Job(id="infer:relationships", source_id=source_id, kind="join", status=status))
+    jobs.append(Job(id="infer:relationships", source_id=source_id, kind="join", status=status,
+                    detail=_listed(inference_failures)))
 
     # A view is the one object the snapshot cannot describe from its columns: the rows it
     # returns are defined by SQL the source holds. Fail-soft like the FK read -- a source that

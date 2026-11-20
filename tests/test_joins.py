@@ -221,23 +221,31 @@ class _KeyRecorder:
     `count(*), count(DISTINCT), count()` gives 10, 10, 10 and the orphan count gives 0. `fail_on` names a column whose
     orphan query raises, as Oracle raised ORA-00906 on `CAST(... AS VARCHAR)` (measured on 23.26, 2026-11-19)."""
 
-    def __init__(self, dialect: str | None, fks=(), fail_on: str | None = None):
+    def __init__(self, dialect: str | None, fks=(), fail_on: str | None = None, catalog=()):
         if dialect is not None:
             self.dialect = dialect
         self.sql: list[str] = []
         self._fks = list(fks)
         self._fail_on = fail_on
+        self._catalog = list(catalog)
 
     def foreign_keys(self):
         return self._fks
+
+    def list_columns(self):
+        return [(t.name, c.name, c.data_type) for t in self._catalog for c in t.columns]
+
+    def view_definitions(self):
+        return []
 
     def execute(self, sql):
         self.sql.append(sql)
         if "NOT EXISTS" in sql:
             if self._fail_on and f'"{self._fail_on}"' in sql:
-                raise RuntimeError("ORA-00906: missing left parenthesis")
+                raise RuntimeError("ORA-00942: table or view does not exist")
             return [(0,)]
-        return [(10, 10, 10)]
+        # every count a profile asks for is 10: each column unique, none null
+        return [tuple([10] + [10, 10] * sql.count("count(DISTINCT"))]
 
 
 def _invoices() -> list[TableInfo]:
@@ -248,14 +256,15 @@ def _invoices() -> list[TableInfo]:
     ]
 
 
-def test_orphan_query_casts_with_to_char_on_oracle():
-    """Oracle refuses `CAST(x AS VARCHAR)` (ORA-00906) and sqlglot's transpile gives `CAST(x AS CLOB)`, which Oracle
-    cannot compare with `=`; `TO_CHAR(x)` is what it accepts."""
+def test_orphan_query_compares_natively_on_oracle():
+    """Oracle refuses `CAST(x AS VARCHAR)` (ORA-00906), and sqlglot's transpile gives `CAST(x AS CLOB)`, which Oracle
+    cannot compare with `=`. Text is the wrong ground anyway: `TO_CHAR` of a DATE follows the session's format, which
+    can drop the time and make two different values one. The check compares as the join will, natively."""
     recorder = _KeyRecorder("oracle")
     rels = infer_relationships(recorder, _invoices())
     orphan = next(sql for sql in recorder.sql if "NOT EXISTS" in sql and '"customer_id"' in sql)
-    assert "AS VARCHAR" not in orphan
-    assert 'TO_CHAR(p."customer_id") = TO_CHAR(c."customer_id")' in orphan
+    assert "CAST" not in orphan and "TO_CHAR" not in orphan
+    assert 'WHERE p."customer_id" = c."customer_id")' in orphan
     assert ("invoice", "customer") in {(r.from_, r.to) for r in rels}
 
 
@@ -280,4 +289,26 @@ def test_a_candidate_that_cannot_be_checked_costs_only_itself(caplog):
         rels = build_relationships(recorder, _invoices())
     assert ("invoice_line", "invoice") in {(r.from_, r.to) for r in rels}
     assert ("invoice", "customer") not in {(r.from_, r.to) for r in rels}
-    assert "customer_id" in caplog.text and "ORA-00906" in caplog.text
+    assert "customer_id" in caplog.text and "ORA-00942" in caplog.text
+
+
+def test_a_skipped_candidate_is_recorded_on_the_snapshot():
+    """A warning alone left an incomplete inference looking like a complete one: the snapshot's job says `partial` and
+    names what was not checked."""
+    from mnemiq.enrichment.pipeline import enrich_structural
+
+    recorder = _KeyRecorder("oracle", fks=[("invoice_line", "invoice_id", "invoice", "invoice_id", "fk_line")],
+                            fail_on="customer_id", catalog=_invoices())
+    snap = enrich_structural(recorder, "src")
+    job = next(j for j in snap.jobs if j.id == "infer:relationships")
+    assert job.status == "partial"
+    assert "invoice.customer_id -> customer" in job.detail and "ORA-00942" in job.detail
+    assert ("invoice_line", "invoice") in {(r.from_, r.to) for r in snap.relationships}
+
+
+def test_a_complete_inference_records_done_with_no_detail():
+    from mnemiq.enrichment.pipeline import enrich_structural
+
+    snap = enrich_structural(_KeyRecorder("oracle", catalog=_invoices()), "src")
+    job = next(j for j in snap.jobs if j.id == "infer:relationships")
+    assert (job.status, job.detail) == ("done", None)
