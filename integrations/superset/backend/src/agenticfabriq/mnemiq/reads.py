@@ -56,6 +56,7 @@ REQUESTS: dict[str, dict[str, _Field]] = {
                    "dataset_ids": _Field(_distinct_ids(MAX_DATASETS), False, []),
                    "dashboard_ids": _Field(_distinct_ids(MAX_DASHBOARDS), False, [])},
     "get_layout": {"dashboard_id": writes._DASHBOARD_ID},
+    "row_rules": {"dataset_ids": _Field(_distinct_ids(MAX_DATASETS))},
 }
 
 
@@ -174,3 +175,19 @@ def get_layout(found: dict) -> dict:
     if _size(answer) > MAX_ANSWER_BYTES:
         return dict(TOO_LARGE)
     return answer
+
+
+@writes._answering("row_rules", REQUESTS)
+def row_rules(found: dict) -> dict:
+    """Whether any row rule applies to the caller on each dataset the caller may access (`can_access_datasource`), in
+    the order asked, as Superset itself works it out for the caller's queries through that dataset
+    (`security_manager.get_rls_filters`). Only whether: never a rule's clause, name or roles, which an Alpha may not
+    list. A dataset the caller may not access, or that does not exist, is left out, so nothing tells the two apart.
+    At most `MAX_DATASETS` short entries, so the answer is far under `MAX_ANSWER_BYTES`."""
+    datasets = []
+    for dataset_id in found["dataset_ids"]:
+        dataset = writes._dataset(dataset_id)
+        if dataset is not None:
+            datasets.append({"dataset_id": dataset_id,
+                             "applies": bool(writes._security().get_rls_filters(dataset))})
+    return {"datasets": datasets}

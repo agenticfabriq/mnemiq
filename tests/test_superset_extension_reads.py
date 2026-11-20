@@ -24,7 +24,7 @@ def refusal(tool, request):
 
 
 def test_every_read_tool_has_a_request_reader():
-    assert set(reads.REQUESTS) == {"dataset_metrics", "editors_of", "get_layout"}
+    assert set(reads.REQUESTS) == {"dataset_metrics", "editors_of", "get_layout", "row_rules"}
 
 
 def test_dataset_metrics_takes_at_most_twenty_distinct_ids():
@@ -259,3 +259,55 @@ def test_a_dashboard_cut_for_size_still_says_whether_the_caller_edits_it(monkeyp
     assert answer["dashboards"] == [{"dashboard_id": 7, "is_editor": True, "too_large": True},
                                     {"dashboard_id": 8, "is_editor": False, "too_large": True}]
     assert size(answer) <= reads.MAX_ANSWER_BYTES
+
+
+def test_row_rules_takes_at_most_twenty_distinct_ids():
+    assert reads.read("row_rules", {"dataset_ids": [3, 3, 1]}) == {"dataset_ids": [3, 1]}
+    assert refusal("row_rules", {"dataset_ids": list(range(1, 22))}) == {"refused": "request", "field": "dataset_ids"}
+    for bad in (0, "3", [0], [True], ["3"], None):
+        assert refusal("row_rules", {"dataset_ids": bad}) == {"refused": "request", "field": "dataset_ids"}
+    assert refusal("row_rules", {}) == {"refused": "request", "field": "dataset_ids"}
+    assert refusal("row_rules", {"dataset_ids": [], "ids": []}) == {"refused": "request", "unknown": ["ids"]}
+
+
+def rules_on(monkeypatch, held, rules):
+    """`held`: the datasets the caller may access, by id; `rules`: the rules that apply to the caller, by dataset id,
+    as Superset's `get_rls_filters` returns them (each a clause the answer must never carry)."""
+    monkeypatch.setattr(writes, "_dataset", lambda dataset_id: held.get(dataset_id))
+    asked = []
+
+    def get_rls_filters(table):
+        asked.append(table.id)
+        return rules.get(table.id, [])
+
+    monkeypatch.setattr(writes, "_security", lambda: SimpleNamespace(get_rls_filters=get_rls_filters))
+    return asked
+
+
+def test_row_rules_answers_whether_any_rule_applies_to_the_caller_on_each_reachable_dataset(monkeypatch):
+    held = {1: SimpleNamespace(id=1), 3: SimpleNamespace(id=3), 4: SimpleNamespace(id=4)}
+    rule = SimpleNamespace(id=9, clause="region = 'west'", group_key=None)
+    asked = rules_on(monkeypatch, held, {1: [rule], 4: [rule, rule]})
+    answer = reads.row_rules({"dataset_ids": [3, 2, 1, 4]})
+    assert answer == {"datasets": [{"dataset_id": 3, "applies": False}, {"dataset_id": 1, "applies": True},
+                                   {"dataset_id": 4, "applies": True}]}
+    assert asked == [3, 1, 4]
+    assert "west" not in json.dumps(answer) and "9" not in json.dumps(answer)
+
+
+def test_row_rules_leaves_out_a_dataset_out_of_reach_and_one_that_does_not_exist_alike(monkeypatch):
+    rules_on(monkeypatch, {}, {})
+    assert reads.row_rules({"dataset_ids": [5, 6]}) == {"datasets": []}
+
+
+def test_row_rules_answers_an_empty_request_without_touching_superset(monkeypatch):
+    def boom(*_args):
+        raise AssertionError("touched Superset")
+
+    monkeypatch.setattr(writes, "_dataset", boom)
+    monkeypatch.setattr(writes, "_security", boom)
+    assert reads.row_rules({"dataset_ids": []}) == {"datasets": []}
+
+
+def test_a_bad_row_rules_request_is_answered_not_raised():
+    assert reads.row_rules({"dataset_ids": "1"}) == {"refused": "request", "field": "dataset_ids"}

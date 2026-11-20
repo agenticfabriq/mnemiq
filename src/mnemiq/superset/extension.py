@@ -25,7 +25,7 @@ TOOL_PREFIX = "extensions.agenticfabriq.mnemiq."
 
 # The base name of every tool the extension offers; the single source the client and the test fake build names from.
 EXTENSION_TOOLS = ("create_dashboard", "create_dataset", "create_chart", "patch_chart", "add_saved_metric",
-                   "delete_dataset", "set_layout", "dataset_metrics", "editors_of", "get_layout")
+                   "delete_dataset", "set_layout", "dataset_metrics", "editors_of", "get_layout", "row_rules")
 
 # The most dataset ids one `dataset_metrics` call takes: the extension refuses a request naming more
 # (`reads.MAX_DATASETS` in the extension).
