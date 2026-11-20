@@ -167,6 +167,22 @@ def test_foreign_keys_pairs_child_and_parent_columns():
     assert cid, "the constraint id groups a composite FK's columns; it must not be empty"
 
 
+def test_table_size_reads_the_statistics_oracle_gathered():
+    """`table_size` reads `ALL_TAB_STATISTICS`, the table's own row, binding the name as `table_name` (Oracle reserves
+    `TABLE`): after a gather it gives the rows, the average row length, the day and "not stale"; a table the dictionary
+    does not show gives all None."""
+    import oracledb
+
+    from mnemiq.adapters.dictionary import TableSize
+
+    with oracledb.connect(user=USER, password=PASSWORD, dsn=DSN) as con:
+        con.cursor().callproc("DBMS_STATS.GATHER_TABLE_STATS", [USER.upper(), "T_REGION"])
+    size = _adapter().table_size("T_REGION")
+    assert (size.rows, size.stale) == (1, False)
+    assert size.avg_row_len and size.analyzed
+    assert _adapter().table_size("NO_SUCH_TABLE") == TableSize(None, None, None, None)
+
+
 def test_view_definitions_reads_the_long_body():
     """`ALL_VIEWS.TEXT` is a LONG column, which cannot be filtered or read after another LONG in
     the same fetch. This is the wrinkle that looks trivial and is not."""

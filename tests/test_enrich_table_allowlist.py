@@ -135,3 +135,53 @@ def test_enrich_with_a_misspelt_table_stops_with_one_line(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "lists table(s) it does not report: b_kep" in err
     assert "Traceback" not in err
+
+
+# --- how the source is profiled ("profile", "exact_tables") ---------------------------------------
+
+def test_profile_and_exact_tables_are_read(tmp_path):
+    spec = _manifest(tmp_path, kind="oracle", profile="statistics",
+                     exact_tables=["ORDERS", " dim_* "]).source_specs()[0]
+    assert (spec.profile, spec.exact_tables) == ("statistics", ("ORDERS", "dim_*"))
+
+
+def test_absent_profile_keys_read_as_today(tmp_path):
+    spec = _manifest(tmp_path).source_specs()[0]
+    assert (spec.profile, spec.exact_tables) == ("", ())
+
+
+def test_exact_is_accepted_on_any_kind(tmp_path):
+    assert _manifest(tmp_path, profile="exact").source_specs()[0].profile == "exact"
+
+
+def test_an_unknown_key_is_refused(tmp_path):
+    """A misspelled key used to be ignored without a word: `"profiling": "statistics"` would fall back to exact
+    profiling, which on a production database reads every table in full many times."""
+    with pytest.raises(ValueError, match=r"unknown key 'profiling'.*\"profile\""):
+        _manifest(tmp_path, kind="oracle", profiling="statistics").source_specs()
+
+
+@pytest.mark.parametrize("bad", ["fast", "", None, 1])
+def test_profile_must_be_exact_or_statistics(tmp_path, bad):
+    with pytest.raises(ValueError, match=r'"profile" must be "exact" or "statistics"'):
+        _manifest(tmp_path, kind="oracle", profile=bad).source_specs()
+
+
+def test_statistics_is_refused_off_oracle(tmp_path):
+    with pytest.raises(ValueError, match=r"Oracle.*'duckdb'"):
+        _manifest(tmp_path, profile="statistics").source_specs()
+
+
+@pytest.mark.parametrize("profile", [None, "exact"])
+def test_exact_tables_needs_statistics(tmp_path, profile):
+    entry = {"kind": "oracle", "exact_tables": ["ORDERS"]}
+    if profile:
+        entry["profile"] = profile
+    with pytest.raises(ValueError, match=r'"exact_tables".*"profile": "statistics"'):
+        _manifest(tmp_path, **entry).source_specs()
+
+
+@pytest.mark.parametrize("bad", ["ORDERS", [], ["ORDERS", ""], ["ORDERS", 3]])
+def test_exact_tables_must_be_non_empty_strings(tmp_path, bad):
+    with pytest.raises(ValueError, match='"exact_tables" must be a non-empty list'):
+        _manifest(tmp_path, kind="oracle", profile="statistics", exact_tables=bad).source_specs()
