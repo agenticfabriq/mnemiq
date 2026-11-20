@@ -372,6 +372,96 @@ def _row_limit(form: dict) -> int | None:
     return limit if limit > 0 else None
 
 
+@dataclass(frozen=True)
+class Ranking:
+    """How the chart's query ranks its rows under its row limit: `ORDER BY <metric> DESC|ASC LIMIT <limit>`, the
+    metric being the expectation's metric at `metric_index`. rc2 adds no NULLS LAST, so Postgres puts NULL first under
+    DESC, and no tiebreak."""
+
+    metric_index: int
+    descending: bool
+    limit: int
+
+
+def _saved_flag(value, *, absent: bool) -> bool | None:
+    """A saved boolean the query reads (`order_desc`, `sort_by_metric`): absent is `absent`; anything but a boolean is
+    not read, since the frontend and the backend may read it apart."""
+    if value is _ABSENT:
+        return absent
+    return value if isinstance(value, bool) else None
+
+
+_ABSENT = object()
+
+
+def _is_form_metric(item) -> bool:
+    """`isQueryFormMetric` (`superset-ui-core`): a saved metric's name, any string, or a SIMPLE or SQL ad hoc one."""
+    return isinstance(item, str) or (isinstance(item, dict) and item.get("expressionType") in ("SIMPLE", "SQL"))
+
+
+def _ranked_metric(item, expectation: Expectation, dataset: DatasetFacts) -> int | None:
+    found = _metric(item, dataset)
+    if isinstance(found, NotCheckable) or found not in expectation.metrics:
+        return None
+    return expectation.metrics.index(found)
+
+
+# The form keys `extractQueryFields` (`superset-ui-core`) gathers into a query's metrics besides `metrics`, in the
+# form's key order: one holding a value can come first in the query's metrics, and the query then ranks by it.
+_OTHER_METRIC_ALIASES = ("metric", "metric_2", "secondary_metric", "left_metric", "right_metric", "x", "y", "size")
+
+
+def ranking_of(form: dict, expectation: Expectation, *, dataset: DatasetFacts) -> Ranking | None:
+    """The ranking the chart's query cuts its rows by, read from its saved form exactly as rc2 orders it, or None where
+    mnemiq does not read one: a type whose query does not rank by its measure (mixed, pivot, funnel, sankey,
+    waterfall), a sort mnemiq does not read, or a ranking metric the chart does not show.
+
+    - The time-series types: `normalizeOrderBy` (`superset-ui-core`), by the series limit metric `buildQueryObject`
+      picks (`series_limit_metric` when it is a metric, a string included, else `timeseries_limit_metric`), else, when
+      that is empty, `metrics[0]`; descending unless `order_desc` is false (`buildQueryObject` reads it absent as
+      true). A valid `order_by_cols` or `orderby` (both reach the query through `extractQueryFields`) would take
+      precedence, so any is not read.
+    - A table (`plugin-chart-table` `buildQuery`): `timeseries_limit_metric`, ascending unless `order_desc` is true,
+      else `metrics[0]` descending whatever `order_desc` says.
+    - A pie, gauge or treemap: its `metric`, descending, only when `sort_by_metric` is on: each plugin's `buildQuery`
+      orders by the metric only then, and the treemap breaks ties by its groups, which mnemiq accepts either way.
+
+    A query that skips rows (`row_offset`, which `buildQueryObject` passes on) keeps rows that are not its first N,
+    and a time-series chart or table with another metric alias holding a value may rank by that alias: neither is
+    read."""
+    limit = _row_limit(form)
+    viz_type = str(form.get("viz_type") or "")
+    if limit is None or form.get("row_offset") not in (None, 0):
+        return None
+    if (viz_type in _TIMESERIES or viz_type == "table") and any(form.get(alias) for alias in _OTHER_METRIC_ALIASES):
+        return None
+    if viz_type in _TIMESERIES:
+        if form.get("order_by_cols") or form.get("orderby"):
+            return None
+        item = form.get("series_limit_metric")
+        if not _is_form_metric(item):
+            item = form.get("timeseries_limit_metric")
+        if item is None or item in ("", {}, []):
+            item = (_as_list(form.get("metrics")) or [None])[0]
+        descending = _saved_flag(form.get("order_desc", _ABSENT), absent=True)
+    elif viz_type == "table":
+        item = form.get("timeseries_limit_metric")
+        if item:
+            descending = _saved_flag(form.get("order_desc", _ABSENT), absent=False)
+        else:
+            item, descending = (_as_list(form.get("metrics")) or [None])[0], True
+    elif viz_type in ("pie", "gauge_chart", "treemap_v2"):
+        if _saved_flag(form.get("sort_by_metric", _ABSENT), absent=False) is not True:
+            return None
+        item, descending = form.get("metric"), True
+    else:
+        return None
+    if item is None or descending is None:
+        return None
+    index = _ranked_metric(item, expectation, dataset)
+    return None if index is None else Ranking(index, descending, limit)
+
+
 def _second_series(form: dict, dimensions: list[str]) -> NotCheckable | None:
     """Why a mixed chart's second series is shown otherwise than Superset's rows hold it, or None. The renderer takes
     each `_b` key the form holds in place of the primary's, an empty `adhoc_filters_b` included

@@ -1410,3 +1410,23 @@ def test_the_workflows_run_this_module(workflow):
     runs = [line for line in workflow.read_text().splitlines() if re.search(r"\brun:.*\bpytest\b", line)]
     assert len(runs) == 1, f"expected one pytest line in {workflow.name}, found {runs}"
     assert f"tests/{Path(__file__).name}" in runs[0].split()
+
+
+
+@pytest.mark.parametrize("ending, status, said", [
+    ("END", ChartStatus.MISMATCH, "keeps groups with no value for 'Lapsed premium' and leaves out groups that have one"),
+    ("ELSE 0 END", ChartStatus.CHECKED, "its row limit keeps the 2 largest groups by 'Lapsed premium'"),
+], ids=["no value is NULL", "no value is 0"])
+def test_a_ranked_bar_whose_row_limit_cuts_groups_is_checked_as_a_ranking(fake, world, store, ending, status, said):
+    """Lapsed premium by region, two bars of three, east having no lapsed policy, checked as a ranking: written with
+    no ELSE, the bars the chart's query keeps are not the two largest (a group with no value counts after every group
+    with one), a mismatch; written to give 0 where nothing lapsed, they are, checked."""
+    lapsed = Measure(name="lapsed_premium", label="Lapsed premium",
+                     expression=f"SUM(CASE WHEN status = 'lapsed' THEN premium {ending})", kind=MeasureKind.CURRENCY,
+                     dataset_id=POLICY_DATASET, description="", asked_by="", currency="USD")
+    chart = dataclasses.replace(_chart("lapsed_by_region", Family.BAR, "Lapsed premium by region", POLICY_DATASET,
+                                       (WrittenRef(lapsed),), dimensions=("region",)), row_limit=2)
+    final = _run(store, _start(store, BuildPlan(charts=(chart,), measures=(lapsed,))).build_id, _adapter(fake))[-1]
+    chart_id = _step(final, "lapsed_by_region").object_id
+    assert final.status == "done" and final.checks == {chart_id: status}, final.message
+    assert said in final.message or status is ChartStatus.CHECKED, final.message
