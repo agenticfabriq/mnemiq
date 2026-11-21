@@ -23,7 +23,7 @@ from collections.abc import Mapping, Sequence
 from mnemiq.superset.charts import Family
 
 __all__ = ["CHART_HEIGHT", "GRID_COLUMNS", "KPI_FAMILIES", "TABLE_FAMILIES", "TREND_FAMILIES", "layout_chart_ids",
-           "layout_positions"]
+           "layout_positions", "layout_without"]
 
 # Superset's dashboard grid (`GRID_COLUMN_COUNT` in `superset-frontend/src/dashboard/util/constants.ts`), and the
 # height rc2's MCP gives a chart it lays out (`generate_dashboard`, `superset/mcp_service/dashboard/tool/`).
@@ -135,3 +135,29 @@ def layout_positions(charts: Sequence[tuple[int, Family]], *, onto: Mapping | No
             grid["children"].append(row_key)
     _rebuild_parents(positions)
     return positions
+
+
+# The nodes a layout keeps when they are left empty: the root, the grid, and the tabs, which rc2 keeps under their ids
+# (`process_tab_diff`, and the extension's `check_positions`, refuse a layout that drops one).
+_KEPT_EMPTY = frozenset({"ROOT", "GRID", "TABS", "TAB"})
+
+
+def layout_without(positions: Mapping, chart_ids) -> dict:
+    """`positions` without the charts `chart_ids`: each one's `CHART` node gone from the layout and from its parent's
+    children, then every row or column left with no child gone too, as Superset's editor drops an empty row. Every
+    other node is kept as it is, and each node's `parents` is rebuilt from where it now sits."""
+    removing = set(chart_ids)
+    out = copy.deepcopy(dict(positions))
+    gone = {key for key, node in out.items() if isinstance(node, Mapping) and node.get("type") == "CHART"
+            and (node.get("meta") or {}).get("chartId") in removing}
+    while gone:
+        for key in gone:
+            out.pop(key, None)
+        for node in out.values():
+            if isinstance(node, dict) and isinstance(node.get("children"), list):
+                node["children"] = [child for child in node["children"] if child not in gone]
+        gone = {key for key, node in out.items() if isinstance(node, dict) and node.get("type") not in _KEPT_EMPTY
+                and node.get("type") in ("ROW", "COLUMN") and not node.get("children")}
+    if _ROOT in out:
+        _rebuild_parents(out)
+    return out

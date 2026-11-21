@@ -1087,6 +1087,70 @@ def test_set_layout_adds_only_charts_the_caller_may_read(superset, monkeypatch):
     assert writes._readable_chart(12) is False and writes._readable_chart(13) is False
 
 
+def test_set_layout_does_not_expect_a_trashed_member_the_layout_no_longer_places(superset, monkeypatch):
+    """rc2 keeps a chart in the trash a member of its dashboard. `set_layout` reads which members are trashed, so a
+    layout that leaves out one the dashboard no longer places (a Remove took it off) is the whole set; the control:
+    the same layout, the member not read as trashed, is refused as dropping it."""
+    superset.charts = {11: SimpleNamespace(id=11), 12: SimpleNamespace(id=12)}
+    security = SimpleNamespace(can_access_dashboard=lambda dashboard: True, is_editor=lambda resource: True,
+                               can_access_chart=lambda chart: True)
+    monkeypatch.setattr(writes, "_security", lambda: security)
+    monkeypatch.setattr(writes, "_member_chart_ids", lambda dashboard_id: [11, 9])
+    dashboard = SimpleNamespace(id=3, changed_on=datetime.fromisoformat(WHEN),
+                                position_json=json.dumps(_one_chart_layout(11)), json_metadata=None, editors=[])
+    positions = _one_chart_layout(11)
+    positions["GRID_ID"]["children"].append("CHART-12")
+    positions["CHART-12"] = {"type": "CHART", "id": "CHART-12", "children": [],
+                             "meta": {"chartId": 12, "width": 4, "height": 50}}
+
+    def layout() -> dict:
+        found = writes.read("set_layout", {"dashboard_id": 3, "positions": positions, "add_chart_ids": [12],
+                                           "expect_changed_on": WHEN})
+        return writes._layout(found, dashboard)
+
+    monkeypatch.setattr(writes, "_trashed_chart_ids", lambda chart_ids: [])
+    assert layout() == {"refused": "chart_set", "missing": [9], "unexpected": []}
+    asked: list = []
+    monkeypatch.setattr(writes, "_trashed_chart_ids", lambda chart_ids: asked.append(chart_ids) or [9])
+    assert layout() == {"ok": True}
+    assert asked == [[11, 9]]
+
+
+def test_trashed_members_are_read_past_the_trash_filter_and_locked_until_the_layout_commits(superset, monkeypatch):
+    """`_trashed_chart_ids` locks every member's row with `lock_row` (the module's one locking read), in id order, past
+    rc2's soft-delete filter (`skip_visibility_filter`, the documented opt-out), so a trashed row is seen and locked
+    too, for the rest of the layout's transaction: a chart restored from, or moved to, the trash meanwhile waits.
+    Only the trashed ones are answered."""
+    import contextlib
+    import types
+
+    locked: list[tuple] = []
+    bypassing: list = []
+
+    @contextlib.contextmanager
+    def skip_visibility_filter(session, *classes):
+        bypassing.append(tuple(c.__name__ for c in classes))
+        try:
+            yield
+        finally:
+            bypassing.pop()
+
+    def lock_row(model, entity_id):
+        locked.append((model.__name__, entity_id, tuple(bypassing)))
+        return {9: SimpleNamespace(deleted_at=datetime.fromisoformat(WHEN)),
+                11: SimpleNamespace(deleted_at=None)}.get(entity_id)
+
+    helpers = types.ModuleType("superset.models.helpers")
+    helpers.skip_visibility_filter = skip_visibility_filter
+    monkeypatch.setitem(sys.modules, "superset.models.helpers", helpers)
+    monkeypatch.setattr(writes, "_session", lambda: SimpleNamespace())
+    monkeypatch.setattr(writes, "lock_row", lock_row)
+    assert writes._trashed_chart_ids([11, 9, 12]) == [9]
+    assert locked == [("Slice", 9, (("Slice",),)), ("Slice", 11, (("Slice",),)), ("Slice", 12, (("Slice",),))]
+    locked.clear()
+    assert writes._trashed_chart_ids([]) == [] and locked == []
+
+
 # ---------------------------------------------------------------- who becomes an editor
 
 USER, ROLE, GROUP = stubs.SubjectType.USER, stubs.SubjectType.ROLE, stubs.SubjectType.GROUP
@@ -3220,3 +3284,91 @@ def test_only_a_histogram_bypasses_rc2s_compile_check(creating):
     creating.superset.mapped = copy.deepcopy(HISTOGRAM_FORM)
     assert set(make_from_config(format_marker(BUILD, "chart_2", 12))) == {"chart_id"}
     assert "compile" not in _kinds(creating.superset) and "chart_data" in _kinds(creating.superset)
+
+
+# ---------------------------------------------------------------- create_chart's leave_out_no_value, config route only
+
+PREMIUM_SQL = {"expressionType": "SQL", "sqlExpression": "SUM(premium)", "label": "Total premium",
+               "hasCustomLabel": True, "optionName": "metric_sql_1"}
+WEST = {"clause": "WHERE", "expressionType": "SIMPLE", "subject": "region", "operator": "==", "comparator": "west"}
+NO_TIME = {"clause": "WHERE", "expressionType": "SIMPLE", "subject": "issued", "operator": "TEMPORAL_RANGE",
+           "comparator": "No filter"}
+BAR_FORM = {"viz_type": "echarts_timeseries_bar", "x_axis": "channel", "groupby": [], "metrics": [PREMIUM_SQL],
+            "adhoc_filters": [WEST, NO_TIME], "row_limit": 10}
+
+
+def _leave_out(condition: str) -> dict:
+    return {"clause": "HAVING", "expressionType": "SQL", "sqlExpression": condition, "subject": None,
+            "operator": None, "comparator": None, "isExtra": False, "isNew": False,
+            "filterOptionName": "mnemiq_leave_out_no_value"}
+
+
+def test_the_extensions_condition_is_the_text_mnemiqs_check_recognises():
+    from mnemiq.superset.charts import not_null_condition
+
+    for sql in ("SUM(premium)", "SUM(CASE WHEN status = 'R&D' THEN premium END)"):
+        assert writes.not_null_condition(sql) == not_null_condition(sql)
+
+
+@pytest.mark.parametrize("flag", ["yes", 1, None, [True]])
+def test_create_chart_refuses_a_leave_out_no_value_that_is_not_a_boolean(flag):
+    with pytest.raises(writes.Refused) as caught:
+        writes.read("create_chart", {"dataset_id": 7, "slice_name": "Premium", "dashboard_id": 12, "marker": STEP,
+                                     "config": CONFIG, "leave_out_no_value": flag})
+    assert caught.value.answer == {"refused": "request", "field": "leave_out_no_value"}
+
+
+def test_the_condition_is_built_from_the_metric_as_mcp_saved_it_and_saved_last(creating):
+    """The HAVING is derived from the ranked metric in the mapped form, after MCP's own sanitising (here the mapped
+    metric holds '&' where the plan's text might have held an entity), so the saved filter, the query's extras and
+    the chart's own metric agree."""
+    mapped = copy.deepcopy(BAR_FORM)
+    mapped["metrics"][0]["sqlExpression"] = "SUM(CASE WHEN dept = 'R&D' THEN premium END)"
+    creating.superset.mapped = mapped
+    made = make_from_config(set={"number_format": ",.2f"}, leave_out_no_value=True)
+    assert set(made) == {"chart_id"}, made
+    ((_, properties),) = commands(creating.superset)
+    saved = json.loads(properties["params"])
+    condition = "(SUM(CASE WHEN dept = 'R&D' THEN premium END)) IS NOT NULL"
+    assert saved["adhoc_filters"] == [WEST, NO_TIME, _leave_out(condition)] and saved["number_format"] == ",.2f"
+    context = json.loads(properties["query_context"])
+    assert context == params.query_context("echarts_timeseries_bar", saved, 7)
+    assert context["queries"][0]["extras"]["having"] == f"({condition})"  # `sanitizeClause` wraps each clause
+
+
+def test_a_saved_metrics_condition_is_its_expression_on_the_dataset(creating):
+    creating.superset.mapped = {**copy.deepcopy(BAR_FORM), "metrics": ["revenue"]}
+    creating.superset.datasets[7].metrics = [SimpleNamespace(metric_name="revenue", expression="SUM(net_amount)")]
+    assert set(make_from_config(leave_out_no_value=True)) == {"chart_id"}
+    ((_, properties),) = commands(creating.superset)
+    assert json.loads(properties["params"])["adhoc_filters"][-1] == _leave_out("(SUM(net_amount)) IS NOT NULL")
+
+
+@pytest.mark.parametrize("mapped", [
+    {**BAR_FORM, "metrics": [{"expressionType": "SIMPLE", "aggregate": "SUM", "column": {"column_name": "premium"},
+                              "label": "Premium"}]},
+    {**BAR_FORM, "metrics": ["no_such_metric"]},
+    {**BAR_FORM, "metrics": []},
+    {"viz_type": "big_number_total", "metric": "count"},
+], ids=["a SIMPLE metric", "a saved metric the dataset does not hold", "no metric", "a type ranked by no metric"])
+def test_a_chart_whose_ranked_metric_cannot_be_read_is_refused_and_not_saved(creating, mapped):
+    creating.superset.mapped = copy.deepcopy(mapped)
+    creating.superset.datasets[7].metrics = []
+    assert make_from_config(leave_out_no_value=True) == {"refused": "leave_out_no_value"}
+    assert commands(creating.superset) == []
+
+
+def test_without_leave_out_no_value_the_saved_chart_is_as_before(creating):
+    creating.superset.mapped = copy.deepcopy(BAR_FORM)
+    made = make_from_config()
+    assert set(made) == {"chart_id"}, made
+    ((_, properties),) = commands(creating.superset)
+    assert json.loads(properties["params"]) == BAR_FORM
+
+
+def test_a_funnel_or_sankey_asked_to_leave_out_no_value_is_refused(creating):
+    found = {"dataset_id": 7, "viz_type": "funnel", "slice_name": "Stages",
+             "params": {"groupby": ["status"], "metric": "count"}, "dashboard_id": 12, "marker": STEP,
+             "leave_out_no_value": True}
+    assert writes.create_chart(found) == {"refused": "request"}
+    assert commands(creating.superset) == []

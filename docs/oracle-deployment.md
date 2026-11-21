@@ -266,7 +266,11 @@ cannot fall back to reading every table.
 - **Code lists come only from complete frequency histograms.** A column gets a list only where
   the histogram is `FREQUENCY` with one endpoint per distinct value, was built from every non-null
   row in the same gather as the table's statistics, and Oracle says the table's statistics are not
-  stale; and only where every value reads back exactly.
+  stale; and only where every value reads back exactly. "The same gather" is read from
+  `LAST_ANALYZED`, which Oracle keeps to the second, and no dictionary view a reader can see says
+  which gather built a histogram: so of two gathers of one table within the same second, the first
+  one's histogram passes for the second's, and if the column's values changed in between without
+  the row count changing, its list can be out of date.
   Measured on 23ai Free: Oracle often stores no text for short `VARCHAR2` values, only a numeric
   encoding of their first bytes. mnemiq reads a value back from that encoding only on a database
   whose character set is UTF-8 (`AL32UTF8` or `UTF8`), and only when the value is at most 5

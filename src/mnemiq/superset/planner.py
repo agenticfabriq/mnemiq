@@ -61,6 +61,7 @@ from mnemiq.sql.identifiers import resolve_identifier
 from mnemiq.sql.schema import column_types, visible_schema
 from mnemiq.superset.adapter import JINJA_DELIMITERS
 from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenRef, plan_refusal
+from mnemiq.superset.dashboard_charts import LeftOut, leave_out_shown, read_dashboard_charts
 from mnemiq.superset.grants import UnreadableAnswer, read_datasets, table_bindings
 from mnemiq.superset.literals import NEGATED_OPERATORS, Absent, Probes, absent_literals, filter_statement, holds_null
 from mnemiq.superset.marker import format_marker
@@ -175,6 +176,9 @@ class BuildPlan:
     reuse_candidates: tuple[int, ...] = ()
     reuse_reason: str | None = None
     datasets: tuple[PlannedDataset, ...] = ()
+    # Built onto a dashboard: each planned chart the dashboard already shows, left out of `charts`, with the chart that
+    # shows it (`dashboard_charts.leave_out_shown`). Answered with the plan, never kept with the build.
+    left_out: tuple[LeftOut, ...] = ()
 
     @property
     def awaiting_choice(self) -> bool:
@@ -338,6 +342,16 @@ column;
 - a histogram takes no measure: its first dimension is the column whose spread it shows;
 - sankey, box_plot and histogram cannot show currency or percent; handlebars shows count or number only;
 - one axis shows one kind of measure.
+
+A condition that says which rows a written measure covers (open, won, overdue, active) goes inside its expression, \
+as CASE WHEN ... THEN ... END with no ELSE on that condition, so a row it leaves out adds nothing: an ELSE 0 there is \
+counted by COUNT and averaged in by AVG. A share keeps its own 0 for the rows it covers: a win rate among closed deals \
+is AVG(CASE WHEN closed THEN CASE WHEN won THEN 1.0 ELSE 0 END END), closed and won standing for their conditions. The \
+measure then means its name on every chart and wherever it is saved; a chart's filters narrow only what that chart \
+shows. A negated condition (!=, NOT IN, NOT LIKE) also leaves out the rows \
+where its column is NULL: where those rows belong to the measure, keep them with COALESCE or IS NULL OR. Where a chart \
+should not show the groups a measure's condition leaves out (a closed stage, shown empty), filter them out on that \
+chart as well.
 
 reuse_dashboard: {"id": a dashboard's id, "reason": why it already covers the goal}, only for one of the dashboards \
 listed and only when it covers the goal; the builder is then asked whether to reuse it. Otherwise null."""
@@ -1517,7 +1531,8 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
 # ---------------------------------------------------------------- the step
 
 def plan_build(goal: str, *, planner: Planner, client, adapter, snapshot: Snapshot, grants: GrantSet, settings,
-               interactive_pivot_available: bool = False, offer_reuse: bool = True) -> BuildPlan | PlanRefused:
+               interactive_pivot_available: bool = False, offer_reuse: bool = True, onto: int | None = None,
+               built_on: Mapping[int, int] | None = None) -> BuildPlan | PlanRefused:
     """The checked plan for `goal`, or why there is none. `client` is the request's Superset client, the one its
     adapter (`superset_executor(settings, delegation)`) carries, and every call goes through it as the builder; nothing
     is written. A part refused goes back to `planner` once, with mnemiq's reason; refused again, the plan is refused,
@@ -1525,6 +1540,10 @@ def plan_build(goal: str, *, planner: Planner, client, adapter, snapshot: Snapsh
 
     With `offer_reuse` False (a build asked for on a dashboard of its own), no dashboard is looked for, and a plan that
     names one to reuse is refused.
+
+    `onto` names the dashboard the build adds to: once the plan is checked, its charts are read, once each, and each
+    planned chart one of them already shows is left out (`BuildPlan.left_out`), with the measures and datasets only it
+    used. `built_on` gives the dataset of each chart mnemiq made there (`dashboard_charts.datasets_built_on`).
 
     A planning prompt the model's server refuses or cuts as longer than its window (`ContextTooLong`, `PromptCut`)
     refuses the plan in mnemiq's words, on the first plan or its repair: the goal and what the builder can see are too
@@ -1564,7 +1583,10 @@ def plan_build(goal: str, *, planner: Planner, client, adapter, snapshot: Snapsh
                                type(terminal).__name__)
                 raise terminal
             if isinstance(checked, BuildPlan):
-                return checked
+                if onto is None:
+                    return checked
+                shown = read_dashboard_charts(client, onto, built_on=built_on)
+                return leave_out_shown(checked, shown, client=client)
             if not all(part.repairable for part in checked):
                 return PlanRefused(_naming(checked), checked)
             parts, previous = checked, json.dumps(draft_of(answer, context), ensure_ascii=False)
