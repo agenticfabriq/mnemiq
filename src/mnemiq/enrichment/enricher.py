@@ -54,6 +54,8 @@ class Enricher(Protocol):
 class LLMEnricher:
     """The stochastic proposer. Its output is screened before it can reach the snapshot."""
 
+    _stop: threading.Event | None = None  # `annotate_tables`'s, read by every call of a parallel run
+
     def __init__(self, client, max_tokens: int = 4000) -> None:
         # Generous budget: reasoning models spend tokens before emitting any content, and a
         # tight cap yields an empty string rather than an error.
@@ -61,6 +63,7 @@ class LLMEnricher:
         self._max_tokens = max_tokens
 
     def annotate(self, table: str, facts: list[ColumnFacts], grounding: str = "") -> TableAnnotation:
+        self._stop = None  # one table at a time: nothing to stop from another thread
         if not facts:
             return TableAnnotation(table=table)
         columns, failures, down = [], [], ""
@@ -87,12 +90,15 @@ class LLMEnricher:
                  for i, (_, facts, _) in enumerate(requests) for start in range(0, len(facts), CHUNK_COLUMNS)]
         down: dict[int, str] = {}
         guard = threading.Lock()
+        # Set when the waiting thread is interrupted (Ctrl-C reaches it alone): no chunk then starts, and no running one
+        # asks again, retries and splits included (`_annotate_chunk` reads it before every call).
+        stop = self._stop = threading.Event()
 
         def run(span: tuple[int, int, int]) -> tuple[list, list[str]]:
             i, start, end = span
             table, facts, grounding = requests[i]
             with guard:
-                stopped = down.get(i)
+                stopped = down.get(i) or ("interrupted" if stop.is_set() else "")
             if stopped:
                 return [], [_span(start, end, len(facts)) + f"not asked -- {stopped}"]
             try:
@@ -104,8 +110,14 @@ class LLMEnricher:
                     down.setdefault(i, failed)
             return described, why
 
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        pool = ThreadPoolExecutor(max_workers=concurrency)
+        try:
             results = dict(zip(spans, pool.map(run, spans)))
+        except BaseException:
+            stop.set()
+            pool.shutdown(wait=False, cancel_futures=True)  # a call in flight ends on the client's request timeout
+            raise
+        pool.shutdown(wait=True)
         annotations = []
         for i, (table, facts, _) in enumerate(requests):
             columns: list = []
@@ -158,6 +170,8 @@ class LLMEnricher:
                         grounding: str, attempts: int = 2) -> tuple[list, str, str]:
         """The columns described in one call, why none were if none were, and the endpoint's
         failure when no attempt got a reply at all."""
+        if getattr(self, "_stop", None) is not None and self._stop.is_set():
+            return [], "not asked -- interrupted", "interrupted"
         facts_block = render_table_facts(table, chunk)
         if others:
             names = ", ".join(sanitize(f.name) for f in others[:_CONTEXT_NAMES])
