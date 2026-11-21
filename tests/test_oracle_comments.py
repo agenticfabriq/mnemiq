@@ -177,9 +177,11 @@ def test_the_table_scope_refuses_a_comment_read_of_a_table_out_of_scope():
     assert asked == [["orders"]]
 
 
-# -- a table comment is prose with no recorded dependencies (Codex's review of #280) ----------------------------------
-# It may describe any column of the table or a table it joins, so it takes the rule `_scoped_facts` gives such prose:
-# shown only to an identity granted the table and every table it joins, and reading every one of its columns raw.
+# -- who sees a comment (Codex's reviews of #280) -----------------------------------------------------------------------
+# A comment is free text a person wrote: it can name or describe any table or column in the schema, and no recorded
+# dependency or join list bounds it (the join list can be empty because discovery failed, or a merge dropped it). So a
+# comment, a table's or a column's, is shown only to an identity that may name every table in the snapshot and is
+# denied or masked no column. Anyone else gets cards without comments.
 
 _TABLE_COMMENT = "One row per customer order."
 
@@ -196,8 +198,8 @@ def test_a_table_comment_is_withheld_from_an_identity_denied_or_masked_any_colum
     assert _TABLE_COMMENT in _orders_card(snap)
     assert _TABLE_COMMENT not in _orders_card(snap, denied={("orders", "id")})
     assert _TABLE_COMMENT not in _orders_card(snap, masked={("orders", "id")})
-    assert "database comment: O open, S shipped" in _orders_card(snap, denied={("orders", "id")}), \
-        "a column's own comment still follows that column"
+    assert "database comment: O open, S shipped" not in _orders_card(snap, denied={("orders", "id")}), \
+        "a column's comment can describe its denied neighbour as easily as the table's can"
 
 
 def test_a_table_comment_is_withheld_where_a_joined_table_is_not_granted(tmp_path):
@@ -243,3 +245,17 @@ def test_a_federated_table_comment_is_withheld_while_its_joins_are_unknown(tmp_p
     assert _TABLE_COMMENT not in card
     unscoped = next(c.text for c in build_cards(fed) if c.object_id == "erp.orders")
     assert _TABLE_COMMENT in unscoped, "the indexed card, rendered without a policy, keeps it"
+
+
+def test_a_comment_naming_an_ungranted_table_is_withheld_when_join_discovery_failed(tmp_path):
+    # Codex's third review of #280: with the join job failed the join list is empty, and a comment naming a table the
+    # identity is not granted was shown to it.
+    tables = {"orders": "One row per customer order; balances live in secret_accounts."}
+    columns = {("orders", "status"): "matches secret_accounts.state"}
+    snap = enrich_structural(_Shop(_shop(tmp_path), comments=(tables, columns)), "shop")
+    snap = snap.model_copy(update={"relationships": []})
+    assert "secret_accounts" in _orders_card(snap), "the unscoped card keeps both"
+    granted_orders = _orders_card(snap, visible=frozenset({"orders"}))
+    assert "secret_accounts" not in granted_orders
+    whole = _orders_card(snap, visible=frozenset({"orders", "notes"}))
+    assert "secret_accounts" in whole, "an identity that sees the whole snapshot gets the comments"
