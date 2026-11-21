@@ -94,3 +94,40 @@ def test_user_prompt_renders_code_vocabulary_block():
     assert "CODE VOCABULARY" in text
     assert "patient.icd10_cd uses ICD-10-CM" in text
     assert "E11 = Type 2 diabetes mellitus" in text
+
+
+# --- a column profiled from the source's statistics ------------------------------------------------
+
+def test_estimates_render_as_estimates():
+    facts = ColumnFacts(name="status", data_type="VARCHAR2", estimated_rows=1000, estimated_distinct=40,
+                        estimated_nulls=0)
+    out = render_table_facts("orders", [facts])
+    assert "rows~1000, distinct~40, nulls~0 (estimated)" in out
+    assert "rows=" not in out and "distinct=" not in out
+
+
+def test_a_partial_estimate_renders_what_it_has():
+    facts = ColumnFacts(name="status", data_type="VARCHAR2", estimated_rows=1000)
+    assert "- status (type=VARCHAR2, rows~1000 (estimated))" in render_table_facts("orders", [facts])
+
+
+def test_exact_counts_render_as_today():
+    """Byte for byte the line every exactly profiled column was given before estimates existed."""
+    facts = ColumnFacts(name="status", data_type="VARCHAR2", codes=["A", "B"], row_count=1000, distinct_count=2,
+                        null_count=0, foreign_key="customers.id")
+    assert render_table_facts("orders", [facts]) == (
+        "TABLE: orders\nCOLUMNS:\n"
+        "- status (type=VARCHAR2, rows=1000, distinct=2, nulls=0) FK -> customers.id observed values: [A, B]")
+
+
+def test_the_describing_model_is_given_a_columns_estimate():
+    from mnemiq.contract import Column
+    from mnemiq.contract.semantic import ColumnEstimate
+    from mnemiq.enrichment.semantic import _facts
+
+    col = Column(id="orders.status", object_id="orders", name="status", data_type="VARCHAR2",
+                 estimate=ColumnEstimate(rows=1000, distinct=40, nulls=0, analyzed="2026-11-01", sampled=False,
+                                         stale=False))
+    facts = _facts([col])[0]
+    assert (facts.estimated_rows, facts.estimated_distinct, facts.estimated_nulls) == (1000, 40, 0)
+    assert (facts.row_count, facts.distinct_count, facts.null_count) == (None, None, None)

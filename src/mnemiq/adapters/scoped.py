@@ -78,6 +78,23 @@ class TableScopedAdapter:
     def table_size(self, table: str):
         """The source's dictionary read for one table, refused for a table out of scope: without this, `__getattr__`
         would hand any table's statistics through."""
+        self._refuse_out_of_scope(table)
+        return self._inner.table_size(table)
+
+    def column_statistics(self, table: str):
+        self._refuse_out_of_scope(table)
+        return self._inner.column_statistics(table)
+
+    def histogram(self, table: str, column: str):
+        self._refuse_out_of_scope(table)
+        return self._inner.histogram(table, column)
+
+    def unique_columns(self, table: str):
+        self._refuse_out_of_scope(table)
+        return self._inner.unique_columns(table)
+
+    def _refuse_out_of_scope(self, table: str) -> None:
+        """Every dictionary read about one table is refused for a table out of scope: without it, `__getattr__` would
+        hand that table's statistics, histograms and keys through."""
         if not self.in_scope(table):
             raise TablesNotFound(f"source {self._source_id!r} does not list table {table!r} in its \"tables\"")
-        return self._inner.table_size(table)

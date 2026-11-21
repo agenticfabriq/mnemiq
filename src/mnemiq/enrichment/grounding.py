@@ -5,6 +5,7 @@ import logging
 from mnemiq.catalog import is_key_like
 from mnemiq.contract import CodedValue, Snapshot
 from mnemiq.enrichment.pipeline import content_version
+from mnemiq.enrichment.statistics import estimated_tables
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,10 @@ def _safe_functional(adapter, table: str, c: str, d: str) -> bool:
 def ground_from_correlated(adapter, snapshot: Snapshot) -> dict[str, dict[str, str]]:
     """Ground a coded column from a sibling label column it functionally determines."""
     out: dict[str, dict[str, str]] = {}
+    estimated = estimated_tables(snapshot)
     for table, cols in _columns_by_table(snapshot).items():
+        if table in estimated:
+            continue  # profiled from the source's statistics: checking a label sibling would read its rows
         for col in cols:
             if not col.coded_values:
                 continue
@@ -86,7 +90,10 @@ def ground_from_lookup(adapter, snapshot: Snapshot) -> dict[str, dict[str, str]]
     by_table = _columns_by_table(snapshot)
     out: dict[str, dict[str, str]] = {}
 
+    estimated = estimated_tables(snapshot)
     for rel in snapshot.relationships:
+        if rel.from_ in estimated or rel.to in estimated:
+            continue  # a table profiled from the source's statistics: the join would read its rows
         for jk in rel.join_keys:
             child = by_id.get((rel.from_, jk.left))
             if child is None or not child.distinct_count:

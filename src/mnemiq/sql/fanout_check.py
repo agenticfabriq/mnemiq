@@ -12,7 +12,7 @@ from sqlglot.optimizer.merge_subqueries import merge_subqueries
 from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.scope import build_scope, traverse_scope
 
-from mnemiq.contract import Snapshot
+from mnemiq.contract import Column, Snapshot
 from mnemiq.sql.identifiers import resolve_identifier
 from mnemiq.sql.qualify import names_one_object, object_key
 from mnemiq.sql.verdict import Refusal, RefusalCode
@@ -43,10 +43,13 @@ def partitions_profiled(snapshot) -> bool:
     Coverage, not existence, as `inventory_for` learned for view discovery: a federated snapshot
     carries every source's jobs, re-keyed to its catalog, and one re-enriched source must not
     vouch for a legacy one. Every catalog in `registry` needs the job; a single source, one.
-    `partial` counts: a failed partition query leaves only its own column without facts.
+    `partial` counts: a failed partition query leaves only its own column without facts. So does
+    `estimated`, a source profiled from its statistics, which has no partition facts at all: there the
+    guard reads declared keys and estimates (`key_facts`), and a current-row join on a type-2
+    dimension is refused, visibly, rather than a sum through a repeating key answered unguarded.
     """
     done = {j.source_id for j in getattr(snapshot, "jobs", None) or []
-            if j.id == PARTITIONS_JOB and j.status in ("done", "partial")}
+            if j.id == PARTITIONS_JOB and j.status in ("done", "partial", "estimated")}
     registry = getattr(snapshot, "registry", {}) or {}
     return set(registry) <= done if registry else bool(done)
 
@@ -112,6 +115,13 @@ def _exact(value) -> str:
     return format(canonical, "f") if -30 <= exponent <= 30 else str(canonical)
 
 
+# A column profiled from the source's statistics repeats when its estimated distinct count is at most this share of
+# its estimated non-null rows. An approximate distinct count (a few percent off) can never prove a key, but it can
+# show a column repeats: 400 values over 1,000 rows is not a key however rough the 400. Nearer the rows it says
+# nothing, and unknown never fires the guard.
+REPEATS_AT_MOST = 0.5
+
+
 def key_facts(snapshot: Snapshot) -> KeyFacts:
     """Which columns hold each value at most once, from the profile enrichment already took.
 
@@ -119,19 +129,35 @@ def key_facts(snapshot: Snapshot) -> KeyFacts:
     `policy_id` with no relationship declared between them, which is exactly how a chasm trap
     escapes schema metadata. The profile's `count(DISTINCT col)` is exact, so this is a fact about
     the data at profiling time, not an estimate.
+
+    A column profiled from the source's statistics has no exact counts. It is unique only where the
+    source declares and enforces a single-column key on it (`declared_unique`), and repeats only
+    where its estimate is far below its rows (`REPEATS_AT_MOST`); otherwise it is unknown. Exact
+    counts, where a column has them, decide.
     """
     facts = KeyFacts()
     partitions: dict[tuple[str, str, str], frozenset[str]] = {}
     for column in snapshot.columns:
         for label, unique in (column.unique_within or {}).items():
             partitions[(column.object_id, column.name, label)] = frozenset(unique)
-        if column.row_count is None or column.distinct_count is None or column.null_count is None:
-            continue
-        facts[(column.object_id, column.name)] = (
-            column.distinct_count == column.row_count - column.null_count
-        )
+        if column.row_count is not None and column.distinct_count is not None and column.null_count is not None:
+            facts[(column.object_id, column.name)] = (
+                column.distinct_count == column.row_count - column.null_count
+            )
+        elif column.declared_unique:
+            facts[(column.object_id, column.name)] = True
+        elif _repeats_by_estimate(column):
+            facts[(column.object_id, column.name)] = False
     facts.partitions = partitions
     return facts
+
+
+def _repeats_by_estimate(column: Column) -> bool:
+    estimate = column.estimate
+    if estimate is None or estimate.rows is None or estimate.distinct is None or estimate.nulls is None:
+        return False
+    non_null = estimate.rows - estimate.nulls
+    return non_null > 0 and estimate.distinct <= REPEATS_AT_MOST * non_null
 
 
 def _unique(facts: KeyFacts, table: str, columns: tuple[str, ...]) -> bool | None:

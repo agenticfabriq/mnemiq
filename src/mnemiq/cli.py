@@ -421,21 +421,26 @@ def _cmd_enrich(settings: Settings) -> int:
     from mnemiq.ontology.records import load_records, merge_records
 
     from mnemiq.adapters.scoped import TablesNotFound
-    from mnemiq.enrichment.size_check import exact_profile_refusal, statistics_refusal
+    from mnemiq.enrichment.size_check import exact_profile_refusal
+    from mnemiq.enrichment.statistics import profile_report, unapplied_code_meanings
+
+    if spec.profile == "statistics" and settings.enrich_examples:
+        print(f'source {spec.id!r}: MNEMIQ_ENRICH_EXAMPLES must be off with "profile": "statistics": the examples '
+              "phase runs the queries it writes against the source's tables, and statistics mode reads none of their "
+              "rows", file=sys.stderr)
+        return 1
 
     # Before any table is read: an Oracle source whose manifest does not say how to profile it is
     # checked for tables too large to read in full (`size_check`). Every other source reads nothing
     # extra here.
     if not superset:
-        refusal = statistics_refusal(spec)
-        if refusal is None:
-            try:
-                refusal, warning = exact_profile_refusal(spec, adapter)
-            except TablesNotFound as exc:
-                print(str(exc), file=sys.stderr)
-                return 1
-            if warning:
-                print(f"WARNING: {warning}", file=sys.stderr)
+        try:
+            refusal, warning = exact_profile_refusal(spec, adapter)
+        except TablesNotFound as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if warning:
+            print(f"WARNING: {warning}", file=sys.stderr)
         if refusal:
             print(refusal, file=sys.stderr)
             return 1
@@ -444,9 +449,12 @@ def _cmd_enrich(settings: Settings) -> int:
         if superset:
             snap = enrich_structural(adapter, spec.id, harvest_values=False,
                                      superset_source=(adapter.database_id, adapter.schema))
+        elif spec.profile == "statistics":
+            # Each table from the source's dictionary, except the ones "exact_tables" names.
+            snap = enrich_structural(adapter, spec.id, statistics=spec.exact_tables)
         else:
             snap = enrich_structural(adapter, spec.id)
-    except TablesNotFound as exc:  # a manifest "tables" entry matching nothing: say which (M110)
+    except TablesNotFound as exc:  # a "tables" or "exact_tables" entry matching nothing: say which (M110)
         print(str(exc), file=sys.stderr)
         return 1
     # Read what the profile jobs say BEFORE spending LLM calls on the result or saving it. M59,
@@ -455,6 +463,11 @@ def _cmd_enrich(settings: Settings) -> int:
     # saved the snapshot whatever they said, so a run in which every table failed persisted a
     # zero-column model and the engine then answered "I don't know about any tables" when the truth
     # was "I could not read them".
+    summary, warning = profile_report(snap)  # (None, None) unless a table was profiled from statistics
+    if summary:
+        print(summary)
+    if warning:
+        print(f"WARNING: {warning}", file=sys.stderr)
     outcome, detail = profile_outcome(snap)
     if outcome in ("unread", "empty"):
         # Both mean the snapshot describes NOTHING, and saving one is the harm: the next `build`
@@ -469,6 +482,12 @@ def _cmd_enrich(settings: Settings) -> int:
     # "N table(s) FAILED to profile and were EXCLUDED -- the semantic model is INCOMPLETE",
     # and it did so before this change. Saying it twice in one run is worse than saying it once.
     _dict = load_dictionary(settings.dictionary_path) if settings.dictionary_path else None
+    unapplied = unapplied_code_meanings(snap, _dict) if _dict else []
+    if unapplied:
+        print(f"WARNING: the dictionary gives code meanings for {len(unapplied)} column(s) profiled from Oracle's "
+              f"statistics that have no code list, or a list without those codes, so they will not be applied: "
+              f"{', '.join(unapplied)}. Name their tables in the source's \"exact_tables\" to read their codes from "
+              "the data.", file=sys.stderr)
     _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
     _certified_set = fetch_certified_records(settings)
     require_certified(_certified_set, settings)
