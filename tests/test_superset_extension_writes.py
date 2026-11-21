@@ -1070,6 +1070,7 @@ def test_set_layout_adds_only_charts_the_caller_may_read(superset, monkeypatch):
                                can_access_chart=lambda chart: chart.id == 11)
     monkeypatch.setattr(writes, "_security", lambda: security)
     monkeypatch.setattr(writes, "_member_chart_ids", lambda dashboard_id: [])
+    monkeypatch.setattr(writes, "_install_membership_baseline", lambda dashboard, charts: None)
     dashboard = SimpleNamespace(id=3, changed_on=datetime.fromisoformat(WHEN), position_json=None, json_metadata=None,
                                 editors=[])
 
@@ -1108,19 +1109,98 @@ def test_set_layout_does_not_expect_a_trashed_member_the_layout_no_longer_places
                                            "expect_changed_on": WHEN})
         return writes._layout(found, dashboard)
 
-    monkeypatch.setattr(writes, "_trashed_chart_ids", lambda chart_ids: [])
+    monkeypatch.setattr(writes, "_install_membership_baseline", lambda dashboard, charts: None)
+    live = [SimpleNamespace(id=9, deleted_at=None), SimpleNamespace(id=11, deleted_at=None)]
+    monkeypatch.setattr(writes, "_locked_members", lambda chart_ids: live)
     assert layout() == {"refused": "chart_set", "missing": [9], "unexpected": []}
     asked: list = []
-    monkeypatch.setattr(writes, "_trashed_chart_ids", lambda chart_ids: asked.append(chart_ids) or [9])
+    trashed = [SimpleNamespace(id=9, deleted_at=datetime.fromisoformat(WHEN)), SimpleNamespace(id=11, deleted_at=None)]
+    monkeypatch.setattr(writes, "_locked_members", lambda chart_ids: asked.append(chart_ids) or trashed)
     assert layout() == {"ok": True}
     assert asked == [[11, 9]]
 
 
+def test_set_layout_installs_the_whole_membership_before_rc2s_command(superset, monkeypatch):
+    """rc2 loads a dashboard's `slices` under its soft-delete filter, so the collection it diffs a layout's new
+    members against lacks a chart in the trash, and its save INSERTs that chart's junction row again. `set_layout`
+    locks every member once, a trashed one included, and installs them as the committed collection before the
+    command runs; a member whose row is gone is not in it."""
+    superset.charts = {11: SimpleNamespace(id=11), 12: SimpleNamespace(id=12)}
+    security = SimpleNamespace(can_access_dashboard=lambda dashboard: True, is_editor=lambda resource: True,
+                               can_access_chart=lambda chart: True)
+    monkeypatch.setattr(writes, "_security", lambda: security)
+    monkeypatch.setattr(writes, "_member_chart_ids", lambda dashboard_id: [9, 11])
+    rows = {9: SimpleNamespace(id=9, deleted_at=datetime.fromisoformat(WHEN)), 11: SimpleNamespace(id=11, deleted_at=None)}
+    locks: list = []
+    import contextlib
+    import types
+
+    helpers = types.ModuleType("superset.models.helpers")
+    helpers.skip_visibility_filter = lambda session, *classes: contextlib.nullcontext()
+    monkeypatch.setitem(sys.modules, "superset.models.helpers", helpers)
+    monkeypatch.setattr(writes, "lock_row", lambda model, chart_id: locks.append(chart_id) or rows.get(chart_id))
+    monkeypatch.setattr(writes, "_session", lambda: SimpleNamespace())
+    monkeypatch.setattr(writes, "_install_membership_baseline",
+                        lambda dashboard, charts: superset.ran.append(("install", [c.id for c in charts])))
+    dashboard = SimpleNamespace(id=3, changed_on=datetime.fromisoformat(WHEN),
+                                position_json=json.dumps(_one_chart_layout(11)), json_metadata=None, editors=[])
+    positions = _one_chart_layout(11)
+    positions["GRID_ID"]["children"].append("CHART-12")
+    positions["CHART-12"] = {"type": "CHART", "id": "CHART-12", "children": [],
+                             "meta": {"chartId": 12, "width": 4, "height": 50}}
+    found = writes.read("set_layout", {"dashboard_id": 3, "positions": positions, "add_chart_ids": [12],
+                                       "expect_changed_on": WHEN})
+    assert writes._layout(found, dashboard) == {"ok": True}
+    assert [entry[0] for entry in superset.ran] == ["install", "UpdateDashboardCommand"]
+    assert superset.ran[0] == ("install", [9, 11])
+    assert locks == [9, 11]  # each member locked once, in id order
+    rows.pop(9)  # a member whose row is gone (lock_row answers None)
+    superset.ran.clear()
+    monkeypatch.setattr(writes, "_member_chart_ids", lambda dashboard_id: [11])
+    assert writes._layout(found, dashboard) == {"ok": True}
+    assert superset.ran[0] == ("install", [11])
+
+
+def test_the_membership_baseline_is_installed_only_on_a_clean_saved_dashboard(monkeypatch, caplog):
+    """`_install_membership_baseline` sets the charts as the committed `slices` collection (SQLAlchemy's
+    `set_committed_value`), the diff rc2's save starts from. A dashboard with a change to the collection still pending
+    keeps it, and nothing is installed (a warning says so); one not yet saved is left alone. The effect on rc2, a save
+    that no longer INSERTs a trashed member's row again, is the live suite's
+    `test_a_build_onto_a_dashboard_holding_a_chart_deleted_in_superset_lays_out`."""
+    import types
+
+    installed: list = []
+    state: dict = {"persistent": True, "pending": False}
+
+    def inspect(instance):
+        return SimpleNamespace(persistent=state["persistent"], attrs=SimpleNamespace(
+            slices=SimpleNamespace(history=SimpleNamespace(has_changes=lambda: state["pending"]))))
+
+    sqlalchemy = types.ModuleType("sqlalchemy")
+    sqlalchemy.inspect = inspect
+    attributes = types.ModuleType("sqlalchemy.orm.attributes")
+    attributes.set_committed_value = lambda instance, key, value: installed.append((instance, key, value))
+    monkeypatch.setitem(sys.modules, "sqlalchemy", sqlalchemy)
+    monkeypatch.setitem(sys.modules, "sqlalchemy.orm", types.ModuleType("sqlalchemy.orm"))
+    monkeypatch.setitem(sys.modules, "sqlalchemy.orm.attributes", attributes)
+    board, charts = SimpleNamespace(id=3), [SimpleNamespace(id=9), SimpleNamespace(id=11)]
+    writes._install_membership_baseline(board, charts)
+    assert installed == [(board, "slices", charts)]
+    installed.clear()
+    state["pending"] = True
+    with caplog.at_level("WARNING"):
+        writes._install_membership_baseline(board, charts)
+    assert installed == [] and "pending" in caplog.text
+    state.update(persistent=False, pending=False)
+    writes._install_membership_baseline(board, charts)
+    assert installed == []
+
+
 def test_trashed_members_are_read_past_the_trash_filter_and_locked_until_the_layout_commits(superset, monkeypatch):
-    """`_trashed_chart_ids` locks every member's row with `lock_row` (the module's one locking read), in id order, past
+    """`_locked_members` locks every member's row with `lock_row` (the module's one locking read), in id order, past
     rc2's soft-delete filter (`skip_visibility_filter`, the documented opt-out), so a trashed row is seen and locked
     too, for the rest of the layout's transaction: a chart restored from, or moved to, the trash meanwhile waits.
-    Only the trashed ones are answered."""
+    A row it does not find is left out."""
     import contextlib
     import types
 
@@ -1145,10 +1225,10 @@ def test_trashed_members_are_read_past_the_trash_filter_and_locked_until_the_lay
     monkeypatch.setitem(sys.modules, "superset.models.helpers", helpers)
     monkeypatch.setattr(writes, "_session", lambda: SimpleNamespace())
     monkeypatch.setattr(writes, "lock_row", lock_row)
-    assert writes._trashed_chart_ids([11, 9, 12]) == [9]
+    assert [c.deleted_at is not None for c in writes._locked_members([11, 9, 12])] == [True, False]
     assert locked == [("Slice", 9, (("Slice",),)), ("Slice", 11, (("Slice",),)), ("Slice", 12, (("Slice",),))]
     locked.clear()
-    assert writes._trashed_chart_ids([]) == [] and locked == []
+    assert writes._locked_members([]) == [] and locked == []
 
 
 # ---------------------------------------------------------------- who becomes an editor
