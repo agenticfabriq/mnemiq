@@ -226,7 +226,24 @@ enrich names those tables and goes on.
 - `"exact_tables"` (with `"statistics"` only) names tables to profile in full anyway, as names or
   `*`/`?` patterns matched without regard to case. Use it for the small tables whose exact facts
   matter most, such as the dimensions your questions filter on. A name that matches no table is
-  refused.
+  refused. The size check applies to these tables: one above 1 GiB stops enrich before any table
+  is read, and enrich says to take it out of `"exact_tables"`.
+
+**The statement time limit.** Every statement enrich sends to the source, in either mode, ends
+after `MNEMIQ_ENRICH_STATEMENT_TIMEOUT_S` seconds (600 by default; 0 for no limit), bounded by the
+driver's call timeout, which cancels the statement on the server. What a cut statement costs:
+
+- A table's profile ends at the first cut statement; it is never retried column by column.
+  Profiled exactly, the table is left out of the model, and enrich names it. Named in
+  `"exact_tables"`, it keeps its estimate from the dictionary instead, and enrich says so.
+- A grounding or value-index statement that is cut skips that one item.
+- Enrich ends with a warning naming every table a cut statement was reading, and the snapshot
+  records the ones cut before it was saved (the `enrich:time-limit` job).
+
+The limit is per statement, not per table: a table under the size line with many columns can
+still take hours of statements that each finish in time. A read-only statement that meets
+Oracle's ORA-01466 (a table redefined while it is read) is retried on a fresh connection up to
+three times, each with the full limit, so one statement can run at most four limits plus 2.5 s.
 
 An unknown key in a source's entry is refused rather than ignored, so a misspelled `"profile"`
 cannot fall back to reading every table.

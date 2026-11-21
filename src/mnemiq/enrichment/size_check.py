@@ -6,7 +6,8 @@ one such read was measured at hours, so a whole profile is days of load on the d
 said how to profile an Oracle source, enrich therefore reads each table's size from the dictionary first, which reads
 no table data, and stops before any table is read if one is large. `"profile": "statistics"` on the source profiles
 it from those statistics instead (`enrichment.statistics`), and `"profile": "exact"` is how an operator says to read
-the tables in full anyway.
+the tables in full anyway. Under statistics mode the same line applies to the tables `"exact_tables"` names, the ones
+it still reads in full.
 """
 from __future__ import annotations
 
@@ -26,12 +27,20 @@ def exact_profile_refusal(spec, adapter) -> tuple[str | None, str | None]:
     on. Two kinds of table can be large without the statistics saying so, and the warning names both while enrich goes
     on as before: one with no table-level statistics, whose size is unknown, and one whose statistics Oracle marks
     stale, which may have grown since they were gathered."""
-    if spec.kind != "oracle" or spec.profile:
+    exact_tables = spec.profile == "statistics" and bool(spec.exact_tables)
+    if spec.kind != "oracle" or (spec.profile and not exact_tables):
         return None, None
+    tables = list(adapter.introspect())
+    if exact_tables:
+        from mnemiq.enrichment.pipeline import exact_table_names
+
+        # Resolved as enrich resolves them, so the check and the profile agree on which tables are read in full.
+        names = exact_table_names(tables, spec.exact_tables, spec.id)
+        tables = [t for t in tables if t in names]
     large: list[tuple[str, int]] = []
     unknown: list[str] = []
     stale: list[str] = []
-    for table in adapter.introspect():
+    for table in tables:
         size = adapter.table_size(table)
         if size.rows is None or size.avg_row_len is None:
             unknown.append(table)
@@ -56,6 +65,11 @@ def exact_profile_refusal(spec, adapter) -> tuple[str | None, str | None]:
     if not large:
         return None, warning
     listed = ", ".join(f"{table} (~{_gib(size)} GiB)" for table, size in large)
+    if exact_tables:
+        return (f"enrich stopped before reading any table: {len(large)} table(s) that \"exact_tables\" of source "
+                f"{spec.id!r} names hold about {_gib(sum(size for _, size in large))} GiB by Oracle's statistics, "
+                f"and an exact profile reads each of them in full many times: {listed}. To profile them from the "
+                "dictionary instead, take them out of \"exact_tables\"."), warning
     refusal = (f"enrich stopped before reading any table: {len(large)} table(s) of source {spec.id!r} hold about "
                f"{_gib(sum(size for _, size in large))} GiB by Oracle's statistics, and exact profiling reads each of "
                f"them in full many times: {listed}. On this source in the manifest, set \"profile\": \"statistics\" to "

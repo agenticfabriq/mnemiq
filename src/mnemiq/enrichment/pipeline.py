@@ -192,7 +192,12 @@ def _exactly_profiled(catalog: list, statistics: tuple[str, ...] | None, source_
     table: a typo would otherwise estimate the table the operator meant to count exactly."""
     if statistics is None:
         return None
-    names = [t.name for t in catalog]
+    return exact_table_names([t.name for t in catalog], statistics, source_id)
+
+
+def exact_table_names(names: list[str], statistics: tuple[str, ...], source_id: str) -> set[str]:
+    """The names among `names` that `"exact_tables"` (`statistics`) matches, raising `TablesNotFound` for a pattern that
+    matches none: one reading for enrich and its size check."""
     patterns = [(raw, raw.casefold()) for raw in statistics]
     missing = [raw for raw, p in patterns if not any(fnmatchcase(n.casefold(), p) for n in names)]
     if missing:
