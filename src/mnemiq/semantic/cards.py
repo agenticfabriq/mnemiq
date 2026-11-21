@@ -101,28 +101,18 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
     tables = [b.object_id for b in snapshot.source_bindings] or list(columns)
     table_comments = {b.object_id: b.comment for b in snapshot.source_bindings if b.comment}
 
-    from mnemiq.semantic.retrieval import known_relationships  # here: retrieval imports this module
-
-    known = known_relationships(snapshot)
-
-    def comment_visible(table: str) -> bool:
-        # A table comment is prose with no recorded dependencies: it may describe any of the table's columns or a
-        # table it joins. So it takes the rule `_scoped_facts` gives such prose: shown only to an identity that may
-        # name the table and every table it joins, and is denied or masked none of its columns. Where the joins are
-        # not known (a merged federated snapshot carries none), no identity is shown it.
-        if policy is None:
-            return True
-        if known is None:
-            return False
-        joined = {r.to if r.from_ == table else r.from_ for r in known if table in (r.from_, r.to)}
-        if not all(policy.names(t) for t in {table, *joined}):
-            return False
-        return not any(policy.denies(table, c.name) or policy.masks(table, c.name) for c in columns.get(table, []))
+    # A comment is free text a person wrote: it can name or describe any table or column in the schema, and nothing
+    # recorded bounds it (a join list can be empty because discovery failed, or a federated merge dropped it). So a
+    # comment, a table's or a column's, is shown only to an identity that may name every table here and is denied or
+    # masked no column; any denied or masked entry at all withholds them, the safe reading of an entry this snapshot
+    # may not hold. Unscoped (the indexed card), every comment is shown.
+    comments_shown = policy is None or (not policy.denied and not policy.masked
+                                        and all(policy.names(t) for t in tables))
 
     cards: list[SchemaCard] = []
     for table in tables:
         lines = [f"TABLE {table}"]
-        if table_comments.get(table) and comment_visible(table):
+        if table_comments.get(table) and comments_shown:
             lines.append(f"COMMENT: {table_comments[table]}")
         lines.append("COLUMNS:")
         ddl: list[tuple[str, str, str]] = []   # (name, data_type, trailing note)
@@ -146,7 +136,7 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
                             "MASKED for this identity: do not select or filter on it."))
                 bare.append(ddl[-1])
                 continue
-            if column.comment and (comment is None or comment(table, column.name)):
+            if column.comment and comments_shown and (comment is None or comment(table, column.name)):
                 # The database's own text, before the model's: a person wrote it.
                 line += f" (database comment: {column.comment})"
             if column.description and (describe is None or describe(table, column.name)):

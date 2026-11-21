@@ -269,10 +269,11 @@ prints it, so table search reads it too. When a prompt must be trimmed to fit th
 every model description goes before any comment. Instant mode's bare cards still carry names and
 types only, without comments.
 
-A column's comment is shown to whoever may read that column raw, as its description is. A table's
-comment may describe any of its columns or a table it joins, so it is shown only to someone who may
-see the table, every table it joins, and every one of its columns unmasked; anyone else gets the
-card without it.
+A comment is free text a person wrote, and can name or describe any table or column in the schema.
+So comments, a table's and a column's alike, are shown only to someone who may see every table
+enriched and is denied or masked no column; anyone else gets cards without them (their model
+descriptions, which are scoped column by column, stay). A role granted the whole schema with no
+column policy sees every comment.
 
 A comment is database text, like a column name or a glossary definition, and is treated the same
 way: its whitespace is flattened (so it cannot start a line of its own on a card), it is cut to
