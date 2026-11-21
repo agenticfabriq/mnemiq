@@ -55,3 +55,13 @@ class HistogramEndpoint:
     value: int | float | None
     actual: str | None
     actual_raw: bytes | None
+
+
+@dataclass(frozen=True)
+class DictionaryFacts:
+    """What the dictionary says about many tables, read at once (`OracleAdapter.dictionary`). Every table asked about is
+    a key of each map, with what its per-table read would give: an all-None size, no statistics, no unique column."""
+
+    sizes: dict[str, TableSize]
+    statistics: dict[str, list[ColumnStatistics]]
+    unique: dict[str, frozenset[str]]

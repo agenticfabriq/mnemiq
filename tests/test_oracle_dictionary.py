@@ -250,3 +250,153 @@ def test_scoped_adapter_passes_every_dictionary_read_in_scope(method, args):
     inner = _Inner()
     getattr(TableScopedAdapter(inner, ("orders",), "src"), method)("ORDERS", *args)
     assert inner.asked == ["ORDERS"]
+
+
+# -- the dictionary for many tables at once ----------------------------------------------------------------------------
+# Statistics mode read four dictionary statements per table, about 2,400 for 600 tables. `dictionary` reads each view
+# once for up to DICTIONARY_BATCH tables, and `histograms` the endpoints of many columns at once; each must give what
+# the per-table reads give.
+
+
+class _Many:
+    """The dictionary of several tables, answering the per-table reads and the batched ones by SQL shape."""
+
+    def __init__(self, tables):
+        self.tables = tables   # name -> {"size": row | None, "stats": [rows], "constraints": [rows], "indexes": [rows],
+        self.sql: list[str] = []   # "histograms": {column: [rows]}}
+        self.binds: list[dict] = []
+
+    def rows(self, sql, **binds):
+        self.sql.append(sql)
+        self.binds.append(binds)
+        s = sql.lower()
+        batched = "table_name in (" in s or ") in ((" in s   # a per-table read has `constraint_type IN (` too
+        if "all_tab_histograms" in s:
+            pairs = ([(binds[f"t{i}"], binds[f"c{i}"]) for i in range(len(binds) // 2)] if batched
+                     else [(binds["table_name"], binds["column_name"])])
+            return [((t, c) if batched else ()) + tuple(row)
+                    for t, c in pairs for row in self.tables.get(t, {}).get("histograms", {}).get(c, [])]
+        names = [v for k, v in sorted(binds.items()) if k[0] == "t" and k[1:].isdigit()] if batched else [binds["table_name"]]
+        key = ("size" if "all_tab_statistics" in s else "stats" if "all_tab_col_statistics" in s
+               else "constraints" if "all_constraints" in s else "indexes")
+        out = []
+        for name in names:
+            got = self.tables.get(name, {}).get(key)
+            for row in ([got] if key == "size" and got else [] if key == "size" else got or []):
+                out.append(((name,) if batched else ()) + tuple(row))
+        return out
+
+
+def _many_adapter(many: _Many) -> OracleAdapter:
+    a = OracleAdapter.__new__(OracleAdapter)
+    a._schema = "APP"
+    a._rows = many.rows
+    return a
+
+
+_TWO = {
+    "ORDERS": {"size": (1000, 40, ANALYZED, "NO"),
+               "stats": [("ID", 1000, 0, "NONE", 1, 1000, ANALYZED, b"\x01", b"\x02", 0),
+                         ("STATUS", 3, 5, "FREQUENCY", 3, 995, ANALYZED, b"A", b"C", None)],
+               "constraints": [("PK_O", "P", "ENABLED", "VALIDATED", "ID")],
+               "indexes": [("PK_O", "UNIQUE", "VALID", "NORMAL", "ID"), ("UX_FN", "UNIQUE", "VALID", "FUNCTION-BASED NORMAL", "STATUS")],
+               "histograms": {"STATUS": [(2, 1.0, "A", None), (5, 2.0, None, b"C")]}},
+    "NEVER_ANALYZED": {"size": None, "stats": [], "constraints": [], "indexes": []},
+}
+
+
+def test_dictionary_matches_the_per_table_reads():
+    a = _many_adapter(_Many(_TWO))
+    facts = a.dictionary(["ORDERS", "NEVER_ANALYZED"])
+    for table in _TWO:
+        assert facts.sizes[table] == a.table_size(table)
+        assert facts.statistics[table] == a.column_statistics(table)
+        assert facts.unique[table] == a.unique_columns(table)
+    assert facts.unique["ORDERS"] == frozenset({"ID"})
+
+
+def test_dictionary_of_a_table_the_dictionary_does_not_show_is_empty():
+    facts = _many_adapter(_Many({})).dictionary(["MISSING"])
+    assert facts.sizes["MISSING"] == TableSize(rows=None, avg_row_len=None, analyzed=None, stale=None)
+    assert (facts.statistics["MISSING"], facts.unique["MISSING"]) == ([], frozenset())
+
+
+def test_dictionary_splits_more_than_1000_tables():
+    # Oracle refuses an IN-list of more than 1,000 items (ORA-01795).
+    many = _Many({})
+    _many_adapter(many).dictionary([f"T{i}" for i in range(1001)])
+    per_view = {}
+    for sql, binds in zip(many.sql, many.binds):
+        view = next(v for v in ("all_tab_statistics", "all_tab_col_statistics", "all_constraints", "all_indexes")
+                    if v in sql.lower())
+        per_view.setdefault(view, []).append(len([k for k in binds if k != "owner"]))
+    assert {view: sizes for view, sizes in per_view.items()} == {
+        v: [500, 500, 1] for v in ("all_tab_statistics", "all_tab_col_statistics", "all_constraints", "all_indexes")}
+    assert all(b["owner"] == "APP" for b in many.binds)
+
+
+def test_dictionary_of_no_tables_reads_nothing():
+    many = _Many({})
+    facts = _many_adapter(many).dictionary([])
+    assert (facts.sizes, facts.statistics, facts.unique, many.sql) == ({}, {}, {}, [])
+
+
+def test_histograms_match_the_per_column_reads():
+    a = _many_adapter(_Many(_TWO))
+    got = a.histograms([("ORDERS", "STATUS"), ("ORDERS", "ID"), ("NEVER_ANALYZED", "X")])
+    for table, column in (("ORDERS", "STATUS"), ("ORDERS", "ID"), ("NEVER_ANALYZED", "X")):
+        assert got[(table, column)] == a.histogram(table, column)
+    assert [e.actual for e in got[("ORDERS", "STATUS")]] == ["A", None]
+
+
+def test_600_tables_cost_a_handful_of_dictionary_statements():
+    many = _Many({})
+    _many_adapter(many).dictionary([f"T{i}" for i in range(600)])
+    assert len(many.sql) == 8, "four views, two batches each, against 2,400 per-table reads"
+
+
+def test_table_sizes_reads_one_view_in_batches():
+    many = _Many(_TWO)
+    a = _many_adapter(many)
+    sizes = a.table_sizes(["ORDERS", "NEVER_ANALYZED"])
+    assert sizes == {t: a.table_size(t) for t in ("ORDERS", "NEVER_ANALYZED")}
+    assert "all_tab_statistics" in many.sql[0].lower() and len(many.sql) == 3  # one batched, two per-table to compare
+
+
+def test_the_table_scope_refuses_a_batched_read_of_a_table_out_of_scope():
+    # The scope guards each per-table dictionary read; the batched reads must not hand an unlisted table's
+    # statistics, sizes or histogram values through (Codex's review of #277).
+    class Inner:
+        def __init__(self):
+            self.asked = []
+
+        def dictionary(self, tables):
+            self.asked.append(("dictionary", list(tables)))
+
+        def table_sizes(self, tables):
+            self.asked.append(("table_sizes", list(tables)))
+
+        def histograms(self, columns):
+            self.asked.append(("histograms", list(columns)))
+
+    inner = Inner()
+    scoped = TableScopedAdapter(inner, ("ORDERS", "dim_*"), "erp")
+    for call in (lambda: scoped.dictionary(["ORDERS", "SECRET"]), lambda: scoped.table_sizes(["SECRET"]),
+                 lambda: scoped.histograms([("ORDERS", "A"), ("SECRET", "B")])):
+        with pytest.raises(TablesNotFound):
+            call()
+    assert inner.asked == [], "nothing was read once a requested table was out of scope"
+    scoped.dictionary(["orders", "DIM_DATE"])
+    scoped.table_sizes(["Orders"])
+    scoped.histograms([("dim_region", "CODE")])
+    assert [kind for kind, _ in inner.asked] == ["dictionary", "table_sizes", "histograms"]
+
+
+def test_the_table_scope_offers_a_batched_read_only_where_the_source_has_one():
+    class Plain:
+        def table_size(self, table):
+            return None
+
+    scoped = TableScopedAdapter(Plain(), ("ORDERS",), "erp")
+    assert not callable(getattr(scoped, "dictionary", None))
+    assert not callable(getattr(scoped, "table_sizes", None))
