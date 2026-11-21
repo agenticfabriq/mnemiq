@@ -60,6 +60,7 @@ from mnemiq.sql.verdict import Refusal
 from mnemiq.superset.adapter import JINJA_DELIMITERS
 from mnemiq.superset.chart_form import (
     _COMPARISONS,
+    _X_AXIS,
     _GRAINS,
     _LISTS,
     _NO_VALUE,
@@ -248,6 +249,25 @@ def read_dataset_facts(client, dataset_id: int) -> DatasetFacts | NotCheckable:
         saved_metric_names=frozenset(m["metric_name"] for m in metrics),
         database_id=answer.get("database_id"), schema=answer.get("schema"),
         saved_metric_sql=tuple((m["metric_name"], m.get("expression") or "") for m in metrics))
+
+
+def read_temporal_columns(client, dataset_id: int) -> frozenset[str] | NotCheckable:
+    """The dataset's time columns, by Superset's own test of one (`TableColumnInfo.is_dttm`, which its time-series
+    charts read to treat an x-axis as time), or why mnemiq could not read them."""
+    try:
+        answer = client.call("get_dataset_info", {"identifier": dataset_id, "select_columns": ["columns"]})
+    except (SupersetUnavailable, SupersetToolError) as failure:
+        return NotCheckable(f"Superset did not answer for its dataset's columns: {failure}")
+    if _failed(answer):
+        _log_error("get_dataset_info", answer)
+        return NotCheckable("Superset answered with an error, which is in the log")
+    if answer.get("_response_truncated"):
+        return NotCheckable("Superset cut its dataset's columns to fit its response size")
+    columns = answer.get("columns")
+    if not isinstance(columns, list):
+        return NotCheckable("Superset answered no columns for its dataset")
+    return frozenset(c["column_name"] for c in columns
+                     if isinstance(c, dict) and isinstance(c.get("column_name"), str) and c.get("is_dttm") is True)
 
 
 @dataclass(frozen=True)
@@ -542,7 +562,8 @@ def _ranking_problem(chart: _Rows, mine: _Rows, ranking: Ranking, label: str) ->
 
 
 def _compare(chart_id: int, chart: _Rows, mine: _Rows, row_limit: int | None, *, source: str,
-             labels: tuple[str, ...] = (), ranking: Ranking | None = None) -> ChartCheck:
+             labels: tuple[str, ...] = (), ranking: Ranking | None = None,
+             time_axis: Callable[[], bool | NotCheckable] | None = None) -> ChartCheck:
     shown = list(chart.values)
     order = [key for key in shown if key in mine.values] + [key for key in mine.values if key not in chart.values]
     both = (_values(chart.values, shown), _values(mine.values, order))
@@ -564,6 +585,15 @@ def _compare(chart_id: int, chart: _Rows, mine: _Rows, row_limit: int | None, *,
             return outcome(ChartStatus.MISMATCH, f"{source} finds a group the chart does not show")
         cut = (f"the chart's row limit ({row_limit:,}) keeps only some of its groups, so not all of them were "
                "compared")
+        # A time axis's query ranks by its measure before its LIMIT and the axis sorts by time afterwards: the points
+        # kept are the largest, not the latest, whatever a ranking would say of them. Read only on a cut.
+        on_time = time_axis() if time_axis is not None else False
+        if isinstance(on_time, NotCheckable):
+            return outcome(ChartStatus.NOT_CHECKED,
+                           f"{cut}: mnemiq could not read whether its x-axis is a time axis ({on_time.reason})")
+        if on_time:
+            return outcome(ChartStatus.NOT_CHECKED, f"{cut}: its x-axis is a time axis, where a row limit keeps the "
+                                                    "points its query ranks first, not the latest")
         if ranking is None or ranking.limit != row_limit:
             return outcome(ChartStatus.NOT_CHECKED, cut)
         label = labels[ranking.metric_index] if ranking.metric_index < len(labels) else f"number {ranking.metric_index + 1}"
@@ -702,6 +732,21 @@ def _row_rule_applies(client, dataset_id: int) -> bool | NotCheckable:
     return entry["applies"]
 
 
+def _time_axis(client, form: dict, expectation: Expectation,
+               dataset: DatasetFacts) -> Callable[[], bool | NotCheckable] | None:
+    """For a chart drawn on an x-axis (a time series or a mixed chart; a waterfall's query does not rank by its measure),
+    whether that axis, the first grouping column, is one of the dataset's time columns, asked of Superset when called.
+    None for any other chart."""
+    if form.get("viz_type") not in _X_AXIS - {"waterfall"} or not expectation.dimensions:
+        return None
+
+    def on_time() -> bool | NotCheckable:
+        columns = read_temporal_columns(client, dataset.dataset_id)
+        return columns if isinstance(columns, NotCheckable) else expectation.dimensions[0] in columns
+
+    return on_time
+
+
 def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, snapshot: Snapshot, grants: GrantSet,
              guard_fanout: bool | None, timeout_s: float, made: Mapping[int, str],
              before_call: Callable[[], None] | None = None) -> _Numbers | ChartCheck:
@@ -772,7 +817,8 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
     mine = _left_out(mine, expectation.not_null)
     labels = tuple(label for label, _ in expectation.metrics)
     found = _compare(chart_id, chart, mine, _row_limit(form), source=compared, labels=labels,
-                     ranking=ranking_of(form, expectation, dataset=dataset))
+                     ranking=ranking_of(form, expectation, dataset=dataset),
+                     time_axis=_time_axis(client, form, expectation, dataset))
     found = _Numbers(found.chart_id, found.status, found.reason, found.chart_values, found.mnemiq_values, labels,
                      chart.values)
     if found.status is ChartStatus.MISMATCH and expectation.time_grain and compared is _OWN_SQL:
