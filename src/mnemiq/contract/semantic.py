@@ -17,6 +17,8 @@ class SourceBinding(BaseModel):
     binding_type: str
     tenant_id: str | None = None
     freshness_ref: str | None = None
+    # The source's own comment on the table (Oracle's `ALL_TAB_COMMENTS`), screened and cut.
+    comment: str | None = None
 
 
 class CodeScheme(BaseModel):
@@ -48,6 +50,9 @@ class Column(BaseModel):
     data_type: str | None = None
     semantic_type: str | None = None
     description: str | None = None
+    # The source's own comment on the column (Oracle's `ALL_COL_COMMENTS`), screened and cut: a person's text, kept apart
+    # from `description`, the model's.
+    comment: str | None = None
     pii_level: str | None = None
     # M135. The levels certified personal dimensions over this column give it, beside its own --
     # added, never substituted: `pii` and `phi` are separate clearances, so one level cannot stand

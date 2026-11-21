@@ -1390,6 +1390,26 @@ class OracleAdapter:
         return DictionaryFacts(sizes=sizes, statistics=statistics,
                                unique={t: _unique_keyed(constraints[t], indexes[t]) for t in names})
 
+    def comments(self, tables: Sequence[str]) -> tuple[dict[str, str], dict[tuple[str, str], str]]:
+        """The tables' comments and their columns' (`ALL_TAB_COMMENTS`, `ALL_COL_COMMENTS`), as the database holds
+        them, `DICTIONARY_BATCH` tables at a time, reading no table data. An empty comment is absent."""
+        names = list(dict.fromkeys(tables))
+        table_comments: dict[str, str] = {}
+        column_comments: dict[tuple[str, str], str] = {}
+        for chunk in _batches(names):
+            listed, binds = _in_list(chunk)
+            for table, text in self._rows(
+                    "SELECT table_name, comments FROM all_tab_comments "
+                    f"WHERE owner = :owner AND comments IS NOT NULL AND table_name IN ({listed})",
+                    owner=self._schema, **binds):
+                table_comments[table] = text
+            for table, column, text in self._rows(
+                    "SELECT table_name, column_name, comments FROM all_col_comments "
+                    f"WHERE owner = :owner AND comments IS NOT NULL AND table_name IN ({listed})",
+                    owner=self._schema, **binds):
+                column_comments[(table, column)] = text
+        return table_comments, column_comments
+
     def table_sizes(self, tables: Sequence[str]) -> dict[str, TableSize]:
         """`table_size` for every table in `tables`, `DICTIONARY_BATCH` at a time: what the size check reads."""
         names = list(dict.fromkeys(tables))
