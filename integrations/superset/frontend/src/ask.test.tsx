@@ -181,8 +181,8 @@ describe("the composer's keys", () => {
   it("Enter while composing with an input method does not send", async () => {
     const { Composer } = await import("./views/Composer");
     const asked: string[] = [];
-    render(<Composer busy={{ ask: false, build: false }} onDashboard={null}
-      onAsk={(text) => { asked.push(text); return true; }} onBuild={() => true} />);
+    render(<Composer busy={{ ask: false, build: false, change: false }} onDashboard={null}
+      onAsk={(text) => { asked.push(text); return true; }} onBuild={() => true} onChange={() => true} />);
     const box = screen.getByRole("textbox", { name: "Ask mnemiq" });
     const { fireEvent } = await import("@testing-library/react");
     fireEvent.change(box, { target: { value: "請問有多少" } });

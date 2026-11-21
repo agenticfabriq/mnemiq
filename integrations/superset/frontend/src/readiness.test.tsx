@@ -65,6 +65,7 @@ describe("the panel's readiness", () => {
     expect(await screen.findByText("How many claims are open?")).toBeTruthy();
     const dashboard = await screen.findByRole("region", { name: "This dashboard" });
     expect(dashboard.textContent).toContain("Claims");
+    expect(screen.getByRole("region", { name: "Measures" })).toBeTruthy();
   });
 
   it("a dashboard the person cannot read gives no dashboard actions", async () => {
@@ -76,6 +77,7 @@ describe("the panel's readiness", () => {
     await screen.findByText("How many claims are open?");
     await new Promise((done) => setTimeout(done, 50));
     expect(screen.queryByRole("region", { name: "This dashboard" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Measures" })).toBeNull();
     expect(document.body.textContent).not.toContain("secret-board");
   });
 

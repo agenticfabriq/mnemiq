@@ -42,7 +42,7 @@ describe("the panel's API client", () => {
   it("an answer no kind names is still a refusal, with mnemiq's sentence", async () => {
     const api = new PanelApi("", async () => "t", answering(422, { detail: "the goal is empty" }));
     expect(await api.post("/superset/builds", { goal: "" })).toEqual({ ok: false, status: 422,
-      refusal: { kind: "refused", sentence: "the goal is empty" } });
+      refusal: { kind: "refused", sentence: "the goal is empty" }, body: { detail: "the goal is empty" } });
   });
 });
 

@@ -4,14 +4,17 @@ import { authentication, chat } from "@apache-superset/core";
 import { PanelApi } from "./api";
 import { askInPanel } from "./ask";
 import { driver } from "./build";
+import { changeInPanel } from "./change";
 import { isRunning } from "./shared";
 import { dashboardRefOf, pageAppRoot, resolveDashboard, usePageContext } from "./page";
 import { probe, type Readiness } from "./readiness";
 import { getSnapshot, subscribe } from "./store";
 import { BuildCard } from "./views/BuildCard";
+import { ChangeCard } from "./views/ChangeCard";
 import { Composer } from "./views/Composer";
 import { Conversation } from "./views/Conversation";
 import { Header } from "./views/Header";
+import { Measures } from "./views/Measures";
 import { UnfinishedBuilds } from "./views/Unfinished";
 
 // 640 px tall, at most 80% of the window: `min(640px, 80vh)`, spelt so jsdom, whose CSS parser drops `min()`, keeps it.
@@ -78,7 +81,7 @@ function Body() {
  * the opening questions until the first is asked; the conversation and the build; and the composer. */
 function Ready({ api, starters }: { api: PanelApi; starters: string[] }) {
   const { dashboard } = usePageContext();
-  const { turns, runningBuild, planning } = useSyncExternalStore(subscribe, getSnapshot);
+  const { turns, runningBuild, planning, change: changing } = useSyncExternalStore(subscribe, getSnapshot);
   const { token } = theme.useToken();
   useEffect(() => driver.attach(api), [api]);
   const onScreen = dashboard?.readable && dashboard.id !== null ? dashboard : null;
@@ -98,6 +101,14 @@ function Ready({ api, starters }: { api: PanelApi; starters: string[] }) {
     });
     return true;
   };
+  // A change goes to the dashboard on screen when it is sent, and only to one the person may read.
+  const change = (request: string) => changeInPanel(api, request, async () => {
+    const root = pageAppRoot();
+    const ref = dashboardRefOf(window.location.pathname, root);
+    if (ref === null) return null;
+    const found = await resolveDashboard(root, ref);
+    return found.readable ? found.id : null;
+  });
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: token.padding }}>
       {onScreen ? (
@@ -105,6 +116,7 @@ function Ready({ api, starters }: { api: PanelApi; starters: string[] }) {
           On <strong style={{ color: token.colorText }}>{onScreen.title ?? "this dashboard"}</strong>
         </section>
       ) : null}
+      {onScreen?.id != null ? <Measures key={onScreen.id} api={api} dashboardId={onScreen.id} /> : null}
       <UnfinishedBuilds api={api} dashboardId={onScreen?.id ?? null} />
       {turns.length === 0 && starters.length > 0 ? (
         <section aria-label="Starters" style={{ display: "flex", flexDirection: "column", gap: token.paddingXS }}>
@@ -116,8 +128,9 @@ function Ready({ api, starters }: { api: PanelApi; starters: string[] }) {
       ) : null}
       <Conversation turns={turns} />
       <BuildCard onScreenId={onScreen?.id ?? null} />
-      <Composer busy={{ ask: asking, build: planning || runningBuild !== null }}
-        onDashboard={onScreen ? onScreen.title ?? "this dashboard" : null} onAsk={ask} onBuild={build} />
+      <ChangeCard api={api} onScreenId={onScreen?.id ?? null} />
+      <Composer busy={{ ask: asking, build: planning || runningBuild !== null, change: changing?.sending ?? false }}
+        onDashboard={onScreen ? onScreen.title ?? "this dashboard" : null} onAsk={ask} onBuild={build} onChange={change} />
     </div>
   );
 }
