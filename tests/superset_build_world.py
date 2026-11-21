@@ -951,11 +951,17 @@ class World:
         current = json.loads(dashboard["position_json"]) if dashboard["position_json"] else {}
         refusal = extension_params.check_positions(found["positions"], current_positions=current,
                                                    current_chart_ids=dashboard["members"], add_chart_ids=added,
-                                                   remove_chart_ids=found["remove_chart_ids"])
+                                                   remove_chart_ids=found["remove_chart_ids"],
+                                                   trashed_chart_ids=[m for m in dashboard["members"]
+                                                                      if m in self.trashed])
         if refusal is not None:
             return refusal
         metadata = extension_params.layout_metadata(found["positions"], json.loads(dashboard["json_metadata"]))
-        members = sorted(extension_params._layout_chart_ids(found["positions"]))
+        # rc2 rebuilds membership from the layout's charts through a relationship that cannot see a chart in the
+        # trash, so a trashed member's row is never removed: it stays a member (seen live: a chart a Remove moved to
+        # the trash, and off the layout, was still a member of its dashboard).
+        trashed = {chart_id for chart_id in dashboard["members"] if chart_id in self.trashed}
+        members = sorted(set(extension_params._layout_chart_ids(found["positions"])) | trashed)
         dashboard.update(position_json=json.dumps(metadata["positions"]), members=members,
                          json_metadata=json.dumps({k: v for k, v in metadata.items() if k != "positions"}),
                          changed_on=self._stamp())

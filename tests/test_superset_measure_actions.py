@@ -278,6 +278,28 @@ def test_remove_deletes_exactly_the_measures_charts(fake, world, store):
     assert "policies" not in _kept(store, built["dashboard"])
 
 
+def test_a_build_onto_the_dashboard_after_a_remove_lays_out(fake, world, store):
+    """A Remove moves charts to the trash and off the layout; rc2 keeps a trashed chart a member of its dashboard (so a
+    restore puts it back). A later build onto that dashboard still lays its charts out: the layout check does not
+    expect a trashed chart the layout no longer places."""
+    built = _built(fake, store, THREE_OF_POLICIES)
+    charts = (built["policies_by_region"], built["policies_by_status"], built["policies_by_channel"])
+    remove_measure(_asking(fake, store, built["dashboard"]), "policies", chart_ids=charts)
+    assert set(world.trashed) == set(charts) and set(charts) <= set(world.dashboards[built["dashboard"]]["members"])
+    state = start_build(store, tenant=TENANT, principal=PRINCIPAL, goal="claims", plan=CLAIMS,
+                        dashboard_id=built["dashboard"])
+    for _ in range(20):
+        adapter = _adapter(fake)
+        build = store.load_build(TENANT, state.build_id, PRINCIPAL)
+        state = next_step(build, client=adapter.client, adapter=adapter, store=store, snapshot=SNAPSHOT,
+                          grants=GRANTS, settings=SETTINGS)
+        if state.status != "building":
+            break
+    assert state.status == "done", state.message
+    made = {step.object_id for step in state.steps if step.kind == "chart"}
+    assert _placed(world, built["dashboard"]) == made
+
+
 def test_remove_deletes_made_datasets_once_unused(fake, world, store):
     """The dataset mnemiq made for the measure goes once its charts are gone."""
     built = _built(fake, store, CLAIMS)

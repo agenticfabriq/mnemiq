@@ -831,9 +831,12 @@ def _reachable_tabs(positions: Any) -> list[tuple[str, Mapping]]:
 
 
 def check_positions(positions: Any, *, current_positions: Any, current_chart_ids: Iterable[int],
-                    add_chart_ids: Iterable[int] = (), remove_chart_ids: Iterable[int] = ()) -> dict | None:
+                    add_chart_ids: Iterable[int] = (), remove_chart_ids: Iterable[int] = (),
+                    trashed_chart_ids: Iterable[int] = ()) -> dict | None:
     """Why `set_layout` refuses `positions`, or None. `current_positions` is the dashboard's layout now and
-    `current_chart_ids` its charts. Refused:
+    `current_chart_ids` its charts, `trashed_chart_ids` those of them in the trash. rc2 keeps a trashed chart a member
+    (so a restore puts it back); one the current layout no longer places (taken off when it was deleted) is not
+    expected in the new layout, while one it still places is, as any member is. Refused:
     - `malformed`: not a layout `set_dash_metadata` reads cleanly, a chart id that is not a positive integer, or a
       tab stored under a key that is not its id (rc2 walks a layout by its keys and knows a tab by its id);
     - `add_and_remove`: a chart both added and removed;
@@ -844,9 +847,9 @@ def check_positions(positions: Any, *, current_positions: Any, current_chart_ids
       rc2 deactivates the reports on a deleted tab only when `position_json` itself is sent
       (`UpdateDashboardCommand.process_tab_diff`), which a `positions` save is not. A tab the current layout holds
       but does not reach is not required: rc2 does not know it, and the save drops it anyway."""
-    add, remove = list(add_chart_ids), list(remove_chart_ids)
+    add, remove, trashed = list(add_chart_ids), list(remove_chart_ids), list(trashed_chart_ids)
     current = list(current_chart_ids)
-    if not isinstance(positions, Mapping) or not all(_is_id(i) for i in [*add, *remove, *current]):
+    if not isinstance(positions, Mapping) or not all(_is_id(i) for i in [*add, *remove, *current, *trashed]):
         return {"refused": "malformed"}
     both = set(add) & set(remove)
     if both:
@@ -855,7 +858,8 @@ def check_positions(positions: Any, *, current_positions: Any, current_chart_ids
     tabs = _reachable_tabs(positions)
     if found is None or any(node.get("id") != key for key, node in tabs):
         return {"refused": "malformed"}
-    expected = (set(current) | set(add)) - set(remove)
+    placed_now = (_layout_chart_ids(current_positions) if isinstance(current_positions, Mapping) else None) or set()
+    expected = ((set(current) - (set(trashed) - placed_now)) | set(add)) - set(remove)
     if found != expected:
         return {"refused": "chart_set", "missing": sorted(expected - found), "unexpected": sorted(found - expected)}
     known = {node["id"] for _, node in _reachable_tabs(current_positions) if isinstance(node.get("id"), str)}

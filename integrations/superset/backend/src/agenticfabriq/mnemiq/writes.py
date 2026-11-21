@@ -1657,6 +1657,18 @@ def _member_chart_ids(dashboard_id: int) -> list[int]:
     return sorted(row.slice_id for row in rows)
 
 
+def _trashed_chart_ids(chart_ids: list[int]) -> list[int]:
+    """Those of `chart_ids` in the trash (`deleted_at` set), read past the soft-delete filter the ORM applies."""
+    if not chart_ids:
+        return []
+    from sqlalchemy import select
+    from superset.models.slice import Slice
+
+    table = Slice.__table__
+    rows = _session().execute(select(table.c.id).where(table.c.id.in_(chart_ids), table.c.deleted_at.is_not(None)))
+    return sorted(row.id for row in rows)
+
+
 def _layout(found: dict, dashboard: Any) -> dict:
     security = _security()
     if dashboard is None or not security.can_access_dashboard(dashboard):
@@ -1670,9 +1682,10 @@ def _layout(found: dict, dashboard: Any) -> dict:
     if blocked := sorted({chart_id for chart_id in added if not _readable_chart(chart_id)}):
         return {"refused": "chart_access", "chart_ids": blocked}
     current_positions = _stored_object(dashboard.position_json) or {}
+    members = _member_chart_ids(dashboard.id)
     refusal = params.check_positions(found["positions"], current_positions=current_positions,
-                                     current_chart_ids=_member_chart_ids(dashboard.id), add_chart_ids=added,
-                                     remove_chart_ids=removed)
+                                     current_chart_ids=members, add_chart_ids=added, remove_chart_ids=removed,
+                                     trashed_chart_ids=_trashed_chart_ids(members))
     if refusal is not None:
         return refusal
     metadata = params.layout_metadata(found["positions"], _stored_object(dashboard.json_metadata) or {})

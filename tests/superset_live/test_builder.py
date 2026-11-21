@@ -2334,6 +2334,31 @@ def test_a_hand_type_change_survives_show_daily_instead_of_monthly(live, served,
     observe("hand-type-survives", chart_id=chart_id, rows=len(data.get("data") or []))
 
 
+def test_a_build_onto_a_dashboard_after_a_remove_lays_out(live, served, model, policy_id):
+    """A Remove moves a measure's charts to the trash and off the dashboard's layout, and rc2 keeps each a member of
+    the dashboard (so a restore puts it back). A build onto that dashboard afterwards still lays its chart out: the
+    layout check does not expect a trashed member the layout no longer places."""
+    counted, plan = _policy_charts(policy_id)
+    run = run_build(live, served, model, plan, "after-a-remove", goal="policies counted, then removed")
+    assert_ran_to_the_end(run)
+    dashboard_id = run.final["dashboard_id"]
+    ids = sorted(_built_charts(run, plan).values())
+    removed = _act(live, served, BUILDER, dashboard_id, counted.name, "remove", {"chart_ids": ids})
+    assert removed.status_code == 200 and sorted(removed.json()["changed"]) == ids, removed.text[:400]
+    members = {row[0] for row in metadata("SELECT slice_id FROM dashboard_slices WHERE dashboard_id = %s",
+                                          (dashboard_id,))}
+    assert set(ids) <= members, (ids, members)
+    again_counted = Measure(name="policies_after_a_remove", label="Policies after a remove", expression="COUNT(id)",
+                            kind=MeasureKind.COUNT, dataset_id=policy_id, description="Policies", asked_by="")
+    kpi = ChartSpec(key="after_a_remove_kpi", family=Family.BIG_NUMBER, title="Policies after a remove",
+                    dataset_id=policy_id, measures=(WrittenRef(again_counted),), dimensions=(), time_column=None,
+                    time_grain=None, filters=(), row_limit=None, source=None, target=None)
+    again = run_build(live, served, model, BuildPlan(charts=(kpi,), measures=(again_counted,)), "after-a-remove-onto",
+                      goal="policies after a remove", dashboard_id=dashboard_id)
+    assert_ran_to_the_end(again)
+    observe("after-a-remove", dashboard_id=dashboard_id, trashed_members=len(set(ids) & members))
+
+
 def test_a_goal_built_onto_its_own_dashboard_builds_nothing(live, served, model, policy_id):
     """Task 13a on rc2: the two-chart goal analyst built, asked again onto the dashboard it made, is answered as
     `shown`, naming both charts, and nothing is kept or made. This holds mnemiq's reading of a planned chart to what
