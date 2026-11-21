@@ -11,6 +11,10 @@ it still reads in full.
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 # A table is large above this much estimated data, NUM_ROWS x AVG_ROW_LEN from ALL_TAB_STATISTICS.
 LARGE_TABLE_BYTES = 1 << 30
 
@@ -40,8 +44,14 @@ def exact_profile_refusal(spec, adapter) -> tuple[str | None, str | None]:
     large: list[tuple[str, int]] = []
     unknown: list[str] = []
     stale: list[str] = []
-    # One batched read where the adapter has it; one per table otherwise.
-    sizes = adapter.table_sizes(tables) if callable(getattr(adapter, "table_sizes", None)) else None
+    # One batched read where the adapter has it; one per table otherwise, and also when the batch fails (one statement
+    # over 500 tables can outlast the probe timeout where each table's own read would not).
+    sizes = None
+    if callable(getattr(adapter, "table_sizes", None)):
+        try:
+            sizes = adapter.table_sizes(tables)
+        except Exception as exc:  # noqa: BLE001 -- the per-table reads remain, and the check still runs
+            logger.warning("the batched size read failed (%s); sizes are read per table", exc)
     for table in tables:
         size = sizes[table] if sizes is not None else adapter.table_size(table)
         if size.rows is None or size.avg_row_len is None:
