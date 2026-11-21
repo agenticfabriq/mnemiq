@@ -355,7 +355,7 @@ title, answered empty without asking the engine. The question is the last user m
 | `embed_api_key` | unset | The embedding endpoint's key; unset uses the chat key. |
 | `enrich_facts` | `false` | An experimental enrichment phase that adds table facts to the store. |
 | `enrich_examples` | `false` | An experimental enrichment phase that adds verified examples to the store. |
-| `enrich_statement_timeout_s` | `600.0` | Seconds each statement `mnemiq enrich` sends to a source may run before it is cut, in either profile mode; 0 for no limit. A cut statement costs its table's profile (in statistics mode an `exact_tables` table keeps its estimate) or one grounding or value-index item, and enrich names what it cut. See [oracle-deployment.md](oracle-deployment.md). |
+| `enrich_statement_timeout_s` | `600.0` | Seconds each statement `mnemiq enrich` sends to a source may run before it is cut, in either profile mode; 0 for no limit. A cut statement costs its table's profile (in statistics mode an `exact_tables` table keeps its estimate) or one grounding or value-index item, and enrich names what it cut. On a Postgres source it is also the connection's statement timeout, unless the DSN or `PGOPTIONS` sets its own. See [oracle-deployment.md](oracle-deployment.md). |
 | `dictionary_path` | unset | A data dictionary's JSON file, which grounds what codes mean. See [grounding.md](grounding.md). |
 | `ontology_records_path` | unset | Ontology records' JSON file, which binds code schemes and grounds bare codes. |
 | `definition_index_max_concepts` | `500` | The most concepts per scheme in the index enrichment builds for grounding definitions. |

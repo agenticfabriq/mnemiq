@@ -11,7 +11,7 @@ import pytest
 
 from mnemiq.superset.charts import (HANDLEBARS_TEMPLATE, MCP_FAMILIES, ChartSpec, Family, Filter, SavedRef, WrittenRef,
                                     config_chart_request, extension_chart_request, generate_chart_request,
-                                    owed_format_params, plan_refusal)
+                                    leaves_out_no_value, owed_format_params, plan_refusal)
 from mnemiq.superset.measures import Measure, MeasureKind
 from mnemiq.superset.saved_metrics import UNKNOWN, SavedMetric
 
@@ -407,3 +407,38 @@ def test_a_saved_metric_with_its_own_iso_currency_keeps_it():
 def test_a_written_currency_measure_without_a_currency_uses_the_deployment_currency():
     spec = _spec(Family.PIE, measures=[WrittenRef(_measure(currency=None))])
     assert generate_chart_request(spec, {}, {}, currency="EUR")["config"]["currency_format"]["symbol"] == "EUR"
+
+
+
+# ---------------------------------------------------------------- a ranked chart leaves out groups with no value
+
+RANKED = [Family.BAR, Family.LINE, Family.AREA, Family.SCATTER, Family.TABLE, Family.PIE, Family.GAUGE,
+          Family.TREEMAP]
+
+
+@pytest.mark.parametrize("family", RANKED)
+def test_a_chart_ranked_under_a_planned_row_limit_leaves_out_groups_with_no_value(family):
+    spec = _spec(family, dimensions=("region",), row_limit=10)
+    assert leaves_out_no_value(spec) is True
+    assert config_chart_request(spec, {}, {}, currency="USD")["leave_out_no_value"] is True
+
+
+@pytest.mark.parametrize("spec", [
+    _spec(Family.BAR, dimensions=("region",)),
+    _spec(Family.BAR, dimensions=(), time_column="issued", row_limit=10),
+    _spec(Family.LINE, dimensions=(), time_column="issued", row_limit=10),
+    _spec(Family.AREA, dimensions=(), time_column="issued", row_limit=10),
+    _spec(Family.SCATTER, dimensions=(), time_column="issued", row_limit=10),
+    _spec(Family.MIXED, dimensions=("region",), row_limit=10),
+    _spec(Family.WATERFALL, dimensions=("region",), row_limit=10),
+    _spec(Family.HISTOGRAM, dimensions=("region",), row_limit=10),
+    _spec(Family.BOX_PLOT, dimensions=("region",), row_limit=10),
+    _spec(Family.BIG_NUMBER, dimensions=(), row_limit=10),
+    _spec(Family.FUNNEL, dimensions=("stage",), row_limit=10),
+    _spec(Family.SANKEY, dimensions=(), source="a", target="b", row_limit=10),
+], ids=["no row limit", "bar over time", "line over time", "area over time", "scatter over time", "mixed",
+        "waterfall", "histogram", "box plot", "big number", "funnel", "sankey"])
+def test_no_other_chart_is_asked_to_leave_out_groups(spec):
+    assert leaves_out_no_value(spec) is False
+    if spec.family not in (Family.FUNNEL, Family.SANKEY, Family.MIXED):  # no config of their own here
+        assert "leave_out_no_value" not in config_chart_request(spec, {}, {}, currency="USD")

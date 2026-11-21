@@ -58,14 +58,24 @@ def infer_relationships(adapter, catalog: list[TableInfo], *, harvest_values: bo
         info = tables.get(table)
         return next((c.data_type for c in info.columns if c.name == col), None) if info else None
 
+    failed: dict[tuple[str, str], Exception] = {}
+
     def stats(table: str, col: str) -> ColumnStats:
+        if (table, col) in failed:
+            # A count that failed once fails again, at the same cost: a parent named by many children is counted once,
+            # and a count that reached the statement time limit is not sent again for the next child.
+            raise failed[(table, col)]
         if (table, col) not in stats_cache:
             # k=0: key detection needs counts only, never the value list. The declared type goes
             # with it so a column the source cannot aggregate is skipped rather than raising --
             # on Oracle a CLOB named `*_id` otherwise takes EVERY relationship down with it.
-            stats_cache[(table, col)] = profile_column(
-                adapter, table, col, k=0, data_type=_declared_type(table, col),
-                **unharvested(harvest_values))
+            try:
+                stats_cache[(table, col)] = profile_column(
+                    adapter, table, col, k=0, data_type=_declared_type(table, col),
+                    **unharvested(harvest_values))
+            except Exception as exc:
+                failed[(table, col)] = exc
+                raise
         return stats_cache[(table, col)]
 
     def is_key_of(table: str, col: str) -> bool:

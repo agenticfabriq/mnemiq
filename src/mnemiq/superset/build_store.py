@@ -62,7 +62,8 @@ from mnemiq.superset.measures import Measure, MeasureKind
 if TYPE_CHECKING:
     from mnemiq.config import Settings
 
-__all__ = ["ABANDONED_AFTER_S", "BUILD_TABLE", "DEFAULT_LEASE_S", "LOCK_TIMEOUT_MS", "MAX_ID", "MEASURE_TABLE", "REASONS",
+__all__ = ["ABANDONED_AFTER_S", "BUILD_TABLE", "DEFAULT_LEASE_S", "LOCK_TIMEOUT_MS", "MAX_ID", "MAX_UNFINISHED",
+           "MEASURE_TABLE", "REASONS",
            "STATEMENT_TIMEOUT_MS", "STEP_KINDS", "STORE_MISSING", "VALUE_SHAPED_KEYS",
            "BuildNotFound", "BuildStore", "BuildStoreMissing", "DashboardBusy", "DashboardMeasure", "LeaseLost",
            "StepBusy", "StepState", "StoredBuild"]
@@ -152,6 +153,11 @@ CREATE TABLE IF NOT EXISTS {MEASURE_TABLE} (
 _LIVE_DASHBOARD = f"{BUILD_TABLE}_live_dashboard"
 _CREATE_LIVE_DASHBOARD = (f"CREATE UNIQUE INDEX IF NOT EXISTS {_LIVE_DASHBOARD} ON {BUILD_TABLE} "
                           f"(tenant_id, dashboard_id) WHERE status = '{BUILDING}' AND dashboard_id IS NOT NULL")
+# A builder's builds by status: what the list of their unfinished builds reads.
+_CREATE_PRINCIPAL_INDEX = (f"CREATE INDEX IF NOT EXISTS {BUILD_TABLE}_principal ON {BUILD_TABLE} "
+                           "(tenant_id, principal_id, status)")
+# The most unfinished builds a list holds.
+MAX_UNFINISHED = 50
 # Two servers starting at once would both run `CREATE TABLE IF NOT EXISTS`, and Postgres can fail the second with a
 # unique violation on its catalogue rather than find the table; the tables are made under this advisory lock instead.
 _DDL_LOCK = int.from_bytes(hashlib.sha256(b"mnemiq.superset.build_store").digest()[:8], "big", signed=True)
@@ -402,6 +408,35 @@ class BuildStore:
             raise LeaseLost()
         return stored
 
+    def unfinished_builds(self, tenant: str, principal: str, *, dashboard_id: int | None = None,
+                          limit: int = 10) -> list[StoredBuild]:
+        """The principal's builds still building, newest touched first, at most `limit` (1 to `MAX_UNFINISHED`):
+        with `dashboard_id`, only that dashboard's, so a build with no dashboard yet is listed only without it."""
+        tenant, principal = _text(tenant, "tenant"), _text(principal, "principal")
+        dashboard_id = _id(dashboard_id, "a dashboard id", optional=True)
+        if type(limit) is not int or not 1 <= limit <= MAX_UNFINISHED:
+            raise ValueError(f"a list holds 1 to {MAX_UNFINISHED} builds")
+        where, values = "tenant_id = %s AND principal_id = %s AND status = %s", [tenant, principal, BUILDING]
+        if dashboard_id is not None:
+            where += " AND dashboard_id = %s"
+            values.append(dashboard_id)
+        with self._connection() as con:
+            rows = con.execute(f"SELECT {_BUILD_COLUMNS}, now() FROM {BUILD_TABLE} WHERE {where} "
+                               "ORDER BY updated_at DESC, build_id LIMIT %s", (*values, limit)).fetchall()
+        return [_stored_build(row) for row in rows]
+
+    def dashboard_building(self, tenant: str, dashboard_id: int) -> bool:
+        """Whether a build of the tenant's is building on the dashboard, once each one left untouched for
+        `ABANDONED_AFTER_S` has been released: what an action on the dashboard's measures asks first, since a build
+        keeps the measures as it last writes them."""
+        tenant = _text(tenant, "tenant")
+        dashboard_id = _id(dashboard_id, "a dashboard id")
+        with self._connection() as con, con.transaction():
+            _release_abandoned(con, tenant, dashboard_id)
+            row = con.execute(f"SELECT 1 FROM {BUILD_TABLE} WHERE tenant_id = %s AND dashboard_id = %s AND "
+                              "status = %s LIMIT 1", (tenant, dashboard_id, BUILDING)).fetchone()
+        return row is not None
+
     # --- a dashboard's measures
 
     def measures_for(self, tenant: str, dashboard_id: int) -> list[DashboardMeasure]:
@@ -545,6 +580,7 @@ def _make_tables(con: psycopg.Connection) -> None:
         con.execute("SELECT pg_advisory_xact_lock(%s)", (_DDL_LOCK,))
         con.execute(_CREATE_BUILD)
         con.execute(_CREATE_LIVE_DASHBOARD)
+        con.execute(_CREATE_PRINCIPAL_INDEX)
         con.execute(_CREATE_MEASURE)
 
 

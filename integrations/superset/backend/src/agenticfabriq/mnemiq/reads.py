@@ -138,15 +138,18 @@ _ID_FIELDS = {"charts": "chart_id", "datasets": "dataset_id", "dashboards": "das
 
 @writes._answering("editors_of", REQUESTS)
 def editors_of(found: dict) -> dict:
-    """The editors' labels of each chart and dataset the caller may read, for the person's panel (who to ask for
-    access), and of each dashboard asked for, with whether the caller edits it (`is_editor`), so a build that would
-    change it can refuse before it makes anything. An object the caller may not read, or that does not exist, is left
-    out. Asked for no dashboard, the answer holds none: as it was before dashboards were asked for."""
-    entries = [("charts", {"chart_id": chart_id, "editors": _labels(chart)})
+    """The editors' labels of each chart, dataset and dashboard asked for that the caller may read, for the person's
+    panel (who to ask for access), each with whether the caller edits it (`is_editor`), so a change refuses a
+    non-editor before it changes anything. An object the caller may not read, or that does not exist, is left out.
+    Asked for no dashboard, the answer holds none: as it was before dashboards were asked for."""
+    security = writes._security()
+    entries = [("charts", {"chart_id": chart_id, "is_editor": bool(security.is_editor(chart)),
+                           "editors": _labels(chart)})
                for chart_id in found["chart_ids"] if (chart := _chart(chart_id)) is not None]
-    entries += [("datasets", {"dataset_id": dataset_id, "editors": _labels(dataset)})
+    entries += [("datasets", {"dataset_id": dataset_id, "is_editor": bool(security.is_editor(dataset)),
+                              "editors": _labels(dataset)})
                 for dataset_id in found["dataset_ids"] if (dataset := writes._dataset(dataset_id)) is not None]
-    entries += [("dashboards", {"dashboard_id": dashboard_id, "is_editor": bool(writes._security().is_editor(board)),
+    entries += [("dashboards", {"dashboard_id": dashboard_id, "is_editor": bool(security.is_editor(board)),
                                 "editors": _labels(board)})
                 for dashboard_id in found["dashboard_ids"] if (board := writes._dashboard(dashboard_id)) is not None]
     kinds = ("charts", "datasets", "dashboards") if found["dashboard_ids"] else ("charts", "datasets")
@@ -156,9 +159,8 @@ def editors_of(found: dict) -> dict:
 
     def mark(pair: tuple) -> tuple:
         kind, entry = pair
-        # A dashboard cut for size keeps whether the caller edits it, one bool: only its labels are left out.
-        kept = {"is_editor": entry["is_editor"]} if kind == "dashboards" else {}
-        return kind, {_ID_FIELDS[kind]: entry[_ID_FIELDS[kind]], **kept, **TOO_LARGE}
+        # An entry cut for size keeps whether the caller edits it, one bool: only its labels are left out.
+        return kind, {_ID_FIELDS[kind]: entry[_ID_FIELDS[kind]], "is_editor": entry["is_editor"], **TOO_LARGE}
 
     return fit(entries, build, mark)
 
