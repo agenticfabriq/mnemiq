@@ -4,6 +4,7 @@
 // every close (`AppContent` renders `ChatPanelHost` only while the panel is open), so what must outlive a close lives
 // here.
 import type { BuildRecord } from "./build";
+import type { ChangeRecord } from "./change";
 import type { Turn } from "./shared";
 
 export type PanelState = {
@@ -14,9 +15,11 @@ export type PanelState = {
   planning: boolean;
   /** The build the panel shows: the latest started or finished on this page. */
   build: BuildRecord | null;
+  /** The change by chat the panel shows: the latest sent on this page. */
+  change: ChangeRecord | null;
 };
 
-const EMPTY: PanelState = { turns: [], runningBuild: null, planning: false, build: null };
+const EMPTY: PanelState = { turns: [], runningBuild: null, planning: false, build: null, change: null };
 
 let state: PanelState = EMPTY;
 const listeners = new Set<() => void>();
