@@ -265,9 +265,24 @@ instead, and enrich logs why.
 **Comments.** In either mode, enrich reads each table's and column's comment from the dictionary
 (`ALL_TAB_COMMENTS`, `ALL_COL_COMMENTS`), reading no table data, and keeps it apart from the
 model's description: the describing model is given it as the database's own text, and the card
-prints it, so table search reads it too. A comment is screened for prompts and cut to 300
-characters. When a prompt must be trimmed to fit the model's window, every model description goes
-before any comment. Instant mode's bare cards still carry names and types only, without comments.
+prints it, so table search reads it too. When a prompt must be trimmed to fit the model's window,
+every model description goes before any comment. Instant mode's bare cards still carry names and
+types only, without comments.
+
+A column's comment is shown to whoever may read that column raw, as its description is. A table's
+comment may describe any of its columns or a table it joins, so it is shown only to someone who may
+see the table, every table it joins, and every one of its columns unmasked; anyone else gets the
+card without it.
+
+A comment is database text, like a column name or a glossary definition, and is treated the same
+way: its whitespace is flattened (so it cannot start a line of its own on a card), it is cut to
+300 characters, and phrases that address the model are screened out. That screen is defence in
+depth, not a guarantee: a comment written as an instruction still reaches the model. What bounds
+it is downstream. The describing model's reply may annotate only the columns it was asked about
+and explain only codes that were observed, and every statement the model writes for an answer is
+refused unless it is a single read within the person's grants, so a comment can steer an answer
+only within what that person may already read. Whoever can comment on
+a table (its owner, or a holder of `COMMENT ANY TABLE`) can write into the prompt.
 
 **What statistics mode gives up.**
 

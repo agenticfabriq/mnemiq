@@ -101,10 +101,21 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
     tables = [b.object_id for b in snapshot.source_bindings] or list(columns)
     table_comments = {b.object_id: b.comment for b in snapshot.source_bindings if b.comment}
 
+    def comment_visible(table: str) -> bool:
+        # A table comment is prose with no recorded dependencies: it may describe any of the table's columns or a
+        # table it joins. So it takes the rule `_scoped_facts` gives such prose: shown only to an identity that may
+        # name the table and every table it joins, and is denied or masked none of its columns.
+        if policy is None:
+            return True
+        joined = {r.to if r.from_ == table else r.from_ for r in snapshot.relationships if table in (r.from_, r.to)}
+        if not all(policy.names(t) for t in {table, *joined}):
+            return False
+        return not any(policy.denies(table, c.name) or policy.masks(table, c.name) for c in columns.get(table, []))
+
     cards: list[SchemaCard] = []
     for table in tables:
         lines = [f"TABLE {table}"]
-        if table_comments.get(table):
+        if table_comments.get(table) and comment_visible(table):
             lines.append(f"COMMENT: {table_comments[table]}")
         lines.append("COLUMNS:")
         ddl: list[tuple[str, str, str]] = []   # (name, data_type, trailing note)
