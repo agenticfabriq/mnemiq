@@ -205,7 +205,7 @@ def test_api_ignores_a_username_in_the_body(tmp_path):
 API_SOURCE = BACKEND_SRC / "agenticfabriq" / "mnemiq" / "api.py"
 
 
-def route(monkeypatch, user, body, config) -> tuple[int, dict]:
+def route(monkeypatch, user, body, config, forwarding=None) -> tuple[int, dict]:
     """What the token route's handler (`MnemiqApi.mint` in `api.py`) responds, as its status and fields, with Flask,
     Flask-AppBuilder and `superset_core` stood in: `g.user` is `user`, the request's JSON `body`, Superset's config
     `config`. Their decorators pass the handler through, so what runs is the handler alone; authentication and CSRF
@@ -224,7 +224,10 @@ def route(monkeypatch, user, body, config) -> tuple[int, dict]:
 
     stood_in = {
         "flask": {"Response": object, "current_app": SimpleNamespace(config=config), "g": SimpleNamespace(user=user),
-                  "request": SimpleNamespace(get_json=lambda silent=False: body)},
+                  "request": SimpleNamespace(get_json=lambda silent=False: body, method="GET", content_length=0,
+                                             args=SimpleNamespace(to_dict=lambda flat=True: {}),
+                                             get_data=lambda cache=False: b""),
+                  "stream_with_context": lambda chunks: chunks},
         "flask_appbuilder": {},
         "flask_appbuilder.api": {"expose": passthrough, "permission_name": passthrough, "protect": passthrough,
                                  "safe": lambda handler: handler},
@@ -239,6 +242,8 @@ def route(monkeypatch, user, body, config) -> tuple[int, dict]:
     spec = importlib.util.spec_from_file_location("token_route_under_test", API_SOURCE)
     loaded = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(loaded)
+    if forwarding is not None:
+        return loaded.MnemiqForward().forward(forwarding)
     return loaded.MnemiqApi().mint()
 
 
@@ -259,25 +264,45 @@ def test_the_route_answers_403_to_anyone_not_signed_in(monkeypatch, tmp_path):
     assert route(monkeypatch, guest("admin"), {"purpose": "build"}, unset)[0] == 403
 
 
+def test_the_forwarder_unconfigured_answers_503_naming_mnemiq_url(monkeypatch, tmp_path):
+    """Without `MNEMIQ_URL` the forwarder answers 503 with the sentence naming it, before anything is minted or sent;
+    the token settings missing, it names that one."""
+    from agenticfabriq.mnemiq.forward import FORWARD_NOT_CONFIGURED
+
+    config = _mapping(tmp_path)
+    assert route(monkeypatch, signed_in("ana"), None, config, forwarding="schema") == (
+        503, {"message": FORWARD_NOT_CONFIGURED})
+    unset = {k: v for k, v in config.items() if k != "MNEMIQ_TOKEN_TENANT"}
+    assert route(monkeypatch, signed_in("ana"), None, {**unset, "MNEMIQ_URL": "http://mnemiq:8080"},
+                 forwarding="schema") == (503, {"message": "MNEMIQ_TOKEN_TENANT is not set"})
+
+
 def csrf_problems(source: str) -> list[str]:
     """Whether the token route's API class opts out of Flask-AppBuilder's CSRF exemption, read with `ast`: FAB
     exempts an API's blueprint unless the class sets `csrf_exempt = False` (`BaseApi.csrf_exempt` is True), and
     `superset_core`'s `RestApi` does not set it."""
     import ast
 
-    for node in ast.parse(source).body:
-        if isinstance(node, ast.ClassDef) and node.name == "MnemiqApi":
-            values = [stmt.value.value for stmt in node.body if isinstance(stmt, ast.Assign)
-                      and any(getattr(t, "id", None) == "csrf_exempt" for t in stmt.targets)
-                      and isinstance(stmt.value, ast.Constant)]
-            return [] if values == [False] else [f"MnemiqApi.csrf_exempt is {values or 'not set'}"]
-    return ["no MnemiqApi class"]
+    problems = []
+    classes = {node.name: node for node in ast.parse(source).body if isinstance(node, ast.ClassDef)}
+    # Every API class the extension mounts: the token route and the forwarder, which mints too.
+    for name in ("MnemiqApi", "MnemiqForward"):
+        node = classes.get(name)
+        if node is None:
+            problems.append(f"no {name} class")
+            continue
+        values = [stmt.value.value for stmt in node.body if isinstance(stmt, ast.Assign)
+                  and any(getattr(t, "id", None) == "csrf_exempt" for t in stmt.targets)
+                  and isinstance(stmt.value, ast.Constant)]
+        if values != [False]:
+            problems.append(f"{name}.csrf_exempt is {values or 'not set'}")
+    return problems
 
 
 def test_the_token_route_needs_csrf():
     assert csrf_problems(API_SOURCE.read_text()) == []
     # The planted defect, as the route first shipped: the class does not say, so FAB exempts the route.
-    assert csrf_problems(API_SOURCE.read_text().replace("    csrf_exempt = False\n", "")) == [
+    assert csrf_problems(API_SOURCE.read_text().replace("    csrf_exempt = False\n", "", 1)) == [
         "MnemiqApi.csrf_exempt is not set"]
     assert csrf_problems(API_SOURCE.read_text().replace("csrf_exempt = False", "csrf_exempt = True")) == [
-        "MnemiqApi.csrf_exempt is [True]"]
+        "MnemiqApi.csrf_exempt is [True]", "MnemiqForward.csrf_exempt is [True]"]

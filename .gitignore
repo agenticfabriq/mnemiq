@@ -84,3 +84,7 @@ ojdbc.properties
 
 # The Open WebUI example's generated secrets (make-secrets.py)
 examples/open-webui/.secrets/
+
+# The Superset panel's build output and its packages (integrations/superset/frontend, `pnpm build`).
+integrations/superset/frontend/dist/
+integrations/superset/frontend/node_modules/
