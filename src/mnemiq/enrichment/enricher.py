@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
+import threading
 from typing import Protocol
 
 from mnemiq.enrichment.prompts import (
@@ -70,6 +73,49 @@ class LLMEnricher:
             columns += described
             failures += why
         return TableAnnotation(table=table, columns=columns, failures=failures)
+
+    def annotate_tables(self, requests: Sequence[tuple[str, list[ColumnFacts], str]],
+                        concurrency: int = 1) -> list[TableAnnotation]:
+        """`annotate` for each (table, facts, grounding), in request order, with the chunk calls of every table run on
+        one pool of `concurrency` workers, so a wide table's chunks do not wait in a row. Each table's results are
+        joined in chunk order, so the annotations do not depend on which call finished first, and `annotate`'s rule
+        holds per table: once a call finds the endpoint down, that table's chunks not yet started are recorded as not
+        asked, while other tables go on. At 1 it is `annotate`, called per table in order."""
+        if concurrency <= 1:
+            return [self.annotate(table, facts, grounding) for table, facts, grounding in requests]
+        spans = [(i, start, min(start + CHUNK_COLUMNS, len(facts)))
+                 for i, (_, facts, _) in enumerate(requests) for start in range(0, len(facts), CHUNK_COLUMNS)]
+        down: dict[int, str] = {}
+        guard = threading.Lock()
+
+        def run(span: tuple[int, int, int]) -> tuple[list, list[str]]:
+            i, start, end = span
+            table, facts, grounding = requests[i]
+            with guard:
+                stopped = down.get(i)
+            if stopped:
+                return [], [_span(start, end, len(facts)) + f"not asked -- {stopped}"]
+            try:
+                described, why, failed = self._annotate_span(table, facts, start, end, grounding)
+            except Exception as exc:  # noqa: BLE001 -- fail-soft per chunk, as enrich_semantic is per table
+                return [], [_span(start, end, len(facts)) + f"the call failed: {type(exc).__name__}"]
+            if failed:
+                with guard:
+                    down.setdefault(i, failed)
+            return described, why
+
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            results = dict(zip(spans, pool.map(run, spans)))
+        annotations = []
+        for i, (table, facts, _) in enumerate(requests):
+            columns: list = []
+            failures: list[str] = []
+            for span in (s for s in spans if s[0] == i):
+                described, why = results[span]
+                columns += described
+                failures += why
+            annotations.append(TableAnnotation(table=table, columns=columns, failures=failures))
+        return annotations
 
     def _annotate_span(self, table: str, facts: list[ColumnFacts], start: int, end: int,
                        grounding: str, root: bool = True,

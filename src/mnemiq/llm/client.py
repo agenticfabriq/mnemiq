@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import logging
 import re
 from collections.abc import Iterator
@@ -222,6 +223,9 @@ class LLMClient:
         self.calls = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
+        # The totals are updated from several workers at once when enrich describes in parallel
+        # (`enrich_concurrency`), and an unlocked `+=` loses updates there (measured).
+        self._counting = threading.Lock()
 
     @property
     def total_tokens(self) -> int:
@@ -306,11 +310,11 @@ class LLMClient:
 
     def _count(self, resp) -> int:
         """Add one response to the running totals; return the prompt tokens the server read."""
-        self.calls += 1
         usage = getattr(resp, "usage", None)
-        if usage is None:
-            return 0
-        read = getattr(usage, "prompt_tokens", 0) or 0
-        self.prompt_tokens += read
-        self.completion_tokens += getattr(usage, "completion_tokens", 0) or 0
+        read = (getattr(usage, "prompt_tokens", 0) or 0) if usage is not None else 0
+        wrote = (getattr(usage, "completion_tokens", 0) or 0) if usage is not None else 0
+        with self._counting:
+            self.calls += 1
+            self.prompt_tokens += read
+            self.completion_tokens += wrote
         return read
