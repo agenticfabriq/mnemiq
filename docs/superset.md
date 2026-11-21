@@ -269,6 +269,11 @@ still to come. In short:
     - To add this goal's charts to it anyway, ask again with its `dashboard_id`. A `dashboard_id` always means that:
       the goal's planned charts are added to the dashboard it names, beside the ones it has.
     - For a new dashboard, ask again with `"fresh": true`.
+  - Onto a dashboard, mnemiq first reads the charts it holds, as the builder, and leaves out each planned chart one of
+    them already shows: the same type and dataset, the same measures by definition, the same grouping and x-axis
+    columns, time grain, filters and row limit. The answer names each one left out and the chart that shows it
+    (`left_out`). A goal the dashboard shows whole builds nothing and is answered as `shown`. A chart mnemiq cannot
+    read the same way, a filter written in SQL among them, is never taken for a match, so the planned one is built.
   - Before anything is planned, mnemiq asks Superset whether the person may build at all; one who may not is
     refused with a 403 as a non-builder, and nothing about a dashboard they named is read. Then, with a
     `dashboard_id`, it asks whether they edit that dashboard. One they cannot read, or one that does not exist, is a

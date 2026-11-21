@@ -6,7 +6,10 @@ request, and the build as it stands. Mounted only in Superset mode, and no other
   offer, its id, title and reason, with mnemiq's words on each answer to it, and nothing is built or kept. Reusing
   the dashboard is opening it, which needs no build. Asking again with its `dashboard_id` adds this goal's planned
   charts to it (a `dashboard_id` always does that, to the dashboard it names), and with `fresh: true` builds a new
-  dashboard; asked either way, no dashboard is looked for. Otherwise the answer is the new build (201), or the plan's
+  dashboard; asked either way, no dashboard is looked for. Onto a dashboard, the plan leaves out each chart the
+  dashboard already shows (`dashboard_charts.leave_out_shown`), and the answer names each one beside the build
+  (`left_out`, each `part`, `chart_id` and `title`); a goal it shows whole builds nothing and keeps nothing, and is
+  answered as `shown` (200) with those parts and mnemiq's words. Otherwise the answer is the new build (201), or the plan's
   refusal, which is an answer too. The build keeps the profile it was asked under (`profile`, None for the
   deployment's default). Before anything is planned or kept, Superset is asked whether the person may build (the
   grants; a non-builder is refused as one, `NOT_A_BUILDER`, and nothing about a dashboard they named is read), then
@@ -57,6 +60,7 @@ from mnemiq.server.v1_refusals import NotPermitted, refused, unknown_profile
 from mnemiq.superset.build_store import MAX_ID, BuildNotFound, BuildStore, BuildStoreMissing, DashboardBusy
 from mnemiq.superset.builder import BuildBusy, BuildState, build_state, next_step, start_build
 from mnemiq.superset.client import SupersetToolError
+from mnemiq.superset.dashboard_charts import LeftOut, datasets_built_on
 from mnemiq.superset.executor import SupersetCredentialMissing, superset_executor
 from mnemiq.superset.extension import ExtensionMissing, dashboard_editorship, require_build_tools
 from mnemiq.superset.planner import MAX_GOAL, BuildPlan, PlanContext, PlanRefused, plan_build
@@ -171,6 +175,19 @@ def _offer(plan: BuildPlan, titles: dict[int, str]) -> dict:
                       "message": message}}
 
 
+def _left_out(left: tuple[LeftOut, ...]) -> list[dict]:
+    return [{"part": item.part, "chart_id": item.chart_id, "title": item.title} for item in left]
+
+
+def _shown(dashboard_id: int, left: tuple[LeftOut, ...]) -> dict:
+    """A goal the dashboard already shows whole: each part and the chart that shows it, and mnemiq's words; nothing
+    was built or kept."""
+    parts = "; ".join(f"{item.part!r} is its chart {item.chart_id}" for item in left)
+    return {"shown": {"dashboard_id": dashboard_id, "left_out": _left_out(left),
+                      "message": f"Dashboard {dashboard_id} already shows every chart this goal plans, so nothing was "
+                                 f"built: {parts}."}}
+
+
 def _refused_plan(plan: PlanRefused) -> dict:
     # mnemiq's reason and each part as the model named it; never the model's draft.
     return {"refused": {"reason": plan.reason, "parts": [{"part": part.part, "reason": part.reason}
@@ -253,18 +270,27 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
             require_build_tools(adapter.client)
             if body.dashboard_id is not None:
                 _held_to_its_editors(adapter.client, body.dashboard_id)
+            built_on = (datasets_built_on(builds.measures_for(who.tenant_id, body.dashboard_id))
+                        if body.dashboard_id is not None else None)
             plan = plan_build(body.goal, planner=planner, client=adapter.client, adapter=adapter,
                               snapshot=runtime.snapshot, grants=grants, settings=profile.settings,
-                              offer_reuse=body.dashboard_id is None and not body.fresh)
+                              offer_reuse=body.dashboard_id is None and not body.fresh, onto=body.dashboard_id,
+                              built_on=built_on)
             if isinstance(plan, PlanRefused):
                 response.status_code = 200
                 return _refused_plan(plan)
             if plan.awaiting_choice:
                 response.status_code = 200
                 return _offer(plan, planner.titles)
-            return {"build": _build(start_build(builds, tenant=who.tenant_id, principal=who.principal_id,
-                                                goal=body.goal, plan=plan, dashboard_id=body.dashboard_id,
-                                                profile=body.profile))}
+            if body.dashboard_id is not None and not plan.charts:
+                response.status_code = 200
+                return _shown(body.dashboard_id, plan.left_out)
+            answer = {"build": _build(start_build(builds, tenant=who.tenant_id, principal=who.principal_id,
+                                                  goal=body.goal, plan=plan, dashboard_id=body.dashboard_id,
+                                                  profile=body.profile))}
+            if plan.left_out:
+                answer["left_out"] = _left_out(plan.left_out)
+            return answer
 
         return answered(work)
 

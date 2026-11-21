@@ -587,7 +587,8 @@ class World:
 
     def form_data(self, dataset_id: int, config: dict) -> dict:
         """The `form_data` MCP's mappers write for the configs a build sends (`map_xy_config`, `map_pie_config`,
-        `map_big_number_config`, `map_table_config`, `map_gauge_config`, `map_treemap_config`)."""
+        `map_big_number_config`, `map_table_config`, `map_gauge_config`, `map_treemap_config`), each row limit a config
+        leaves unset as its `*ChartConfig.row_limit` default (`superset/mcp_service/chart/schemas.py`)."""
         kind = config["chart_type"]
         if kind == "xy":
             viz = {"line": "echarts_timeseries_line", "bar": "echarts_timeseries_bar", "area": "echarts_area",
@@ -620,12 +621,12 @@ class World:
                     "number_format": config.get("number_format", "SMART_NUMBER"), "row_limit": 10}
         elif kind == "treemap_v2":
             form = {"viz_type": "treemap_v2", "groupby": [c["name"] for c in config["groupby"]],
-                    "metric": self._metric(config["metric"]), "row_limit": 10000}
+                    "metric": self._metric(config["metric"]), "row_limit": config.get("row_limit", 100)}
         elif kind == "table":
             names = [c["name"] for c in config["columns"] if "name" in c and not c.get("saved_metric")]
             metrics = [self._metric(c) for c in config["columns"] if c.get("saved_metric") or c.get("sql_expression")]
             form = {"viz_type": "table", "query_mode": "aggregate", "all_columns": names, "groupby": names,
-                    "metrics": metrics, "row_limit": config.get("row_limit", 10000)}
+                    "metrics": metrics, "row_limit": config.get("row_limit", 1000)}
             if config.get("column_config"):
                 form["column_config"] = copy.deepcopy(config["column_config"])
         else:

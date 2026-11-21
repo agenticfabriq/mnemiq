@@ -42,13 +42,14 @@ from mnemiq.superset.builder import start_build
 from mnemiq.superset.client import DelegatedToken, SupersetMcp
 from mnemiq.superset.extension import EXTENSION_TOOLS, TOOL_PREFIX
 from mnemiq.superset.grants import NOT_A_BUILDER
-from mnemiq.superset.planner import FakePlanner, LLMPlanner, PlanRefused, RefusedPart
+from mnemiq.superset.planner import BuildPlan, FakePlanner, LLMPlanner, PlanRefused, RefusedPart
 from tests.auth_keys import AUDIENCE, ISSUER, claims, jwks_for, mint, rsa_key
 from tests.superset_build_world import SNAPSHOT as WORLD_SNAPSHOT
 from tests.superset_build_world import TABLES, Clock, Hook, MemoryBuildStore, World
 from tests.superset_fake import FakeSuperset
 from tests.sweep.stub_model import StubModel
 from tests.superset_shared import (
+    BY_REGION,
     ONE_BAR,
     ROLE_DENIAL,
     SIGN_IN,
@@ -811,6 +812,41 @@ def _run_to_the_end(client, build_id: str) -> list:
         if answers[-1].json()["build"]["status"] != "building":
             return answers
     raise AssertionError("the build did not end")
+
+
+def test_a_goal_the_dashboard_shows_whole_is_answered_and_nothing_is_kept(served, fake, world, store):
+    """Asked onto the dashboard a build made, for the goal it already shows: the answer names each part and the chart
+    that shows it, nothing is kept, and nothing is made."""
+    client, _ = served
+    first = _start(client).json()["build"]
+    final = _run_to_the_end(client, first["build_id"])[-1].json()["build"]
+    chart = next(step["object_id"] for step in final["steps"] if step["key"] == "policies_by_region")
+    builds, charts = len(store._builds), set(world.charts)
+    again = _start(client, dashboard_id=final["dashboard_id"])
+    assert again.status_code == 200, again.text
+    assert again.json() == {"shown": {
+        "dashboard_id": final["dashboard_id"],
+        "left_out": [{"part": "Policies by region", "chart_id": chart, "title": "Policies by region"}],
+        "message": (f"Dashboard {final['dashboard_id']} already shows every chart this goal plans, so nothing was "
+                    f"built: 'Policies by region' is its chart {chart}.")}}
+    assert len(store._builds) == builds and set(world.charts) == charts
+
+
+def test_a_build_onto_a_dashboard_names_what_it_left_out(served, fake, world, store):
+    """A plan of which the dashboard shows one chart builds the other and names the one left out beside the build."""
+    client, runtime = served
+    first = _start(client).json()["build"]
+    final = _run_to_the_end(client, first["build_id"])[-1].json()["build"]
+    chart = next(step["object_id"] for step in final["steps"] if step["key"] == "policies_by_region")
+    by_status = dataclasses.replace(BY_REGION, key="policies_by_status", title="Policies by status",
+                                    dimensions=("status",))
+    _planned(runtime, FakePlanner(BuildPlan(charts=(BY_REGION, by_status), measures=ONE_BAR.measures)))
+    again = _start(client, dashboard_id=final["dashboard_id"])
+    assert again.status_code == 201, again.text
+    assert again.json()["left_out"] == [{"part": "Policies by region", "chart_id": chart,
+                                         "title": "Policies by region"}]
+    assert [step["key"] for step in again.json()["build"]["steps"]] == ["dashboard", "policies_by_status", "layout",
+                                                                         "check"]
 
 
 def test_a_build_keeps_the_profile_it_started_with(profiled, fake, world, store, monkeypatch):
