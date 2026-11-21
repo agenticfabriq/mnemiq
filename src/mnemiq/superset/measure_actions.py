@@ -11,6 +11,9 @@ the list. A measure's value is computed each time it is listed, as the person as
   (`query_dataset`), a written measure by a chart of it that shows it as one number (`get_chart_data`). Never
   mnemiq's own SQL, since a row rule attached to a virtual dataset applies only through it. Otherwise there is no
   value, and `value_note` says why.
+A value says what it covers (`ValueBasis`): mnemiq's statement and Superset's query of the dataset cover every row
+the person can read, under no chart's filters, while a chart's one number is under that chart's own filters. A
+measure whose charts all carry its condition as a filter shows them right while its value here covers every row.
 
 **A copy** of a measure on a chart is a metric the chart holds that is still the measure as the dashboard keeps it: an
 SQL metric with the same label and the same SQL once normalized, or a saved metric's name. A chart the measure is kept
@@ -41,6 +44,8 @@ import logging
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
+from typing import NamedTuple
 
 from mnemiq.execute.runner import DEFAULT_TIMEOUT_S, ExecutionError
 from mnemiq.superset.chart_check import (
@@ -110,6 +115,25 @@ class ChartOf:
     check: ChartStatus | None
 
 
+class ValueBasis(StrEnum):
+    """What a listed value covers. `READABLE_ROWS`: every row of the measure's dataset the person can read, under no
+    chart's filters (mnemiq's own statement, or Superset's query of the dataset). `CHART`: the one number a chart shows,
+    under that chart's own filters."""
+
+    READABLE_ROWS = "readable_rows"
+    CHART = "chart"
+
+
+class Valued(NamedTuple):
+    """A measure's value as listed: the value, or None and `note` saying why; what it covers, and the chart it was read
+    from when that is a chart. No value says nothing of what it would cover."""
+
+    value: float | None
+    note: str | None
+    basis: ValueBasis | None
+    chart_id: int | None
+
+
 @dataclass(frozen=True)
 class MeasureView:
     """A measure as it is listed: its definition, the saved metric it is (None: one written on its charts), its charts,
@@ -120,6 +144,8 @@ class MeasureView:
     charts: tuple[ChartOf, ...]
     value: float | None
     value_note: str | None
+    value_basis: ValueBasis | None
+    value_chart_id: int | None
 
 
 @dataclass(frozen=True)
@@ -250,38 +276,50 @@ def _not_editors(editorship: dict, kind: str, ids: Iterable[int],
 
 
 def _value(asking: Asking, row, facts: DatasetFacts | NotCheckable,
-           reads: Mapping[int, ChartRead]) -> tuple[float | None, str | None]:
+           reads: Mapping[int, ChartRead]) -> Valued:
     if isinstance(facts, NotCheckable):
-        return None, "mnemiq could not read the measure's dataset"
+        return _no_value("mnemiq could not read the measure's dataset")
     if not facts.is_virtual:
         if not facts.table:
-            return None, "mnemiq could not read the measure's table"
+            return _no_value("mnemiq could not read the measure's table")
         if (facts.database_id, facts.schema) != (getattr(asking.adapter, "database_id", facts.database_id),
                                                  getattr(asking.adapter, "schema", facts.schema)):
-            return None, "the measure's dataset reads another database or schema than the one mnemiq answers from"
+            return _no_value("the measure's dataset reads another database or schema than the one mnemiq answers from")
         sql = measure_statement(dataclasses.replace(row.measure, name="value"), _quoted(facts.table))
         try:
             decided = run_decided(sql, adapter=asking.adapter, snapshot=asking.snapshot, grants=asking.grants,
                                   timeout_s=asking.timeout_s, guard_fanout=asking.settings.guard_fanout)
         except ExecutionError as failure:
             logger.warning("a measure's value did not run: %s %s", failure.message, failure.source_detail or "")
-            return None, "mnemiq's statement for the value did not run; why is in the log"
+            return _no_value("mnemiq's statement for the value did not run; why is in the log")
         if isinstance(decided, Refusal):
-            return None, f"mnemiq refused the statement for its value ({decided.code.value}): {decided.message}"
+            return _no_value(f"mnemiq refused the statement for its value ({decided.code.value}): {decided.message}")
         table = decided.table
         if table.num_rows == 0 or table.num_columns == 0 or table.column(0)[0].as_py() is None:
-            return None, "no row this person can read has a value for it"
-        return _finite(table.column(0)[0].as_py())
+            return _no_value("no row this person can read has a value for it")
+        return _covering(_finite(table.column(0)[0].as_py()), ValueBasis.READABLE_ROWS)
     if row.saved_metric is not None:
-        return _one_number(asking.client, "query_dataset", {"dataset_id": facts.dataset_id,
+        return _covering(_one_number(asking.client, "query_dataset", {"dataset_id": facts.dataset_id,
                                                             "metrics": [row.saved_metric], "columns": [],
-                                                            "row_limit": 1}, row.saved_metric)
+                                                            "row_limit": 1}, row.saved_metric),
+                         ValueBasis.READABLE_ROWS)
     for chart_id in row.chart_ids:
         read = reads.get(chart_id)
         if read is not None and read.form_data is not None and read.viz_type == "big_number_total" \
                 and _copies(read.form_data, row) == [("metric", None)]:
-            return _one_number(asking.client, "get_chart_data", {"identifier": chart_id}, row.measure.label)
-    return None, VIRTUAL_NO_VALUE
+            return _covering(_one_number(asking.client, "get_chart_data", {"identifier": chart_id}, row.measure.label),
+                             ValueBasis.CHART, chart_id)
+    return _no_value(VIRTUAL_NO_VALUE)
+
+
+def _no_value(note: str) -> Valued:
+    return Valued(None, note, None, None)
+
+
+def _covering(found: tuple[float | None, str | None], basis: ValueBasis, chart_id: int | None = None) -> Valued:
+    """`found` with what it covers, or, when it is no value, its note alone."""
+    value, note = found
+    return Valued(value, note, basis, chart_id) if value is not None else _no_value(note)
 
 
 def _one_number(client, tool: str, request: dict, label: str) -> tuple[float | None, str | None]:
@@ -324,9 +362,10 @@ def list_measures(asking: Asking) -> list[MeasureView]:
         dataset_id = row.measure.dataset_id
         if dataset_id not in facts:
             facts[dataset_id] = read_dataset_facts(asking.client, dataset_id)
-        value, note = _value(asking, row, facts[dataset_id], reads)
+        valued = _value(asking, row, facts[dataset_id], reads)
         views.append(MeasureView(measure=row.measure, saved_metric=row.saved_metric,
-                                 charts=_charts_of(row, placed, reads), value=value, value_note=note))
+                                 charts=_charts_of(row, placed, reads), value=valued.value, value_note=valued.note,
+                                 value_basis=valued.basis, value_chart_id=valued.chart_id))
     return views
 
 

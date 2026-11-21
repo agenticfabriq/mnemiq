@@ -879,6 +879,7 @@ def test_the_measures_route_answers_each_measure_with_its_value_and_charts(serve
     assert measure == {"name": "policies", "label": "Policies", "expression": "COUNT(policy_id)", "kind": "count",
                        "currency": None, "description": "Policies written", "asked_by": measure["asked_by"],
                        "dataset_id": 12, "saved_metric": None, "value": 7.0, "value_note": None,
+                       "value_basis": "readable_rows", "value_chart_id": None,
                        "charts": [{"chart_id": chart, "title": "Policies by region", "check": "checked"}]}
     assert "7.0" not in json.dumps([dataclasses.asdict(row) for row in store.measures_for(
         next(iter(store._builds))[0], dashboard)], default=str)

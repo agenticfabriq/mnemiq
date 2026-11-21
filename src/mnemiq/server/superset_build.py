@@ -197,6 +197,7 @@ def _measure(view: MeasureView) -> dict:
     return {"name": m.name, "label": m.label, "expression": m.expression, "kind": str(m.kind),
             "currency": m.currency, "description": m.description, "asked_by": m.asked_by, "dataset_id": m.dataset_id,
             "saved_metric": view.saved_metric, "value": view.value, "value_note": view.value_note,
+            "value_basis": str(view.value_basis) if view.value_basis else None, "value_chart_id": view.value_chart_id,
             "charts": [{"chart_id": c.chart_id, "title": c.title, "check": str(c.check) if c.check else None}
                        for c in view.charts]}
 

@@ -32,6 +32,7 @@ from mnemiq.superset.measure_actions import (
     remove_measure,
     save_measure,
 )
+from mnemiq.superset.measure_actions import ValueBasis
 from mnemiq.superset.measures import MeasureKind
 from mnemiq.superset.planner import BuildPlan, PlannedDataset
 from tests.superset_build_world import (
@@ -146,6 +147,7 @@ def test_values_are_computed_per_caller_never_stored(fake, world, store):
     [east] = list_measures(_asking(fake, store, built["dashboard"], "tok-east"))
     assert (west.value, east.value) == (2.0, 3.0), (west, east)
     assert west.measure == east.measure and west.value_note is None
+    assert (west.value_basis, west.value_chart_id) == (ValueBasis.READABLE_ROWS, None)
     assert store.measures_for(TENANT, built["dashboard"]) == before
     assert "2.0" not in json.dumps([dataclasses.asdict(row) for row in before], default=str)
     [shown] = list_measures(_asking(fake, store, built["dashboard"]))
@@ -164,10 +166,45 @@ def test_virtual_measure_value_comes_through_the_chart(fake, world, store):
     since = len(fake.calls)
     [claimed] = list_measures(_asking(fake, store, built["dashboard"]))
     assert claimed.value == 1125.0 and claimed.value_note is None, claimed
+    assert (claimed.value_basis, claimed.value_chart_id) == (ValueBasis.CHART, built["claimed_kpi"])
     assert "execute_sql" not in _tools(fake, since) and "get_chart_data" in _tools(fake, since)
     world.charts[built["claimed_kpi"]]["params"]["metric"]["label"] = "Claimed, by hand"
     [claimed] = list_measures(_asking(fake, store, built["dashboard"]))
     assert claimed.value is None and claimed.value_note == VIRTUAL_NO_VALUE
+    assert (claimed.value_basis, claimed.value_chart_id) == (None, None)
+
+
+def test_a_saved_metric_value_covers_the_readable_rows(fake, world, store):
+    """A saved metric's value on a virtual dataset is Superset's query of the dataset, under no chart's filters: it
+    covers every row the person can read. When Superset answers no value, nothing is said of what it covers."""
+    built = _built(fake, store, CLAIMS)
+    made = built["dataset_1"]
+    world.datasets[made]["editors"].append("builder")
+    save_measure(_asking(fake, store, built["dashboard"]), "claimed")
+    assert _kept(store, built["dashboard"])["claimed"].saved_metric == "claimed"
+    world.datasets[made]["sql"] = 'SELECT * FROM "claim"'
+    fake.reply("query_dataset", lambda request, authorization: {"data": [{"claimed": 1125.0}]})
+    [claimed] = list_measures(_asking(fake, store, built["dashboard"]))
+    assert claimed.value == 1125.0, claimed
+    assert (claimed.value_basis, claimed.value_chart_id) == (ValueBasis.READABLE_ROWS, None)
+
+    def refused(request, authorization):
+        raise RuntimeError("Superset refused the query")
+
+    fake.reply("query_dataset", refused)
+    [claimed] = list_measures(_asking(fake, store, built["dashboard"]))
+    assert claimed.value is None and claimed.value_note, claimed
+    assert (claimed.value_basis, claimed.value_chart_id) == (None, None)
+
+
+def test_no_value_has_no_basis(fake, world, store):
+    """A physical dataset in another schema than mnemiq answers from has no value, and so nothing is said of what
+    a value would cover."""
+    built = _built(fake, store, THREE_OF_POLICIES)
+    world.datasets[POLICY_DATASET]["schema"] = "elsewhere"
+    [policies] = list_measures(_asking(fake, store, built["dashboard"]))
+    assert policies.value is None and "another database or schema" in policies.value_note, policies
+    assert (policies.value_basis, policies.value_chart_id) == (None, None)
 
 
 def test_chart_removed_by_hand_drops_out_of_the_list(fake, world, store):
