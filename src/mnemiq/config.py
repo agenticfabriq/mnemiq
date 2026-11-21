@@ -363,6 +363,9 @@ class Settings(BaseSettings):
     answer_markdown: bool = Field(default=False, description="let the answer use markdown (lists, tables) when the result has structure")
     enrich_facts: bool = Field(default=False, description="eval: table-facts enrichment phase (plan-20, default off)")
     enrich_examples: bool = Field(default=False, description="eval: verified-example enrichment phase (plan-20, default off)")
+    enrich_statement_timeout_s: float = Field(
+        default=600.0, ge=0,
+        description="seconds each statement enrich sends to a source may run before it is cut (0: no limit)")
     dictionary_path: str | None = Field(default=None, description="operator code data-dictionary JSON path (grounds code meanings)")
     ontology_records_path: str | None = Field(default=None, description="ontology records JSON path (binds code schemes, grounds bare codes)")
     verity_records_url: str | None = Field(default=None, description=f"Verity GET {CERTIFIED_RECORDS_PATH} endpoint (governed certified records). NOT the sibling without `/open`, and DO NOT change the page size to make that one fit: it accepts no `since`, so ANY page size it tolerates -- 0 included -- makes every pull a full dump merged as though it were a delta, silently, while this pull's default 500 makes it refuse outright. Loud is the better failure. Verity's published OpenAPI is where that endpoint's missing `since` and its own limit ceiling are declared")

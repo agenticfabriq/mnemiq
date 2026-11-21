@@ -10,6 +10,7 @@ from mnemiq.adapters.duckdb import (
     duckdb_reachable_user_functions,
     duckdb_user_functions,
     execute_bounded,
+    execute_rows_bounded,
     unavailable_fault,
 )
 from mnemiq.config import SourceSpec
@@ -110,8 +111,8 @@ class FederatedAdapter:
         return [(f"{cat}.{tbl}", col, (typ or "unknown")) for cat, sch, tbl, col, typ in rows
                 if registered.get(cat.casefold()) == sch.casefold()]
 
-    def execute(self, sql: str) -> list[tuple]:
-        return self._con.execute(sql).fetchall()
+    def execute(self, sql: str, timeout_s: float | None = None) -> list[tuple]:
+        return execute_rows_bounded(self._con, sql, timeout_s)
 
     def execute_arrow(self, sql: str, timeout_s: float | None = None) -> pa.Table:
         return execute_bounded(self._con, sql, timeout_s)
