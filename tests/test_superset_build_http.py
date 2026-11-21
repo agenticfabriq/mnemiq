@@ -883,6 +883,20 @@ def test_the_measures_route_answers_each_measure_with_its_value_and_charts(serve
         next(iter(store._builds))[0], dashboard)], default=str)
 
 
+def test_an_ask_token_reads_no_dashboards_measures(served, fake, world, store):
+    """The list reads the dashboard's layout and charts, which an ask token's scopes do not reach: it is refused as
+    made for asking, naming what it needs, before Superset is asked anything."""
+    client, _ = served
+    dashboard, _ = _a_built_dashboard(client)
+    before = len(fake.calls)
+    r = client.get(f"/v1/superset/dashboards/{dashboard}/measures", headers=_bearer(_token(scope=ASK_SCOPES)))
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"] == NOT_FOR_BUILDING
+    challenge = r.headers["www-authenticate"]
+    assert "superset:dashboard:read" in challenge and "superset:chart:read" in challenge
+    assert fake.calls[before:] == []
+
+
 def test_a_measure_action_by_a_non_editor_of_the_dashboard_is_refused_naming_its_editors(served, fake, world, store):
     client, _ = served
     dashboard, _ = _a_built_dashboard(client)

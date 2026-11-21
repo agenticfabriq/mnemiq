@@ -2093,3 +2093,252 @@ def test_a_hand_made_same_named_chart_is_never_adopted(live, served, model, poli
         assert_no_model_call(run)
         seen[case] = {"built": built, "hand_made": hand_id}
     observe("hand made", **seen)
+
+
+# --- a dashboard's measures, and changes by chat (B1, B3, B4, B5), and a goal onto its own dashboard ----------------
+
+
+def _policy_charts(policy_id: int) -> tuple[Measure, BuildPlan]:
+    """Two charts of one written measure on `policy`: a bar by region and a pie by status."""
+    counted = Measure(name="counted_policies", label="Counted policies", expression="COUNT(id)",
+                      kind=MeasureKind.COUNT, dataset_id=policy_id, description="Policies counted", asked_by="")
+
+    def chart(key: str, family: Family, title: str, dimension: str) -> ChartSpec:
+        return ChartSpec(key=key, family=family, title=title, dataset_id=policy_id, measures=(WrittenRef(counted),),
+                         dimensions=(dimension,), time_column=None, time_grain=None, filters=(), row_limit=None,
+                         source=None, target=None)
+
+    return counted, BuildPlan(charts=(chart("counted_by_region", Family.BAR, "Counted by region", "region"),
+                                      chart("counted_by_status", Family.PIE, "Counted by status", "status")),
+                              measures=(counted,))
+
+
+def _publish(live, dashboard_id: int) -> None:
+    """As analyst, signed in, the dashboard published through Superset's own API, so every Alpha may read it."""
+    with live.signed_in(BUILDER) as (client, headers):
+        csrf = live.csrf_token(client, headers)
+        answer = client.put(f"/api/v1/dashboard/{dashboard_id}", json={"published": True},
+                            headers={**headers, "X-CSRFToken": csrf})
+    assert answer.status_code == 200, answer.status_code
+
+
+def _chart_editors(live, chart_id: int, usernames: list[str]) -> None:
+    with live.signed_in(BUILDER) as (client, headers):
+        csrf = live.csrf_token(client, headers)
+        answer = client.put(f"/api/v1/chart/{chart_id}", json={"editors": [user_subject(n) for n in usernames]},
+                            headers={**headers, "X-CSRFToken": csrf})
+    assert answer.status_code == 200, answer.status_code
+
+
+def _measures(live, served, username: str, dashboard_id: int):
+    return served.client.get(f"/v1/superset/dashboards/{dashboard_id}/measures",
+                             headers=bearer(live.minted(username, "build")))
+
+
+def _act(live, served, username: str, dashboard_id: int, name: str, action: str, body: dict):
+    return served.client.post(f"/v1/superset/dashboards/{dashboard_id}/measures/{name}/{action}", json=body,
+                              headers=bearer(live.minted(username, "build")))
+
+
+def _built_charts(run: BuildRun, plan: BuildPlan) -> dict[str, int]:
+    return {chart.key: next(step["object_id"] for step in run.final["steps"] if step["key"] == chart.key)
+            for chart in plan.charts}
+
+
+def test_two_builders_get_their_own_values_and_a_narrowed_rule_shows_on_the_next_read(live, served, model,
+                                                                                       policy_id):
+    """B1. A measure on a dashboard analyst built and published: west and east open its measures and get different
+    values, each the count of the policies their own row rule keeps (read from the source); after an admin narrows
+    west's rule (`setup_superset.py narrow west`), west's next read is the narrowed count. gamma_only is told the
+    roles and nothing else (403, NOT_A_BUILDER). No value is in the build store."""
+    _, plan = _policy_charts(policy_id)
+    run = run_build(live, served, model, plan, "measures-per-caller", goal="policies counted")
+    assert_ran_to_the_end(run)
+    dashboard_id = run.final["dashboard_id"]
+    _publish(live, dashboard_id)
+    counts = dict(ground_truth(live, "SELECT region, count(id) FROM policy GROUP BY 1"))
+    narrowed_west = ground_truth(live, "SELECT count(id) FROM policy WHERE region = 'west' AND status = 'active'")[0][0]
+    values = {}
+    for username in ("west", "east"):
+        answer = _measures(live, served, username, dashboard_id)
+        assert answer.status_code == 200, (username, answer.status_code, answer.text[:300])
+        [measure] = answer.json()["measures"]
+        values[username] = measure["value"]
+    assert values == {"west": float(counts["west"]), "east": float(counts["east"])}, values
+    try:
+        observe("narrow", rule=run_setup("narrow", "west"))
+        [measure] = _measures(live, served, "west", dashboard_id).json()["measures"]
+        assert measure["value"] == float(narrowed_west), measure["value"]
+    finally:
+        observe("widen", rule=run_setup("widen", "west"))
+    refused = _measures(live, served, "gamma_only", dashboard_id)
+    assert refused.status_code == 403, refused.text[:300]
+    assert set(refused.json()) == {"detail", "end_session_url"}
+    import psycopg
+
+    with psycopg.connect(served.store_dsn, autocommit=True, connect_timeout=10) as con:
+        kept = con.execute(f"SELECT definition, check_status FROM {MEASURE_TABLE} WHERE dashboard_id = %s",
+                           (dashboard_id,)).fetchall()
+    assert kept and not any(str(float(counts[r])) in json.dumps(kept, default=str) for r in ("west", "east"))
+    observe("measures-per-caller", dashboard_id=dashboard_id, distinct=len(set(values.values())))
+
+
+def test_save_adds_the_metric_switches_matching_copies_and_a_non_editor_is_told_the_editors(live, served, model,
+                                                                                            policy_id, region_table):
+    """B3. On the dataset the build makes over the module's region table (analyst its editor): the measure is on both
+    charts and the build leaves the dataset's saved metrics as Superset made them. One chart's copy is changed by
+    hand through the extension's `patch_chart`. Save adds the metric with its definition and format, switches the
+    other chart's copy to it, and leaves and names the hand-changed one. On `policy`, whose editors do not include
+    analyst, Save names the editors and changes nothing. What this test made is removed as it ends."""
+    managers = Measure(name="managers", label="Managers", expression="COUNT(manager)", kind=MeasureKind.COUNT,
+                       dataset_id=-1, description="Managers counted", asked_by="")
+
+    def chart(key: str, family: Family, title: str, dimension: str) -> ChartSpec:
+        return ChartSpec(key=key, family=family, title=title, dataset_id=-1, measures=(WrittenRef(managers),),
+                         dimensions=(dimension,), time_column=None, time_grain=None, filters=(), row_limit=None,
+                         source=None, target=None)
+
+    plan = BuildPlan(charts=(chart("managers_by_status", Family.BAR, "Managers by status", "status"),
+                             chart("managers_share", Family.PIE, "Managers share by status", "status")),
+                     measures=(managers,), datasets=(PlannedDataset(key="dataset_1", placeholder=-1,
+                                                                   table=region_table.name,
+                                                                   table_name=region_table.name),))
+    builder = as_user(live, BUILDER)
+    run = run_build(live, served, model, plan, "save-to-dataset", goal="managers counted")
+    made = next((step["object_id"] for step in run.final.get("steps", []) if step["key"] == "dataset_1"), None)
+    ids = {key: value for key, value in _built_charts(run, plan).items() if value is not None} \
+        if run.final.get("steps") else {}
+    try:
+        assert_ran_to_the_end(run)
+        dashboard_id = run.final["dashboard_id"]
+        assert set(saved_metrics(made)) == {"count"}, saved_metrics(made)
+        by_hand = ids["managers_share"]
+        info = builder.call("get_chart_info", {"identifier": by_hand,
+                                               "select_columns": ["id", "changed_on", "form_data"]})
+        metric = {**info["form_data"]["metric"], "sqlExpression": "COUNT(DISTINCT manager)"}
+        assert builder.call(TOOL_PREFIX + "patch_chart", {"chart_id": by_hand, "set": {"metric": metric},
+                                                           "expect_changed_on": info["changed_on"]}) == {"ok": True}
+        saved = _act(live, served, BUILDER, dashboard_id, "managers", "save", {})
+        assert saved.status_code == 200, saved.text[:400]
+        assert saved.json()["changed"] == [ids["managers_by_status"]] and saved.json()["left_by_hand"] == [by_hand]
+        assert saved_metrics(made).get("managers") == "COUNT(manager)", saved_metrics(made)
+        [(fmt,)] = metadata("SELECT d3format FROM sql_metrics WHERE table_id = %s AND metric_name = 'managers'",
+                            (made,))
+        assert fmt == ",d"
+        assert chart_metrics(stored_chart(ids["managers_by_status"])["params"]) == ["managers"]
+        assert chart_metrics(stored_chart(by_hand)["params"])[0]["sqlExpression"] == "COUNT(DISTINCT manager)"
+        listed = _measures(live, served, BUILDER, dashboard_id).json()["measures"]
+        assert [m["saved_metric"] for m in listed] == ["managers"], listed
+        # On policy, which analyst does not edit.
+        _, policy_plan = _policy_charts(policy_id)
+        other = run_build(live, served, model, BuildPlan(charts=policy_plan.charts[:1],
+                                                         measures=policy_plan.measures),
+                          "save-not-an-editor", goal="policies counted once")
+        assert_ran_to_the_end(other)
+        reads = builder.call(TOOL_PREFIX + "editors_of", {"dataset_ids": [policy_id]})["datasets"]
+        assert reads and reads[0]["is_editor"] is False, reads
+        before = saved_metrics(policy_id)
+        refused = _act(live, served, BUILDER, other.final["dashboard_id"], "counted_policies", "save", {})
+        assert refused.status_code == 200, refused.text[:400]
+        assert refused.json()["changed"] == [] and refused.json()["not_editor"] == [
+            {"dataset_id": policy_id, "editors": reads[0]["editors"]}]
+        assert saved_metrics(policy_id) == before
+        observe("save-to-dataset", dashboard_id=dashboard_id, dataset_id=made, message=saved.json()["message"])
+    finally:
+        for chart_id in ids.values():
+            builder.call("delete_chart", {"identifier": chart_id})
+        if made is not None:
+            builder.call(TOOL_PREFIX + "delete_dataset", {"dataset_id": made,
+                                                          "dashboard_id": run.final.get("dashboard_id")})
+
+
+def test_a_second_editor_edits_and_removes_and_a_chart_they_do_not_edit_is_named(live, served, model, policy_id):
+    """B4. west is made an editor of the dashboard analyst built, not of its charts: west's Edit changes nothing and
+    names both charts, since every chart is asked first. analyst then makes west an editor of the bar alone: west's
+    Remove, sent the charts the list showed, moves the bar to Superset's trash and takes the pie off the dashboard,
+    naming it; the measure is gone from the list. The pie is removed as the test ends."""
+    _, plan = _policy_charts(policy_id)
+    run = run_build(live, served, model, plan, "second-editor", goal="policies counted twice")
+    assert_ran_to_the_end(run)
+    dashboard_id = run.final["dashboard_id"]
+    ids = _built_charts(run, plan)
+    _publish(live, dashboard_id)
+    set_editors(live, dashboard_id, [BUILDER, "west"])
+    body = {"label": "Counted policies", "expression": "COUNT(DISTINCT id)", "kind": "count"}
+    edit = _act(live, served, "west", dashboard_id, "counted_policies", "edit", body)
+    assert edit.status_code == 200, edit.text[:400]
+    assert edit.json()["changed"] == [] and sorted(e["chart_id"] for e in edit.json()["not_editor"]) == sorted(
+        ids.values())
+    assert chart_metrics(stored_chart(ids["counted_by_region"])["params"])[0]["sqlExpression"] == "COUNT(id)"
+    _chart_editors(live, ids["counted_by_region"], [BUILDER, "west"])
+    listed = _measures(live, served, "west", dashboard_id).json()["measures"]
+    shown = [chart["chart_id"] for chart in listed[0]["charts"]]
+    removed = _act(live, served, "west", dashboard_id, "counted_policies", "remove", {"chart_ids": shown})
+    assert removed.status_code == 200, removed.text[:400]
+    assert removed.json()["changed"] == [ids["counted_by_region"]]
+    assert [e["chart_id"] for e in removed.json()["not_editor"]] == [ids["counted_by_status"]]
+    assert stored_chart(ids["counted_by_region"])["deleted_at"] is not None
+    assert stored_chart(ids["counted_by_status"])["deleted_at"] is None
+    members = {row[0] for row in metadata("SELECT slice_id FROM dashboard_slices WHERE dashboard_id = %s",
+                                          (dashboard_id,))}
+    assert ids["counted_by_status"] not in members
+    assert _measures(live, served, BUILDER, dashboard_id).json()["measures"] == []
+    as_user(live, BUILDER).call("delete_chart", {"identifier": ids["counted_by_status"]})
+    observe("second-editor", dashboard_id=dashboard_id, message=removed.json()["message"])
+
+
+def test_a_hand_type_change_survives_show_daily_instead_of_monthly(live, served, model, policy_id):
+    """B5. A monthly line analyst built, made a bar by hand (`patch_chart` with `viz_type`, as Explore's type
+    picker saves it); then "show daily instead of monthly", read by the profile's interpreter (a fake here: the
+    model is not asked) as the grain alone, is sent through the changes route. Superset then holds the chart as a
+    bar at the daily grain, and its saved query context answers by day."""
+    from mnemiq.superset.chart_change import ChartChange, FakeInterpreter, Interpretation
+
+    counted = Measure(name="monthly_policies", label="Monthly policies", expression="COUNT(id)",
+                      kind=MeasureKind.COUNT, dataset_id=policy_id, description="Policies by month", asked_by="")
+    line = ChartSpec(key="policies_by_month", family=Family.LINE, title="Policies by month", dataset_id=policy_id,
+                     measures=(WrittenRef(counted),), dimensions=(), time_column="issued", time_grain="P1M",
+                     filters=(), row_limit=None, source=None, target=None)
+    plan = BuildPlan(charts=(line,), measures=(counted,))
+    run = run_build(live, served, model, plan, "hand-type-survives", goal="policies by month")
+    assert_ran_to_the_end(run)
+    dashboard_id = run.final["dashboard_id"]
+    [chart_id] = _built_charts(run, plan).values()
+    builder = as_user(live, BUILDER)
+    info = builder.call("get_chart_info", {"identifier": chart_id, "select_columns": ["id", "changed_on"]})
+    assert builder.call(TOOL_PREFIX + "patch_chart", {"chart_id": chart_id, "set": {"viz_type": "echarts_timeseries_bar"},
+                                                       "expect_changed_on": info["changed_on"]}) == {"ok": True}
+    served.runtime.profiles[served.runtime.default_profile].interpreter = FakeInterpreter(Interpretation(
+        changes=(ChartChange(chart_id=chart_id, set={"time_grain_sqla": "P1D"}),)))
+    answer = served.client.post(f"/v1/superset/dashboards/{dashboard_id}/changes",
+                                json={"request": "show daily instead of monthly"},
+                                headers=bearer(live.minted(BUILDER, "build")))
+    assert answer.status_code == 200, answer.text[:400]
+    assert answer.json()["changed"] == [chart_id], answer.json()
+    stored = stored_chart(chart_id)
+    assert stored["viz_type"] == "echarts_timeseries_bar" and stored["params"]["time_grain_sqla"] == "P1D"
+    data = builder.call("get_chart_data", {"identifier": chart_id})
+    days = ground_truth(live, "SELECT count(DISTINCT date_trunc('day', issued)) FROM policy")[0][0]
+    assert len(data.get("data") or []) == days, (len(data.get("data") or []), days)
+    observe("hand-type-survives", chart_id=chart_id, rows=len(data.get("data") or []))
+
+
+def test_a_goal_built_onto_its_own_dashboard_builds_nothing(live, served, model, policy_id):
+    """Task 13a on rc2: the two-chart goal analyst built, asked again onto the dashboard it made, is answered as
+    `shown`, naming both charts, and nothing is kept or made. This holds mnemiq's reading of a planned chart to what
+    rc2's MCP mapping saved (row limits, grouping, metrics)."""
+    _, plan = _policy_charts(policy_id)
+    run = run_build(live, served, model, plan, "onto-its-own", goal="policies counted thrice")
+    assert_ran_to_the_end(run)
+    dashboard_id = run.final["dashboard_id"]
+    ids = _built_charts(run, plan)
+    builds, made = served.builds(), made_by(BUILDER)
+    served.plan_with(plan)
+    again = served.client.post("/v1/superset/builds", json={"goal": "policies counted thrice",
+                                                             "dashboard_id": dashboard_id},
+                               headers=bearer(live.minted(BUILDER, "build")))
+    assert again.status_code == 200, again.text[:400]
+    shown = again.json()["shown"]
+    assert [left["chart_id"] for left in shown["left_out"]] == [ids["counted_by_region"], ids["counted_by_status"]]
+    assert served.builds() == builds and made_by(BUILDER) == made
+    observe("onto-its-own", dashboard_id=dashboard_id, message=shown["message"])

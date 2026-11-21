@@ -285,7 +285,8 @@ still to come. In short:
     needs a large window.
   - `POST /v1/superset/builds/{id}/next` runs the build's next step.
   - `GET /v1/superset/builds/{id}` reads the build as it stands.
-- **A dashboard's measures**, for any editor of the dashboard.
+- **A dashboard's measures**, for any editor of the dashboard, each route asked with a token minted for building:
+  the list reads the dashboard's layout and charts, which a token minted for asking cannot (a 403 naming the scopes).
   - `GET /v1/superset/dashboards/{id}/measures` lists the measures mnemiq keeps for the dashboard: each definition,
     the charts on the dashboard that show it (by id and title, with each one's last check), and its value, computed
     then as the person asking and kept nowhere. On a physical dataset the value is mnemiq's own statement, run through

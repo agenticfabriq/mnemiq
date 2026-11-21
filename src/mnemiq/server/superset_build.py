@@ -39,7 +39,8 @@ read once per request. The `GET` calls nothing.
 under, picked again at every step as `/v1/ask` picks one: a profile gone or no longer offered to the builder refuses
 the step (422) before Superset is asked anything.
 
-**A dashboard's measures.** `GET /v1/superset/dashboards/{id}/measures` needs `db.read` only; each action
+**A dashboard's measures.** `GET /v1/superset/dashboards/{id}/measures` needs `db.read` and Superset's read scopes
+for the dashboard's layout and charts (`READ_SCOPES`), which a token minted for building carries; each action
 (`POST .../measures/{name}/edit`, `remove`, `save`) needs the write scopes too, and is asked only once Superset said the
 person edits the dashboard, as a build onto it is. A measure as `_measure` writes it, an action's outcome as `_result`
 writes it.
@@ -87,7 +88,7 @@ from mnemiq.superset.measure_actions import DashboardUnreadable as _MeasuresUnre
 from mnemiq.superset.measures import MAX_LABEL, MeasureKind
 from mnemiq.superset.planner import MAX_GOAL, BuildPlan, PlanContext, PlanRefused, plan_build
 
-__all__ = ["WRITE_SCOPES", "mount_superset_build"]
+__all__ = ["READ_SCOPES", "WRITE_SCOPES", "mount_superset_build"]
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,10 @@ logger = logging.getLogger(__name__)
 # Superset's metadata, never the source database, so no mnemiq scope of their own.
 WRITE_SCOPES = ("superset:chart:write", "superset:dashboard:write", "superset:dataset:write")
 _NEEDED = ("db.read", *WRITE_SCOPES)
+# What reading a dashboard's measures needs beside `db.read`: Superset's own scopes for its layout and its charts,
+# which a token Superset mints for building carries and one minted for asking does not.
+READ_SCOPES = ("superset:chart:read", "superset:dashboard:read")
+_NEEDED_TO_READ = ("db.read", *READ_SCOPES)
 
 NO_DELEGATION = ("Superset mode builds as the person whose verified token each request carries, and this request "
                  "carries none")
@@ -275,14 +280,16 @@ def _refused_plan(plan: PlanRefused) -> dict:
                                                          for part in plan.parts]}}
 
 
-def _builder(asking, *, building: bool):
+def _builder(asking, *, building: bool, reading: bool = False):
     """The verified caller and their delegated token, or the refusal: no token (401), or, for a route that builds, a
-    token that lacks a write scope (403)."""
+    token that lacks a write scope (403), and for one that reads a dashboard's charts, one that lacks a read scope."""
     delegation = asking.handed.get("delegation")
     if delegation is None:
         raise SupersetCredentialMissing(NO_DELEGATION)
     if building and not set(WRITE_SCOPES) <= asking.scopes:
         raise NotForBuilding(_NEEDED)
+    if reading and not set(READ_SCOPES) <= asking.scopes:
+        raise NotForBuilding(_NEEDED_TO_READ)
     return asking.identity, delegation
 
 
@@ -422,7 +429,7 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
     def asking(asking_, dashboard_id: int, *, changing: bool) -> Asking:
         """Who asks about dashboard `dashboard_id`, once Superset said they may build and, for a change, that they
         edit the dashboard (its editors named when they do not)."""
-        who, delegation = _builder(asking_, building=changing)
+        who, delegation = _builder(asking_, building=changing, reading=True)
         builds = kept()
         profile = runtime.build_profile(None, who)
         adapter = superset_executor(deployment, delegation)
