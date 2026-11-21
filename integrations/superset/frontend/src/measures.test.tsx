@@ -2,7 +2,7 @@ import React from "react";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PanelApi } from "./api";
-import { measureValueText, type MeasureItem } from "./measures";
+import { measureValueText, valueBasisText, type MeasureItem } from "./measures";
 import { Measures } from "./views/Measures";
 import { getSnapshot, resetStore } from "./store";
 
@@ -53,6 +53,29 @@ describe("measureValueText", () => {
   });
 });
 
+describe("valueBasisText", () => {
+  it("says a computed value covers every readable row", () => {
+    expect(valueBasisText(measure({ value_basis: "readable_rows", value_chart_id: null })))
+      .toBe("Over every row you can read, before any chart's filters.");
+  });
+
+  it("names the chart a value was read from, by title or by id", () => {
+    expect(valueBasisText(measure({ value_basis: "chart", value_chart_id: 101 })))
+      .toBe("As Open claims shows it, with that chart's filters.");
+    expect(valueBasisText(measure({ value_basis: "chart", value_chart_id: 999 })))
+      .toBe("As chart 999 shows it, with that chart's filters.");
+  });
+
+  it("says nothing without a value, or when mnemiq does not say", () => {
+    expect(valueBasisText(measure({ value: null, value_note: "why", value_basis: null }))).toBeNull();
+    // No value says nothing of what it covers, even were mnemiq to send a basis with it.
+    expect(valueBasisText(measure({ value: null, value_note: "why", value_basis: "readable_rows" }))).toBeNull();
+    expect(valueBasisText(measure({}))).toBeNull(); // an older mnemiq: no value_basis at all
+    expect(valueBasisText(measure({ value_basis: "later" as never }))).toBeNull();
+    expect(valueBasisText(measure({ value_basis: "chart", value_chart_id: null }))).toBeNull();
+  });
+});
+
 describe("the dashboard's measures", () => {
   it("values are read each time the section opens, never reused", async () => {
     let value = 412;
@@ -66,6 +89,19 @@ describe("the dashboard's measures", () => {
     open();
     await screen.findByText("413");
     expect(calls.filter((c) => c.path === LIST)).toHaveLength(2);
+  });
+
+  it("a value says what it covers, and a measure with no value says nothing of it", async () => {
+    const { api } = server({ [`GET ${LIST}`]: () => json(200, { measures: [
+      measure({ value_basis: "readable_rows", value_chart_id: null }),
+      measure({ name: "claimed", label: "Claimed", value: null, value_note: "Superset refused this query",
+        value_basis: null, value_chart_id: null })] }) });
+    render(<Measures api={api} dashboardId={7} />);
+    open();
+    const [covered, valueless] = await screen.findAllByRole("listitem");
+    expect(within(covered).getByText("Over every row you can read, before any chart's filters.")).toBeTruthy();
+    expect(valueless.textContent).toContain("Superset refused this query");
+    expect(valueless.textContent).not.toContain("before any chart's filters");
   });
 
   it("a measure with no value says so in the list", async () => {
