@@ -14,13 +14,16 @@ export type PageContext = { page: Page; dashboard: DashboardContext | null };
 // superset-frontend/src/utils/getBootstrapData.ts): slash-led segments, no `.` or `..` segment.
 const APP_ROOT_PATH_RE = /^(?:\/[\w~%-]+(?:\.[\w~%-]+)*)*$/;
 
-/** The application root Superset serves under, read from `#app`'s `data-bootstrap` as rc2 reads it, or "" when there
- * is none or it does not have the shape rc2 keeps. */
+/** The application root Superset serves under, read from `#app`'s `data-bootstrap` as rc2 reads it (one trailing
+ * slash dropped, `normalizePathWithFallback`, then the shape checked), or "" when there is none or it does not have the
+ * shape rc2 keeps. */
 export function appRootFrom(bootstrap: string | null): string {
   if (!bootstrap) return "";
   try {
     const root = (JSON.parse(bootstrap) as { common?: { application_root?: unknown } })?.common?.application_root;
-    return typeof root === "string" && APP_ROOT_PATH_RE.test(root) ? root : "";
+    if (typeof root !== "string") return "";
+    const trimmed = root.replace(/\/$/, "");
+    return APP_ROOT_PATH_RE.test(trimmed) ? trimmed : "";
   } catch {
     return "";
   }
@@ -43,6 +46,25 @@ export function dashboardRefOf(pathname: string, appRoot: string): string | null
 }
 
 type Options = { appRoot?: string; fetchFn?: typeof fetch };
+
+/** The dashboard `ref` as Superset answers it to this person (`GET <root>/api/v1/dashboard/<ref>`, same origin): its id
+ * and title, or not readable when Superset will not show it (403, 404) or cannot be asked. */
+export async function resolveDashboard(root: string, ref: string, fetchFn?: typeof fetch): Promise<DashboardContext> {
+  const unreadable = { ref, id: null, title: null, readable: false };
+  const ask = fetchFn ?? ((...args: Parameters<typeof fetch>) => fetch(...args));
+  try {
+    const response = await ask(`${root}/api/v1/dashboard/${encodeURIComponent(ref)}`, { credentials: "same-origin",
+      redirect: "manual", headers: { Accept: "application/json" } });
+    if (!response.ok) return unreadable;
+    const result = ((await response.json()) as { result?: { id?: unknown; dashboard_title?: unknown } })?.result;
+    return typeof result?.id === "number"
+      ? { ref, id: result.id, title: typeof result.dashboard_title === "string" ? result.dashboard_title : null,
+          readable: true }
+      : unreadable;
+  } catch {
+    return unreadable;
+  }
+}
 
 /** The page on screen and, on a dashboard, which one: its ref, then its id and title as Superset answers them to
  * this person (`GET <root>/api/v1/dashboard/<ref>`, same origin). A dashboard Superset will not show them (403, 404)
@@ -73,19 +95,7 @@ export function usePageContext({ appRoot, fetchFn }: Options = {}): PageContext 
   useEffect(() => {
     if (ref === null) return;
     let current = true;
-    const ask = fetchFn ?? ((...args: Parameters<typeof fetch>) => fetch(...args));
-    ask(`${root}/api/v1/dashboard/${encodeURIComponent(ref)}`, { credentials: "same-origin", redirect: "manual",
-      headers: { Accept: "application/json" } })
-      .then(async (response) => {
-        if (!response.ok) return { ref, id: null, title: null, readable: false };
-        const result = ((await response.json()) as { result?: { id?: unknown; dashboard_title?: unknown } })?.result;
-        return typeof result?.id === "number"
-          ? { ref, id: result.id, title: typeof result.dashboard_title === "string" ? result.dashboard_title : null,
-              readable: true }
-          : { ref, id: null, title: null, readable: false };
-      })
-      .catch(() => ({ ref, id: null, title: null, readable: false }))
-      .then((found) => current && setResolved(found));
+    void resolveDashboard(root, ref, fetchFn).then((found) => current && setResolved(found));
     return () => {
       current = false;
     };

@@ -1,5 +1,5 @@
 import React, { useSyncExternalStore, type CSSProperties } from "react";
-import { Alert, Button, Typography, theme } from "antd";
+import { Alert, Button, Spin, Typography, theme } from "antd";
 import { CHECK_WORDS, driver, type BuildRecord, type BuildView, type StepView } from "../build";
 import { pageAppRoot } from "../page";
 import { getSnapshot, subscribe } from "../store";
@@ -9,7 +9,7 @@ const STEP_WORDS: Record<string, string> = { pending: "to do", done: "done", fai
 
 /** A step's name for the person: a chart by its planned title, the others by what they make. */
 function stepName(step: StepView, view: BuildView): string {
-  if (step.kind === "chart") return view.plan?.charts.find((chart) => chart.key === step.key)?.title ?? step.key;
+  if (step.kind === "chart") return view.plan?.charts?.find((chart) => chart.key === step.key)?.title ?? step.key;
   if (step.kind === "dataset") return `Dataset ${step.key}`;
   if (step.kind === "dashboard") return "Dashboard";
   if (step.kind === "layout") return "Layout";
@@ -22,7 +22,7 @@ const dashboardUrl = (id: number) => `${pageAppRoot()}/dashboard/${id}/`;
 /** The build the panel shows: the goal; the plan; the steps; each chart's check; mnemiq's message; and, once it is
  * done, where to see it. A start that offered, refused or found the goal shown says so, with its answers. */
 export function BuildCard({ onScreenId = null }: { onScreenId?: number | null }) {
-  const { build } = useSyncExternalStore(subscribe, getSnapshot);
+  const { build, planning } = useSyncExternalStore(subscribe, getSnapshot);
   const { token } = theme.useToken();
   if (build === null) return null;
   const muted: CSSProperties = { color: token.colorTextSecondary };
@@ -30,6 +30,9 @@ export function BuildCard({ onScreenId = null }: { onScreenId?: number | null })
     <section aria-label="Build" style={{ display: "flex", flexDirection: "column", gap: token.paddingXS,
       padding: token.paddingSM, border: `1px solid ${token.colorBorderSecondary}`, borderRadius: token.borderRadius }}>
       <Typography.Text strong>{build.goal}</Typography.Text>
+      {planning && build.answer === null ? (
+        <div role="status" aria-label="Planning" style={muted}><Spin size="small" /> Planning the dashboard</div>
+      ) : null}
       <Answer build={build} muted={muted} />
       {build.view ? <Progress view={build.view} muted={muted} onScreenId={onScreenId} /> : null}
       {build.stopped && !("failed" in (build.answer ?? {})) ? <Alert type="warning" showIcon message={build.stopped} /> : null}
@@ -75,6 +78,9 @@ function Answer({ build, muted }: { build: BuildRecord; muted: CSSProperties }) 
       </div>
     );
   }
+  if (!("shown" in answer) || typeof answer.shown?.message !== "string") {
+    return <Alert type="warning" showIcon message="mnemiq answered this goal in a way this panel does not read; update the panel or mnemiq." />;
+  }
   return (
     <div>
       <span>{answer.shown.message}</span>
@@ -87,15 +93,18 @@ function Answer({ build, muted }: { build: BuildRecord; muted: CSSProperties }) 
 
 function Progress({ view, muted, onScreenId }: { view: BuildView; muted: CSSProperties; onScreenId: number | null }) {
   const { token } = theme.useToken();
+  // A mnemiq older than the panel may leave out a field: each is read as absent, never as an error.
+  const checks = view.checks ?? {};
+  const reasons = view.check_reasons ?? {};
   const charts = view.steps.filter((step) => step.kind === "chart" && step.object_id !== null
-    && view.checks[String(step.object_id)] !== undefined);
+    && checks[String(step.object_id)] !== undefined);
   return (
     <>
-      {view.plan ? (
+      {view.plan?.charts ? (
         <section aria-label="Plan" style={muted}>
           {view.plan.charts.map((chart) => (
             <div key={chart.key}>
-              {chart.title} <span>({chart.family}{chart.measures.length ? `: ${chart.measures.join(", ")}` : ""})</span>
+              {chart.title} <span>({chart.family}{chart.measures?.length ? `: ${chart.measures.join(", ")}` : ""})</span>
             </div>
           ))}
         </section>
@@ -109,13 +118,13 @@ function Progress({ view, muted, onScreenId }: { view: BuildView; muted: CSSProp
         <section aria-label="Checks" style={{ display: "flex", flexDirection: "column", gap: 2 }}>
           {charts.map((step) => {
             const id = String(step.object_id);
-            const status = view.checks[id] as keyof typeof CHECK_WORDS;
-            const reason = view.check_reasons[id];
+            const status = checks[id] as keyof typeof CHECK_WORDS;
+            const reason = reasons[id];
             return (
               <div key={id}>
                 {stepName(step, view)}:{" "}
                 <span style={{ color: status === "checked" ? token.colorSuccess : token.colorWarning }}>
-                  {CHECK_WORDS[status] ?? view.checks[id]}
+                  {CHECK_WORDS[status] ?? checks[id]}
                 </span>
                 {reason ? <span style={muted}> ({reason})</span> : null}
               </div>

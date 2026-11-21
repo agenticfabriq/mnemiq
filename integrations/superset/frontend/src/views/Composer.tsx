@@ -5,7 +5,8 @@ export type ComposerMode = "ask" | "build";
 
 type Props = {
   busy: { ask: boolean; build: boolean };
-  /** The dashboard on screen, when the person may read it: a Build goes onto it unless "New dashboard" is ticked. */
+  /** The dashboard on screen, when the person may read it: a Build goes onto it unless "New dashboard" is ticked.
+   * `onBuild`'s second argument is that tick. */
   onDashboard: string | null;
   onAsk: (text: string) => boolean;
   onBuild: (goal: string, fresh: boolean) => boolean;
@@ -22,7 +23,8 @@ export function Composer({ busy, onDashboard, onAsk, onBuild }: Props) {
   const send = () => {
     const said = text.trim();
     if (!said || blocked) return;
-    if (mode === "ask" ? onAsk(said) : onBuild(said, fresh || onDashboard === null)) setText("");
+    // "New dashboard" is offered, and so counts, only on a dashboard; off one the goal is sent with neither.
+    if (mode === "ask" ? onAsk(said) : onBuild(said, fresh && onDashboard !== null)) setText("");
   };
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: token.paddingXS }}>

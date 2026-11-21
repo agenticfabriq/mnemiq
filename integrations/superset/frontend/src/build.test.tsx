@@ -5,7 +5,7 @@ import { host } from "./test/core";
 import { PanelApi } from "./api";
 import { BuildDriver, CHECK_WORDS, driver, resetBuilds, type BuildView, type PlanSummary } from "./build";
 import { BuildCard } from "./views/BuildCard";
-import { getSnapshot, resetStore } from "./store";
+import { getSnapshot, resetStore, update } from "./store";
 import { resetAsking } from "./ask";
 import { resetDismissed } from "./views/Unfinished";
 
@@ -283,6 +283,8 @@ describe("finishing and the page", () => {
   });
 
   it("nothing the panel holds is written to browser storage", async () => {
+    const FINISHED = "1a2b3c4d-0000-4000-8000-000000000003";
+    let finishing = false;
     const touched: string[] = [];
     for (const [name, storage] of [["localStorage", window.localStorage], ["sessionStorage", window.sessionStorage]] as const) {
       for (const method of ["getItem", "setItem", "removeItem", "clear", "key"] as const) {
@@ -303,7 +305,12 @@ describe("finishing and the page", () => {
       "POST /chat": () => new Response(chat, { status: 200, headers: { "content-type": "text/event-stream" } }),
       "POST /superset/builds": () => json(201, { build: view(0) }),
       [`POST /superset/builds/${BUILD_ID}/next`]: stepping(),
-      "GET /superset/builds": () => json(200, { builds: [] }),
+      "GET /superset/builds": () => json(200, { builds: finishing ? [{ build_id: FINISHED, goal: "claims by region",
+        dashboard_id: 7, status: "building", created_at: "x", updated_at: "y", steps_done: 2, steps_total: 5 }] : [] }),
+      [`POST /superset/builds/${FINISHED}/next`]: (() => {
+        let done = 2;
+        return () => json(200, { build: view(++done, { build_id: FINISHED }) });
+      })(),
     });
     vi.stubGlobal("fetch", fetchFn);
     const { Panel } = await import("./Panel");
@@ -312,8 +319,185 @@ describe("finishing and the page", () => {
     await vi.waitFor(() => expect(getSnapshot().turns.at(-1)?.status).toBe("complete"));
     await act(async () => { await driver.start("open claims", { dashboardId: 7 }); });
     await vi.waitFor(() => expect(getSnapshot().build?.view?.status).toBe("done"));
-    await act(async () => { await driver.run(BUILD_ID); });
+    // A Finish, through the banner: the list now holds a stopped build.
+    finishing = true;
+    cleanup();
+    render(<Panel />);
+    const banner = await screen.findByRole("status", { name: "Unfinished build" });
+    fireEvent.click(within(banner).getByRole("button", { name: "Finish" }));
+    await vi.waitFor(() => expect(getSnapshot().build?.view?.status).toBe("done"));
     expect(touched).toEqual([]);
     vi.restoreAllMocks();
+  });
+});
+
+/** The panel on `path`, mnemiq and Superset answering as `handlers` say, once it shows the composer. */
+async function inPanel(path: string, handlers: Record<string, Handler>) {
+  history.replaceState(null, "", path);
+  host.navigate(path.startsWith("/dashboard/") ? "dashboard" : "chart_list");
+  const served = server({
+    "GET /schema": () => json(200, { tables: [], starters: [] }),
+    "GET /superset/builds": () => json(200, { builds: [] }),
+    ...handlers,
+  });
+  vi.stubGlobal("fetch", served.fetchFn);
+  const { Panel } = await import("./Panel");
+  render(<Panel />);
+  await screen.findByRole("textbox");
+  return served;
+}
+
+/** Sends `goal` with Build, from the composer, "New dashboard" ticked when `fresh`. */
+function sendBuild(goal: string, { fresh = false } = {}) {
+  fireEvent.click(screen.getByText("Build", { exact: true }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Describe the dashboard" }), { target: { value: goal } });
+  if (fresh) fireEvent.click(screen.getByRole("checkbox", { name: "New dashboard" }));
+  fireEvent.click(screen.getByRole("button", { name: "Build" }));
+}
+
+const starts = (calls: Call[]) => calls.filter((c) => c.method === "POST" && c.path === "/superset/builds");
+const DASHBOARDS: Record<string, Handler> = {
+  "GET /api/v1/dashboard/1": () => json(200, { id: 1, result: { id: 1, dashboard_title: "One" } }),
+  "GET /api/v1/dashboard/2": () => json(200, { id: 2, result: { id: 2, dashboard_title: "Two" } }),
+  "GET /api/v1/dashboard/9": () => json(403, { message: "Forbidden" }),
+};
+
+describe("building from the composer", () => {
+  it("Build sends what the composer says: neither off a dashboard, the dashboard on screen on one, fresh when ticked", async () => {
+    const answered: Handler = () => json(200, { offer: { dashboard_id: 12, title: "Claims", reason: null, message: "covered" } });
+    const off = await inPanel("/chart/list/", { "POST /superset/builds": answered });
+    sendBuild("open claims");
+    await vi.waitFor(() => expect(starts(off.calls)).toHaveLength(1));
+    expect(starts(off.calls)[0].body).toEqual({ goal: "open claims" });
+    expect(await screen.findByRole("button", { name: "Add these charts to it" })).toBeTruthy();
+    cleanup();
+    resetStore();
+    const on = await inPanel("/dashboard/1/", { ...DASHBOARDS, "POST /superset/builds": answered });
+    await screen.findByRole("region", { name: "This dashboard" });
+    sendBuild("open claims");
+    await vi.waitFor(() => expect(starts(on.calls)).toHaveLength(1));
+    expect(starts(on.calls)[0].body).toEqual({ goal: "open claims", dashboard_id: 1 });
+    cleanup();
+    resetStore();
+    const ticked = await inPanel("/dashboard/1/", { ...DASHBOARDS, "POST /superset/builds": answered });
+    await screen.findByRole("region", { name: "This dashboard" });
+    sendBuild("open claims", { fresh: true });
+    await vi.waitFor(() => expect(starts(ticked.calls)).toHaveLength(1));
+    expect(starts(ticked.calls)[0].body).toEqual({ goal: "open claims", fresh: true });
+  });
+
+  it("a Build goes to the dashboard on screen when it is sent, before the page context has caught up", async () => {
+    let release = () => {};
+    const held = new Promise<void>((done) => { release = done; });
+    const served = await inPanel("/dashboard/1/", {
+      ...DASHBOARDS,
+      "GET /api/v1/dashboard/2": async () => { await held; return json(200, { id: 2, result: { id: 2, dashboard_title: "Two" } }); },
+      "POST /superset/builds": () => json(200, { refused: { reason: "nothing to plan", parts: [] } }),
+    });
+    await screen.findByRole("region", { name: "This dashboard" });
+    // Superset moves to dashboard 2 with no page event, and the panel has not read the path again yet.
+    history.pushState(null, "", "/dashboard/2/");
+    sendBuild("open claims");
+    await new Promise((done) => setTimeout(done, 30));
+    expect(starts(served.calls)).toEqual([]);
+    release();
+    await vi.waitFor(() => expect(starts(served.calls)).toHaveLength(1));
+    expect(starts(served.calls)[0].body).toEqual({ goal: "open claims", dashboard_id: 2 });
+  });
+
+  it("a Build on a dashboard the person cannot read is planned as one off a dashboard, naming nothing", async () => {
+    const served = await inPanel("/dashboard/9/", { ...DASHBOARDS,
+      "POST /superset/builds": () => json(200, { refused: { reason: "nothing to plan", parts: [] } }) });
+    sendBuild("open claims");
+    await vi.waitFor(() => expect(starts(served.calls)).toHaveLength(1));
+    expect(starts(served.calls)[0].body).toEqual({ goal: "open claims" });
+  });
+});
+
+describe("one build at a time", () => {
+  it("a second start while one plans sends nothing and leaves the card as it was", async () => {
+    let release = () => {};
+    const held = new Promise<void>((done) => { release = done; });
+    const { fetchFn, calls } = server({
+      "POST /superset/builds": async () => { await held; return json(201, { build: view(0) }); },
+      [`POST /superset/builds/${BUILD_ID}/next`]: stepping(),
+    });
+    driver.attach(api(fetchFn));
+    const first = driver.start("goal A", {});
+    render(<BuildCard />);
+    expect(screen.getByRole("status", { name: "Planning" })).toBeTruthy();
+    expect(await driver.start("goal B", {})).toEqual({ failed: expect.stringMatching(/already/i) });
+    expect(getSnapshot().build?.goal).toBe("goal A");
+    release();
+    await first;
+    await vi.waitFor(() => expect(getSnapshot().build?.view?.status).toBe("done"));
+    expect(starts(calls)).toHaveLength(1);
+    expect(getSnapshot().build?.goal).toBe("goal A");
+  });
+
+  it("Finish is refused while another build runs, and the card is unchanged", async () => {
+    const OTHER = "1a2b3c4d-0000-4000-8000-000000000002";
+    let release = () => {};
+    const held = new Promise<void>((done) => { release = done; });
+    const next = stepping();
+    const served = await inPanel("/chart/list/", {
+      "POST /superset/builds": () => json(201, { build: view(0) }),
+      [`POST /superset/builds/${BUILD_ID}/next`]: async () => { await held; return next(); },
+      "GET /superset/builds": () => json(200, { builds: [{ build_id: OTHER, goal: "goal X", dashboard_id: null,
+        status: "building", created_at: "x", updated_at: "y", steps_done: 1, steps_total: 5 }] }),
+    });
+    await act(async () => { await driver.start("goal A", {}); });
+    const banner = await screen.findByRole("status", { name: "Unfinished build" });
+    expect((within(banner).getByRole("button", { name: "Finish" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(driver.resume("goal X", {}, OTHER)).toBe(false);
+    expect(getSnapshot().build?.goal).toBe("goal A");
+    release();
+    await vi.waitFor(() => expect(getSnapshot().build?.view?.status).toBe("done"));
+    expect(served.calls.filter((c) => c.path === `/superset/builds/${OTHER}/next`)).toEqual([]);
+    expect(getSnapshot().build?.goal).toBe("goal A");
+  });
+});
+
+describe("steps that do not move", () => {
+  it("a step that made no progress waits like a busy one, then stops with mnemiq's message", async () => {
+    const waits: number[] = [];
+    let answers = 0;
+    const stuck = view(1, { message: "Superset was busy; the step will be tried again" });
+    stuck.steps[1] = { ...stuck.steps[1], status: "uncertain" };
+    const { fetchFn, calls } = server({
+      // One step moves, then none does: mnemiq leaves the chart's step uncertain each time.
+      [`POST /superset/builds/${BUILD_ID}/next`]: () => json(200, { build: ++answers === 1 ? view(1) : stuck }),
+    });
+    const building = new BuildDriver({ sleep: async (ms) => { waits.push(ms); } });
+    building.attach(api(fetchFn));
+    building.show("open claims", {}, view(0), BUILD_ID);
+    await building.run(BUILD_ID);
+    expect(waits).toEqual([2000, 4000, 8000, 16000, 16000]);
+    expect(nexts(calls)).toHaveLength(7);
+    expect(getSnapshot().build?.stopped).toBe("Superset was busy; the step will be tried again");
+    expect(building.running()).toBeNull();
+  });
+
+  it("an answer of a shape the panel does not read stops the build with a sentence", async () => {
+    const { fetchFn } = server({ [`POST /superset/builds/${BUILD_ID}/next`]: () => json(200, {}) });
+    const building = new BuildDriver();
+    building.attach(api(fetchFn));
+    building.show("open claims", {}, null, BUILD_ID);
+    await building.run(BUILD_ID);
+    expect(getSnapshot().build?.stopped).toMatch(/could not be read/);
+    expect(building.running()).toBeNull();
+  });
+
+  it("the card shows a build answered without its check reasons, and a start answer it does not know", () => {
+    const old = view(5) as Partial<BuildView>;
+    delete old.check_reasons;
+    act(() => { driver.show("open claims", {}, old as BuildView, BUILD_ID); });
+    render(<BuildCard />);
+    expect(screen.getByRole("region", { name: "Build" }).textContent).toContain("checked");
+    cleanup();
+    act(() => update((state) => ({ ...state, build: { goal: "x", target: {}, buildId: null, view: null, stopped: null,
+      answer: { surprise: true } as never } })));
+    render(<BuildCard />);
+    expect(screen.getByRole("region", { name: "Build" }).textContent).toMatch(/does not read/);
   });
 });

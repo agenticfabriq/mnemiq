@@ -78,4 +78,34 @@ describe("the panel's readiness", () => {
     expect(screen.queryByRole("region", { name: "This dashboard" })).toBeNull();
     expect(document.body.textContent).not.toContain("secret-board");
   });
+
+  it("reopening asks again before showing anything", async () => {
+    let refuse = false;
+    let release = () => {};
+    const held = new Promise<void>((done) => { release = done; });
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.includes("/api/v1/dashboard/")) return json(200, { id: 7, result: { id: 7, dashboard_title: "Claims" } });
+      if (url.includes("/superset/builds")) return json(200, { builds: [] });
+      if (refuse) {
+        await held;
+        return json(403, { detail: NOT_A_BUILDER });
+      }
+      return json(200, { tables: [], starters: ["How many claims are open?"] });
+    });
+    vi.stubGlobal("fetch", fetchFn);
+    const first = render(<Panel />);
+    await screen.findByRole("textbox");
+    first.unmount();
+    // The person's roles changed while the panel was closed.
+    refuse = true;
+    fetchFn.mockClear();
+    render(<Panel />);
+    await new Promise((done) => setTimeout(done, 50));
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(fetchFn.mock.calls.map((call) => (call as unknown as [string])[0]))
+      .toEqual(["/extensions/agenticfabriq/mnemiq/v1/schema"]);
+    release();
+    await screen.findByText(NOT_A_BUILDER);
+    expect(screen.queryByRole("textbox")).toBeNull();
+  });
 });

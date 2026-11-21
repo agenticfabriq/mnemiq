@@ -5,9 +5,9 @@ import { PanelApi } from "./api";
 import { askInPanel } from "./ask";
 import { driver } from "./build";
 import { isRunning } from "./shared";
-import { pageAppRoot, usePageContext } from "./page";
-import { probe } from "./readiness";
-import { getSnapshot, subscribe, update } from "./store";
+import { dashboardRefOf, pageAppRoot, resolveDashboard, usePageContext } from "./page";
+import { probe, type Readiness } from "./readiness";
+import { getSnapshot, subscribe } from "./store";
 import { BuildCard } from "./views/BuildCard";
 import { Composer } from "./views/Composer";
 import { Conversation } from "./views/Conversation";
@@ -57,14 +57,15 @@ function usePanelApi(): PanelApi {
   return useMemo(() => new PanelApi(pageAppRoot(), () => authentication.getCSRFToken()), []);
 }
 
-/** What the person may do here, asked once per opening; until mnemiq says they are ready, nothing else is asked. */
+/** What the person may do here, asked on each opening; until this opening's answer says they are ready, nothing else
+ * is shown or asked (an earlier opening's answer may be out of date: their roles can change while it is closed). */
 function Body() {
   const api = usePanelApi();
-  const { readiness } = useSyncExternalStore(subscribe, getSnapshot);
+  const [readiness, setReadiness] = useState<Readiness | null>(null);
   useEffect(() => {
     const asking = new AbortController();
     probe(api, asking.signal)
-      .then((found) => update((state) => ({ ...state, readiness: found })))
+      .then((found) => setReadiness(found))
       .catch(() => {});
     return () => asking.abort();
   }, [api]);
@@ -77,16 +78,24 @@ function Body() {
  * the opening questions until the first is asked; the conversation and the build; and the composer. */
 function Ready({ api, starters }: { api: PanelApi; starters: string[] }) {
   const { dashboard } = usePageContext();
-  const { turns, runningBuild } = useSyncExternalStore(subscribe, getSnapshot);
+  const { turns, runningBuild, planning } = useSyncExternalStore(subscribe, getSnapshot);
   const { token } = theme.useToken();
   useEffect(() => driver.attach(api), [api]);
   const onScreen = dashboard?.readable && dashboard.id !== null ? dashboard : null;
   const asking = isRunning(turns);
   const ask = (question: string) => askInPanel(api, question);
-  // The target is read when the goal is sent: the dashboard on screen then, never the one the panel opened on.
+  // The target is worked out when the goal is sent, from the path on screen then (Superset moves between dashboards
+  // with no page event, so the page context may be a second behind): that dashboard, resolved as the person; a new one
+  // when ticked; and, off a dashboard or on one they cannot read, neither, so mnemiq may offer one that covers it.
   const build = (goal: string, fresh: boolean) => {
-    if (driver.running() !== null) return false;
-    void driver.start(goal, fresh || onScreen === null ? (fresh ? { fresh: true } : {}) : { dashboardId: onScreen.id! });
+    if (driver.busy()) return false;
+    const root = pageAppRoot();
+    void driver.start(goal, fresh ? { fresh: true } : async () => {
+      const ref = dashboardRefOf(window.location.pathname, root);
+      if (ref === null) return {};
+      const found = await resolveDashboard(root, ref);
+      return found.readable && found.id !== null ? { dashboardId: found.id } : {};
+    });
     return true;
   };
   return (
@@ -107,7 +116,7 @@ function Ready({ api, starters }: { api: PanelApi; starters: string[] }) {
       ) : null}
       <Conversation turns={turns} />
       <BuildCard onScreenId={onScreen?.id ?? null} />
-      <Composer busy={{ ask: asking, build: runningBuild !== null }}
+      <Composer busy={{ ask: asking, build: planning || runningBuild !== null }}
         onDashboard={onScreen ? onScreen.title ?? "this dashboard" : null} onAsk={ask} onBuild={build} />
     </div>
   );

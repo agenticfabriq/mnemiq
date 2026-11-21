@@ -4,20 +4,19 @@
 // every close (`AppContent` renders `ChatPanelHost` only while the panel is open), so what must outlive a close lives
 // here.
 import type { BuildRecord } from "./build";
-import type { Readiness } from "./readiness";
 import type { Turn } from "./shared";
 
 export type PanelState = {
   turns: Turn[];
   /** The build this page is driving, while it runs. */
   runningBuild: string | null;
-  /** What mnemiq said this person may do, the last time the panel asked. */
-  readiness: Readiness | null;
+  /** Whether a goal is being planned on this page (before its build runs). */
+  planning: boolean;
   /** The build the panel shows: the latest started or finished on this page. */
   build: BuildRecord | null;
 };
 
-const EMPTY: PanelState = { turns: [], runningBuild: null, readiness: null, build: null };
+const EMPTY: PanelState = { turns: [], runningBuild: null, planning: false, build: null };
 
 let state: PanelState = EMPTY;
 const listeners = new Set<() => void>();

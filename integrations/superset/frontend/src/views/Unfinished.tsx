@@ -22,21 +22,23 @@ export function resetDismissed(): void {
 }
 
 /** The person's builds that stopped before they were done (of the dashboard on screen, on one), each with Finish,
- * which runs it on from where it stopped, and Not now. Read again whenever this page's build stops. */
+ * which runs it on from where it stopped, and Not now. Read again whenever this page stops planning or running a
+ * build (a start that failed may still have made one). Finish waits while another build is planned or runs. */
 export function UnfinishedBuilds({ api, dashboardId }: { api: PanelApi; dashboardId: number | null }) {
-  const { runningBuild } = useSyncExternalStore(subscribe, getSnapshot);
+  const { runningBuild, planning } = useSyncExternalStore(subscribe, getSnapshot);
+  const busy = planning || runningBuild !== null;
   const [builds, setBuilds] = useState<Unfinished[]>([]);
   const [, setShown] = useState(0);
   const { token } = theme.useToken();
   useEffect(() => {
-    if (runningBuild !== null) return;
+    if (busy) return;
     const asking = new AbortController();
     const query = dashboardId !== null ? `?dashboard_id=${dashboardId}` : "";
     api.get<{ builds?: Unfinished[] }>(`/superset/builds${query}`, asking.signal)
       .then((answer) => setBuilds(answer.ok && Array.isArray(answer.body?.builds) ? answer.body.builds : []))
       .catch(() => {});
     return () => asking.abort();
-  }, [api, dashboardId, runningBuild]);
+  }, [api, dashboardId, busy]);
   const offered = builds.filter((build) => !dismissed.has(build.build_id) && build.build_id !== runningBuild);
   return (
     <>
@@ -46,9 +48,9 @@ export function UnfinishedBuilds({ api, dashboardId }: { api: PanelApi; dashboar
             borderRadius: token.borderRadius, background: token.colorWarningBg }}>
           <span>'{build.goal}' stopped after {build.steps_done} of {build.steps_total} steps</span>
           <div style={{ display: "flex", gap: 8 }}>
-            <Button size="small" type="primary" onClick={() => {
-              driver.show(build.goal, build.dashboard_id !== null ? { dashboardId: build.dashboard_id } : {}, null);
-              void driver.run(build.build_id);
+            <Button size="small" type="primary" disabled={busy} onClick={() => {
+              driver.resume(build.goal, build.dashboard_id !== null ? { dashboardId: build.dashboard_id } : {},
+                build.build_id);
             }}>Finish</Button>
             <Button size="small" onClick={() => {
               dismissed.add(build.build_id);

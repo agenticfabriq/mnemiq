@@ -174,3 +174,21 @@ describe("the composer", () => {
     expect(chats).toEqual(["How many claims are open?", "and by region?"]);
   });
 });
+
+describe("the composer's keys", () => {
+  afterEach(cleanup);
+
+  it("Enter while composing with an input method does not send", async () => {
+    const { Composer } = await import("./views/Composer");
+    const asked: string[] = [];
+    render(<Composer busy={{ ask: false, build: false }} onDashboard={null}
+      onAsk={(text) => { asked.push(text); return true; }} onBuild={() => true} />);
+    const box = screen.getByRole("textbox", { name: "Ask mnemiq" });
+    const { fireEvent } = await import("@testing-library/react");
+    fireEvent.change(box, { target: { value: "請問有多少" } });
+    fireEvent.keyDown(box, { key: "Enter", code: "Enter", keyCode: 13, isComposing: true });
+    expect(asked).toEqual([]);
+    fireEvent.keyDown(box, { key: "Enter", code: "Enter", keyCode: 13 });
+    expect(asked).toEqual(["請問有多少"]);
+  });
+});

@@ -23,6 +23,9 @@ describe("appRootFrom", () => {
   const bootstrap = (root: unknown) => JSON.stringify({ common: { application_root: root } });
   it("keeps a root of Superset's own shape and refuses anything else", () => {
     expect(appRootFrom(bootstrap("/analytics"))).toBe("/analytics");
+    // As rc2 reads it (`normalizePathWithFallback`): one trailing slash dropped before the shape is checked.
+    expect(appRootFrom(bootstrap("/analytics/"))).toBe("/analytics");
+    expect(appRootFrom(bootstrap("/"))).toBe("");
     expect(appRootFrom(bootstrap("/app/.."))).toBe("");
     expect(appRootFrom(bootstrap("javascript:x"))).toBe("");
     expect(appRootFrom(bootstrap(""))).toBe("");
