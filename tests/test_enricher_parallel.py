@@ -201,3 +201,41 @@ def test_an_interrupt_starts_no_further_calls():
     enricher = LLMEnricher(model2)
     enricher.annotate_tables(requests[:1], concurrency=2)
     assert len(enricher.annotate("t", _facts("x", 5)).columns) == 5
+
+
+def test_reusing_an_interrupted_enricher_does_not_resume_the_old_run():
+    # The stop flag belonged to the enricher, so a later call on it cleared the flag and the interrupted run's running
+    # workers went back to retrying (Codex's second review of #278: 1 call became 6). It belongs to the run now.
+    import os
+    import signal
+
+    release = threading.Event()
+
+    class Blocking(_Model):
+        def __init__(self):
+            super().__init__()
+            self.interrupted = False
+
+        def complete(self, system, user, max_tokens=512, **kw):
+            with self._lock:
+                self.prompts.append(user)
+                old = "TABLE: old" in user
+                first = old and len([p for p in self.prompts if "TABLE: old" in p]) == 1
+            if first:
+                os.kill(os.getpid(), signal.SIGINT)
+                release.wait(5)  # held until the enricher has been reused
+            if old:
+                return ""  # empty: a running chunk would retry and split if it could
+            names = _ASKED.findall(user.split("The table's other columns")[0])
+            return json.dumps({"columns": [{"name": n, "description": f"about {n}"} for n in names]})
+
+    model = Blocking()
+    enricher = LLMEnricher(model)
+    with pytest.raises(KeyboardInterrupt):
+        enricher.annotate_tables([("old0", _facts("a", 3 * CHUNK_COLUMNS), ""),
+                                  ("old1", _facts("b", 3 * CHUNK_COLUMNS), "")], concurrency=2)
+    assert len(enricher.annotate("fresh", _facts("f", 5)).columns) == 5, "the enricher works after the interrupt"
+    old_before = sum("TABLE: old" in p for p in model.prompts)
+    release.set()
+    time.sleep(0.5)
+    assert sum("TABLE: old" in p for p in model.prompts) == old_before, "the old run asked again after being reused"
