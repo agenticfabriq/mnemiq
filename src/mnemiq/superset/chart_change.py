@@ -503,8 +503,11 @@ def _recorded(change: ChartChange, planned: _Planned) -> ChartChange:
     """`change` held to what made `planned`: the keys it sets and unsets, and its filters only when the plan writes
     them. Planned again against the same chart, it plans the same."""
     filters = "adhoc_filters" in planned.to_set
+    # A chart's filters are changed through `add_filters` and `remove_filters` only: an `adhoc_filters` the model put
+    # in `set` is never settable, and its plan's `adhoc_filters` comes from the filters it adds and drops.
     return ChartChange(chart_id=change.chart_id,
-                       set={key: value for key, value in change.set.items() if key in planned.to_set},
+                       set={key: value for key, value in change.set.items()
+                            if key in planned.to_set and key != "adhoc_filters"},
                        unset=tuple(key for key in change.unset if key in planned.to_unset),
                        add_filters=tuple({"column": item.get("column"), "op": item.get("op"),
                                           "value": item.get("value")} for item in change.add_filters)
@@ -658,6 +661,10 @@ def _strict_writes(asking: Asking, preview: ChangePreview) -> tuple[list, list, 
         if _digest(planned) != edit.digest:
             return [], stale, []
         sends.append((edit, planned))
+    # Read again just before the first write: a layout changed while the charts were read stops the apply too. What
+    # is left open is the writes themselves, each of which `patch_chart` holds to its own chart's `changed_on`.
+    if _dashboard_changed_on(asking) != preview.dashboard_changed_on:
+        return [], stale, []
     changed, left, not_editor = [], [], []
     for index, (edit, planned) in enumerate(sends):
         answer = _send(asking, edit.chart_id, edit.changed_on, planned)
