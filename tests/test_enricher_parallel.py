@@ -165,3 +165,39 @@ def test_the_cli_describes_with_enrich_concurrency(monkeypatch, tmp_path):
         _cmd_enrich(settings)
     assert seen.get("concurrency") == 3
     assert Settings(sources_path=str(manifest)).enrich_concurrency == 4
+
+
+def test_an_interrupt_starts_no_further_calls():
+    # Ctrl-C reaches the waiting thread only. The pool used to wait out every queued chunk and each running chunk's
+    # retries and splits, so calls kept starting after the interrupt (Codex's review of #278: 10 after it at 2 workers).
+    # Now no queued chunk starts and no running one asks again; a call already in flight ends on the client's timeout.
+    import os
+    import signal
+
+    class Interrupting(_Model):
+        """Answers every call empty, as a model over its budget does: each chunk then retries and splits, many calls."""
+
+        def __init__(self):
+            super().__init__()
+            self.at_interrupt = None
+
+        def complete(self, system, user, max_tokens=512, **kw):
+            with self._lock:
+                self.prompts.append(user)
+                if len(self.prompts) == 3 and self.at_interrupt is None:
+                    self.at_interrupt = 3
+                    os.kill(os.getpid(), signal.SIGINT)  # a real Ctrl-C: the signal wakes the waiting thread
+            time.sleep(0.02)
+            return ""
+
+    model = Interrupting()
+    requests = [(f"t{i}", _facts(f"c{i}_", 3 * CHUNK_COLUMNS), "") for i in range(4)]
+    with pytest.raises(KeyboardInterrupt):
+        LLMEnricher(model).annotate_tables(requests, concurrency=2)
+    time.sleep(0.5)  # anything still in flight lands
+    assert len(model.prompts) - model.at_interrupt <= 2, f"{len(model.prompts)} calls, interrupted at the third"
+    # The enricher is usable afterwards, one call at a time.
+    model2 = _Model()
+    enricher = LLMEnricher(model2)
+    enricher.annotate_tables(requests[:1], concurrency=2)
+    assert len(enricher.annotate("t", _facts("x", 5)).columns) == 5
