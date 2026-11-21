@@ -8,7 +8,7 @@ The REST route is registered by importing `api`. The MCP tools register by impor
 
 import logging
 
-from agenticfabriq.mnemiq import api  # noqa: F401  (registers the token route)
+from agenticfabriq.mnemiq import api  # noqa: F401  (registers the token route and the forwarder)
 
 logger = logging.getLogger(__name__)
 

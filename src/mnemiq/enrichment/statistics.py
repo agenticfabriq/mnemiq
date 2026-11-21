@@ -68,6 +68,8 @@ def estimate_table(adapter, table: TableInfo, key_columns: set[str] | None = Non
     candidate, not per column. Excludes from code lists what the exact profile excludes: key-like names, declared
     foreign-key children (`key_columns`), sensitive names, and a column with as many values as rows; and a column
     whose statistics were gathered at another time than the table's, whose histogram can lack codes added since.
+    That time is `LAST_ANALYZED`, to the second, and nothing a reader can see names the gather: two gathers of the table
+    within one second are one time here, a residual the deployment guide states.
     `charset` is the database's character set (`database_charset`), None when unknown (see `frequency_codes`)."""
     size = adapter.table_size(table.name)
     statistics = {s.column: s for s in adapter.column_statistics(table.name)}

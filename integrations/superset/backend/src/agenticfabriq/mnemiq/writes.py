@@ -134,6 +134,12 @@ def _a_string(value: Any) -> str:
     return value
 
 
+def _a_flag(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError("not a boolean")
+    return value
+
+
 def _an_object(value: Any) -> dict:
     """A JSON object with text keys, as a copy that shares nothing with the request."""
     if not isinstance(value, Mapping) or not all(isinstance(key, str) for key in value):
@@ -215,7 +221,8 @@ REQUESTS: dict[str, dict[str, _Field]] = {
     "create_chart": {"dataset_id": _Field(_an_id), "viz_type": _Field(_one_of(EXTENSION_MADE), False),
                      "slice_name": _Field(_text(250)), "params": _Field(_an_object, False),
                      "config": _Field(_an_object, False), "set": _Field(_an_object, False),
-                     "dashboard_id": _DASHBOARD_ID, "marker": _MARKER},
+                     "leave_out_no_value": _Field(_a_flag, False, False), "dashboard_id": _DASHBOARD_ID,
+                     "marker": _MARKER},
     "patch_chart": {"chart_id": _Field(_an_id), "set": _Field(_an_object, False, {}),
                     "unset": _Field(_names, False, []), "expect_changed_on": _EXPECT_CHANGED_ON},
     "add_saved_metric": {"dataset_id": _Field(_an_id), "metric": _Field(_a_metric),
@@ -485,7 +492,7 @@ def _bound_lock_waits(session: Any) -> None:
 
 def lock_row(model: type, entity_id: int) -> Any:
     """Row `entity_id` of `model`, locked for update and refreshed to its committed state, or None when no such row is
-    visible (a row in the trash is not). A blocking `SELECT ... FOR UPDATE` of the primary-key row, so it serialises
+    visible (a row in the trash is not, unless the caller reads past the soft-delete filter). A blocking `SELECT ... FOR UPDATE` of the primary-key row, so it serialises
     against every other writer that locks the row, rc2's own dataset `PUT` included.
 
     On Postgres the wait is bounded first (`_bound_lock_waits`), until the transaction ends, which is the command's
@@ -1308,6 +1315,47 @@ def _funnel_form(found: dict) -> tuple[str, dict, dict] | dict:
     return viz_type, form_data, context
 
 
+# The chart types whose query ranks its rows by one metric under a row limit, with where that metric is in the form:
+# `metrics[0]` for a time-series chart or a table, `metric` for a pie, gauge or treemap.
+_RANKED_BY_FIRST = frozenset({"echarts_timeseries_line", "echarts_timeseries_bar", "echarts_area",
+                              "echarts_timeseries_scatter", "table"})
+_RANKED_BY_METRIC = frozenset({"pie", "gauge_chart", "treemap_v2"})
+
+
+def not_null_condition(sql: str) -> str:
+    """The SQL HAVING condition that leaves out the groups whose metric `sql` has no value. mnemiq's value check
+    recognises exactly this text (`mnemiq.superset.charts.not_null_condition`, which a test holds equal)."""
+    return f"({sql}) IS NOT NULL"
+
+
+def ranked_metric_sql(form_data: dict, dataset: Any) -> str | None:
+    """The SQL of the metric the chart's query ranks by, as the chart holds it once MCP's mapping has saved it (an ad
+    hoc metric's `sqlExpression` after rc2's own sanitising; a saved metric's expression on the dataset): None for a
+    type that ranks by no one metric, a SIMPLE metric, or a saved metric the dataset does not hold."""
+    viz_type = form_data.get("viz_type")
+    if viz_type in _RANKED_BY_FIRST:
+        metrics = form_data.get("metrics")
+        item = metrics[0] if isinstance(metrics, list) and metrics else None
+    elif viz_type in _RANKED_BY_METRIC:
+        item = form_data.get("metric")
+    else:
+        return None
+    if isinstance(item, Mapping) and item.get("expressionType") == "SQL" and isinstance(item.get("sqlExpression"), str):
+        return item["sqlExpression"].strip() or None
+    if isinstance(item, str):
+        found = [m.expression for m in getattr(dataset, "metrics", None) or [] if m.metric_name == item]
+        return found[0] if len(found) == 1 and isinstance(found[0], str) and found[0].strip() else None
+    return None
+
+
+def _having_filter(condition: str) -> dict:
+    """The SQL HAVING adhoc filter rc2's filter editor saves for `condition`, which rc2's frontend (`processFilters`)
+    and the query context (`params._filters_and_extras`) read into `extras.having`."""
+    return {"clause": "HAVING", "expressionType": "SQL", "sqlExpression": condition, "subject": None,
+            "operator": None, "comparator": None, "isExtra": False, "isNew": False,
+            "filterOptionName": "mnemiq_leave_out_no_value"}
+
+
 def _config_form(found: dict, dataset: Any) -> tuple[str, dict, dict | None] | dict:
     """MCP's chart config made into a chart as its `generate_chart` saves one: the config validated
     (`ValidationPipeline`), mapped to form data (`map_config_to_form_data`, whose warnings key is dropped), the
@@ -1331,7 +1379,12 @@ def _config_form(found: dict, dataset: Any) -> tuple[str, dict, dict | None] | d
     except ValueError:
         return {"refused": "config"}
     form_data.pop("_mcp_warnings", None)
-    form_data.update(found["set"])
+    form_data.update(found["set"] or {})
+    if found["leave_out_no_value"]:
+        ranked = ranked_metric_sql(form_data, dataset)
+        if ranked is None:
+            return {"refused": "leave_out_no_value"}
+        form_data["adhoc_filters"] = [*(form_data.get("adhoc_filters") or []), _having_filter(not_null_condition(ranked))]
     viz_type = form_data.get("viz_type")
     if not isinstance(viz_type, str) or not viz_type:
         return {"refused": "config"}
@@ -1397,7 +1450,8 @@ def create_chart(found: dict) -> dict:
     if from_config:
         shaped = found["viz_type"] is None and found["params"] is None
     else:
-        shaped = found["viz_type"] is not None and found["params"] is not None and found["set"] is None
+        shaped = found["viz_type"] is not None and found["params"] is not None and found["set"] is None \
+            and not found["leave_out_no_value"]
     if not shaped:
         return {"refused": "request"}
     if from_config and not set(found["set"] or ()) <= _CREATE_SET_KEYS:
@@ -1603,6 +1657,26 @@ def _member_chart_ids(dashboard_id: int) -> list[int]:
     return sorted(row.slice_id for row in rows)
 
 
+def _trashed_chart_ids(chart_ids: list[int]) -> list[int]:
+    """Those of `chart_ids` in the trash (`deleted_at` set). Each row is locked by `lock_row`, in id order, read past
+    rc2's soft-delete filter (`skip_visibility_filter`, the opt-out from `_add_soft_delete_filter`, both in
+    `superset/models/helpers.py`), and stays locked for the rest of the layout's transaction: a chart restored
+    (`RestoreChartCommand`) or moved to the trash meanwhile waits for the save, so the trash state read here is the one
+    its membership rebuild meets."""
+    if not chart_ids:
+        return []
+    from superset.models.helpers import skip_visibility_filter
+    from superset.models.slice import Slice
+
+    trashed = []
+    with skip_visibility_filter(_session(), Slice):
+        for chart_id in sorted(chart_ids):
+            chart = lock_row(Slice, chart_id)
+            if chart is not None and chart.deleted_at is not None:
+                trashed.append(chart_id)
+    return trashed
+
+
 def _layout(found: dict, dashboard: Any) -> dict:
     security = _security()
     if dashboard is None or not security.can_access_dashboard(dashboard):
@@ -1616,9 +1690,10 @@ def _layout(found: dict, dashboard: Any) -> dict:
     if blocked := sorted({chart_id for chart_id in added if not _readable_chart(chart_id)}):
         return {"refused": "chart_access", "chart_ids": blocked}
     current_positions = _stored_object(dashboard.position_json) or {}
+    members = _member_chart_ids(dashboard.id)
     refusal = params.check_positions(found["positions"], current_positions=current_positions,
-                                     current_chart_ids=_member_chart_ids(dashboard.id), add_chart_ids=added,
-                                     remove_chart_ids=removed)
+                                     current_chart_ids=members, add_chart_ids=added, remove_chart_ids=removed,
+                                     trashed_chart_ids=_trashed_chart_ids(members))
     if refusal is not None:
         return refusal
     metadata = params.layout_metadata(found["positions"], _stored_object(dashboard.json_metadata) or {})
@@ -1635,8 +1710,9 @@ def _layout(found: dict, dashboard: Any) -> dict:
 def set_layout(found: dict) -> dict:
     """Writes a dashboard's layout, which also sets its charts (`json_metadata.positions`, through
     `UpdateDashboardCommand`), under the dashboard's lock, once the `changed_on` the caller read is still the
-    dashboard's. The layout must hold exactly the dashboard's charts plus those added minus those removed, keep every
-    tab rc2 knows reachable under its id (`params.check_positions`), and add only charts the caller may read. The
+    dashboard's. The layout must hold exactly the dashboard's charts plus those added minus those removed (a chart in
+    the trash the stored layout no longer places aside), keep every tab rc2 knows reachable under its id
+    (`params.check_positions`), and add only charts the caller may read. The
     dashboard's native filters and the settings rc2 would otherwise reset are sent back as they are
     (`params.layout_metadata`), so no report on a filter is deactivated."""
     from superset.models.dashboard import Dashboard
