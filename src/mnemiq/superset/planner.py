@@ -343,10 +343,12 @@ column;
 - sankey, box_plot and histogram cannot show currency or percent; handlebars shows count or number only;
 - one axis shows one kind of measure.
 
-A condition that says what a written measure means (open, won, overdue, active) goes inside its expression, as \
-CASE WHEN ... THEN ... END with no ELSE on that condition, so a row it leaves out adds nothing: an ELSE 0 there is \
-counted by COUNT and averaged in by AVG. The measure then means its name on every chart and wherever it is saved; a \
-chart's filters narrow only what that chart shows. A negated condition (!=, NOT IN, NOT LIKE) also leaves out the rows \
+A condition that says which rows a written measure covers (open, won, overdue, active) goes inside its expression, \
+as CASE WHEN ... THEN ... END with no ELSE on that condition, so a row it leaves out adds nothing: an ELSE 0 there is \
+counted by COUNT and averaged in by AVG. A share keeps its own 0 for the rows it covers: a win rate among closed deals \
+is AVG(CASE WHEN closed THEN CASE WHEN won THEN 1.0 ELSE 0 END END), closed and won standing for their conditions. The \
+measure then means its name on every chart and wherever it is saved; a chart's filters narrow only what that chart \
+shows. A negated condition (!=, NOT IN, NOT LIKE) also leaves out the rows \
 where its column is NULL: where those rows belong to the measure, keep them with COALESCE or IS NULL OR. Where a chart \
 should not show the groups a measure's condition leaves out (a closed stage, shown empty), filter them out on that \
 chart as well.

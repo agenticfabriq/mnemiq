@@ -1348,6 +1348,18 @@ def test_the_prompt_keeps_a_measures_condition_in_its_expression():
     assert "at 0)" not in system
     # A negated condition also drops the NULL rows; the model is asked to keep them where they belong.
     assert "keep them with COALESCE or IS NULL OR" in system
+    # The "no ELSE" is the condition that picks the measure's rows; a share keeps its own 0 for the rows it covers, or
+    # a win rate among closed deals, its inner ELSE 0 dropped, reads 100%.
+    assert "A condition that says which rows a written measure covers" in system
+    assert "A share keeps its own 0 for the rows it covers" in system
+    assert "AVG(CASE WHEN closed THEN CASE WHEN won THEN 1.0 ELSE 0 END END)" in system
+
+
+def test_the_prompts_share_form_passes_the_plan_check_as_a_percent():
+    """The share the prompt shows (its own 0 inside the condition that picks its rows) is one mnemiq's checks accept
+    as a percent, so the prompt never asks for what the plan check refuses."""
+    share = "AVG(CASE WHEN region = 'west' THEN CASE WHEN premium > 100 THEN 1.0 ELSE 0 END END)"
+    assert isinstance(_plan(GOAL, FakePlanner(_percent_plan(share, K.PERCENT)), _tools()), BuildPlan)
 
 
 def test_a_saved_metric_on_a_0_to_100_scale_cannot_be_planned_as_a_percent():
