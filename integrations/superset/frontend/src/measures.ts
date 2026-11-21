@@ -21,6 +21,11 @@ export type MeasureItem = {
   saved_metric: string | null;
   value: number | null;
   value_note: string | null;
+  /** What `value` covers (mnemiq's `ValueBasis`): "readable_rows", every row the person can read before any chart's
+   * filters, or "chart", the one number the chart `value_chart_id` shows under that chart's own filters; null with no
+   * value. An older mnemiq answers neither. */
+  value_basis?: "readable_rows" | "chart" | null;
+  value_chart_id?: number | null;
   charts: ChartOfMeasure[];
 };
 
@@ -43,6 +48,24 @@ export type ChartsChanged = { chartsChanged: { message: string; charts: ChartOfM
 
 export type MeasureEdit = { label: string; expression: string; kind: MeasureKind; currency: string | null;
   description: string };
+
+/** A chart as the measures section names it: its title, else its id. */
+export const chartName = (chart: ChartOfMeasure) => chart.title ?? `chart ${chart.chart_id}`;
+
+/** What a listed value covers, as one sentence, or null where there is no value or mnemiq does not say. mnemiq's own
+ * statement covers every row the person can read, before any chart's filters, so a measure whose condition sits on
+ * its charts' filters reads differently here than on them; a chart's one number is under that chart's own filters.
+ * An older mnemiq answers no `value_basis`, and then nothing is said rather than a guess. */
+export function valueBasisText(measure: MeasureItem): string | null {
+  if (measure.value === null) return null;
+  if (measure.value_basis === "readable_rows") return "Over every row you can read, before any chart's filters.";
+  if (measure.value_basis === "chart" && typeof measure.value_chart_id === "number") {
+    const id = measure.value_chart_id;
+    const chart = measure.charts.find((c) => c.chart_id === id) ?? { chart_id: id, title: null, check: null };
+    return `As ${chartName(chart)} shows it, with that chart's filters.`;
+  }
+  return null;
+}
 
 const path = (dashboardId: number, name?: string, action?: string) =>
   `/superset/dashboards/${dashboardId}/measures${name === undefined ? "" : `/${encodeURIComponent(name)}/${action}`}`;

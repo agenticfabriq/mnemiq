@@ -296,7 +296,10 @@ still to come. In short:
     then as the person asking and kept nowhere. On a physical dataset the value is mnemiq's own statement, run through
     Superset as that person, so Superset's row rules apply to it. On a virtual dataset it comes only through Superset:
     a saved metric by Superset's query of the dataset, a written measure by a chart that shows it as one number.
-    Otherwise there is no value, and `value_note` says why.
+    Otherwise there is no value, and `value_note` says why. `value_basis` says what a value covers:
+    `readable_rows`, every row of the measure's dataset the person can read, before any chart's filters; or `chart`,
+    the one number the chart `value_chart_id` shows, under that chart's own filters. Both are null when there is no
+    value.
   - `POST .../measures/{name}/edit` takes `{label, expression, kind, currency?, description?}`. The new definition
     passes mnemiq's measure checks first, and its label may be no other measure's on the dashboard. Every copy on a
     chart that still matches the kept definition changes, and each changed chart is checked again; a copy changed by

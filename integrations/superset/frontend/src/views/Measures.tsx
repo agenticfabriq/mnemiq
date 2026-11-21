@@ -3,11 +3,13 @@ import { Alert, Button, Form, Input, Modal, Select, Spin, theme } from "antd";
 import type { PanelApi } from "../api";
 import { CHECK_WORDS } from "../build";
 import {
+  chartName,
   editMeasure,
   listMeasures,
   measureValueText,
   removeMeasure,
   saveMeasure,
+  valueBasisText,
   type ActionAnswer,
   type ChartOfMeasure,
   type MeasureEdit,
@@ -22,8 +24,6 @@ const MAX_DESCRIPTION = 500;
 
 type Action = "edit" | "remove" | "save";
 type Result = { action: Action; answer: ActionAnswer; charts: ChartOfMeasure[] } | { refused: string };
-
-const chartName = (chart: ChartOfMeasure) => chart.title ?? `chart ${chart.chart_id}`;
 
 /** The dashboard's measures: read each time the section opens, held in this component's state only (a value is the
  * person's, computed now, and kept nowhere else), each with its definition and its charts' checks, and with Edit,
@@ -121,6 +121,7 @@ export function Measures({ api, dashboardId }: { api: PanelApi; dashboardId: num
                     <strong style={{ flex: 1 }}>{measure.label}</strong>
                     <span>{measureValueText(measure.value, measure.kind, measure.currency, navigator.language)}</span>
                   </div>
+                  {valueBasisText(measure) ? <div style={muted}>{valueBasisText(measure)}</div> : null}
                   {measure.value_note ? <div style={muted}>{measure.value_note}</div> : null}
                   <code style={{ ...muted, fontSize: token.fontSizeSM, wordBreak: "break-all" }}>{measure.expression}</code>
                   <div style={muted}>
