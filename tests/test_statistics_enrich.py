@@ -309,3 +309,38 @@ def test_no_character_set_read_without_values_or_estimated_tables(shop):
     enrich_structural(shop, "shop", statistics=("*",))
     enrich_structural(shop, "shop")
     assert shop.charset_reads == 0
+
+
+class _Cutting(_Recording):
+    """The shop source, whose statements reading one table reach the statement time limit."""
+
+    def __init__(self, inner, cut):
+        super().__init__(inner)
+        self._cut = cut
+
+    def execute(self, sql, *args, **kwargs):
+        if _touches(sql, self._cut):
+            self.sql.append(sql)
+            from mnemiq.adapters.base import QueryTimedOut
+            raise QueryTimedOut("query timed out after 600s")
+        return super().execute(sql, *args, **kwargs)
+
+
+def test_an_exact_table_whose_read_times_out_falls_back_to_its_estimate(tmp_path):
+    # "exact_tables" asks for more than the dictionary gives; when the exact read reaches the time limit the table keeps
+    # what the dictionary gives rather than being lost, is recorded as estimated so nothing later reads it, and says why.
+    from mnemiq.enrichment.statistics import estimated_tables
+
+    path = tmp_path / "shop.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript(SHOP)
+    con.close()
+    source = _Cutting(SQLiteAdapter(str(path)), "orders")
+    snap = enrich_structural(source, "shop", statistics=("orders",))
+    orders = _columns(snap, "orders")
+    assert orders["status"].estimate is not None and orders["status"].distinct_count is None
+    jobs = {j.id: j for j in snap.jobs}
+    assert (jobs["profile:orders"].status, jobs["profile:orders"].detail) == ("done", "estimated")
+    assert jobs["profile:orders:exact"].status == "failed" and "time limit" in jobs["profile:orders:exact"].detail
+    assert "orders" in estimated_tables(snap)
+    assert sum(_touches(sql, "orders") for sql in source.sql) == 1, "only the cut read touched it"

@@ -18,8 +18,9 @@ from mnemiq.enrichment.size_check import LARGE_TABLE_BYTES, exact_profile_refusa
 GiB = 1 << 30
 
 
-def _spec(kind: str = "oracle", profile: str = "") -> SourceSpec:
-    return SourceSpec(id="erp", kind=kind, target="db", catalog="erp", schema="APP", profile=profile)
+def _spec(kind: str = "oracle", profile: str = "", exact_tables: tuple[str, ...] = ()) -> SourceSpec:
+    return SourceSpec(id="erp", kind=kind, target="db", catalog="erp", schema="APP", profile=profile,
+                      exact_tables=exact_tables)
 
 
 class _Dictionary:
@@ -153,15 +154,16 @@ def test_enrich_exits_1_and_reads_no_table_on_refusal(monkeypatch, tmp_path, cap
 
 
 def test_enrich_passes_the_statistics_scope(monkeypatch, tmp_path):
-    """"statistics" skips the size check, which exists for exact profiling, and reaches the profile with the tables the
-    manifest names exact."""
+    """"statistics" sizes only the tables it still reads in full, the ones "exact_tables" names (the owner's choice of
+    2026-11-21: the line applies to them too), and reaches the profile with those names. A large table it estimates is
+    not checked: nothing reads its rows."""
     from mnemiq.cli import _cmd_enrich
 
-    source = _Dictionary({"ORDERS": _size(20_000_000)})
+    source = _Dictionary({"ORDERS": _size(10), "DIM_DATE": _size(10), "FACTS": _size(20_000_000)})
     profiled = _wire(monkeypatch, source)
     with pytest.raises(_Profiled):
         _cmd_enrich(_settings(tmp_path, profile="statistics", exact_tables=["orders", "dim_*"]))
-    assert profiled[0][1]["statistics"] == ("orders", "dim_*") and source.asked == []
+    assert profiled[0][1]["statistics"] == ("orders", "dim_*") and source.asked == ["ORDERS", "DIM_DATE"]
     profiled.clear()
     with pytest.raises(_Profiled):
         _cmd_enrich(_settings(tmp_path, profile="statistics"))
@@ -322,3 +324,33 @@ def test_enrich_warns_when_dictionary_meanings_cannot_attach(monkeypatch, tmp_pa
     err = capsys.readouterr().err
     assert "WARNING: the dictionary gives code meanings for 1 column(s) profiled from Oracle's statistics" in err
     assert "LINES.KIND (1 of 1 codes)" in err and '"exact_tables"' in err
+
+
+# -- statistics mode's "exact_tables": the same line, on the tables read in full ---------------------------------------
+
+
+def test_statistics_mode_refuses_an_exact_table_over_the_line():
+    source = _Dictionary({"ORDERS": _size(20_000_000), "CODES": _size(10)})
+    refusal, _ = exact_profile_refusal(_spec(profile="statistics", exact_tables=("ORDERS",)), source)
+    assert refusal and "ORDERS" in refusal and "GiB" in refusal
+    assert 'take them out of "exact_tables"' in refusal
+    assert source.asked == ["ORDERS"], "only the tables read in full are sized"
+
+
+def test_statistics_mode_checks_only_the_exact_tables():
+    source = _Dictionary({"ORDERS": _size(20_000_000), "CODES": _size(10)})
+    assert exact_profile_refusal(_spec(profile="statistics", exact_tables=("codes",)), source) == (None, None)
+    assert source.asked == ["CODES"]
+
+
+def test_an_exact_table_without_statistics_warns_and_goes_on():
+    source = _Dictionary({"CODES": TableSize(rows=None, avg_row_len=None, analyzed=None, stale=None)})
+    refusal, warning = exact_profile_refusal(_spec(profile="statistics", exact_tables=("CODES",)), source)
+    assert refusal is None and warning and "CODES" in warning
+
+
+def test_an_exact_tables_pattern_matching_nothing_is_refused():
+    from mnemiq.adapters.scoped import TablesNotFound
+
+    with pytest.raises(TablesNotFound):
+        exact_profile_refusal(_spec(profile="statistics", exact_tables=("NOPE",)), _Dictionary({"CODES": _size(10)}))

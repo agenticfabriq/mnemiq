@@ -70,10 +70,19 @@ class SQLiteAdapter:
                 out.append((table, from_col, parent, to_col, f"{table}:{fk_id}"))
         return out
 
-    def execute(self, sql: str) -> list[tuple]:
-        return self._con.execute(sql).fetchall()
+    def execute(self, sql: str, timeout_s: float | None = None) -> list[tuple]:
+        return self._interruptible(sql, timeout_s)[1]
 
     def execute_arrow(self, sql: str, timeout_s: float | None = None) -> pa.Table:
+        names, rows = self._interruptible(sql, timeout_s)
+        # Column-major, by position -- so duplicate output names survive (a dict would not).
+        columns = list(zip(*rows)) if rows else [() for _ in names]
+        arrays = [pa.array(list(col)) for col in columns]
+        return pa.Table.from_arrays(arrays, names=names)
+
+    def _interruptible(self, sql: str, timeout_s: float | None) -> tuple[list[str], list[tuple]]:
+        """Column names and rows, the statement interrupted past `timeout_s` and the interrupt raised as
+        `QueryTimedOut`: one body for `execute` and `execute_arrow`."""
         timer = None
         if timeout_s is not None:
             timer = threading.Timer(timeout_s, self._con.interrupt)
@@ -81,16 +90,11 @@ class SQLiteAdapter:
         try:
             cursor = self._con.execute(sql)
             names = [d[0] for d in cursor.description] if cursor.description else []
-            rows = cursor.fetchall()
+            return names, cursor.fetchall()
         except sqlite3.OperationalError as exc:
-            if "interrupt" in str(exc).lower():
+            if timeout_s is not None and "interrupt" in str(exc).lower():
                 raise QueryTimedOut(f"query timed out after {timeout_s}s") from exc
             raise
         finally:
             if timer is not None:
                 timer.cancel()
-
-        # Column-major, by position -- so duplicate output names survive (a dict would not).
-        columns = list(zip(*rows)) if rows else [() for _ in names]
-        arrays = [pa.array(list(col)) for col in columns]
-        return pa.Table.from_arrays(arrays, names=names)

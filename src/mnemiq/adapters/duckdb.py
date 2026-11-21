@@ -8,7 +8,7 @@ import threading
 import duckdb
 import pyarrow as pa
 
-from mnemiq.adapters.base import QueryCancelled
+from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
 from mnemiq.adapters.pg_keys import DECLARED_KEYS
 from mnemiq.duckdb_extensions import connect_duckdb, load_extension, lock_configuration
 
@@ -204,12 +204,28 @@ def execute_bounded(con, sql: str, timeout_s: float | None) -> pa.Table:
     own statement-timeout cancellation raised as the interrupt it is -- one body for the single-
     source and the federated adapter, so they cannot disagree about what a timeout looks like
     (Codex's review of #134 found the federated one never translated it)."""
+    return _bounded(con, sql, timeout_s, lambda result: result.to_arrow_table())
+
+
+def execute_rows_bounded(con, sql: str, timeout_s: float | None) -> list[tuple]:
+    """`execute`'s rows under the bound `execute_bounded` applies, its end raised as `QueryTimedOut`: the adapters'
+    word for a timeout on `execute`, which enrich reads (the interrupt stays `execute_arrow`'s, which the runner
+    reads)."""
+    if timeout_s is None:
+        return con.execute(sql).fetchall()
+    try:
+        return _bounded(con, sql, timeout_s, lambda result: result.fetchall())
+    except duckdb.InterruptException as exc:
+        raise QueryTimedOut(f"query timed out after {timeout_s}s") from exc
+
+
+def _bounded(con, sql: str, timeout_s: float | None, fetch):
     timer = None
     if timeout_s is not None:
         timer = threading.Timer(timeout_s, con.interrupt)
         timer.start()
     try:
-        return con.execute(sql).to_arrow_table()
+        return fetch(con.execute(sql))
     except Exception as exc:
         if timeout_s is not None and _ended_by_statement_timeout(exc):
             raise duckdb.InterruptException(
@@ -523,8 +539,8 @@ class DuckDBAdapter:
             raise RuntimeError(f"could not read view definitions from DuckDB: {exc}") from exc
         return [(r[0], r[1], "duckdb") for r in rows]
 
-    def execute(self, sql: str) -> list[tuple]:
-        return self._con.execute(sql).fetchall()
+    def execute(self, sql: str, timeout_s: float | None = None) -> list[tuple]:
+        return execute_rows_bounded(self._con, sql, timeout_s)
 
     def execute_arrow(self, sql: str, timeout_s: float | None = None) -> pa.Table:
         """Run a query and return Arrow, cancelling it if it overruns. A LIMIT bounds rows;

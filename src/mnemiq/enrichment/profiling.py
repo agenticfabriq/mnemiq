@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 import sqlglot
 
+from mnemiq.adapters.base import QueryTimedOut
 from mnemiq.adapters.base import SourceAdapter
 from mnemiq.catalog import TableInfo, is_key_like, is_sensitive_name
 
@@ -205,6 +206,10 @@ def profile_table(
             row_count = row[0]
             for i, c in enumerate(cols):
                 measured[c] = (row[1 + 2 * i], row[2 + 2 * i])
+        except QueryTimedOut:
+            # The table is too slow to read within the statement time limit, which no column can fix: measuring column
+            # by column would send one more statement per column, each reaching the limit again. The profile ends here.
+            raise
         except Exception as exc:
             # LOGGED, because otherwise this is the absence/failure collapse inside the fix for
             # one: a column skipped by `_UNAGGREGATABLE` and a column that BROKE both end up as
@@ -228,6 +233,8 @@ def profile_table(
                 try:
                     measured[c] = adapter.execute(
                         f'SELECT count(DISTINCT "{c}"), count("{c}") FROM "{table.name}"')[0]
+                except QueryTimedOut:
+                    raise  # as above: the table, not the column
                 except Exception as col_exc:
                     logger.warning("column %r.%r could not be counted and is carried with unknown "
                                    "stats: %s", table.name, c, col_exc)
@@ -375,6 +382,8 @@ def _profile_partitions(adapter: SourceAdapter, table: TableInfo, stats: list[Co
                 # Two values spelled alike would pool their facts under one label; keep only what
                 # holds in both, never the last group's word.
                 within[label] = [c for c in within[label] if c in unique] if label in within else unique
+        except QueryTimedOut:
+            raise  # a partition read that reaches the time limit ends the table's profile, as every profile read does
         except Exception as exc:  # noqa: BLE001 -- one partition failing costs only itself
             logger.warning("partition profile of %r.%r failed: %s", table.name, part.column, exc)
             part.partition_failure = str(exc)
