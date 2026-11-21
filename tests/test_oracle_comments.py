@@ -161,3 +161,23 @@ def test_the_fitter_drops_the_model_description_before_the_comment(tmp_path):
     descriptions = [i for i, (kind, _, _) in enumerate(order) if kind == "description"]
     assert comments and descriptions and max(comments) < min(descriptions), \
         "every comment ranks before every description, so trimming from the end drops descriptions first"
+
+
+def test_the_table_scope_refuses_a_comment_read_of_a_table_out_of_scope():
+    import pytest
+
+    from mnemiq.adapters.scoped import TableScopedAdapter, TablesNotFound
+
+    asked = []
+
+    class Inner:
+        def comments(self, tables):
+            asked.append(list(tables))
+            return {}, {}
+
+    scoped = TableScopedAdapter(Inner(), ("ORDERS",), "erp")
+    with pytest.raises(TablesNotFound):
+        scoped.comments(["ORDERS", "SECRET"])
+    assert asked == [], "nothing was read once a requested table was out of scope"
+    scoped.comments(["orders"])
+    assert asked == [["orders"]]
