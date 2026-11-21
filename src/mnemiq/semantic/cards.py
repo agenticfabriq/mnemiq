@@ -106,8 +106,10 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
     # comment, a table's or a column's, is shown only to an identity that may name every table here and is denied or
     # masked no column; any denied or masked entry at all withholds them, the safe reading of an entry this snapshot
     # may not hold. Unscoped (the indexed card), every comment is shown.
+    # Every table by its exact id, as retrieval serves cards (`object_id IN` the grants), never by the case fold
+    # `policy.names` uses for joins: `orders` and a quoted `Orders` are two tables, and a grant on one is not the other.
     comments_shown = policy is None or (not policy.denied and not policy.masked
-                                        and all(policy.names(t) for t in tables))
+                                        and (policy.visible is None or set(tables) <= policy.visible))
 
     cards: list[SchemaCard] = []
     for table in tables:

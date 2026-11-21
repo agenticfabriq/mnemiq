@@ -259,3 +259,17 @@ def test_a_comment_naming_an_ungranted_table_is_withheld_when_join_discovery_fai
     assert "secret_accounts" not in granted_orders
     whole = _orders_card(snap, visible=frozenset({"orders", "notes"}))
     assert "secret_accounts" in whole, "an identity that sees the whole snapshot gets the comments"
+
+
+def test_a_grant_on_one_spelling_does_not_cover_a_case_distinct_table(tmp_path):
+    # Codex's fourth review of #280: tables `orders` and `Orders` (quoted names are distinct on Oracle and Postgres),
+    # a grant on `orders` alone. Retrieval serves cards by exact id, so the identity never sees `Orders`; the comment
+    # rule matched names with the case fold and showed comments that may describe it.
+    snap = enrich_structural(_Shop(_shop(tmp_path)), "shop")
+    twin = snap.source_bindings[0].model_copy(update={"object_id": "Orders", "comment": None})
+    snap = snap.model_copy(update={"source_bindings": [*snap.source_bindings, twin]})
+    held = {b.object_id for b in snap.source_bindings}
+    assert {"orders", "Orders"} <= held
+    assert _TABLE_COMMENT not in _orders_card(snap, visible=frozenset(held - {"Orders"}))
+    assert "O open, S shipped" not in _orders_card(snap, visible=frozenset(held - {"Orders"}))
+    assert _TABLE_COMMENT in _orders_card(snap, visible=frozenset(held)), "granted every spelling, it is shown"
