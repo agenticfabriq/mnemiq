@@ -510,7 +510,8 @@ def test_a_planned_chart_the_dashboard_shows_is_left_out_and_named(fake, world, 
     pytest.param(dataclasses.replace(BY_REGION, filters=(Filter("premium", ">", 50),)), id="another filter"),
     pytest.param(dataclasses.replace(BY_REGION, measures=(WrittenRef(DISTINCT),)), id="another measure definition"),
     pytest.param(dataclasses.replace(BY_REGION, family=Family.LINE), id="another family"),
-    pytest.param(dataclasses.replace(BY_MONTH, row_limit=5), id="another row limit"),
+    # On a categorical chart: a time axis takes no row limit (the planner refuses one), and a bar's is a ranking.
+    pytest.param(dataclasses.replace(BY_REGION, row_limit=5), id="another row limit"),
 ])
 def test_a_near_match_is_not_left_out(fake, world, store, near):
     """A planned chart that differs from the dashboard's in one thing it shows is not one the dashboard shows."""

@@ -1326,6 +1326,38 @@ def test_a_percent_measure_multiplied_by_100_is_refused_at_plan_time():
                       BuildPlan)
 
 
+TIME_AXIS_ROW_LIMIT = ("a chart on a time axis takes no row_limit: a row limit keeps the points its query ranks first, "
+                       "the largest by its first measure, not the latest; to show a recent span, filter its time column "
+                       "with >= a start date instead")
+AVERAGE_PREMIUM = _measure("average_premium", "Average premium", "AVG(premium)")
+
+
+@pytest.mark.parametrize("family", [Family.LINE, Family.BAR, Family.AREA, Family.SCATTER, Family.MIXED])
+def test_a_row_limit_on_a_time_axis_chart_is_refused_with_a_time_range_repair(family):
+    """A time axis's query orders by its first measure, then the axis sorts by time: under a row limit it keeps the
+    largest points, not the latest. The plan goes back once with the reason, which points to a time filter instead."""
+    refs = [WrittenRef(PREMIUM), WrittenRef(AVERAGE_PREMIUM)] if family is Family.MIXED else [WrittenRef(PREMIUM)]
+    chart = _chart("premium_by_month", family, refs, time_column="start_date", grain="P1M", row_limit=12)
+    planner = FakePlanner(_valid_plan(charts=(chart,), measures=(PREMIUM, AVERAGE_PREMIUM)))
+    refused = _plan(GOAL, planner, _tools())
+    assert isinstance(refused, PlanRefused)
+    assert len(planner.contexts) == 2, "repairable: it went back once"
+    assert _parts(refused)["chart 'premium_by_month'"] == TIME_AXIS_ROW_LIMIT
+    assert planner.contexts[1].repair.refused[0].repairable
+
+
+def test_a_row_limit_on_a_categorical_chart_still_plans():
+    """A bar by region keeps its top groups under a row limit: a ranking, which the chart check reads as one."""
+    chart = _chart("premium_by_region", Family.BAR, [WrittenRef(PREMIUM)], dims=["region"], row_limit=20)
+    assert isinstance(_plan(GOAL, FakePlanner(_valid_plan(charts=(chart,), measures=(PREMIUM,))), _tools()), BuildPlan)
+
+
+def test_the_prompt_says_a_time_axis_takes_no_row_limit():
+    model = ScriptedModel([_draft("SUM(premium)")])
+    _plan(GOAL, LLMPlanner(model), _tools())
+    assert '"row_limit": optional, never on a chart with a time_column,' in model.sent[0]["system"]
+
+
 def test_the_prompt_says_a_percent_is_a_fraction():
     model = ScriptedModel([_draft("SUM(premium)")])
     _plan(GOAL, LLMPlanner(model), _tools())

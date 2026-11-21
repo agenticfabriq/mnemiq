@@ -83,6 +83,14 @@ logger = logging.getLogger(__name__)
 # virtual dataset alike.
 COUNT_METRIC = ("count", "COUNT(*)")
 
+# The families whose x-axis is the chart's time column when it has one. rc2's time-series query orders by the first
+# measure (`normalizeOrderBy`) before its LIMIT and the axis sorts by time afterwards, so a row limit keeps the largest
+# points, not the latest: such a chart takes no row limit.
+_TIME_AXIS_FAMILIES = frozenset({Family.LINE, Family.BAR, Family.AREA, Family.SCATTER, Family.MIXED})
+_TIME_AXIS_ROW_LIMIT = ("a chart on a time axis takes no row_limit: a row limit keeps the points its query ranks "
+                        "first, the largest by its first measure, not the latest; to show a recent span, filter its "
+                        "time column with >= a start date instead")
+
 # rc2's `FilterConfig.op` (`superset/mcp_service/chart/schemas.py`): the operators a chart's filter may use.
 FILTER_OPERATORS = ("=", "!=", ">", "<", ">=", "<=", "LIKE", "ILIKE", "NOT LIKE", "IN", "NOT IN", "IS NULL",
                     "IS NOT NULL")
@@ -333,8 +341,9 @@ Charts: {"key": lower case letters, digits and _, at most 40, one per chart, "fa
 "measures": [measure names], "dimensions": [columns], "time_column": a date or timestamp column, or omitted, \
 "grain": one of GRAINS or omitted, "filters": [{"column", "op": one of =, !=, >, <, >=, <=, LIKE, ILIKE, NOT LIKE, IN, \
 NOT IN, IS NULL, IS NOT NULL, "operand": one value, a list for IN and NOT IN, omitted for IS NULL and IS NOT NULL}], \
-"row_limit": optional, "source" and "target": a sankey's two columns, "table" or "join": the chart's rows, needed only \
-when it has no measures}. A chart's measures, dimensions and filters are all on one table or one join.
+"row_limit": optional, never on a chart with a time_column, "source" and "target": a sankey's two columns, \
+"table" or "join": the chart's rows, needed only when it has no measures}. A chart's measures, dimensions and \
+filters are all on one table or one join.
 - pie, big_number, gauge, treemap, waterfall, funnel and sankey plot exactly one measure; mixed plots two or more on a \
 time column, the first on its primary axis;
 - pie, treemap, funnel, histogram, pivot and table need a dimension; waterfall and box_plot need a dimension or a time \
@@ -1485,6 +1494,8 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
                 refuse(part, f"its grain is one of {', '.join(GRAINS)}")
             elif not spec.time_column:
                 refuse(part, "a grain groups a time column, and the chart has none")
+        if spec.time_column and spec.row_limit is not None and spec.family in _TIME_AXIS_FAMILIES:
+            refuse(part, _TIME_AXIS_ROW_LIMIT)
         for item in spec.filters:
             if (problem := _filter_problem(item)) is not None:
                 refuse(part, problem)
