@@ -93,7 +93,7 @@ change, since the panel calls only its own origin.
 
 It forwards only these mnemiq routes, each by its method: `GET /v1/schema`, `POST /v1/chat` (streamed), `GET` and
 `POST /v1/superset/builds` (the `GET` with `dashboard_id` alone), `GET /v1/superset/builds/<id>`, `POST
-/v1/superset/builds/<id>/next`, `GET /v1/superset/dashboards/<id>/measures`, `POST
+/v1/superset/builds/<id>/next|confirm`, `GET /v1/superset/dashboards/<id>/measures`, `POST
 /v1/superset/dashboards/<id>/measures/<name>/edit|remove|save`, and `POST /v1/superset/dashboards/<id>/changes`.
 mnemiq receives only `Authorization`, `Accept` and `Content-Type` (beside the `Host` and length every request carries),
 never Superset's cookie or CSRF header, and no proxy, `.netrc` or other setting is read from the server's environment;

@@ -10,7 +10,7 @@ Nothing kept is a row of results. A message is held to `MESSAGE_JSON_SHAPE`, an 
 and beneath it the build store's refusal of any key a value, a row or a sample is kept under (`VALUE_SHAPED_KEYS`). An
 answer keeps its question, mnemiq's sentence and its SQL; the sentence can hold numbers, and is kept because the answer
 is already its owner's own, in their conversation alone. Its table is run again as the person when they ask for it,
-and kept nowhere. A build's proposal keeps its plan as the build store does, a filter's typed operand under `operand`.
+and kept nowhere. A build's proposal keeps its plan as the person is shown it (`builder.plan_summary`).
 
 A proposal's outcome is settled by compare-and-set (`settle`): only while its state is the one expected, so a second
 confirm of one proposal, from a double click or another tab, finds it settled and does nothing.
@@ -32,7 +32,8 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from mnemiq.superset.build_store import MAX_ID, BuildStoreMissing, _bound_waits, _iso, _plain_json, _shaped, _text
-from mnemiq.superset.planner import PLAN_JSON_SHAPE, SCALAR
+from mnemiq.superset.builder import PLAN_SUMMARY_JSON
+from mnemiq.superset.planner import SCALAR
 
 if TYPE_CHECKING:
     from mnemiq.config import Settings
@@ -65,7 +66,9 @@ STATES = frozenset({"proposed", "applying", "done", "refused", "stale", "partial
 
 _DASHBOARD_JSON = {"id": SCALAR, "title": SCALAR}
 _LEFT_OUT_JSON = [{"part": SCALAR, "chart_id": SCALAR, "title": SCALAR}]
-_BUILD_PROPOSAL_JSON = {"build_id": SCALAR, "goal": SCALAR, "dashboard_id": SCALAR, "plan": PLAN_JSON_SHAPE,
+# A proposed build as the person is shown it: its plan as `plan_summary` writes it, never the plan itself (the build
+# store keeps that), so no dataset SQL, dimension or filter is kept here.
+_BUILD_PROPOSAL_JSON = {"build_id": SCALAR, "goal": SCALAR, "dashboard_id": SCALAR, "plan": PLAN_SUMMARY_JSON,
                         "left_out": _LEFT_OUT_JSON}
 _OUTCOME_JSON = {"state": SCALAR, "detail": SCALAR, "build_id": SCALAR, "changed": [SCALAR],
                  "left": [{"chart_id": SCALAR, "reason": SCALAR}], "dropped": [{"chart_id": SCALAR, "key": SCALAR}],

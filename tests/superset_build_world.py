@@ -162,25 +162,52 @@ class MemoryBuildStore:
         return any(row["tenant_id"] == tenant and row["dashboard_id"] == dashboard_id and row["status"] == bs.BUILDING
                    and row["build_id"] != other_than for row in self._builds.values())
 
-    def create_build(self, tenant, principal, goal, plan, steps, *, dashboard_id=None, profile=None) -> StoredBuild:
+    def create_build(self, tenant, principal, goal, plan, steps, *, dashboard_id=None, profile=None,
+                     proposed=False, planned_against=None) -> StoredBuild:
         tenant, principal = bs._text(tenant, "tenant"), bs._text(principal, "principal")
         goal = bs._text(goal, "goal")
         profile = None if profile is None else bs._text(profile, "profile")
         dashboard_id = bs._id(dashboard_id, "a build's dashboard id", optional=True)
+        if type(proposed) is not bool:
+            raise ValueError("whether a build is proposed is true or false")
+        planned_against = None if planned_against is None else bs._text(planned_against, "dashboard's changed_on")
         plan = bs._plan(plan)
         build_id = str(uuid.uuid4())
         step_list = bs._new_steps(build_id, steps)
         with self._lock:
             now = self._now()
-            if dashboard_id is not None:
+            if dashboard_id is not None and not proposed:
                 self._release_abandoned(tenant, dashboard_id)
-            if dashboard_id is not None and self._live_on(tenant, dashboard_id):
-                raise bs.DashboardBusy()
+                if self._live_on(tenant, dashboard_id):
+                    raise bs.DashboardBusy()
             row = {"tenant_id": tenant, "build_id": build_id, "principal_id": principal, "dashboard_id": dashboard_id,
-                   "goal": goal, "profile": profile, "plan": plan, "steps": step_list, "status": bs.BUILDING,
-                   "created_at": now, "updated_at": now}
+                   "goal": goal, "profile": profile, "plan": plan, "steps": step_list,
+                   "status": bs.PROPOSED if proposed else bs.BUILDING, "created_at": now, "updated_at": now,
+                   "planned_against": planned_against}
             self._builds[(tenant, build_id)] = row
             return self._stored(row)
+
+    def confirm_build(self, tenant, build_id, principal) -> StoredBuild:
+        tenant, principal = bs._text(tenant, "tenant"), bs._text(principal, "principal")
+        with self._lock:
+            row = self._builds.get((tenant, build_id))
+            if row is None or row["principal_id"] != principal or row["status"] != bs.PROPOSED:
+                raise BuildNotFound()
+            if row["dashboard_id"] is not None:
+                self._release_abandoned(tenant, row["dashboard_id"])
+                if self._live_on(tenant, row["dashboard_id"]):
+                    raise bs.DashboardBusy()
+            row.update(status=bs.BUILDING, updated_at=self._now())
+            return self._stored(row)
+
+    def withdraw_proposal(self, tenant, build_id, principal) -> bool:
+        tenant, principal = bs._text(tenant, "tenant"), bs._text(principal, "principal")
+        with self._lock:
+            row = self._builds.get((tenant, build_id))
+            if row is None or row["principal_id"] != principal or row["status"] != bs.PROPOSED:
+                return False
+            del self._builds[(tenant, build_id)]
+            return True
 
     def unfinished_builds(self, tenant, principal, *, dashboard_id=None, limit=10) -> list[StoredBuild]:
         """`BuildStore.unfinished_builds`: newest touched first, ties by build id ascending, as Postgres orders them."""
@@ -290,7 +317,8 @@ class MemoryBuildStore:
 
     def _row(self, tenant: str, build_id: str, principal: str | None) -> dict:
         row = self._builds.get((tenant, build_id))
-        if row is None or (principal is not None and row["principal_id"] != principal):
+        # A proposal has no step to change until it is confirmed, as `BuildStore._change` reads it.
+        if row is None or row["status"] == bs.PROPOSED or (principal is not None and row["principal_id"] != principal):
             raise BuildNotFound()
         return row
 
@@ -303,7 +331,7 @@ class MemoryBuildStore:
                            dashboard_id=row["dashboard_id"], goal=row["goal"], plan=copy.deepcopy(row["plan"]),
                            steps=tuple(bs._step_state(step, now) for step in row["steps"]), status=row["status"],
                            created_at=bs._iso(row["created_at"]), updated_at=bs._iso(row["updated_at"]),
-                           profile=row["profile"])
+                           profile=row["profile"], planned_against=row.get("planned_against"))
 
     def _measure(self, row: dict) -> bs.DashboardMeasure:
         return bs._dashboard_measure((row["name"], copy.deepcopy(row["definition"]), list(row["chart_ids"]),

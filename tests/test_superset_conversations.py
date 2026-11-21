@@ -40,16 +40,17 @@ def _answer() -> dict:
                        "grant_fingerprint": "g1", "tables_used": ["sales"]}}
 
 
-def _plan(filter_key: str = "operand") -> dict:
-    return {"format": 1, "measures": [], "charts": [
-        {"key": "c1", "family": "bar", "title": "Revenue by product line", "dataset_id": 7,
-         "filters": [{"column": "region", "op": "=", filter_key: "west"}]}]}
+def _plan() -> dict:
+    """A proposed build's plan as the person is shown it (`plan_summary`'s form)."""
+    return {"charts": [{"key": "c1", "title": "Revenue by product line", "family": "bar", "measures": ["Revenue"]}],
+            "measures": [{"name": "revenue", "label": "Revenue", "expression": "SUM(amount)", "kind": "sum",
+                          "currency": "USD"}]}
 
 
-def _proposal(filter_key: str = "operand") -> dict:
+def _proposal(**plan_over) -> dict:
     return {"role": "mnemiq", "kind": "build", "text": "I'll add 1 chart to \"Q3 pipeline\".",
-            "proposal": {"build_id": "b1", "goal": "revenue by product line, west", "dashboard_id": 3,
-                         "plan": _plan(filter_key)},
+            "proposal": {"build_id": "b1", "goal": "revenue by product line", "dashboard_id": 3,
+                         "plan": {**_plan(), **plan_over}},
             "outcome": {"state": "proposed"}}
 
 
@@ -242,7 +243,8 @@ def test_a_list_limit_out_of_range_is_refused(conversations, limit):
     {**_ask(), "rows": [[1, 2]]},
     {**_answer(), "answer": {**_answer()["answer"], "data": [[1]]}},
     {**_answer(), "answer": {**_answer()["answer"], "Rows": [[1]]}},
-    _proposal(filter_key="value"),
+    _proposal(measures=[{"name": "revenue", "value": 3}]),
+    _proposal(charts=[{"key": "c1", "filters": [{"column": "region", "op": "=", "operand": "west"}]}]),
     {**_proposal(), "outcome": {"state": "done", "results": [1]}},
     {**_ask(), "anything": "else"},
     {**_ask(), "role": "system"},
@@ -257,9 +259,16 @@ def test_the_shape_refuses_a_row_anywhere(doc):
         message_shape(doc)
 
 
-def test_a_typed_filter_operand_is_kept():
-    kept = message_shape(_proposal(filter_key="operand"))
-    assert kept["proposal"]["plan"]["charts"][0]["filters"] == [{"column": "region", "op": "=", "operand": "west"}]
+def test_a_proposed_build_keeps_its_plan_as_the_person_is_shown_it():
+    """The plan as `plan_summary` writes it is kept; anything more of the plan (a filter, its operand) is not, since
+    the build store keeps the plan itself."""
+    from mnemiq.superset.builder import plan_summary
+    from mnemiq.superset.planner import plan_to_json
+    from tests.superset_shared import ONE_BAR
+
+    shown = plan_summary(plan_to_json(ONE_BAR))
+    kept = message_shape({**_proposal(), "proposal": {**_proposal()["proposal"], "plan": shown}})
+    assert kept["proposal"]["plan"] == shown
 
 
 def test_the_sentence_and_sql_are_kept(conversations):

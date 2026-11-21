@@ -148,7 +148,7 @@ def test_the_table_holds_no_row_of_results(conversations, store_dsn):
             "SELECT DISTINCT k FROM walk, LATERAL jsonb_object_keys(walk.doc) k "
             "WHERE jsonb_typeof(walk.doc) = 'object'").fetchall()}
     assert keys  # a positive control: the walk reads the messages' keys
-    assert {"answer", "sentence", "sql", "operand"} <= keys
+    assert {"answer", "sentence", "sql", "proposal", "charts"} <= keys
     assert not keys & VALUE_SHAPED_KEYS
 
 

@@ -37,7 +37,7 @@ from mnemiq.llm.client import ContextTooLong, ModelUnavailable, PromptCut
 from mnemiq.contract import Snapshot, SourceBinding
 from mnemiq.store.bootstrap import init_store
 from mnemiq.store.snapshot_store import save_snapshot
-from mnemiq.superset.build_store import STORE_MISSING
+from mnemiq.superset.build_store import STORE_MISSING, DashboardBusy
 from mnemiq.superset.builder import start_build
 from mnemiq.superset.client import DelegatedToken, SupersetMcp
 from mnemiq.superset.extension import EXTENSION_TOOLS, TOOL_PREFIX
@@ -94,6 +94,7 @@ guard_fanout = true
 BUILD_ROUTES = {("POST", "/v1/superset/builds"), ("GET", "/v1/superset/builds"),
                 ("GET", "/v1/superset/builds/{build_id}"),
                 ("POST", "/v1/superset/builds/{build_id}/next"),
+                ("POST", "/v1/superset/builds/{build_id}/confirm"),
                 ("GET", "/v1/superset/dashboards/{dashboard_id}/measures"),
                 ("POST", "/v1/superset/dashboards/{dashboard_id}/measures/{name}/edit"),
                 ("POST", "/v1/superset/dashboards/{dashboard_id}/measures/{name}/remove"),
@@ -101,7 +102,7 @@ BUILD_ROUTES = {("POST", "/v1/superset/builds"), ("GET", "/v1/superset/builds"),
                 ("POST", "/v1/superset/dashboards/{dashboard_id}/changes")}
 # Each measure action's body, as the panel sends it.
 ACTION_BODIES = {"edit": {"label": "Policies", "expression": "COUNT(DISTINCT policy_id)", "kind": "count"},
-                 "remove": {"chart_ids": [1]}, "save": {}, "changes": {"request": "show daily"}}
+                 "remove": {"chart_ids": [1]}, "save": {}, "changes": {"request": "show daily"}, "confirm": {}}
 # The calls that change something in Superset, which a refused request never makes. The build's probe of the
 # extension, its `create_dataset` with an empty request, changes nothing: `_writes` passes over it.
 WRITES = {"generate_chart", "create_dataset", "create_virtual_dataset",
@@ -1251,3 +1252,114 @@ def test_every_call_carries_the_requests_token(served, fake, world, store, monke
     assert {t for t, _, _ in held} == set(tokens.values())
     assert {DelegatedToken(t) for t, _ in built} == {DelegatedToken(t) for t in tokens.values()}
     assert alone == []  # and the two requests of each pair were in flight together
+
+
+# --- A build that waits for the person's "Build it"
+
+def _confirm(client, build_id: str, token: str | None = None):
+    return client.post(f"/v1/superset/builds/{build_id}/confirm", headers=_bearer(token or _token()))
+
+
+def _run_out(client, build_id: str) -> dict:
+    """The build's steps run with `/next` until it stops building."""
+    for _ in range(20):
+        build = _next(client, build_id).json()["build"]
+        if build["status"] != "building":
+            return build
+    raise AssertionError("the build did not finish in 20 steps")
+
+
+def test_a_proposed_build_writes_nothing_until_confirmed(served, fake, world, store):
+    """Proposed, a build is planned and kept, and nothing is written to Superset: it is no unfinished build, `/next`
+    finds no build to run, and only its confirm starts it, after which `/next` runs it as today."""
+    client, _ = served
+    _dashboard(world, 900)
+    r = _start(client, dashboard_id=900, propose=True)
+    assert r.status_code == 200, r.text
+    proposal = r.json()["proposal"]
+    assert set(proposal) == {"build_id", "goal", "dashboard_id", "plan"}
+    assert (proposal["goal"], proposal["dashboard_id"]) == (GOAL, 900)
+    assert [chart["title"] for chart in proposal["plan"]["charts"]] == [chart.title for chart in ONE_BAR.charts]
+    assert _writes(fake) == []
+    assert client.get("/v1/superset/builds", headers=_bearer(_token())).json()["builds"] == []
+    # `/next` answers a proposal as it is, as it answers a build that finished, and runs nothing.
+    unrun = _next(client, proposal["build_id"])
+    assert unrun.status_code == 200 and unrun.json()["build"]["status"] == "proposed", unrun.text
+    assert store.claims == []
+    assert _get(client, proposal["build_id"]).json()["build"]["status"] == "proposed"
+    assert _writes(fake) == []
+
+    confirmed = _confirm(client, proposal["build_id"])
+    assert confirmed.status_code == 200, confirmed.text
+    build = confirmed.json()["build"]
+    assert (build["build_id"], build["status"], build["dashboard_id"]) == (proposal["build_id"], "building", 900)
+    assert _writes(fake) == []  # the confirm starts the build; `/next` runs its steps
+    assert _run_out(client, proposal["build_id"])["status"] == "done"
+    assert _writes(fake)
+
+
+def test_a_proposal_for_a_new_dashboard_confirms_without_reading_one(served, fake, world, store):
+    client, _ = served
+    r = _start(client, fresh=True, propose=True)
+    assert r.status_code == 200, r.text
+    proposal = r.json()["proposal"]
+    assert proposal["dashboard_id"] is None
+    fake.calls.clear()
+    confirmed = _confirm(client, proposal["build_id"])
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["build"]["status"] == "building"
+    assert TOOL_PREFIX + "get_layout" not in {call.tool for call in fake.calls}
+
+
+def test_confirm_starts_it_and_a_second_confirm_is_refused(served, fake, world, store):
+    client, _ = served
+    _dashboard(world, 900)
+    proposal = _start(client, dashboard_id=900, propose=True).json()["proposal"]
+    assert _confirm(client, proposal["build_id"]).status_code == 200
+    again = _confirm(client, proposal["build_id"])
+    assert again.status_code == 409, again.text
+    assert again.json()["detail"] == "This build was already started."
+    assert len(store._builds) == 1
+
+
+def test_another_persons_proposal_is_not_found(served, fake, world, store):
+    client, _ = served
+    _dashboard(world, 900)
+    proposal = _start(client, dashboard_id=900, propose=True).json()["proposal"]
+    other = _confirm(client, proposal["build_id"], _token(sub="east", preferred_username="east"))
+    assert other.status_code == 404, other.text
+    assert _get(client, proposal["build_id"]).json()["build"]["status"] == "proposed"
+
+
+def test_confirm_on_a_busy_dashboard_is_refused_and_the_proposal_stays(served, fake, world, store):
+    client, _ = served
+    _dashboard(world, 900)
+    proposal = _start(client, dashboard_id=900, propose=True).json()["proposal"]
+    _stored(store, client, dashboard_id=900)  # another build of the dashboard started meanwhile
+    busy = _confirm(client, proposal["build_id"])
+    assert busy.status_code == 409, busy.text
+    assert busy.json()["detail"] == str(DashboardBusy())
+    assert _get(client, proposal["build_id"]).json()["build"]["status"] == "proposed"
+
+
+def test_confirm_after_the_dashboard_changed_asks_to_plan_again(served, fake, world, store, clock):
+    client, _ = served
+    _dashboard(world, 900)
+    proposal = _start(client, dashboard_id=900, propose=True).json()["proposal"]
+    clock.advance(5)
+    world.dashboards[900]["changed_on"] = world.superset_now()  # edited by hand since the plan
+    stale = _confirm(client, proposal["build_id"])
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["detail"] == "The dashboard changed since this plan; plan it again."
+    assert _get(client, proposal["build_id"]).json()["build"]["status"] == "proposed"
+    assert _writes(fake) == []
+
+
+def test_a_start_without_propose_is_unchanged(served, fake, world, store):
+    client, _ = served
+    _dashboard(world, 900)
+    r = _start(client, dashboard_id=900)
+    assert r.status_code == 201, r.text
+    assert set(r.json()) == {"build"} and r.json()["build"]["status"] == "building"
+    tenant, principal = _whoami(client, _token())
+    assert store.load_build(tenant, r.json()["build"]["build_id"], principal).planned_against is None
