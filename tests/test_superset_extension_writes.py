@@ -1169,12 +1169,45 @@ def test_set_layout_installs_the_membership_rc2s_save_must_keep_before_its_comma
                                               "expect_changed_on": WHEN})
     assert writes._layout(found_placed, dashboard) == {"ok": True}
     assert superset.ran[0] == ("install", [9, 11])
-    dashboard.position_json = json.dumps(_one_chart_layout(11))
-    rows.pop(9)  # a member whose row is gone (lock_row answers None)
+    # A member whose row is gone (lock_row answers None), still a member and still placed: it is not in the
+    # baseline, and rc2's own query of the layout's charts finds no row for it either.
+    rows.pop(9)
     superset.ran.clear()
-    monkeypatch.setattr(writes, "_member_chart_ids", lambda dashboard_id: [11])
+    locks.clear()
+    assert writes._layout(found_placed, dashboard) == {"ok": True}
+    assert locks == [9, 11] and superset.ran[0] == ("install", [11])
+
+
+def test_a_remove_of_a_placed_trashed_member_keeps_its_membership(superset, monkeypatch):
+    """A Remove moves a chart to the trash, then takes it off the layout (`remove_chart_ids`) while the stored layout
+    still places it. The new layout decides which trashed members the baseline holds, not the stored one: the chart
+    is left out, so rc2's save leaves its row and a restore puts it back."""
+    import contextlib
+    import types
+
+    superset.charts = {11: SimpleNamespace(id=11)}
+    security = SimpleNamespace(can_access_dashboard=lambda dashboard: True, is_editor=lambda resource: True,
+                               can_access_chart=lambda chart: True)
+    monkeypatch.setattr(writes, "_security", lambda: security)
+    monkeypatch.setattr(writes, "_member_chart_ids", lambda dashboard_id: [9, 11])
+    helpers = types.ModuleType("superset.models.helpers")
+    helpers.skip_visibility_filter = lambda session, *classes: contextlib.nullcontext()
+    monkeypatch.setitem(sys.modules, "superset.models.helpers", helpers)
+    rows = {9: SimpleNamespace(id=9, deleted_at=datetime.fromisoformat(WHEN)), 11: SimpleNamespace(id=11, deleted_at=None)}
+    monkeypatch.setattr(writes, "lock_row", lambda model, chart_id: rows.get(chart_id))
+    monkeypatch.setattr(writes, "_session", lambda: SimpleNamespace())
+    installs: list = []
+    monkeypatch.setattr(writes, "_install_membership_baseline",
+                        lambda dashboard, charts: installs.append([c.id for c in charts]))
+    stored = _one_chart_layout(11)
+    stored["GRID_ID"]["children"].append("CHART-9")
+    stored["CHART-9"] = {"type": "CHART", "id": "CHART-9", "children": [], "meta": {"chartId": 9, "width": 4, "height": 50}}
+    dashboard = SimpleNamespace(id=3, changed_on=datetime.fromisoformat(WHEN), position_json=json.dumps(stored),
+                                json_metadata=None, editors=[])
+    found = writes.read("set_layout", {"dashboard_id": 3, "positions": _one_chart_layout(11), "add_chart_ids": [],
+                                       "remove_chart_ids": [9], "expect_changed_on": WHEN})
     assert writes._layout(found, dashboard) == {"ok": True}
-    assert superset.ran[0] == ("install", [11])
+    assert installs == [[11]]
 
 
 def test_the_membership_baseline_is_installed_only_on_a_clean_saved_dashboard(monkeypatch, caplog):
