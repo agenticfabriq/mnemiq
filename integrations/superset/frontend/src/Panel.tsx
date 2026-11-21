@@ -1,6 +1,11 @@
-import React, { useEffect, useState, type CSSProperties } from "react";
-import { Button, theme } from "antd";
-import { chat } from "@apache-superset/core";
+import React, { useEffect, useMemo, useState, useSyncExternalStore, type CSSProperties } from "react";
+import { Button, Spin, theme } from "antd";
+import { authentication, chat } from "@apache-superset/core";
+import { PanelApi } from "./api";
+import { pageAppRoot, usePageContext } from "./page";
+import { probe } from "./readiness";
+import { getSnapshot, subscribe, update } from "./store";
+import { Header } from "./views/Header";
 
 // 640 px tall, at most 80% of the window: `min(640px, 80vh)`, spelt so jsdom, whose CSS parser drops `min()`, keeps it.
 const FLOATING: CSSProperties = { width: 420, height: 640, maxHeight: "80vh" };
@@ -29,25 +34,56 @@ export function Panel() {
     fontSize: token.fontSize,
     overflow: "hidden",
   };
-  const header: CSSProperties = {
-    display: "flex",
-    alignItems: "center",
-    gap: token.paddingXS,
-    padding: `${token.paddingXS}px ${token.padding}px`,
-    borderBottom: `1px solid ${token.colorBorderSecondary}`,
-  };
   return (
     <section data-mnemiq-panel={mode} style={root} aria-label="mnemiq">
-      <header style={header}>
-        <strong style={{ flex: 1 }}>mnemiq</strong>
-        {mode === "floating" ? (
-          <Button size="small" type="text" onClick={() => chat.setDisplayMode("panel")}>Dock</Button>
-        ) : (
-          <Button size="small" type="text" onClick={() => chat.setDisplayMode("floating")}>Float</Button>
-        )}
-        <Button size="small" type="text" onClick={() => chat.close()}>Close</Button>
-      </header>
-      <div style={{ flex: 1, overflow: "auto", padding: token.padding }} />
+      <Header mode={mode} />
+      <div style={{ flex: 1, overflow: "auto", padding: token.padding }}>
+        <Body />
+      </div>
     </section>
+  );
+}
+
+/** The panel's API client for this page: the forwarder under the page's application root, with Superset's CSRF
+ * token on a POST. */
+function usePanelApi(): PanelApi {
+  return useMemo(() => new PanelApi(pageAppRoot(), () => authentication.getCSRFToken()), []);
+}
+
+/** What the person may do here, asked once per opening; until mnemiq says they are ready, nothing else is asked. */
+function Body() {
+  const api = usePanelApi();
+  const { readiness } = useSyncExternalStore(subscribe, getSnapshot);
+  useEffect(() => {
+    const asking = new AbortController();
+    probe(api, asking.signal)
+      .then((found) => update((state) => ({ ...state, readiness: found })))
+      .catch(() => {});
+    return () => asking.abort();
+  }, [api]);
+  if (readiness === null) return <Spin size="small" />;
+  if (readiness.kind !== "ready") return <p role="alert">{readiness.sentence}</p>;
+  return <Ready starters={readiness.starters} />;
+}
+
+/** The panel for a person mnemiq answers: the dashboard on screen, when they may read it, and the opening questions. */
+function Ready({ starters }: { starters: string[] }) {
+  const { dashboard } = usePageContext();
+  const { token } = theme.useToken();
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: token.padding }}>
+      {dashboard?.readable && dashboard.id !== null ? (
+        <section aria-label="This dashboard" style={{ color: token.colorTextSecondary }}>
+          On <strong style={{ color: token.colorText }}>{dashboard.title ?? "this dashboard"}</strong>
+        </section>
+      ) : null}
+      {starters.length > 0 ? (
+        <section aria-label="Starters" style={{ display: "flex", flexDirection: "column", gap: token.paddingXS }}>
+          {starters.map((starter) => (
+            <Button key={starter} style={{ textAlign: "left", whiteSpace: "normal", height: "auto" }}>{starter}</Button>
+          ))}
+        </section>
+      ) : null}
+    </div>
   );
 }

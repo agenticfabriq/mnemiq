@@ -3,15 +3,18 @@
 // value (the measures section keeps those in its own state, read again each time it opens). rc2 unmounts the panel on
 // every close (`AppContent` renders `ChatPanelHost` only while the panel is open), so what must outlive a close lives
 // here.
+import type { Readiness } from "./readiness";
 import type { Turn } from "./shared";
 
 export type PanelState = {
   turns: Turn[];
   /** The build this page is driving, while it runs. */
   runningBuild: string | null;
+  /** What mnemiq said this person may do, the last time the panel asked. */
+  readiness: Readiness | null;
 };
 
-const EMPTY: PanelState = { turns: [], runningBuild: null };
+const EMPTY: PanelState = { turns: [], runningBuild: null, readiness: null };
 
 let state: PanelState = EMPTY;
 const listeners = new Set<() => void>();
