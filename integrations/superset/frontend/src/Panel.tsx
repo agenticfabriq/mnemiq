@@ -128,7 +128,7 @@ function Ready({ api, starters }: { api: PanelApi; starters: string[] }) {
       ) : null}
       <Conversation turns={turns} />
       <BuildCard onScreenId={onScreen?.id ?? null} />
-      <ChangeCard api={api} />
+      <ChangeCard api={api} onScreenId={onScreen?.id ?? null} />
       <Composer busy={{ ask: asking, build: planning || runningBuild !== null, change: changing?.sending ?? false }}
         onDashboard={onScreen ? onScreen.title ?? "this dashboard" : null} onAsk={ask} onBuild={build} onChange={change} />
     </div>

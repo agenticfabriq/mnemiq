@@ -1,7 +1,7 @@
-// Changing the dashboard on screen by chat (PR D's `POST v1/superset/dashboards/{id}/changes`): mnemiq reads the
-// request against the dashboard's charts and makes each change as the person, leaves what it should not change with
-// its reason, proposes any removal for the person to confirm, and plans a chart to add as a build, which the panel
-// runs. The dashboard is the one on screen when the request is sent.
+// Changing the dashboard on screen by chat (mnemiq's changes route, `POST v1/superset/dashboards/{id}/changes`): mnemiq
+// reads the request against the dashboard's charts and makes each change as the person, leaves what it should not
+// change with its reason, proposes any removal (a deletion) for the person to confirm, and plans a chart to add as a
+// build, which the panel runs. The dashboard is the one on screen when the request is sent.
 import type { Answer, PanelApi } from "./api";
 import { driver, type StartAnswer } from "./build";
 import { update } from "./store";
@@ -31,20 +31,45 @@ export type ChangeRecord = {
 export const NOT_ON_A_DASHBOARD = "Change works on a dashboard you can read: open one, then ask again.";
 const UNASKED = "mnemiq could not be asked to change the dashboard; try again shortly.";
 
-const list = <T,>(value: unknown): T[] => (Array.isArray(value) ? (value as T[]) : []);
+const isId = (value: unknown): value is number => typeof value === "number" && Number.isInteger(value) && value > 0;
+const isText = (value: unknown): value is string => typeof value === "string";
+const entries = (value: unknown): Record<string, unknown>[] =>
+  Array.isArray(value) ? value.filter((item): item is Record<string, unknown> => !!item && typeof item === "object") : [];
 
-/** mnemiq's answer read defensively: a list it leaves out is none, and its message is text or nothing. */
+/** A chart added by the change, as the start route answers it, when it reads as one of its answers; else null. */
+function addedOf(value: unknown): ChangeView["added"] {
+  const found = (value ?? null) as Record<string, Record<string, unknown> | null> | null;
+  if (found === null || typeof found !== "object") return null;
+  const build = found.build;
+  if (build && isText(build.build_id) && isText(build.status) && Array.isArray(build.steps)) {
+    return { build: build as never };
+  }
+  if (found.offer && isId(found.offer.dashboard_id) && isText(found.offer.message)) return { offer: found.offer as never };
+  if (found.refused && isText(found.refused.reason)) {
+    return { refused: { reason: found.refused.reason, parts: entries(found.refused.parts)
+      .filter((part) => isText(part.part) && isText(part.reason)) as { part: string; reason: string }[] } };
+  }
+  if (found.shown && isText(found.shown.message)) return { shown: found.shown as never };
+  if (found.error && typeof found.error === "object") return { error: found.error as { status: number; detail: unknown } };
+  return null;
+}
+
+/** mnemiq's answer read entry by entry: an entry of another shape is left out, a list the answer leaves out is none,
+ * and its message is text or nothing, so nothing in it can break the card (which the store keeps across openings). */
 export function changeView(body: unknown): ChangeView {
   const found = (body ?? {}) as Record<string, unknown>;
+  const ids = (value: unknown) => (Array.isArray(value) ? value.filter(isId) : []);
   return {
-    changed: list<number>(found.changed),
-    left: list(found.left),
-    dropped: list(found.dropped),
-    not_editor: list(found.not_editor),
-    removed: list<number>(found.removed),
-    would_remove: list(found.would_remove),
-    added: (found.added as ChangeView["added"]) ?? null,
-    message: typeof found.message === "string" ? found.message : "",
+    changed: ids(found.changed),
+    left: entries(found.left).filter((e) => isId(e.chart_id) && isText(e.reason)) as ChangeView["left"],
+    dropped: entries(found.dropped).filter((e) => isId(e.chart_id) && isText(e.key)) as ChangeView["dropped"],
+    not_editor: entries(found.not_editor).filter((e) => isId(e.chart_id) && Array.isArray(e.editors))
+      .map((e) => ({ chart_id: e.chart_id as number, editors: (e.editors as unknown[]).filter(isText) })),
+    removed: ids(found.removed),
+    would_remove: entries(found.would_remove).filter((e) => isId(e.chart_id))
+      .map((e) => ({ chart_id: e.chart_id as number, title: isText(e.title) ? e.title : null })),
+    added: addedOf(found.added),
+    message: isText(found.message) ? found.message : "",
   };
 }
 
@@ -117,7 +142,7 @@ function settle(answer: Answer<unknown>, request: string, dashboardId: number): 
     // The chart the change adds is a build onto this dashboard: run it, unless one is already running here, in which
     // case it waits, resumable, among the person's unfinished builds.
     if (!driver.resume(request, { dashboardId }, added.build.build_id)) {
-      note = "Another build is running here; the chart's build waits among your unfinished builds.";
+      note = "Another build is running on this page; the chart's build waits among your unfinished builds.";
     }
   }
   write((record) => ({ ...record, answer: view, refused: null, note }));

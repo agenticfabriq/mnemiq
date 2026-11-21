@@ -12,7 +12,7 @@ const json = (status: number, body: unknown) =>
 
 function measure(fields: Partial<MeasureItem> = {}): MeasureItem {
   return { name: "open_claims", label: "Open claims", expression: "COUNT(*)", kind: "count", currency: null,
-    description: "", asked_by: "", dataset_id: 3, saved_metric: false, value: 412, value_note: null,
+    description: "", asked_by: "", dataset_id: 3, saved_metric: null, value: 412, value_note: null,
     charts: [{ chart_id: 101, title: "Open claims", check: "checked" }, { chart_id: 102, title: "Claims by region", check: null }],
     ...fields };
 }
@@ -78,11 +78,12 @@ describe("the dashboard's measures", () => {
     expect(row.textContent).not.toMatch(/\b0\b/);
   });
 
-  it("Remove names the charts before it removes them, and sends those ids", async () => {
+  it("Remove names the charts it deletes before it deletes them, and sends those ids", async () => {
     const { api, calls } = server({
       [`GET ${LIST}`]: () => json(200, { measures: [measure()] }),
-      [`POST ${LIST}/open_claims/remove`]: () => json(200, { changed: [101, 102], left_by_hand: [], not_editor: [],
-        blocked_by_report: [], could_not_read: [], message: "Open claims was removed from 2 charts." }),
+      [`POST ${LIST}/open_claims/remove`]: () => json(200, { changed: [101], left_by_hand: [], not_editor: [
+        { chart_id: 102, dataset_id: 3, editors: ["Bo Owner"] }], blocked_by_report: [], could_not_read: [],
+        message: "Deleted 1 chart, moved to Superset's trash; 1 chart you do not edit was taken off this dashboard." }),
     });
     render(<Measures api={api} dashboardId={7} />);
     open();
@@ -90,9 +91,16 @@ describe("the dashboard's measures", () => {
     const dialog = await screen.findByRole("dialog");
     expect(dialog.textContent).toContain("Open claims");
     expect(dialog.textContent).toContain("Claims by region");
+    // What Remove does, said before it is done: the charts are deleted, not the measure taken off them.
+    expect(dialog.textContent).toMatch(/deleted/);
+    expect(dialog.textContent).toMatch(/taken off this dashboard instead/);
     expect(calls.filter((c) => c.method === "POST")).toEqual([]);
-    fireEvent.click(within(dialog).getByRole("button", { name: "Remove from these charts" }));
-    await screen.findByText("Open claims was removed from 2 charts.");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Delete these charts" }));
+    await screen.findByText("Deleted 1 chart, moved to Superset's trash; 1 chart you do not edit was taken off this dashboard.");
+    const result = screen.getByRole("status", { name: "Result" });
+    expect(result.textContent).toMatch(/Deleted: Open claims/);
+    expect(result.textContent).toMatch(/Taken off this dashboard \(you do not edit it\): Claims by region; its editors: Bo Owner/);
+    expect(result.textContent).not.toMatch(/Changed:/);
     expect(calls.find((c) => c.method === "POST")).toEqual({ method: "POST", path: `${LIST}/open_claims/remove`,
       body: { chart_ids: [101, 102] } });
   });
@@ -106,7 +114,7 @@ describe("the dashboard's measures", () => {
     render(<Measures api={api} dashboardId={7} />);
     open();
     fireEvent.click(await screen.findByRole("button", { name: "Remove" }));
-    fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Remove from these charts" }));
+    fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Delete these charts" }));
     await screen.findByText("The measure's charts changed; look again.");
     const dialog = screen.getByRole("dialog");
     expect(dialog.textContent).toContain("Claims this week");
@@ -155,5 +163,84 @@ describe("the dashboard's measures", () => {
     open();
     await screen.findByText("987,654");
     expect(JSON.stringify(getSnapshot())).not.toMatch(/98765/);
+  });
+
+  it("an action in flight sends once, and holds the other actions until it answers", async () => {
+    let release = () => {};
+    const held = new Promise<void>((done) => { release = done; });
+    const { api, calls } = server({
+      [`GET ${LIST}`]: () => json(200, { measures: [measure()] }),
+      [`POST ${LIST}/open_claims/remove`]: async () => { await held; return json(200, { changed: [101, 102],
+        left_by_hand: [], not_editor: [], blocked_by_report: [], could_not_read: [], message: "Deleted 2 charts." }); },
+      [`POST ${LIST}/open_claims/edit`]: async () => { await held; return json(200, { changed: [101], left_by_hand: [],
+        not_editor: [], blocked_by_report: [], could_not_read: [], message: "Changed." }); },
+    });
+    render(<Measures api={api} dashboardId={7} />);
+    open();
+    fireEvent.click(await screen.findByRole("button", { name: "Remove" }));
+    const confirm = within(await screen.findByRole("dialog")).getByRole("button", { name: "Delete these charts" });
+    fireEvent.click(confirm);
+    fireEvent.click(confirm);
+    await new Promise((done) => setTimeout(done, 20));
+    expect(calls.filter((c) => c.path.endsWith("/remove"))).toHaveLength(1);
+    for (const name of ["Edit", "Remove", "Save to dataset"]) {
+      expect((screen.getAllByRole("button", { name })[0] as HTMLButtonElement).disabled, name).toBe(true);
+    }
+    release();
+    await screen.findByText("Deleted 2 charts.");
+    expect(calls.filter((c) => c.path.endsWith("/remove"))).toHaveLength(1);
+  });
+
+  it("Edit stays open until mnemiq answers, so a second edit starts from the saved definition", async () => {
+    let release = () => {};
+    const held = new Promise<void>((done) => { release = done; });
+    const { api, calls } = server({
+      [`GET ${LIST}`]: () => json(200, { measures: [measure()] }),
+      [`POST ${LIST}/open_claims/edit`]: async () => { await held; return json(200, { changed: [101], left_by_hand: [],
+        not_editor: [], blocked_by_report: [], could_not_read: [], message: "Changed." }); },
+    });
+    render(<Measures api={api} dashboardId={7} />);
+    open();
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save changes" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save changes" }));
+    await new Promise((done) => setTimeout(done, 20));
+    expect(calls.filter((c) => c.path.endsWith("/edit"))).toHaveLength(1);
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    release();
+    await screen.findByText("Changed.");
+  });
+
+  it("each measure shows its definition and each chart's check; a saved metric offers no Edit", async () => {
+    const { api } = server({ [`GET ${LIST}`]: () => json(200, { measures: [
+      measure(), measure({ name: "premium@3", label: "Premium", expression: "SUM(premium)", saved_metric: "premium",
+        charts: [{ chart_id: 103, title: "Premium by region", check: "mismatch" }] })] }) });
+    render(<Measures api={api} dashboardId={7} />);
+    open();
+    const [counted, saved] = await screen.findAllByRole("listitem");
+    expect(counted.textContent).toContain("COUNT(*)");
+    expect(counted.textContent).toMatch(/Open claims: checked/);
+    expect(saved.textContent).toMatch(/Premium by region: numbers differ from mnemiq's/);
+    expect(within(counted).getByRole("button", { name: "Edit" })).toBeTruthy();
+    expect(within(saved).queryByRole("button", { name: "Edit" })).toBeNull();
+    expect(within(saved).queryByRole("button", { name: "Save to dataset" })).toBeNull();
+  });
+
+  it("an action answered after the section closed reads nothing more", async () => {
+    let release = () => {};
+    const held = new Promise<void>((done) => { release = done; });
+    const { api, calls } = server({
+      [`GET ${LIST}`]: () => json(200, { measures: [measure()] }),
+      [`POST ${LIST}/open_claims/save`]: async () => { await held; return json(200, { changed: [], left_by_hand: [],
+        not_editor: [], blocked_by_report: [], could_not_read: [], message: "Saved." }); },
+    });
+    render(<Measures api={api} dashboardId={7} />);
+    open();
+    fireEvent.click(await screen.findByRole("button", { name: "Save to dataset" }));
+    open();
+    release();
+    await new Promise((done) => setTimeout(done, 30));
+    expect(calls.filter((c) => c.path === LIST)).toHaveLength(1);
   });
 });

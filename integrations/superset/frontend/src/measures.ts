@@ -1,4 +1,4 @@
-// The dashboard's measures, as mnemiq answers them for the person asking (PR D's measures routes): each measure's
+// The dashboard's measures, as mnemiq's measures routes answer them for the person asking: each measure's
 // definition, its value computed now under the person's own rules, and the charts that hold a copy of it. Values are
 // read each time the section opens and kept only in its component's state, never in the panel's store.
 import type { Answer, PanelApi } from "./api";
@@ -17,7 +17,8 @@ export type MeasureItem = {
   description: string;
   asked_by: string;
   dataset_id: number;
-  saved_metric: boolean;
+  /** The saved metric the measure is, when it is one (a metric Superset keeps on the dataset), else null. */
+  saved_metric: string | null;
   value: number | null;
   value_note: string | null;
   charts: ChartOfMeasure[];
@@ -25,8 +26,9 @@ export type MeasureItem = {
 
 export type Editors = { chart_id?: number; dataset_id?: number; editors: string[] };
 
-/** What an Edit, a Remove or a Save did: the charts changed, those left as changed by hand, those the person does not
- * edit (with who does), those a report holds, those that could not be read, and mnemiq's words. */
+/** What an Edit, a Remove or a Save did: the charts changed (for a Remove, deleted), those left as changed by hand,
+ * those the person does not edit (with who does; a Remove takes them off this dashboard instead), those a report
+ * holds, those that could not be read, and mnemiq's words. */
 export type ActionAnswer = {
   changed: number[];
   left_by_hand: number[];
