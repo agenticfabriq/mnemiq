@@ -303,6 +303,52 @@ def test_failed_check_is_reported_as_what_it_is(fake, world, store):
     assert kept["policies"].check_status[ids["policies_by_region"]] is ChartStatus.MISMATCH
 
 
+def test_build_answer_names_its_plan(fake, world, store):
+    """What the panel shows before the first chart is made: each planned chart by key, title and family with its
+    measures by label (a saved metric by name), and each written measure's definition."""
+    state = _start(store)
+    plan = state.plan
+    assert [c["key"] for c in plan["charts"]] == [c.key for c in SIX.charts]
+    by_key = {c["key"]: c for c in plan["charts"]}
+    assert by_key["premium_by_month"] == {"key": "premium_by_month", "title": "Premium by month", "family": "line",
+                                          "measures": ["total_premium"]}
+    assert by_key["policies_kpi"]["measures"] == ["Policies"]
+    assert {"name": "policies", "label": "Policies", "expression": "COUNT(policy_id)", "kind": "count",
+            "currency": None} in plan["measures"]
+    later = build_state(store, store.load_build(TENANT, state.build_id, PRINCIPAL))
+    assert later.plan == plan
+
+
+def test_plan_summary_holds_no_filter_operand():
+    """The summary names charts and measures only: a filter's operand, a dimension or a dataset's SQL is not in it."""
+    from mnemiq.superset.builder import plan_summary
+    from mnemiq.superset.planner import plan_to_json
+
+    filtered = dataclasses.replace(BY_REGION, filters=(Filter("stage", "=", "Closed Won"),))
+    summary = plan_summary(plan_to_json(BuildPlan(charts=(filtered,), measures=(POLICIES,))))
+    text = json.dumps(summary)
+    assert "Closed Won" not in text and "stage" not in text and "dimensions" not in text
+
+
+def test_check_step_answers_each_charts_reason(fake, world, store):
+    """The check step's answer names why each chart that did not check did not, by its id; a checked chart has
+    none."""
+    world.skewed["Policies by region"] = 1
+    final = _run(store, _start(store).build_id, _adapter(fake))[-1]
+    ids = _chart_ids(final)
+    assert set(final.check_reasons) == {ids["policies_by_region"]}
+    assert final.check_reasons[ids["policies_by_region"]]
+
+
+def test_check_reasons_are_not_kept(fake, world, store):
+    """The reasons ride back in the check step's own answer only: a later read of the build answers none."""
+    world.skewed["Policies by region"] = 1
+    final = _run(store, _start(store).build_id, _adapter(fake))[-1]
+    assert final.check_reasons
+    later = build_state(store, store.load_build(TENANT, final.build_id, PRINCIPAL))
+    assert later.check_reasons == {}
+
+
 # A written measure whose label rc2's MCP saves as other text (`ColumnRef.sanitize_label` escapes `<`), on a currency
 # table, whose per-column currency is set under the label mnemiq sent.
 YOUNG = Measure(name="young_premium", label="Premium < 1y", expression="SUM(premium)", kind=MeasureKind.CURRENCY,

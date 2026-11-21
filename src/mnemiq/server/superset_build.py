@@ -22,6 +22,9 @@ route under `/v1/superset/`.
   is a 503 saying to try again; a prompt its server refuses or cuts as too long is a refused plan, since the goal and
   the schema are too large to plan in one prompt.
 - `GET /v1/superset/builds/{build_id}`: the build as it stands, read from the build store alone.
+- `GET /v1/superset/builds?dashboard_id=`: the person's builds still building, newest first (with `dashboard_id`,
+  only that dashboard's), each `build_id`, `goal`, `dashboard_id`, `status`, `created_at`, `updated_at`, `steps_done`
+  and `steps_total`, read from the build store alone: what a client offers to finish.
 - `POST /v1/superset/builds/{build_id}/next`: the build's next step, claimed, run and recorded (`builder.next_step`);
   409 while another request's step holds the build.
 
@@ -48,7 +51,9 @@ writes it.
 **What is answered.** A build as `_build` writes it, and nothing else: `build_id`, `status` and `dashboard_id`; its
 `steps`, each `key`, `kind`, `status`, `object_id` (what the step made), `started_at` and `lease_until` (when a running
 step's lease passes); `checks`, each chart's check status by chart id; `ran`, the step this request ran, and `message`,
-mnemiq's own words on it. Never a lease id, a step's intent, or a value. Every failure is a status and mnemiq's own
+mnemiq's own words on it; `plan`, the build's plan as the person is shown it (`builder.plan_summary`: each chart's
+key, title, family and measures, each written measure's definition); and `check_reasons`, why each chart the check
+step did not check did not, in that step's own answer only. Never a lease id, a step's intent, or a value. Every failure is a status and mnemiq's own
 sentence (`server/superset_refusals.py`, and `_refusal` here for the build's own).
 """
 
@@ -58,7 +63,7 @@ import logging
 from typing import Annotated, Any
 
 import psycopg
-from fastapi import Depends, FastAPI, HTTPException, Path, Response
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Response
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, model_validator
 
 from mnemiq.llm.client import ModelUnavailable
@@ -259,6 +264,8 @@ def _build(state: BuildState) -> dict:
         "checks": {str(chart_id): str(status) for chart_id, status in state.checks.items()},
         "ran": state.ran,
         "message": state.message,
+        "plan": state.plan,
+        "check_reasons": {str(chart_id): reason for chart_id, reason in state.check_reasons.items()},
     }
 
 
@@ -403,6 +410,23 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
                                      profile_name=body.profile)
             response.status_code = status
             return answer
+
+        return answered(work)
+
+    @app.get("/v1/superset/builds")
+    def unfinished(dashboard_id: Annotated[int | None, Query(gt=0, le=MAX_ID)] = None,
+                   asking=Depends(asker)) -> dict:
+        """The person's builds still building, newest touched first, from the build store alone: what a client
+        offers to finish. With `dashboard_id`, only that dashboard's. Calls no Superset tool."""
+
+        def work() -> dict:
+            who, _ = _builder(asking, building=False)
+            listed = kept().unfinished_builds(who.tenant_id, who.principal_id, dashboard_id=dashboard_id)
+            return {"builds": [{"build_id": build.build_id, "goal": build.goal, "dashboard_id": build.dashboard_id,
+                                "status": build.status, "created_at": build.created_at,
+                                "updated_at": build.updated_at,
+                                "steps_done": sum(1 for step in build.steps if step.status == "done"),
+                                "steps_total": len(build.steps)} for build in listed]}
 
         return answered(work)
 

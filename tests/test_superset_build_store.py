@@ -1121,6 +1121,38 @@ def test_a_held_row_makes_a_claim_fail_promptly_not_hang(store_dsn, monkeypatch,
 
 # --- One live build per dashboard: a dashboard's measures are replaced by whichever build writes them last.
 
+def test_unfinished_builds_are_the_callers_own(store):
+    """A builder's unfinished builds are theirs, of their tenant, newest touched first: another principal's and
+    another tenant's are not listed."""
+    first = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12)
+    second = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=13)
+    store.create_build(TENANT, BO, GOAL, PLAN, STEPS, dashboard_id=14)
+    store.create_build(OTHER_TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=15)
+    claimed = store.claim_next_step(TENANT, first.build_id, ANA, _intent("dashboard", "dashboard"))
+    store.finish_step(TENANT, first.build_id, "dashboard", "done", 12, lease_id=claimed.lease_id)
+    listed = store.unfinished_builds(TENANT, ANA)
+    assert [build.build_id for build in listed] == [first.build_id, second.build_id]
+
+
+def test_done_and_failed_builds_are_not_listed(store):
+    failed = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12)
+    claimed = store.claim_next_step(TENANT, failed.build_id, ANA, _intent("dashboard", "dashboard"))
+    store.finish_step(TENANT, failed.build_id, "dashboard", "failed", None, lease_id=claimed.lease_id)
+    building = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=13)
+    assert [build.build_id for build in store.unfinished_builds(TENANT, ANA)] == [building.build_id]
+
+
+def test_unfinished_builds_filter_by_dashboard(store):
+    """Asked for a dashboard, only builds of that dashboard are listed: one with no dashboard yet is listed only
+    when none is asked for."""
+    on_twelve = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12)
+    fresh = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS)
+    assert [b.build_id for b in store.unfinished_builds(TENANT, ANA, dashboard_id=12)] == [on_twelve.build_id]
+    assert {b.build_id for b in store.unfinished_builds(TENANT, ANA)} == {on_twelve.build_id, fresh.build_id}
+    assert store.unfinished_builds(TENANT, ANA, dashboard_id=99) == []
+    assert len(store.unfinished_builds(TENANT, ANA, limit=1)) == 1
+
+
 def test_a_dashboard_with_a_build_building_is_said_to_be_building(store):
     """What an action on a dashboard's measures asks first: whether a build of the tenant's is building on it. Another
     tenant's and another dashboard's build do not count, nor one that ended."""

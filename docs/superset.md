@@ -284,7 +284,11 @@ still to come. In short:
     prompt. The planning prompt holds every table, column and saved metric the builder can see, so a large schema
     needs a large window.
   - `POST /v1/superset/builds/{id}/next` runs the build's next step.
-  - `GET /v1/superset/builds/{id}` reads the build as it stands.
+  - `GET /v1/superset/builds/{id}` reads the build as it stands. Every build answer names its plan (each chart's
+    title, family and measures, and each measure mnemiq writes), and the check step's own answer says why each chart
+    that did not check did not (`check_reasons`), which is not kept.
+  - `GET /v1/superset/builds` lists the person's builds still building, newest first (with `?dashboard_id=`, only
+    that dashboard's), each with its goal and how many of its steps are done: what a client offers to finish.
 - **A dashboard's measures**, for any editor of the dashboard, each route asked with a token minted for building:
   the list reads the dashboard's layout and charts, which a token minted for asking cannot (a 403 naming the scopes).
   - `GET /v1/superset/dashboards/{id}/measures` lists the measures mnemiq keeps for the dashboard: each definition,

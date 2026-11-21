@@ -181,6 +181,14 @@ class MemoryBuildStore:
             self._builds[(tenant, build_id)] = row
             return self._stored(row)
 
+    def unfinished_builds(self, tenant, principal, *, dashboard_id=None, limit=10) -> list[StoredBuild]:
+        with self._lock:
+            rows = [row for row in self._builds.values() if row["tenant_id"] == tenant
+                    and row["principal_id"] == principal and row["status"] == bs.BUILDING
+                    and (dashboard_id is None or row["dashboard_id"] == dashboard_id)]
+            rows.sort(key=lambda row: (row["updated_at"], row["build_id"]), reverse=True)
+            return [self._stored(row) for row in rows[:limit]]
+
     def dashboard_building(self, tenant, dashboard_id) -> bool:
         with self._lock:
             self._release_abandoned(tenant, dashboard_id)
