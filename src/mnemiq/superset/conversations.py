@@ -10,7 +10,8 @@ Nothing kept is a row of results. A message is held to `MESSAGE_JSON_SHAPE`, an 
 and beneath it the build store's refusal of any key a value, a row or a sample is kept under (`VALUE_SHAPED_KEYS`). An
 answer keeps its question, mnemiq's sentence and its SQL; the sentence can hold numbers, and is kept because the answer
 is already its owner's own, in their conversation alone. Its table is run again as the person when they ask for it,
-and kept nowhere. A build's proposal keeps its plan as the person is shown it (`builder.plan_summary`).
+and kept nowhere. A build's proposal keeps its plan as the person is shown it (`builder.plan_summary`); a change's
+preview keeps what the model read of the request, a filter's typed literal under `operand`.
 
 A proposal's outcome is settled by compare-and-set (`settle`): only while its state is the one expected, so a second
 confirm of one proposal, from a double click or another tab, finds it settled and does nothing.
@@ -33,6 +34,7 @@ from psycopg.types.json import Jsonb
 
 from mnemiq.superset.build_store import MAX_ID, BuildStoreMissing, _bound_waits, _iso, _plain_json, _shaped, _text
 from mnemiq.superset.builder import PLAN_SUMMARY_JSON
+from mnemiq.superset.chart_change import PREVIEW_JSON_SHAPE
 from mnemiq.superset.planner import SCALAR
 
 if TYPE_CHECKING:
@@ -84,7 +86,8 @@ MESSAGE_JSON_SHAPE: dict = {
     "intent": SCALAR, "goal": SCALAR,
     "answer": {"sentence": SCALAR, "sql": SCALAR, "grant_fingerprint": SCALAR, "tables_used": [SCALAR]},
     "build_id": SCALAR,
-    "proposal": (_BUILD_PROPOSAL_JSON,),
+    # A build waiting for "Build it", or a change's preview waiting for "Apply" (`ChangePreview.to_json`).
+    "proposal": (_BUILD_PROPOSAL_JSON, PREVIEW_JSON_SHAPE),
     "offer": {"dashboard_id": SCALAR, "title": SCALAR, "reason": SCALAR},
     "refused": {"reason": SCALAR, "parts": [{"part": SCALAR, "reason": SCALAR}]},
     "shown": {"dashboard_id": SCALAR, "left_out": _LEFT_OUT_JSON},
