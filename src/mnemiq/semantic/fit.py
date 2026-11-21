@@ -118,6 +118,19 @@ def rank_columns(packet: ContextPacket, snapshot, policy) -> list[tuple[str, str
     return first + shared
 
 
+@dataclass(frozen=True)
+class PromptFit:
+    """Whether the prompt `fit` sends fits the model's window: its tokens, counted by the server where it counts them
+    (`counted_by` "server"), else the byte bound (`"estimate"`, never an undercount), against the window less the reply
+    budget (`reserve`). `budget` and `fits` are None where no window is known."""
+
+    tokens: int
+    budget: int | None
+    reserve: int
+    counted_by: str
+    fits: bool | None
+
+
 def ranked_meanings(ranked: list[tuple[str, str]], snapshot) -> list[tuple[str, str, str]]:
     """What the fitter keeps, best first: every ranked column's comment, then every ranked column's description, each
     in `rank_columns` order. Trimming from the end drops the model's descriptions before any comment, which a person
@@ -177,6 +190,23 @@ class PromptFitter:
             logger.warning("prompt window: fitting the cards failed; sending them as retrieved",
                            exc_info=True)
             return packet
+
+    def measure(self, packet: ContextPacket, snapshot, grants, card_style: str | None = None) -> PromptFit:
+        """What `fit` would send for `packet`, counted as `fit` counts it, and whether it fits the window: the table-search
+        check's reading of a question, which `fit` itself never refuses (it sends what it cannot trim)."""
+        from mnemiq.generate.prompts import user_prompt
+
+        fitted = self.fit(packet, snapshot, grants, card_style)
+        system = self.system()
+        reserve = self.reply_tokens + FEEDBACK_ALLOWANCE
+        user = user_prompt(fitted)
+        counted = self._counted(system, user)
+        tokens = counted if counted is not None else byte_bound(system, user)
+        window = self._server_window or self.window
+        budget = window - reserve if window else None
+        return PromptFit(tokens=tokens, budget=budget, reserve=reserve,
+                         counted_by="server" if counted is not None else "estimate",
+                         fits=tokens <= budget if budget is not None else None)
 
     def _counted(self, system: str, user: str) -> int | None:
         """The server's count of this prompt, or None. A server that gave none is not asked again for
