@@ -383,8 +383,11 @@ def _enrichment_source(settings: Settings):
 
         adapter = enrichment_adapter(settings, service_credential_from_env())
         return source_spec(settings), adapter
+    from mnemiq.enrichment.deadline import EnrichDeadline
+
     spec = source_spec(settings)
-    return spec, adapter_for(spec, settings)
+    # Every statement enrich and refresh send carries the statement time limit; a cut one is recorded for the report.
+    return spec, EnrichDeadline(adapter_for(spec, settings), settings.enrich_statement_timeout_s)
 
 
 def _cmd_enrich(settings: Settings) -> int:
@@ -406,6 +409,9 @@ def _cmd_enrich(settings: Settings) -> int:
     except (SourceUnconfigured, UnknownSourceKind, SupersetConfigError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    if getattr(adapter, "unbounded", False):
+        print(f"WARNING: source {spec.id!r}: its adapter takes no statement time limit, so enrich reads it without "
+              "one", file=sys.stderr)
     # Superset mode reads the source as the service user, whose view of it is no one asking
     # person's: so it reads the catalogue and the counts and harvests no values. No code set, no
     # grounding from the source's labels, no binding probe and no value index, each of which
@@ -545,6 +551,11 @@ def _cmd_enrich(settings: Settings) -> int:
             snap, LLMExampleGenerator(LLMClient(settings)), adapter, dialect=adapter.dialect,
             guard_fanout=settings.guard_fanout,
         )
+    from mnemiq.enrichment.deadline import time_limit_job, time_limit_warning
+
+    # What the statement time limit cut before the save, on the snapshot; the closing warning names the value index's too.
+    if (cut := time_limit_job(adapter, snap.source_id)) is not None:
+        snap = snap.model_copy(update={"jobs": [*snap.jobs, cut]})
     con = init_store(settings.store_path, local_only=settings.local_only)
     save_snapshot(con, snap)
     if superset:
@@ -611,6 +622,8 @@ def _cmd_enrich(settings: Settings) -> int:
     from mnemiq.enrichment.pipeline import partition_warning
 
     if warning := partition_warning(snap):
+        print(warning, file=sys.stderr)
+    if warning := time_limit_warning(adapter, snap.source_id):
         print(warning, file=sys.stderr)
     return 0
 
