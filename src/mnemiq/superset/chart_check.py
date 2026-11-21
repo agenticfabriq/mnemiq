@@ -67,10 +67,12 @@ from mnemiq.superset.chart_form import (
     DatasetFacts,
     Expectation,
     NotCheckable,
+    Ranking,
     _metric_items,
     _quoted,
     _row_limit,
     expectation_from_form_data,
+    ranking_of,
 )
 from mnemiq.superset.charts import Filter
 from mnemiq.superset.client import SupersetToolError, SupersetUnavailable
@@ -79,8 +81,8 @@ from mnemiq.superset.display_format import CANNOT_TELL, Displayed, displayed, fi
 from mnemiq.superset.measures import Measure, MeasureKind, measure_statement, run_decided
 from mnemiq.superset.saved_metrics import SavedMetric
 
-__all__ = ["ChartCheck", "ChartStatus", "DatasetFacts", "Expectation", "NotCheckable", "check_chart",
-           "expectation_from_form_data", "percent_problem", "read_dataset_facts"]
+__all__ = ["ChartCheck", "ChartRead", "ChartStatus", "DatasetFacts", "Expectation", "NotCheckable", "check_chart",
+           "dataset_of", "expectation_from_form_data", "percent_problem", "read_chart", "read_dataset_facts"]
 
 logger = logging.getLogger(__name__)
 
@@ -159,29 +161,60 @@ def _log_error(what: str, answer: dict) -> None:
                    answer.get("error") or answer.get("message"))
 
 
-def _read_chart(client, chart_id: int) -> tuple[str, dict] | NotCheckable:
-    """The chart's type and `form_data`, the type as the chart row holds it (`get_chart_data` reads it the same way)."""
+@dataclass(frozen=True)
+class ChartRead:
+    """A chart as `get_chart_info` gives it to the caller: its title, its type as the chart row holds it
+    (`get_chart_data` reads it the same way), its `form_data` with that type, and its `changed_on`. `form_data` is None
+    when it cannot be read whole, and `unreadable` then says why, in mnemiq's words."""
+
+    chart_id: int
+    title: str | None
+    viz_type: str
+    form_data: dict | None
+    changed_on: str | None
+    unreadable: str | None = None
+    # Superset holds no chart of this id that the caller may read: deleted, or in the trash (rc2's soft-delete filter
+    # hides a trashed chart from every read), or never theirs to read.
+    missing: bool = False
+
+
+def read_chart(client, chart_id: int) -> ChartRead:
+    """The chart, read as the caller: never raised over a failed or cut read, which is answered as unreadable."""
     try:
         answer = client.call("get_chart_info", {"identifier": chart_id, "select_columns": _CHART_FIELDS})
     except (SupersetUnavailable, SupersetToolError) as failure:
-        return NotCheckable(f"{_UNREADABLE}{failure}")
+        return ChartRead(chart_id, None, "", None, None, f"{_UNREADABLE}{failure}")
     if _failed(answer):
         _log_error("get_chart_info", answer)
-        return NotCheckable(f"{_UNREADABLE}Superset answered with an error, which is in the log")
+        missing = str(answer.get("error_type") or "").replace("_", "").lower() == "notfound"
+        return ChartRead(chart_id, None, "", None, None,
+                         f"{_UNREADABLE}Superset answered with an error, which is in the log", missing=missing)
+    title = answer.get("slice_name") if isinstance(answer.get("slice_name"), str) else None
+    changed_on = answer.get("changed_on") if isinstance(answer.get("changed_on"), str) else None
     form = answer.get("form_data")
+    viz_type = answer.get("viz_type") or (form.get("viz_type") if isinstance(form, dict) else None) or ""
     if answer.get("_response_truncated") or (isinstance(form, dict) and form.get("_truncated")):
         # The size guard (`truncate_oversized_response` in `superset/mcp_service/utils/response_size_utils.py`) clips
         # strings and summarizes dicts anywhere in the answer, `form_data` among them.
-        return NotCheckable(f"{_UNREADABLE}Superset cut them to fit its response size")
+        return ChartRead(chart_id, title, viz_type, None, changed_on,
+                         f"{_UNREADABLE}Superset cut them to fit its response size")
     if not isinstance(form, dict):
         # `redact_chart_data_model_fields` (`superset/mcp_service/privacy.py`) withholds them from a caller without
         # the data-model privilege.
-        return NotCheckable(f"{_UNREADABLE}Superset does not show them to this builder")
-    viz_type = answer.get("viz_type") or form.get("viz_type") or ""
-    return viz_type, {**form, "viz_type": viz_type}
+        return ChartRead(chart_id, title, viz_type, None, changed_on,
+                         f"{_UNREADABLE}Superset does not show them to this builder")
+    return ChartRead(chart_id, title, viz_type, {**form, "viz_type": viz_type}, changed_on)
 
 
-def _dataset_of(form: dict, dataset_id: int) -> int | NotCheckable:
+def _read_chart(client, chart_id: int) -> tuple[str, dict] | NotCheckable:
+    """The chart's type and `form_data`, or why they cannot be read."""
+    read = read_chart(client, chart_id)
+    if read.form_data is None:
+        return NotCheckable(read.unreadable or _UNREADABLE)
+    return read.viz_type, read.form_data
+
+
+def dataset_of(form: dict, dataset_id: int) -> int | NotCheckable:
     """The dataset the chart reads now: the one its `form_data` names once saved in Explore, as
     `resolve_form_data_datasource` reads it, else the one mnemiq built it on (MCP's `generate_chart` saves no
     `datasource` in the chart's params, and `get_chart_info` returns no dataset id)."""
@@ -474,8 +507,42 @@ _OWN_SQL = "mnemiq's own SQL"
 _QUERY_DATASET = "Superset's own query of the dataset's saved metrics (query_dataset)"
 
 
+def _ranking_problem(chart: _Rows, mine: _Rows, ranking: Ranking, label: str) -> str | None | NotCheckable:
+    """Whether the chart's rows are the first `ranking.limit` of mnemiq's, ranked as the chart's query ranks them, a
+    group whose ranking value is NULL counted after every group with a value, groups tied at the cut standing in for
+    each other: None when they are, else why not. A ranking value that is not a number cannot be ranked."""
+    index, limit = ranking.metric_index, ranking.limit
+    values = {key: row[index] if index < len(row) else None for key, row in mine.values.items()}
+    if any(v is not None and (isinstance(v, bool) or not isinstance(v, (int, float, Decimal))) for v in values.values()):
+        return NotCheckable("the chart's ranking measure holds values mnemiq cannot rank")
+
+    def rank(value) -> tuple:
+        if value is None:
+            return (1, 0)
+        return (0, -value if ranking.descending else value)
+
+    ordered = sorted(values.values(), key=rank)
+    nth = ordered[min(limit, len(ordered)) - 1]
+
+    def place(value) -> int:
+        """-1 before the cut, 0 tied with it (equal as `_same` compares, so float noise is a tie), 1 after it."""
+        if _same(value, nth):
+            return 0
+        return -1 if rank(value) < rank(nth) else 1
+
+    shown = set(chart.values)
+    order = "largest" if ranking.descending else "smallest"
+    if any(values[key] is None for key in shown) and any(values[key] is not None for key in values if key not in shown):
+        return (f"the chart's row limit ({limit:,}) keeps groups with no value for {label!r} and leaves out groups that "
+                f"have one, so they are not the {limit:,} {order}")
+    if any(place(values[key]) < 0 for key in values if key not in shown) or any(place(values[key]) > 0
+                                                                                for key in shown):
+        return f"the chart's row limit ({limit:,}) keeps groups that are not the {limit:,} {order} by {label!r}"
+    return None
+
+
 def _compare(chart_id: int, chart: _Rows, mine: _Rows, row_limit: int | None, *, source: str,
-             labels: tuple[str, ...] = ()) -> ChartCheck:
+             labels: tuple[str, ...] = (), ranking: Ranking | None = None) -> ChartCheck:
     shown = list(chart.values)
     order = [key for key in shown if key in mine.values] + [key for key in mine.values if key not in chart.values]
     both = (_values(chart.values, shown), _values(mine.values, order))
@@ -491,19 +558,31 @@ def _compare(chart_id: int, chart: _Rows, mine: _Rows, row_limit: int | None, *,
                                                 f"({mine.cap:,}), so not all of them were compared")
     if any(key not in mine.values for key in shown):
         return outcome(ChartStatus.MISMATCH, f"the chart shows a group {source} does not find")
+    checked = f"the chart's numbers match {source}"
     if len(mine.values) > len(shown):
-        if row_limit is not None and chart.largest >= row_limit:
-            return outcome(ChartStatus.NOT_CHECKED, f"the chart's row limit ({row_limit:,}) keeps only some of its "
-                                                    "groups, so not all of them were compared")
-        return outcome(ChartStatus.MISMATCH, f"{source} finds a group the chart does not show")
+        if row_limit is None or chart.largest < row_limit:
+            return outcome(ChartStatus.MISMATCH, f"{source} finds a group the chart does not show")
+        cut = (f"the chart's row limit ({row_limit:,}) keeps only some of its groups, so not all of them were "
+               "compared")
+        if ranking is None or ranking.limit != row_limit:
+            return outcome(ChartStatus.NOT_CHECKED, cut)
+        label = labels[ranking.metric_index] if ranking.metric_index < len(labels) else f"number {ranking.metric_index + 1}"
+        problem = _ranking_problem(chart, mine, ranking, label)
+        if isinstance(problem, NotCheckable):
+            return outcome(ChartStatus.NOT_CHECKED, f"{cut}: {problem.reason}")
+        if problem is not None:
+            return outcome(ChartStatus.MISMATCH, problem)
+        checked = (f"{checked}, and its row limit keeps the {row_limit:,} "
+                   f"{'largest' if ranking.descending else 'smallest'} groups by {label!r}")
     if not shown:
         return outcome(ChartStatus.EMPTY, f"the chart shows no rows, and {source} finds none")
     # A measure that is NULL on every row it shows, on both sides (the values matched above), is no number the chart
     # shows: the chart reads "No data" for it, which a check must not report as checked.
-    width = max((len(values) for rows in (chart, mine) for values in rows.values.values()), default=0)
-    empty = [i for i in range(width) if all(values[i] is None for rows in (chart, mine)
-                                            for values in rows.values.values() if i < len(values))
-             and any(i < len(values) for rows in (chart, mine) for values in rows.values.values())]
+    # Over the groups the chart shows: mnemiq's other groups, those a ranked row limit left out, are on no screen.
+    sides = (list(chart.values.values()), [mine.values[key] for key in shown if key in mine.values])
+    width = max((len(values) for rows in sides for values in rows), default=0)
+    empty = [i for i in range(width) if all(values[i] is None for rows in sides for values in rows if i < len(values))
+             and any(i < len(values) for rows in sides for values in rows)]
     if empty:
         if len(empty) == width:
             return outcome(ChartStatus.EMPTY, f"the chart's measures are NULL on every row it shows, and {source} "
@@ -511,7 +590,7 @@ def _compare(chart_id: int, chart: _Rows, mine: _Rows, row_limit: int | None, *,
         first = labels[empty[0]] if empty[0] < len(labels) else f"number {empty[0] + 1}"
         return outcome(ChartStatus.EMPTY, f"the chart's measure {first!r} is NULL on every row it shows, and {source} "
                                           "computes the same")
-    return outcome(ChartStatus.CHECKED, f"the chart's numbers match {source}")
+    return outcome(ChartStatus.CHECKED, checked)
 
 
 def _all_found(chart: _Rows, mine: _Rows) -> bool:
@@ -602,20 +681,25 @@ _RULES_UNKNOWN = ("mnemiq could not tell whether a row rule applies to you on th
 
 
 def _row_rule_applies(client, dataset_id: int) -> bool | NotCheckable:
-    """Whether a row rule applies to the caller on the dataset, as the extension's `row_rules` answers it. Anything
-    but one entry for the dataset with a boolean, or a failure of the call, is that mnemiq cannot tell. A refusal of
-    the caller is raised, as for every other call of the check."""
+    """Whether a row rule applies to the caller on the dataset, as the extension's `row_rules` answers it, read
+    strictly: the answer must be exactly `{"datasets": [...]}` holding at most this one entry, exactly
+    `{"dataset_id": <this id>, "applies": <a boolean>}`. Anything else (a refusal or a size cut beside it, a malformed
+    or repeated entry, an entry for another dataset, an entry saying more), a dataset left out, or a failure of the call
+    is that mnemiq cannot tell. A refusal of the caller is raised, as for every other call of the check."""
     try:
         answer = client.call(TOOL_PREFIX + "row_rules", {"dataset_ids": [dataset_id]})
     except (SupersetUnavailable, SupersetToolError) as failure:
         logger.warning("the value check: the extension's row_rules for dataset %s failed: %s", dataset_id, failure)
         return NotCheckable(_RULES_UNKNOWN)
-    entries = answer.get("datasets") if isinstance(answer, dict) else None
-    found = [entry for entry in entries if isinstance(entry, dict) and entry.get("dataset_id") == dataset_id] \
-        if isinstance(entries, list) else []
-    if len(found) != 1 or not isinstance(found[0].get("applies"), bool):
+    entries = answer.get("datasets") if isinstance(answer, dict) and set(answer) == {"datasets"} else None
+    if not isinstance(entries, list) or len(entries) != 1:
         return NotCheckable(_RULES_UNKNOWN)
-    return found[0]["applies"]
+    [entry] = entries
+    if not isinstance(entry, dict) or set(entry) != {"dataset_id", "applies"} \
+            or type(entry["dataset_id"]) is not int or entry["dataset_id"] != dataset_id \
+            or not isinstance(entry["applies"], bool):
+        return NotCheckable(_RULES_UNKNOWN)
+    return entry["applies"]
 
 
 def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, snapshot: Snapshot, grants: GrantSet,
@@ -625,7 +709,7 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
     def not_checked(reason: str) -> ChartCheck:
         return _outcome(chart_id, ChartStatus.NOT_CHECKED, reason)
 
-    dataset_id = _dataset_of(form, dataset_id)
+    dataset_id = dataset_of(form, dataset_id)
     if isinstance(dataset_id, NotCheckable):
         return not_checked(dataset_id.reason)
     dataset = read_dataset_facts(client, dataset_id)
@@ -685,8 +769,10 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
                                    before_call=before_call), _OWN_SQL
     if isinstance(mine, NotCheckable):
         return not_checked(mine.reason)
+    mine = _left_out(mine, expectation.not_null)
     labels = tuple(label for label, _ in expectation.metrics)
-    found = _compare(chart_id, chart, mine, _row_limit(form), source=compared, labels=labels)
+    found = _compare(chart_id, chart, mine, _row_limit(form), source=compared, labels=labels,
+                     ranking=ranking_of(form, expectation, dataset=dataset))
     found = _Numbers(found.chart_id, found.status, found.reason, found.chart_values, found.mnemiq_values, labels,
                      chart.values)
     if found.status is ChartStatus.MISMATCH and expectation.time_grain and compared is _OWN_SQL:
@@ -697,9 +783,19 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
         # keeps only first-of-month days. Only on positive evidence: every one of the chart's rows found among mnemiq's
         # ungrouped ones, with equal values. An ungrouped read at its row cap, or an empty chart, proves nothing, and
         # the grouped finding stands.
-        if not isinstance(plain, NotCheckable) and _all_found(chart, plain):
+        if not isinstance(plain, NotCheckable) and _all_found(chart, _left_out(plain, expectation.not_null)):
             return not_checked(_NO_GRAIN)
     return found
+
+
+def _left_out(rows: _Rows, not_null: tuple[int, ...]) -> _Rows:
+    """`rows` without the groups whose value at any of `not_null` is NULL: what the chart's HAVING
+    `(<metric>) IS NOT NULL` leaves out of its query. A read at its cap stays one."""
+    if not not_null:
+        return rows
+    kept = {key: values for key, values in rows.values.items()
+            if all(index < len(values) and values[index] is not None for index in not_null)}
+    return _Rows(kept, len(kept), cap=rows.cap)
 
 
 class _BeforeEachCall:

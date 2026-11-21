@@ -89,8 +89,8 @@ def adapter_for(spec: SourceSpec, settings: Settings | None = None, *, read_only
 
     `statement_timeout_s` bounds every statement on a Postgres source SERVER-side (M152), which
     is the only bound that stops it: the serving runtime passes its execution timeout -- writes
-    on that adapter included -- while enrich and refresh pass none, since profiling a large
-    table may rightly run long. A source whose own limit is tighter keeps it.
+    on that adapter included -- and enrich and refresh pass their statement time limit
+    (`enrich_statement_timeout_s`; none when it is 0). A source whose own limit is tighter keeps it.
 
     Refused in Superset mode, which opens no source connection of its own."""
     refuse_a_direct_source(settings)

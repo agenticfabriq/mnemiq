@@ -261,7 +261,7 @@ builder can turn a goal into a dashboard. mnemiq plans the charts on named measu
 builder, lays them out, and checks each chart it can against its own SQL, run as the same builder. A fuller guide is
 still to come. In short:
 
-- **Three routes, mounted only in Superset mode.**
+- **The build routes, mounted only in Superset mode.**
   - `POST /v1/superset/builds` takes `{goal, dashboard_id?, fresh?, profile?}`. It starts a build. With neither
     `dashboard_id` nor `fresh`, it may instead answer an offer: a dashboard the builder can see that already covers
     the goal. An offer builds and keeps nothing.
@@ -269,6 +269,11 @@ still to come. In short:
     - To add this goal's charts to it anyway, ask again with its `dashboard_id`. A `dashboard_id` always means that:
       the goal's planned charts are added to the dashboard it names, beside the ones it has.
     - For a new dashboard, ask again with `"fresh": true`.
+  - Onto a dashboard, mnemiq first reads the charts it holds, as the builder, and leaves out each planned chart one of
+    them already shows: the same type and dataset, the same measures by definition, the same grouping and x-axis
+    columns, time grain, filters and row limit. The answer names each one left out and the chart that shows it
+    (`left_out`). A goal the dashboard shows whole builds nothing and is answered as `shown`. A chart mnemiq cannot
+    read the same way, a filter written in SQL among them, is never taken for a match, so the planned one is built.
   - Before anything is planned, mnemiq asks Superset whether the person may build at all; one who may not is
     refused with a 403 as a non-builder, and nothing about a dashboard they named is read. Then, with a
     `dashboard_id`, it asks whether they edit that dashboard. One they cannot read, or one that does not exist, is a
@@ -279,7 +284,57 @@ still to come. In short:
     prompt. The planning prompt holds every table, column and saved metric the builder can see, so a large schema
     needs a large window.
   - `POST /v1/superset/builds/{id}/next` runs the build's next step.
-  - `GET /v1/superset/builds/{id}` reads the build as it stands.
+  - `GET /v1/superset/builds/{id}` reads the build as it stands. Every build answer names its plan (each chart's
+    title, family and measures, and each measure mnemiq writes), and the check step's own answer says why each chart
+    that did not check did not (`check_reasons`), which is not kept.
+  - `GET /v1/superset/builds` lists the person's builds still building, newest first (with `?dashboard_id=`, only
+    that dashboard's), each with its goal and how many of its steps are done: what a client offers to finish.
+- **A dashboard's measures**, for any editor of the dashboard, each route asked with a token minted for building:
+  the list reads the dashboard's layout and charts, which a token minted for asking cannot (a 403 naming the scopes).
+  - `GET /v1/superset/dashboards/{id}/measures` lists the measures mnemiq keeps for the dashboard: each definition,
+    the charts on the dashboard that show it (by id and title, with each one's last check), and its value, computed
+    then as the person asking and kept nowhere. On a physical dataset the value is mnemiq's own statement, run through
+    Superset as that person, so Superset's row rules apply to it. On a virtual dataset it comes only through Superset:
+    a saved metric by Superset's query of the dataset, a written measure by a chart that shows it as one number.
+    Otherwise there is no value, and `value_note` says why. `value_basis` says what a value covers:
+    `readable_rows`, every row of the measure's dataset the person can read, before any chart's filters; or `chart`,
+    the one number the chart `value_chart_id` shows, under that chart's own filters. Both are null when there is no
+    value.
+  - `POST .../measures/{name}/edit` takes `{label, expression, kind, currency?, description?}`. The new definition
+    passes mnemiq's measure checks first, and its label may be no other measure's on the dashboard. Every copy on a
+    chart that still matches the kept definition changes, and each changed chart is checked again; a copy changed by
+    hand is left and named. When a chart keeps changing under the edit, the charts already changed are put back and
+    the dashboard keeps the old definition, so its copies never differ.
+  - `POST .../measures/{name}/remove` takes `{chart_ids}`, the charts the person was shown, and answers 409 with the
+    charts the measure has now when they differ. It moves the charts that still show the measure to Superset's trash
+    (or deletes them for good where Superset keeps none, and says so), leaves a chart changed by hand and names it,
+    takes a chart the person does not edit off the dashboard instead and names it with its dataset and editors,
+    names a chart a report holds and leaves it, and deletes a dataset mnemiq made for the measure once no chart uses
+    it. A chart already in Superset's trash is no longer listed, and is taken off the layout as gone.
+  - `POST .../measures/{name}/save` adds the measure to its dataset as a saved metric, then switches every matching
+    copy to it. Asked again, it switches what is left onto a saved metric of the measure's own definition; one of the
+    name with another definition refuses it.
+  - Each action first asks whether the person edits every chart it would change (and, to save, the dataset). Edit
+    and Save change nothing unless they edit every chart that shows the measure, and name that chart's editors, so
+    the copies never split. No action runs while a build is building on the dashboard (409). Each answers
+    `changed`, `left_by_hand`, `not_editor` (each chart with its dataset, or a dataset, and the editors),
+    `blocked_by_report`, `could_not_read` and mnemiq's `message`.
+- **Changing a dashboard by chat**, for any editor of it. `POST /v1/superset/dashboards/{id}/changes` takes
+  `{request}`. The profile's model reads the request against the dashboard's charts as the person sees them (each
+  chart's title, type, table, measures by label, grouping, grain, row limit, filters, and the columns of its table
+  they may read; never an editor or a value from the data). mnemiq then writes only the settings the request names,
+  through the extension's `patch_chart`, which leaves every other setting, a hand edit among them, as it is.
+  - Only the settings a chart's type may have changed by chat are written, each with a value mnemiq reads as valid;
+    any other is dropped and named. A chart's type changes only when the request asks, and only among line, bar,
+    area and scatter. Filters are added to a chart's own, or dropped by column: the chart's other filters stay.
+  - A chart changed meanwhile is read again and changed once more; changed again, it is left and named. A chart the
+    person does not edit is named. A filter the chart already has is not added twice.
+  - Nothing is deleted on the model's reading: a chart the request asks to remove is answered under `would_remove`,
+    by id and title. Sent back as `{remove_chart_ids}`, once the person confirms, those charts go to Superset's trash
+    and off the layout (and the model is not asked); one a report holds is left, with the reason.
+  - A request for a chart the dashboard lacks is planned onto it and started as a build (`added`, as the start
+    route answers it), which the client runs step by step. When that planning fails, what the request changed is
+    still answered, and `added` holds the failure's status and sentence.
 - **Values a plan's repair is told.** The planning prompt holds no value read from the data's rows. When a plan
   filters on a value no row the builder can read holds, up to 20 values of that column, one the plan itself filtered,
   read as the builder, go to the one repair prompt and to the refused plan's answer: a hosted planning model sees them.
@@ -332,11 +387,65 @@ still to come. In short:
 - **One build of a dashboard at a time.** While a build of a dashboard is building, starting another build of it is
   refused with a 409. A build left untouched for 20 minutes (twice the lease), with no step running, no longer holds
   its dashboard: the next build of that dashboard stops it, as abandoned, and takes the dashboard over.
+- **A chart whose row limit keeps only some of its groups is checked as a ranking** when it is a bar, line, area or
+  scatter chart, a table, a pie, a gauge or a treemap. The check reads from the chart's saved settings which measure
+  its query ranks by, and in which direction, as Superset orders it. It then asks whether the groups shown are the ones
+  that ranking puts first among all of mnemiq's own groups. A group with no value for that measure counts after every
+  group with one, and groups tied at the cut may stand in for each other. Any other chart a row limit cuts is not
+  checked: a mixed chart, a pivot table, a funnel, a sankey or a waterfall, or one sorted by a column.
+- **A chart the builder makes with a row limit leaves out the groups its measure has no value for**, when it is one of
+  those types and is not over a time axis. Its query gets `HAVING (<measure>) IS NOT NULL`, so the groups the limit
+  keeps are the largest with a value, and the check leaves the same groups out of its own rows. A chart over a time
+  axis gets no such HAVING: there it would drop points from a series and join the line across them.
 - **Builds are kept in the control Postgres (`MNEMIQ_CONTROL_DSN`).** It holds plans, measure definitions, Superset
   ids and statuses, never a value or a row. Without it the build routes answer 503.
 - **Without the extension, the build routes answer 503** with a sentence that names it, before anything is planned. An
   extension older than mnemiq, without the creates a build sends, is answered 503 too, with a sentence saying to
-  update it.
+  update it. One that has them but does not take a field a chart needs (`create_chart`'s `leave_out_no_value`, for a
+  chart made with a row limit) stops the build at that chart's step, with a sentence saying to update it.
+
+## The panel
+
+The extension ([`integrations/superset`](../integrations/superset/README.md)) also puts mnemiq inside Superset 7.0 as
+the page's chat. A trigger in the page's corner opens a panel that floats over the page or docks beside it, for a
+signed-in person, with `ENABLE_EXTENSIONS` on. The panel shares Superset's React and antd, and reaches mnemiq only
+through the extension's forwarder, as the person signed in: the browser holds no mnemiq token and never learns
+mnemiq's address.
+
+- **Who sees what.** Each time the panel opens it asks mnemiq once whether this person may use it. A person Superset
+  will not let build (Alpha and sql_lab are needed) sees only the sentence that says so, and the panel asks nothing
+  else.
+- **Ask** a question about the data. The answer streams in: its sentence, the SQL (folded), and the rows it read.
+- **Build** a dashboard from a goal. mnemiq shows the plan before it makes anything, then the panel runs the build one
+  step per request, with each chart's check, and links to the result. On a dashboard, a build goes onto the
+  dashboard on screen when the goal is sent, unless "New dashboard" is ticked; off one, mnemiq may first offer a
+  dashboard that already covers the goal, with Open it, Add these charts to it, and Build a new one.
+- **The dashboard's measures**, on a dashboard the person can read: each measure mnemiq keeps there, with its
+  definition and its value computed now under the person's own row rules, and Edit, Remove and Save to dataset.
+  Remove deletes the charts that show the measure (into Superset's trash, where it keeps one), and takes a chart the
+  person does not edit off the dashboard instead; it says so, and names the charts, before it does anything.
+- **Change** the dashboard on screen by chat: "show daily instead of monthly", "add a funnel of policies by status". A
+  chart setting changed by hand is kept. A removal is a proposal the person confirms, and a chart to add is built
+  onto the dashboard.
+- **Finish.** Closing the panel does not stop a build. Leaving or reloading the page stops it after the step in
+  flight, and the build stays resumable: the panel then lists the person's unfinished builds (on a dashboard, that
+  dashboard's), each with Finish and Not now.
+- **What it keeps: nothing.** The conversation and a running build live in the page's memory for its life; a measure's
+  value lives only in the open measures section. Nothing is written to browser storage.
+
+The forwarder is configured in Superset's `superset_config.py`, beside the token settings the extension's README lists
+(it mints each request's token with them):
+
+| Setting | What it is |
+|---|---|
+| `MNEMIQ_URL` | Where Superset's web server reaches mnemiq. Required. |
+| `MNEMIQ_FORWARD_TIMEOUT_S` | How long a forwarded request may take, its whole answer read, 1 to 900 seconds. Default 600. |
+| `MNEMIQ_FORWARD_IDLE_S` | How long a chat answer's stream may go quiet between two reads, 5 to 300 seconds. Default 60. |
+
+Planning a build with a slow model can take minutes, and each forwarded request holds one of Superset's web worker
+threads while it runs. A proxy in front of Superset must allow a read timeout at least as long as
+`MNEMIQ_FORWARD_TIMEOUT_S`, and must pass a chat answer's event stream through unbuffered; size Superset's workers for
+the builds that run at once. The README lists every refusal the forwarder answers.
 
 ## What each refusal returns
 

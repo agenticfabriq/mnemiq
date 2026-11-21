@@ -506,6 +506,41 @@ def test_positions_chart_set_must_match():
     assert check(["not", "a", "layout"]) == {"refused": "malformed"}
 
 
+def test_positions_a_trashed_member_the_layout_no_longer_places_is_not_expected():
+    """rc2 keeps a chart in the trash a member of its dashboard. One the current layout no longer places (taken off
+    when it was deleted) is not expected in the new layout; one it still places is, as any member is."""
+    def check(positions, current_positions, add=(), trashed=()):
+        return ext.check_positions(positions, current_positions=current_positions, current_chart_ids=[1, 2, 3],
+                                   add_chart_ids=add, trashed_chart_ids=trashed)
+
+    # 3 is in the trash and off the layout: a layout of 1, 2 and an added 4 is the whole set.
+    assert check(layout([1, 2, 4]), layout([1, 2]), add=[4], trashed=[3]) is None
+    # Not said to be in the trash, 3 is a member the layout left out.
+    assert check(layout([1, 2, 4]), layout([1, 2]), add=[4]) == {"refused": "chart_set", "missing": [3],
+                                                                  "unexpected": []}
+    # In the trash but still placed (Superset's own soft delete keeps its place), 3 is expected.
+    assert check(layout([1, 2, 4]), layout([1, 2, 3]), add=[4], trashed=[3]) == {
+        "refused": "chart_set", "missing": [3], "unexpected": []}
+    assert check(layout([1, 2, 3, 4]), layout([1, 2, 3]), add=[4], trashed=[3]) is None
+    # Putting a trashed chart the layout no longer places back is not the set either: it is not expected.
+    assert check(layout([1, 2, 3]), layout([1, 2]), trashed=[3]) == {"refused": "chart_set", "missing": [],
+                                                                     "unexpected": [3]}
+    # A trashed id that is not one is malformed, as any id is.
+    assert check(layout([1, 2]), layout([1, 2]), trashed=["3"]) == {"refused": "malformed"}
+
+
+def test_positions_an_unreadable_current_layout_exempts_no_trashed_member():
+    """When the stored layout cannot be read (a node rc2 would fail on), which trashed members it places is not known:
+    none is exempt, so a write that leaves one out is refused rather than let through. A layout that places nothing
+    (an empty one) is read, and exempts each trashed member."""
+    unreadable = {**layout([1, 2]), "ODD-1": {"id": "ODD-1", "children": []}}
+    assert ext._layout_chart_ids(unreadable) is None
+    assert ext.check_positions(layout([1]), current_positions=unreadable, current_chart_ids=[1, 2],
+                               trashed_chart_ids=[2]) == {"refused": "chart_set", "missing": [2], "unexpected": []}
+    assert ext.check_positions(layout([1]), current_positions={}, current_chart_ids=[1, 2],
+                               trashed_chart_ids=[2]) is None
+
+
 def test_positions_may_not_drop_a_tab():
     current = layout([1, 2], tabs=("TAB-a", "TAB-b"))
 
