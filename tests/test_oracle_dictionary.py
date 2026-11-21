@@ -361,3 +361,42 @@ def test_table_sizes_reads_one_view_in_batches():
     sizes = a.table_sizes(["ORDERS", "NEVER_ANALYZED"])
     assert sizes == {t: a.table_size(t) for t in ("ORDERS", "NEVER_ANALYZED")}
     assert "all_tab_statistics" in many.sql[0].lower() and len(many.sql) == 3  # one batched, two per-table to compare
+
+
+def test_the_table_scope_refuses_a_batched_read_of_a_table_out_of_scope():
+    # The scope guards each per-table dictionary read; the batched reads must not hand an unlisted table's
+    # statistics, sizes or histogram values through (Codex's review of #277).
+    class Inner:
+        def __init__(self):
+            self.asked = []
+
+        def dictionary(self, tables):
+            self.asked.append(("dictionary", list(tables)))
+
+        def table_sizes(self, tables):
+            self.asked.append(("table_sizes", list(tables)))
+
+        def histograms(self, columns):
+            self.asked.append(("histograms", list(columns)))
+
+    inner = Inner()
+    scoped = TableScopedAdapter(inner, ("ORDERS", "dim_*"), "erp")
+    for call in (lambda: scoped.dictionary(["ORDERS", "SECRET"]), lambda: scoped.table_sizes(["SECRET"]),
+                 lambda: scoped.histograms([("ORDERS", "A"), ("SECRET", "B")])):
+        with pytest.raises(TablesNotFound):
+            call()
+    assert inner.asked == [], "nothing was read once a requested table was out of scope"
+    scoped.dictionary(["orders", "DIM_DATE"])
+    scoped.table_sizes(["Orders"])
+    scoped.histograms([("dim_region", "CODE")])
+    assert [kind for kind, _ in inner.asked] == ["dictionary", "table_sizes", "histograms"]
+
+
+def test_the_table_scope_offers_a_batched_read_only_where_the_source_has_one():
+    class Plain:
+        def table_size(self, table):
+            return None
+
+    scoped = TableScopedAdapter(Plain(), ("ORDERS",), "erp")
+    assert not callable(getattr(scoped, "dictionary", None))
+    assert not callable(getattr(scoped, "table_sizes", None))

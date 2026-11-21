@@ -39,6 +39,7 @@ from mnemiq.superset.chart_check import (
     expectation_from_form_data,
     percent_problem,
 )
+from mnemiq.superset.chart_form import Ranking, ranking_of
 from mnemiq.superset.charts import Filter
 from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetPermissionDenied
 from mnemiq.superset.measures import MeasureKind
@@ -724,12 +725,17 @@ def test_grain_mismatch_either_way_is_a_mismatch(fake):
     assert check.mnemiq_values == MONTHS
 
 
-def test_rows_cut_by_the_charts_row_limit_are_not_checked(fake):
-    """No order is fixed for a chart's rows, so which groups its row limit keeps is Superset's choice."""
-    _serve(fake, form_data=_bar(row_limit=2), chart=_chart_data(["region", "Total premium"], ("east", 1), ("west", 2)),
+ROW_LIMIT_CUT = "the chart's row limit (2) keeps only some of its groups, so not all of them were compared"
+
+
+def test_rows_cut_by_a_row_limit_mnemiq_reads_no_ranking_for_are_not_checked(fake):
+    """A bar sorted by a column (`order_by_cols`): mnemiq reads no ranking for it, so which groups its row limit keeps
+    is not checked."""
+    _serve(fake, form_data=_bar(row_limit=2, order_by_cols=['["region", true]']),
+           chart=_chart_data(["region", "Total premium"], ("east", 1), ("west", 2)),
            mnemiq=_result(("east", 1), ("west", 2), ("north", 3)))
     check = _check(fake)
-    assert check.status is ChartStatus.NOT_CHECKED and "row limit" in check.reason
+    assert check.status is ChartStatus.NOT_CHECKED and check.reason == ROW_LIMIT_CUT
 
 
 def test_chart_data_without_the_named_columns_is_not_checked(fake):
@@ -1881,7 +1887,15 @@ def test_a_row_rule_on_a_made_dataset_means_no_comparison_and_no_values(fake):
     {"datasets": [{"dataset_id": DATASET_ID + 1, "applies": False}]},
     {"refused": "request", "field": "dataset_ids"},
     ["not", "an", "object"],
-], ids=["not offered", "failed", "left out", "not a boolean", "another dataset", "refused", "not an object"])
+    {"refused": "request", "datasets": [{"dataset_id": DATASET_ID, "applies": False}]},
+    {"datasets": [{"dataset_id": DATASET_ID, "applies": False}, "malformed"]},
+    {"datasets": [{"dataset_id": DATASET_ID, "applies": False}, {"dataset_id": DATASET_ID, "applies": False}]},
+    {"datasets": [{"dataset_id": DATASET_ID, "applies": False, "clause": "region = 'west'"}]},
+    {"datasets": [{"dataset_id": DATASET_ID, "applies": False}], "_response_truncated": True},
+    {"datasets": [{"dataset_id": True, "applies": False}]},
+], ids=["not offered", "failed", "left out", "not a boolean", "another dataset", "refused", "not an object",
+        "refused beside an entry", "a malformed entry beside it", "twice", "an entry with more than asked",
+        "cut for size", "an id that is a boolean"])
 def test_a_made_dataset_whose_row_rules_cannot_be_told_is_not_checked(fake, rules):
     _made(fake, rules=rules)
     check = _check(fake, made={DATASET_ID: MADE_SQL})
@@ -1928,3 +1942,302 @@ def test_a_made_dataset_whose_sql_superset_does_not_show_is_not_called_changed(f
     assert check.reason == ("Superset did not show the SQL of the chart's dataset, which this build made, so mnemiq "
                             "does not check it with its own SQL")
     assert _statements(fake) == [] and ROW_RULES not in _tools(fake)
+
+
+
+# ---------------------------------------------------------------- the ranking a row limit cuts by
+
+SECOND = PREMIUM | {"label": "Average premium", "sqlExpression": "AVG(premium)", "optionName": "metric_sql_2"}
+
+
+def _ranked(form: dict):
+    expectation = expectation_from_form_data(form, dataset=PHYSICAL)
+    assert not isinstance(expectation, NotCheckable), expectation
+    return ranking_of(form, expectation, dataset=PHYSICAL)
+
+
+@pytest.mark.parametrize("viz", ["echarts_timeseries_bar", "echarts_timeseries_line", "echarts_area",
+                                 "echarts_timeseries_scatter", "echarts_timeseries_smooth", "echarts_timeseries_step"])
+def test_a_timeseries_chart_ranks_by_its_first_metric_descending(viz):
+    assert _ranked(_bar(viz_type=viz, row_limit=10)) == Ranking(metric_index=0, descending=True, limit=10)
+
+
+def test_a_bar_ranks_ascending_only_when_order_desc_is_false():
+    assert _ranked(_bar(order_desc=False)) == Ranking(0, False, 100)
+    assert _ranked(_bar(order_desc=True)) == Ranking(0, True, 100)
+    assert _ranked(_bar(order_desc=None)) is None  # the frontend would read it as ascending, the backend as given
+
+
+def test_a_bar_ranks_by_its_series_limit_metric_when_one_is_set():
+    form = _bar(metrics=[copy.deepcopy(PREMIUM), copy.deepcopy(SECOND)])
+    assert _ranked(form | {"series_limit_metric": copy.deepcopy(SECOND)}) == Ranking(1, True, 100)
+    assert _ranked(form | {"timeseries_limit_metric": copy.deepcopy(SECOND)}) == Ranking(1, True, 100)
+
+
+def test_a_ranking_metric_the_chart_does_not_show_is_no_ranking():
+    other = PREMIUM | {"label": "Most premium", "sqlExpression": "MAX(premium)"}
+    assert _ranked(_bar(series_limit_metric=other)) is None
+
+
+def test_a_bar_with_an_order_by_column_is_no_ranking_mnemiq_reads():
+    assert _ranked(_bar(order_by_cols=['["region", true]'])) is None
+
+
+def test_a_table_ranks_by_its_first_metric_descending_whatever_order_desc_says():
+    form = {"viz_type": "table", "query_mode": "aggregate", "groupby": ["region"],
+            "metrics": [copy.deepcopy(PREMIUM), copy.deepcopy(SECOND)], "row_limit": 10}
+    assert _ranked(form) == Ranking(0, True, 10)
+    assert _ranked(form | {"order_desc": False}) == Ranking(0, True, 10)
+    assert _ranked(form | {"timeseries_limit_metric": copy.deepcopy(SECOND)}) == Ranking(1, False, 10)
+    assert _ranked(form | {"timeseries_limit_metric": copy.deepcopy(SECOND), "order_desc": True}) == Ranking(1, True, 10)
+
+
+@pytest.mark.parametrize("viz", ["pie", "gauge_chart", "treemap_v2"])
+def test_a_one_metric_chart_ranks_by_its_metric_only_when_sort_by_metric_is_on(viz):
+    form = {"viz_type": viz, "groupby": ["region"], "metric": copy.deepcopy(PREMIUM), "row_limit": 10}
+    assert _ranked(form | {"sort_by_metric": True}) == Ranking(0, True, 10)
+    assert _ranked(form | {"sort_by_metric": False}) is None
+    # Each plugin's buildQuery, and the extension's query context, orders by the metric only when the flag is set.
+    assert _ranked(form) is None
+
+
+def test_a_chart_with_no_positive_row_limit_has_no_ranking():
+    for limit in (None, 0, -1, "ten"):
+        assert _ranked(_bar(row_limit=limit)) is None
+
+
+@pytest.mark.parametrize("form", [
+    {"viz_type": "funnel", "groupby": ["region"], "metric": PREMIUM, "row_limit": 10},
+    {"viz_type": "sankey_v2", "source": "region", "target": "channel", "metric": PREMIUM, "row_limit": 10},
+    {"viz_type": "waterfall", "x_axis": "region", "metric": PREMIUM, "row_limit": 10},
+], ids=["funnel", "sankey", "waterfall"])
+def test_a_type_whose_query_does_not_rank_by_its_measure_has_no_ranking(form):
+    assert _ranked(copy.deepcopy(form)) is None
+
+
+@pytest.mark.parametrize("form", [
+    {"viz_type": "mixed_timeseries", "x_axis": "region", "metrics": [PREMIUM], "metrics_b": [PREMIUM],
+     "row_limit": 10},
+    {"viz_type": "pivot_table_v2", "groupbyRows": ["region"], "metrics": [PREMIUM], "row_limit": 10},
+], ids=["mixed", "pivot"])
+def test_a_mixed_or_pivot_chart_has_no_ranking_mnemiq_reads(form):
+    expectation = Expectation(metrics=(("Total premium", "SUM(premium)"),), dimensions=("region",), time_grain=None,
+                              filters=())
+    assert ranking_of(copy.deepcopy(form), expectation, dataset=PHYSICAL) is None
+
+
+
+# ---------------------------------------------------------------- a row limit, checked as a ranking
+
+def _cut(fake, chart_rows, mnemiq_rows, **form):
+    _serve(fake, form_data=_bar(**form), chart=_chart_data(["region", "Total premium"], *chart_rows),
+           mnemiq=_result(*mnemiq_rows, columns=(("region", "object"), ("m0", "float64"))))
+    return _check(fake)
+
+
+NULL_KEPT = ("the chart's row limit ({n}) keeps groups with no value for 'Total premium' and leaves out groups that "
+             "have one, so they are not the {n} {order}")
+NOT_FIRST = "the chart's row limit ({n}) keeps groups that are not the {n} {order} by 'Total premium'"
+RANKED = ("the chart's numbers match mnemiq's own SQL, and its row limit keeps the {n} {order} groups by "
+          "'Total premium'")
+
+
+def test_groups_with_no_value_kept_ahead_of_larger_ones_are_a_mismatch(fake):
+    """The shape of a top 10 whose measure is NULL for most groups: Postgres puts NULL first under DESC, so the chart
+    keeps the groups with no value and leaves out the largest."""
+    check = _cut(fake, [("a", None), ("b", None)], [("a", None), ("b", None), ("c", 50.0), ("d", 30.0)], row_limit=2)
+    assert check.status is ChartStatus.MISMATCH and check.reason == NULL_KEPT.format(n=2, order="largest")
+    assert check.mnemiq_values is not None
+
+
+def test_the_true_top_n_is_checked_as_a_ranking(fake):
+    check = _cut(fake, [("c", 50.0), ("d", 30.0)], [("a", None), ("c", 50.0), ("d", 30.0), ("e", 10.0)], row_limit=2)
+    assert check.status is ChartStatus.CHECKED and check.reason == RANKED.format(n=2, order="largest")
+
+
+@pytest.mark.parametrize("kept", [("d", 30.0), ("e", 30.0)], ids=["one tie", "the other"])
+def test_either_group_tied_at_the_cut_may_be_kept(fake, kept):
+    check = _cut(fake, [("c", 50.0), kept], [("c", 50.0), ("d", 30.0), ("e", 30.0), ("f", 5.0)], row_limit=2)
+    assert check.status is ChartStatus.CHECKED, check.reason
+
+
+def test_a_group_above_the_cut_left_out_is_a_mismatch(fake):
+    check = _cut(fake, [("c", 50.0), ("e", 10.0)], [("c", 50.0), ("d", 30.0), ("e", 10.0)], row_limit=2)
+    assert check.status is ChartStatus.MISMATCH and check.reason == NOT_FIRST.format(n=2, order="largest")
+
+
+def test_an_ascending_chart_keeps_the_smallest(fake):
+    rows = [("c", 50.0), ("d", 30.0), ("e", 10.0)]
+    check = _cut(fake, [("e", 10.0), ("d", 30.0)], rows, row_limit=2, order_desc=False)
+    assert check.status is ChartStatus.CHECKED and check.reason == RANKED.format(n=2, order="smallest")
+    fake.calls.clear()
+    check = _cut(fake, [("c", 50.0), ("d", 30.0)], rows, row_limit=2, order_desc=False)
+    assert check.status is ChartStatus.MISMATCH and check.reason == NOT_FIRST.format(n=2, order="smallest")
+
+
+def test_groups_with_no_value_may_fill_a_cut_once_every_group_with_one_is_kept(fake):
+    rows = [("c", 50.0), ("a", None), ("b", None), ("z", None)]
+    check = _cut(fake, [("c", 50.0), ("a", None), ("b", None)], rows, row_limit=3)
+    assert check.status is ChartStatus.CHECKED, check.reason
+    fake.calls.clear()
+    check = _cut(fake, [("a", None), ("b", None), ("z", None)], rows, row_limit=3)
+    assert check.status is ChartStatus.MISMATCH and check.reason == NULL_KEPT.format(n=3, order="largest")
+
+
+def test_a_ranked_cut_on_a_dataset_this_build_made_is_ranked_too(fake):
+    _serve(fake, form_data=_bar(row_limit=2), chart=_chart_data(["region", "Total premium"], ("a", None), ("b", None)),
+           mnemiq=_result(("a", None), ("b", None), ("c", 5.0), columns=(("region", "object"), ("m0", "float64"))),
+           dataset=_dataset(virtual=True))
+    _rules(fake, _no_rule)
+    check = _check(fake, made={DATASET_ID: MADE_SQL})
+    assert check.status is ChartStatus.MISMATCH and check.reason == NULL_KEPT.format(n=2, order="largest")
+
+
+def test_a_read_at_its_cap_is_never_ranked(fake):
+    """A pin, not a new behaviour: mnemiq's own read stopped at its cap, so its groups are not all there to rank, and
+    the cap's reason stands before any ranking is read."""
+    rows = [(f"g{i:04}", float(i)) for i in range(1000)]
+    check = _cut(fake, [("g0999", 999.0), ("g0998", 998.0)], rows, row_limit=2)
+    assert check.status is ChartStatus.NOT_CHECKED and "returns in one read" in check.reason
+
+
+
+def test_an_empty_series_limit_metric_ranks_by_the_first_metric_not_the_timeseries_limit_metric():
+    """rc2's `buildQueryObject` keeps an empty `series_limit_metric` (a string is a metric to `isQueryFormMetric`), and
+    `normalizeOrderBy` then reads it as unset and orders by `metrics[0]`."""
+    form = _bar(metrics=[copy.deepcopy(PREMIUM), copy.deepcopy(SECOND)], series_limit_metric="",
+                timeseries_limit_metric=copy.deepcopy(SECOND))
+    assert _ranked(form) == Ranking(0, True, 100)
+
+
+def test_a_bar_with_a_raw_orderby_is_no_ranking_mnemiq_reads():
+    """`extractQueryFields` sends a form's own `orderby` to the query, as it sends `order_by_cols`."""
+    assert _ranked(_bar(orderby=[["region", True]])) is None
+
+
+@pytest.mark.parametrize("kept", [("d", 30.0), ("e", 30.000000000000004)], ids=["one", "the other"])
+def test_groups_tied_but_for_float_noise_at_the_cut_may_stand_in_for_each_other(fake, kept):
+    check = _cut(fake, [("c", 50.0), kept], [("c", 50.0), ("d", 30.0), ("e", 30.000000000000004), ("f", 5.0)],
+                 row_limit=2)
+    assert check.status is ChartStatus.CHECKED, check.reason
+
+
+def test_a_second_measure_with_no_value_on_every_kept_group_is_empty_though_a_cut_group_has_one(fake):
+    """The empty rule looks at the groups the chart shows: a measure NULL on every bar is "No data" on screen, whatever
+    the groups the row limit left out hold."""
+    other = PREMIUM | {"label": "Overdue", "sqlExpression": "SUM(CASE WHEN premium < 0 THEN premium END)",
+                       "optionName": "metric_sql_3"}
+    _serve(fake, form_data=_bar(row_limit=2, metrics=[copy.deepcopy(PREMIUM), copy.deepcopy(other)]),
+           chart=_chart_data(["region", "Total premium", "Overdue"], ("c", 50.0, None), ("d", 30.0, None)),
+           mnemiq=_result(("c", 50.0, None), ("d", 30.0, None), ("e", 10.0, 7.0),
+                          columns=(("region", "object"), ("m0", "float64"), ("m1", "float64"))))
+    check = _check(fake, kinds={"Total premium": MeasureKind.CURRENCY, "Overdue": MeasureKind.CURRENCY})
+    assert check.status is ChartStatus.EMPTY and "'Overdue'" in check.reason, check.reason
+
+
+@pytest.mark.parametrize("alias", ["metric", "metric_2", "secondary_metric", "left_metric", "right_metric", "x", "y",
+                                   "size"])
+def test_a_second_metric_alias_on_a_ranked_chart_is_no_ranking_mnemiq_reads(alias):
+    """`extractQueryFields` gathers every metric alias in the form's key order, so another alias holding a value can
+    come first in the query's metrics, and the query then ranks by it, not by `metrics[0]`."""
+    form = {"viz_type": "echarts_timeseries_bar", alias: copy.deepcopy(SECOND), **_bar()}
+    assert _ranked(form) is None
+    table = {"viz_type": "table", "query_mode": "aggregate", "groupby": ["region"], alias: copy.deepcopy(SECOND),
+             "metrics": [copy.deepcopy(PREMIUM), copy.deepcopy(SECOND)], "row_limit": 10}
+    assert _ranked(table) is None
+
+
+@pytest.mark.parametrize("offset", [1, 5, "2"])
+def test_a_row_offset_is_no_ranking_mnemiq_reads(offset):
+    """The query skips its first `row_offset` rows, so the rows it keeps are not its first N."""
+    assert _ranked(_bar(row_offset=offset)) is None
+
+
+@pytest.mark.parametrize("offset", [None, 0])
+def test_no_row_offset_keeps_the_ranking(offset):
+    assert _ranked(_bar(row_offset=offset)) == Ranking(0, True, 100)
+
+
+# ---------------------------------------------------------------- the builder's HAVING: groups with no value left out
+
+from mnemiq.superset.charts import not_null_condition  # noqa: E402
+
+
+def _having(condition: str) -> dict:
+    return {"clause": "HAVING", "expressionType": "SQL", "sqlExpression": condition, "subject": None,
+            "operator": None, "comparator": None, "isExtra": False, "isNew": False,
+            "filterOptionName": "mnemiq_having_0"}
+
+
+LEFT_OUT = _having(not_null_condition("SUM(premium)"))
+
+
+def test_the_builders_having_is_read_as_leaving_out_groups_with_no_value():
+    form = _bar(adhoc_filters=[copy.deepcopy(WEB_ONLY), copy.deepcopy(NO_TIME_FILTER), LEFT_OUT])
+    assert expectation_from_form_data(form, dataset=PHYSICAL) == Expectation(
+        metrics=(("Total premium", "SUM(premium)"),), dimensions=("region",), time_grain=None,
+        filters=(Filter("channel", "IN", ["web"]),), not_null=(0,))
+
+
+def test_mnemiqs_groups_with_no_value_are_left_out_as_the_having_leaves_them_out(fake):
+    """The chart's query leaves out the groups with no value; mnemiq's own rows hold them, and drops them the same way,
+    so a ranked cut of what is left is checked."""
+    _serve(fake, form_data=_bar(row_limit=2, adhoc_filters=[copy.deepcopy(WEB_ONLY), LEFT_OUT]),
+           chart=_chart_data(["region", "Total premium"], ("c", 50.0), ("d", 30.0)),
+           mnemiq=_result(("a", None), ("b", None), ("c", 50.0), ("d", 30.0), ("e", 10.0),
+                          columns=(("region", "object"), ("m0", "float64"))))
+    check = _check(fake)
+    assert check.status is ChartStatus.CHECKED and check.reason == RANKED.format(n=2, order="largest")
+    assert check.mnemiq_values == (("c", 50.0), ("d", 30.0), ("e", 10.0))
+
+
+def test_a_saved_metrics_having_is_its_expression(fake):
+    rows = (("c", 50.0), ("d", 30.0))
+    _serve(fake, form_data=_bar(metrics=[M_SAVED], adhoc_filters=[_having(not_null_condition("SUM(premium)"))]),
+           chart=_chart_data(["region", M_SAVED], *rows),
+           mnemiq=_result(("a", None), *rows, columns=(("region", "object"), ("m0", "float64"))),
+           dataset=_dataset(metrics=[(M_SAVED, "SUM(premium)")]))
+    record = SavedMetric(dataset_id=DATASET_ID, name=M_SAVED, expression="SUM(premium)", verbose_name=None,
+                         d3format=None, currency=None, certified_by=None, warning_text=None)
+    check = _check(fake, kinds={M_SAVED: MeasureKind.CURRENCY}, saved={M_SAVED: record})
+    assert check.status is ChartStatus.CHECKED, check.reason
+
+
+def test_the_having_on_a_dataset_this_build_made_leaves_out_the_same_groups(fake):
+    _serve(fake, form_data=_bar(row_limit=2, adhoc_filters=[LEFT_OUT]),
+           chart=_chart_data(["region", "Total premium"], ("c", 50.0), ("d", 30.0)),
+           mnemiq=_result(("a", None), ("c", 50.0), ("d", 30.0), ("e", 1.0),
+                          columns=(("region", "object"), ("m0", "float64"))),
+           dataset=_dataset(virtual=True))
+    _rules(fake, _no_rule)
+    check = _check(fake, made={DATASET_ID: MADE_SQL})
+    assert check.status is ChartStatus.CHECKED, check.reason
+
+
+@pytest.mark.parametrize("filters", [
+    [_having(not_null_condition("MAX(premium)"))],
+    [_having("(SUM(premium)) > 0")],
+    [LEFT_OUT, copy.deepcopy(LEFT_OUT)],
+    [_having(not_null_condition("SUM(premium)") + " OR 1 = 1")],
+], ids=["a metric the chart does not show", "another condition", "twice on one metric", "more after it"])
+def test_any_other_sql_having_keeps_todays_reason(filters):
+    form = _bar(adhoc_filters=[copy.deepcopy(WEB_ONLY), *filters])
+    assert expectation_from_form_data(form, dataset=PHYSICAL) == NotCheckable(chart_form._SQL_FILTER)
+
+
+def test_a_simple_having_keeps_todays_reason():
+    simple = {"clause": "HAVING", "expressionType": "SIMPLE", "subject": "Total premium", "operator": "IS NOT NULL",
+              "comparator": None}
+    assert expectation_from_form_data(_bar(adhoc_filters=[simple]), dataset=PHYSICAL) == NotCheckable(
+        "the chart filters its aggregated values (HAVING), which mnemiq does not translate")
+
+
+@pytest.mark.parametrize("viz", ["mixed_timeseries", "pivot_table_v2", "big_number_total"])
+def test_the_builders_having_on_a_type_it_never_gives_one_keeps_todays_reason(viz):
+    """The builder gives the HAVING only to the types the check ranks; on any other type (a mixed chart, whose second
+    query has filters of its own, say) it is read as any other SQL filter, never as leaving out mnemiq's rows."""
+    form = {"viz_type": viz, "x_axis": "region", "groupby": [], "groupbyRows": ["region"],
+            "metrics": [copy.deepcopy(PREMIUM)], "metric": copy.deepcopy(PREMIUM), "metrics_b": [copy.deepcopy(SECOND)],
+            "adhoc_filters": [LEFT_OUT], "adhoc_filters_b": [], "row_limit": 10}
+    found = expectation_from_form_data(form, dataset=PHYSICAL)
+    assert not isinstance(found, Expectation) or found.not_null == (), found

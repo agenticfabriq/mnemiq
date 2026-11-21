@@ -108,6 +108,8 @@ class LoadedProfile:
     # Superset mode's dashboard planner, on this profile's writer client (`assembly.Components.planner`): a build asked
     # under this profile is planned by its model. None: built by hand.
     planner: Any = None
+    # The reader of a dashboard change asked by chat, on the same client (`assembly.Components.interpreter`).
+    interpreter: Any = None
 
 
 @dataclass(frozen=True)
@@ -1351,7 +1353,8 @@ def build_runtime(settings: Settings) -> Runtime:
             for name, mode in modes.items()
         }
         loaded[profile_name] = LoadedProfile(profile, profile_version(profile.settings, dialect), profile.settings, modes,
-                                             agents, kit.fitter, clients, planner=kit.planner)
+                                             agents, kit.fitter, clients, planner=kit.planner,
+                                             interpreter=kit.interpreter)
     default = loaded[default_profile]
     commit = read_engine_commit(settings.engine_commit)
     answer_log = build_answer_log(settings)

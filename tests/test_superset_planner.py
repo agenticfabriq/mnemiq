@@ -1333,6 +1333,35 @@ def test_the_prompt_says_a_percent_is_a_fraction():
     assert "a percent is a fraction from 0 to 1" in system and "never multiply it by 100" in system
 
 
+def test_the_prompt_keeps_a_measures_condition_in_its_expression():
+    """A condition that defines a measure (open, won) belongs in its expression, so the measure means its name on every
+    chart, in the measures section and in a saved metric; a chart's filters only narrow that chart."""
+    model = ScriptedModel([_draft("SUM(premium)")])
+    _plan(GOAL, LLMPlanner(model), _tools())
+    system = model.sent[0]["system"]
+    assert "goes inside its expression" in system
+    assert "a chart's filters narrow only what that chart shows" in system
+    assert "filter them out on that chart as well" in system
+    # No ELSE on the condition: an ELSE 0 is a row COUNT counts and AVG averages in, the same wrong meaning again.
+    assert "with no ELSE on that condition" in system
+    assert "an ELSE 0 there is counted by COUNT and averaged in by AVG" in system
+    assert "at 0)" not in system
+    # A negated condition also drops the NULL rows; the model is asked to keep them where they belong.
+    assert "keep them with COALESCE or IS NULL OR" in system
+    # The "no ELSE" is the condition that picks the measure's rows; a share keeps its own 0 for the rows it covers, or
+    # a win rate among closed deals, its inner ELSE 0 dropped, reads 100%.
+    assert "A condition that says which rows a written measure covers" in system
+    assert "A share keeps its own 0 for the rows it covers" in system
+    assert "AVG(CASE WHEN closed THEN CASE WHEN won THEN 1.0 ELSE 0 END END)" in system
+
+
+def test_the_prompts_share_form_passes_the_plan_check_as_a_percent():
+    """The share the prompt shows (its own 0 inside the condition that picks its rows) is one mnemiq's checks accept
+    as a percent, so the prompt never asks for what the plan check refuses."""
+    share = "AVG(CASE WHEN region = 'west' THEN CASE WHEN premium > 100 THEN 1.0 ELSE 0 END END)"
+    assert isinstance(_plan(GOAL, FakePlanner(_percent_plan(share, K.PERCENT)), _tools()), BuildPlan)
+
+
 def test_a_saved_metric_on_a_0_to_100_scale_cannot_be_planned_as_a_percent():
     metrics = {1: [_metric(1, "win_pct", "100.0 * AVG(premium)")]}
     chart = _chart("rate", Family.BIG_NUMBER, [SavedRef("win_pct", K.PERCENT)])

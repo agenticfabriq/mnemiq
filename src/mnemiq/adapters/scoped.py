@@ -27,6 +27,10 @@ class TablesNotFound(RuntimeError):
     """A manifest `tables` entry matched no table the source reports."""
 
 
+_BATCHED_BY_TABLE = frozenset({"dictionary", "table_sizes"})
+_BATCHED_BY_COLUMN = frozenset({"histograms"})
+
+
 class TableScopedAdapter:
     def __init__(self, inner: Any, patterns: tuple[str, ...], source_id: str) -> None:
         self._inner = inner
@@ -35,8 +39,24 @@ class TableScopedAdapter:
         self._source_id = source_id
 
     def __getattr__(self, name: str) -> Any:
-        # Everything this view does not narrow -- execution, dialect, functions -- is the source's.
-        return getattr(self._inner, name)
+        # Everything this view does not narrow -- execution, dialect, functions -- is the source's, except the batched
+        # dictionary reads, refused whole when any table asked for is out of scope, before anything is read: forwarded
+        # bare they would hand an unlisted table's statistics, sizes and histogram values through. They exist here only
+        # where the source has them, so a caller asking whether it can batch gets the source's answer.
+        attr = getattr(self._inner, name)
+        if name in _BATCHED_BY_TABLE:
+            def by_table(tables, _read=attr):
+                for table in tables:
+                    self._refuse_out_of_scope(table)
+                return _read(tables)
+            return by_table
+        if name in _BATCHED_BY_COLUMN:
+            def by_column(columns, _read=attr):
+                for table, _column in columns:
+                    self._refuse_out_of_scope(table)
+                return _read(columns)
+            return by_column
+        return attr
 
     def in_scope(self, table: str) -> bool:
         name = table.casefold()

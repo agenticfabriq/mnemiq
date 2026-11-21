@@ -241,9 +241,17 @@ driver's call timeout, which cancels the statement on the server. What a cut sta
   records the ones cut before it was saved (the `enrich:time-limit` job).
 
 The limit is per statement, not per table: a table under the size line with many columns can
-still take hours of statements that each finish in time. A read-only statement that meets
+still take hours of statements that each finish in time. On Oracle it is the driver's call
+timeout, which bounds each round trip to the database: every statement enrich sends is a count, a
+`GROUP BY` or a `DISTINCT`, whose work Oracle finishes before it returns the first row, so the
+limit bounds that work. A statement that streams rows could outlast it in many short round trips;
+of enrich's phases only the experimental examples phase sends one. A read-only statement that meets
 Oracle's ORA-01466 (a table redefined while it is read) is retried on a fresh connection up to
 three times, each with the full limit, so one statement can run at most four limits plus 2.5 s.
+The examples phase's own bound (`MNEMIQ_ENRICH_EXAMPLES`) is capped by the limit too. On a
+Postgres source the limit is also the connection's statement timeout, the bound that stops the
+server's scan; a `-c statement_timeout` written in the source's DSN or `PGOPTIONS` comes after it
+and takes precedence, as it does for answering, so an explicit setting there is the operator's.
 
 An unknown key in a source's entry is refused rather than ignored, so a misspelled `"profile"`
 cannot fall back to reading every table.
@@ -272,7 +280,11 @@ instead, and enrich logs why.
 - **Code lists come only from complete frequency histograms.** A column gets a list only where
   the histogram is `FREQUENCY` with one endpoint per distinct value, was built from every non-null
   row in the same gather as the table's statistics, and Oracle says the table's statistics are not
-  stale; and only where every value reads back exactly.
+  stale; and only where every value reads back exactly. "The same gather" is read from
+  `LAST_ANALYZED`, which Oracle keeps to the second, and no dictionary view a reader can see says
+  which gather built a histogram: so of two gathers of one table within the same second, the first
+  one's histogram passes for the second's, and if the column's values changed in between without
+  the row count changing, its list can be out of date.
   Measured on 23ai Free: Oracle often stores no text for short `VARCHAR2` values, only a numeric
   encoding of their first bytes. mnemiq reads a value back from that encoding only on a database
   whose character set is UTF-8 (`AL32UTF8` or `UTF8`), and only when the value is at most 5

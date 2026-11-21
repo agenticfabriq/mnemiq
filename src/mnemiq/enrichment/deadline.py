@@ -61,8 +61,20 @@ class EnrichDeadline:
             self.timed_out.append(_tables(sql, getattr(self._source, "dialect", None)))
             raise
 
+    def execute_arrow(self, sql: str, timeout_s: float | None = None):
+        """A bounded read (the examples phase's, through `run`) under the tighter of the caller's bound and the enrich
+        limit, and a cut one recorded like `execute`'s: DuckDB reports its interrupt as its own error."""
+        from duckdb import InterruptException
+
+        limits = [t for t in (timeout_s, self.timeout_s) if t]
+        try:
+            return self._source.execute_arrow(sql, timeout_s=min(limits) if limits else None)
+        except (QueryTimedOut, InterruptException):
+            self.timed_out.append(_tables(sql, getattr(self._source, "dialect", None)))
+            raise
+
     def __getattr__(self, name: str) -> Any:
-        # Everything but `execute` is the source's: its dictionary, its dialect, its scope.
+        # Everything but the two reads is the source's: its dictionary, its dialect, its scope.
         return getattr(self._source, name)
 
 

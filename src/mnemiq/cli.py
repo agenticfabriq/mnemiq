@@ -387,7 +387,10 @@ def _enrichment_source(settings: Settings):
 
     spec = source_spec(settings)
     # Every statement enrich and refresh send carries the statement time limit; a cut one is recorded for the report.
-    return spec, EnrichDeadline(adapter_for(spec, settings), settings.enrich_statement_timeout_s)
+    # A Postgres source also gets it as its connection's statement timeout, the bound that stops the server's scan:
+    # DuckDB's interrupt, which EnrichDeadline sends, waits for a streaming scan to finish (M152).
+    limit = settings.enrich_statement_timeout_s or None
+    return spec, EnrichDeadline(adapter_for(spec, settings, statement_timeout_s=limit), settings.enrich_statement_timeout_s)
 
 
 def _cmd_enrich(settings: Settings) -> int:
