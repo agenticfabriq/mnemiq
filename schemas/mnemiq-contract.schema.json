@@ -77,6 +77,18 @@
             "title": "Coded Values",
             "type": "array"
           },
+          "comment": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Comment"
+          },
           "data_type": {
             "anyOf": [
               {
@@ -1195,6 +1207,18 @@
             "title": "Coded Values",
             "type": "array"
           },
+          "comment": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Comment"
+          },
           "data_type": {
             "anyOf": [
               {
@@ -1910,6 +1934,18 @@
           "binding_type": {
             "title": "Binding Type",
             "type": "string"
+          },
+          "comment": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Comment"
           },
           "freshness_ref": {
             "anyOf": [

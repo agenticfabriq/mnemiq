@@ -43,7 +43,8 @@ def render_facts_block(tf) -> str:
 def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
                 style: str = "cards",
                 describe: Callable[[str, str], bool] | None = None,
-                dialect: str | None = None) -> list[SchemaCard]:
+                dialect: str | None = None,
+                comment: Callable[[str, str], bool] | None = None) -> list[SchemaCard]:
     """One self-sufficient card per table: what it is, what it holds, how it joins.
 
     This is the retrieval unit -- indexed, matched, and later read by the agent to write
@@ -98,10 +99,24 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
         joins.setdefault(rel.from_, []).append(line)
 
     tables = [b.object_id for b in snapshot.source_bindings] or list(columns)
+    table_comments = {b.object_id: b.comment for b in snapshot.source_bindings if b.comment}
+
+    # A comment is free text a person wrote: it can name or describe any table or column in the schema, and nothing
+    # recorded bounds it (a join list can be empty because discovery failed, or a federated merge dropped it). So a
+    # comment, a table's or a column's, is shown only to an identity that may name every table here and is denied or
+    # masked no column; any denied or masked entry at all withholds them, the safe reading of an entry this snapshot
+    # may not hold. Unscoped (the indexed card), every comment is shown.
+    # Every table by its exact id, as retrieval serves cards (`object_id IN` the grants), never by the case fold
+    # `policy.names` uses for joins: `orders` and a quoted `Orders` are two tables, and a grant on one is not the other.
+    comments_shown = policy is None or (not policy.denied and not policy.masked
+                                        and (policy.visible is None or set(tables) <= policy.visible))
 
     cards: list[SchemaCard] = []
     for table in tables:
-        lines = [f"TABLE {table}", "COLUMNS:"]
+        lines = [f"TABLE {table}"]
+        if table_comments.get(table) and comments_shown:
+            lines.append(f"COMMENT: {table_comments[table]}")
+        lines.append("COLUMNS:")
         ddl: list[tuple[str, str, str]] = []   # (name, data_type, trailing note)
         bare: list[tuple[str, str, str]] = []  # the same, whose only note is the mask
         for column in columns.get(table, []):
@@ -123,6 +138,9 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
                             "MASKED for this identity: do not select or filter on it."))
                 bare.append(ddl[-1])
                 continue
+            if column.comment and comments_shown and (comment is None or comment(table, column.name)):
+                # The database's own text, before the model's: a person wrote it.
+                line += f" (database comment: {column.comment})"
             if column.description and (describe is None or describe(table, column.name)):
                 line += f" {column.description}"
             if (
