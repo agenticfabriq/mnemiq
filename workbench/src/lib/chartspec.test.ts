@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { TABLE_ANSWER } from "../test/fixtures";
-import { chartSpecFor, isNumeric, isTemporal, whyNoChart } from "./chartspec";
+import { chartSpecFor, isLabelColumn, isNumeric, isTemporal, whyNoChart } from "./chartspec";
 import { compact } from "./chartoption";
 import type { Cell, ResultPreview } from "./types";
 
@@ -107,5 +107,56 @@ describe("compact axis figures", () => {
 
   it("keeps the sign", () => {
     expect(compact(-2500000)).toBe("-2.5M");
+  });
+});
+
+describe("years and identifiers are labels", () => {
+  it("charts a year against a total as a bar labelled by the year", () => {
+    const spec = chartSpecFor(preview(["year", "total"], [[2023, 10], [2024, 20], [2025, 15]]));
+    expect(spec).toEqual({ kind: "bar", labelColumn: "year", valueColumns: ["total"] });
+  });
+
+  it("keeps the region the label and the year out of the values", () => {
+    const spec = chartSpecFor(
+      preview(["region", "year", "total"], [["west", 2024, 10], ["east", 2024, 20], ["west", 2025, 5]]),
+    );
+    expect(spec).toEqual({ kind: "bar", labelColumn: "region", valueColumns: ["total"] });
+  });
+
+  it("labels the bars by an identifier column", () => {
+    const spec = chartSpecFor(preview(["customer_id", "total"], [[101, 10], [102, 20], [103, 5]]));
+    expect(spec).toEqual({ kind: "bar", labelColumn: "customer_id", valueColumns: ["total"] });
+  });
+
+  it("reads a fiscal year column of four-digit years as a label", () => {
+    const spec = chartSpecFor(preview(["fiscal_yr", "revenue"], [[2023, 1.5], [2024, 2.5]]));
+    expect(spec).toEqual({ kind: "bar", labelColumn: "fiscal_yr", valueColumns: ["revenue"] });
+  });
+
+  it("does not take whole numbers in a year's range for years without a year in the name", () => {
+    const spec = chartSpecFor(preview(["score", "total"], [[1950, 2001], [1984, 2010], [2003, 1999]]));
+    expect(spec?.kind).toBe("scatter");
+  });
+
+  it("names a label column by its identifier word or its year", () => {
+    expect(isLabelColumn("id", [1, 2])).toBe(true);
+    expect(isLabelColumn("order_no", [1, 2])).toBe(true);
+    expect(isLabelColumn("zip_code", [94301])).toBe(true);
+    expect(isLabelColumn("customerId", [1])).toBe(true);
+    expect(isLabelColumn("phone_number", [5551234])).toBe(true);
+    expect(isLabelColumn("year", [2024, null])).toBe(true);
+    expect(isLabelColumn("year", [2024.5])).toBe(false);
+    expect(isLabelColumn("paid", [10])).toBe(false);
+    expect(isLabelColumn("video", [1])).toBe(false);
+  });
+});
+
+describe("an empty result says it is empty", () => {
+  it("says no rows came back when there are none", () => {
+    expect(whyNoChart(preview(["region", "total"], []))).toBe("no rows came back, so there is nothing to chart");
+  });
+
+  it("keeps a single row a number", () => {
+    expect(whyNoChart(preview(["total"], [[3]]))).toBe("a single row is a number, not a chart");
   });
 });

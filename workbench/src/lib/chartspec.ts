@@ -51,6 +51,29 @@ export const toNumber = (v: Cell): number | null => {
   return Number.isFinite(n) ? n : null;
 };
 
+// An identifier word as the whole name or after `_` (`id`, `order_no`, `zip_code`), or a camel-case `Id` ending.
+const IDENTIFIER = /(^|_)(id|key|code|no|number)$/i;
+const CAMEL_ID = /[a-z0-9]Id$/;
+const YEAR_NAME = /year|yr/i;
+
+/**
+ * Whether a column names its rows rather than measuring them: an identifier by its name, or a year, a column whose
+ * name holds `year` or `yr` and whose every present value is a whole number from 1000 to 9999. A column whose values
+ * merely fall in a year's range, with no year in its name, stays a measure.
+ */
+export function isLabelColumn(name: string, values: Cell[]): boolean {
+  if (IDENTIFIER.test(name) || CAMEL_ID.test(name)) return true;
+  if (!YEAR_NAME.test(name)) return false;
+  const present = values.filter((v) => !isBlank(v));
+  return (
+    present.length > 0 &&
+    present.every((v) => {
+      const n = toNumber(v);
+      return n !== null && Number.isInteger(n) && n >= 1000 && n <= 9999;
+    })
+  );
+}
+
 /**
  * Returns the chart this result should render as, or null when it should not be
  * charted at all.
@@ -61,7 +84,10 @@ export function chartSpecFor(preview: ResultPreview): ChartSpec | null {
   if (rows.length > MAX_CATEGORIES) return null;
 
   const columnValues = columns.map((_, i) => rows.map((r) => (r[i] ?? null) as Cell));
-  const numeric = columns.filter((_, i) => isNumeric(columnValues[i]!));
+  // A year or an identifier is numeric, but it names the rows: a label, never a measure.
+  const numeric = columns.filter(
+    (c, i) => isNumeric(columnValues[i]!) && !isLabelColumn(c, columnValues[i]!),
+  );
   const temporal = columns.filter((_, i) => isTemporal(columnValues[i]!));
 
   if (numeric.length === 0) return null;
@@ -91,6 +117,7 @@ export function chartSpecFor(preview: ResultPreview): ChartSpec | null {
 /** Why no chart is on offer -- shown so the absence is explained, not silent. */
 export function whyNoChart(preview: ResultPreview): string {
   const { columns, rows } = preview;
+  if (rows.length === 0) return "no rows came back, so there is nothing to chart";
   if (rows.length < 2) return "a single row is a number, not a chart";
   if (columns.length < 2) return "one column has nothing to plot against";
   if (rows.length > MAX_CATEGORIES) return `${rows.length} rows is more than a chart can show`;
