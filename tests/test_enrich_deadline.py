@@ -39,10 +39,12 @@ class _Recording(SQLiteAdapter):
         super().__init__(path)
         self.limits: list = []
         self._cut = cut
+        self.cut_sent = 0
 
     def execute(self, sql, timeout_s=None):
         self.limits.append(timeout_s)
         if self._cut and (self._cut(sql) if callable(self._cut) else self._cut in sql.lower()):
+            self.cut_sent += 1
             raise QueryTimedOut(f"query timed out after {timeout_s}s")
         return super().execute(sql, timeout_s=timeout_s)
 
@@ -173,3 +175,63 @@ def test_a_timed_out_partition_read_ends_the_tables_profile(tmp_path):
     facts = next(t for t in introspect(source) if t.name == "facts")
     with pytest.raises(QueryTimedOut):
         profile_table(EnrichDeadline(source, 600), facts)
+
+
+def _shop(tmp_path):
+    """A parent named by two children's key-like columns, so join inference checks the parent's key once per child."""
+    path = tmp_path / "shop.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript(
+        "CREATE TABLE customer (customer_id INTEGER, name TEXT);"
+        "CREATE TABLE orders (order_id INTEGER, customer_id INTEGER);"
+        "CREATE TABLE invoice (invoice_id INTEGER, customer_id INTEGER);"
+        + "".join(f"INSERT INTO customer VALUES ({i}, 'c{i}');" for i in range(20))
+        + "".join(f"INSERT INTO orders VALUES ({i}, {i % 20});" for i in range(40))
+        + "".join(f"INSERT INTO invoice VALUES ({i}, {i % 20});" for i in range(30)))
+    con.close()
+    return str(path)
+
+
+def test_a_table_whose_profile_timed_out_is_not_read_by_join_inference(tmp_path):
+    # Excluded from the model, the table has no join to offer, and each inference check of it would reach the limit
+    # again (Codex's review of #276: the same timed-out count sent three times).
+    source = _Recording(_shop(tmp_path), cut=lambda sql: 'FROM "customer"' in sql)
+    snap = enrich_structural(EnrichDeadline(source, 600), "src")
+    assert {j.id: j for j in snap.jobs}["profile:customer"].status == "failed"
+    assert source.cut_sent == 1, "only the profile's cut statement read the excluded table"
+
+
+def test_join_inference_does_not_repeat_a_timed_out_count(tmp_path):
+    # The parent profiles, but inference's own count of its key reaches the limit: asked for by both children, it is
+    # sent once.
+    key_count = 'SELECT count(*), count(DISTINCT "customer_id"), count("customer_id") FROM "customer"'
+    source = _Recording(_shop(tmp_path), cut=lambda sql: sql == key_count)
+    snap = enrich_structural(EnrichDeadline(source, 600), "src")
+    assert {j.id: j for j in snap.jobs}["profile:customer"].status == "done"
+    assert source.cut_sent == 1
+
+
+def test_enrich_bounds_a_postgres_source_on_the_server(monkeypatch, tmp_path):
+    # A Postgres source is read through DuckDB's attach, whose interrupt does not stop the server's scan; the bound that
+    # does is the connection's statement timeout, which adapter_for sets from `statement_timeout_s`.
+    from mnemiq.cli import _enrichment_source
+    from mnemiq.config import Settings
+
+    seen = {}
+    source = _Recording(_db(tmp_path))
+
+    def adapter_for(spec, settings=None, **kwargs):
+        seen.update(kwargs)
+        return source
+
+    monkeypatch.setattr("mnemiq.adapters.resolve.adapter_for", adapter_for)
+    manifest = tmp_path / "sources.json"
+    manifest.write_text('[{"id": "src", "kind": "postgres", "target": "postgresql://h/db", "catalog": "src", '
+                        '"schema": "public"}]')
+    _enrichment_source(Settings(sources_path=str(manifest), store_path=str(tmp_path / "s.duckdb"),
+                                enrich_statement_timeout_s=120))
+    assert seen.get("statement_timeout_s") == 120
+    seen.clear()
+    _enrichment_source(Settings(sources_path=str(manifest), store_path=str(tmp_path / "s.duckdb"),
+                                enrich_statement_timeout_s=0))
+    assert seen.get("statement_timeout_s") is None

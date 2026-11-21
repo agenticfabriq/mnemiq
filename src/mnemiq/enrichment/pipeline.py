@@ -364,13 +364,17 @@ def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
                             status="failed", detail="its exact read reached the statement time limit; profiled from "
                                                     "the dictionary instead"))
     estimated = estimated | frozenset(fell_back)
+    # Only the tables that profiled can join: one left out has no join to offer the model, and checking a candidate
+    # against it would read it again, a table whose read may just have reached the time limit (Codex's review of #276).
+    profiled = {j.id.removeprefix("profile:") for j in jobs if j.kind == "profile" and j.status == "done"}
 
     # A candidate whose check could not run is skipped, and recorded here as well as logged: a
     # warning alone left an incomplete inference looking like a complete one on the snapshot.
     inference_failures: list[str] = []
     try:
-        relationships = build_relationships(adapter, catalog, **unharvested(harvest_values),
-                                            failures=inference_failures, estimated=estimated)
+        relationships = build_relationships(adapter, [t for t in catalog if t.name in profiled],
+                                            **unharvested(harvest_values), failures=inference_failures,
+                                            estimated=estimated)
         status = "partial" if inference_failures else "done"
     except Exception:
         relationships, status = [], "failed"
