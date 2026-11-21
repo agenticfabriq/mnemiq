@@ -1657,24 +1657,45 @@ def _member_chart_ids(dashboard_id: int) -> list[int]:
     return sorted(row.slice_id for row in rows)
 
 
-def _trashed_chart_ids(chart_ids: list[int]) -> list[int]:
-    """Those of `chart_ids` in the trash (`deleted_at` set). Each row is locked by `lock_row`, in id order, read past
-    rc2's soft-delete filter (`skip_visibility_filter`, the opt-out from `_add_soft_delete_filter`, both in
-    `superset/models/helpers.py`), and stays locked for the rest of the layout's transaction: a chart restored
+def _locked_members(chart_ids: list[int]) -> list[Any]:
+    """The rows of `chart_ids`, each locked by `lock_row`, in id order, read past rc2's soft-delete filter
+    (`skip_visibility_filter`, the opt-out from `_add_soft_delete_filter`, both in `superset/models/helpers.py`), so a
+    chart in the trash is read and locked too, for the rest of the layout's transaction: a chart restored
     (`RestoreChartCommand`) or moved to the trash meanwhile waits for the save, so the trash state read here is the one
-    its membership rebuild meets."""
+    its membership rebuild meets. A row `lock_row` does not find is left out."""
     if not chart_ids:
         return []
     from superset.models.helpers import skip_visibility_filter
     from superset.models.slice import Slice
 
-    trashed = []
+    locked = []
     with skip_visibility_filter(_session(), Slice):
         for chart_id in sorted(chart_ids):
             chart = lock_row(Slice, chart_id)
-            if chart is not None and chart.deleted_at is not None:
-                trashed.append(chart_id)
-    return trashed
+            if chart is not None:
+                locked.append(chart)
+    return locked
+
+
+def _install_membership_baseline(dashboard: Any, charts: list[Any]) -> None:
+    """Install `charts`, members of the dashboard as its membership table holds them, as the committed state of
+    `dashboard.slices`, the collection rc2's `set_dash_metadata` diffs a layout's members against. rc2 loads that collection under its soft-delete filter: the filter's loader criteria travel from the
+    dashboard's own load to its `slices` load, past the `skip_visibility_filter` around the assignment, so a trashed
+    member is missing from it and the save INSERTs its junction row again (a duplicate key). apache/superset#45543
+    installs the same baseline in Superset itself; 7.0's branch (7.0.0 RC3) does not carry it. A change to the
+    collection still pending is kept, by leaving the collection alone, and a dashboard not yet saved has no membership
+    to install."""
+    from sqlalchemy import inspect
+    from sqlalchemy.orm.attributes import set_committed_value
+
+    state = inspect(dashboard)
+    if not state.persistent:
+        return
+    if state.attrs.slices.history.has_changes():
+        logger.warning("dashboard %s has a pending change to its charts; its membership is left as loaded",
+                       getattr(dashboard, "id", "?"))
+        return
+    set_committed_value(dashboard, "slices", charts)
 
 
 def _layout(found: dict, dashboard: Any) -> dict:
@@ -1691,14 +1712,20 @@ def _layout(found: dict, dashboard: Any) -> dict:
         return {"refused": "chart_access", "chart_ids": blocked}
     current_positions = _stored_object(dashboard.position_json) or {}
     members = _member_chart_ids(dashboard.id)
+    locked = _locked_members(members)
     refusal = params.check_positions(found["positions"], current_positions=current_positions,
                                      current_chart_ids=members, add_chart_ids=added, remove_chart_ids=removed,
-                                     trashed_chart_ids=_trashed_chart_ids(members))
+                                     trashed_chart_ids=[c.id for c in locked if c.deleted_at is not None])
     if refusal is not None:
         return refusal
     metadata = params.layout_metadata(found["positions"], _stored_object(dashboard.json_metadata) or {})
     from superset.commands.dashboard.update import UpdateDashboardCommand
 
+    # The members rc2's save must neither add again nor drop: the live ones, and those in the trash the new layout
+    # places. A trashed member the layout no longer places stays out, so the save leaves its row and a restore puts
+    # it back, as apache/superset#45543 keeps it.
+    placed = params._layout_chart_ids(found["positions"]) or set()
+    _install_membership_baseline(dashboard, [c for c in locked if c.deleted_at is None or c.id in placed])
     try:
         UpdateDashboardCommand(dashboard.id, {"json_metadata": json.dumps(metadata)}).run()
     except _command_errors() as exc:
