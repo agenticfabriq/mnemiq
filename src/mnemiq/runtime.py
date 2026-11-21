@@ -127,6 +127,7 @@ class SearchResult:
 
     tables: list[str]
     fit: object = None  # PromptFit, None where the deployment fits nothing
+    granted: frozenset[str] = frozenset()  # the tables the search's grants cover, by exact id, as retrieval matches
 
 
 @dataclass
@@ -328,7 +329,7 @@ class Runtime:
         packet.history = scope_history(None, grants.fingerprint)
         fit = (fitter.measure(packet, self.snapshot, grants, card_style=self._card_style(name, picked))
                if fitter is not None else None)
-        return SearchResult(tables=[c.object_id for c in packet.cards], fit=fit)
+        return SearchResult(tables=[c.object_id for c in packet.cards], fit=fit, granted=frozenset(grants.objects))
 
     def ask(
         self,

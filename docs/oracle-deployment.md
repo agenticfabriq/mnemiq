@@ -290,9 +290,12 @@ question's retrieval picks `MNEMIQ_RETRIEVAL_K` of them (24 by default), and a q
 tables it misses cannot be answered. `mnemiq check-search --questions questions.json` asks each
 question as answering would, up to the model call (no model is asked), and says where each table
 its gold SQL reads was found, and whether the prompt fits the model's window. The file is a JSON
-list of `{"id", "question", "gold_sql"}`. Its output holds counts and question ids only, unless
-`--names` is given, so it can be shared without the schema. A gold query that does not parse, or
-reads a table the deployment does not hold, is reported apart, never as a search miss.
+list of `{"id", "question", "gold_sql"}`, and the identity is the one `ask` would use (`--principal`,
+`--roles`). The report holds counts and question ids only, unless `--names` is given: write it with
+`--out report.txt` and share that file, not the terminal, where the deployment's own startup
+warnings can name tables and columns. A gold query that does not parse, or reads a table the
+identity cannot see (absent from the deployment or not granted, which read alike), is reported
+apart, never as a search miss.
 
 **What statistics mode gives up.**
 

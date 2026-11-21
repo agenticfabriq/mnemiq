@@ -5,7 +5,8 @@ tables it misses cannot be answered whatever the model does; and wide cards can 
 is found. `check` asks each question as answering would, up to the model call (`Runtime.search`: the same retrieval and
 the same fit, no model asked), takes the tables its gold SQL reads (the engine's own reading, `sql.scope.base_tables`),
 and says where each was found and whether the prompt fits. A gold query that does not parse, or reads a table the
-deployment does not hold, is reported apart and never counted as a search miss. `render` prints counts and question ids
+identity cannot see (absent from the deployment, or not granted: the two read alike), is reported apart and never
+counted as a search miss. `render` prints counts and question ids
 only, unless asked for names, so a deployment can send its result without its schema.
 """
 from __future__ import annotations
@@ -46,7 +47,6 @@ def _held_id(written: str, held: dict[str, str]) -> str | None:
 def check(runtime: Any, questions: list[dict], identity: Any) -> tuple[list[dict], dict]:
     """One row per question (`id`, then `gold`, `found`, `ranks`, `fits`, `tokens`, `budget`, `tables`, or
     `unreadable`), and the totals."""
-    held = {b.object_id.casefold(): b.object_id for b in runtime.snapshot.source_bindings}
     dialect = getattr(runtime.adapter, "dialect", None)
     rows: list[dict] = []
     for q in questions:
@@ -56,14 +56,21 @@ def check(runtime: Any, questions: list[dict], identity: Any) -> tuple[list[dict
             row["unreadable"] = "the gold SQL does not parse"
         elif not gold:
             row["unreadable"] = "the gold SQL reads no table"
-        elif outside := [g for g in gold if _held_id(g, held) is None]:
-            row["unreadable"] = f"the gold SQL reads {len(outside)} table(s) outside this deployment"
         if "unreadable" in row:
+            rows.append(row)
+            continue
+        result = runtime.search(q["question"], identity)
+        # Only the tables this search's grants cover, by exact id as retrieval serves them: a table the identity may
+        # not read cannot be found, and reporting it apart from an absent one would tell which tables exist.
+        held = {b.object_id.casefold(): b.object_id for b in runtime.snapshot.source_bindings
+                if b.object_id in result.granted}
+        if outside := [g for g in gold if _held_id(g, held) is None]:
+            row["unreadable"] = (f"the gold SQL reads {len(outside)} table(s) this identity cannot see "
+                                 "(not in this deployment, or not granted)")
             rows.append(row)
             continue
         text = q["gold_sql"].casefold()
         ordered = sorted({_held_id(g, held) for g in gold}, key=lambda g: (text.find(g.casefold()), g.casefold()))
-        result = runtime.search(q["question"], identity)
         ranked = [t.casefold() for t in result.tables]
         ranks = [ranked.index(g.casefold()) + 1 if g.casefold() in ranked else None for g in ordered]
         fit = result.fit
