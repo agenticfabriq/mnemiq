@@ -235,3 +235,32 @@ def test_enrich_bounds_a_postgres_source_on_the_server(monkeypatch, tmp_path):
     _enrichment_source(Settings(sources_path=str(manifest), store_path=str(tmp_path / "s.duckdb"),
                                 enrich_statement_timeout_s=0))
     assert seen.get("statement_timeout_s") is None
+
+
+def test_a_bounded_arrow_read_is_capped_by_the_limit_and_named(tmp_path):
+    # The examples phase reads through `execute_arrow` with its own 30 s (Codex's second review of #276): the enrich
+    # limit caps it, and a cut there is named like any other.
+    class Arrow(_Recording):
+        def __init__(self, path):
+            super().__init__(path)
+            self.arrow_limits: list = []
+
+        def execute_arrow(self, sql, timeout_s=None):
+            self.arrow_limits.append(timeout_s)
+            if "notes" in sql:
+                raise QueryTimedOut(f"query timed out after {timeout_s}s")
+            return super().execute_arrow(sql, timeout_s=timeout_s)
+
+    source = Arrow(_db(tmp_path))
+    adapter = EnrichDeadline(source, 5)
+    adapter.execute_arrow('SELECT count(*) FROM "orders"', timeout_s=30)
+    adapter.execute_arrow('SELECT count(*) FROM "orders"', timeout_s=2)
+    adapter.execute_arrow('SELECT count(*) FROM "orders"')
+    assert source.arrow_limits == [5, 2, 5], "the tighter of the caller's bound and the enrich limit"
+    with pytest.raises(QueryTimedOut):
+        adapter.execute_arrow('SELECT count(*) FROM "notes"', timeout_s=30)
+    assert adapter.timed_out == [("notes",)]
+    (tmp_path / "b").mkdir()
+    unbounded = EnrichDeadline(Arrow(_db(tmp_path / "b")), 0)
+    unbounded.execute_arrow('SELECT count(*) FROM "orders"', timeout_s=30)
+    assert unbounded._source.arrow_limits == [30], "no enrich limit: the caller's bound stands"

@@ -244,6 +244,10 @@ The limit is per statement, not per table: a table under the size line with many
 still take hours of statements that each finish in time. A read-only statement that meets
 Oracle's ORA-01466 (a table redefined while it is read) is retried on a fresh connection up to
 three times, each with the full limit, so one statement can run at most four limits plus 2.5 s.
+The examples phase's own bound (`MNEMIQ_ENRICH_EXAMPLES`) is capped by the limit too. On a
+Postgres source the limit is also the connection's statement timeout, the bound that stops the
+server's scan; a `-c statement_timeout` written in the source's DSN or `PGOPTIONS` comes after it
+and takes precedence, as it does for answering, so an explicit setting there is the operator's.
 
 An unknown key in a source's entry is refused rather than ignored, so a misspelled `"profile"`
 cannot fall back to reading every table.
