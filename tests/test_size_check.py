@@ -354,3 +354,31 @@ def test_an_exact_tables_pattern_matching_nothing_is_refused():
 
     with pytest.raises(TablesNotFound):
         exact_profile_refusal(_spec(profile="statistics", exact_tables=("NOPE",)), _Dictionary({"CODES": _size(10)}))
+
+
+def test_size_check_reads_sizes_in_one_batch():
+    class Batched(_Dictionary):
+        def __init__(self, sizes):
+            super().__init__(sizes)
+            self.batches: list[list[str]] = []
+
+        def table_sizes(self, tables):
+            self.batches.append(list(tables))
+            return {t: self.sizes[t] for t in tables}
+
+    source = Batched({f"T{i}": _size(10) for i in range(600)})
+    assert exact_profile_refusal(_spec(), source) == (None, None)
+    assert len(source.batches) == 1 and source.asked == [], "sizes came from the batched read, not one per table"
+
+
+def test_a_failed_batched_size_read_falls_back_to_the_per_table_reads():
+    # One batched statement over 500 tables can outlast the probe timeout where each table's own read would not
+    # (Codex's review of #277): the check reads table by table then, and still stops on a large one.
+    class Failing(_Dictionary):
+        def table_sizes(self, tables):
+            raise RuntimeError("DPY-4024: call timeout of 30000 ms exceeded")
+
+    source = Failing({"ORDERS": _size(20_000_000), "CODES": _size(10)})
+    refusal, _ = exact_profile_refusal(_spec(), source)
+    assert refusal and "ORDERS" in refusal
+    assert sorted(source.asked) == ["CODES", "ORDERS"]

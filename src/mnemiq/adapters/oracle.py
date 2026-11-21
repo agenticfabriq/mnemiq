@@ -5,12 +5,13 @@ import re
 import threading
 import time
 from contextlib import contextmanager
+from collections.abc import Sequence
 from typing import Any
 
 import pyarrow as pa
 
 from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
-from mnemiq.adapters.dictionary import ColumnStatistics, HistogramEndpoint, TableSize
+from mnemiq.adapters.dictionary import ColumnStatistics, DictionaryFacts, HistogramEndpoint, TableSize
 
 logger = logging.getLogger(__name__)
 
@@ -1320,14 +1321,7 @@ class OracleAdapter:
             "WHERE owner = :owner AND table_name = :table_name AND object_type = 'TABLE'",
             owner=self._schema, table_name=table,
         )
-        if not rows:
-            return TableSize(rows=None, avg_row_len=None, analyzed=None, stale=None)
-        num_rows, avg_row_len, analyzed, stale = rows[0]
-        return TableSize(
-            rows=num_rows, avg_row_len=avg_row_len,
-            analyzed=analyzed.isoformat(timespec="seconds") if analyzed is not None else None,
-            stale={"YES": True, "NO": False}.get(stale),
-        )
+        return _table_size(*rows[0]) if rows else _NO_SIZE
 
     def column_statistics(self, table: str) -> list[ColumnStatistics]:
         """Each column's optimizer statistics for `table`, reading no table data. A column the dictionary holds nothing
@@ -1341,13 +1335,7 @@ class OracleAdapter:
             "WHERE s.owner = :owner AND s.table_name = :table_name",
             owner=self._schema, table_name=table,
         )
-        return [
-            ColumnStatistics(column=column, distinct=distinct, nulls=nulls, histogram=histogram or "NONE",
-                             buckets=buckets, sample_size=sample_size,
-                             analyzed=analyzed.isoformat(timespec="seconds") if analyzed is not None else None,
-                             low=low, high=high, scale=scale)
-            for column, distinct, nulls, histogram, buckets, sample_size, analyzed, low, high, scale in rows
-        ]
+        return [_column_statistics(*row) for row in rows]
 
     def database_charset(self) -> str | None:
         """The database character set (`NLS_CHARACTERSET`), which every user may read; None where it is not shown. It
@@ -1364,6 +1352,74 @@ class OracleAdapter:
             owner=self._schema, table_name=table, column_name=column,
         )
         return [HistogramEndpoint(number=n, value=v, actual=a, actual_raw=r) for n, v, a, r in rows]
+
+    def dictionary(self, tables: Sequence[str]) -> DictionaryFacts:
+        """`table_size`, `column_statistics` and `unique_columns` for every table in `tables`, each view read once for up
+        to `DICTIONARY_BATCH` of them (Oracle refuses an IN-list of more than 1,000 items), through `_rows` and so its
+        probe timeout. The same SQL and the same reading of each row as the per-table reads, with the table's name
+        added; a table the dictionary does not show gets what its per-table read would."""
+        names = list(dict.fromkeys(tables))
+        sizes = self.table_sizes(names)
+        statistics: dict[str, list[ColumnStatistics]] = {t: [] for t in names}
+        constraints: dict[str, list[tuple]] = {t: [] for t in names}
+        indexes: dict[str, list[tuple]] = {t: [] for t in names}
+        for chunk in _batches(names):
+            listed, binds = _in_list(chunk)
+            for table, *row in self._rows(
+                    "SELECT s.table_name, s.column_name, s.num_distinct, s.num_nulls, s.histogram, s.num_buckets, "
+                    "s.sample_size, s.last_analyzed, s.low_value, s.high_value, c.data_scale FROM all_tab_col_statistics s "
+                    "LEFT JOIN all_tab_columns c "
+                    "ON c.owner = s.owner AND c.table_name = s.table_name AND c.column_name = s.column_name "
+                    f"WHERE s.owner = :owner AND s.table_name IN ({listed})",
+                    owner=self._schema, **binds):
+                statistics[table].append(_column_statistics(*row))
+            for table, *row in self._rows(
+                    "SELECT c.table_name, c.constraint_name, c.constraint_type, c.status, c.validated, cc.column_name "
+                    "FROM all_constraints c JOIN all_cons_columns cc "
+                    "ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name AND cc.table_name = c.table_name "
+                    f"WHERE c.owner = :owner AND c.table_name IN ({listed}) AND c.constraint_type IN ('P', 'U')",
+                    owner=self._schema, **binds):
+                constraints[table].append(tuple(row))
+            for table, *row in self._rows(
+                    "SELECT i.table_name, i.index_name, i.uniqueness, i.status, i.index_type, ic.column_name "
+                    "FROM all_indexes i JOIN all_ind_columns ic "
+                    "ON ic.index_owner = i.owner AND ic.index_name = i.index_name "
+                    f"WHERE i.table_owner = :owner AND i.table_name IN ({listed}) AND i.uniqueness = 'UNIQUE'",
+                    owner=self._schema, **binds):
+                indexes[table].append(tuple(row))
+        return DictionaryFacts(sizes=sizes, statistics=statistics,
+                               unique={t: _unique_keyed(constraints[t], indexes[t]) for t in names})
+
+    def table_sizes(self, tables: Sequence[str]) -> dict[str, TableSize]:
+        """`table_size` for every table in `tables`, `DICTIONARY_BATCH` at a time: what the size check reads."""
+        names = list(dict.fromkeys(tables))
+        sizes = {t: _NO_SIZE for t in names}
+        for chunk in _batches(names):
+            listed, binds = _in_list(chunk)
+            for table, *row in self._rows(
+                    "SELECT table_name, num_rows, avg_row_len, last_analyzed, stale_stats FROM all_tab_statistics "
+                    f"WHERE owner = :owner AND object_type = 'TABLE' AND table_name IN ({listed})",
+                    owner=self._schema, **binds):
+                sizes[table] = _table_size(*row)
+        return sizes
+
+    def histograms(self, columns: Sequence[tuple[str, str]]) -> dict[tuple[str, str], list[HistogramEndpoint]]:
+        """`histogram` for every (table, column) in `columns`, read `DICTIONARY_BATCH` pairs at a time."""
+        pairs = list(dict.fromkeys(columns))
+        out: dict[tuple[str, str], list[HistogramEndpoint]] = {p: [] for p in pairs}
+        for chunk in _batches(pairs):
+            binds = {}
+            for i, (table, column) in enumerate(chunk):
+                binds[f"t{i}"], binds[f"c{i}"] = table, column
+            listed = ", ".join(f"(:t{i}, :c{i})" for i in range(len(chunk)))
+            for table, column, n, v, a, r in self._rows(
+                    "SELECT table_name, column_name, endpoint_number, endpoint_value, endpoint_actual_value, "
+                    "endpoint_actual_value_raw FROM all_tab_histograms "
+                    f"WHERE owner = :owner AND (table_name, column_name) IN ({listed}) "
+                    "ORDER BY table_name, column_name, endpoint_number",
+                    owner=self._schema, **binds):
+                out[(table, column)].append(HistogramEndpoint(number=n, value=v, actual=a, actual_raw=r))
+        return out
 
     def unique_columns(self, table: str) -> frozenset[str]:
         """The columns of `table` that a single-column key declares and enforces: an `ENABLED`, `VALIDATED` primary key
@@ -1383,16 +1439,7 @@ class OracleAdapter:
             "WHERE i.table_owner = :owner AND i.table_name = :table_name AND i.uniqueness = 'UNIQUE'",
             owner=self._schema, table_name=table,
         )
-        keys: dict[tuple[str, str], list[str]] = {}
-        for name, kind, status, validated, column in constraints:
-            if kind in ("P", "U") and status == "ENABLED" and validated == "VALIDATED":
-                keys.setdefault(("constraint", name), []).append(column)
-            else:
-                keys.setdefault(("constraint", name), []).append("")  # makes the key unusable, whatever its width
-        for name, uniqueness, status, index_type, column in indexes:
-            usable = uniqueness == "UNIQUE" and status == "VALID" and not (index_type or "").startswith("FUNCTION")
-            keys.setdefault(("index", name), []).append(column if usable else "")
-        return frozenset(columns[0] for columns in keys.values() if len(columns) == 1 and columns[0])
+        return _unique_keyed(constraints, indexes)
 
     def view_definitions(self) -> list[tuple[str, str, str]]:
         """(view, body, dialect). A failure RAISES, and that is load-bearing.
@@ -1926,6 +1973,50 @@ def _is_read_only_database(exc: Exception) -> bool:
     if getattr(err, "code", None) == 16000 or getattr(err, "full_code", None) == "ORA-16000":
         return True
     return "ORA-16000" in str(exc)
+
+
+# Names per IN-list in the batched dictionary reads: Oracle refuses an IN-list of more than 1,000 items (ORA-01795).
+DICTIONARY_BATCH = 500
+
+_NO_SIZE = TableSize(rows=None, avg_row_len=None, analyzed=None, stale=None)
+
+
+def _batches(items: list) -> list[list]:
+    return [items[i:i + DICTIONARY_BATCH] for i in range(0, len(items), DICTIONARY_BATCH)]
+
+
+def _in_list(names: list[str]) -> tuple[str, dict[str, str]]:
+    binds = {f"t{i}": name for i, name in enumerate(names)}
+    return ", ".join(f":{key}" for key in binds), binds
+
+
+def _table_size(num_rows, avg_row_len, analyzed, stale) -> TableSize:
+    """A table's `ALL_TAB_STATISTICS` row; `STALE_STATS` read three ways, so a NULL is unknown rather than fresh."""
+    return TableSize(rows=num_rows, avg_row_len=avg_row_len,
+                     analyzed=analyzed.isoformat(timespec="seconds") if analyzed is not None else None,
+                     stale={"YES": True, "NO": False}.get(stale))
+
+
+def _column_statistics(column, distinct, nulls, histogram, buckets, sample_size, analyzed, low, high,
+                       scale) -> ColumnStatistics:
+    return ColumnStatistics(column=column, distinct=distinct, nulls=nulls, histogram=histogram or "NONE",
+                            buckets=buckets, sample_size=sample_size,
+                            analyzed=analyzed.isoformat(timespec="seconds") if analyzed is not None else None,
+                            low=low, high=high, scale=scale)
+
+
+def _unique_keyed(constraints, indexes) -> frozenset[str]:
+    """The columns a single-column, enforced key declares (`unique_columns`), from its constraint and index rows."""
+    keys: dict[tuple[str, str], list[str]] = {}
+    for name, kind, status, validated, column in constraints:
+        if kind in ("P", "U") and status == "ENABLED" and validated == "VALIDATED":
+            keys.setdefault(("constraint", name), []).append(column)
+        else:
+            keys.setdefault(("constraint", name), []).append("")  # makes the key unusable, whatever its width
+    for name, uniqueness, status, index_type, column in indexes:
+        usable = uniqueness == "UNIQUE" and status == "VALID" and not (index_type or "").startswith("FUNCTION")
+        keys.setdefault(("index", name), []).append(column if usable else "")
+    return frozenset(columns[0] for columns in keys.values() if len(columns) == 1 and columns[0])
 
 
 def _is_ddl_race(exc: Exception) -> bool:

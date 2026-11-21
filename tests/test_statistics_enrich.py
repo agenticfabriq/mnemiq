@@ -344,3 +344,90 @@ def test_an_exact_table_whose_read_times_out_falls_back_to_its_estimate(tmp_path
     assert jobs["profile:orders:exact"].status == "failed" and "time limit" in jobs["profile:orders:exact"].detail
     assert "orders" in estimated_tables(snap)
     assert sum(_touches(sql, "orders") for sql in source.sql) == 1, "only the cut read touched it"
+
+
+class _Batched(_Recording):
+    """The shop source with the batched dictionary reads too, counting which kind each read was. Its data moves out of
+    the `dictionary` attribute the base keeps it in, which would hide the batched read of that name."""
+
+    def __init__(self, inner):
+        super().__init__(inner)
+        self.data = self.__dict__.pop("dictionary")
+        self.per_table = 0
+        self.batched: list[list] = []
+
+    def table_size(self, table):
+        self.per_table += 1
+        return self.data[table][0]
+
+    def column_statistics(self, table):
+        self.per_table += 1
+        return self.data[table][1]
+
+    def histogram(self, table, column):
+        self.per_table += 1
+        return self.data[table][2].get(column, [])
+
+    def unique_columns(self, table):
+        self.per_table += 1
+        return self.data[table][3]
+
+    def dictionary(self, tables):
+        from mnemiq.adapters.dictionary import DictionaryFacts
+        self.batched.append(list(tables))
+        return DictionaryFacts(sizes={t: self.data[t][0] for t in tables},
+                               statistics={t: self.data[t][1] for t in tables},
+                               unique={t: self.data[t][3] for t in tables})
+
+    def histograms(self, columns):
+        self.batched.append(list(columns))
+        return {(t, c): self.data[t][2].get(c, []) for t, c in columns}
+
+
+def _shop_source(tmp_path, cls):
+    path = tmp_path / f"{cls.__name__}.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript(SHOP)
+    con.close()
+    return cls(SQLiteAdapter(str(path)))
+
+
+def test_statistics_snapshot_is_the_same_batched_or_per_table(tmp_path):
+    from mnemiq.enrichment.pipeline import content_version
+
+    per_table = enrich_structural(_shop_source(tmp_path, _Recording), "shop", statistics=())
+    source = _shop_source(tmp_path, _Batched)
+    batched = enrich_structural(source, "shop", statistics=())
+    assert content_version(batched) == content_version(per_table)
+    assert source.per_table == 0, "every dictionary read went through the batched reads"
+    assert sorted(source.batched[0]) == ["customers", "order_lines", "orders", "product"]
+
+
+def test_the_prefetch_reads_only_the_estimated_tables(tmp_path):
+    source = _shop_source(tmp_path, _Batched)
+    enrich_structural(source, "shop", statistics=("orders",))
+    assert sorted(source.batched[0]) == ["customers", "order_lines", "product"], "the exact table is not prefetched"
+
+
+def test_the_prefetch_honours_the_table_scope(tmp_path):
+    from mnemiq.adapters.scoped import TableScopedAdapter
+
+    source = _shop_source(tmp_path, _Batched)
+    enrich_structural(TableScopedAdapter(source, ("orders", "customers"), "shop"), "shop", statistics=())
+    assert sorted(source.batched[0]) == ["customers", "orders"]
+
+
+def test_a_failed_batched_read_falls_back_to_the_per_table_reads(tmp_path, caplog):
+    # A batched read is one statement over many tables; on a large dictionary it can outlast the probe timeout. The
+    # per-table reads still work then, so the profile reads that way rather than failing.
+    class Failing(_Batched):
+        def dictionary(self, tables):
+            raise RuntimeError("DPY-4024: call timeout of 30000 ms exceeded")
+
+    from mnemiq.enrichment.pipeline import content_version
+
+    source = _shop_source(tmp_path, Failing)
+    snap = enrich_structural(source, "shop", statistics=())
+    assert content_version(snap) == content_version(enrich_structural(_shop_source(tmp_path, _Recording), "shop",
+                                                                      statistics=()))
+    assert source.per_table > 0 and "read per table" in caplog.text
