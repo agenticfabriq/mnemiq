@@ -748,3 +748,27 @@ def test_a_wide_table_whose_descriptions_match_the_question_does_not_starve_the_
     sent, _total = fitted.descriptions
     assert 6 <= sent < 40, "the case: room for a few, not all, and not none"
     assert narrow.count("Recorded once per lot") >= min(6, sent // 2), "the narrow table keeps its share"
+
+
+# -- measure: whether what `fit` sends fits, for the table-search check ----------------------------------------------
+
+
+def test_measure_says_a_packet_over_the_window_does_not_fit():
+    from mnemiq.semantic.fit import PromptFit
+
+    snap = _snapshot(width=400)
+    fit = _fitter(2_000).measure(_packet(snap), snap, _grants(snap))
+    assert isinstance(fit, PromptFit)
+    assert fit.fits is False and fit.counted_by == "estimate" and fit.tokens > fit.budget
+
+
+def test_measure_counts_as_fit_does():
+    snap = _snapshot()
+    fit = _fitter(None, count=lambda s, u: (len(s + u) // 4, 10_000_000)).measure(_packet(snap), snap, _grants(snap))
+    assert fit.counted_by == "server" and fit.fits is True and fit.budget == 10_000_000 - fit.reserve
+
+
+def test_measure_without_a_window_cannot_say():
+    snap = _snapshot()
+    fit = _fitter(None, count=lambda s, u: None).measure(_packet(snap), snap, _grants(snap))
+    assert fit.fits is None and fit.budget is None

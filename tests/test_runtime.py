@@ -406,7 +406,11 @@ def test_the_eval_door_and_the_product_door_ground_identically():
         raise AssertionError(f"{function.__qualname__} no longer calls retrieve()")
 
     eval_door = retrieve_kwargs(build_engine)
-    product_door = retrieve_kwargs(runtime_module.Runtime.ask)
+    # The product door's retrieve call lives in `Runtime._retrieve`, which `ask` and `search` (the table-search check)
+    # both call, so the check scores what answering reads.
+    product_door = retrieve_kwargs(runtime_module.Runtime._retrieve)
+    for door in (runtime_module.Runtime.ask, runtime_module.Runtime.search):
+        assert "self._retrieve(" in inspect.getsource(door), f"{door.__qualname__} no longer retrieves as ask does"
 
     assert eval_door == product_door, (
         "the eval and product doors ground differently, so an eval no longer measures the engine "
