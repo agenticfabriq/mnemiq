@@ -1,7 +1,17 @@
 import { describe, expect, it } from "vitest";
 
 import { DEFERRAL, SCALAR_ANSWER } from "../test/fixtures";
-import { ANSWER_EVENT, RESULT_EVENT, isRunning, reduce, userTurn, type Turn } from "./store";
+import {
+  ANSWER_EVENT,
+  CONNECTION_ENDED,
+  RESULT_EVENT,
+  isRunning,
+  reduce,
+  settle,
+  userTurn,
+  type Turn,
+} from "./store";
+import { streamChat } from "./transport";
 import type { AguiEvent } from "./types";
 
 const run = (events: AguiEvent[], from: Turn[] = []) => events.reduce(reduce, from);
@@ -115,6 +125,45 @@ describe("reduce", () => {
     expect(reduce([], { type: "CUSTOM", name: ANSWER_EVENT, value: SCALAR_ANSWER })).toEqual(
       [],
     );
+  });
+});
+
+describe("a run that ends without its own events", () => {
+  it("an error with no run of its own leaves the previous answer complete and opens its own turn", () => {
+    const first = run(answered());
+    const turns = reduce(first, { type: "RUN_ERROR", message: "the engine returned 502" });
+    expect(turns[0]!.status).toBe("complete");
+    expect(turns.filter((t) => t.role === "assistant")).toHaveLength(2);
+    expect(turns[1]!.status).toBe("error");
+    expect(turns[1]!.error).toBe("the engine returned 502");
+  });
+
+  it("a failed request on a later question leaves the earlier answer as it was", async () => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response("bad gateway", { status: 502, statusText: "Bad Gateway" })) as typeof fetch;
+    try {
+      let turns = run(answered());
+      for await (const event of streamChat("q2", "thinking")) turns = reduce(turns, event);
+      expect(turns[0]!.status).toBe("complete");
+      expect(turns[0]!.text).toBe("There are 2 claims.");
+      expect(turns.at(-1)!.status).toBe("error");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("settle turns a running turn into an error and leaves a finished one alone", () => {
+    const turns = run([...answered(), { type: "RUN_STARTED", runId: "r2" }]);
+    const settled = settle(turns);
+    expect(settled[0]!.status).toBe("complete");
+    expect(settled[1]!.status).toBe("error");
+    expect(settled[1]!.error).toBe(CONNECTION_ENDED);
+    expect(settle(turns, "cut")[1]!.error).toBe("cut");
+  });
+
+  it("settle returns the same array when nothing runs", () => {
+    const turns = run(answered());
+    expect(settle(turns)).toBe(turns);
   });
 });
 

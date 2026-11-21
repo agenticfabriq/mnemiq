@@ -20,7 +20,7 @@ import {
 
 import { historyFrom } from "./history";
 import { Refused, streamChat, type Refusal } from "./transport";
-import { isRunning, reduce, userTurn, type Turn } from "./store";
+import { isRunning, reduce, settle, userTurn, type Turn } from "./store";
 import { emptyThread, isBlank, load, save, titleFor, type Thread } from "./threads";
 import { loadMode, saveMode } from "./mode";
 import { type Mode } from "./types";
@@ -142,11 +142,16 @@ export function useWorkbench(
         for await (const event of streamChat(question, modeRef.current, history, controller.signal)) {
           updateTurns(threadId, (current) => reduce(current, event));
         }
+        // The stream ended: an answer still running never got its end, so it ends as an error.
+        updateTurns(threadId, (current) => settle(current));
       } catch (error) {
         if (controller.signal.aborted) return; // the workbench went; nothing is left to tell
-        // Only a sign-out is thrown; every other refusal arrives as a failed run.
-        if (!(error instanceof Refused)) throw error;
-        onRefused(error.refusal);
+        // A sign-out is thrown before any event; a stream that breaks mid-answer ends that answer as an error.
+        if (error instanceof Refused) {
+          onRefused(error.refusal);
+          return;
+        }
+        updateTurns(threadId, (current) => settle(current));
       } finally {
         inflight.current.delete(controller);
       }
