@@ -1372,6 +1372,33 @@ def test_create_dataset_physical_and_virtual_carry_the_marker(live, extension, m
 BOTH_REFUSE = {"interactive_pivot"}
 
 
+def test_create_chart_leaves_out_no_value_from_the_metric_as_superset_saved_it(live, extension, policy_id, made):
+    """A bar of `policies` by region with a row limit, as a build sends it (`config_request`, which asks to leave out
+    groups with no value): saved with a SQL HAVING filter last among its filters whose condition is built from the
+    metric as Superset saved it, and in its query context's `extras.having`, wrapped as Superset's frontend wraps a
+    clause. A big number asked the same, which ranks by no one metric, is refused and nothing carrying its marker is
+    saved."""
+    from mnemiq.superset.charts import not_null_condition
+
+    client = as_user(live, BUILDER)
+    build = new_build(client, "leave_out")
+    chart = spec(Family.BAR, policy_id, dimensions=("region",), row_limit=10)
+    request = config_request(build, chart, build.marker("leave_out"))
+    assert request.get("leave_out_no_value") is True, request
+    answer = made.chart(call(client, "create_chart", **request))
+    assert set(answer) == {"chart_id"}, answer
+    stored = stored_chart(answer["chart_id"])
+    condition = not_null_condition(stored["params"]["metrics"][0]["sqlExpression"])
+    last = stored["params"]["adhoc_filters"][-1]
+    assert (last["clause"], last["expressionType"], last["sqlExpression"]) == ("HAVING", "SQL", condition)
+    assert stored["query_context"]["queries"][0]["extras"]["having"] == f"({condition})"
+    big_marker = build.marker("big_number")
+    big = {**config_request(build, spec(Family.BIG_NUMBER, policy_id), big_marker), "leave_out_no_value": True}
+    assert made.chart(call(client, "create_chart", **big)) == {"refused": "leave_out_no_value"}
+    assert carrying("slices", big_marker) == []
+    observe("leave out", chart_id=answer["chart_id"], having=stored["query_context"]["queries"][0]["extras"]["having"])
+
+
 def test_a_config_chart_saves_what_generate_chart_saves(live, extension, policy_id, made):
     """For every one of MCP's chart families, one chart spec sent both ways, each request built by mnemiq: to MCP's
     `generate_chart` (`generate_chart_request`) and to the extension's `create_chart` (`config_chart_request`). The
@@ -1837,9 +1864,9 @@ def test_row_rules_says_only_whether_a_rule_applies_to_the_caller(live, extensio
 
 def test_editors_of_names_editors_of_readable_objects_only(live, extension, policy_id):
     """analyst's chart and dataset, each made by the extension for a build's dashboard (editors: the dashboard's,
-    analyst), are answered to analyst as
-    `{charts: [{chart_id, editors: [analyst's label]}], datasets: [{dataset_id, editors: [analyst's label]}]}`; a chart
-    and a dataset id that do not exist are left out. `gamma_only`, which reads neither, is answered
+    analyst), are answered to analyst as `{charts: [{chart_id, is_editor: true, editors: [analyst's label]}],
+    datasets: [{dataset_id, is_editor: true, editors: [analyst's label]}]}`, and to west (Alpha, who reads both) the
+    same with `is_editor: false`; a chart and a dataset id that do not exist are left out. `gamma_only`, which reads neither, is answered
     `{charts: [], datasets: []}`, with no id and no label."""
     analyst = as_user(live, BUILDER)
     build = new_build(analyst, "editors of")
@@ -1847,8 +1874,13 @@ def test_editors_of_names_editors_of_readable_objects_only(live, extension, poli
     dataset_id = marked_dataset(live, build, "data")
     missing = 2_000_000_000
     answer = call(analyst, "editors_of", chart_ids=[chart_id, missing], dataset_ids=[dataset_id, missing])
-    assert answer == {"charts": [{"chart_id": chart_id, "editors": [label_of(BUILDER)]}],
-                      "datasets": [{"dataset_id": dataset_id, "editors": [label_of(BUILDER)]}]}, answer
+    assert answer == {"charts": [{"chart_id": chart_id, "is_editor": True, "editors": [label_of(BUILDER)]}],
+                      "datasets": [{"dataset_id": dataset_id, "is_editor": True, "editors": [label_of(BUILDER)]}]}, \
+        answer
+    # west (Alpha) reads both and edits neither, and is told so beside the same editors.
+    seen = call(as_user(live, "west"), "editors_of", chart_ids=[chart_id], dataset_ids=[dataset_id])
+    assert seen == {"charts": [{"chart_id": chart_id, "is_editor": False, "editors": [label_of(BUILDER)]}],
+                    "datasets": [{"dataset_id": dataset_id, "is_editor": False, "editors": [label_of(BUILDER)]}]}, seen
     hidden = call(as_user(live, "gamma_only"), "editors_of", chart_ids=[chart_id], dataset_ids=[dataset_id])
     assert hidden == {"charts": [], "datasets": []}, hidden
     observe("editors_of", editors=[label_of(BUILDER)])

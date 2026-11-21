@@ -26,14 +26,15 @@ import pytest
 from mnemiq.config import Settings
 from mnemiq.superset.adapter import SupersetSqlAdapter
 from mnemiq.superset.build_store import DashboardBusy, StepState
-from mnemiq.superset.builder import BuildBusy, BuildState, build_state, build_steps, next_step, start_build
+from mnemiq.superset.builder import BuildBusy, BuildState, build_state, build_steps, next_step, plan_summary, start_build
 from mnemiq.superset.chart_check import ChartStatus
-from mnemiq.superset.charts import Family, SavedRef, WrittenRef, extension_chart_request
+from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenRef, extension_chart_request
 from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetRefusedCaller, SupersetToolError
+from mnemiq.superset.dashboard_charts import LeftOut, datasets_built_on
 from mnemiq.superset.extension import TOOL_PREFIX
 from mnemiq.superset.marker import Marker, format_marker, parse_marker
 from mnemiq.superset.measures import Measure, MeasureKind
-from mnemiq.superset.planner import BuildPlan, PlannedDataset
+from mnemiq.superset.planner import BuildPlan, PlannedDataset, plan_to_json
 from tests.superset_build_world import (
     DATABASE_ID,
     FRESH_TOKEN,
@@ -302,6 +303,49 @@ def test_failed_check_is_reported_as_what_it_is(fake, world, store):
     assert kept["policies"].check_status[ids["policies_by_region"]] is ChartStatus.MISMATCH
 
 
+def test_build_answer_names_its_plan(fake, world, store):
+    """What a client shows before the first chart is made: each planned chart by key, title and family with its
+    measures by label (a saved metric by name), and each written measure's definition."""
+    state = _start(store)
+    plan = state.plan
+    assert [c["key"] for c in plan["charts"]] == [c.key for c in SIX.charts]
+    by_key = {c["key"]: c for c in plan["charts"]}
+    assert by_key["premium_by_month"] == {"key": "premium_by_month", "title": "Premium by month", "family": "line",
+                                          "measures": ["total_premium"]}
+    assert by_key["policies_kpi"]["measures"] == ["Policies"]
+    assert {"name": "policies", "label": "Policies", "expression": "COUNT(policy_id)", "kind": "count",
+            "currency": None} in plan["measures"]
+    later = build_state(store, store.load_build(TENANT, state.build_id, PRINCIPAL))
+    assert later.plan == plan
+
+
+def test_plan_summary_holds_no_filter_operand():
+    """The summary names charts and measures only: a filter's operand, a dimension or a dataset's SQL is not in it."""
+    filtered = dataclasses.replace(BY_REGION, filters=(Filter("stage", "=", "Closed Won"),))
+    summary = plan_summary(plan_to_json(BuildPlan(charts=(filtered,), measures=(POLICIES,))))
+    text = json.dumps(summary)
+    assert "Closed Won" not in text and "stage" not in text and "dimensions" not in text
+
+
+def test_check_step_answers_each_charts_reason(fake, world, store):
+    """The check step's answer names why each chart that did not check did not, by its id; a checked chart has
+    none."""
+    world.skewed["Policies by region"] = 1
+    final = _run(store, _start(store).build_id, _adapter(fake))[-1]
+    ids = _chart_ids(final)
+    assert set(final.check_reasons) == {ids["policies_by_region"]}
+    assert final.check_reasons[ids["policies_by_region"]]
+
+
+def test_check_reasons_are_not_kept(fake, world, store):
+    """The reasons ride back in the check step's own answer only: a later read of the build answers none."""
+    world.skewed["Policies by region"] = 1
+    final = _run(store, _start(store).build_id, _adapter(fake))[-1]
+    assert final.check_reasons
+    later = build_state(store, store.load_build(TENANT, final.build_id, PRINCIPAL))
+    assert later.check_reasons == {}
+
+
 # A written measure whose label rc2's MCP saves as other text (`ColumnRef.sanitize_label` escapes `<`), on a currency
 # table, whose per-column currency is set under the label mnemiq sent.
 YOUNG = Measure(name="young_premium", label="Premium < 1y", expression="SUM(premium)", kind=MeasureKind.CURRENCY,
@@ -415,6 +459,102 @@ def test_an_existing_dashboard_the_builder_does_not_edit_is_refused_before_anyth
     assert set(world.charts) == charts and not any(t.startswith(("generate", "create", "claim")) for t in _tools(fake))
     later = build_state(store, store.load_build(TENANT, state.build_id, PRINCIPAL))
     assert "not an editor" in later.message and "colleague" not in later.message
+
+
+# --- Building onto a dashboard plans only what the dashboard does not already show: each planned chart is compared
+# with the dashboard's charts, read once as the builder, and one it shows exactly is left out and named.
+
+THREE = BuildPlan(charts=(BY_REGION, KPI_TOTAL, BY_CHANNEL), measures=(POLICIES,))
+BY_STATUS = _chart("policies_by_status_bar", Family.BAR, "Policies by status", POLICY_DATASET, (WrittenRef(POLICIES),),
+                   dimensions=("status",))
+DISTINCT = dataclasses.replace(POLICIES, name="distinct_policies", label="Distinct policies",
+                               expression="COUNT(DISTINCT policy_id)")
+
+
+def _built(fake, store, plan: BuildPlan) -> BuildState:
+    final = _run(store, _start(store, plan).build_id, _adapter(fake))[-1]
+    assert final.status == "done", final
+    return final
+
+
+def _plan_onto(fake, store, planned: BuildPlan, dashboard_id: int):
+    from mnemiq.superset.planner import FakePlanner, plan_build
+
+    adapter = _adapter(fake)
+    return plan_build(GOAL, planner=FakePlanner(planned), client=adapter.client, adapter=adapter, snapshot=SNAPSHOT,
+                      grants=GRANTS, settings=SETTINGS, offer_reuse=False, onto=dashboard_id,
+                      built_on=datasets_built_on(store.measures_for(TENANT, dashboard_id)))
+
+
+def test_a_planned_chart_the_dashboard_shows_is_left_out_and_named(fake, world, store):
+    """Planned again onto the dashboard a build made, a chart it already shows is left out of the plan, under another
+    key and title too, and named with the chart that shows it; the chart it lacks is planned and built, and nothing
+    else is made. The dashboard's charts are read once: its layout, then each chart."""
+    built = _built(fake, store, THREE)
+    shown = _step(built, "policies_by_region").object_id
+    again = dataclasses.replace(BY_REGION, key="region_policies", title="Policies per region")
+    before = len(fake.calls)
+    plan = _plan_onto(fake, store, BuildPlan(charts=(again, BY_STATUS), measures=(POLICIES,)), built.dashboard_id)
+    assert isinstance(plan, BuildPlan), plan
+    assert [chart.key for chart in plan.charts] == ["policies_by_status_bar"]
+    assert plan.left_out == (LeftOut(part="Policies per region", chart_id=shown, title="Policies by region"),)
+    read = [call.tool.rsplit(".", 1)[-1] for call in fake.calls[before:]]
+    assert read.count("get_layout") == 1 and read.count("get_chart_info") == len(THREE.charts)
+    final = _run(store, _start(store, plan, dashboard_id=built.dashboard_id).build_id, _adapter(fake))[-1]
+    assert final.status == "done", final
+    assert [step.key for step in final.steps if step.kind == "chart"] == ["policies_by_status_bar"]
+
+
+@pytest.mark.parametrize("near", [
+    pytest.param(dataclasses.replace(BY_MONTH, time_grain="P1W"), id="another grain"),
+    pytest.param(dataclasses.replace(BY_REGION, filters=(Filter("premium", ">", 50),)), id="another filter"),
+    pytest.param(dataclasses.replace(BY_REGION, measures=(WrittenRef(DISTINCT),)), id="another measure definition"),
+    pytest.param(dataclasses.replace(BY_REGION, family=Family.LINE), id="another family"),
+    pytest.param(dataclasses.replace(BY_MONTH, row_limit=5), id="another row limit"),
+])
+def test_a_near_match_is_not_left_out(fake, world, store, near):
+    """A planned chart that differs from the dashboard's in one thing it shows is not one the dashboard shows."""
+    built = _built(fake, store, BuildPlan(charts=(BY_REGION, BY_MONTH), measures=(POLICIES,)))
+    measures = tuple(ref.measure for ref in near.measures if isinstance(ref, WrittenRef))
+    plan = _plan_onto(fake, store, BuildPlan(charts=(dataclasses.replace(near, key="near", title="Near"),),
+                                      measures=measures), built.dashboard_id)
+    assert isinstance(plan, BuildPlan), plan
+    assert [chart.key for chart in plan.charts] == ["near"] and plan.left_out == ()
+
+
+def test_a_ranked_chart_is_left_out_only_when_it_ranks_the_same_way(fake, world, store):
+    """A top-two bar is what the dashboard shows only while it ranks as the plan would: largest first. Flipped by
+    hand to the smallest two, it shows other groups, and the planned one is built."""
+    top_two = dataclasses.replace(BY_REGION, row_limit=2)
+    built = _built(fake, store, BuildPlan(charts=(top_two,), measures=(POLICIES,)))
+    planned = BuildPlan(charts=(dataclasses.replace(top_two, key="again", title="Again"),), measures=(POLICIES,))
+    assert [left.chart_id for left in _plan_onto(fake, store, planned, built.dashboard_id).left_out] == [
+        _step(built, top_two.key).object_id]
+    chart = world.charts[_step(built, top_two.key).object_id]
+    chart["params"] = {**chart["params"], "order_desc": False}
+    plan = _plan_onto(fake, store, planned, built.dashboard_id)
+    assert [c.key for c in plan.charts] == ["again"] and plan.left_out == ()
+
+
+def test_a_goal_the_dashboard_shows_whole_builds_nothing(fake, world, store):
+    """Every planned chart already on the dashboard: the plan keeps no chart and no measure, and names each part with
+    the chart that shows it."""
+    built = _built(fake, store, THREE)
+    plan = _plan_onto(fake, store, THREE, built.dashboard_id)
+    assert isinstance(plan, BuildPlan), plan
+    assert plan.charts == () and plan.measures == () and plan.datasets == ()
+    assert [left.part for left in plan.left_out] == [chart.title for chart in THREE.charts]
+    assert [left.chart_id for left in plan.left_out] == [_step(built, chart.key).object_id for chart in THREE.charts]
+
+
+def test_a_chart_on_a_dataset_the_build_makes_is_never_left_out(fake, world, store):
+    """A planned chart on a dataset the build is to make reads no dataset the dashboard's charts can be on."""
+    built = _built(fake, store, THREE)
+    plan = _plan_onto(fake, store, BuildPlan(charts=(CLAIMS_TABLE,), measures=(CLAIMED,), datasets=(CLAIM_DATASET,)),
+                      built.dashboard_id)
+    assert isinstance(plan, BuildPlan), plan
+    assert [chart.key for chart in plan.charts] == ["claimed_by_region"] and plan.left_out == ()
+    assert plan.datasets and plan.measures
 
 
 def _tabbed(chart_id: int) -> dict:
@@ -1410,3 +1550,67 @@ def test_the_workflows_run_this_module(workflow):
     runs = [line for line in workflow.read_text().splitlines() if re.search(r"\brun:.*\bpytest\b", line)]
     assert len(runs) == 1, f"expected one pytest line in {workflow.name}, found {runs}"
     assert f"tests/{Path(__file__).name}" in runs[0].split()
+
+
+
+def _lapsed_bar(ending: str) -> tuple[Measure, ChartSpec]:
+    lapsed = Measure(name="lapsed_premium", label="Lapsed premium",
+                     expression=f"SUM(CASE WHEN status = 'lapsed' THEN premium {ending})", kind=MeasureKind.CURRENCY,
+                     dataset_id=POLICY_DATASET, description="", asked_by="", currency="USD")
+    chart = dataclasses.replace(_chart("lapsed_by_region", Family.BAR, "Lapsed premium by region", POLICY_DATASET,
+                                       (WrittenRef(lapsed),), dimensions=("region",)), row_limit=2)
+    return lapsed, chart
+
+
+@pytest.mark.parametrize("ending", ["END", "ELSE 0 END"], ids=["no value is NULL", "no value is 0"])
+def test_a_ranked_bar_whose_row_limit_cuts_groups_is_checked_as_a_ranking(fake, world, store, ending):
+    """Lapsed premium by region, two bars of three, east having no lapsed policy. The chart is made with the HAVING
+    that leaves out the groups with no value, so written with no ELSE east is left out and the two bars are the two
+    regions that have one, checked; written to give 0 there, the two largest of three are kept, checked as a
+    ranking."""
+    lapsed, chart = _lapsed_bar(ending)
+    final = _run(store, _start(store, BuildPlan(charts=(chart,), measures=(lapsed,))).build_id, _adapter(fake))[-1]
+    chart_id = _step(final, "lapsed_by_region").object_id
+    assert final.status == "done" and final.checks == {chart_id: ChartStatus.CHECKED}, final.message
+    [having] = [f for f in world.charts[chart_id]["params"]["adhoc_filters"] if f.get("clause") == "HAVING"]
+    assert having["sqlExpression"] == f"({lapsed.expression}) IS NOT NULL"
+
+
+def test_an_extension_without_leave_out_no_value_stops_the_chart_step_and_makes_no_chart(fake, world, store):
+    world.without_leave_out = True
+    lapsed, chart = _lapsed_bar("END")
+    states = _run(store, _start(store, BuildPlan(charts=(chart,), measures=(lapsed,))).build_id, _adapter(fake))
+    final = states[-1]
+    assert final.status == "failed", final
+    assert "older than this mnemiq" in final.message and "update the extension" in final.message, final.message
+    assert world.charts == {}
+
+
+def test_a_carried_metric_ranked_on_a_join_the_build_made_carries_its_having_on_the_joins_columns(fake, world, store):
+    """Policy's saved metric carried onto a join with claim, by claim region, one bar: the chart is made with the
+    HAVING of the metric as the joined dataset names its columns, and the check over the dataset the build made reads
+    the cut as a ranking."""
+    from mnemiq.superset.planner import FakePlanner, plan_build
+
+    world.datasets[POLICY_DATASET]["metrics"].append(
+        {"metric_name": "active_premium", "expression": "SUM(CASE WHEN status = 'active' THEN premium END)",
+         "verbose_name": "Active premium", "d3format": None, "currency": None, "certified_by": "finance",
+         "certification_details": None, "warning_text": None, "description": None})
+    join = "policy JOIN claim ON claim.claim_id = policy.policy_id"
+    ref = SavedRef("active_premium", MeasureKind.CURRENCY, table="policy", handle="active_premium")
+    chart = dataclasses.replace(_chart("active_by_claim_region", Family.BAR, "Active premium by claim region", -1,
+                                       (ref,), dimensions=("claim_region",)), row_limit=1)
+    planned = BuildPlan(charts=(chart,), measures=(), datasets=(PlannedDataset(key="dataset_1", placeholder=-1,
+                                                                                join=join),))
+    adapter = _adapter(fake)
+    plan = plan_build(GOAL, planner=FakePlanner(planned), client=adapter.client, adapter=adapter, snapshot=SNAPSHOT,
+                      grants=GRANTS, settings=SETTINGS)
+    assert isinstance(plan, BuildPlan), plan
+    [measure] = plan.measures
+    final = _run(store, _start(store, plan).build_id, _adapter(fake))[-1]
+    [request] = [call.request for call in world.calls("create_chart")]
+    assert request["leave_out_no_value"] is True and '"status"' in measure.expression
+    chart_id = _step(final, "active_by_claim_region").object_id
+    [left_out] = [f for f in world.charts[chart_id]["params"]["adhoc_filters"] if f.get("clause") == "HAVING"]
+    assert left_out["sqlExpression"] == f"({measure.expression}) IS NOT NULL"
+    assert final.status == "done" and final.checks == {chart_id: ChartStatus.CHECKED}, final.message

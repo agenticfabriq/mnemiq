@@ -1,0 +1,3 @@
+# The panel's own pnpm project, beside the workbench's: the same release-age gate (pnpm's own, which this file leaves
+# as the workbench's does) and no dependency may run an install script.
+allowBuilds: {}

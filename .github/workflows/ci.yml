@@ -73,3 +73,27 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
+
+  # The Superset panel: a module-federation container Superset 7.0 loads, built and then loaded from its own dist/ as
+  # Superset's loader loads it, and packed by the extension's packer (Python, the runner's own). It shares modules with
+  # the workbench (`workbench/src/lib`), and with no path filter on this workflow a change there runs this job too.
+  superset-panel:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: integrations/superset/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: integrations/superset/frontend/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: integrations/superset/frontend/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+      - run: pnpm test:bundle

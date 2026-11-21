@@ -95,3 +95,8 @@ if _cache_dir := os.environ.get("MNEMIQ_TEST_SUPERSET_DATA_CACHE_DIR"):
 # - MCP_STRUCTURED_OUTPUT_ENABLED: off, so every answer arrives as JSON text, the shape a deployment sends by default.
 # - MCP_CACHE_CONFIG: off, and never `dangerously_share_cache_across_principals`, which would answer one person's call
 #   from another's.
+
+# Where the extension's forwarder sends a panel's requests: the mnemiq the live suite serves for a test's life on the
+# address `MNEMIQ_TEST_SUPERSET_MNEMIQ_URL` names. Without it the forwarder answers 503 naming MNEMIQ_URL.
+if _mnemiq_url := os.environ.get("MNEMIQ_TEST_SUPERSET_MNEMIQ_URL", "").strip():
+    MNEMIQ_URL = _mnemiq_url

@@ -10,7 +10,7 @@
 import { useEffect, useState } from "react";
 import type { DataMessagePartProps } from "@assistant-ui/react";
 
-import type { Turn } from "../lib/store";
+import { CONNECTION_ENDED_CODE, type Turn } from "../lib/store";
 import type { ResultPayload, Step } from "../lib/types";
 import { duration } from "../lib/verdict";
 import { Steps } from "./Steps";
@@ -74,7 +74,9 @@ export function TurnArtifacts({ data }: DataMessagePartProps<Turn>) {
               serving, and the question was never the problem. */}
           {turn.errorCode === "unavailable"
             ? "→ A service problem, not the question. Ask again shortly."
-            : turn.errorCode === "not-permitted"
+            : turn.errorCode === CONNECTION_ENDED_CODE
+              ? "→ The connection was cut, not the question refused."
+              : turn.errorCode === "not-permitted"
               ? "→ This sign-in is not permitted here; asking again will not help."
               : "→ The engine is still serving. Ask again."}
         </p>

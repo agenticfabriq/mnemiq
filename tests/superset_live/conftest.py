@@ -16,6 +16,8 @@ skipping part of itself:
 
 - `MNEMIQ_TEST_SUPERSET_CACHED_MCP_URL`: a second MCP service on the same Superset, with its result cache on a directory
   (`MNEMIQ_TEST_SUPERSET_DATA_CACHE_DIR` in `superset_config.py`).
+- `MNEMIQ_TEST_SUPERSET_MNEMIQ_URL`: the address the forwarder tests serve mnemiq on, which Superset's config gives the
+  extension's forwarder as `MNEMIQ_URL` (`superset_config.py`); needed by `test_extension_forward.py` alone.
 - `MNEMIQ_TEST_SUPERSET_PYTHON` and `MNEMIQ_TEST_SUPERSET_METADATA_URI`: Superset's interpreter and its metadata
   database, for `setup_superset.py narrow` and `widen`, which change a row rule while the suite runs.
 
