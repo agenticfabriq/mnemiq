@@ -241,7 +241,11 @@ driver's call timeout, which cancels the statement on the server. What a cut sta
   records the ones cut before it was saved (the `enrich:time-limit` job).
 
 The limit is per statement, not per table: a table under the size line with many columns can
-still take hours of statements that each finish in time. A read-only statement that meets
+still take hours of statements that each finish in time. On Oracle it is the driver's call
+timeout, which bounds each round trip to the database: every statement enrich sends is a count, a
+`GROUP BY` or a `DISTINCT`, whose work Oracle finishes before it returns the first row, so the
+limit bounds that work. A statement that streams rows could outlast it in many short round trips;
+of enrich's phases only the experimental examples phase sends one. A read-only statement that meets
 Oracle's ORA-01466 (a table redefined while it is read) is retried on a fresh connection up to
 three times, each with the full limit, so one statement can run at most four limits plus 2.5 s.
 The examples phase's own bound (`MNEMIQ_ENRICH_EXAMPLES`) is capped by the limit too. On a
