@@ -1346,6 +1346,17 @@ def test_a_row_limit_on_a_time_axis_chart_is_refused_with_a_time_range_repair(fa
     assert planner.contexts[1].repair.refused[0].repairable
 
 
+@pytest.mark.parametrize("family", [Family.LINE, Family.BAR, Family.AREA, Family.SCATTER])
+def test_a_row_limit_on_a_date_first_dimension_is_refused_too(family):
+    """With no time column, an x-y chart is drawn on its first dimension: a date there is a time axis all the same, so
+    moving the date out of `time_column` does not get a row limit past the check."""
+    chart = _chart("premium_by_day", family, [WrittenRef(PREMIUM)], dims=["start_date"], row_limit=12)
+    planner = FakePlanner(_valid_plan(charts=(chart,), measures=(PREMIUM,)))
+    refused = _plan(GOAL, planner, _tools())
+    assert isinstance(refused, PlanRefused)
+    assert _parts(refused)["chart 'premium_by_day'"] == TIME_AXIS_ROW_LIMIT
+
+
 def test_a_row_limit_on_a_categorical_chart_still_plans():
     """A bar by region keeps its top groups under a row limit: a ranking, which the chart check reads as one."""
     chart = _chart("premium_by_region", Family.BAR, [WrittenRef(PREMIUM)], dims=["region"], row_limit=20)
@@ -1355,7 +1366,8 @@ def test_a_row_limit_on_a_categorical_chart_still_plans():
 def test_the_prompt_says_a_time_axis_takes_no_row_limit():
     model = ScriptedModel([_draft("SUM(premium)")])
     _plan(GOAL, LLMPlanner(model), _tools())
-    assert '"row_limit": optional, never on a chart with a time_column,' in model.sent[0]["system"]
+    assert '"row_limit": optional, never on a chart with a time_column or a date or timestamp first dimension,' \
+        in model.sent[0]["system"]
 
 
 def test_the_prompt_says_a_percent_is_a_fraction():

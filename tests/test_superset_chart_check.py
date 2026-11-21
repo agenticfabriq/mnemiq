@@ -2085,6 +2085,68 @@ def test_an_unreadable_axis_under_a_cut_is_not_checked(fake):
                                    "compared: mnemiq could not read whether its x-axis is a time axis")
 
 
+def _with_columns_answer(fake, answer) -> None:
+    """The dataset's answer to the axis read alone (`select_columns: ["columns"]`), the rest of its answer as before:
+    `answer` is the reply, or an exception the reply raises (an error result)."""
+    def reply(request, authorization):
+        if "columns" not in (request.get("select_columns") or []):
+            return _dataset()
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    fake.reply("get_dataset_info", reply)
+
+
+@pytest.mark.parametrize("columns", [
+    pytest.param([], id="no columns at all"),
+    pytest.param([{"column_name": "region", "type": "VARCHAR", "is_dttm": False}], id="the axis not among them"),
+    pytest.param([{"column_name": "order_date", "type": "DATE"}], id="the axis with no is_dttm"),
+    pytest.param([{"column_name": "order_date", "type": "DATE", "is_dttm": None}], id="the axis with is_dttm unknown"),
+])
+def test_an_axis_superset_does_not_resolve_under_a_cut_is_not_checked(fake, columns):
+    """Only a column Superset says is no time column (`is_dttm` false) lets a cut chart be read as a ranking: an axis
+    missing from the columns, or one whose flag is absent or unknown, is not checked."""
+    _serve(fake, form_data=_line(row_limit=3), chart=_chart_data(["order_date", "Total premium"], *LARGEST_THREE_MONTHS),
+           mnemiq=_result(*SIX_MONTHS, columns=(("order_date", "datetime64[ns]"), ("m0", "float64"))))
+    _with_columns_answer(fake, {"columns": columns})
+    check = _check(fake)
+    assert check.status is ChartStatus.NOT_CHECKED, check.reason
+    assert "mnemiq could not read whether its x-axis is a time axis" in check.reason
+
+
+@pytest.mark.parametrize("answer", [
+    pytest.param({"columns": [{"column_name": "region", "type": "VARCHAR", "is_dttm": False}],
+                  "_response_truncated": True}, id="cut to fit, the axis left out"),
+    # Cut to fit, whatever it still lists: an answer Superset says it shortened is not read at all.
+    pytest.param({"columns": [{"column_name": "order_date", "type": "DATE", "is_dttm": False}],
+                  "_response_truncated": True}, id="cut to fit, the axis listed"),
+    pytest.param({"error": "Superset broke", "error_type": "InternalError"}, id="an error answer"),
+    pytest.param(RuntimeError("Superset refused the read"), id="a raised error"),
+])
+def test_a_columns_read_that_is_cut_or_fails_under_a_cut_is_not_checked(fake, answer):
+    """rc2 shortens a list to fit its response size and keeps it a valid list, so only `_response_truncated` says the
+    axis may be missing; that, an error answer and a refused call are all not checked, never checked."""
+    _serve(fake, form_data=_line(row_limit=3), chart=_chart_data(["order_date", "Total premium"], *LARGEST_THREE_MONTHS),
+           mnemiq=_result(*SIX_MONTHS, columns=(("order_date", "datetime64[ns]"), ("m0", "float64"))))
+    _with_columns_answer(fake, answer)
+    check = _check(fake)
+    assert check.status is ChartStatus.NOT_CHECKED, check.reason
+    assert "mnemiq could not read whether its x-axis is a time axis" in check.reason
+
+
+def test_a_table_grouped_by_a_time_column_under_a_cut_still_ranks(fake):
+    """A table shows its rows in its measure's order and has no x-axis: grouped by a date and cut by its row limit, it
+    is a ranking the check reads, and the axis is never asked about."""
+    form = _table(groupby=["order_date"], row_limit=3)
+    largest = sorted(SIX_MONTHS, key=lambda row: -row[1])[:3]
+    _serve(fake, form_data=form, chart=_chart_data(["order_date", "Total premium"], *largest),
+           mnemiq=_result(*SIX_MONTHS, columns=(("order_date", "datetime64[ns]"), ("m0", "float64"))))
+    check = _check(fake)
+    assert check.status is ChartStatus.CHECKED, check.reason
+    assert _column_reads(fake) == 0
+
+
 def test_a_time_axis_nothing_cuts_reads_no_columns(fake):
     """The axis is read only when a row limit cuts the chart: a line showing every month asks Superset nothing more."""
     check = _timeline(fake, SIX_MONTHS)

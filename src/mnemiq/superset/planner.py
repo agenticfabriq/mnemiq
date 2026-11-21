@@ -341,9 +341,9 @@ Charts: {"key": lower case letters, digits and _, at most 40, one per chart, "fa
 "measures": [measure names], "dimensions": [columns], "time_column": a date or timestamp column, or omitted, \
 "grain": one of GRAINS or omitted, "filters": [{"column", "op": one of =, !=, >, <, >=, <=, LIKE, ILIKE, NOT LIKE, IN, \
 NOT IN, IS NULL, IS NOT NULL, "operand": one value, a list for IN and NOT IN, omitted for IS NULL and IS NOT NULL}], \
-"row_limit": optional, never on a chart with a time_column, "source" and "target": a sankey's two columns, \
-"table" or "join": the chart's rows, needed only when it has no measures}. A chart's measures, dimensions and \
-filters are all on one table or one join.
+"row_limit": optional, never on a chart with a time_column or a date or timestamp first dimension, "source" and \
+"target": a sankey's two columns, "table" or "join": the chart's rows, needed only when it has no measures}. \
+A chart's measures, dimensions and filters are all on one table or one join.
 - pie, big_number, gauge, treemap, waterfall, funnel and sankey plot exactly one measure; mixed plots two or more on a \
 time column, the first on its primary axis;
 - pie, treemap, funnel, histogram, pivot and table need a dimension; waterfall and box_plot need a dimension or a time \
@@ -1494,8 +1494,13 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
                 refuse(part, f"its grain is one of {', '.join(GRAINS)}")
             elif not spec.time_column:
                 refuse(part, "a grain groups a time column, and the chart has none")
-        if spec.time_column and spec.row_limit is not None and spec.family in _TIME_AXIS_FAMILIES:
-            refuse(part, _TIME_AXIS_ROW_LIMIT)
+        if spec.row_limit is not None and spec.family in _TIME_AXIS_FAMILIES:
+            # The x-axis is the time column, or, for an x-y chart without one, its first dimension: a date there is
+            # a time axis all the same.
+            axis = spec.time_column or (spec.dimensions[0] if spec.dimensions and spec.family is not Family.MIXED
+                                        else None)
+            if axis is not None and (axis == spec.time_column or _temporal(on.types.get(axis))):
+                refuse(part, _TIME_AXIS_ROW_LIMIT)
         for item in spec.filters:
             if (problem := _filter_problem(item)) is not None:
                 refuse(part, problem)

@@ -251,9 +251,10 @@ def read_dataset_facts(client, dataset_id: int) -> DatasetFacts | NotCheckable:
         saved_metric_sql=tuple((m["metric_name"], m.get("expression") or "") for m in metrics))
 
 
-def read_temporal_columns(client, dataset_id: int) -> frozenset[str] | NotCheckable:
-    """The dataset's time columns, by Superset's own test of one (`TableColumnInfo.is_dttm`, which its time-series
-    charts read to treat an x-axis as time), or why mnemiq could not read them."""
+def read_dttm_columns(client, dataset_id: int) -> dict[str, bool | None] | NotCheckable:
+    """Each of the dataset's columns and whether Superset takes it for a time column (`TableColumnInfo.is_dttm`, which
+    its time-series charts read to treat an x-axis as time): True, False, or None where Superset does not say. Or why
+    mnemiq could not read them."""
     try:
         answer = client.call("get_dataset_info", {"identifier": dataset_id, "select_columns": ["columns"]})
     except (SupersetUnavailable, SupersetToolError) as failure:
@@ -266,8 +267,8 @@ def read_temporal_columns(client, dataset_id: int) -> frozenset[str] | NotChecka
     columns = answer.get("columns")
     if not isinstance(columns, list):
         return NotCheckable("Superset answered no columns for its dataset")
-    return frozenset(c["column_name"] for c in columns
-                     if isinstance(c, dict) and isinstance(c.get("column_name"), str) and c.get("is_dttm") is True)
+    return {c["column_name"]: c.get("is_dttm") if isinstance(c.get("is_dttm"), bool) else None
+            for c in columns if isinstance(c, dict) and isinstance(c.get("column_name"), str)}
 
 
 @dataclass(frozen=True)
@@ -734,15 +735,24 @@ def _row_rule_applies(client, dataset_id: int) -> bool | NotCheckable:
 
 def _time_axis(client, form: dict, expectation: Expectation,
                dataset: DatasetFacts) -> Callable[[], bool | NotCheckable] | None:
-    """For a chart drawn on an x-axis (a time series or a mixed chart; a waterfall's query does not rank by its measure),
-    whether that axis, the first grouping column, is one of the dataset's time columns, asked of Superset when called.
-    None for any other chart."""
+    """For a chart drawn on an x-axis (a time series or a mixed chart; a waterfall's query does not rank by its
+    measure), whether that axis, the first grouping column, is one of the dataset's time columns, asked of Superset
+    when called. None for any other chart."""
     if form.get("viz_type") not in _X_AXIS - {"waterfall"} or not expectation.dimensions:
         return None
 
     def on_time() -> bool | NotCheckable:
-        columns = read_temporal_columns(client, dataset.dataset_id)
-        return columns if isinstance(columns, NotCheckable) else expectation.dimensions[0] in columns
+        # Only a column Superset says is no time column lets the cut be read as a ranking: one it does not list, or
+        # whose flag it does not give, is not known to be one.
+        columns = read_dttm_columns(client, dataset.dataset_id)
+        if isinstance(columns, NotCheckable):
+            return columns
+        axis = expectation.dimensions[0]
+        if axis not in columns:
+            return NotCheckable(f"its x-axis {axis!r} is not among the dataset's columns")
+        if columns[axis] is None:
+            return NotCheckable(f"Superset does not say whether {axis!r} is a time column")
+        return columns[axis]
 
     return on_time
 
