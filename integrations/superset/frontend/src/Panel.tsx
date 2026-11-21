@@ -3,13 +3,16 @@ import { Button, Spin, theme } from "antd";
 import { authentication, chat } from "@apache-superset/core";
 import { PanelApi } from "./api";
 import { askInPanel } from "./ask";
+import { driver } from "./build";
 import { isRunning } from "./shared";
 import { pageAppRoot, usePageContext } from "./page";
 import { probe } from "./readiness";
 import { getSnapshot, subscribe, update } from "./store";
+import { BuildCard } from "./views/BuildCard";
 import { Composer } from "./views/Composer";
 import { Conversation } from "./views/Conversation";
 import { Header } from "./views/Header";
+import { UnfinishedBuilds } from "./views/Unfinished";
 
 // 640 px tall, at most 80% of the window: `min(640px, 80vh)`, spelt so jsdom, whose CSS parser drops `min()`, keeps it.
 const FLOATING: CSSProperties = { width: 420, height: 640, maxHeight: "80vh" };
@@ -70,31 +73,42 @@ function Body() {
   return <Ready api={api} starters={readiness.starters} />;
 }
 
-/** The panel for a person mnemiq answers: the dashboard on screen, when they may read it; the opening questions
- * until the first is asked; the conversation; and the composer. */
+/** The panel for a person mnemiq answers: the dashboard on screen, when they may read it; their unfinished builds;
+ * the opening questions until the first is asked; the conversation and the build; and the composer. */
 function Ready({ api, starters }: { api: PanelApi; starters: string[] }) {
   const { dashboard } = usePageContext();
-  const { turns } = useSyncExternalStore(subscribe, getSnapshot);
+  const { turns, runningBuild } = useSyncExternalStore(subscribe, getSnapshot);
   const { token } = theme.useToken();
-  const busy = isRunning(turns);
+  useEffect(() => driver.attach(api), [api]);
+  const onScreen = dashboard?.readable && dashboard.id !== null ? dashboard : null;
+  const asking = isRunning(turns);
   const ask = (question: string) => askInPanel(api, question);
+  // The target is read when the goal is sent: the dashboard on screen then, never the one the panel opened on.
+  const build = (goal: string, fresh: boolean) => {
+    if (driver.running() !== null) return false;
+    void driver.start(goal, fresh || onScreen === null ? (fresh ? { fresh: true } : {}) : { dashboardId: onScreen.id! });
+    return true;
+  };
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: token.padding }}>
-      {dashboard?.readable && dashboard.id !== null ? (
+      {onScreen ? (
         <section aria-label="This dashboard" style={{ color: token.colorTextSecondary }}>
-          On <strong style={{ color: token.colorText }}>{dashboard.title ?? "this dashboard"}</strong>
+          On <strong style={{ color: token.colorText }}>{onScreen.title ?? "this dashboard"}</strong>
         </section>
       ) : null}
+      <UnfinishedBuilds api={api} dashboardId={onScreen?.id ?? null} />
       {turns.length === 0 && starters.length > 0 ? (
         <section aria-label="Starters" style={{ display: "flex", flexDirection: "column", gap: token.paddingXS }}>
           {starters.map((starter) => (
-            <Button key={starter} disabled={busy} onClick={() => ask(starter)}
+            <Button key={starter} disabled={asking} onClick={() => ask(starter)}
               style={{ textAlign: "left", whiteSpace: "normal", height: "auto" }}>{starter}</Button>
           ))}
         </section>
       ) : null}
       <Conversation turns={turns} />
-      <Composer busy={busy} onAsk={ask} />
+      <BuildCard onScreenId={onScreen?.id ?? null} />
+      <Composer busy={{ ask: asking, build: runningBuild !== null }}
+        onDashboard={onScreen ? onScreen.title ?? "this dashboard" : null} onAsk={ask} onBuild={build} />
     </div>
   );
 }

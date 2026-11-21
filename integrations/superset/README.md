@@ -6,8 +6,11 @@ on Superset's MCP service.
 
 ## Build
 
+The panel's frontend first, then the extension:
+
 ```
-python scripts/build_superset_extension.py --out build/superset-extension
+cd integrations/superset/frontend && pnpm install --frozen-lockfile && pnpm build && cd -
+python scripts/build_superset_extension.py --out build/superset-extension --require-frontend
 ```
 
 That writes `build/superset-extension/dist/` (for `LOCAL_EXTENSIONS`) and `mnemiq-0.2.0.supx` (for `EXTENSIONS_PATH`).
@@ -46,6 +49,21 @@ Run `superset init` after the first load so roles receive the route's permission
 The token settings are required, all but the lifetime, and the token route answers 503 naming the one that is
 missing. The forwarder needs `MNEMIQ_URL` and the token settings; without a token setting it answers 503 saying it
 cannot sign, and Superset's log names the setting.
+
+## The panel
+
+mnemiq's chat inside Superset 7.0: a trigger at the page's corner opens a panel that floats over the page or docks
+beside it. It shares Superset's React and antd, and reaches mnemiq only through the forwarder below, as the person
+signed in.
+
+- **Ask** a question about the data, and see the answer, its SQL (folded) and the rows it read.
+- **Build** a dashboard from a goal: mnemiq shows the plan first, then makes it one step at a time, with each chart's
+  check. On a dashboard, a build goes onto the dashboard on screen unless "New dashboard" is ticked. A dashboard that
+  already covers the goal is offered first, with the choice to open it, add the charts to it, or build a new one.
+- **Finish** a build that stopped: closing the panel does not stop one, but leaving or reloading the page stops it
+  after the step in flight, and the panel offers to finish it.
+- A person Superset will not let build sees only the sentence that says which roles building needs.
+- Nothing the panel holds is written to browser storage.
 
 ## The token route
 
