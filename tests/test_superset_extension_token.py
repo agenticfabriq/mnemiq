@@ -2,6 +2,7 @@
 module imports Flask or Superset, so these run in `unit` with no install."""
 
 import json
+import logging
 import os
 import time
 from types import SimpleNamespace
@@ -280,18 +281,23 @@ def test_the_route_answers_403_to_anyone_not_signed_in(monkeypatch, tmp_path):
     assert route(monkeypatch, guest("admin"), {"purpose": "build"}, unset)[0] == 403
 
 
-def test_the_forwarder_unconfigured_answers_503_naming_mnemiq_url(monkeypatch, tmp_path):
+def test_the_forwarder_unconfigured_answers_503_naming_mnemiq_url(monkeypatch, tmp_path, caplog):
     """Without `MNEMIQ_URL` the forwarder answers 503 with the sentence naming it, as `{"detail": ...}` like every
-    refusal of its own, before anything is minted or sent; the token settings missing, it names that one."""
-    from agenticfabriq.mnemiq.forward import FORWARD_NOT_CONFIGURED
+    refusal of its own, before anything is minted or sent; a token setting missing, it says it cannot sign, and
+    Superset's log names the setting."""
+    from agenticfabriq.mnemiq.forward import FORWARD_NOT_CONFIGURED, SIGNING_NOT_CONFIGURED
 
     config = _mapping(tmp_path)
     status, body, headers = route(monkeypatch, signed_in("ana"), None, config, forwarding="schema")
     assert (status, body, headers.get("Cache-Control")) == (503, {"detail": FORWARD_NOT_CONFIGURED}, "no-store")
     unset = {k: v for k, v in config.items() if k != "MNEMIQ_TOKEN_TENANT"}
-    status, body, _ = route(monkeypatch, signed_in("ana"), None, {**unset, "MNEMIQ_URL": "http://mnemiq:8080"},
-                            forwarding="schema")
-    assert (status, body) == (503, {"detail": "MNEMIQ_TOKEN_TENANT is not set"})
+    with caplog.at_level(logging.WARNING):
+        status, body, _ = route(monkeypatch, signed_in("ana"), None, {**unset, "MNEMIQ_URL": "http://mnemiq:8080"},
+                                forwarding="schema")
+    # The person is told the extension cannot sign, in a fixed sentence; Superset's log names the setting.
+    assert (status, body) == (503, {"detail": SIGNING_NOT_CONFIGURED})
+    assert "MNEMIQ_TOKEN_TENANT is not set" not in SIGNING_NOT_CONFIGURED
+    assert any("MNEMIQ_TOKEN_TENANT is not set" in record.getMessage() for record in caplog.records)
 
 
 def test_the_forwarder_refuses_a_guest_before_reading_any_setting(monkeypatch, tmp_path):

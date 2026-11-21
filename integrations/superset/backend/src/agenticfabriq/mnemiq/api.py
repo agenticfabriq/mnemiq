@@ -21,7 +21,8 @@ from superset_core.rest_api.api import RestApi
 from superset_core.rest_api.decorators import api
 
 from agenticfabriq.mnemiq import forward
-from agenticfabriq.mnemiq.forward import ANSWER_HEADERS, FORWARD_NOT_CONFIGURED, MAX_BODY, ForwardConfig, forward_for
+from agenticfabriq.mnemiq.forward import (ANSWER_HEADERS, FORWARD_NOT_CONFIGURED, MAX_BODY, SIGNING_NOT_CONFIGURED,
+                                          ForwardConfig, forward_for)
 from agenticfabriq.mnemiq.token import NOT_SIGNED_IN, BadRequest, NotSignedIn, SigningConfig, mint_for, signed_in
 
 logger = logging.getLogger(__name__)
@@ -182,7 +183,7 @@ class MnemiqForward(RestApi):
         except ValueError as exc:
             logger.warning("mnemiq extension: the forwarder cannot mint, its token settings are not configured: %s",
                            exc)
-            return _answer(503, str(exc))
+            return _answer(503, SIGNING_NOT_CONFIGURED)
         body = b""
         if request.method == "POST":
             if (request.content_length or 0) > MAX_BODY:

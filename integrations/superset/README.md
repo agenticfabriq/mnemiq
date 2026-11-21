@@ -44,7 +44,8 @@ Run `superset init` after the first load so roles receive the route's permission
 | `MNEMIQ_LOCK_TIMEOUT_S` | Seconds a write tool waits for each lock another transaction holds before it answers `{"busy": true}`. Default 30. It must be above 0 and below 45, mnemiq's default deadline for a call, or a write could land after mnemiq gave up on it: any other value is not used, and the extension logs a warning naming the setting and waits 30. On a Postgres metadata database it bounds every lock wait; on MySQL it bounds a create's wait for its marker's lock (in whole seconds), and a row's lock waits as long as the database's own setting says. So on MySQL set `innodb_lock_wait_timeout` (default 50 seconds) below 45: it bounds every row lock, a create's second lock among them. A longer wait can let a write land after mnemiq gave up on it: a create sent again then answers its object by its marker, while another write answers stale or busy. |
 
 The token settings are required, all but the lifetime, and the token route answers 503 naming the one that is
-missing. The forwarder needs `MNEMIQ_URL` and the token settings, and answers 503 the same way.
+missing. The forwarder needs `MNEMIQ_URL` and the token settings; without a token setting it answers 503 saying it
+cannot sign, and Superset's log names the setting.
 
 ## The token route
 
@@ -95,6 +96,7 @@ What it refuses, before mnemiq is called, each with its sentence as `{"detail": 
 | 502 | mnemiq could not be reached, or answered with something other than JSON or an event stream | "mnemiq did not answer; try again, and if it keeps failing ask your Superset administrator to check mnemiq." |
 | 504 | mnemiq did not answer in time | "mnemiq took too long to answer; try again, and if it keeps happening ask your Superset administrator to check mnemiq and the timeouts in front of it." |
 | 503 | `MNEMIQ_URL` is not set or not valid | "This Superset's mnemiq extension does not know where mnemiq is: set MNEMIQ_URL in Superset's configuration." |
+| 503 | A token setting is missing or not valid | "This Superset's mnemiq extension cannot sign its requests to mnemiq: a token setting is missing or not valid, and Superset's log names it." |
 
 ## The write tools
 

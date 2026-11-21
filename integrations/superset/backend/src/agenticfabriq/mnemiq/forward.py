@@ -43,6 +43,9 @@ MNEMIQ_TIMED_OUT = ("mnemiq took too long to answer; try again, and if it keeps 
                     "administrator to check mnemiq and the timeouts in front of it.")
 FORWARD_NOT_CONFIGURED = ("This Superset's mnemiq extension does not know where mnemiq is: set MNEMIQ_URL in "
                           "Superset's configuration.")
+# A token setting missing or not valid: the person is told only that much; Superset's log names the setting.
+SIGNING_NOT_CONFIGURED = ("This Superset's mnemiq extension cannot sign its requests to mnemiq: a token setting is "
+                          "missing or not valid, and Superset's log names it.")
 
 # The headers every forwarded answer carries, beside mnemiq's `Content-Type` and `WWW-Authenticate`.
 ANSWER_HEADERS = {"Cache-Control": "no-store"}
