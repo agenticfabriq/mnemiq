@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pyarrow as pa
 
+from mnemiq.adapters.base import QueryTimedOut
+
 
 def unavailable_fault(exc: BaseException) -> bool:
     """Whether a psycopg error says the source could not be asked, rather than that it answered
@@ -30,10 +32,25 @@ class PostgresAdapter:
 
         self._con = psycopg.connect(dsn, autocommit=True)
 
-    def execute(self, sql: str) -> list[tuple]:
+    def execute(self, sql: str, timeout_s: float | None = None) -> list[tuple]:
+        """Rows for `sql`; with `timeout_s`, bounded by the server's statement timeout for this statement alone (RESET
+        after, so the session's own setting comes back) and its end raised as `QueryTimedOut`."""
+        import psycopg
+
         with self._con.cursor() as cur:
-            cur.execute(sql)
-            return cur.fetchall()
+            if timeout_s is None:
+                cur.execute(sql)
+                return cur.fetchall()
+            cur.execute(f"SET statement_timeout = {max(1, int(timeout_s * 1000))}")
+            try:
+                cur.execute(sql)
+                return cur.fetchall()
+            except psycopg.errors.QueryCanceled as exc:
+                if "statement timeout" in str(exc):
+                    raise QueryTimedOut(f"query timed out after {timeout_s}s") from exc
+                raise
+            finally:
+                cur.execute("RESET statement_timeout")
 
     def source_unavailable(self, exc: BaseException) -> bool:
         """The proof seam's question: did the source not answer, rather than answer no."""

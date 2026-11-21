@@ -1415,8 +1415,12 @@ class OracleAdapter:
 
     # -- execution ---------------------------------------------------------------------------
 
-    def execute(self, sql: str) -> list[tuple]:
+    def execute(self, sql: str, timeout_s: float | None = None) -> list[tuple]:
         """Rows for a query; `[]` for a statement that returns none, which the WRITE PATH needs.
+
+        `timeout_s` bounds the statement as `execute_arrow` bounds one, by the driver's call timeout, and ends it with
+        `QueryTimedOut`; enrich passes it for every statement it sends. None, as the write path calls it, is today's
+        unbounded call. A statement that times out is attempted once: `_with_cursor` retries only ORA-01466.
 
         `Runtime.write` runs the approved mutation through this method, and `oracledb` raises
         DPY-1003 from `fetchall()` on a statement that returns no rows -- where sqlite3 answers
@@ -1432,6 +1436,9 @@ class OracleAdapter:
         self._refuse_unless_read(sql)
 
         def _run(cur):
+            if timeout_s is not None:
+                # Inside the work, after `_cursor()`'s own `SET TRANSACTION READ ONLY`, as `execute_arrow` sets it.
+                _set_call_timeout(cur.connection, int(timeout_s * 1000))
             cur.execute(sql)
             if cur.description is not None:
                 rows = cur.fetchall()
@@ -1451,7 +1458,22 @@ class OracleAdapter:
 
         # Retried only under read_only, where the DDL race lives; a write is never re-executed by
         # `_with_cursor`, which is what makes retrying safe to apply on this shared method.
-        return self._with_cursor(_run)
+        if timeout_s is None:
+            return self._with_cursor(_run)
+        return self._bounded(_run, timeout_s)
+
+    def _bounded(self, work, timeout_s: float | None):
+        """`work` through `_with_cursor`, its driver errors read as a bounded call's: the driver's own word for the
+        bound's end (`_TIMEOUT_CODES`) is `QueryTimedOut`, someone else's cancel `QueryCancelled`, anything else as the
+        driver raised it. One reading for `execute` and `execute_arrow`, so the two cannot disagree."""
+        try:
+            return self._with_cursor(work)
+        except self._oracledb.DatabaseError as exc:
+            if timeout_s is not None and _is_timeout(exc):
+                raise QueryTimedOut(f"query timed out after {timeout_s}s") from exc
+            if _is_cancel(exc):
+                raise QueryCancelled(f"the source cancelled the query: {exc}") from exc
+            raise
 
     # Statements `validate` will hand to Oracle's parser. Default-deny for a second, sharper
     # reason than `_READ_LEADERS`: **`cursor.parse()` EXECUTES DDL.** Measured -- 
@@ -1530,25 +1552,12 @@ class OracleAdapter:
             names = [d[0] for d in cur.description] if cur.description else []
             return names, cur.fetchall()
 
-        try:
-            names, rows = self._with_cursor(_fetch)
-        except self._oracledb.DatabaseError as exc:
-            # The driver's own word for the bound's end (`_TIMEOUT_CODES`) is a timeout, raised as
-            # `QueryTimedOut` rather than letting a driver code reach the caller as an opaque
-            # source error. Nothing else is one, however long the call ran: the adapter cannot
-            # time the bound, which covers each round trip, some of them the driver's own between
-            # rows (Codex's reviews of #179), and it does not need to, since the driver reports
-            # the bound as DPY-4024 itself.
-            if timeout_s is not None and _is_timeout(exc):
-                raise QueryTimedOut(f"query timed out after {timeout_s}s") from exc
-            if _is_cancel(exc):
-                # ORA-01013: someone else's cancel, since the driver cancels its own bound and
-                # reports DPY-4024. Not an outage either, though the classifier calls the driver's
-                # cancel unavailable (the review gate on M188): read as one, the turn would end as
-                # the source's fault. A closed connection, DPY-4011, goes to the classifier as the
-                # driver raised it, unless the driver said its bound ended it (`_is_timeout`).
-                raise QueryCancelled(f"the source cancelled the query: {exc}") from exc
-            raise
+        # The driver's own word for the bound's end (`_TIMEOUT_CODES`) is a timeout, raised as `QueryTimedOut` rather
+        # than letting a driver code reach the caller as an opaque source error, and nothing else is one, however long
+        # the call ran: the adapter cannot time the bound, which covers each round trip, some of them the driver's own
+        # between rows (Codex's reviews of #179). ORA-01013 is someone else's cancel, since the driver cancels its own
+        # bound and reports DPY-4024 (the review gate on M188). `_bounded` reads both, for `execute` too.
+        names, rows = self._bounded(_fetch, timeout_s)
 
         # Column-major, by position, so duplicate output names survive -- a dict would collapse
         # `SELECT a AS x, b AS x` into one column and silently change the result.

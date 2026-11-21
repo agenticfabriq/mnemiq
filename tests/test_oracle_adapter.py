@@ -2293,3 +2293,35 @@ def test_a_calendar_one_lease_changed_never_reaches_the_next():
             assert cur.fetchone()[0].strip() == "2024-03-03"
     finally:
         a.close()
+
+
+@needs_admin
+def test_execute_deadline_stops_the_statement_on_the_server():
+    """A statement `execute` cuts at its deadline stops on the server, not only in the client: enrich tells the operator
+    it cut a statement, so the load must be gone. Read from `V$SESSION` and `V$SQL` as the admin user; the marker in the
+    statement's comment is how they find it, and the admin's own query carries it only as a bind."""
+    import time
+    import uuid
+
+    import oracledb
+
+    from mnemiq.adapters.base import QueryTimedOut
+
+    marker = f"deadline_probe_{uuid.uuid4().hex[:12]}"
+    sql = f"SELECT /* {marker} */ COUNT(*) FROM all_objects a, all_objects b, all_objects c"
+    with pytest.raises(QueryTimedOut):
+        _adapter().execute(sql, timeout_s=2)
+    admin = oracledb.connect(user=ADMIN_USER, password=ADMIN_PASSWORD, dsn=DSN)
+    try:
+        give_up = time.monotonic() + 10
+        while True:
+            cur = admin.cursor()
+            cur.execute("SELECT COUNT(*) FROM v$session s JOIN v$sql q ON q.sql_id = s.sql_id "
+                        "WHERE s.status = 'ACTIVE' AND q.sql_text LIKE :m", m=f"%{marker}%")
+            running = cur.fetchone()[0]
+            if running == 0 or time.monotonic() > give_up:
+                break
+            time.sleep(1)
+        assert running == 0, "the statement cut at its deadline is still running on the server"
+    finally:
+        admin.close()
