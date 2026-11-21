@@ -304,6 +304,18 @@ still to come. In short:
   - Each action first asks whether the person edits every chart it would change (and, to save, the dataset), so one
     refusal changes nothing and names that object's editors. Each answers `changed`, `left_by_hand`, `not_editor`
     (each object and its editors), `blocked_by_report`, `could_not_read` and mnemiq's `message`.
+- **Changing a dashboard by chat**, for any editor of it. `POST /v1/superset/dashboards/{id}/changes` takes
+  `{request}`. The profile's model reads the request against the dashboard's charts as the person sees them (each
+  chart's title, type, table, measures by label, grouping, grain, row limit, filters, and the columns of its table
+  they may read; never an editor or a value from the data). mnemiq then writes only the settings the request names,
+  through the extension's `patch_chart`, which leaves every other setting, a hand edit among them, as it is.
+  - Only the settings a chart's type may have changed by chat are written, each with a value mnemiq reads as valid;
+    any other is dropped and named. A chart's type changes only when the request asks, and only among line, bar,
+    area and scatter. Filters are added to a chart's own, or dropped by column: the chart's other filters stay.
+  - A chart changed meanwhile is read again and changed once more; changed again, it is left and named. A chart the
+    person does not edit is named. A chart removed by chat goes to Superset's trash.
+  - A request for a chart the dashboard lacks is planned onto it and started as a build (`added`, as the start
+    route answers it), which the client runs step by step.
 - **Values a plan's repair is told.** The planning prompt holds no value read from the data's rows. When a plan
   filters on a value no row the builder can read holds, up to 20 values of that column, one the plan itself filtered,
   read as the builder, go to the one repair prompt and to the refused plan's answer: a hosted planning model sees them.

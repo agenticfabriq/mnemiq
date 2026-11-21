@@ -66,6 +66,7 @@ from mnemiq.server.superset_refusals import NotForBuilding
 from mnemiq.server.v1_refusals import NotPermitted, refused, unknown_profile
 from mnemiq.superset.build_store import MAX_ID, BuildNotFound, BuildStore, BuildStoreMissing, DashboardBusy
 from mnemiq.superset.builder import BuildBusy, BuildState, build_state, next_step, start_build
+from mnemiq.superset.chart_change import ChangeAnswer, change_dashboard
 from mnemiq.superset.client import SupersetToolError
 from mnemiq.superset.dashboard_charts import LeftOut, datasets_built_on
 from mnemiq.superset.executor import SupersetCredentialMissing, superset_executor
@@ -195,6 +196,21 @@ def _result(result: ActionResult) -> dict:
                             "editors": list(e.editors)} for e in result.not_editor],
             "blocked_by_report": list(result.blocked_by_report), "could_not_read": list(result.could_not_read),
             "message": result.message}
+
+
+class ChangeBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request: Annotated[StrictStr, Field(min_length=1, max_length=MAX_GOAL)]
+
+
+def _changed(answer: ChangeAnswer) -> dict:
+    """A change's outcome as the changes route answers it, every field named here."""
+    return {"changed": list(answer.changed),
+            "left": [{"chart_id": chart_id, "reason": reason} for chart_id, reason in answer.left],
+            "dropped": [{"chart_id": chart_id, "key": key} for chart_id, key in answer.dropped],
+            "not_editor": [{"chart_id": e.chart_id, "editors": list(e.editors)} for e in answer.not_editor],
+            "removed": list(answer.removed), "added": None, "message": answer.message}
 
 
 class _Offering:
@@ -327,42 +343,46 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
                 raise
             raise answer from None
 
+    def started(asking_, goal: str, *, dashboard_id: int | None, fresh: bool, profile_name: str | None,
+                ) -> tuple[int, dict]:
+        """A goal planned and, when its plan is one, started as a build: the status and the answer, as the start route
+        gives them. A change asked by chat that adds a chart runs it too, onto its dashboard."""
+        who, delegation = _builder(asking_, building=True)
+        builds = kept()
+        profile = runtime.build_profile(profile_name, who)
+        planner = _Offering(profile.planner)
+        adapter = superset_executor(deployment, delegation)
+        # Whether Superset lets this person build at all, first: a non-builder is refused as one (NOT_A_BUILDER)
+        # and learns nothing of a dashboard they named, its editors included.
+        grants = runtime.builder_grants(adapter)
+        # Before anything is planned or kept: every write of a build goes through the extension, which must be
+        # one that makes every object a build makes.
+        require_build_tools(adapter.client)
+        if dashboard_id is not None:
+            _held_to_its_editors(adapter.client, dashboard_id)
+        built_on = (datasets_built_on(builds.measures_for(who.tenant_id, dashboard_id))
+                    if dashboard_id is not None else None)
+        plan = plan_build(goal, planner=planner, client=adapter.client, adapter=adapter,
+                          snapshot=runtime.snapshot, grants=grants, settings=profile.settings,
+                          offer_reuse=dashboard_id is None and not fresh, onto=dashboard_id, built_on=built_on)
+        if isinstance(plan, PlanRefused):
+            return 200, _refused_plan(plan)
+        if plan.awaiting_choice:
+            return 200, _offer(plan, planner.titles)
+        if dashboard_id is not None and not plan.charts:
+            return 200, _shown(dashboard_id, plan.left_out)
+        answer = {"build": _build(start_build(builds, tenant=who.tenant_id, principal=who.principal_id, goal=goal,
+                                              plan=plan, dashboard_id=dashboard_id, profile=profile_name))}
+        if plan.left_out:
+            answer["left_out"] = _left_out(plan.left_out)
+        return 201, answer
+
     @app.post("/v1/superset/builds", status_code=201)
     def start(body: StartBody, response: Response, asking=Depends(asker)) -> dict:
         def work() -> dict:
-            who, delegation = _builder(asking, building=True)
-            builds = kept()
-            profile = runtime.build_profile(body.profile, who)
-            planner = _Offering(profile.planner)
-            adapter = superset_executor(deployment, delegation)
-            # Whether Superset lets this person build at all, first: a non-builder is refused as one (NOT_A_BUILDER)
-            # and learns nothing of a dashboard they named, its editors included.
-            grants = runtime.builder_grants(adapter)
-            # Before anything is planned or kept: every write of a build goes through the extension, which must be
-            # one that makes every object a build makes.
-            require_build_tools(adapter.client)
-            if body.dashboard_id is not None:
-                _held_to_its_editors(adapter.client, body.dashboard_id)
-            built_on = (datasets_built_on(builds.measures_for(who.tenant_id, body.dashboard_id))
-                        if body.dashboard_id is not None else None)
-            plan = plan_build(body.goal, planner=planner, client=adapter.client, adapter=adapter,
-                              snapshot=runtime.snapshot, grants=grants, settings=profile.settings,
-                              offer_reuse=body.dashboard_id is None and not body.fresh, onto=body.dashboard_id,
-                              built_on=built_on)
-            if isinstance(plan, PlanRefused):
-                response.status_code = 200
-                return _refused_plan(plan)
-            if plan.awaiting_choice:
-                response.status_code = 200
-                return _offer(plan, planner.titles)
-            if body.dashboard_id is not None and not plan.charts:
-                response.status_code = 200
-                return _shown(body.dashboard_id, plan.left_out)
-            answer = {"build": _build(start_build(builds, tenant=who.tenant_id, principal=who.principal_id,
-                                                  goal=body.goal, plan=plan, dashboard_id=body.dashboard_id,
-                                                  profile=body.profile))}
-            if plan.left_out:
-                answer["left_out"] = _left_out(plan.left_out)
+            status, answer = started(asking, body.goal, dashboard_id=body.dashboard_id, fresh=body.fresh,
+                                     profile_name=body.profile)
+            response.status_code = status
             return answer
 
         return answered(work)
@@ -436,3 +456,25 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
     def save(dashboard_id: Annotated[int, Path(gt=0, le=MAX_ID)],
              name: Annotated[str, Path(pattern=_MEASURE_NAME)], body: SaveBody, asking_=Depends(asker)) -> dict:
         return answered(lambda: _result(save_measure(asking(asking_, dashboard_id, changing=True), name)))
+
+    @app.post("/v1/superset/dashboards/{dashboard_id}/changes")
+    def changes(dashboard_id: Annotated[int, Path(gt=0, le=MAX_ID)], body: ChangeBody,
+                asking_=Depends(asker)) -> dict:
+        """A change asked of the dashboard by chat, made as the person: each chart setting the profile's model reads
+        the request as naming, written alone; a chart to add planned and started as a build onto the dashboard
+        (`added`, as the start route answers it)."""
+
+        def work() -> dict:
+            ask = asking(asking_, dashboard_id, changing=True)
+            who, _ = _builder(asking_, building=True)
+            interpreter = runtime.build_profile(None, who).interpreter
+            if interpreter is None:
+                raise RuntimeError("this runtime was built with no change interpreter, so it changes no dashboard")
+            found = change_dashboard(ask, body.request, interpreter=interpreter)
+            answer = _changed(found)
+            if found.add_chart:
+                answer["added"] = started(asking_, body.request, dashboard_id=dashboard_id, fresh=False,
+                                          profile_name=None)[1]
+            return answer
+
+        return answered(work)

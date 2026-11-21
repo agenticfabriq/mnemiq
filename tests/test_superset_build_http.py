@@ -42,6 +42,7 @@ from mnemiq.superset.builder import start_build
 from mnemiq.superset.client import DelegatedToken, SupersetMcp
 from mnemiq.superset.extension import EXTENSION_TOOLS, TOOL_PREFIX
 from mnemiq.superset.grants import NOT_A_BUILDER
+from mnemiq.superset.charts import Family, WrittenRef
 from mnemiq.superset.planner import BuildPlan, FakePlanner, LLMPlanner, PlanRefused, RefusedPart
 from tests.auth_keys import AUDIENCE, ISSUER, claims, jwks_for, mint, rsa_key
 from tests.superset_build_world import SNAPSHOT as WORLD_SNAPSHOT
@@ -95,10 +96,11 @@ BUILD_ROUTES = {("POST", "/v1/superset/builds"), ("GET", "/v1/superset/builds/{b
                 ("GET", "/v1/superset/dashboards/{dashboard_id}/measures"),
                 ("POST", "/v1/superset/dashboards/{dashboard_id}/measures/{name}/edit"),
                 ("POST", "/v1/superset/dashboards/{dashboard_id}/measures/{name}/remove"),
-                ("POST", "/v1/superset/dashboards/{dashboard_id}/measures/{name}/save")}
+                ("POST", "/v1/superset/dashboards/{dashboard_id}/measures/{name}/save"),
+                ("POST", "/v1/superset/dashboards/{dashboard_id}/changes")}
 # Each measure action's body, as the panel sends it.
 ACTION_BODIES = {"edit": {"label": "Policies", "expression": "COUNT(DISTINCT policy_id)", "kind": "count"},
-                 "remove": {"chart_ids": [1]}, "save": {}}
+                 "remove": {"chart_ids": [1]}, "save": {}, "changes": {"request": "show daily"}}
 # The calls that change something in Superset, which a refused request never makes. The build's probe of the
 # extension, its `create_dataset` with an empty request, changes nothing: `_writes` passes over it.
 WRITES = {"generate_chart", "create_dataset", "create_virtual_dataset",
@@ -916,6 +918,48 @@ def test_an_edit_is_answered_with_what_it_changed(served, fake, world, store):
     unknown = client.post(f"/v1/superset/dashboards/{dashboard}/measures/nothing/save", json={},
                           headers=_bearer(_token()))
     assert unknown.status_code == 404 and unknown.json()["detail"] == "This dashboard keeps no measure of that name."
+
+
+def test_a_change_by_chat_is_answered_with_what_it_changed(served, fake, world, store):
+    """The profile's interpreter reads the request; the setting it names is written alone, and the answer says so."""
+    from mnemiq.superset.chart_change import ChartChange, FakeInterpreter, Interpretation
+
+    client, runtime = served
+    dashboard, chart = _a_built_dashboard(client)
+    interpreter = FakeInterpreter(Interpretation(changes=(ChartChange(chart_id=chart, set={"row_limit": 2}),)))
+    runtime.profiles[runtime.default_profile].interpreter = interpreter
+    r = client.post(f"/v1/superset/dashboards/{dashboard}/changes", json={"request": "only the top two regions"},
+                    headers=_bearer(_token()))
+    assert r.status_code == 200, r.text
+    assert r.json()["changed"] == [chart] and r.json()["added"] is None and r.json()["message"]
+    assert interpreter.requests == ["only the top two regions"]
+    assert world.charts[chart]["params"]["row_limit"] == 2
+
+
+def test_add_a_funnel_by_chat(served, fake, world, store):
+    """A request the interpreter reads as adding a chart is planned onto the dashboard and started as a build; run,
+    the funnel is made by the extension and laid out on the same dashboard."""
+    from mnemiq.superset.chart_change import FakeInterpreter, Interpretation
+    from tests.superset_shared import POLICIES, _chart
+
+    client, runtime = served
+    dashboard, _ = _a_built_dashboard(client)
+    funnel = _chart("policies_by_status", Family.FUNNEL, "Policies by status", 12, (WrittenRef(POLICIES),),
+                    dimensions=("status",))
+    _planned(runtime, FakePlanner(BuildPlan(charts=(funnel,), measures=(POLICIES,))))
+    runtime.profiles[runtime.default_profile].interpreter = FakeInterpreter(Interpretation(add_chart=True))
+    r = client.post(f"/v1/superset/dashboards/{dashboard}/changes", json={"request": "add a funnel of policies by "
+                                                                                     "status"},
+                    headers=_bearer(_token()))
+    assert r.status_code == 200, r.text
+    build = r.json()["added"]["build"]
+    assert build["dashboard_id"] == dashboard
+    final = _run_to_the_end(client, build["build_id"])[-1].json()["build"]
+    assert final["status"] == "done", final
+    made = next(step["object_id"] for step in final["steps"] if step["key"] == "policies_by_status")
+    [created] = [call.request for call in world.calls("create_chart") if call.request.get("viz_type") == "funnel"]
+    assert created["dashboard_id"] == dashboard and world.charts[made]["viz_type"] == "funnel"
+    assert made in world.dashboards[dashboard]["members"] and world.calls("set_layout")
 
 
 def test_a_build_keeps_the_profile_it_started_with(profiled, fake, world, store, monkeypatch):
