@@ -35,6 +35,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="instant (cheapest) | thinking (default) | deep (highest precision)")
     a.add_argument("--profile", default=None, help="a profile this deployment offers you (defaults to its default)")
 
+    c = sub.add_parser("check-search", help="for each question, does table search find the tables its gold SQL "
+                                            "reads, and does the prompt fit the window? (no model call)")
+    c.add_argument("--questions", required=True, help="a JSON list of {id, question, gold_sql}")
+    c.add_argument("--names", action="store_true", help="also print the gold tables' names (off: counts and ids only)")
+    c.add_argument("--principal", default=None, help="identity principal (defaults to MNEMIQ_PRINCIPAL)")
+    c.add_argument("--roles", default=None, help="comma-separated (defaults to MNEMIQ_ROLES)")
     w = sub.add_parser("write", help="execute a single INSERT/UPDATE/DELETE (governed)")
     w.add_argument("sql")
     w.add_argument("--json", action="store_true",
@@ -731,6 +737,25 @@ def _refused_in_superset_mode(settings: Settings, entry: str, *, writes: bool = 
     return False
 
 
+def _cmd_check_search(settings: Settings, args) -> int:
+    """`mnemiq check-search`: the table-search check (`mnemiq.eval.search_check`) over a file of questions with gold SQL,
+    asking no model. Prints counts and question ids, and the gold tables' names only with --names."""
+    import json
+
+    from mnemiq.eval.search_check import check, render
+
+    try:
+        rt = build_runtime(settings)
+    except (SnapshotMissing, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    with open(args.questions) as fh:
+        questions = json.load(fh)
+    rows, summary = check(rt, questions, _identity(args, settings))
+    print(render(rows, summary, names=args.names))
+    return 0
+
+
 def _cmd_ask(settings: Settings, args) -> int:
     if _refused_in_superset_mode(settings, "`mnemiq ask`"):
         return 1
@@ -910,6 +935,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_refresh(settings)
     if args.command == "ask":
         return _cmd_ask(settings, args)
+    if args.command == "check-search":
+        return _cmd_check_search(settings, args)
     if args.command == "write":
         return _cmd_write(settings, args)
     if args.command == "feedback":
