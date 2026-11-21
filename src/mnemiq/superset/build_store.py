@@ -633,7 +633,11 @@ def _make_tables(con: psycopg.Connection) -> None:
     with con.transaction():
         con.execute("SELECT pg_advisory_xact_lock(%s)", (_DDL_LOCK,))
         con.execute(_CREATE_BUILD)
-        con.execute(_ADD_PLANNED_AGAINST)
+        # Only when the column is missing: `ALTER TABLE` takes the table's strongest lock even when it adds nothing, so
+        # run on every connect it would wait behind any open transaction reading the builds.
+        if con.execute("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() "
+                       "AND table_name = %s AND column_name = 'planned_against'", (BUILD_TABLE,)).fetchone() is None:
+            con.execute(_ADD_PLANNED_AGAINST)
         con.execute(_CREATE_LIVE_DASHBOARD)
         con.execute(_CREATE_PRINCIPAL_INDEX)
         con.execute(_CREATE_MEASURE)

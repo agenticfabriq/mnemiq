@@ -516,3 +516,38 @@ def test_a_preview_round_trips_through_json():
     back = ChangePreview.from_json(doc)
     assert back == dataclasses.replace(preview, edits=(dataclasses.replace(edit, to_set={}, to_unset=()),))
     assert back.edits[0].recorded == recorded and back.edits[0].change is None
+
+
+def test_a_strict_apply_refuses_a_dashboard_changed_while_it_read_the_charts(fake, world, store):
+    """The dashboard changed after the apply first read it and before its first write (a chart taken off its layout
+    while the charts were read): nothing is written."""
+    from mnemiq.superset.chart_change import STALE_SINCE_PREVIEW
+
+    built = _built(fake, store)
+    preview = _recorded(_preview(fake, store, built, _two_edits(built)))
+    dashboard = built["dashboard"]
+
+    def layout_edited_meanwhile(request, _world):
+        world.dashboards[dashboard]["changed_on"] = world._stamp()
+
+    world.hooks["get_chart_info"] = Hook(before=layout_edited_meanwhile)
+    answer = _apply(fake, store, built, preview)
+    assert _patches(world) == [] and answer.changed == ()
+    assert answer.left == tuple((edit.chart_id, STALE_SINCE_PREVIEW) for edit in preview.edits)
+
+
+def test_a_model_that_sets_the_filters_itself_still_gives_a_record_a_conversation_keeps(fake, world, store):
+    """The model's reply may name `adhoc_filters` in `set` beside the filters it adds; the record keeps only what the
+    filters are changed through, so it is one a conversation keeps, and it applies as previewed."""
+    from mnemiq.superset.conversations import message_shape
+
+    built = _built(fake, store, BuildPlan(charts=(BY_REGION,), measures=(POLICIES,)))
+    chart = built["policies_by_region"]
+    preview = _preview(fake, store, built, Interpretation(changes=(ChartChange(
+        chart_id=chart, set={"adhoc_filters": [{"subject": "status", "comparator": "active"}]},
+        add_filters=({"column": "status", "op": "=", "value": "active"},)),)), "only active")
+    message_shape({"role": "mnemiq", "kind": "change", "text": "", "proposal": preview.to_json()})
+    answer = _apply(fake, store, built, _recorded(preview))
+    assert answer.changed == (chart,)
+    [patch] = _patches(world)
+    assert patch["set"] == dict(preview.edits[0].to_set)

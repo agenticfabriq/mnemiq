@@ -1450,3 +1450,17 @@ def test_a_proposal_planned_against_nothing_readable_is_refused(planned_against)
     with pytest.raises(ValueError):
         _offline_store().create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12, proposed=True,
                                       planned_against=planned_against)
+
+
+def test_a_store_connecting_while_a_transaction_reads_the_builds_does_not_wait(store_dsn, stores):
+    """A store connecting (a server starting, or a broken connection made again) while another transaction holds the
+    build table open, as a long report or a dump does: its tables are found as they are, and it answers at once,
+    rather than waiting on a lock its own setup asks for."""
+    first = stores()
+    kept = first.create_build(TENANT, ANA, GOAL, PLAN, STEPS)
+    with psycopg.connect(store_dsn) as reader:  # a transaction left open, reading the builds
+        reader.execute(sql.SQL("SELECT count(*) FROM {}").format(sql.Identifier(BUILD_TABLE))).fetchone()
+        started = time.monotonic()
+        assert stores().load_build(TENANT, kept.build_id, ANA) == kept
+        assert time.monotonic() - started < 5
+        reader.rollback()
