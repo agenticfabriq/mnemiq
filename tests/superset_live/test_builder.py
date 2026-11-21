@@ -2254,9 +2254,10 @@ def test_save_adds_the_metric_switches_matching_copies_and_a_non_editor_is_told_
 
 def test_a_second_editor_edits_and_removes_and_a_chart_they_do_not_edit_is_named(live, served, model, policy_id):
     """B4. west is made an editor of the dashboard analyst built, not of its charts: west's Edit changes nothing and
-    names both charts, since every chart is asked first. analyst then makes west an editor of the bar alone: west's
-    Remove, sent the charts the list showed, moves the bar to Superset's trash and takes the pie off the dashboard,
-    naming it; the measure is gone from the list. The pie is removed as the test ends."""
+    names both charts, since every chart is asked first. Made an editor of both charts, west's Edit changes both, and
+    each is checked again. Taken off the pie's editors again, west's Remove, sent the charts the list showed, moves the
+    bar to Superset's trash and takes the pie off the dashboard, naming it with its dataset; the measure is gone from
+    the list. The pie is removed as the test ends."""
     _, plan = _policy_charts(policy_id)
     run = run_build(live, served, model, plan, "second-editor", goal="policies counted twice")
     assert_ran_to_the_end(run)
@@ -2270,13 +2271,23 @@ def test_a_second_editor_edits_and_removes_and_a_chart_they_do_not_edit_is_named
     assert edit.json()["changed"] == [] and sorted(e["chart_id"] for e in edit.json()["not_editor"]) == sorted(
         ids.values())
     assert chart_metrics(stored_chart(ids["counted_by_region"])["params"])[0]["sqlExpression"] == "COUNT(id)"
-    _chart_editors(live, ids["counted_by_region"], [BUILDER, "west"])
-    listed = _measures(live, served, "west", dashboard_id).json()["measures"]
-    shown = [chart["chart_id"] for chart in listed[0]["charts"]]
+    for chart_id in ids.values():
+        _chart_editors(live, chart_id, [BUILDER, "west"])
+    edit = _act(live, served, "west", dashboard_id, "counted_policies", "edit", body)
+    assert edit.status_code == 200, edit.text[:400]
+    assert sorted(edit.json()["changed"]) == sorted(ids.values()), edit.json()
+    for chart_id in ids.values():
+        assert chart_metrics(stored_chart(chart_id)["params"])[0]["sqlExpression"] == "COUNT(DISTINCT id)"
+    [listed] = _measures(live, served, "west", dashboard_id).json()["measures"]
+    assert listed["expression"] == "COUNT(DISTINCT id)"
+    assert {chart["check"] for chart in listed["charts"]} == {"checked"}, listed["charts"]
+    _chart_editors(live, ids["counted_by_status"], [BUILDER])
+    shown = [chart["chart_id"] for chart in listed["charts"]]
     removed = _act(live, served, "west", dashboard_id, "counted_policies", "remove", {"chart_ids": shown})
     assert removed.status_code == 200, removed.text[:400]
     assert removed.json()["changed"] == [ids["counted_by_region"]]
-    assert [e["chart_id"] for e in removed.json()["not_editor"]] == [ids["counted_by_status"]]
+    assert removed.json()["not_editor"] == [{"chart_id": ids["counted_by_status"], "dataset_id": policy_id,
+                                             "editors": [label_of(BUILDER)]}]
     assert stored_chart(ids["counted_by_region"])["deleted_at"] is not None
     assert stored_chart(ids["counted_by_status"])["deleted_at"] is None
     members = {row[0] for row in metadata("SELECT slice_id FROM dashboard_slices WHERE dashboard_id = %s",

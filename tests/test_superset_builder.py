@@ -479,6 +479,20 @@ def test_a_near_match_is_not_left_out(fake, world, store, near):
     assert [chart.key for chart in plan.charts] == ["near"] and plan.left_out == ()
 
 
+def test_a_ranked_chart_is_left_out_only_when_it_ranks_the_same_way(fake, world, store):
+    """A top-two bar is what the dashboard shows only while it ranks as the plan would: largest first. Flipped by
+    hand to the smallest two, it shows other groups, and the planned one is built."""
+    top_two = dataclasses.replace(BY_REGION, row_limit=2)
+    built = _built(fake, store, BuildPlan(charts=(top_two,), measures=(POLICIES,)))
+    planned = BuildPlan(charts=(dataclasses.replace(top_two, key="again", title="Again"),), measures=(POLICIES,))
+    assert [left.chart_id for left in _plan_onto(fake, store, planned, built.dashboard_id).left_out] == [
+        _step(built, top_two.key).object_id]
+    chart = world.charts[_step(built, top_two.key).object_id]
+    chart["params"] = {**chart["params"], "order_desc": False}
+    plan = _plan_onto(fake, store, planned, built.dashboard_id)
+    assert [c.key for c in plan.charts] == ["again"] and plan.left_out == ()
+
+
 def test_a_goal_the_dashboard_shows_whole_builds_nothing(fake, world, store):
     """Every planned chart already on the dashboard: the plan keeps no chart and no measure, and names each part with
     the chart that shows it."""

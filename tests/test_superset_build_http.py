@@ -976,6 +976,45 @@ def test_add_a_funnel_by_chat(served, fake, world, store):
     assert made in world.dashboards[dashboard]["members"] and world.calls("set_layout")
 
 
+def test_an_action_while_a_build_onto_the_dashboard_runs_is_a_409(served, fake, world, store):
+    """A build keeps the dashboard's measures as it last writes them, so no action changes them while one is building
+    on the dashboard: each is refused, as a second build is, before Superset is asked to change anything."""
+    client, _ = served
+    dashboard, chart = _a_built_dashboard(client)
+    _stored(store, client, dashboard_id=dashboard)
+    before = len(fake.calls)
+    for path, body in ((f"/v1/superset/dashboards/{dashboard}/measures/policies/save", {}),
+                       (f"/v1/superset/dashboards/{dashboard}/measures/policies/remove", {"chart_ids": [chart]}),
+                       (f"/v1/superset/dashboards/{dashboard}/changes", {"request": "show daily"})):
+        r = client.post(path, json=body, headers=_bearer(_token()))
+        assert r.status_code == 409, (path, r.text)
+        assert r.json()["detail"] == DASHBOARD_BUSY
+    assert not [call for call in fake.calls[before:] if call.tool in WRITES and call.request != {}]
+
+
+def test_a_chat_change_whose_added_chart_cannot_be_planned_still_reports_its_changes(served, fake, world, store):
+    """The settings a request changed are reported even when the chart it adds could not be planned: the planning's
+    refusal is answered under `added`, not as the request's whole answer."""
+    from mnemiq.llm.client import ModelUnavailable
+    from mnemiq.superset.chart_change import ChartChange, FakeInterpreter, Interpretation
+
+    client, runtime = served
+    dashboard, chart = _a_built_dashboard(client)
+
+    class Down:
+        def plan(self, goal, context):
+            raise ModelUnavailable("down", kind="unavailable")
+
+    runtime.profiles[runtime.default_profile].planner = Down()
+    runtime.profiles[runtime.default_profile].interpreter = FakeInterpreter(Interpretation(
+        changes=(ChartChange(chart_id=chart, set={"row_limit": 2}),), add_chart=True))
+    r = client.post(f"/v1/superset/dashboards/{dashboard}/changes", json={"request": "top two, and a funnel"},
+                    headers=_bearer(_token()))
+    assert r.status_code == 200, r.text
+    assert r.json()["changed"] == [chart]
+    assert r.json()["added"] == {"error": {"status": 503, "detail": MODEL_UNAVAILABLE}}
+
+
 def test_a_build_keeps_the_profile_it_started_with(profiled, fake, world, store, monkeypatch):
     """Started under profile `b`, whose `guard_fanout` is not the deployment's, the build keeps `b` on its row: its plan
     and every one of its steps, the check included, run under `b`'s settings, while every adapter is built from the

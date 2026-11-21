@@ -1121,6 +1121,18 @@ def test_a_held_row_makes_a_claim_fail_promptly_not_hang(store_dsn, monkeypatch,
 
 # --- One live build per dashboard: a dashboard's measures are replaced by whichever build writes them last.
 
+def test_a_dashboard_with_a_build_building_is_said_to_be_building(store):
+    """What an action on a dashboard's measures asks first: whether a build of the tenant's is building on it. Another
+    tenant's and another dashboard's build do not count, nor one that ended."""
+    assert store.dashboard_building(TENANT, 12) is False
+    first = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12)
+    assert store.dashboard_building(TENANT, 12) is True
+    assert store.dashboard_building(OTHER_TENANT, 12) is False and store.dashboard_building(TENANT, 13) is False
+    claimed = store.claim_next_step(TENANT, first.build_id, ANA, _intent("dashboard", "dashboard"))
+    store.finish_step(TENANT, first.build_id, "dashboard", "failed", None, lease_id=claimed.lease_id)
+    assert store.dashboard_building(TENANT, 12) is False
+
+
 def test_a_second_build_of_a_dashboard_is_refused_while_one_is_building(store):
     """While a build of a dashboard is building, another of the same tenant and dashboard is refused; another
     tenant's, another dashboard's, and one once the first has ended, are not. A new dashboard's build holds its

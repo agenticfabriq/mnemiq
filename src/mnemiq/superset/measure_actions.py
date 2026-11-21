@@ -17,8 +17,11 @@ SQL metric with the same label and the same SQL once normalized, or a saved metr
 on that holds no copy is one someone changed by hand, and an action leaves it as it is and names it.
 
 **Every action asks first, then changes.** Whether the person edits each chart (and, to save, the dataset) is read
-before anything is written (the extension's `editors_of`), so an action that one chart would refuse changes nothing
-and names that chart's editors. A chart whose settings cannot be read whole is named and left as it is.
+before anything is written (the extension's `editors_of`). Edit and Save change nothing when the person does not
+edit every chart holding a copy, and name that chart's editors, so the copies never split; Remove takes such a chart
+off the dashboard instead and names it with its dataset. A chart whose settings cannot be read whole is named and left
+as it is; a chart Superset no longer holds is gone. No action runs while a build is building on the dashboard (the
+route refuses it), since a build keeps the dashboard's measures as it last writes them.
 - **Edit** writes the new definition into every copy (`patch_chart`, only the keys it touches), and checks each chart
   it changed again.
 - **Remove** deletes the charts that show the measure (MCP's `delete_chart`, which moves them to Superset's trash),
@@ -35,6 +38,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
@@ -184,13 +188,17 @@ def _row(asking: Asking, name: str):
 
 
 def _charts_of(row, placed: set[int], reads: Mapping[int, ChartRead]) -> tuple[ChartOf, ...]:
+    """The measure's charts the dashboard places now, a chart Superset no longer holds (in its trash) left out."""
     return tuple(ChartOf(chart_id, reads[chart_id].title if chart_id in reads else None,
-                         row.check_status.get(chart_id)) for chart_id in row.chart_ids if chart_id in placed)
+                         row.check_status.get(chart_id)) for chart_id in row.chart_ids
+                 if chart_id in placed and not (chart_id in reads and reads[chart_id].missing))
 
 
 def _is_copy(item, row) -> bool:
-    if row.saved_metric is not None:
-        return item == row.saved_metric
+    """Whether `item`, a metric a chart holds, is still the measure: its SQL with the same label and the same
+    definition, or, once it is saved on its dataset, the saved metric's name."""
+    if row.saved_metric is not None and item == row.saved_metric:
+        return True
     if not isinstance(item, dict) or item.get("expressionType") != "SQL":
         return False
     text = item.get("sqlExpression")
@@ -226,13 +234,15 @@ def _editorship(asking: Asking, *, chart_ids: Iterable[int] = (), dataset_ids: I
     return found
 
 
-def _not_editors(editorship: dict, kind: str, ids: Iterable[int]) -> tuple[EditorsOf, ...]:
+def _not_editors(editorship: dict, kind: str, ids: Iterable[int],
+                 dataset_id: int | None = None) -> tuple[EditorsOf, ...]:
+    """Each object of `ids` the person does not edit, with its editors' labels; a chart with the dataset it is on."""
     out = []
     for object_id in ids:
         is_editor, editors = editorship.get((kind, object_id), (False, ()))
         if not is_editor:
-            out.append(EditorsOf(editors=editors, **({"chart_id": object_id} if kind == "chart"
-                                                     else {"dataset_id": object_id})))
+            out.append(EditorsOf(editors=editors, chart_id=object_id, dataset_id=dataset_id) if kind == "chart"
+                       else EditorsOf(editors=editors, dataset_id=object_id))
     return tuple(out)
 
 
@@ -246,6 +256,9 @@ def _value(asking: Asking, row, facts: DatasetFacts | NotCheckable,
     if not facts.is_virtual:
         if not facts.table:
             return None, "mnemiq could not read the measure's table"
+        if (facts.database_id, facts.schema) != (getattr(asking.adapter, "database_id", facts.database_id),
+                                                 getattr(asking.adapter, "schema", facts.schema)):
+            return None, "the measure's dataset reads another database or schema than the one mnemiq answers from"
         sql = measure_statement(dataclasses.replace(row.measure, name="value"), _quoted(facts.table))
         try:
             decided = run_decided(sql, adapter=asking.adapter, snapshot=asking.snapshot, grants=asking.grants,
@@ -258,7 +271,7 @@ def _value(asking: Asking, row, facts: DatasetFacts | NotCheckable,
         table = decided.table
         if table.num_rows == 0 or table.num_columns == 0 or table.column(0)[0].as_py() is None:
             return None, "no row this person can read has a value for it"
-        return float(table.column(0)[0].as_py()), None
+        return _finite(table.column(0)[0].as_py())
     if row.saved_metric is not None:
         return _one_number(asking.client, "query_dataset", {"dataset_id": facts.dataset_id,
                                                             "metrics": [row.saved_metric], "columns": [],
@@ -285,10 +298,18 @@ def _one_number(client, tool: str, request: dict, label: str) -> tuple[float | N
     value = rows[0][label]
     if value is None:
         return None, "no row this person can read has a value for it"
+    return _finite(value)
+
+
+def _finite(value) -> tuple[float | None, str | None]:
+    """A value as a finite number, or no value and why: an infinity or a NaN is not a number to show."""
     try:
-        return float(value), None
+        number = float(value)
     except (TypeError, ValueError):
         return None, "Superset's answer for its value is not a number"
+    if not math.isfinite(number):
+        return None, "its value is not a finite number"
+    return number, None
 
 
 def list_measures(asking: Asking) -> list[MeasureView]:
@@ -320,22 +341,26 @@ class _Copies:
     holding: dict[int, list[tuple[str, int | None]]]
     by_hand: tuple[int, ...]
     unreadable: tuple[int, ...]
+    # Placed, but Superset no longer holds them: deleted, or in its trash.
+    gone: tuple[int, ...] = ()
 
 
 def _the_copies(asking: Asking, row, placed: set[int]) -> _Copies:
-    reads, holding, by_hand, unreadable = {}, {}, [], []
+    reads, holding, by_hand, unreadable, gone = {}, {}, [], [], []
     for chart_id in row.chart_ids:
         if chart_id not in placed:
             continue
         read = read_chart(asking.client, chart_id)
         reads[chart_id] = read
-        if read.form_data is None:
+        if read.missing:
+            gone.append(chart_id)
+        elif read.form_data is None:
             unreadable.append(chart_id)
         elif places := _copies(read.form_data, row):
             holding[chart_id] = places
         else:
             by_hand.append(chart_id)
-    return _Copies(reads, holding, tuple(by_hand), tuple(unreadable))
+    return _Copies(reads, holding, tuple(by_hand), tuple(unreadable), tuple(gone))
 
 
 def _patch(asking: Asking, chart_id: int, read: ChartRead, to_set: dict, *, again) -> str:
@@ -399,7 +424,8 @@ def _sentence(done: str, result: ActionResult) -> str:
                      + ", ".join(f"chart {c}" for c in result.blocked_by_report))
     if result.not_editor:
         parts.append("not edited by this person: " + "; ".join(
-            (f"chart {e.chart_id}" if e.chart_id is not None else f"dataset {e.dataset_id}")
+            (f"chart {e.chart_id}" + (f" on dataset {e.dataset_id}" if e.dataset_id is not None else "")
+             if e.chart_id is not None else f"dataset {e.dataset_id}")
             + (f" (its editors are {', '.join(e.editors)})" if e.editors else "") for e in result.not_editor))
     return "; ".join(parts) + "."
 
@@ -485,10 +511,31 @@ def _source(asking: Asking, row, facts) -> str:
     return _quoted(facts.table)
 
 
+def _label_taken(asking: Asking, row, label: str, facts, copies: _Copies) -> str | None:
+    """Why `label` cannot be the measure's: Superset keys a chart's values by label, so it may be no other measure's
+    the dashboard keeps, no saved metric's name on its dataset, and no other metric's on a chart that shows it."""
+    folded = label.casefold()
+    if any(other.measure.name != row.measure.name and other.measure.label.casefold() == folded
+           for other in _kept(asking).values()):
+        return "another measure of this dashboard has that label"
+    if isinstance(facts, DatasetFacts) and folded in {name.casefold() for name in facts.saved_metric_names}:
+        return "a saved metric of its dataset has that name"
+    for read in copies.reads.values():
+        form = read.form_data or {}
+        items = [*(form.get("metrics") if isinstance(form.get("metrics"), list) else []),
+                 *(form.get("metrics_b") if isinstance(form.get("metrics_b"), list) else []), form.get("metric")]
+        if any(item is not None and not _is_copy(item, row) and (metric_label(item) or "").casefold() == folded
+               for item in items):
+            return f"chart {read.chart_id} shows another metric under that label"
+    return None
+
+
 def edit_measure(asking: Asking, name: str, *, label: str, expression: str, kind: MeasureKind,
                  currency: str | None, description: str) -> ActionResult:
     """The measure `name` made `label`, `expression`, `kind`, `currency` and `description` on every copy, once the
-    new definition passes mnemiq's checks and the person edits every chart holding a copy."""
+    new definition passes mnemiq's checks and the person edits every chart holding a copy. The copies never split:
+    when a chart keeps changing under the edit, the charts already changed are put back, and the dashboard keeps
+    the old definition."""
     row = _row(asking, name)
     if row.saved_metric is not None:
         raise ActionRefused("This measure is a saved metric of its dataset: edit it in Superset's dataset editor, "
@@ -502,6 +549,9 @@ def edit_measure(asking: Asking, name: str, *, label: str, expression: str, kind
     placed = _placed(asking)
     copies = _the_copies(asking, row, placed)
     facts = read_dataset_facts(asking.client, row.measure.dataset_id)
+    if new.label.casefold() != row.measure.label.casefold() and \
+            (taken := _label_taken(asking, row, new.label, facts, copies)) is not None:
+        raise ActionRefused(f"The label {new.label!r} cannot be used: {taken}; nothing was changed.")
     dimensions: set[str] = set()
     for read in copies.reads.values():
         if read.form_data is not None and isinstance(facts, DatasetFacts) and \
@@ -522,50 +572,82 @@ def edit_measure(asking: Asking, name: str, *, label: str, expression: str, kind
                                 "changed; change its kind there by hand, or remove the measure and plan it again.")
         plans[chart_id] = found
     editorship = _editorship(asking, chart_ids=plans)
-    blocked = _not_editors(editorship, "chart", plans)
+    blocked = _not_editors(editorship, "chart", plans, row.measure.dataset_id)
     if blocked:
         result = ActionResult(left_by_hand=copies.by_hand, not_editor=blocked, could_not_read=copies.unreadable)
         return dataclasses.replace(result, message=_sentence("Nothing was changed, since this person does not edit "
                                                              "every chart that shows the measure", result))
-    changed, unreadable, refused = [], list(copies.unreadable), []
+
+    def towards(target_row, to: Measure):
+        return lambda read: (found if isinstance(found := _edit_set(read.viz_type, read.form_data, target_row, to,
+                                                                    to.currency or deployment), dict) else None)
+
+    changed, failed = [], []
     for chart_id, to_set in plans.items():
-        outcome = _patch(asking, chart_id, copies.reads[chart_id], to_set,
-                         again=lambda read: (found if isinstance(
-                             found := _edit_set(read.viz_type, read.form_data, row, new, new.currency or deployment),
-                             dict) else None))
-        if outcome == "ok":
-            changed.append(chart_id)
-        elif outcome == "not_editor":
-            refused.append(chart_id)
-        else:
-            unreadable.append(chart_id)
+        outcome = _patch(asking, chart_id, copies.reads[chart_id], to_set, again=towards(row, new))
+        (changed if outcome == "ok" else failed).append(chart_id)
+    if failed:
+        # Put back what was changed, so no chart holds a definition the dashboard does not keep.
+        edited_row = dataclasses.replace(row, measure=new)
+        split = []
+        for chart_id in changed:
+            read = read_chart(asking.client, chart_id)
+            back = towards(edited_row, row.measure)(read) if read.form_data is not None else None
+            if back is None or _patch(asking, chart_id, read, back, again=towards(edited_row, row.measure)) != "ok":
+                split.append(chart_id)
+        result = ActionResult(left_by_hand=copies.by_hand, could_not_read=(*copies.unreadable, *failed))
+        said = "Nothing was changed: " + ", ".join(f"chart {c}" for c in failed) + \
+            " kept changing while it was edited, so the charts already changed were put back"
+        if split:
+            said += "; " + ", ".join(f"chart {c}" for c in split) + " could not be put back and shows the new " \
+                    "definition, so edit it by hand or edit the measure again"
+        return dataclasses.replace(result, message=_sentence(said, result))
     status = dict(row.check_status)
+    status.update(_recheck_with(asking, changed, row.measure.dataset_id, {row.measure.name: new}))
     _put(asking, row, measure=new, check_status=status)
-    if changed:
-        status.update(_recheck(asking, changed, row.measure.dataset_id))
-        _put(asking, row, measure=new, check_status=status)
-    result = ActionResult(changed=tuple(changed), left_by_hand=copies.by_hand,
-                          not_editor=_not_editors({}, "chart", refused), could_not_read=tuple(unreadable))
+    result = ActionResult(changed=tuple(changed), left_by_hand=copies.by_hand, could_not_read=copies.unreadable)
     return dataclasses.replace(result, message=_sentence(
         f"The measure {name!r} now reads as its new definition on {len(changed)} chart"
         f"{'' if len(changed) == 1 else 's'}, each checked again", result))
+
+
+def _recheck_with(asking: Asking, chart_ids: Iterable[int], dataset_id: int, replacing: Mapping[str, Measure]):
+    """`_recheck`, each measure of `replacing` read as its new definition (not yet kept)."""
+    if not chart_ids:
+        return {}
+    kept = list(_kept(asking).values())
+    saved = {metric.name: metric for metric in read_saved_metrics(asking.client, dataset_ids=(dataset_id,))}
+    statuses = {}
+    for chart_id in chart_ids:
+        kinds: dict[str, MeasureKind] = {}
+        for row in kept:
+            if chart_id in row.chart_ids:
+                measure = replacing.get(row.measure.name, row.measure)
+                kinds[row.saved_metric or measure.label] = measure.kind
+        statuses[chart_id] = check_chart(asking.adapter, chart_id=chart_id, dataset_id=dataset_id, kinds=kinds,
+                                         saved=saved, snapshot=asking.snapshot, grants=asking.grants,
+                                         guard_fanout=asking.settings.guard_fanout).status
+    return statuses
 
 
 # ---------------------------------------------------------------- remove
 
 
 def remove_measure(asking: Asking, name: str, *, chart_ids: Iterable[int]) -> ActionResult:
-    """Delete the charts that show measure `name`, `chart_ids` being the ones the person was shown. A chart they do
-    not edit is taken off the dashboard and named; one a report holds is named and left."""
+    """Delete the charts that show measure `name`, `chart_ids` being the ones the person was shown (the list's): a
+    chart Superset no longer holds is not among them, and is taken off the layout as gone. Only a chart that still
+    holds a copy is deleted: one changed by hand is left and named, as is one that cannot be read whole. A chart the
+    person does not edit is taken off the dashboard instead, and named with its dataset and its editors; one a
+    report holds is named and left. A dataset mnemiq made for the measure is deleted once no chart uses it."""
     row = _row(asking, name)
     placed = _placed(asking)
-    now = tuple(chart_id for chart_id in row.chart_ids if chart_id in placed)
+    copies = _the_copies(asking, row, placed)
+    now = tuple(chart_id for chart_id in row.chart_ids if chart_id in placed and chart_id not in copies.gone)
     if sorted(set(chart_ids)) != sorted(now):
-        reads = {chart_id: read_chart(asking.client, chart_id) for chart_id in now}
-        raise ChartsChanged(_charts_of(row, placed, reads))
-    editorship = _editorship(asking, chart_ids=now)
-    deleted, reported, off, failed = [], [], [], []
-    for chart_id in now:
+        raise ChartsChanged(_charts_of(row, placed, copies.reads))
+    editorship = _editorship(asking, chart_ids=copies.holding)
+    deleted, reported, off, failed, gone, permanent = [], [], [], [], list(copies.gone), False
+    for chart_id in copies.holding:
         is_editor, _ = editorship.get(("chart", chart_id), (False, ()))
         if not is_editor:
             off.append(chart_id)
@@ -573,46 +655,65 @@ def remove_measure(asking: Asking, name: str, *, chart_ids: Iterable[int]) -> Ac
         answer = asking.client.call("delete_chart", {"identifier": chart_id})
         if answer.get("success") is True:
             deleted.append(chart_id)
+            permanent = permanent or answer.get("soft_deleted") is False
         elif answer.get("error_type") == "ReportsExist":
             reported.append(chart_id)
+        elif answer.get("error_type") == "NotFound":
+            gone.append(chart_id)
         elif answer.get("permission_denied"):
             off.append(chart_id)
         else:
             logger.warning("delete_chart answered a remove with %s", answer.get("error_type"))
             failed.append(chart_id)
-    gone = set(deleted) | set(off)
-    if gone:
-        _take_off(asking, gone)
+    taking = set(deleted) | set(off) | set(gone)
+    layout_note = None
+    if taking:
+        try:
+            _take_off(asking, taking)
+        except ActionRefused as refused:
+            layout_note = str(refused)
     for dataset_id in row.made_dataset_ids:
         answer = call_tool(asking.client, "delete_dataset", {"dataset_id": dataset_id,
                                                              "dashboard_id": asking.dashboard_id})
         if answer.get("ok") is not True:
             logger.info("a dataset mnemiq made for a removed measure was kept (%s)", sorted(answer))
+    left_here = set(reported) | set(failed) | set(copies.unreadable)
     for other in _kept(asking).values():
-        left = tuple(chart_id for chart_id in other.chart_ids if chart_id not in gone)
         if other.measure.name == name:
-            if reported or failed:
-                kept = tuple(chart_id for chart_id in other.chart_ids if chart_id in set(reported) | set(failed))
+            kept = tuple(chart_id for chart_id in other.chart_ids if chart_id in left_here)
+            if kept:
                 _put(asking, other, chart_ids=kept,
                      check_status={c: s for c, s in other.check_status.items() if c in kept})
             else:
                 asking.store.delete_measure(asking.tenant, asking.dashboard_id, name)
-        elif left != tuple(other.chart_ids):
+            continue
+        left = tuple(chart_id for chart_id in other.chart_ids if chart_id not in taking)
+        if left != tuple(other.chart_ids):
             _put(asking, other, chart_ids=left,
                  check_status={c: s for c, s in other.check_status.items() if c in left})
-    result = ActionResult(changed=tuple(deleted), not_editor=_not_editors(editorship, "chart", off),
-                          blocked_by_report=tuple(reported), could_not_read=tuple(failed))
-    return dataclasses.replace(result, message=_sentence(
-        f"The measure {name!r} was removed: {len(deleted)} chart{'' if len(deleted) == 1 else 's'} moved to "
-        "Superset's trash" + (", the rest taken off the dashboard" if off else ""), result))
+    result = ActionResult(changed=tuple(deleted), left_by_hand=copies.by_hand,
+                          not_editor=_not_editors(editorship, "chart", off, row.measure.dataset_id),
+                          blocked_by_report=tuple(reported), could_not_read=(*copies.unreadable, *failed))
+    where = "deleted for good (this Superset keeps no trash)" if permanent else "moved to Superset's trash"
+    said = (f"The measure {name!r} was removed: {len(deleted)} chart{'' if len(deleted) == 1 else 's'} {where}"
+            + (", the rest taken off the dashboard" if off else ""))
+    if layout_note:
+        said += f"; {layout_note}"
+    return dataclasses.replace(result, message=_sentence(said, result))
 
 
 def _take_off(asking: Asking, chart_ids: set[int]) -> None:
     """The charts taken off the dashboard's layout, which sets its charts; read and computed again once when the
-    dashboard changed meanwhile."""
+    dashboard changed meanwhile. `ActionRefused` when it cannot be done."""
     for _ in range(2):
         answer = call_tool(asking.client, "get_layout", {"dashboard_id": asking.dashboard_id})
-        current = json.loads(answer["position_json"]) if answer.get("position_json") else {}
+        try:
+            current = json.loads(answer["position_json"]) if answer.get("position_json") else {}
+        except (TypeError, ValueError):
+            current = None
+        if not isinstance(current, dict) or not isinstance(answer.get("changed_on"), str):
+            raise ActionRefused(f"The layout of dashboard {asking.dashboard_id} could not be read, so the charts "
+                                "were not taken off it")
         removing = sorted(chart_ids & layout_chart_ids(current))
         if not removing:
             return
@@ -623,19 +724,42 @@ def _take_off(asking: Asking, chart_ids: set[int]) -> None:
             return
         if not answer.get("stale"):
             raise ActionRefused(f"The charts could not be taken off dashboard {asking.dashboard_id} "
-                                f"({sorted(answer)}); the measure's charts are as the answer says.")
-    raise ActionRefused(f"Dashboard {asking.dashboard_id} kept changing while its charts were taken off it.")
+                                f"({sorted(answer)})")
+    raise ActionRefused(f"Dashboard {asking.dashboard_id} kept changing while its charts were taken off it")
 
 
 # ---------------------------------------------------------------- save
 
 
+def _switch(read: ChartRead, row, name: str) -> dict | None:
+    """The params keys that make each written copy on the chart the saved metric `name`; None when it holds none."""
+    form = read.form_data or {}
+    places = [(key, index) for key, index in _copies(form, row)
+              if (form[key] if index is None else form[key][index]) != name]
+    if not places:
+        return None
+    to_set: dict = {}
+    for key, index in places:
+        if index is None:
+            to_set[key] = name
+        else:
+            items = list(to_set.get(key) or form[key])
+            items[index] = name
+            to_set[key] = items
+    if read.viz_type == "table":
+        config = dict(form.get("column_config") or {})
+        if row.measure.label in config:
+            config[name] = config.pop(row.measure.label)
+            to_set["column_config"] = config
+    return to_set
+
+
 def save_measure(asking: Asking, name: str) -> ActionResult:
-    """Save measure `name` on its dataset as a saved metric, then switch every copy to it. A person who does not edit
-    the dataset is told its editors, and nothing changes."""
+    """Save measure `name` on its dataset as a saved metric, then switch every copy to it. Like Edit, it changes
+    nothing unless the person edits the dataset and every chart holding a copy, and names whom to ask otherwise, so
+    the copies never split. Asked again (an earlier save whose answer was lost, or copies that could not be switched),
+    it switches what is left, onto a saved metric of the measure's own definition."""
     row = _row(asking, name)
-    if row.saved_metric is not None:
-        raise ActionRefused("This measure is already a saved metric of its dataset.")
     measure = row.measure
     dataset_editors = _editorship(asking, dataset_ids=(measure.dataset_id,))
     blocked = _not_editors(dataset_editors, "dataset", (measure.dataset_id,))
@@ -645,70 +769,61 @@ def save_measure(asking: Asking, name: str) -> ActionResult:
                                                              "measure's dataset", result))
     placed = _placed(asking)
     copies = _the_copies(asking, row, placed)
-    editorship = _editorship(asking, chart_ids=copies.holding)
-    not_editor = _not_editors(editorship, "chart", copies.holding)
-    fmt, shown = display_format(measure.kind, measure.currency or (
-        asking.settings.superset_currency if measure.kind is MeasureKind.CURRENCY else None))
-    metric = {"metric_name": measure.name, "expression": measure.expression, "verbose_name": measure.label,
-              "d3format": fmt, "description": measure.description or None, "currency": shown}
-    _add_metric(asking, measure.dataset_id, metric)
-    switched, unreadable = [], list(copies.unreadable)
+    switching = {chart_id: switch for chart_id in copies.holding
+                 if (switch := _switch(copies.reads[chart_id], row, measure.name)) is not None}
+    editorship = _editorship(asking, chart_ids=switching)
+    not_editor = _not_editors(editorship, "chart", switching, measure.dataset_id)
+    if not_editor:
+        result = ActionResult(left_by_hand=copies.by_hand, not_editor=not_editor, could_not_read=copies.unreadable)
+        return dataclasses.replace(result, message=_sentence("Nothing was saved, since this person does not edit "
+                                                             "every chart that shows the measure", result))
+    if row.saved_metric is None:
+        fmt, shown = display_format(measure.kind, measure.currency or (
+            asking.settings.superset_currency if measure.kind is MeasureKind.CURRENCY else None))
+        metric = {"metric_name": measure.name, "expression": measure.expression, "verbose_name": measure.label,
+                  "d3format": fmt, "description": measure.description or None, "currency": shown}
+        _add_metric(asking, measure.dataset_id, metric)
     saved_row = dataclasses.replace(row, saved_metric=measure.name)
-    others = {entry.chart_id for entry in not_editor}
-    for chart_id in copies.holding:
-        if chart_id in others:
-            continue
-        read = copies.reads[chart_id]
-
-        def switch(read: ChartRead) -> dict | None:
-            places = _copies(read.form_data, row)
-            if not places:
-                return None
-            to_set: dict = {}
-            for key, index in places:
-                if index is None:
-                    to_set[key] = measure.name
-                else:
-                    items = list(to_set.get(key) or read.form_data[key])
-                    items[index] = measure.name
-                    to_set[key] = items
-            if read.viz_type == "table":
-                config = dict(read.form_data.get("column_config") or {})
-                if measure.label in config:
-                    config[measure.name] = config.pop(measure.label)
-                    to_set["column_config"] = config
-            return to_set
-
-        outcome = _patch(asking, chart_id, read, switch(read) or {}, again=switch)
-        (switched if outcome == "ok" else unreadable).append(chart_id)
-    _put(asking, saved_row, saved_metric=measure.name)
-    status = dict(row.check_status)
+    _put(asking, row, saved_metric=measure.name)
+    switched, failed = [], []
+    for chart_id, to_set in switching.items():
+        outcome = _patch(asking, chart_id, copies.reads[chart_id], to_set,
+                         again=lambda read: _switch(read, row, measure.name))
+        (switched if outcome == "ok" else failed).append(chart_id)
     if switched:
-        status.update(_recheck(asking, switched, measure.dataset_id))
+        status = {**row.check_status, **_recheck(asking, switched, measure.dataset_id)}
         _put(asking, saved_row, check_status=status, saved_metric=measure.name)
-    result = ActionResult(changed=tuple(switched), left_by_hand=copies.by_hand, not_editor=not_editor,
-                          could_not_read=tuple(unreadable))
-    return dataclasses.replace(result, message=_sentence(
-        f"The measure {name!r} is saved on dataset {measure.dataset_id}, and {len(switched)} chart"
-        f"{'' if len(switched) == 1 else 's'} now use{'s' if len(switched) == 1 else ''} it", result))
+    result = ActionResult(changed=tuple(switched), left_by_hand=copies.by_hand,
+                          could_not_read=(*copies.unreadable, *failed))
+    said = (f"The measure {name!r} is saved on dataset {measure.dataset_id}, and {len(switched)} chart"
+            f"{'' if len(switched) == 1 else 's'} now use{'s' if len(switched) == 1 else ''} it")
+    if failed:
+        said += "; save again to switch the charts that kept changing"
+    return dataclasses.replace(result, message=_sentence(said, result))
 
 
 def _add_metric(asking: Asking, dataset_id: int, metric: dict) -> None:
-    """The saved metric added to the dataset, read and sent again once when the dataset changed meanwhile."""
+    """The saved metric added to the dataset, read and sent again once when the dataset changed meanwhile. One the
+    dataset already holds under the name with the same definition (an earlier save whose answer was lost) is taken
+    as saved; one with another definition refuses the save."""
     for _ in range(2):
-        info = asking.client.call("get_dataset_info", {"identifier": dataset_id, "select_columns": ["id", "changed_on"]})
+        info = asking.client.call("get_dataset_info", {"identifier": dataset_id,
+                                                       "select_columns": ["id", "changed_on", "metrics"]})
         changed_on = info.get("changed_on") if isinstance(info, dict) else None
         if not isinstance(changed_on, str):
             raise ActionRefused("mnemiq could not read the measure's dataset, so nothing was saved.")
+        held = {m.get("metric_name"): m.get("expression") for m in info.get("metrics") or [] if isinstance(m, dict)}
+        if metric["metric_name"] in held:
+            if _definition(str(held[metric["metric_name"]] or "")) == _definition(metric["expression"]):
+                return
+            raise ActionRefused(f"Dataset {dataset_id} already has a saved metric named {metric['metric_name']!r} "
+                                "with another definition, so nothing was saved.")
         answer = call_tool(asking.client, "add_saved_metric", {"dataset_id": dataset_id, "metric": metric,
                                                                "expect_changed_on": changed_on})
         if answer.get("ok") is True:
             return
-        if answer.get("exists"):
-            raise ActionRefused(f"Dataset {dataset_id} already has a saved metric named {metric['metric_name']!r}, "
-                                "so nothing was saved.")
         if answer.get("refused") == "row_level":
             raise ActionRefused("Superset reads the measure as giving one value per row, so it was not saved.")
-        if not answer.get("stale"):
+        if not answer.get("stale") and not answer.get("exists"):
             raise ActionRefused(f"Superset did not save the metric ({sorted(answer)}), so nothing was changed.")
     raise ActionRefused(f"Dataset {dataset_id} kept changing while the metric was saved; nothing was changed.")

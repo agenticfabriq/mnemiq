@@ -294,17 +294,24 @@ still to come. In short:
     a saved metric by Superset's query of the dataset, a written measure by a chart that shows it as one number.
     Otherwise there is no value, and `value_note` says why.
   - `POST .../measures/{name}/edit` takes `{label, expression, kind, currency?, description?}`. The new definition
-    passes mnemiq's measure checks first. Every copy on a chart that still matches the kept definition changes, and
-    each changed chart is checked again; a copy changed by hand is left and named.
+    passes mnemiq's measure checks first, and its label may be no other measure's on the dashboard. Every copy on a
+    chart that still matches the kept definition changes, and each changed chart is checked again; a copy changed by
+    hand is left and named. When a chart keeps changing under the edit, the charts already changed are put back and
+    the dashboard keeps the old definition, so its copies never differ.
   - `POST .../measures/{name}/remove` takes `{chart_ids}`, the charts the person was shown, and answers 409 with the
-    charts the measure has now when they differ. It moves the measure's charts to Superset's trash, takes a chart the
-    person does not edit off the dashboard instead and names it, names a chart a report holds and leaves it, and
-    deletes a dataset mnemiq made for the measure once no chart uses it.
+    charts the measure has now when they differ. It moves the charts that still show the measure to Superset's trash
+    (or deletes them for good where Superset keeps none, and says so), leaves a chart changed by hand and names it,
+    takes a chart the person does not edit off the dashboard instead and names it with its dataset and editors,
+    names a chart a report holds and leaves it, and deletes a dataset mnemiq made for the measure once no chart uses
+    it. A chart already in Superset's trash is no longer listed, and is taken off the layout as gone.
   - `POST .../measures/{name}/save` adds the measure to its dataset as a saved metric, then switches every matching
-    copy to it.
-  - Each action first asks whether the person edits every chart it would change (and, to save, the dataset), so one
-    refusal changes nothing and names that object's editors. Each answers `changed`, `left_by_hand`, `not_editor`
-    (each object and its editors), `blocked_by_report`, `could_not_read` and mnemiq's `message`.
+    copy to it. Asked again, it switches what is left onto a saved metric of the measure's own definition; one of the
+    name with another definition refuses it.
+  - Each action first asks whether the person edits every chart it would change (and, to save, the dataset). Edit
+    and Save change nothing unless they edit every chart that shows the measure, and name that chart's editors, so
+    the copies never split. No action runs while a build is building on the dashboard (409). Each answers
+    `changed`, `left_by_hand`, `not_editor` (each chart with its dataset, or a dataset, and the editors),
+    `blocked_by_report`, `could_not_read` and mnemiq's `message`.
 - **Changing a dashboard by chat**, for any editor of it. `POST /v1/superset/dashboards/{id}/changes` takes
   `{request}`. The profile's model reads the request against the dashboard's charts as the person sees them (each
   chart's title, type, table, measures by label, grouping, grain, row limit, filters, and the columns of its table
@@ -314,9 +321,13 @@ still to come. In short:
     any other is dropped and named. A chart's type changes only when the request asks, and only among line, bar,
     area and scatter. Filters are added to a chart's own, or dropped by column: the chart's other filters stay.
   - A chart changed meanwhile is read again and changed once more; changed again, it is left and named. A chart the
-    person does not edit is named. A chart removed by chat goes to Superset's trash.
+    person does not edit is named. A filter the chart already has is not added twice.
+  - Nothing is deleted on the model's reading: a chart the request asks to remove is answered under `would_remove`,
+    by id and title. Sent back as `{remove_chart_ids}`, once the person confirms, those charts go to Superset's trash
+    and off the layout (and the model is not asked); one a report holds is left, with the reason.
   - A request for a chart the dashboard lacks is planned onto it and started as a build (`added`, as the start
-    route answers it), which the client runs step by step.
+    route answers it), which the client runs step by step. When that planning fails, what the request changed is
+    still answered, and `added` holds the failure's status and sentence.
 - **Values a plan's repair is told.** The planning prompt holds no value read from the data's rows. When a plan
   filters on a value no row the builder can read holds, up to 20 values of that column, one the plan itself filtered,
   read as the builder, go to the one repair prompt and to the refused plan's answer: a hosted planning model sees them.

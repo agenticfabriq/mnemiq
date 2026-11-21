@@ -402,6 +402,18 @@ class BuildStore:
             raise LeaseLost()
         return stored
 
+    def dashboard_building(self, tenant: str, dashboard_id: int) -> bool:
+        """Whether a build of the tenant's is building on the dashboard, once each one left untouched for
+        `ABANDONED_AFTER_S` has been released: what an action on the dashboard's measures asks first, since a build
+        keeps the measures as it last writes them."""
+        tenant = _text(tenant, "tenant")
+        dashboard_id = _id(dashboard_id, "a dashboard id")
+        with self._connection() as con, con.transaction():
+            _release_abandoned(con, tenant, dashboard_id)
+            row = con.execute(f"SELECT 1 FROM {BUILD_TABLE} WHERE tenant_id = %s AND dashboard_id = %s AND "
+                              "status = %s LIMIT 1", (tenant, dashboard_id, BUILDING)).fetchone()
+        return row is not None
+
     # --- a dashboard's measures
 
     def measures_for(self, tenant: str, dashboard_id: int) -> list[DashboardMeasure]:

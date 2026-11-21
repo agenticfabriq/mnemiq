@@ -8,9 +8,11 @@ its expression on the dataset), the same grouping and x-axis columns, the same t
 same row limit. Anything mnemiq cannot read the same way on both sides (a chart it cannot read whole, a filter in SQL,
 a dataset the build is still to make) is never a match, so a doubt builds the chart rather than leaving it out.
 
-A chart's view is read with the value check's own reader (`chart_form.expectation_from_form_data`), so "shows the
-same" means "computes the same" as the check reads it; a planned chart's view is what that reader finds on the chart
-the builder makes from it (`charts.config_chart_request`, mapped as rc2's MCP maps it).
+A chart's view is read with the value check's own readers (`chart_form.expectation_from_form_data`, and
+`chart_form.ranking_of` for its ranking under a row limit), so "shows the same" means "computes the same" as the
+check reads it. A planned chart's view is written here by hand, as those readers find it on the chart the builder makes
+from the plan (`charts.config_chart_request`, mapped as rc2's MCP maps it); the tests hold the two to agree on the
+test world's mapping, and the live suite on rc2's.
 """
 
 from __future__ import annotations
@@ -31,8 +33,8 @@ from mnemiq.superset.chart_check import (
     read_chart,
     read_dataset_facts,
 )
-from mnemiq.superset.chart_form import _row_limit
-from mnemiq.superset.charts import ChartSpec, Family, SavedRef, WrittenRef, leaves_out_no_value
+from mnemiq.superset.chart_form import _row_limit, ranking_of
+from mnemiq.superset.charts import _RANKED, ChartSpec, Family, SavedRef, WrittenRef, leaves_out_no_value
 from mnemiq.superset.extension import call_tool
 from mnemiq.superset.layout import layout_chart_ids
 from mnemiq.superset.saved_metrics import normalized
@@ -108,6 +110,9 @@ class _View:
     filters: frozenset
     row_limit: int | None
     not_null: tuple[int, ...]
+    # Under a row limit, which measure the rows are ranked by and in which direction (`chart_form.ranking_of`):
+    # a top ten and a bottom ten of one measure show other groups.
+    ranking: tuple | None = None
 
 
 _XY = {Family.LINE, Family.BAR, Family.AREA, Family.SCATTER}
@@ -149,9 +154,11 @@ def _shown_view(chart: DashboardChart, facts: DatasetFacts) -> _View | None:
     saved = dict(facts.saved_metric_sql)
     measures = tuple(_definition(saved[label] if label in facts.saved_metric_names and label == sql else sql)
                      for label, sql in expectation.metrics)
+    ranked = ranking_of(form, expectation, dataset=facts)
     return _View(viz_type=chart.read.viz_type, dataset_id=facts.dataset_id, measures=measures,
                  dimensions=expectation.dimensions, time_grain=expectation.time_grain,
-                 filters=_filters(expectation.filters), row_limit=_row_limit(form), not_null=expectation.not_null)
+                 filters=_filters(expectation.filters), row_limit=_row_limit(form), not_null=expectation.not_null,
+                 ranking=(ranked.metric_index, ranked.descending, ranked.limit) if ranked is not None else None)
 
 
 def _planned_dimensions(spec: ChartSpec) -> tuple[str, ...] | None:
@@ -195,9 +202,12 @@ def _planned_view(spec: ChartSpec, measures: Mapping[str, object], facts: Datase
         return None
     filters = _filters(replace(item, op=_OPERATOR[item.op]) for item in spec.filters)
     limit = spec.row_limit if spec.row_limit is not None else _MCP_ROW_LIMIT.get(spec.family)
+    # The builder's ranked charts rank by their first measure, largest first, as rc2 orders them by default.
+    ranking = (0, True, limit) if spec.family in _RANKED and limit is not None and spec.measures else None
     return _View(viz_type=spec.family.value, dataset_id=spec.dataset_id, measures=tuple(shown),
                  dimensions=dimensions, time_grain=spec.time_grain if spec.family in _XY else None,
-                 filters=filters, row_limit=limit, not_null=(0,) if leaves_out_no_value(spec) else ())
+                 filters=filters, row_limit=limit, not_null=(0,) if leaves_out_no_value(spec) else (),
+                 ranking=ranking)
 
 
 # ---------------------------------------------------------------- the plan, less what is shown

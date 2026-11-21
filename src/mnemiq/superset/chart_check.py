@@ -173,6 +173,9 @@ class ChartRead:
     form_data: dict | None
     changed_on: str | None
     unreadable: str | None = None
+    # Superset holds no chart of this id that the caller may read: deleted, or in the trash (rc2's soft-delete filter
+    # hides a trashed chart from every read), or never theirs to read.
+    missing: bool = False
 
 
 def read_chart(client, chart_id: int) -> ChartRead:
@@ -183,8 +186,9 @@ def read_chart(client, chart_id: int) -> ChartRead:
         return ChartRead(chart_id, None, "", None, None, f"{_UNREADABLE}{failure}")
     if _failed(answer):
         _log_error("get_chart_info", answer)
+        missing = str(answer.get("error_type") or "").replace("_", "").lower() == "notfound"
         return ChartRead(chart_id, None, "", None, None,
-                         f"{_UNREADABLE}Superset answered with an error, which is in the log")
+                         f"{_UNREADABLE}Superset answered with an error, which is in the log", missing=missing)
     title = answer.get("slice_name") if isinstance(answer.get("slice_name"), str) else None
     changed_on = answer.get("changed_on") if isinstance(answer.get("changed_on"), str) else None
     form = answer.get("form_data")

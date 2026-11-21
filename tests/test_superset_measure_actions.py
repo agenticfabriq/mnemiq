@@ -215,7 +215,8 @@ def test_non_editor_edit_changes_nothing(fake, world, store):
                           expression="COUNT(DISTINCT policy_id)", kind=MeasureKind.COUNT, currency=None,
                           description="")
     assert result.changed == () and result.not_editor == (EditorsOf(editors=("someone",),
-                                                                    chart_id=built["policies_by_channel"]),)
+                                                                    chart_id=built["policies_by_channel"],
+                                                                    dataset_id=POLICY_DATASET),)
     assert {c: json.dumps(world.charts[c]["params"], sort_keys=True) for c in world.charts} == before
     assert _kept(store, built["dashboard"])["policies"] == kept
     assert "patch_chart" not in _tools(fake)
@@ -243,10 +244,11 @@ def test_stubbed_chart_is_named_not_edited(fake, world, store):
 def test_an_edit_the_deciders_refuse_changes_nothing(fake, world, store):
     """A new definition that does not aggregate is refused before any chart is read for editors or written."""
     built = _built(fake, store, THREE_OF_POLICIES)
+    since = len(fake.calls)
     with pytest.raises(ActionRefused, match="refused"):
         edit_measure(_asking(fake, store, built["dashboard"]), "policies", label="Policies", expression="policy_id",
                      kind=MeasureKind.COUNT, currency=None, description="")
-    assert "patch_chart" not in _tools(fake) and "editors_of" not in _tools(fake)[-3:]
+    assert "patch_chart" not in _tools(fake) and "editors_of" not in _tools(fake, since)
 
 
 def test_an_edit_of_the_kind_rewrites_the_charts_format(fake, world, store):
@@ -292,7 +294,7 @@ def test_non_editor_remove_takes_the_chart_off_and_names_it(fake, world, store):
     world.charts[theirs]["editors"] = ["someone"]
     charts = (built["policies_by_region"], built["policies_by_status"], theirs)
     result = remove_measure(_asking(fake, store, built["dashboard"]), "policies", chart_ids=charts)
-    assert result.not_editor == (EditorsOf(editors=("someone",), chart_id=theirs),)
+    assert result.not_editor == (EditorsOf(editors=("someone",), chart_id=theirs, dataset_id=POLICY_DATASET),)
     assert theirs in world.charts and theirs not in world.trashed and theirs not in _placed(world, built["dashboard"])
     assert "someone" in result.message
 
@@ -323,26 +325,67 @@ def test_a_remove_sent_other_charts_than_the_measure_has_removes_nothing(fake, w
 # --- save
 
 
-def test_save_switches_matching_copies_and_names_the_rest(fake, world, store):
-    """Saved to its dataset, the measure becomes a saved metric there with its definition and format; every copy on
-    a chart the person edits switches to it, a copy changed by hand is left and named, and so is a chart they do not
-    edit."""
+def test_save_switches_matching_copies_and_names_the_one_changed_by_hand(fake, world, store):
+    """Saved to its dataset, the measure becomes a saved metric there with its definition and format; every copy
+    switches to it, and a copy changed by hand is left and named."""
     built = _built(fake, store, THREE_OF_POLICIES)
     world.datasets[POLICY_DATASET]["editors"].append("builder")
-    by_hand, theirs = built["policies_by_status"], built["policies_by_channel"]
+    by_hand = built["policies_by_status"]
     world.charts[by_hand]["params"]["metrics"][0]["sqlExpression"] = "COUNT(*)"
-    world.charts[theirs]["editors"] = ["someone"]
     result = save_measure(_asking(fake, store, built["dashboard"]), "policies")
     [saved] = [m for m in world.datasets[POLICY_DATASET]["metrics"] if m["metric_name"] == "policies"]
     assert saved["expression"] == "COUNT(policy_id)" and saved["verbose_name"] == "Policies"
     assert saved["d3format"] == ",d"
-    assert result.changed == (built["policies_by_region"],) and result.left_by_hand == (by_hand,)
-    assert result.not_editor == (EditorsOf(editors=("someone",), chart_id=theirs),)
+    assert result.changed == (built["policies_by_region"], built["policies_by_channel"])
+    assert result.left_by_hand == (by_hand,) and not result.not_editor
     assert _metric(world, built["policies_by_region"]) == "policies"
     assert _metric(world, by_hand)["sqlExpression"] == "COUNT(*)"
     kept = _kept(store, built["dashboard"])["policies"]
     assert kept.saved_metric == "policies"
     assert kept.check_status[built["policies_by_region"]] is ChartStatus.CHECKED
+
+
+def test_save_by_a_non_editor_of_one_chart_changes_nothing(fake, world, store):
+    """Save, like Edit, changes nothing when the person does not edit every chart holding a copy, and names that
+    chart's editors: the copies never split between the saved metric and the written one."""
+    built = _built(fake, store, THREE_OF_POLICIES)
+    world.datasets[POLICY_DATASET]["editors"].append("builder")
+    theirs = built["policies_by_channel"]
+    world.charts[theirs]["editors"] = ["someone"]
+    metrics = [dict(m) for m in world.datasets[POLICY_DATASET]["metrics"]]
+    result = save_measure(_asking(fake, store, built["dashboard"]), "policies")
+    assert result.changed == () and result.not_editor == (EditorsOf(editors=("someone",), chart_id=theirs,
+                                                                    dataset_id=POLICY_DATASET),)
+    assert world.datasets[POLICY_DATASET]["metrics"] == metrics
+    assert "patch_chart" not in _tools(fake) and "add_saved_metric" not in _tools(fake)
+    assert _kept(store, built["dashboard"])["policies"].saved_metric is None
+
+
+def test_save_retried_after_the_metric_was_saved_carries_on(fake, world, store):
+    """A save whose metric Superset already holds with the measure's own definition (an earlier save whose answer
+    was lost) switches the copies; one of that name with another definition is refused, and nothing changes."""
+    built = _built(fake, store, THREE_OF_POLICIES)
+    world.datasets[POLICY_DATASET]["editors"].append("builder")
+    world.datasets[POLICY_DATASET]["metrics"].append(
+        {"metric_name": "policies", "expression": "COUNT(policy_id)", "verbose_name": "Policies", "d3format": ",d",
+         "currency": None, "certified_by": None, "certification_details": None, "warning_text": None,
+         "description": None})
+    result = save_measure(_asking(fake, store, built["dashboard"]), "policies")
+    assert set(result.changed) == {built["policies_by_region"], built["policies_by_status"],
+                                   built["policies_by_channel"]}
+    assert _kept(store, built["dashboard"])["policies"].saved_metric == "policies"
+
+
+def test_save_onto_a_metric_of_its_name_with_another_definition_is_refused(fake, world, store):
+    built = _built(fake, store, THREE_OF_POLICIES)
+    world.datasets[POLICY_DATASET]["editors"].append("builder")
+    world.datasets[POLICY_DATASET]["metrics"].append(
+        {"metric_name": "policies", "expression": "COUNT(*)", "verbose_name": "Policies", "d3format": None,
+         "currency": None, "certified_by": None, "certification_details": None, "warning_text": None,
+         "description": None})
+    with pytest.raises(ActionRefused, match="another definition"):
+        save_measure(_asking(fake, store, built["dashboard"]), "policies")
+    assert "patch_chart" not in _tools(fake)
 
 
 def test_save_by_a_non_editor_changes_nothing(fake, world, store):
@@ -365,3 +408,74 @@ def test_the_mcp_2x_workflow_runs_this_module():
     workflow = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "mcp-2x.yml"
     runs = [line for line in workflow.read_text().splitlines() if re.search(r"\brun:.*\bpytest\b", line)]
     assert len(runs) == 1 and f"tests/{Path(__file__).name}" in runs[0].split()
+
+
+def test_remove_leaves_a_chart_changed_by_hand_and_names_it(fake, world, store):
+    """A chart whose copy someone changed by hand no longer shows the measure: Remove leaves it on the dashboard and
+    names it, and deletes the others."""
+    built = _built(fake, store, THREE_OF_POLICIES)
+    by_hand = built["policies_by_status"]
+    world.charts[by_hand]["params"]["metrics"][0]["sqlExpression"] = "COUNT(*)"
+    charts = (built["policies_by_region"], by_hand, built["policies_by_channel"])
+    result = remove_measure(_asking(fake, store, built["dashboard"]), "policies", chart_ids=charts)
+    assert result.left_by_hand == (by_hand,) and by_hand not in result.changed
+    assert by_hand in world.charts and _placed(world, built["dashboard"]) == {by_hand}
+    assert "policies" not in _kept(store, built["dashboard"])
+
+
+def test_remove_counts_a_chart_already_in_the_trash_as_gone(fake, world, store):
+    """A chart already moved to the trash (an earlier remove whose answer was lost, or someone in Superset) drops out
+    of the list; Remove of the rest takes it off the layout too, and forgets the measure."""
+    built = _built(fake, store, THREE_OF_POLICIES)
+    trashed = built["policies_by_status"]
+    world.trashed[trashed] = world.charts.pop(trashed)
+    [shown] = list_measures(_asking(fake, store, built["dashboard"]))
+    listed = tuple(chart.chart_id for chart in shown.charts)
+    assert trashed not in listed
+    result = remove_measure(_asking(fake, store, built["dashboard"]), "policies", chart_ids=listed)
+    assert set(result.changed) == set(listed)
+    assert _placed(world, built["dashboard"]) == set()
+    assert "policies" not in _kept(store, built["dashboard"])
+
+
+def test_an_edit_whose_second_chart_keeps_changing_puts_the_first_back(fake, world, store):
+    """The copies never split: when one chart keeps changing under the edit, the charts already changed are put
+    back, the dashboard keeps the old definition, and the chart is named."""
+    built = _built(fake, store, THREE_OF_POLICIES)
+    restless = built["policies_by_channel"]
+
+    def hand_edit(request, _world):
+        if request.get("chart_id") == restless:
+            world.charts[restless]["changed_on"] = world._stamp()
+
+    world.hooks["patch_chart"] = Hook(before=hand_edit)
+    result = edit_measure(_asking(fake, store, built["dashboard"]), "policies", label="Policies",
+                          expression="COUNT(DISTINCT policy_id)", kind=MeasureKind.COUNT, currency=None,
+                          description="")
+    assert result.changed == () and result.could_not_read == (restless,)
+    for chart_id in (built["policies_by_region"], built["policies_by_status"], restless):
+        assert _metric(world, chart_id)["sqlExpression"] == "COUNT(policy_id)", chart_id
+    assert _kept(store, built["dashboard"])["policies"].measure.expression == "COUNT(policy_id)"
+
+
+def test_an_edit_to_a_label_another_measure_has_is_refused(fake, world, store):
+    """Two measures under one label could not be told apart on a chart: the edit is refused, and nothing changes."""
+    built = _built(fake, store, BuildPlan(charts=(BY_REGION, dataclasses.replace(
+        BY_STATUS, measures=(WrittenRef(dataclasses.replace(POLICIES, name="others", label="Others")),))),
+        measures=(POLICIES, dataclasses.replace(POLICIES, name="others", label="Others"))))
+    with pytest.raises(ActionRefused, match="label"):
+        edit_measure(_asking(fake, store, built["dashboard"]), "policies", label="others",
+                     expression="COUNT(policy_id)", kind=MeasureKind.COUNT, currency=None, description="")
+    assert "patch_chart" not in _tools(fake)
+
+
+def test_a_value_that_is_not_a_finite_number_is_no_value():
+    """An infinity or a NaN Superset answers is no value, said so, never a number the list answers (which JSON could
+    not carry)."""
+    from mnemiq.superset.measure_actions import _finite
+
+    assert _finite("3.5") == (3.5, None)
+    for value in (float("nan"), float("inf"), "-inf"):
+        number, note = _finite(value)
+        assert number is None and note == "its value is not a finite number"
+    assert _finite("n/a")[0] is None

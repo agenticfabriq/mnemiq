@@ -225,14 +225,50 @@ def test_a_chart_not_on_the_dashboard_is_never_changed(fake, world, store):
     assert answer.changed == () and [left[0] for left in answer.left] == [other] and _patches(world) == []
 
 
-def test_remove_a_chart_by_chat(fake, world, store):
-    """A chart removed by chat goes to Superset's trash and off the layout, and out of the measures it showed."""
+def test_a_removal_by_chat_is_proposed_and_nothing_is_deleted(fake, world, store):
+    """The model's reading never deletes anything: a chart it reads the request as removing is answered as a
+    proposal, by id and title, for the person to confirm."""
     built = _built(fake, store)
     chart = built["policies_by_region"]
     answer = _change(fake, store, built, "drop the region chart", Interpretation(remove_chart_ids=(chart,)))
-    assert answer.removed == (chart,) and chart in world.trashed
+    assert answer.would_remove == ((chart, "Policies by region"),) and answer.removed == ()
+    assert chart in world.charts and "delete_chart" not in [c.tool for c in fake.calls]
+
+
+def test_a_confirmed_removal_deletes_those_charts(fake, world, store):
+    """Confirmed by the person, the charts go to Superset's trash and off the layout, and out of the measures they
+    showed; the model is not asked."""
+    built = _built(fake, store)
+    chart = built["policies_by_region"]
+    interpreter = FakeInterpreter(Interpretation())
+    answer = change_dashboard(_asking(fake, store, built["dashboard"]), "", interpreter=interpreter,
+                              confirmed_removal=(chart,))
+    assert answer.removed == (chart,) and chart in world.trashed and interpreter.requests == []
     [kept] = store.measures_for(TENANT, built["dashboard"])
     assert chart not in kept.chart_ids
+
+
+def test_a_confirmed_removal_superset_refuses_is_named(fake, world, store):
+    """A chart a report holds is left on the dashboard and named, with the reason."""
+    built = _built(fake, store)
+    chart = built["policies_by_region"]
+    world.reported.add(chart)
+    answer = change_dashboard(_asking(fake, store, built["dashboard"]), "", interpreter=FakeInterpreter(
+        Interpretation()), confirmed_removal=(chart,))
+    assert answer.removed == () and answer.left == ((chart, "a report holds it"),)
+    assert chart in world.charts
+
+
+def test_a_filter_added_twice_is_added_once(fake, world, store):
+    """A change sent again (its answer lost) adds no second copy of a filter the chart already has."""
+    built = _built(fake, store, BuildPlan(charts=(BY_REGION,), measures=(POLICIES,)))
+    chart = built["policies_by_region"]
+    change = Interpretation(changes=(ChartChange(chart_id=chart, add_filters=(
+        {"column": "status", "op": "=", "value": "active"},)),))
+    _change(fake, store, built, "only active", change)
+    _change(fake, store, built, "only active", change)
+    subjects = [f["subject"] for f in world.charts[chart]["params"]["adhoc_filters"] if f.get("clause") == "WHERE"]
+    assert subjects == ["status"]
 
 
 def test_the_prompt_holds_the_charts_settings_and_never_an_editor(fake, world, store):
@@ -272,7 +308,7 @@ def _calls_update_chart(source: str) -> list[int]:
     found = []
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Call) and any(isinstance(arg, ast.Constant) and arg.value == "update_chart"
-                                              for arg in node.args):
+                                              for arg in [*node.args, *(k.value for k in node.keywords)]):
             found.append(node.lineno)
     return found
 
@@ -280,9 +316,11 @@ def _calls_update_chart(source: str) -> list[int]:
 def test_change_never_calls_update_chart():
     """MCP's `update_chart` replaces a chart's settings wholesale and loses hand edits: no change sends it. The
     guard is shown its planted twin."""
-    module = Path(__file__).resolve().parents[1] / "src" / "mnemiq" / "superset" / "chart_change.py"
-    assert _calls_update_chart(module.read_text()) == []
+    package = Path(__file__).resolve().parents[1] / "src" / "mnemiq" / "superset"
+    assert {path.name: found for path in sorted(package.glob("*.py"))
+            if (found := _calls_update_chart(path.read_text()))} == {}
     assert _calls_update_chart('client.call("update_chart", {"identifier": 1})') == [1]
+    assert _calls_update_chart('client.call(tool="update_chart", request={})') == [1]
 
 
 def test_the_mcp_2x_workflow_runs_this_module():

@@ -10,7 +10,8 @@ of its table the person may read. Never an editor, a value read from the data, o
 
 **What the model may answer** (`Interpretation`): changes of charts (keys to set or unset, filters to add, the
 columns whose filters to drop), charts to remove, or that the request adds a chart, which the route builds onto the
-dashboard as a build (planned as every build is, so only what the dashboard lacks is made).
+dashboard as a build (planned as every build is, so only what the dashboard lacks is made). A chart to remove is only
+proposed (`would_remove`): nothing is deleted on the model's reading, only on the person's confirmation.
 
 **What is written.** Only keys a chart's type may have set by chat (`SETTABLE`), with values mnemiq reads as valid
 for that key; any other is dropped and named. A chart's type changes only when the change names it, and only among the
@@ -122,6 +123,10 @@ class ChangeAnswer:
     removed: tuple[int, ...] = ()
     add_chart: bool = False
     message: str = ""
+    # The charts the request reads as removing, by id and title: a proposal the person confirms, never acted on.
+    would_remove: tuple[tuple[int, str | None], ...] = ()
+    # A confirmed removal deleted at least one chart for good (a Superset keeping no trash).
+    permanent: bool = False
 
 
 # ---------------------------------------------------------------- what the model sees
@@ -355,7 +360,15 @@ def _planned(change: ChartChange, read: ChartRead, columns: set[str]) -> _Planne
             if any(item is None for item in added):
                 dropped.append("adhoc_filters")
             else:
-                to_set["adhoc_filters"] = kept + [_adhoc_filter(item) for item in added]
+                def same(a: Mapping, b: Mapping) -> bool:
+                    return all(a.get(k) == b.get(k) for k in ("expressionType", "clause", "subject", "operator",
+                                                              "comparator"))
+
+                # A change sent again (its answer lost) adds no second copy of a filter the chart already holds.
+                new = [f for f in (_adhoc_filter(item) for item in added)
+                       if not any(isinstance(old, Mapping) and same(old, f) for old in kept)]
+                if new or removing:
+                    to_set["adhoc_filters"] = kept + new
     return _Planned(to_set, to_unset, sorted(set(dropped)))
 
 
@@ -365,9 +378,14 @@ def _send(asking: Asking, chart_id: int, read: ChartRead, planned: _Planned) -> 
                                                      "expect_changed_on": read.changed_on})
 
 
-def change_dashboard(asking: Asking, request: str, *, interpreter) -> ChangeAnswer:
+def change_dashboard(asking: Asking, request: str, *, interpreter,
+                     confirmed_removal: Sequence[int] = ()) -> ChangeAnswer:
     """Make `request` on the dashboard, as the person asking: read the dashboard's charts, have `interpreter` read the
-    request against them, and write only what it names, as `SETTABLE` and `_valid` allow."""
+    request against them, and write only what it names, as `SETTABLE` and `_valid` allow. A chart the request reads
+    as removing is only proposed (`would_remove`); `confirmed_removal` names the charts the person confirmed, which
+    are removed and nothing else is done (the model is not asked)."""
+    if confirmed_removal:
+        return _confirmed(asking, tuple(dict.fromkeys(confirmed_removal)))
     request = " ".join((request or "").split())[:_MAX_REQUEST]
     summary = dashboard_summary(asking)
     placed = {chart["id"] for chart in summary["charts"]}
@@ -388,10 +406,12 @@ def change_dashboard(asking: Asking, request: str, *, interpreter) -> ChangeAnsw
         dropped += [(change.chart_id, key) for key in planned.dropped]
         if planned.to_set or planned.to_unset:
             wanted[change.chart_id] = (change, current, planned)
-    removing = tuple(chart_id for chart_id in read.remove_chart_ids if chart_id in placed)
+    titles = {chart["id"]: chart.get("title") for chart in summary["charts"]}
+    would_remove = tuple((chart_id, titles.get(chart_id)) for chart_id in dict.fromkeys(read.remove_chart_ids)
+                         if chart_id in placed)
     left += [(chart_id, "it is not a chart of this dashboard") for chart_id in read.remove_chart_ids
              if chart_id not in placed]
-    editorship = _editorship(asking, chart_ids=[*wanted, *removing])
+    editorship = _editorship(asking, chart_ids=wanted)
     not_editor = list(_not_editors(editorship, "chart", wanted))
     for entry in not_editor:
         wanted.pop(entry.chart_id, None)
@@ -415,36 +435,55 @@ def change_dashboard(asking: Asking, request: str, *, interpreter) -> ChangeAnsw
                 left.append((chart_id, current.unreadable or "its settings could not be read"))
                 break
             planned = _planned(change, current, columns_of.get(chart_id, set()))
-    removed = _removed(asking, removing, editorship, not_editor)
     if changed:
         _recheck_kept(asking, changed)
     answer = ChangeAnswer(changed=tuple(changed), left=tuple(left), dropped=tuple(sorted(dropped)),
-                          not_editor=tuple(not_editor), removed=removed, add_chart=read.add_chart)
+                          not_editor=tuple(not_editor), add_chart=read.add_chart, would_remove=would_remove)
     return dataclasses.replace(answer, message=_said(answer, read.reason))
 
 
-def _removed(asking: Asking, removing: tuple[int, ...], editorship: dict, not_editor: list) -> tuple[int, ...]:
-    """Each chart to remove deleted (moved to Superset's trash) when the person edits it, else named; both off the
-    layout, and out of the dashboard's kept measures."""
-    if not removing:
-        return ()
-    deleted, off = [], []
+def _confirmed(asking: Asking, removing: tuple[int, ...]) -> ChangeAnswer:
+    """The charts the person confirmed removing: each one the dashboard places and they edit deleted (moved to
+    Superset's trash, or deleted for good where Superset keeps none), then taken off the layout and out of the
+    dashboard's kept measures. One they do not edit is named with its editors; one Superset will not delete (a
+    report holds it) is named with the reason and left; one Superset no longer holds is taken off as gone."""
+    placed = _placed(asking)
+    left = [(chart_id, "it is not a chart of this dashboard") for chart_id in removing if chart_id not in placed]
+    removing = tuple(chart_id for chart_id in removing if chart_id in placed)
+    editorship = _editorship(asking, chart_ids=removing)
+    not_editor, deleted, gone, permanent = [], [], [], False
     for chart_id in removing:
-        is_editor, editors = editorship.get(("chart", chart_id), (False, ()))
-        if not is_editor:
+        is_editor, editors = editorship.get(("chart", chart_id), (None, ()))
+        if is_editor is False:
             not_editor.append(EditorsOf(editors=editors, chart_id=chart_id))
             continue
         answer = asking.client.call("delete_chart", {"identifier": chart_id})
-        (deleted if answer.get("success") is True else off).append(chart_id)
-    gone = set(deleted)
-    if gone:
-        _take_off(asking, gone)
+        if answer.get("success") is True:
+            deleted.append(chart_id)
+            permanent = permanent or answer.get("soft_deleted") is False
+        elif answer.get("error_type") == "NotFound":
+            gone.append(chart_id)
+        elif answer.get("error_type") == "ReportsExist":
+            left.append((chart_id, "a report holds it"))
+        elif answer.get("permission_denied"):
+            not_editor.append(EditorsOf(editors=editors, chart_id=chart_id))
+        else:
+            logger.warning("delete_chart answered a confirmed removal with %s", answer.get("error_type"))
+            left.append((chart_id, "Superset did not delete it"))
+    taken = set(deleted) | set(gone)
+    if taken:
+        try:
+            _take_off(asking, taken)
+        except Exception as exc:  # what was deleted is answered whatever the layout's write did
+            left.append((min(taken), f"it was deleted, but the layout was not written ({exc})"))
         for row in _kept(asking).values():
-            if gone & set(row.chart_ids):
-                left = tuple(c for c in row.chart_ids if c not in gone)
-                _put(asking, row, chart_ids=left, check_status={c: s for c, s in row.check_status.items()
-                                                                if c in left})
-    return tuple(deleted)
+            if taken & set(row.chart_ids):
+                kept = tuple(c for c in row.chart_ids if c not in taken)
+                _put(asking, row, chart_ids=kept, check_status={c: s for c, s in row.check_status.items()
+                                                                if c in kept})
+    answer = ChangeAnswer(removed=tuple(deleted + gone), left=tuple(left), not_editor=tuple(not_editor),
+                          permanent=permanent)
+    return dataclasses.replace(answer, message=_said(answer, None))
 
 
 def _recheck_kept(asking: Asking, changed: list[int]) -> None:
@@ -461,7 +500,11 @@ def _said(answer: ChangeAnswer, reason: str | None) -> str:
     if answer.changed:
         parts.append("changed: " + ", ".join(f"chart {c}" for c in answer.changed))
     if answer.removed:
-        parts.append("moved to Superset's trash: " + ", ".join(f"chart {c}" for c in answer.removed))
+        where = "deleted for good (this Superset keeps no trash)" if answer.permanent else "moved to Superset's trash"
+        parts.append(f"{where}: " + ", ".join(f"chart {c}" for c in answer.removed))
+    if answer.would_remove:
+        parts.append("to remove, once confirmed: " + ", ".join(
+            f"chart {c}" + (f" ({title!r})" if title else "") for c, title in answer.would_remove))
     if answer.add_chart:
         parts.append("the chart asked for is planned and built onto the dashboard")
     if answer.dropped:

@@ -1864,9 +1864,9 @@ def test_row_rules_says_only_whether_a_rule_applies_to_the_caller(live, extensio
 
 def test_editors_of_names_editors_of_readable_objects_only(live, extension, policy_id):
     """analyst's chart and dataset, each made by the extension for a build's dashboard (editors: the dashboard's,
-    analyst), are answered to analyst as
-    `{charts: [{chart_id, editors: [analyst's label]}], datasets: [{dataset_id, editors: [analyst's label]}]}`; a chart
-    and a dataset id that do not exist are left out. `gamma_only`, which reads neither, is answered
+    analyst), are answered to analyst as `{charts: [{chart_id, is_editor: true, editors: [analyst's label]}],
+    datasets: [{dataset_id, is_editor: true, editors: [analyst's label]}]}`, and to west (Alpha, who reads both) the
+    same with `is_editor: false`; a chart and a dataset id that do not exist are left out. `gamma_only`, which reads neither, is answered
     `{charts: [], datasets: []}`, with no id and no label."""
     analyst = as_user(live, BUILDER)
     build = new_build(analyst, "editors of")
@@ -1874,8 +1874,13 @@ def test_editors_of_names_editors_of_readable_objects_only(live, extension, poli
     dataset_id = marked_dataset(live, build, "data")
     missing = 2_000_000_000
     answer = call(analyst, "editors_of", chart_ids=[chart_id, missing], dataset_ids=[dataset_id, missing])
-    assert answer == {"charts": [{"chart_id": chart_id, "editors": [label_of(BUILDER)]}],
-                      "datasets": [{"dataset_id": dataset_id, "editors": [label_of(BUILDER)]}]}, answer
+    assert answer == {"charts": [{"chart_id": chart_id, "is_editor": True, "editors": [label_of(BUILDER)]}],
+                      "datasets": [{"dataset_id": dataset_id, "is_editor": True, "editors": [label_of(BUILDER)]}]}, \
+        answer
+    # west (Alpha) reads both and edits neither, and is told so beside the same editors.
+    seen = call(as_user(live, "west"), "editors_of", chart_ids=[chart_id], dataset_ids=[dataset_id])
+    assert seen == {"charts": [{"chart_id": chart_id, "is_editor": False, "editors": [label_of(BUILDER)]}],
+                    "datasets": [{"dataset_id": dataset_id, "is_editor": False, "editors": [label_of(BUILDER)]}]}, seen
     hidden = call(as_user(live, "gamma_only"), "editors_of", chart_ids=[chart_id], dataset_ids=[dataset_id])
     assert hidden == {"charts": [], "datasets": []}, hidden
     observe("editors_of", editors=[label_of(BUILDER)])

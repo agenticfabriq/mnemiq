@@ -86,7 +86,7 @@ from mnemiq.superset.measure_actions import (
 )
 from mnemiq.superset.measure_actions import DashboardUnreadable as _MeasuresUnreadable
 from mnemiq.superset.measures import MAX_LABEL, MeasureKind
-from mnemiq.superset.planner import MAX_GOAL, BuildPlan, PlanContext, PlanRefused, plan_build
+from mnemiq.superset.planner import MAX_DESCRIPTION, MAX_GOAL, BuildPlan, PlanContext, PlanRefused, plan_build
 
 __all__ = ["READ_SCOPES", "WRITE_SCOPES", "mount_superset_build"]
 
@@ -166,7 +166,7 @@ class EditBody(BaseModel):
     expression: Annotated[StrictStr, Field(min_length=1, max_length=4000)]
     kind: MeasureKind
     currency: Annotated[StrictStr, Field(pattern=r"^[A-Z]{3}$")] | None = None
-    description: Annotated[StrictStr, Field(max_length=2000)] = ""
+    description: Annotated[StrictStr, Field(max_length=MAX_DESCRIPTION)] = ""
 
 
 class RemoveBody(BaseModel):
@@ -182,7 +182,7 @@ class SaveBody(BaseModel):
 
 # A measure's name in a path, as the store keeps it: a written measure's name, or a reused saved metric's
 # `<metric>@<dataset id>`.
-_MEASURE_NAME = r"^[A-Za-z0-9_.@-]{1,250}$"
+_MEASURE_NAME = r"^[^/]{1,300}$"
 
 
 def _measure(view: MeasureView) -> dict:
@@ -197,7 +197,8 @@ def _measure(view: MeasureView) -> dict:
 
 def _result(result: ActionResult) -> dict:
     return {"changed": list(result.changed), "left_by_hand": list(result.left_by_hand),
-            "not_editor": [{**({"chart_id": e.chart_id} if e.chart_id is not None else {"dataset_id": e.dataset_id}),
+            "not_editor": [{**({"chart_id": e.chart_id} if e.chart_id is not None else {}),
+                            **({"dataset_id": e.dataset_id} if e.dataset_id is not None else {}),
                             "editors": list(e.editors)} for e in result.not_editor],
             "blocked_by_report": list(result.blocked_by_report), "could_not_read": list(result.could_not_read),
             "message": result.message}
@@ -206,7 +207,16 @@ def _result(result: ActionResult) -> dict:
 class ChangeBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    request: Annotated[StrictStr, Field(min_length=1, max_length=MAX_GOAL)]
+    request: Annotated[StrictStr, Field(min_length=1, max_length=MAX_GOAL)] | None = None
+    # The charts the person confirmed removing, from a change's `would_remove`: removed, and nothing else done.
+    remove_chart_ids: Annotated[list[Annotated[StrictInt, Field(gt=0, le=MAX_ID)]],
+                                Field(min_length=1, max_length=250)] | None = None
+
+    @model_validator(mode="after")
+    def _one_ask(self) -> ChangeBody:
+        if (self.request is None) == (self.remove_chart_ids is None):
+            raise ValueError("send a request, or the charts confirmed for removal, not both")
+        return self
 
 
 def _changed(answer: ChangeAnswer) -> dict:
@@ -215,7 +225,9 @@ def _changed(answer: ChangeAnswer) -> dict:
             "left": [{"chart_id": chart_id, "reason": reason} for chart_id, reason in answer.left],
             "dropped": [{"chart_id": chart_id, "key": key} for chart_id, key in answer.dropped],
             "not_editor": [{"chart_id": e.chart_id, "editors": list(e.editors)} for e in answer.not_editor],
-            "removed": list(answer.removed), "added": None, "message": answer.message}
+            "removed": list(answer.removed),
+            "would_remove": [{"chart_id": chart_id, "title": title} for chart_id, title in answer.would_remove],
+            "added": None, "message": answer.message}
 
 
 class _Offering:
@@ -437,6 +449,9 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
         if changing:
             require_build_tools(adapter.client)
             _held_to_its_editors(adapter.client, dashboard_id)
+            # A build keeps the dashboard's measures as it last writes them: none is changed while one builds on it.
+            if builds.dashboard_building(who.tenant_id, dashboard_id):
+                raise DashboardBusy()
         return Asking(adapter=adapter, store=builds, tenant=who.tenant_id, principal=who.principal_id,
                       dashboard_id=dashboard_id, snapshot=runtime.snapshot, grants=grants, settings=profile.settings)
 
@@ -477,11 +492,19 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
             interpreter = runtime.build_profile(None, who).interpreter
             if interpreter is None:
                 raise RuntimeError("this runtime was built with no change interpreter, so it changes no dashboard")
-            found = change_dashboard(ask, body.request, interpreter=interpreter)
+            found = change_dashboard(ask, body.request or "", interpreter=interpreter,
+                                     confirmed_removal=tuple(body.remove_chart_ids or ()))
             answer = _changed(found)
             if found.add_chart:
-                answer["added"] = started(asking_, body.request, dashboard_id=dashboard_id, fresh=False,
-                                          profile_name=None)[1]
+                # What the request changed stays answered whatever the planning of its chart meets.
+                try:
+                    answer["added"] = started(asking_, body.request, dashboard_id=dashboard_id, fresh=False,
+                                              profile_name=None)[1]
+                except Exception as exc:
+                    refusal = _refusal(exc, doors)
+                    if refusal is None:
+                        raise
+                    answer["added"] = {"error": {"status": refusal.status_code, "detail": refusal.detail}}
             return answer
 
         return answered(work)

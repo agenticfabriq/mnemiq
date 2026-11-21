@@ -181,6 +181,11 @@ class MemoryBuildStore:
             self._builds[(tenant, build_id)] = row
             return self._stored(row)
 
+    def dashboard_building(self, tenant, dashboard_id) -> bool:
+        with self._lock:
+            self._release_abandoned(tenant, dashboard_id)
+            return self._live_on(tenant, dashboard_id)
+
     def _release_abandoned(self, tenant: str, dashboard_id: int) -> None:
         """`build_store._release_abandoned`: each build of the dashboard still building, untouched for
         `ABANDONED_AFTER_S` with no claim of it holding, has its next step failed as abandoned."""
@@ -594,7 +599,8 @@ class World:
     def form_data(self, dataset_id: int, config: dict) -> dict:
         """The `form_data` MCP's mappers write for the configs a build sends (`map_xy_config`, `map_pie_config`,
         `map_big_number_config`, `map_table_config`, `map_gauge_config`, `map_treemap_config`), each row limit a config
-        leaves unset as its `*ChartConfig.row_limit` default (`superset/mcp_service/chart/schemas.py`)."""
+        leaves unset as its `*ChartConfig.row_limit` default, and a pie's, gauge's and treemap's `sort_by_metric` as
+        its default, true (`superset/mcp_service/chart/schemas.py`)."""
         kind = config["chart_type"]
         if kind == "xy":
             viz = {"line": "echarts_timeseries_line", "bar": "echarts_timeseries_bar", "area": "echarts_area",
@@ -616,7 +622,8 @@ class World:
         elif kind == "pie":
             form = {"viz_type": "pie", "groupby": [config["dimension"]["name"]], "metric": self._metric(config["metric"]),
                     "number_format": config.get("number_format", "SMART_NUMBER"), "row_limit": config.get("row_limit", 100),
-                    "show_total": False, "donut": False, "show_labels": True}
+                    "show_total": False, "donut": False, "show_labels": True,
+                    "sort_by_metric": config.get("sort_by_metric", True)}
         elif kind == "big_number":
             form = {"viz_type": "big_number_total", "metric": self._metric(config["metric"])}
             if config.get("y_axis_format"):
@@ -624,10 +631,12 @@ class World:
         elif kind == "gauge":
             form = {"viz_type": "gauge_chart", "metric": self._metric(config["metric"]),
                     "groupby": [c["name"] for c in config.get("groupby") or []],
-                    "number_format": config.get("number_format", "SMART_NUMBER"), "row_limit": 10}
+                    "number_format": config.get("number_format", "SMART_NUMBER"), "row_limit": 10,
+                    "sort_by_metric": config.get("sort_by_metric", True)}
         elif kind == "treemap_v2":
             form = {"viz_type": "treemap_v2", "groupby": [c["name"] for c in config["groupby"]],
-                    "metric": self._metric(config["metric"]), "row_limit": config.get("row_limit", 100)}
+                    "metric": self._metric(config["metric"]), "row_limit": config.get("row_limit", 100),
+                    "sort_by_metric": config.get("sort_by_metric", True)}
         elif kind == "table":
             names = [c["name"] for c in config["columns"] if "name" in c and not c.get("saved_metric")]
             metrics = [self._metric(c) for c in config["columns"] if c.get("saved_metric") or c.get("sql_expression")]
