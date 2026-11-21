@@ -6,6 +6,7 @@ is recorded by the tables it reads, and enrich turns the record into a job and a
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 
 import duckdb
@@ -41,7 +42,7 @@ class _Recording(SQLiteAdapter):
 
     def execute(self, sql, timeout_s=None):
         self.limits.append(timeout_s)
-        if self._cut and self._cut in sql.lower():
+        if self._cut and (self._cut(sql) if callable(self._cut) else self._cut in sql.lower()):
             raise QueryTimedOut(f"query timed out after {timeout_s}s")
         return super().execute(sql, timeout_s=timeout_s)
 
@@ -112,3 +113,63 @@ def test_enrich_reads_its_source_through_the_deadline(monkeypatch, tmp_path):
     _, adapter = _enrichment_source(settings)
     assert isinstance(adapter, EnrichDeadline) and adapter.timeout_s == 120
     assert Settings(sources_path=str(manifest)).enrich_statement_timeout_s == 600
+
+
+def test_exact_mode_excludes_a_table_whose_profile_timed_out(tmp_path):
+    adapter = EnrichDeadline(_Recording(_db(tmp_path), cut="notes"), 600)
+    snap = enrich_structural(adapter, "src")
+    jobs = {j.id: j for j in snap.jobs}
+    assert jobs["profile:notes"].status == "failed"
+    assert "time limit" in jobs["profile:notes"].detail and "600" in jobs["profile:notes"].detail
+    assert "notes" not in {c.object_id for c in snap.columns}
+    assert jobs["profile:orders"].status == "done"
+
+
+def test_a_cut_grounding_statement_skips_its_item(tmp_path):
+    from mnemiq.enrichment.grounding import ground_codes
+
+    path = tmp_path / "g.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript("CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT, status_name TEXT);"
+                      + "".join(f"INSERT INTO orders VALUES ({i}, '{'AB'[i % 2]}', '{('Active', 'Blocked')[i % 2]}');"
+                                for i in range(40)))
+    con.close()
+    # Grounding's functional-dependency check alone: `SELECT "c", count(DISTINCT "d") ...` (a partition read starts
+    # `SELECT "c", count(*)`, and ends the table's profile when cut).
+    functional_check = re.compile(r'^SELECT "\w+", count\(DISTINCT "\w+"\) FROM').match
+    adapter = EnrichDeadline(_Recording(str(path), cut=functional_check), 600)
+    snap = ground_codes(adapter, enrich_structural(adapter, "src"), dictionary=None, ontology=None)
+    status = next(c for c in snap.columns if c.name == "status")
+    assert status.coded_values and not any(v.meaning for v in status.coded_values), "the cut check grounded nothing"
+    assert {j.id: j for j in snap.jobs}["profile:orders"].status == "done", "the table stays profiled"
+    assert "orders" in time_limit_job(adapter, "src").detail
+
+
+def test_a_timeout_ends_the_tables_profile_without_retrying_column_by_column(tmp_path):
+    # The batched profile falls back to one statement per column when it fails. A timeout says the table is too slow
+    # to read, not that one column cannot be counted, so each retry would reach the limit again: 184 statements of 600 s
+    # on a 183-column table. The timeout ends the profile instead.
+    from mnemiq.catalog import introspect
+    from mnemiq.enrichment.profiling import profile_table
+
+    source = _Recording(_db(tmp_path), cut="notes")
+    notes = next(t for t in introspect(source) if t.name == "notes")
+    with pytest.raises(QueryTimedOut):
+        profile_table(EnrichDeadline(source, 600), notes)
+    assert len(source.limits) == 1, "nothing after the cut statement was sent"
+
+
+def test_a_timed_out_partition_read_ends_the_tables_profile(tmp_path):
+    from mnemiq.catalog import introspect
+    from mnemiq.enrichment.profiling import profile_table
+
+    path = tmp_path / "p.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript("CREATE TABLE facts (id INTEGER PRIMARY KEY, current INTEGER, region TEXT, item TEXT);"
+                      + "".join(f"INSERT INTO facts VALUES ({i}, {i % 2}, '{'NS'[i % 2]}', 'i{i % 7}');"
+                                for i in range(60)))
+    con.close()
+    source = _Recording(str(path), cut="is not null group by")
+    facts = next(t for t in introspect(source) if t.name == "facts")
+    with pytest.raises(QueryTimedOut):
+        profile_table(EnrichDeadline(source, 600), facts)

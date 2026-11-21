@@ -8,6 +8,7 @@ from fnmatch import fnmatchcase
 
 from mnemiq.adapters.scoped import TablesNotFound
 from mnemiq.catalog import introspect
+from mnemiq.adapters.base import QueryTimedOut
 from mnemiq.contract import CodedValue, Column, Job, Snapshot, SourceBinding, ViewDefinition
 from mnemiq.enrichment.joins import build_relationships
 from mnemiq.enrichment.profiling import FAILED, profile_table, unharvested
@@ -265,19 +266,31 @@ def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
     except Exception:
         fk_children = {}
 
+    # Statistics mode's exact tables whose exact read reached the statement time limit: each keeps its dictionary
+    # estimate instead of being lost, and is estimated from here on, so nothing after this pass reads it.
+    fell_back: set[str] = set()
     for table in catalog:
+        failure: str | None = None
         try:
-            if table.name in estimated:
+            if table.name not in estimated:
+                try:
+                    stats = {
+                        s.column: s
+                        for s in profile_table(adapter, table, key_columns=fk_children.get(table.name),
+                                               **unharvested(harvest_values))
+                    }
+                except QueryTimedOut:
+                    if exact is None:
+                        raise  # exact mode: the table is excluded below, and its job says why
+                    fell_back.add(table.name)
+                    if charset is None and harvest_values:
+                        charset = _database_charset(adapter)
+            if table.name in estimated or table.name in fell_back:
                 # From the dictionary, reading no row; nothing measured, so nothing below to record.
                 stats = {}
                 table_columns = _estimated_columns(adapter, table, fk_children.get(table.name), harvest_values,
                                                    charset)
             else:
-                stats = {
-                    s.column: s
-                    for s in profile_table(adapter, table, key_columns=fk_children.get(table.name),
-                                           **unharvested(harvest_values))
-                }
                 table_columns = [
                     Column(
                         id=f"{table.name}.{col.name}",
@@ -321,6 +334,8 @@ def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
             logger.warning("profile failed for table %r; EXCLUDED from the model: %s",
                            table.name, exc)
             table_columns, status = [], "failed"
+            if isinstance(exc, QueryTimedOut):
+                failure = f"its profile reached the statement time limit ({exc})"
 
         if status == "done":
             columns.extend(table_columns)
@@ -333,10 +348,17 @@ def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
                     binding_type="table",
                 )
             )
+        is_estimated = table.name in estimated or table.name in fell_back
         jobs.append(
             Job(id=f"profile:{table.name}", source_id=source_id, kind="profile", status=status,
-                detail="estimated" if table.name in estimated and status == "done" else None)
+                detail="estimated" if is_estimated and status == "done" else failure)
         )
+        if table.name in fell_back:
+            # Not kind "profile", which counts tables: this records why an exact table is estimated.
+            jobs.append(Job(id=f"profile:{table.name}:exact", source_id=source_id, kind="profile:exact",
+                            status="failed", detail="its exact read reached the statement time limit; profiled from "
+                                                    "the dictionary instead"))
+    estimated = estimated | frozenset(fell_back)
 
     # A candidate whose check could not run is skipped, and recorded here as well as logged: a
     # warning alone left an incomplete inference looking like a complete one on the snapshot.
