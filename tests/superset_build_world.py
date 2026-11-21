@@ -541,7 +541,20 @@ class World:
         # `changed_on` and `created_on` are answered only when asked for (`get_dataset_info`'s default columns).
         columns = request.get("select_columns") or ["id", "table_name", "schema", "database_id", "is_virtual",
                                                     "description", "sql", "metrics"]
+        if "columns" in columns:
+            shown["columns"] = self._columns_of(row)
         return {key: value for key, value in shown.items() if key in columns}
+
+    def _columns_of(self, row: dict) -> list[dict]:
+        """The dataset's columns as rc2's `TableColumnInfo` gives them, `is_dttm` on a date or a timestamp: a table's
+        own, or for a join, each column of every table its SQL names, alone and as `<table>_<column>`."""
+        def info(name: str, kind: str) -> dict:
+            return {"column_name": name, "type": kind, "is_dttm": kind in ("DATE", "TIMESTAMP")}
+
+        if row["sql"] is None:
+            return [info(name, kind) for name, kind in TABLES.get(row["table_name"], [])]
+        named = [t for t in TABLES if re.search(rf"\b{re.escape(t)}\b", row["sql"])]
+        return [info(label, kind) for t in named for name, kind in TABLES[t] for label in (name, f"{t}_{name}")]
 
     def _list_metrics(self, request: dict, user: str) -> dict:
         row = self.datasets[request["dataset_id"]]
