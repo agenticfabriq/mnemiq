@@ -957,9 +957,10 @@ class World:
         if refusal is not None:
             return refusal
         metadata = extension_params.layout_metadata(found["positions"], json.loads(dashboard["json_metadata"]))
-        # rc2 rebuilds membership from the layout's charts through a relationship that cannot see a chart in the
-        # trash, so a trashed member's row is never removed: it stays a member (seen live: a chart a Remove moved to
-        # the trash, and off the layout, was still a member of its dashboard).
+        # A chart in the trash stays a member through a layout write that leaves it out, as seen live on rc2: a chart a
+        # Remove moved to the trash and took off the layout was still in `dashboard_slices` after the write
+        # (`DashboardDAO.set_dash_metadata` rebuilds `dashboard.slices` from the layout's charts; the trashed row is
+        # not removed).
         trashed = {chart_id for chart_id in dashboard["members"] if chart_id in self.trashed}
         members = sorted(set(extension_params._layout_chart_ids(found["positions"])) | trashed)
         dashboard.update(position_json=json.dumps(metadata["positions"]), members=members,

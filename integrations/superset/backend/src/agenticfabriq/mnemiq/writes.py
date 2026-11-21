@@ -492,7 +492,7 @@ def _bound_lock_waits(session: Any) -> None:
 
 def lock_row(model: type, entity_id: int) -> Any:
     """Row `entity_id` of `model`, locked for update and refreshed to its committed state, or None when no such row is
-    visible (a row in the trash is not). A blocking `SELECT ... FOR UPDATE` of the primary-key row, so it serialises
+    visible (a row in the trash is not, unless the caller reads past the soft-delete filter). A blocking `SELECT ... FOR UPDATE` of the primary-key row, so it serialises
     against every other writer that locks the row, rc2's own dataset `PUT` included.
 
     On Postgres the wait is bounded first (`_bound_lock_waits`), until the transaction ends, which is the command's
@@ -1658,15 +1658,23 @@ def _member_chart_ids(dashboard_id: int) -> list[int]:
 
 
 def _trashed_chart_ids(chart_ids: list[int]) -> list[int]:
-    """Those of `chart_ids` in the trash (`deleted_at` set), read past the soft-delete filter the ORM applies."""
+    """Those of `chart_ids` in the trash (`deleted_at` set). Each row is locked by `lock_row`, in id order, read past
+    rc2's soft-delete filter (`skip_visibility_filter`, the opt-out from `_add_soft_delete_filter`, both in
+    `superset/models/helpers.py`), and stays locked for the rest of the layout's transaction: a chart restored
+    (`RestoreChartCommand`) or moved to the trash meanwhile waits for the save, so the trash state read here is the one
+    its membership rebuild meets."""
     if not chart_ids:
         return []
-    from sqlalchemy import select
+    from superset.models.helpers import skip_visibility_filter
     from superset.models.slice import Slice
 
-    table = Slice.__table__
-    rows = _session().execute(select(table.c.id).where(table.c.id.in_(chart_ids), table.c.deleted_at.is_not(None)))
-    return sorted(row.id for row in rows)
+    trashed = []
+    with skip_visibility_filter(_session(), Slice):
+        for chart_id in sorted(chart_ids):
+            chart = lock_row(Slice, chart_id)
+            if chart is not None and chart.deleted_at is not None:
+                trashed.append(chart_id)
+    return trashed
 
 
 def _layout(found: dict, dashboard: Any) -> dict:
@@ -1702,8 +1710,9 @@ def _layout(found: dict, dashboard: Any) -> dict:
 def set_layout(found: dict) -> dict:
     """Writes a dashboard's layout, which also sets its charts (`json_metadata.positions`, through
     `UpdateDashboardCommand`), under the dashboard's lock, once the `changed_on` the caller read is still the
-    dashboard's. The layout must hold exactly the dashboard's charts plus those added minus those removed, keep every
-    tab rc2 knows reachable under its id (`params.check_positions`), and add only charts the caller may read. The
+    dashboard's. The layout must hold exactly the dashboard's charts plus those added minus those removed (a chart in
+    the trash the stored layout no longer places aside), keep every tab rc2 knows reachable under its id
+    (`params.check_positions`), and add only charts the caller may read. The
     dashboard's native filters and the settings rc2 would otherwise reset are sent back as they are
     (`params.layout_metadata`), so no report on a filter is deactivated."""
     from superset.models.dashboard import Dashboard

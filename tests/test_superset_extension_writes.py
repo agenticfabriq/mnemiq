@@ -1116,6 +1116,41 @@ def test_set_layout_does_not_expect_a_trashed_member_the_layout_no_longer_places
     assert asked == [[11, 9]]
 
 
+def test_trashed_members_are_read_past_the_trash_filter_and_locked_until_the_layout_commits(superset, monkeypatch):
+    """`_trashed_chart_ids` locks every member's row with `lock_row` (the module's one locking read), in id order, past
+    rc2's soft-delete filter (`skip_visibility_filter`, the documented opt-out), so a trashed row is seen and locked
+    too, for the rest of the layout's transaction: a chart restored from, or moved to, the trash meanwhile waits.
+    Only the trashed ones are answered."""
+    import contextlib
+    import types
+
+    locked: list[tuple] = []
+    bypassing: list = []
+
+    @contextlib.contextmanager
+    def skip_visibility_filter(session, *classes):
+        bypassing.append(tuple(c.__name__ for c in classes))
+        try:
+            yield
+        finally:
+            bypassing.pop()
+
+    def lock_row(model, entity_id):
+        locked.append((model.__name__, entity_id, tuple(bypassing)))
+        return {9: SimpleNamespace(deleted_at=datetime.fromisoformat(WHEN)),
+                11: SimpleNamespace(deleted_at=None)}.get(entity_id)
+
+    helpers = types.ModuleType("superset.models.helpers")
+    helpers.skip_visibility_filter = skip_visibility_filter
+    monkeypatch.setitem(sys.modules, "superset.models.helpers", helpers)
+    monkeypatch.setattr(writes, "_session", lambda: SimpleNamespace())
+    monkeypatch.setattr(writes, "lock_row", lock_row)
+    assert writes._trashed_chart_ids([11, 9, 12]) == [9]
+    assert locked == [("Slice", 9, (("Slice",),)), ("Slice", 11, (("Slice",),)), ("Slice", 12, (("Slice",),))]
+    locked.clear()
+    assert writes._trashed_chart_ids([]) == [] and locked == []
+
+
 # ---------------------------------------------------------------- who becomes an editor
 
 USER, ROLE, GROUP = stubs.SubjectType.USER, stubs.SubjectType.ROLE, stubs.SubjectType.GROUP

@@ -416,7 +416,7 @@ mnemiq's address.
 - **Build** a dashboard from a goal. mnemiq shows the plan before it makes anything, then the panel runs the build one
   step per request, with each chart's check, and links to the result. On a dashboard, a build goes onto the
   dashboard on screen when the goal is sent, unless "New dashboard" is ticked; off one, mnemiq may first offer a
-  dashboard that already covers the goal, to open, add to, or pass over.
+  dashboard that already covers the goal, with Open it, Add these charts to it, and Build a new one.
 - **The dashboard's measures**, on a dashboard the person can read: each measure mnemiq keeps there, with its
   definition and its value computed now under the person's own row rules, and Edit, Remove and Save to dataset.
   Remove deletes the charts that show the measure (into Superset's trash, where it keeps one), and takes a chart the
@@ -425,11 +425,13 @@ mnemiq's address.
   chart setting changed by hand is kept. A removal is a proposal the person confirms, and a chart to add is built
   onto the dashboard.
 - **Finish.** Closing the panel does not stop a build. Leaving or reloading the page stops it after the step in
-  flight, and the build stays resumable: the panel then lists the person's unfinished builds, each with Finish.
+  flight, and the build stays resumable: the panel then lists the person's unfinished builds (on a dashboard, that
+  dashboard's), each with Finish and Not now.
 - **What it keeps: nothing.** The conversation and a running build live in the page's memory for its life; a measure's
   value lives only in the open measures section. Nothing is written to browser storage.
 
-The forwarder is configured in Superset's `superset_config.py`:
+The forwarder is configured in Superset's `superset_config.py`, beside the token settings the extension's README lists
+(it mints each request's token with them):
 
 | Setting | What it is |
 |---|---|
