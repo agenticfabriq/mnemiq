@@ -269,6 +269,11 @@ still to come. In short:
     - To add this goal's charts to it anyway, ask again with its `dashboard_id`. A `dashboard_id` always means that:
       the goal's planned charts are added to the dashboard it names, beside the ones it has.
     - For a new dashboard, ask again with `"fresh": true`.
+  - Onto a dashboard, mnemiq first reads the charts it holds, as the builder, and leaves out each planned chart one of
+    them already shows: the same type and dataset, the same measures by definition, the same grouping and x-axis
+    columns, time grain, filters and row limit. The answer names each one left out and the chart that shows it
+    (`left_out`). A goal the dashboard shows whole builds nothing and is answered as `shown`. A chart mnemiq cannot
+    read the same way, a filter written in SQL among them, is never taken for a match, so the planned one is built.
   - Before anything is planned, mnemiq asks Superset whether the person may build at all; one who may not is
     refused with a 403 as a non-builder, and nothing about a dashboard they named is read. Then, with a
     `dashboard_id`, it asks whether they edit that dashboard. One they cannot read, or one that does not exist, is a
@@ -280,6 +285,49 @@ still to come. In short:
     needs a large window.
   - `POST /v1/superset/builds/{id}/next` runs the build's next step.
   - `GET /v1/superset/builds/{id}` reads the build as it stands.
+- **A dashboard's measures**, for any editor of the dashboard, each route asked with a token minted for building:
+  the list reads the dashboard's layout and charts, which a token minted for asking cannot (a 403 naming the scopes).
+  - `GET /v1/superset/dashboards/{id}/measures` lists the measures mnemiq keeps for the dashboard: each definition,
+    the charts on the dashboard that show it (by id and title, with each one's last check), and its value, computed
+    then as the person asking and kept nowhere. On a physical dataset the value is mnemiq's own statement, run through
+    Superset as that person, so Superset's row rules apply to it. On a virtual dataset it comes only through Superset:
+    a saved metric by Superset's query of the dataset, a written measure by a chart that shows it as one number.
+    Otherwise there is no value, and `value_note` says why.
+  - `POST .../measures/{name}/edit` takes `{label, expression, kind, currency?, description?}`. The new definition
+    passes mnemiq's measure checks first, and its label may be no other measure's on the dashboard. Every copy on a
+    chart that still matches the kept definition changes, and each changed chart is checked again; a copy changed by
+    hand is left and named. When a chart keeps changing under the edit, the charts already changed are put back and
+    the dashboard keeps the old definition, so its copies never differ.
+  - `POST .../measures/{name}/remove` takes `{chart_ids}`, the charts the person was shown, and answers 409 with the
+    charts the measure has now when they differ. It moves the charts that still show the measure to Superset's trash
+    (or deletes them for good where Superset keeps none, and says so), leaves a chart changed by hand and names it,
+    takes a chart the person does not edit off the dashboard instead and names it with its dataset and editors,
+    names a chart a report holds and leaves it, and deletes a dataset mnemiq made for the measure once no chart uses
+    it. A chart already in Superset's trash is no longer listed, and is taken off the layout as gone.
+  - `POST .../measures/{name}/save` adds the measure to its dataset as a saved metric, then switches every matching
+    copy to it. Asked again, it switches what is left onto a saved metric of the measure's own definition; one of the
+    name with another definition refuses it.
+  - Each action first asks whether the person edits every chart it would change (and, to save, the dataset). Edit
+    and Save change nothing unless they edit every chart that shows the measure, and name that chart's editors, so
+    the copies never split. No action runs while a build is building on the dashboard (409). Each answers
+    `changed`, `left_by_hand`, `not_editor` (each chart with its dataset, or a dataset, and the editors),
+    `blocked_by_report`, `could_not_read` and mnemiq's `message`.
+- **Changing a dashboard by chat**, for any editor of it. `POST /v1/superset/dashboards/{id}/changes` takes
+  `{request}`. The profile's model reads the request against the dashboard's charts as the person sees them (each
+  chart's title, type, table, measures by label, grouping, grain, row limit, filters, and the columns of its table
+  they may read; never an editor or a value from the data). mnemiq then writes only the settings the request names,
+  through the extension's `patch_chart`, which leaves every other setting, a hand edit among them, as it is.
+  - Only the settings a chart's type may have changed by chat are written, each with a value mnemiq reads as valid;
+    any other is dropped and named. A chart's type changes only when the request asks, and only among line, bar,
+    area and scatter. Filters are added to a chart's own, or dropped by column: the chart's other filters stay.
+  - A chart changed meanwhile is read again and changed once more; changed again, it is left and named. A chart the
+    person does not edit is named. A filter the chart already has is not added twice.
+  - Nothing is deleted on the model's reading: a chart the request asks to remove is answered under `would_remove`,
+    by id and title. Sent back as `{remove_chart_ids}`, once the person confirms, those charts go to Superset's trash
+    and off the layout (and the model is not asked); one a report holds is left, with the reason.
+  - A request for a chart the dashboard lacks is planned onto it and started as a build (`added`, as the start
+    route answers it), which the client runs step by step. When that planning fails, what the request changed is
+    still answered, and `added` holds the failure's status and sentence.
 - **Values a plan's repair is told.** The planning prompt holds no value read from the data's rows. When a plan
   filters on a value no row the builder can read holds, up to 20 values of that column, one the plan itself filtered,
   read as the builder, go to the one repair prompt and to the refused plan's answer: a hosted planning model sees them.

@@ -42,13 +42,15 @@ from mnemiq.superset.builder import start_build
 from mnemiq.superset.client import DelegatedToken, SupersetMcp
 from mnemiq.superset.extension import EXTENSION_TOOLS, TOOL_PREFIX
 from mnemiq.superset.grants import NOT_A_BUILDER
-from mnemiq.superset.planner import FakePlanner, LLMPlanner, PlanRefused, RefusedPart
+from mnemiq.superset.charts import Family, WrittenRef
+from mnemiq.superset.planner import BuildPlan, FakePlanner, LLMPlanner, PlanRefused, RefusedPart
 from tests.auth_keys import AUDIENCE, ISSUER, claims, jwks_for, mint, rsa_key
 from tests.superset_build_world import SNAPSHOT as WORLD_SNAPSHOT
 from tests.superset_build_world import TABLES, Clock, Hook, MemoryBuildStore, World
 from tests.superset_fake import FakeSuperset
 from tests.sweep.stub_model import StubModel
 from tests.superset_shared import (
+    BY_REGION,
     ONE_BAR,
     ROLE_DENIAL,
     SIGN_IN,
@@ -90,7 +92,15 @@ guard_fanout = true
 """
 
 BUILD_ROUTES = {("POST", "/v1/superset/builds"), ("GET", "/v1/superset/builds/{build_id}"),
-                ("POST", "/v1/superset/builds/{build_id}/next")}
+                ("POST", "/v1/superset/builds/{build_id}/next"),
+                ("GET", "/v1/superset/dashboards/{dashboard_id}/measures"),
+                ("POST", "/v1/superset/dashboards/{dashboard_id}/measures/{name}/edit"),
+                ("POST", "/v1/superset/dashboards/{dashboard_id}/measures/{name}/remove"),
+                ("POST", "/v1/superset/dashboards/{dashboard_id}/measures/{name}/save"),
+                ("POST", "/v1/superset/dashboards/{dashboard_id}/changes")}
+# Each measure action's body, as the panel sends it.
+ACTION_BODIES = {"edit": {"label": "Policies", "expression": "COUNT(DISTINCT policy_id)", "kind": "count"},
+                 "remove": {"chart_ids": [1]}, "save": {}, "changes": {"request": "show daily"}}
 # The calls that change something in Superset, which a refused request never makes. The build's probe of the
 # extension, its `create_dataset` with an empty request, changes nothing: `_writes` passes over it.
 WRITES = {"generate_chart", "create_dataset", "create_virtual_dataset",
@@ -248,10 +258,11 @@ def _routes(app) -> set[tuple[str, str]]:
 
 
 def _call(client, method: str, path: str, token: str | None):
-    path = path.replace("{build_id}", str(uuid.uuid4()))
+    action = path.rsplit("/", 1)[-1]
+    path = path.replace("{build_id}", str(uuid.uuid4())).replace("{dashboard_id}", "900").replace("{name}", "policies")
     headers = _bearer(token) if token is not None else {}
-    return client.post(path, json={"goal": GOAL}, headers=headers) if method == "POST" else client.get(path,
-                                                                                                    headers=headers)
+    body = ACTION_BODIES.get(action, {"goal": GOAL})
+    return client.post(path, json=body, headers=headers) if method == "POST" else client.get(path, headers=headers)
 
 
 # --- the routes there are, and where
@@ -811,6 +822,197 @@ def _run_to_the_end(client, build_id: str) -> list:
         if answers[-1].json()["build"]["status"] != "building":
             return answers
     raise AssertionError("the build did not end")
+
+
+def test_a_goal_the_dashboard_shows_whole_is_answered_and_nothing_is_kept(served, fake, world, store):
+    """Asked onto the dashboard a build made, for the goal it already shows: the answer names each part and the chart
+    that shows it, nothing is kept, and nothing is made."""
+    client, _ = served
+    first = _start(client).json()["build"]
+    final = _run_to_the_end(client, first["build_id"])[-1].json()["build"]
+    chart = next(step["object_id"] for step in final["steps"] if step["key"] == "policies_by_region")
+    builds, charts = len(store._builds), set(world.charts)
+    again = _start(client, dashboard_id=final["dashboard_id"])
+    assert again.status_code == 200, again.text
+    assert again.json() == {"shown": {
+        "dashboard_id": final["dashboard_id"],
+        "left_out": [{"part": "Policies by region", "chart_id": chart, "title": "Policies by region"}],
+        "message": (f"Dashboard {final['dashboard_id']} already shows every chart this goal plans, so nothing was "
+                    f"built: 'Policies by region' is its chart {chart}.")}}
+    assert len(store._builds) == builds and set(world.charts) == charts
+
+
+def test_a_build_onto_a_dashboard_names_what_it_left_out(served, fake, world, store):
+    """A plan of which the dashboard shows one chart builds the other and names the one left out beside the build."""
+    client, runtime = served
+    first = _start(client).json()["build"]
+    final = _run_to_the_end(client, first["build_id"])[-1].json()["build"]
+    chart = next(step["object_id"] for step in final["steps"] if step["key"] == "policies_by_region")
+    by_status = dataclasses.replace(BY_REGION, key="policies_by_status", title="Policies by status",
+                                    dimensions=("status",))
+    _planned(runtime, FakePlanner(BuildPlan(charts=(BY_REGION, by_status), measures=ONE_BAR.measures)))
+    again = _start(client, dashboard_id=final["dashboard_id"])
+    assert again.status_code == 201, again.text
+    assert again.json()["left_out"] == [{"part": "Policies by region", "chart_id": chart,
+                                         "title": "Policies by region"}]
+    assert [step["key"] for step in again.json()["build"]["steps"]] == ["dashboard", "policies_by_status", "layout",
+                                                                         "check"]
+
+
+def _a_built_dashboard(client) -> tuple[int, int]:
+    """`ONE_BAR` built through the routes: its dashboard's id and its chart's."""
+    first = _start(client).json()["build"]
+    final = _run_to_the_end(client, first["build_id"])[-1].json()["build"]
+    return final["dashboard_id"], next(step["object_id"] for step in final["steps"]
+                                       if step["key"] == "policies_by_region")
+
+
+def test_the_measures_route_answers_each_measure_with_its_value_and_charts(served, fake, world, store):
+    """The dashboard's measures, each with its definition, its value computed now and its charts by id, title and
+    check; the value is in the answer and nowhere in the store."""
+    client, _ = served
+    dashboard, chart = _a_built_dashboard(client)
+    r = client.get(f"/v1/superset/dashboards/{dashboard}/measures", headers=_bearer(_token()))
+    assert r.status_code == 200, r.text
+    [measure] = r.json()["measures"]
+    assert measure == {"name": "policies", "label": "Policies", "expression": "COUNT(policy_id)", "kind": "count",
+                       "currency": None, "description": "Policies written", "asked_by": measure["asked_by"],
+                       "dataset_id": 12, "saved_metric": None, "value": 7.0, "value_note": None,
+                       "charts": [{"chart_id": chart, "title": "Policies by region", "check": "checked"}]}
+    assert "7.0" not in json.dumps([dataclasses.asdict(row) for row in store.measures_for(
+        next(iter(store._builds))[0], dashboard)], default=str)
+
+
+def test_an_ask_token_reads_no_dashboards_measures(served, fake, world, store):
+    """The list reads the dashboard's layout and charts, which an ask token's scopes do not reach: it is refused as
+    made for asking, naming what it needs, before Superset is asked anything."""
+    client, _ = served
+    dashboard, _ = _a_built_dashboard(client)
+    before = len(fake.calls)
+    r = client.get(f"/v1/superset/dashboards/{dashboard}/measures", headers=_bearer(_token(scope=ASK_SCOPES)))
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"] == NOT_FOR_BUILDING
+    challenge = r.headers["www-authenticate"]
+    assert "superset:dashboard:read" in challenge and "superset:chart:read" in challenge
+    assert fake.calls[before:] == []
+
+
+def test_a_measure_action_by_a_non_editor_of_the_dashboard_is_refused_naming_its_editors(served, fake, world, store):
+    client, _ = served
+    dashboard, _ = _a_built_dashboard(client)
+    world.dashboards[dashboard]["editors"] = ["colleague"]
+    before = len(fake.calls)
+    r = client.post(f"/v1/superset/dashboards/{dashboard}/measures/policies/save", json={},
+                    headers=_bearer(_token()))
+    assert r.status_code == 403, r.text
+    assert "colleague" in r.json()["detail"]
+    assert not [call for call in fake.calls[before:] if call.tool in WRITES and call.request != {}]
+
+
+def test_a_remove_sent_other_charts_is_a_409_naming_the_charts_it_has(served, fake, world, store):
+    client, _ = served
+    dashboard, chart = _a_built_dashboard(client)
+    r = client.post(f"/v1/superset/dashboards/{dashboard}/measures/policies/remove", json={"chart_ids": [chart + 1]},
+                    headers=_bearer(_token()))
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["charts"] == [{"chart_id": chart, "title": "Policies by region", "check": "checked"}]
+    assert chart in world.charts
+
+
+def test_an_edit_is_answered_with_what_it_changed(served, fake, world, store):
+    client, _ = served
+    dashboard, chart = _a_built_dashboard(client)
+    r = client.post(f"/v1/superset/dashboards/{dashboard}/measures/policies/edit", json=ACTION_BODIES["edit"],
+                    headers=_bearer(_token()))
+    assert r.status_code == 200, r.text
+    assert r.json()["changed"] == [chart] and r.json()["not_editor"] == [] and r.json()["message"]
+    refused = client.post(f"/v1/superset/dashboards/{dashboard}/measures/policies/edit",
+                          json={**ACTION_BODIES["edit"], "expression": "policy_id"}, headers=_bearer(_token()))
+    assert refused.status_code == 422 and "refused" in refused.json()["detail"]
+    unknown = client.post(f"/v1/superset/dashboards/{dashboard}/measures/nothing/save", json={},
+                          headers=_bearer(_token()))
+    assert unknown.status_code == 404 and unknown.json()["detail"] == "This dashboard keeps no measure of that name."
+
+
+def test_a_change_by_chat_is_answered_with_what_it_changed(served, fake, world, store):
+    """The profile's interpreter reads the request; the setting it names is written alone, and the answer says so."""
+    from mnemiq.superset.chart_change import ChartChange, FakeInterpreter, Interpretation
+
+    client, runtime = served
+    dashboard, chart = _a_built_dashboard(client)
+    interpreter = FakeInterpreter(Interpretation(changes=(ChartChange(chart_id=chart, set={"row_limit": 2}),)))
+    runtime.profiles[runtime.default_profile].interpreter = interpreter
+    r = client.post(f"/v1/superset/dashboards/{dashboard}/changes", json={"request": "only the top two regions"},
+                    headers=_bearer(_token()))
+    assert r.status_code == 200, r.text
+    assert r.json()["changed"] == [chart] and r.json()["added"] is None and r.json()["message"]
+    assert interpreter.requests == ["only the top two regions"]
+    assert world.charts[chart]["params"]["row_limit"] == 2
+
+
+def test_add_a_funnel_by_chat(served, fake, world, store):
+    """A request the interpreter reads as adding a chart is planned onto the dashboard and started as a build; run,
+    the funnel is made by the extension and laid out on the same dashboard."""
+    from mnemiq.superset.chart_change import FakeInterpreter, Interpretation
+    from tests.superset_shared import POLICIES, _chart
+
+    client, runtime = served
+    dashboard, _ = _a_built_dashboard(client)
+    funnel = _chart("policies_by_status", Family.FUNNEL, "Policies by status", 12, (WrittenRef(POLICIES),),
+                    dimensions=("status",))
+    _planned(runtime, FakePlanner(BuildPlan(charts=(funnel,), measures=(POLICIES,))))
+    runtime.profiles[runtime.default_profile].interpreter = FakeInterpreter(Interpretation(add_chart=True))
+    r = client.post(f"/v1/superset/dashboards/{dashboard}/changes", json={"request": "add a funnel of policies by "
+                                                                                     "status"},
+                    headers=_bearer(_token()))
+    assert r.status_code == 200, r.text
+    build = r.json()["added"]["build"]
+    assert build["dashboard_id"] == dashboard
+    final = _run_to_the_end(client, build["build_id"])[-1].json()["build"]
+    assert final["status"] == "done", final
+    made = next(step["object_id"] for step in final["steps"] if step["key"] == "policies_by_status")
+    [created] = [call.request for call in world.calls("create_chart") if call.request.get("viz_type") == "funnel"]
+    assert created["dashboard_id"] == dashboard and world.charts[made]["viz_type"] == "funnel"
+    assert made in world.dashboards[dashboard]["members"] and world.calls("set_layout")
+
+
+def test_an_action_while_a_build_onto_the_dashboard_runs_is_a_409(served, fake, world, store):
+    """A build keeps the dashboard's measures as it last writes them, so no action changes them while one is building
+    on the dashboard: each is refused, as a second build is, before Superset is asked to change anything."""
+    client, _ = served
+    dashboard, chart = _a_built_dashboard(client)
+    _stored(store, client, dashboard_id=dashboard)
+    before = len(fake.calls)
+    for path, body in ((f"/v1/superset/dashboards/{dashboard}/measures/policies/save", {}),
+                       (f"/v1/superset/dashboards/{dashboard}/measures/policies/remove", {"chart_ids": [chart]}),
+                       (f"/v1/superset/dashboards/{dashboard}/changes", {"request": "show daily"})):
+        r = client.post(path, json=body, headers=_bearer(_token()))
+        assert r.status_code == 409, (path, r.text)
+        assert r.json()["detail"] == DASHBOARD_BUSY
+    assert not [call for call in fake.calls[before:] if call.tool in WRITES and call.request != {}]
+
+
+def test_a_chat_change_whose_added_chart_cannot_be_planned_still_reports_its_changes(served, fake, world, store):
+    """The settings a request changed are reported even when the chart it adds could not be planned: the planning's
+    refusal is answered under `added`, not as the request's whole answer."""
+    from mnemiq.llm.client import ModelUnavailable
+    from mnemiq.superset.chart_change import ChartChange, FakeInterpreter, Interpretation
+
+    client, runtime = served
+    dashboard, chart = _a_built_dashboard(client)
+
+    class Down:
+        def plan(self, goal, context):
+            raise ModelUnavailable("down", kind="unavailable")
+
+    runtime.profiles[runtime.default_profile].planner = Down()
+    runtime.profiles[runtime.default_profile].interpreter = FakeInterpreter(Interpretation(
+        changes=(ChartChange(chart_id=chart, set={"row_limit": 2}),), add_chart=True))
+    r = client.post(f"/v1/superset/dashboards/{dashboard}/changes", json={"request": "top two, and a funnel"},
+                    headers=_bearer(_token()))
+    assert r.status_code == 200, r.text
+    assert r.json()["changed"] == [chart]
+    assert r.json()["added"] == {"error": {"status": 503, "detail": MODEL_UNAVAILABLE}}
 
 
 def test_a_build_keeps_the_profile_it_started_with(profiled, fake, world, store, monkeypatch):

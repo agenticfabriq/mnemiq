@@ -52,7 +52,7 @@ from agenticfabriq.mnemiq import writes as extension_writes  # noqa: E402
 TOKEN = "tok-builder"
 FRESH_TOKEN = "tok-builder-signed-in-again"
 # Who each bearer is, to Superset: a fresh sign-in is the same person.
-USERS = {TOKEN: "builder", FRESH_TOKEN: "builder", "tok-colleague": "colleague"}
+USERS = {TOKEN: "builder", FRESH_TOKEN: "builder", "tok-colleague": "colleague", "tok-west": "west", "tok-east": "east"}
 DATABASE_ID = 7
 SCHEMA = "public"
 POLICY_DATASET = 12
@@ -180,6 +180,11 @@ class MemoryBuildStore:
                    "created_at": now, "updated_at": now}
             self._builds[(tenant, build_id)] = row
             return self._stored(row)
+
+    def dashboard_building(self, tenant, dashboard_id) -> bool:
+        with self._lock:
+            self._release_abandoned(tenant, dashboard_id)
+            return self._live_on(tenant, dashboard_id)
 
     def _release_abandoned(self, tenant: str, dashboard_id: int) -> None:
         """`build_store._release_abandoned`: each build of the dashboard still building, untouched for
@@ -332,6 +337,11 @@ class World:
         self.without_leave_out = False
         self.charts: dict[int, dict] = {}
         self.dashboards: dict[int, dict] = {}
+        # A row rule on `policy` for each user it applies to, as SQL Superset adds to every statement and chart query
+        # that user runs over the table; and the charts an alert or a report holds, which `delete_chart` refuses.
+        self.user_rules: dict[str, str] = {}
+        self.reported: set[int] = set()
+        self.trashed: dict[int, dict] = {}
         self.hooks: dict[str, Hook] = {}
         # A chart's numbers a test puts off: chart title to the amount added to its first row's last value.
         self.skewed: dict[str, float] = {}
@@ -461,9 +471,10 @@ class World:
                  "list_dashboards": self._list_dashboards, "generate_chart": self._generate_chart,
                  "create_dataset": self._create_dataset, "create_virtual_dataset": self._create_virtual_dataset,
                  "execute_sql": self._execute_sql}
+        plain["delete_chart"] = self._delete_chart
         extension = {"create_dashboard": self._create_dashboard, "create_dataset": self._make_dataset,
                      "create_chart": self._create_chart, "patch_chart": self._patch_chart,
-                     "add_saved_metric": self._add_saved_metric,
+                     "add_saved_metric": self._add_saved_metric, "delete_dataset": self._delete_dataset,
                      "set_layout": self._set_layout, "dataset_metrics": self._dataset_metrics,
                      "get_layout": self._get_layout, "editors_of": self._editors_of,
                      "row_rules": self._row_rules}
@@ -587,7 +598,9 @@ class World:
 
     def form_data(self, dataset_id: int, config: dict) -> dict:
         """The `form_data` MCP's mappers write for the configs a build sends (`map_xy_config`, `map_pie_config`,
-        `map_big_number_config`, `map_table_config`, `map_gauge_config`, `map_treemap_config`)."""
+        `map_big_number_config`, `map_table_config`, `map_gauge_config`, `map_treemap_config`), each row limit a config
+        leaves unset as its `*ChartConfig.row_limit` default, and a pie's, gauge's and treemap's `sort_by_metric` as
+        its default, true (`superset/mcp_service/chart/schemas.py`)."""
         kind = config["chart_type"]
         if kind == "xy":
             viz = {"line": "echarts_timeseries_line", "bar": "echarts_timeseries_bar", "area": "echarts_area",
@@ -609,7 +622,8 @@ class World:
         elif kind == "pie":
             form = {"viz_type": "pie", "groupby": [config["dimension"]["name"]], "metric": self._metric(config["metric"]),
                     "number_format": config.get("number_format", "SMART_NUMBER"), "row_limit": config.get("row_limit", 100),
-                    "show_total": False, "donut": False, "show_labels": True}
+                    "show_total": False, "donut": False, "show_labels": True,
+                    "sort_by_metric": config.get("sort_by_metric", True)}
         elif kind == "big_number":
             form = {"viz_type": "big_number_total", "metric": self._metric(config["metric"])}
             if config.get("y_axis_format"):
@@ -617,15 +631,17 @@ class World:
         elif kind == "gauge":
             form = {"viz_type": "gauge_chart", "metric": self._metric(config["metric"]),
                     "groupby": [c["name"] for c in config.get("groupby") or []],
-                    "number_format": config.get("number_format", "SMART_NUMBER"), "row_limit": 10}
+                    "number_format": config.get("number_format", "SMART_NUMBER"), "row_limit": 10,
+                    "sort_by_metric": config.get("sort_by_metric", True)}
         elif kind == "treemap_v2":
             form = {"viz_type": "treemap_v2", "groupby": [c["name"] for c in config["groupby"]],
-                    "metric": self._metric(config["metric"]), "row_limit": 10000}
+                    "metric": self._metric(config["metric"]), "row_limit": config.get("row_limit", 100),
+                    "sort_by_metric": config.get("sort_by_metric", True)}
         elif kind == "table":
             names = [c["name"] for c in config["columns"] if "name" in c and not c.get("saved_metric")]
             metrics = [self._metric(c) for c in config["columns"] if c.get("saved_metric") or c.get("sql_expression")]
             form = {"viz_type": "table", "query_mode": "aggregate", "all_columns": names, "groupby": names,
-                    "metrics": metrics, "row_limit": config.get("row_limit", 10000)}
+                    "metrics": metrics, "row_limit": config.get("row_limit", 1000)}
             if config.get("column_config"):
                 form["column_config"] = copy.deepcopy(config["column_config"])
         else:
@@ -834,9 +850,55 @@ class World:
         return {"ok": True}
 
     def _add_saved_metric(self, request: dict, user: str) -> dict:
+        """The extension's `add_saved_metric`: the dataset's editors only, once its `changed_on` is the one read, a
+        name the dataset already has refused."""
         found = extension_writes.read("add_saved_metric", request)
-        self.datasets[found["dataset_id"]]["metrics"].append(dict(found["metric"]))
+        dataset = self.datasets.get(found["dataset_id"])
+        if dataset is None:
+            return {"not_found": "dataset"}
+        if not self._editor_of(dataset, user):
+            return {"not_editor": True, "editors": sorted(dataset["editors"])}
+        if dataset["changed_on"] != found["expect_changed_on"]:
+            return {"stale": True}
+        if any(m["metric_name"] == found["metric"]["metric_name"] for m in dataset["metrics"]):
+            return {"exists": True}
+        metric = {"verbose_name": None, "d3format": None, "currency": None, "certified_by": None,
+                  "certification_details": None, "warning_text": None, "description": None, **found["metric"]}
+        dataset["metrics"].append(metric)
+        dataset["changed_on"] = self._stamp()
         return {"ok": True}
+
+    def _delete_dataset(self, request: dict, user: str) -> dict:
+        """The extension's `delete_dataset`: a dataset whose marker names this dashboard, once no chart uses it."""
+        found = extension_writes.read("delete_dataset", request)
+        dataset = self.datasets.get(found["dataset_id"])
+        if dataset is None:
+            return {"not_found": "dataset"}
+        if not self._editor_of(dataset, user):
+            return {"not_editor": True, "editors": sorted(dataset["editors"])}
+        marker = extension_params.parse_marker(dataset["description"])
+        if marker is None:
+            return {"refused": "no_marker"}
+        if marker.dashboard_id != found["dashboard_id"]:
+            return {"refused": "another_dashboard"}
+        if in_use := sorted(c["id"] for c in self.charts.values() if c["datasource_id"] == dataset["id"]):
+            return {"in_use": True, "chart_ids": in_use}
+        del self.datasets[dataset["id"]]
+        return {"ok": True, "soft_deleted": True}
+
+    def _delete_chart(self, request: dict, user: str) -> dict:
+        """MCP's `delete_chart` under `SOFT_DELETE`: the chart's editors only, a chart a report holds refused; the
+        chart goes to the trash and stays a member of its dashboards, as rc2 keeps it."""
+        chart = self.charts.get(request["identifier"])
+        if chart is None:
+            return {"success": False, "error": "No chart found", "error_type": "NotFound"}
+        if not self._editor_of(chart, user):
+            return {"success": False, "permission_denied": True, "error": "no", "error_type": "Forbidden"}
+        if chart["id"] in self.reported:
+            return {"success": False, "error": "reports exist", "error_type": "ReportsExist"}
+        self.trashed[chart["id"]] = self.charts.pop(chart["id"])
+        return {"success": True, "deleted_id": chart["id"], "deleted_name": chart["slice_name"],
+                "soft_deleted": True}
 
     def _get_layout(self, request: dict, user: str) -> dict:
         found = extension_reads.read("get_layout", request)
@@ -848,9 +910,11 @@ class World:
 
     def _editors_of(self, request: dict, user: str) -> dict:
         found = extension_reads.read("editors_of", request)
-        answer = {"charts": [{"chart_id": i, "editors": sorted(self.charts[i]["editors"])}
+        answer = {"charts": [{"chart_id": i, "is_editor": user in self.charts[i]["editors"],
+                              "editors": sorted(self.charts[i]["editors"])}
                              for i in found["chart_ids"] if i in self.charts],
-                  "datasets": [{"dataset_id": i, "editors": sorted(self.datasets[i]["editors"])}
+                  "datasets": [{"dataset_id": i, "is_editor": user in self.datasets[i]["editors"],
+                                "editors": sorted(self.datasets[i]["editors"])}
                                for i in found["dataset_ids"] if i in self.datasets]}
         if found["dashboard_ids"]:
             answer["dashboards"] = [{"dashboard_id": i, "is_editor": user in self.dashboards[i]["editors"],
@@ -893,7 +957,7 @@ class World:
             # A rebuild from form_data is rc2's, not the world's: no chart a build makes is left without a query.
             return {"error": "the world rebuilds no query", "error_type": "NoQueryContext"}
         dataset = self.datasets[chart["datasource_id"]]
-        results = [self._run_query(query, dataset) for query in chart["query_context"]["queries"]]
+        results = [self._run_query(query, dataset, user) for query in chart["query_context"]["queries"]]
         columns, rows = results[0]
         if chart["slice_name"] in self.skewed and rows:
             last = columns[-1]
@@ -908,7 +972,25 @@ class World:
                                        for i, (c, r) in enumerate(results)]
         return answer
 
-    def _run_query(self, query: dict, dataset: dict) -> tuple[list[str], list[dict]]:
+    def _as(self, user: str, sql: str) -> tuple[list, list]:
+        """`sql` run as `user`, its cursor's description and rows: with a row rule of theirs, the name `policy` reads
+        the rows it keeps (a view in a schema of their own, first on the search path), as Superset adds the rule to
+        every statement they run."""
+        rule = self.user_rules.get(user)
+        if rule is None:
+            cursor = self.db.execute(sql)
+            return cursor.description, cursor.fetchall()
+        schema = f"ruled_{user}"
+        self.db.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+        self.db.execute(f'CREATE OR REPLACE VIEW "{schema}"."policy" AS SELECT * FROM main."policy" WHERE {rule}')
+        self.db.execute(f"SET search_path = '{schema},main'")
+        try:
+            cursor = self.db.execute(sql)
+            return cursor.description, cursor.fetchall()
+        finally:
+            self.db.execute("SET search_path = 'main'")
+
+    def _run_query(self, query: dict, dataset: dict, user: str = "builder") -> tuple[list[str], list[dict]]:
         """A query of a saved query context, as Superset compiles one for a physical dataset."""
         saved = {m["metric_name"]: m["expression"] for m in dataset["metrics"]}
         selected, labels, groups = [], [], []
@@ -960,7 +1042,7 @@ class World:
             sql += " ORDER BY " + ", ".join(order or groups)
         if query.get("row_limit"):
             sql += f" LIMIT {int(query['row_limit'])}"
-        found = self.db.execute(sql).fetchall()
+        found = self._as(user, sql)[1]
         return labels, [{label: self._json(v) for label, v in zip(labels, row)} for row in found]
 
     @staticmethod
@@ -979,11 +1061,10 @@ class World:
         if request.get("force_refresh") or request.get("dry_run") or sql.rstrip().endswith(
                 "AS mnemiq_probe WHERE 1 = 0"):
             return EMPTY
-        cursor = self.db.execute(sql)
-        names = [d[0] for d in cursor.description]
-        rows = cursor.fetchall()
+        described, rows = self._as(user, sql)
+        names = [d[0] for d in described]
         types = []
-        for index, description in enumerate(cursor.description):
+        for index, description in enumerate(described):
             kind = str(description[1]).upper()
             types.append("datetime64[ns]" if "TIMESTAMP" in kind else "int64" if "INT" in kind
                          else "float64" if kind in ("DOUBLE", "FLOAT") or kind.startswith("DECIMAL") else "object")

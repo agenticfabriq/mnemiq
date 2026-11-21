@@ -81,8 +81,8 @@ from mnemiq.superset.display_format import CANNOT_TELL, Displayed, displayed, fi
 from mnemiq.superset.measures import Measure, MeasureKind, measure_statement, run_decided
 from mnemiq.superset.saved_metrics import SavedMetric
 
-__all__ = ["ChartCheck", "ChartStatus", "DatasetFacts", "Expectation", "NotCheckable", "check_chart",
-           "expectation_from_form_data", "percent_problem", "read_dataset_facts"]
+__all__ = ["ChartCheck", "ChartRead", "ChartStatus", "DatasetFacts", "Expectation", "NotCheckable", "check_chart",
+           "dataset_of", "expectation_from_form_data", "percent_problem", "read_chart", "read_dataset_facts"]
 
 logger = logging.getLogger(__name__)
 
@@ -161,29 +161,60 @@ def _log_error(what: str, answer: dict) -> None:
                    answer.get("error") or answer.get("message"))
 
 
-def _read_chart(client, chart_id: int) -> tuple[str, dict] | NotCheckable:
-    """The chart's type and `form_data`, the type as the chart row holds it (`get_chart_data` reads it the same way)."""
+@dataclass(frozen=True)
+class ChartRead:
+    """A chart as `get_chart_info` gives it to the caller: its title, its type as the chart row holds it
+    (`get_chart_data` reads it the same way), its `form_data` with that type, and its `changed_on`. `form_data` is None
+    when it cannot be read whole, and `unreadable` then says why, in mnemiq's words."""
+
+    chart_id: int
+    title: str | None
+    viz_type: str
+    form_data: dict | None
+    changed_on: str | None
+    unreadable: str | None = None
+    # Superset holds no chart of this id that the caller may read: deleted, or in the trash (rc2's soft-delete filter
+    # hides a trashed chart from every read), or never theirs to read.
+    missing: bool = False
+
+
+def read_chart(client, chart_id: int) -> ChartRead:
+    """The chart, read as the caller: never raised over a failed or cut read, which is answered as unreadable."""
     try:
         answer = client.call("get_chart_info", {"identifier": chart_id, "select_columns": _CHART_FIELDS})
     except (SupersetUnavailable, SupersetToolError) as failure:
-        return NotCheckable(f"{_UNREADABLE}{failure}")
+        return ChartRead(chart_id, None, "", None, None, f"{_UNREADABLE}{failure}")
     if _failed(answer):
         _log_error("get_chart_info", answer)
-        return NotCheckable(f"{_UNREADABLE}Superset answered with an error, which is in the log")
+        missing = str(answer.get("error_type") or "").replace("_", "").lower() == "notfound"
+        return ChartRead(chart_id, None, "", None, None,
+                         f"{_UNREADABLE}Superset answered with an error, which is in the log", missing=missing)
+    title = answer.get("slice_name") if isinstance(answer.get("slice_name"), str) else None
+    changed_on = answer.get("changed_on") if isinstance(answer.get("changed_on"), str) else None
     form = answer.get("form_data")
+    viz_type = answer.get("viz_type") or (form.get("viz_type") if isinstance(form, dict) else None) or ""
     if answer.get("_response_truncated") or (isinstance(form, dict) and form.get("_truncated")):
         # The size guard (`truncate_oversized_response` in `superset/mcp_service/utils/response_size_utils.py`) clips
         # strings and summarizes dicts anywhere in the answer, `form_data` among them.
-        return NotCheckable(f"{_UNREADABLE}Superset cut them to fit its response size")
+        return ChartRead(chart_id, title, viz_type, None, changed_on,
+                         f"{_UNREADABLE}Superset cut them to fit its response size")
     if not isinstance(form, dict):
         # `redact_chart_data_model_fields` (`superset/mcp_service/privacy.py`) withholds them from a caller without
         # the data-model privilege.
-        return NotCheckable(f"{_UNREADABLE}Superset does not show them to this builder")
-    viz_type = answer.get("viz_type") or form.get("viz_type") or ""
-    return viz_type, {**form, "viz_type": viz_type}
+        return ChartRead(chart_id, title, viz_type, None, changed_on,
+                         f"{_UNREADABLE}Superset does not show them to this builder")
+    return ChartRead(chart_id, title, viz_type, {**form, "viz_type": viz_type}, changed_on)
 
 
-def _dataset_of(form: dict, dataset_id: int) -> int | NotCheckable:
+def _read_chart(client, chart_id: int) -> tuple[str, dict] | NotCheckable:
+    """The chart's type and `form_data`, or why they cannot be read."""
+    read = read_chart(client, chart_id)
+    if read.form_data is None:
+        return NotCheckable(read.unreadable or _UNREADABLE)
+    return read.viz_type, read.form_data
+
+
+def dataset_of(form: dict, dataset_id: int) -> int | NotCheckable:
     """The dataset the chart reads now: the one its `form_data` names once saved in Explore, as
     `resolve_form_data_datasource` reads it, else the one mnemiq built it on (MCP's `generate_chart` saves no
     `datasource` in the chart's params, and `get_chart_info` returns no dataset id)."""
@@ -678,7 +709,7 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
     def not_checked(reason: str) -> ChartCheck:
         return _outcome(chart_id, ChartStatus.NOT_CHECKED, reason)
 
-    dataset_id = _dataset_of(form, dataset_id)
+    dataset_id = dataset_of(form, dataset_id)
     if isinstance(dataset_id, NotCheckable):
         return not_checked(dataset_id.reason)
     dataset = read_dataset_facts(client, dataset_id)

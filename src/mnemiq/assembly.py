@@ -16,6 +16,7 @@ from mnemiq.generate.generator import LLMGenerator
 from mnemiq.llm.client import LLMClient
 from mnemiq.semantic.fit import PromptFitter, fitter_for
 from mnemiq.semantic.values import NoValueIndex, ValueIndex
+from mnemiq.superset.chart_change import LLMChangeInterpreter
 from mnemiq.superset.planner import LLMPlanner
 
 
@@ -33,6 +34,8 @@ class Components:
     # Superset mode's dashboard planner, on the profile's own client, so a build is planned by the
     # model of the profile it was asked under. Nothing calls it outside a build.
     planner: LLMPlanner
+    # Superset mode's reader of a change asked of a dashboard by chat, on the same client.
+    interpreter: LLMChangeInterpreter
 
 
 def build_components(settings: Settings, adapter, con) -> Components:
@@ -50,4 +53,4 @@ def build_components(settings: Settings, adapter, con) -> Components:
                       corrector=LLMCorrector(client), values=ValueIndex(con),
                       selector=LLMSelector(client),
                       fitter=fitter_for(settings, getattr(adapter, "dialect", "duckdb")),
-                      planner=LLMPlanner(client))
+                      planner=LLMPlanner(client), interpreter=LLMChangeInterpreter(client))
