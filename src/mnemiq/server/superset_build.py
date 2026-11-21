@@ -1,5 +1,7 @@
 """Superset mode's build routes: a builder's goal to a checked plan and a build of it, the build run one step per
-request, and the build as it stands. Mounted only in Superset mode, and no other route under `/v1/superset/`.
+request, and the build as it stands; and a dashboard's measures, listed with each value computed for the person
+asking, and edited, removed or saved to their dataset (`measure_actions`). Mounted only in Superset mode, and no other
+route under `/v1/superset/`.
 
 - `POST /v1/superset/builds` takes `{goal, dashboard_id?, fresh?, profile?}`. Asked with neither `dashboard_id` nor
   `fresh`, the plan may offer a dashboard the builder can see that already covers the goal: the answer is then the
@@ -37,6 +39,11 @@ read once per request. The `GET` calls nothing.
 under, picked again at every step as `/v1/ask` picks one: a profile gone or no longer offered to the builder refuses
 the step (422) before Superset is asked anything.
 
+**A dashboard's measures.** `GET /v1/superset/dashboards/{id}/measures` needs `db.read` only; each action
+(`POST .../measures/{name}/edit`, `remove`, `save`) needs the write scopes too, and is asked only once Superset said the
+person edits the dashboard, as a build onto it is. A measure as `_measure` writes it, an action's outcome as `_result`
+writes it.
+
 **What is answered.** A build as `_build` writes it, and nothing else: `build_id`, `status` and `dashboard_id`; its
 `steps`, each `key`, `kind`, `status`, `object_id` (what the step made), `started_at` and `lease_until` (when a running
 step's lease passes); `checks`, each chart's check status by chart id; `ran`, the step this request ran, and `message`,
@@ -50,7 +57,7 @@ import logging
 from typing import Annotated, Any
 
 import psycopg
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, HTTPException, Path, Response
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, model_validator
 
 from mnemiq.llm.client import ModelUnavailable
@@ -63,6 +70,20 @@ from mnemiq.superset.client import SupersetToolError
 from mnemiq.superset.dashboard_charts import LeftOut, datasets_built_on
 from mnemiq.superset.executor import SupersetCredentialMissing, superset_executor
 from mnemiq.superset.extension import ExtensionMissing, dashboard_editorship, require_build_tools
+from mnemiq.superset.measure_actions import (
+    ActionRefused,
+    ActionResult,
+    Asking,
+    ChartsChanged,
+    MeasureNotFound,
+    MeasureView,
+    edit_measure,
+    list_measures,
+    remove_measure,
+    save_measure,
+)
+from mnemiq.superset.measure_actions import DashboardUnreadable as _MeasuresUnreadable
+from mnemiq.superset.measures import MAX_LABEL, MeasureKind
 from mnemiq.superset.planner import MAX_GOAL, BuildPlan, PlanContext, PlanRefused, plan_build
 
 __all__ = ["WRITE_SCOPES", "mount_superset_build"]
@@ -130,6 +151,50 @@ class StartBody(BaseModel):
         if self.fresh and self.dashboard_id is not None:
             raise ValueError("name a dashboard to add charts to, or ask for a fresh one, not both")
         return self
+
+
+class EditBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: Annotated[StrictStr, Field(min_length=1, max_length=MAX_LABEL)]
+    expression: Annotated[StrictStr, Field(min_length=1, max_length=4000)]
+    kind: MeasureKind
+    currency: Annotated[StrictStr, Field(pattern=r"^[A-Z]{3}$")] | None = None
+    description: Annotated[StrictStr, Field(max_length=2000)] = ""
+
+
+class RemoveBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # The charts the person was shown, which must be the measure's charts now.
+    chart_ids: Annotated[list[Annotated[StrictInt, Field(gt=0, le=MAX_ID)]], Field(max_length=250)]
+
+
+class SaveBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+# A measure's name in a path, as the store keeps it: a written measure's name, or a reused saved metric's
+# `<metric>@<dataset id>`.
+_MEASURE_NAME = r"^[A-Za-z0-9_.@-]{1,250}$"
+
+
+def _measure(view: MeasureView) -> dict:
+    """A measure as the measures route answers it, every field named here."""
+    m = view.measure
+    return {"name": m.name, "label": m.label, "expression": m.expression, "kind": str(m.kind),
+            "currency": m.currency, "description": m.description, "asked_by": m.asked_by, "dataset_id": m.dataset_id,
+            "saved_metric": view.saved_metric, "value": view.value, "value_note": view.value_note,
+            "charts": [{"chart_id": c.chart_id, "title": c.title, "check": str(c.check) if c.check else None}
+                       for c in view.charts]}
+
+
+def _result(result: ActionResult) -> dict:
+    return {"changed": list(result.changed), "left_by_hand": list(result.left_by_hand),
+            "not_editor": [{**({"chart_id": e.chart_id} if e.chart_id is not None else {"dataset_id": e.dataset_id}),
+                            "editors": list(e.editors)} for e in result.not_editor],
+            "blocked_by_report": list(result.blocked_by_report), "could_not_read": list(result.could_not_read),
+            "message": result.message}
 
 
 class _Offering:
@@ -210,8 +275,16 @@ def _refusal(exc: Exception, doors) -> HTTPException | None:
     `/v1` route answers them (`v1_refusals.refused`). None for anything else, which stays a 500."""
     if isinstance(exc, (BuildBusy, DashboardBusy)):
         return HTTPException(status_code=409, detail=str(exc))
-    if isinstance(exc, BuildNotFound):
+    if isinstance(exc, (BuildNotFound, MeasureNotFound)):
         return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, _MeasuresUnreadable):
+        return HTTPException(status_code=404, detail=NO_SUCH_DASHBOARD)
+    if isinstance(exc, ChartsChanged):
+        return HTTPException(status_code=409, detail={
+            "message": str(exc), "charts": [{"chart_id": c.chart_id, "title": c.title,
+                                             "check": str(c.check) if c.check else None} for c in exc.charts]})
+    if isinstance(exc, ActionRefused):
+        return HTTPException(status_code=422, detail=str(exc))
     if isinstance(exc, DashboardUnreadable):
         return HTTPException(status_code=404, detail=NO_SUCH_DASHBOARD)
     if isinstance(exc, NotAnEditor):  # Superset's answer, in mnemiq's words: a 403 like every `/v1` one
@@ -325,3 +398,41 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
                                               snapshot=runtime.snapshot, grants=grants, settings=profile.settings))}
 
         return answered(work)
+
+    def asking(asking_, dashboard_id: int, *, changing: bool) -> Asking:
+        """Who asks about dashboard `dashboard_id`, once Superset said they may build and, for a change, that they
+        edit the dashboard (its editors named when they do not)."""
+        who, delegation = _builder(asking_, building=changing)
+        builds = kept()
+        profile = runtime.build_profile(None, who)
+        adapter = superset_executor(deployment, delegation)
+        grants = runtime.builder_grants(adapter)
+        if changing:
+            require_build_tools(adapter.client)
+            _held_to_its_editors(adapter.client, dashboard_id)
+        return Asking(adapter=adapter, store=builds, tenant=who.tenant_id, principal=who.principal_id,
+                      dashboard_id=dashboard_id, snapshot=runtime.snapshot, grants=grants, settings=profile.settings)
+
+    @app.get("/v1/superset/dashboards/{dashboard_id}/measures")
+    def measures(dashboard_id: Annotated[int, Path(gt=0, le=MAX_ID)], asking_=Depends(asker)) -> dict:
+        """The dashboard's measures, each value computed now as the person asking and kept nowhere."""
+        return answered(lambda: {"measures": [_measure(view) for view in
+                                              list_measures(asking(asking_, dashboard_id, changing=False))]})
+
+    @app.post("/v1/superset/dashboards/{dashboard_id}/measures/{name}/edit")
+    def edit(dashboard_id: Annotated[int, Path(gt=0, le=MAX_ID)],
+             name: Annotated[str, Path(pattern=_MEASURE_NAME)], body: EditBody, asking_=Depends(asker)) -> dict:
+        return answered(lambda: _result(edit_measure(asking(asking_, dashboard_id, changing=True), name,
+                                                     label=body.label, expression=body.expression, kind=body.kind,
+                                                     currency=body.currency, description=body.description)))
+
+    @app.post("/v1/superset/dashboards/{dashboard_id}/measures/{name}/remove")
+    def remove(dashboard_id: Annotated[int, Path(gt=0, le=MAX_ID)],
+               name: Annotated[str, Path(pattern=_MEASURE_NAME)], body: RemoveBody, asking_=Depends(asker)) -> dict:
+        return answered(lambda: _result(remove_measure(asking(asking_, dashboard_id, changing=True), name,
+                                                       chart_ids=body.chart_ids)))
+
+    @app.post("/v1/superset/dashboards/{dashboard_id}/measures/{name}/save")
+    def save(dashboard_id: Annotated[int, Path(gt=0, le=MAX_ID)],
+             name: Annotated[str, Path(pattern=_MEASURE_NAME)], body: SaveBody, asking_=Depends(asker)) -> dict:
+        return answered(lambda: _result(save_measure(asking(asking_, dashboard_id, changing=True), name)))

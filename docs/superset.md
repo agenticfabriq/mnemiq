@@ -285,6 +285,25 @@ still to come. In short:
     needs a large window.
   - `POST /v1/superset/builds/{id}/next` runs the build's next step.
   - `GET /v1/superset/builds/{id}` reads the build as it stands.
+- **A dashboard's measures**, for any editor of the dashboard.
+  - `GET /v1/superset/dashboards/{id}/measures` lists the measures mnemiq keeps for the dashboard: each definition,
+    the charts on the dashboard that show it (by id and title, with each one's last check), and its value, computed
+    then as the person asking and kept nowhere. On a physical dataset the value is mnemiq's own statement, run through
+    Superset as that person, so Superset's row rules apply to it. On a virtual dataset it comes only through Superset:
+    a saved metric by Superset's query of the dataset, a written measure by a chart that shows it as one number.
+    Otherwise there is no value, and `value_note` says why.
+  - `POST .../measures/{name}/edit` takes `{label, expression, kind, currency?, description?}`. The new definition
+    passes mnemiq's measure checks first. Every copy on a chart that still matches the kept definition changes, and
+    each changed chart is checked again; a copy changed by hand is left and named.
+  - `POST .../measures/{name}/remove` takes `{chart_ids}`, the charts the person was shown, and answers 409 with the
+    charts the measure has now when they differ. It moves the measure's charts to Superset's trash, takes a chart the
+    person does not edit off the dashboard instead and names it, names a chart a report holds and leaves it, and
+    deletes a dataset mnemiq made for the measure once no chart uses it.
+  - `POST .../measures/{name}/save` adds the measure to its dataset as a saved metric, then switches every matching
+    copy to it.
+  - Each action first asks whether the person edits every chart it would change (and, to save, the dataset), so one
+    refusal changes nothing and names that object's editors. Each answers `changed`, `left_by_hand`, `not_editor`
+    (each object and its editors), `blocked_by_report`, `could_not_read` and mnemiq's `message`.
 - **Values a plan's repair is told.** The planning prompt holds no value read from the data's rows. When a plan
   filters on a value no row the builder can read holds, up to 20 values of that column, one the plan itself filtered,
   read as the builder, go to the one repair prompt and to the refused plan's answer: a hosted planning model sees them.

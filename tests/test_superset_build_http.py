@@ -91,7 +91,14 @@ guard_fanout = true
 """
 
 BUILD_ROUTES = {("POST", "/v1/superset/builds"), ("GET", "/v1/superset/builds/{build_id}"),
-                ("POST", "/v1/superset/builds/{build_id}/next")}
+                ("POST", "/v1/superset/builds/{build_id}/next"),
+                ("GET", "/v1/superset/dashboards/{dashboard_id}/measures"),
+                ("POST", "/v1/superset/dashboards/{dashboard_id}/measures/{name}/edit"),
+                ("POST", "/v1/superset/dashboards/{dashboard_id}/measures/{name}/remove"),
+                ("POST", "/v1/superset/dashboards/{dashboard_id}/measures/{name}/save")}
+# Each measure action's body, as the panel sends it.
+ACTION_BODIES = {"edit": {"label": "Policies", "expression": "COUNT(DISTINCT policy_id)", "kind": "count"},
+                 "remove": {"chart_ids": [1]}, "save": {}}
 # The calls that change something in Superset, which a refused request never makes. The build's probe of the
 # extension, its `create_dataset` with an empty request, changes nothing: `_writes` passes over it.
 WRITES = {"generate_chart", "create_dataset", "create_virtual_dataset",
@@ -249,10 +256,11 @@ def _routes(app) -> set[tuple[str, str]]:
 
 
 def _call(client, method: str, path: str, token: str | None):
-    path = path.replace("{build_id}", str(uuid.uuid4()))
+    action = path.rsplit("/", 1)[-1]
+    path = path.replace("{build_id}", str(uuid.uuid4())).replace("{dashboard_id}", "900").replace("{name}", "policies")
     headers = _bearer(token) if token is not None else {}
-    return client.post(path, json={"goal": GOAL}, headers=headers) if method == "POST" else client.get(path,
-                                                                                                    headers=headers)
+    body = ACTION_BODIES.get(action, {"goal": GOAL})
+    return client.post(path, json=body, headers=headers) if method == "POST" else client.get(path, headers=headers)
 
 
 # --- the routes there are, and where
@@ -847,6 +855,67 @@ def test_a_build_onto_a_dashboard_names_what_it_left_out(served, fake, world, st
                                          "title": "Policies by region"}]
     assert [step["key"] for step in again.json()["build"]["steps"]] == ["dashboard", "policies_by_status", "layout",
                                                                          "check"]
+
+
+def _a_built_dashboard(client) -> tuple[int, int]:
+    """`ONE_BAR` built through the routes: its dashboard's id and its chart's."""
+    first = _start(client).json()["build"]
+    final = _run_to_the_end(client, first["build_id"])[-1].json()["build"]
+    return final["dashboard_id"], next(step["object_id"] for step in final["steps"]
+                                       if step["key"] == "policies_by_region")
+
+
+def test_the_measures_route_answers_each_measure_with_its_value_and_charts(served, fake, world, store):
+    """The dashboard's measures, each with its definition, its value computed now and its charts by id, title and
+    check; the value is in the answer and nowhere in the store."""
+    client, _ = served
+    dashboard, chart = _a_built_dashboard(client)
+    r = client.get(f"/v1/superset/dashboards/{dashboard}/measures", headers=_bearer(_token()))
+    assert r.status_code == 200, r.text
+    [measure] = r.json()["measures"]
+    assert measure == {"name": "policies", "label": "Policies", "expression": "COUNT(policy_id)", "kind": "count",
+                       "currency": None, "description": "Policies written", "asked_by": measure["asked_by"],
+                       "dataset_id": 12, "saved_metric": None, "value": 7.0, "value_note": None,
+                       "charts": [{"chart_id": chart, "title": "Policies by region", "check": "checked"}]}
+    assert "7.0" not in json.dumps([dataclasses.asdict(row) for row in store.measures_for(
+        next(iter(store._builds))[0], dashboard)], default=str)
+
+
+def test_a_measure_action_by_a_non_editor_of_the_dashboard_is_refused_naming_its_editors(served, fake, world, store):
+    client, _ = served
+    dashboard, _ = _a_built_dashboard(client)
+    world.dashboards[dashboard]["editors"] = ["colleague"]
+    before = len(fake.calls)
+    r = client.post(f"/v1/superset/dashboards/{dashboard}/measures/policies/save", json={},
+                    headers=_bearer(_token()))
+    assert r.status_code == 403, r.text
+    assert "colleague" in r.json()["detail"]
+    assert not [call for call in fake.calls[before:] if call.tool in WRITES and call.request != {}]
+
+
+def test_a_remove_sent_other_charts_is_a_409_naming_the_charts_it_has(served, fake, world, store):
+    client, _ = served
+    dashboard, chart = _a_built_dashboard(client)
+    r = client.post(f"/v1/superset/dashboards/{dashboard}/measures/policies/remove", json={"chart_ids": [chart + 1]},
+                    headers=_bearer(_token()))
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["charts"] == [{"chart_id": chart, "title": "Policies by region", "check": "checked"}]
+    assert chart in world.charts
+
+
+def test_an_edit_is_answered_with_what_it_changed(served, fake, world, store):
+    client, _ = served
+    dashboard, chart = _a_built_dashboard(client)
+    r = client.post(f"/v1/superset/dashboards/{dashboard}/measures/policies/edit", json=ACTION_BODIES["edit"],
+                    headers=_bearer(_token()))
+    assert r.status_code == 200, r.text
+    assert r.json()["changed"] == [chart] and r.json()["not_editor"] == [] and r.json()["message"]
+    refused = client.post(f"/v1/superset/dashboards/{dashboard}/measures/policies/edit",
+                          json={**ACTION_BODIES["edit"], "expression": "policy_id"}, headers=_bearer(_token()))
+    assert refused.status_code == 422 and "refused" in refused.json()["detail"]
+    unknown = client.post(f"/v1/superset/dashboards/{dashboard}/measures/nothing/save", json={},
+                          headers=_bearer(_token()))
+    assert unknown.status_code == 404 and unknown.json()["detail"] == "This dashboard keeps no measure of that name."
 
 
 def test_a_build_keeps_the_profile_it_started_with(profiled, fake, world, store, monkeypatch):
