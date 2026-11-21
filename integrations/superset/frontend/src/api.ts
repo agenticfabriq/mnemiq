@@ -2,6 +2,7 @@
 // mints a token for the signed-in person on each request. The browser holds no mnemiq token and never sets
 // `Authorization`; Superset's own session cookie rides along (same origin), and a POST carries the session's CSRF
 // token, which the forwarder requires.
+import { readSse, type AguiEvent } from "./shared";
 
 export type RefusalKind =
   | "signed-out"
@@ -94,6 +95,36 @@ export class PanelApi {
     return this.send<T>(path, { method: "POST", headers, body: JSON.stringify(body), signal });
   }
 
+  /** `POST` `body` to mnemiq's streaming `path` (`/chat`), yielding each event as it arrives. A refusal before the
+   * stream starts is a run of its own that failed with the refusal's sentence, as the workbench's transport makes it,
+   * so the conversation reads it as an answer that could not be given. */
+  async *stream(path: string, body: unknown, signal?: AbortSignal): AsyncGenerator<AguiEvent> {
+    const token = await this.csrf();
+    const headers: Record<string, string> = { Accept: "text/event-stream", "Content-Type": "application/json" };
+    if (token) headers["X-CSRFToken"] = token;
+    let response: Response;
+    try {
+      response = await this.request(path, { method: "POST", headers, body: JSON.stringify(body), signal });
+    } catch (error) {
+      if ((error as { name?: string })?.name === "AbortError") throw error;
+      yield* failedRun(SAID.unavailable, "unavailable");
+      return;
+    }
+    if (!response.ok || response.body === null) {
+      const { detail } = await detailOf(response);
+      const refusal = refusalOf(response, detail) ?? { kind: "refused", sentence: detail?.trim() || SAID.refused };
+      yield* failedRun(refusal.sentence, refusal.kind);
+      return;
+    }
+    for await (const data of readSse(response.body)) {
+      try {
+        yield JSON.parse(data) as AguiEvent;
+      } catch {
+        // A frame that is not JSON carries nothing the conversation reads.
+      }
+    }
+  }
+
   /** The request as every call makes it: same origin, Superset's session, and no redirect followed (a redirect is a
    * sign-in page, which the panel reads as signed out). */
   request(path: string, init: RequestInit): Promise<Response> {
@@ -116,4 +147,10 @@ export class PanelApi {
     }
     return { ok: true, status: response.status, body: body as T };
   }
+}
+
+/** A run that failed before it started: the events the conversation reads as an answer that could not be given. */
+function* failedRun(sentence: string, code: string): Generator<AguiEvent> {
+  yield { type: "RUN_STARTED", runId: "" };
+  yield { type: "RUN_ERROR", message: sentence, code };
 }

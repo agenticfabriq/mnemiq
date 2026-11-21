@@ -12,6 +12,7 @@ export default defineConfig({
   },
   test: {
     environment: "jsdom",
+    setupFiles: ["src/test/setup.ts"],
     include: bundle ? ["src/bundle.test.ts"] : ["src/**/*.test.{ts,tsx}"],
     exclude: bundle ? [] : ["src/bundle.test.ts"],
   },

@@ -12,7 +12,8 @@ export {
   type Turn,
   type TurnStatus,
 } from "../../../../workbench/src/lib/store";
-export { SseDecoder } from "../../../../workbench/src/lib/sse";
+export { readSse, SseDecoder } from "../../../../workbench/src/lib/sse";
 export { historyFrom } from "../../../../workbench/src/lib/history";
 export * from "../../../../workbench/src/lib/verdict";
+export { DEFAULT_MODE } from "../../../../workbench/src/lib/types";
 export type * from "../../../../workbench/src/lib/types";

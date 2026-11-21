@@ -2,9 +2,13 @@ import React, { useEffect, useMemo, useState, useSyncExternalStore, type CSSProp
 import { Button, Spin, theme } from "antd";
 import { authentication, chat } from "@apache-superset/core";
 import { PanelApi } from "./api";
+import { askInPanel } from "./ask";
+import { isRunning } from "./shared";
 import { pageAppRoot, usePageContext } from "./page";
 import { probe } from "./readiness";
 import { getSnapshot, subscribe, update } from "./store";
+import { Composer } from "./views/Composer";
+import { Conversation } from "./views/Conversation";
 import { Header } from "./views/Header";
 
 // 640 px tall, at most 80% of the window: `min(640px, 80vh)`, spelt so jsdom, whose CSS parser drops `min()`, keeps it.
@@ -63,13 +67,17 @@ function Body() {
   }, [api]);
   if (readiness === null) return <Spin size="small" />;
   if (readiness.kind !== "ready") return <p role="alert">{readiness.sentence}</p>;
-  return <Ready starters={readiness.starters} />;
+  return <Ready api={api} starters={readiness.starters} />;
 }
 
-/** The panel for a person mnemiq answers: the dashboard on screen, when they may read it, and the opening questions. */
-function Ready({ starters }: { starters: string[] }) {
+/** The panel for a person mnemiq answers: the dashboard on screen, when they may read it; the opening questions
+ * until the first is asked; the conversation; and the composer. */
+function Ready({ api, starters }: { api: PanelApi; starters: string[] }) {
   const { dashboard } = usePageContext();
+  const { turns } = useSyncExternalStore(subscribe, getSnapshot);
   const { token } = theme.useToken();
+  const busy = isRunning(turns);
+  const ask = (question: string) => askInPanel(api, question);
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: token.padding }}>
       {dashboard?.readable && dashboard.id !== null ? (
@@ -77,13 +85,16 @@ function Ready({ starters }: { starters: string[] }) {
           On <strong style={{ color: token.colorText }}>{dashboard.title ?? "this dashboard"}</strong>
         </section>
       ) : null}
-      {starters.length > 0 ? (
+      {turns.length === 0 && starters.length > 0 ? (
         <section aria-label="Starters" style={{ display: "flex", flexDirection: "column", gap: token.paddingXS }}>
           {starters.map((starter) => (
-            <Button key={starter} style={{ textAlign: "left", whiteSpace: "normal", height: "auto" }}>{starter}</Button>
+            <Button key={starter} disabled={busy} onClick={() => ask(starter)}
+              style={{ textAlign: "left", whiteSpace: "normal", height: "auto" }}>{starter}</Button>
           ))}
         </section>
       ) : null}
+      <Conversation turns={turns} />
+      <Composer busy={busy} onAsk={ask} />
     </div>
   );
 }
