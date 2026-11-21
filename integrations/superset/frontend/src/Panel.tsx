@@ -12,6 +12,7 @@ import { BuildCard } from "./views/BuildCard";
 import { Composer } from "./views/Composer";
 import { Conversation } from "./views/Conversation";
 import { Header } from "./views/Header";
+import { Measures } from "./views/Measures";
 import { UnfinishedBuilds } from "./views/Unfinished";
 
 // 640 px tall, at most 80% of the window: `min(640px, 80vh)`, spelt so jsdom, whose CSS parser drops `min()`, keeps it.
@@ -105,6 +106,7 @@ function Ready({ api, starters }: { api: PanelApi; starters: string[] }) {
           On <strong style={{ color: token.colorText }}>{onScreen.title ?? "this dashboard"}</strong>
         </section>
       ) : null}
+      {onScreen?.id != null ? <Measures key={onScreen.id} api={api} dashboardId={onScreen.id} /> : null}
       <UnfinishedBuilds api={api} dashboardId={onScreen?.id ?? null} />
       {turns.length === 0 && starters.length > 0 ? (
         <section aria-label="Starters" style={{ display: "flex", flexDirection: "column", gap: token.paddingXS }}>

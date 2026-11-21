@@ -16,7 +16,11 @@ export type RefusalKind =
 
 export type PanelRefusal = { kind: RefusalKind; sentence: string };
 
-export type Answer<T> = { ok: true; status: number; body: T } | { ok: false; status: number; refusal: PanelRefusal };
+/** An answer: its body, or what its refusal means, with the refused answer's body for a caller that reads more of
+ * it (a remove whose charts changed answers the new list there). */
+export type Answer<T> =
+  | { ok: true; status: number; body: T }
+  | { ok: false; status: number; refusal: PanelRefusal; body?: unknown };
 
 // mnemiq's sentence for a person Superset will not run queries for (`NOT_A_BUILDER` in mnemiq's superset/grants.py).
 const NOT_A_BUILDER_OPENING = "Superset refused this user's queries.";
@@ -141,9 +145,10 @@ export class PanelApi {
     }
     const { detail, body } = await detailOf(response);
     const refusal = refusalOf(response, detail);
-    if (refusal) return { ok: false, status: response.status, refusal };
+    if (refusal) return { ok: false, status: response.status, refusal, body };
     if (!response.ok) {
-      return { ok: false, status: response.status, refusal: { kind: "refused", sentence: detail?.trim() || SAID.refused } };
+      return { ok: false, status: response.status, refusal: { kind: "refused", sentence: detail?.trim() || SAID.refused },
+        body };
     }
     return { ok: true, status: response.status, body: body as T };
   }
