@@ -262,6 +262,13 @@ statements rather than several per table. Each statement is bounded by the probe
 (`MNEMIQ_ORACLE_PROBE_TIMEOUT_S`, 30 s by default); a batch that fails is read table by table
 instead, and enrich logs why.
 
+**Comments.** In either mode, enrich reads each table's and column's comment from the dictionary
+(`ALL_TAB_COMMENTS`, `ALL_COL_COMMENTS`), reading no table data, and keeps it apart from the
+model's description: the describing model is given it as the database's own text, and the card
+prints it, so table search reads it too. A comment is screened for prompts and cut to 300
+characters. When a prompt must be trimmed to fit the model's window, every model description goes
+before any comment. Instant mode's bare cards still carry names and types only, without comments.
+
 **What statistics mode gives up.**
 
 - **Counts are estimates.** They are kept apart from exact counts. The model that describes the
