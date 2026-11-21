@@ -101,13 +101,20 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
     tables = [b.object_id for b in snapshot.source_bindings] or list(columns)
     table_comments = {b.object_id: b.comment for b in snapshot.source_bindings if b.comment}
 
+    from mnemiq.semantic.retrieval import known_relationships  # here: retrieval imports this module
+
+    known = known_relationships(snapshot)
+
     def comment_visible(table: str) -> bool:
         # A table comment is prose with no recorded dependencies: it may describe any of the table's columns or a
         # table it joins. So it takes the rule `_scoped_facts` gives such prose: shown only to an identity that may
-        # name the table and every table it joins, and is denied or masked none of its columns.
+        # name the table and every table it joins, and is denied or masked none of its columns. Where the joins are
+        # not known (a merged federated snapshot carries none), no identity is shown it.
         if policy is None:
             return True
-        joined = {r.to if r.from_ == table else r.from_ for r in snapshot.relationships if table in (r.from_, r.to)}
+        if known is None:
+            return False
+        joined = {r.to if r.from_ == table else r.from_ for r in known if table in (r.from_, r.to)}
         if not all(policy.names(t) for t in {table, *joined}):
             return False
         return not any(policy.denies(table, c.name) or policy.masks(table, c.name) for c in columns.get(table, []))
