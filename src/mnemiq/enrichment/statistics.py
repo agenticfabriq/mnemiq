@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 
+import logging
+
 from mnemiq.adapters.dictionary import ColumnStatistics, HistogramEndpoint
 from mnemiq.catalog import TableInfo, is_key_like, is_sensitive_name
 from mnemiq.contract.semantic import ColumnEstimate
@@ -44,6 +46,8 @@ _DECODABLE_CHARSETS = frozenset({"AL32UTF8", "UTF8"})
 
 _TEXT_TYPES = frozenset({"VARCHAR2", "VARCHAR", "CHAR"})
 _NUMBER_TYPES = frozenset({"NUMBER", "FLOAT", "INTEGER"})
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -83,15 +87,83 @@ def estimate_table(adapter, table: TableInfo, key_columns: set[str] | None = Non
                                   analyzed=st.analyzed or size.analyzed, sampled=_sampled(st, size.rows),
                                   stale=size.stale)
         codes: list[str] = []
-        if (not is_key_like(col.name) and col.name not in keys and not is_sensitive_name(col.name)
-                and _kind(col.data_type) is not None
-                and st.distinct is not None and size.rows is not None and st.distinct < size.rows
-                and st.analyzed is not None and st.analyzed == size.analyzed
-                and _may_be_complete(st, size.rows, size.stale, code_max_distinct)):
+        if _histogram_candidate(col, st, size, keys, code_max_distinct):
             codes = frequency_codes(st, size.rows, size.stale, adapter.histogram(table.name, col.name),
                                     col.data_type, code_max_distinct, charset)
         columns.append(EstimatedColumn(col.name, estimate, codes, col.name in unique))
     return columns
+
+
+def _histogram_candidate(col, st: ColumnStatistics, size, keys: set[str], code_max_distinct: int) -> bool:
+    """Whether `col` can carry a code list from its histogram, so the histogram is worth reading: what the exact
+    profile excludes is excluded (key-like names, declared foreign-key children, sensitive names, as many values as
+    rows), and statistics gathered at another time than the table's cannot give one."""
+    return (not is_key_like(col.name) and col.name not in keys and not is_sensitive_name(col.name)
+            and _kind(col.data_type) is not None
+            and st.distinct is not None and size.rows is not None and st.distinct < size.rows
+            and st.analyzed is not None and st.analyzed == size.analyzed
+            and _may_be_complete(st, size.rows, size.stale, code_max_distinct))
+
+
+def histogram_candidates(table: TableInfo, size, statistics: dict[str, ColumnStatistics],
+                         key_columns: set[str] | None, code_max_distinct: int) -> list[str]:
+    """The columns of `table` whose histogram `estimate_table` reads: one rule, so a prefetch reads exactly those."""
+    keys = key_columns or set()
+    return [col.name for col in table.columns
+            if col.name in statistics and _histogram_candidate(col, statistics[col.name], size, keys, code_max_distinct)]
+
+
+class PrefetchedDictionary:
+    """An adapter whose dictionary reads come from one batched read of many tables (`prefetch_dictionary`): the four
+    reads `estimate_table` makes are answered from it, and anything else, a table it does not hold included, is the
+    adapter's."""
+
+    def __init__(self, adapter, facts, histograms: dict) -> None:
+        self._adapter, self._facts, self._histograms = adapter, facts, histograms
+
+    def table_size(self, table: str):
+        return self._facts.sizes[table] if table in self._facts.sizes else self._adapter.table_size(table)
+
+    def column_statistics(self, table: str):
+        return (self._facts.statistics[table] if table in self._facts.statistics
+                else self._adapter.column_statistics(table))
+
+    def unique_columns(self, table: str):
+        return self._facts.unique[table] if table in self._facts.unique else self._adapter.unique_columns(table)
+
+    def histogram(self, table: str, column: str):
+        if (table, column) in self._histograms:
+            return self._histograms[(table, column)]
+        return self._adapter.histogram(table, column)
+
+    def __getattr__(self, name: str):
+        return getattr(self._adapter, name)
+
+
+def prefetch_dictionary(adapter, tables: list[TableInfo], key_columns: dict[str, set[str]],
+                        code_max_distinct: int):
+    """`adapter` with the dictionary of `tables` read at once, where it can read it so (`dictionary`, `histograms`):
+    statistics mode's 600 tables become a handful of statements instead of four or more each. An adapter without the
+    batched reads is returned as it is, and read per table."""
+    if not tables or not callable(getattr(adapter, "dictionary", None)):
+        return adapter
+    try:
+        facts = adapter.dictionary([t.name for t in tables])
+    except Exception as exc:  # noqa: BLE001 -- the per-table reads remain, so a failed batch costs time, not the run
+        logger.warning("the batched dictionary read failed (%s); the dictionary is read per table", exc)
+        return adapter
+    wanted = []
+    if code_max_distinct and callable(getattr(adapter, "histograms", None)):
+        for t in tables:
+            statistics = {st.column: st for st in facts.statistics[t.name]}
+            wanted += [(t.name, c) for c in histogram_candidates(t, facts.sizes[t.name], statistics,
+                                                                 key_columns.get(t.name), code_max_distinct)]
+    try:
+        histograms = adapter.histograms(wanted) if wanted else {}
+    except Exception as exc:  # noqa: BLE001 -- as above: each histogram is then read on its own
+        logger.warning("the batched histogram read failed (%s); histograms are read per table", exc)
+        histograms = {}
+    return PrefetchedDictionary(adapter, facts, histograms)
 
 
 def frequency_codes(stats: ColumnStatistics, rows: int | None, stale: bool | None,

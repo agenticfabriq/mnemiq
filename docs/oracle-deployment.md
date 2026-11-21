@@ -248,6 +248,12 @@ three times, each with the full limit, so one statement can run at most four lim
 An unknown key in a source's entry is refused rather than ignored, so a misspelled `"profile"`
 cannot fall back to reading every table.
 
+**Reading the dictionary at scale.** Statistics mode and the size check read the dictionary in
+batches: each view once for up to 500 tables, so a schema of 600 tables costs a handful of
+statements rather than several per table. Each statement is bounded by the probe timeout
+(`MNEMIQ_ORACLE_PROBE_TIMEOUT_S`, 30 s by default); a batch that fails is read table by table
+instead, and enrich logs why.
+
 **What statistics mode gives up.**
 
 - **Counts are estimates.** They are kept apart from exact counts. The model that describes the

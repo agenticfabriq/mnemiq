@@ -40,8 +40,10 @@ def exact_profile_refusal(spec, adapter) -> tuple[str | None, str | None]:
     large: list[tuple[str, int]] = []
     unknown: list[str] = []
     stale: list[str] = []
+    # One batched read where the adapter has it; one per table otherwise.
+    sizes = adapter.table_sizes(tables) if callable(getattr(adapter, "table_sizes", None)) else None
     for table in tables:
-        size = adapter.table_size(table)
+        size = sizes[table] if sizes is not None else adapter.table_size(table)
         if size.rows is None or size.avg_row_len is None:
             unknown.append(table)
             continue

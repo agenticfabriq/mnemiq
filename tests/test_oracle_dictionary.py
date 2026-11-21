@@ -347,3 +347,17 @@ def test_histograms_match_the_per_column_reads():
     for table, column in (("ORDERS", "STATUS"), ("ORDERS", "ID"), ("NEVER_ANALYZED", "X")):
         assert got[(table, column)] == a.histogram(table, column)
     assert [e.actual for e in got[("ORDERS", "STATUS")]] == ["A", None]
+
+
+def test_600_tables_cost_a_handful_of_dictionary_statements():
+    many = _Many({})
+    _many_adapter(many).dictionary([f"T{i}" for i in range(600)])
+    assert len(many.sql) == 8, "four views, two batches each, against 2,400 per-table reads"
+
+
+def test_table_sizes_reads_one_view_in_batches():
+    many = _Many(_TWO)
+    a = _many_adapter(many)
+    sizes = a.table_sizes(["ORDERS", "NEVER_ANALYZED"])
+    assert sizes == {t: a.table_size(t) for t in ("ORDERS", "NEVER_ANALYZED")}
+    assert "all_tab_statistics" in many.sql[0].lower() and len(many.sql) == 3  # one batched, two per-table to compare

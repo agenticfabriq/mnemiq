@@ -354,3 +354,18 @@ def test_an_exact_tables_pattern_matching_nothing_is_refused():
 
     with pytest.raises(TablesNotFound):
         exact_profile_refusal(_spec(profile="statistics", exact_tables=("NOPE",)), _Dictionary({"CODES": _size(10)}))
+
+
+def test_size_check_reads_sizes_in_one_batch():
+    class Batched(_Dictionary):
+        def __init__(self, sizes):
+            super().__init__(sizes)
+            self.batches: list[list[str]] = []
+
+        def table_sizes(self, tables):
+            self.batches.append(list(tables))
+            return {t: self.sizes[t] for t in tables}
+
+    source = Batched({f"T{i}": _size(10) for i in range(600)})
+    assert exact_profile_refusal(_spec(), source) == (None, None)
+    assert len(source.batches) == 1 and source.asked == [], "sizes came from the batched read, not one per table"

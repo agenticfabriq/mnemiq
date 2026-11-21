@@ -1359,17 +1359,12 @@ class OracleAdapter:
         probe timeout. The same SQL and the same reading of each row as the per-table reads, with the table's name
         added; a table the dictionary does not show gets what its per-table read would."""
         names = list(dict.fromkeys(tables))
-        sizes = {t: _NO_SIZE for t in names}
+        sizes = self.table_sizes(names)
         statistics: dict[str, list[ColumnStatistics]] = {t: [] for t in names}
         constraints: dict[str, list[tuple]] = {t: [] for t in names}
         indexes: dict[str, list[tuple]] = {t: [] for t in names}
         for chunk in _batches(names):
             listed, binds = _in_list(chunk)
-            for table, *row in self._rows(
-                    "SELECT table_name, num_rows, avg_row_len, last_analyzed, stale_stats FROM all_tab_statistics "
-                    f"WHERE owner = :owner AND object_type = 'TABLE' AND table_name IN ({listed})",
-                    owner=self._schema, **binds):
-                sizes[table] = _table_size(*row)
             for table, *row in self._rows(
                     "SELECT s.table_name, s.column_name, s.num_distinct, s.num_nulls, s.histogram, s.num_buckets, "
                     "s.sample_size, s.last_analyzed, s.low_value, s.high_value, c.data_scale FROM all_tab_col_statistics s "
@@ -1394,6 +1389,19 @@ class OracleAdapter:
                 indexes[table].append(tuple(row))
         return DictionaryFacts(sizes=sizes, statistics=statistics,
                                unique={t: _unique_keyed(constraints[t], indexes[t]) for t in names})
+
+    def table_sizes(self, tables: Sequence[str]) -> dict[str, TableSize]:
+        """`table_size` for every table in `tables`, `DICTIONARY_BATCH` at a time: what the size check reads."""
+        names = list(dict.fromkeys(tables))
+        sizes = {t: _NO_SIZE for t in names}
+        for chunk in _batches(names):
+            listed, binds = _in_list(chunk)
+            for table, *row in self._rows(
+                    "SELECT table_name, num_rows, avg_row_len, last_analyzed, stale_stats FROM all_tab_statistics "
+                    f"WHERE owner = :owner AND object_type = 'TABLE' AND table_name IN ({listed})",
+                    owner=self._schema, **binds):
+                sizes[table] = _table_size(*row)
+        return sizes
 
     def histograms(self, columns: Sequence[tuple[str, str]]) -> dict[tuple[str, str], list[HistogramEndpoint]]:
         """`histogram` for every (table, column) in `columns`, read `DICTIONARY_BATCH` pairs at a time."""

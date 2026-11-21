@@ -12,7 +12,7 @@ from mnemiq.adapters.base import QueryTimedOut
 from mnemiq.contract import CodedValue, Column, Job, Snapshot, SourceBinding, ViewDefinition
 from mnemiq.enrichment.joins import build_relationships
 from mnemiq.enrichment.profiling import FAILED, profile_table, unharvested
-from mnemiq.enrichment.statistics import estimate_table
+from mnemiq.enrichment.statistics import estimate_table, prefetch_dictionary
 from mnemiq.sql.fanout_check import PARTITIONS_JOB
 from mnemiq.superset.settings import SUPERSET_SOURCE_JOB
 
@@ -271,6 +271,9 @@ def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
     except Exception:
         fk_children = {}
 
+    # The estimated tables' dictionary, read at once where the adapter can (a handful of statements for 600 tables).
+    dictionary = prefetch_dictionary(adapter, [t for t in catalog if t.name in estimated], fk_children,
+                                     25 if harvest_values else 0)
     # Statistics mode's exact tables whose exact read reached the statement time limit: each keeps its dictionary
     # estimate instead of being lost, and is estimated from here on, so nothing after this pass reads it.
     fell_back: set[str] = set()
@@ -293,7 +296,7 @@ def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
             if table.name in estimated or table.name in fell_back:
                 # From the dictionary, reading no row; nothing measured, so nothing below to record.
                 stats = {}
-                table_columns = _estimated_columns(adapter, table, fk_children.get(table.name), harvest_values,
+                table_columns = _estimated_columns(dictionary, table, fk_children.get(table.name), harvest_values,
                                                    charset)
             else:
                 table_columns = [
