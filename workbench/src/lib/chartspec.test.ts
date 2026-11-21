@@ -148,6 +148,19 @@ describe("years and identifiers are labels", () => {
     expect(isLabelColumn("year", [2024.5])).toBe(false);
     expect(isLabelColumn("paid", [10])).toBe(false);
     expect(isLabelColumn("video", [1])).toBe(false);
+    expect(isLabelColumn("CustomerID", [1])).toBe(true);
+    expect(isLabelColumn("PAID", [1])).toBe(false);
+    expect(isLabelColumn("Order No", [7])).toBe(true);
+    expect(isLabelColumn("model_year", [2024])).toBe(true);
+    expect(isLabelColumn("fiscal year", [2024])).toBe(true);
+  });
+
+  it("keeps a measure whose name only mentions years a measure", () => {
+    for (const name of ["yearly_premium", "claims_per_year", "policies_this_year", "years_active", "syringe_count"]) {
+      expect(isLabelColumn(name, [1200, 2400])).toBe(false);
+    }
+    const spec = chartSpecFor(preview(["policy_type", "yearly_premium"], [["auto", 1200], ["home", 2400]]));
+    expect(spec).toEqual({ kind: "bar", labelColumn: "policy_type", valueColumns: ["yearly_premium"] });
   });
 });
 

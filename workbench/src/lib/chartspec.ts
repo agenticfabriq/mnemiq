@@ -51,19 +51,33 @@ export const toNumber = (v: Cell): number | null => {
   return Number.isFinite(n) ? n : null;
 };
 
-// An identifier word as the whole name or after `_` (`id`, `order_no`, `zip_code`), or a camel-case `Id` ending.
-const IDENTIFIER = /(^|_)(id|key|code|no|number)$/i;
-const CAMEL_ID = /[a-z0-9]Id$/;
-const YEAR_NAME = /year|yr/i;
+// An identifier word as the whole name or after `_` or a space (`id`, `order_no`, `zip_code`, `Order No`), or a
+// camel-case `Id` or `ID` ending after a lower-case letter or a digit (`customerId`, `CustomerID`; never `PAID`).
+const IDENTIFIER = /(^|[_\s])(id|key|code|no|number)$/i;
+const CAMEL_ID = /[a-z0-9]I[dD]$/;
+// A year names its rows when it is the name's last word, not counted per or within one (`claims_per_year`).
+const YEAR_WORDS = new Set(["year", "yr"]);
+const NOT_A_YEAR_BEFORE = new Set(["per", "each", "this", "last", "next", "prev", "previous"]);
+
+/** The name's words: split at `_`, spaces and camel-case boundaries, lower-cased. */
+const words = (name: string): string[] =>
+  name.replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().split(/[_\s]+/).filter(Boolean);
+
+function namesAYear(name: string): boolean {
+  const all = words(name);
+  const last = all.at(-1);
+  return last !== undefined && YEAR_WORDS.has(last) && !NOT_A_YEAR_BEFORE.has(all.at(-2) ?? "");
+}
 
 /**
  * Whether a column names its rows rather than measuring them: an identifier by its name, or a year, a column whose
- * name holds `year` or `yr` and whose every present value is a whole number from 1000 to 9999. A column whose values
- * merely fall in a year's range, with no year in its name, stays a measure.
+ * name ends in the word `year` or `yr` (not after `per`, `this` and the like) and whose every present value is a whole
+ * number from 1000 to 9999. A column whose values merely fall in a year's range, or whose name only mentions years
+ * (`yearly_premium`, `claims_per_year`), stays a measure.
  */
 export function isLabelColumn(name: string, values: Cell[]): boolean {
   if (IDENTIFIER.test(name) || CAMEL_ID.test(name)) return true;
-  if (!YEAR_NAME.test(name)) return false;
+  if (!namesAYear(name)) return false;
   const present = values.filter((v) => !isBlank(v));
   return (
     present.length > 0 &&

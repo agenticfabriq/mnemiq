@@ -20,7 +20,7 @@ import {
 
 import { historyFrom } from "./history";
 import { Refused, streamChat, type Refusal } from "./transport";
-import { isRunning, reduce, settle, userTurn, type Turn } from "./store";
+import { closeRun, isRunning, reduce, settle, userTurn, type Turn } from "./store";
 import { emptyThread, isBlank, load, save, titleFor, type Thread } from "./threads";
 import { loadMode, saveMode } from "./mode";
 import { type Mode } from "./types";
@@ -72,7 +72,9 @@ export function useWorkbench(
   confirm: () => Promise<boolean>,
 ) {
   const restored = useMemo(() => {
-    const stored = load(shelf);
+    // A thread saved while an answer ran (a reload, or a workbench closed mid-run) comes back with that answer
+    // ended: still running, it would hold the composer for good.
+    const stored = load(shelf).map((thread) => ({ ...thread, turns: settle(thread.turns) }));
     return stored.length ? stored : [emptyThread()];
   }, [shelf]);
 
@@ -126,24 +128,32 @@ export function useWorkbench(
     [],
   );
 
+  // The threads with a question in flight: one at a time in a thread, so one ask's end never ends another's answer.
+  const asking = useRef(new Set<string>());
+
   const ask = useCallback(
     async (question: string) => {
-      // Before anything is shown or sent: a tab whose user changed must not send this user's
-      // history under the next user's credentials.
-      if (!(await confirm())) return;
+      // The thread is the one shown when the question was sent, read once; one question runs in it at a time.
       const threadId = activeRef.current;
-      // Read before the user turn is appended: the history is what came BEFORE this ask.
-      const before = threadsRef.current.find((t) => t.id === threadId)?.turns ?? [];
-      const history = historyFrom(before);
-      updateTurns(threadId, (current) => [...current, userTurn(question)]);
+      if (asking.current.has(threadId)) return;
+      asking.current.add(threadId);
       const controller = new AbortController();
-      inflight.current.add(controller);
+      let sawEnd = false;
       try {
+        // Before anything is shown or sent: a tab whose user changed must not send this user's
+        // history under the next user's credentials.
+        if (!(await confirm())) return;
+        // Read before the user turn is appended: the history is what came BEFORE this ask.
+        const before = threadsRef.current.find((t) => t.id === threadId)?.turns ?? [];
+        const history = historyFrom(before);
+        updateTurns(threadId, (current) => [...current, userTurn(question)]);
+        inflight.current.add(controller);
         for await (const event of streamChat(question, modeRef.current, history, controller.signal)) {
+          if (event.type === "RUN_FINISHED" || event.type === "RUN_ERROR") sawEnd = true;
           updateTurns(threadId, (current) => reduce(current, event));
         }
-        // The stream ended: an answer still running never got its end, so it ends as an error.
-        updateTurns(threadId, (current) => settle(current));
+        // The stream ended: an answer still running, or a question no run answered, ends as an error.
+        updateTurns(threadId, (current) => closeRun(current, sawEnd));
       } catch (error) {
         if (controller.signal.aborted) return; // the workbench went; nothing is left to tell
         // A sign-out is thrown before any event; a stream that breaks mid-answer ends that answer as an error.
@@ -151,9 +161,11 @@ export function useWorkbench(
           onRefused(error.refusal);
           return;
         }
-        updateTurns(threadId, (current) => settle(current));
+        console.error("the answer's stream broke", error);
+        updateTurns(threadId, (current) => closeRun(current, sawEnd));
       } finally {
         inflight.current.delete(controller);
+        asking.current.delete(threadId);
       }
     },
     [updateTurns, onRefused, confirm],

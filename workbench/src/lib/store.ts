@@ -32,6 +32,8 @@ export type Turn = {
 export const ANSWER_EVENT = "mnemiq.answer";
 /** What a turn says when its run's events stopped before it ended: a stream cut short, or one that broke. */
 export const CONNECTION_ENDED = "The connection ended before the answer was complete; ask again.";
+/** The code such a turn carries, so it is shown as a cut connection, never as a run the engine finished. */
+export const CONNECTION_ENDED_CODE = "connection-ended";
 export const RESULT_EVENT = "mnemiq.result";
 
 // Ids must not collide with ids restored from a previous session, so they cannot be
@@ -171,5 +173,21 @@ export const isRunning = (turns: Turn[]): boolean =>
  */
 export function settle(turns: Turn[], failure: string = CONNECTION_ENDED): Turn[] {
   if (!isRunning(turns)) return turns;
-  return turns.map((t) => (t.status === "running" ? { ...t, status: "error" as const, error: failure } : t));
+  return turns.map((t) => {
+    if (t.status !== "running") return t;
+    // The answer arrived and only the run's last frame was lost: the answer stands.
+    if (t.answer) return { ...t, status: "complete" as const };
+    return { ...t, status: "error" as const, error: failure, errorCode: CONNECTION_ENDED_CODE };
+  });
+}
+
+/**
+ * The end of an ask's stream, whatever it carried: a turn left running settles (`settle`), and a stream that never
+ * ended its run (`sawEnd` false) and opened no turn, such as a page that was not an event stream, gives the question
+ * an error turn of its own. Asked after a run that ended, nothing changes, and the same array comes back.
+ */
+export function closeRun(turns: Turn[], sawEnd: boolean): Turn[] {
+  if (isRunning(turns)) return settle(turns);
+  if (sawEnd) return turns;
+  return reduce(turns, { type: "RUN_ERROR", message: CONNECTION_ENDED, code: CONNECTION_ENDED_CODE } as AguiEvent);
 }
