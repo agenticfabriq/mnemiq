@@ -11,8 +11,8 @@ route under `/v1/superset/`.
   dashboard; asked either way, no dashboard is looked for. Onto a dashboard, the plan leaves out each chart the
   dashboard already shows (`dashboard_charts.leave_out_shown`), and the answer names each one beside the build
   (`left_out`, each `part`, `chart_id` and `title`); a goal it shows whole builds nothing and keeps nothing, and is
-  answered as `shown` (200) with those parts and mnemiq's words. Otherwise the answer is the new build (201), or the plan's
-  refusal, which is an answer too. The build keeps the profile it was asked under (`profile`, None for the
+  answered as `shown` (200) with those parts and mnemiq's words. Otherwise the answer is the new build (201), or the
+  plan's refusal, which is an answer too. The build keeps the profile it was asked under (`profile`, None for the
   deployment's default). Before anything is planned or kept, Superset is asked whether the person may build (the
   grants; a non-builder is refused as one, `NOT_A_BUILDER`, and nothing about a dashboard they named is read), then
   whether the extension is there and offers every create a build sends (`require_build_tools`: a missing one and an
@@ -36,7 +36,7 @@ through Superset as the builder, never the source database, so they need no mnem
 **As the builder.** A route that calls Superset builds its own adapter with `superset_executor(settings, delegation)`
 from the deployment's settings, which name Superset, and the request's verified token; the planner and the builder
 call Superset only through that adapter's client. What the builder may read is what Superset says when asked as them,
-read once per request. The `GET` calls nothing.
+read once per request. The build `GET`s call nothing.
 
 **Under its profile.** A build's plan, and each of its steps, run under the settings of the profile it was started
 under, picked again at every step as `/v1/ask` picks one: a profile gone or no longer offered to the builder refuses
@@ -53,8 +53,9 @@ writes it.
 step's lease passes); `checks`, each chart's check status by chart id; `ran`, the step this request ran, and `message`,
 mnemiq's own words on it; `plan`, the build's plan as the person is shown it (`builder.plan_summary`: each chart's
 key, title, family and measures, each written measure's definition); and `check_reasons`, why each chart the check
-step did not check did not, in that step's own answer only. Never a lease id, a step's intent, or a value. Every failure is a status and mnemiq's own
-sentence (`server/superset_refusals.py`, and `_refusal` here for the build's own).
+step did not check did not, in that step's own answer only. Never a lease id, a step's intent, or a value. Every
+failure is a status and mnemiq's own sentence (`server/superset_refusals.py`, and `_refusal` here for the build's
+own).
 """
 
 from __future__ import annotations
@@ -345,7 +346,7 @@ def _refusal(exc: Exception, doors) -> HTTPException | None:
 
 
 def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
-    """Mount the three build routes on `app`, each behind `asker`, the `/v1` door's dependency. The build store is
+    """Mount the build, measures and changes routes on `app`, each behind `asker`, the `/v1` door's dependency. The build store is
     the deployment's control Postgres (`MNEMIQ_CONTROL_DSN`); without one, every build route answers 503 naming it."""
     # The deployment's settings name Superset (its MCP URL, database and schema), so every adapter is built from them;
     # a build's plan and steps run under the settings of the profile it was started under.

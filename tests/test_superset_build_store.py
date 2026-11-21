@@ -1119,22 +1119,26 @@ def test_a_held_row_makes_a_claim_fail_promptly_not_hang(store_dsn, monkeypatch,
                           StepState)
 
 
-# --- One live build per dashboard: a dashboard's measures are replaced by whichever build writes them last.
+# --- A builder's unfinished builds: what a client offers to finish.
 
 def test_unfinished_builds_are_the_callers_own(store):
     """A builder's unfinished builds are theirs, of their tenant, newest touched first: another principal's and
-    another tenant's are not listed."""
-    first = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12)
-    second = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=13)
+    another tenant's are not listed. Of three, the middle one touched last comes first, then the newest made: an
+    order neither by when they were made nor oldest touched first."""
+    a = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12)
+    b = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=13)
+    c = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=16)
     store.create_build(TENANT, BO, GOAL, PLAN, STEPS, dashboard_id=14)
     store.create_build(OTHER_TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=15)
-    claimed = store.claim_next_step(TENANT, first.build_id, ANA, _intent("dashboard", "dashboard"))
-    store.finish_step(TENANT, first.build_id, "dashboard", "done", 12, lease_id=claimed.lease_id)
+    claimed = store.claim_next_step(TENANT, b.build_id, ANA, _intent("dashboard", "dashboard"))
+    store.finish_step(TENANT, b.build_id, "dashboard", "done", 13, lease_id=claimed.lease_id)
     listed = store.unfinished_builds(TENANT, ANA)
-    assert [build.build_id for build in listed] == [first.build_id, second.build_id]
+    assert [build.build_id for build in listed] == [b.build_id, c.build_id, a.build_id]
 
 
 def test_done_and_failed_builds_are_not_listed(store):
+    done = _run_build(store)
+    assert done.status == "done"
     failed = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12)
     claimed = store.claim_next_step(TENANT, failed.build_id, ANA, _intent("dashboard", "dashboard"))
     store.finish_step(TENANT, failed.build_id, "dashboard", "failed", None, lease_id=claimed.lease_id)
@@ -1152,6 +1156,21 @@ def test_unfinished_builds_filter_by_dashboard(store):
     assert store.unfinished_builds(TENANT, ANA, dashboard_id=99) == []
     assert len(store.unfinished_builds(TENANT, ANA, limit=1)) == 1
 
+
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda store: store.unfinished_builds(TENANT, ANA, limit=0), id="limit 0"),
+    pytest.param(lambda store: store.unfinished_builds(TENANT, ANA, limit=51), id="limit over the most"),
+    pytest.param(lambda store: store.unfinished_builds(TENANT, ANA, limit=True), id="limit a bool"),
+    pytest.param(lambda store: store.unfinished_builds("", ANA), id="no tenant"),
+    pytest.param(lambda store: store.unfinished_builds(TENANT, ""), id="no principal"),
+    pytest.param(lambda store: store.unfinished_builds(TENANT, ANA, dashboard_id=0), id="dashboard id 0"),
+])
+def test_unfinished_builds_refuse_a_bad_request_before_connecting(call):
+    with pytest.raises(ValueError):
+        call(_offline_store())
+
+
+# --- One live build per dashboard: a dashboard's measures are replaced by whichever build writes them last.
 
 def test_a_dashboard_with_a_build_building_is_said_to_be_building(store):
     """What an action on a dashboard's measures asks first: whether a build of the tenant's is building on it. Another

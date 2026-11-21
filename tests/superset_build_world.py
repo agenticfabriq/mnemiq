@@ -182,11 +182,17 @@ class MemoryBuildStore:
             return self._stored(row)
 
     def unfinished_builds(self, tenant, principal, *, dashboard_id=None, limit=10) -> list[StoredBuild]:
+        """`BuildStore.unfinished_builds`: newest touched first, ties by build id ascending, as Postgres orders them."""
+        tenant, principal = bs._text(tenant, "tenant"), bs._text(principal, "principal")
+        dashboard_id = bs._id(dashboard_id, "a dashboard id", optional=True)
+        if type(limit) is not int or not 1 <= limit <= bs.MAX_UNFINISHED:
+            raise ValueError(f"a list holds 1 to {bs.MAX_UNFINISHED} builds")
         with self._lock:
             rows = [row for row in self._builds.values() if row["tenant_id"] == tenant
                     and row["principal_id"] == principal and row["status"] == bs.BUILDING
                     and (dashboard_id is None or row["dashboard_id"] == dashboard_id)]
-            rows.sort(key=lambda row: (row["updated_at"], row["build_id"]), reverse=True)
+            rows.sort(key=lambda row: row["build_id"])
+            rows.sort(key=lambda row: row["updated_at"], reverse=True)
             return [self._stored(row) for row in rows[:limit]]
 
     def dashboard_building(self, tenant, dashboard_id) -> bool:

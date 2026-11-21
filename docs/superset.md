@@ -261,7 +261,7 @@ builder can turn a goal into a dashboard. mnemiq plans the charts on named measu
 builder, lays them out, and checks each chart it can against its own SQL, run as the same builder. A fuller guide is
 still to come. In short:
 
-- **Three routes, mounted only in Superset mode.**
+- **The build routes, mounted only in Superset mode.**
   - `POST /v1/superset/builds` takes `{goal, dashboard_id?, fresh?, profile?}`. It starts a build. With neither
     `dashboard_id` nor `fresh`, it may instead answer an offer: a dashboard the builder can see that already covers
     the goal. An offer builds and keeps nothing.

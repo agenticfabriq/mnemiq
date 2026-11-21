@@ -26,7 +26,7 @@ import pytest
 from mnemiq.config import Settings
 from mnemiq.superset.adapter import SupersetSqlAdapter
 from mnemiq.superset.build_store import DashboardBusy, StepState
-from mnemiq.superset.builder import BuildBusy, BuildState, build_state, build_steps, next_step, start_build
+from mnemiq.superset.builder import BuildBusy, BuildState, build_state, build_steps, next_step, plan_summary, start_build
 from mnemiq.superset.chart_check import ChartStatus
 from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenRef, extension_chart_request
 from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetRefusedCaller, SupersetToolError
@@ -34,7 +34,7 @@ from mnemiq.superset.dashboard_charts import LeftOut, datasets_built_on
 from mnemiq.superset.extension import TOOL_PREFIX
 from mnemiq.superset.marker import Marker, format_marker, parse_marker
 from mnemiq.superset.measures import Measure, MeasureKind
-from mnemiq.superset.planner import BuildPlan, PlannedDataset
+from mnemiq.superset.planner import BuildPlan, PlannedDataset, plan_to_json
 from tests.superset_build_world import (
     DATABASE_ID,
     FRESH_TOKEN,
@@ -304,7 +304,7 @@ def test_failed_check_is_reported_as_what_it_is(fake, world, store):
 
 
 def test_build_answer_names_its_plan(fake, world, store):
-    """What the panel shows before the first chart is made: each planned chart by key, title and family with its
+    """What a client shows before the first chart is made: each planned chart by key, title and family with its
     measures by label (a saved metric by name), and each written measure's definition."""
     state = _start(store)
     plan = state.plan
@@ -321,9 +321,6 @@ def test_build_answer_names_its_plan(fake, world, store):
 
 def test_plan_summary_holds_no_filter_operand():
     """The summary names charts and measures only: a filter's operand, a dimension or a dataset's SQL is not in it."""
-    from mnemiq.superset.builder import plan_summary
-    from mnemiq.superset.planner import plan_to_json
-
     filtered = dataclasses.replace(BY_REGION, filters=(Filter("stage", "=", "Closed Won"),))
     summary = plan_summary(plan_to_json(BuildPlan(charts=(filtered,), measures=(POLICIES,))))
     text = json.dumps(summary)
