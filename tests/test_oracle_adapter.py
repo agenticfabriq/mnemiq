@@ -2325,3 +2325,23 @@ def test_execute_deadline_stops_the_statement_on_the_server():
         assert running == 0, "the statement cut at its deadline is still running on the server"
     finally:
         admin.close()
+
+
+def test_batched_dictionary_reads_live():
+    """The batched dictionary reads give what the per-table reads give, on a real dictionary: the module's two tables
+    (one with a declared key) and one the dictionary does not show."""
+    a = _adapter()
+    with contextlib.closing(_adapter(read_only=False)) as w:
+        w.execute("BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, 'T_CLAIM'); "
+                  "DBMS_STATS.GATHER_TABLE_STATS(USER, 'T_REGION'); END;")
+    tables = ["T_CLAIM", "T_REGION", "NO_SUCH_TABLE"]
+    facts = a.dictionary(tables)
+    for table in tables:
+        assert facts.sizes[table] == a.table_size(table), table
+        assert sorted(facts.statistics[table], key=lambda s: s.column) == sorted(
+            a.column_statistics(table), key=lambda s: s.column), table
+        assert facts.unique[table] == a.unique_columns(table), table
+    assert facts.sizes["T_CLAIM"].rows is not None
+    pairs = [(t, s.column) for t in ("T_CLAIM", "T_REGION") for s in facts.statistics[t]]
+    got = a.histograms(pairs)
+    assert all(got[p] == a.histogram(*p) for p in pairs)
