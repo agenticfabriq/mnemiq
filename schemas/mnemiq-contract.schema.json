@@ -89,6 +89,18 @@
             "default": null,
             "title": "Data Type"
           },
+          "declared_unique": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Declared Unique"
+          },
           "description": {
             "anyOf": [
               {
@@ -119,6 +131,17 @@
             ],
             "default": null,
             "title": "Distinct Count"
+          },
+          "estimate": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ColumnEstimate"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "id": {
             "title": "Id",
@@ -205,6 +228,85 @@
           "name"
         ],
         "title": "Column",
+        "type": "object"
+      },
+      "ColumnEstimate": {
+        "description": "What the source's optimizer statistics say about a column, read from its dictionary, never from its rows.\n\nApproximate by nature: a distinct count may be off by a few percent, and the whole is as old as `analyzed`.\n`sampled` says the statistics were read from part of the rows; `stale` is the source's own flag, None when it\ncannot say. A field is None where the source holds no such statistic.",
+        "properties": {
+          "analyzed": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Analyzed"
+          },
+          "distinct": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Distinct"
+          },
+          "nulls": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Nulls"
+          },
+          "rows": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Rows"
+          },
+          "sampled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sampled"
+          },
+          "stale": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Stale"
+          }
+        },
+        "title": "ColumnEstimate",
         "type": "object"
       },
       "Concept": {
@@ -763,7 +865,7 @@
     "title": "CertifiedRecord",
     "type": "object"
   },
-  "format_version": "1.6.0",
+  "format_version": "1.7.0",
   "identity_context": {
     "properties": {
       "attributes": {
@@ -1105,6 +1207,18 @@
             "default": null,
             "title": "Data Type"
           },
+          "declared_unique": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Declared Unique"
+          },
           "description": {
             "anyOf": [
               {
@@ -1135,6 +1249,17 @@
             ],
             "default": null,
             "title": "Distinct Count"
+          },
+          "estimate": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ColumnEstimate"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "id": {
             "title": "Id",
@@ -1221,6 +1346,85 @@
           "name"
         ],
         "title": "Column",
+        "type": "object"
+      },
+      "ColumnEstimate": {
+        "description": "What the source's optimizer statistics say about a column, read from its dictionary, never from its rows.\n\nApproximate by nature: a distinct count may be off by a few percent, and the whole is as old as `analyzed`.\n`sampled` says the statistics were read from part of the rows; `stale` is the source's own flag, None when it\ncannot say. A field is None where the source holds no such statistic.",
+        "properties": {
+          "analyzed": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Analyzed"
+          },
+          "distinct": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Distinct"
+          },
+          "nulls": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Nulls"
+          },
+          "rows": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Rows"
+          },
+          "sampled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sampled"
+          },
+          "stale": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Stale"
+          }
+        },
+        "title": "ColumnEstimate",
         "type": "object"
       },
       "CompatibilityProfile": {

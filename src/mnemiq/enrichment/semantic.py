@@ -27,6 +27,9 @@ def _facts(
             distinct_count=c.distinct_count,
             null_count=c.null_count,
             foreign_key=fk_map.get((c.object_id, c.name)),
+            estimated_rows=c.estimate.rows if c.estimate else None,
+            estimated_distinct=c.estimate.distinct if c.estimate else None,
+            estimated_nulls=c.estimate.nulls if c.estimate else None,
         )
         for c in columns
     ]

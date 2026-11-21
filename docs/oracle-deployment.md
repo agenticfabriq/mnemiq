@@ -195,3 +195,82 @@ The driver runs in thin mode, which needs the encrypted `ewallet.pem` from the w
 If the read principal is not the schema owner, the adapter issues
 `ALTER SESSION SET CURRENT_SCHEMA` at connect time so unqualified names resolve to the governed
 schema. Note that this changes name resolution only — it grants nothing.
+
+## 6. Enriching a production database
+
+`mnemiq enrich` profiles each table before describing it: one count over every column, a
+`GROUP BY` per code-like column, partition counts, the grounding and join checks, the value
+index. Each of those reads the table in full, and on large tables one read can take hours. So
+on Oracle, enrich decides how to profile a source from its manifest entry before reading
+anything.
+
+**The size check.** When a source's entry names no `"profile"`, enrich first reads each
+table's size from the optimizer statistics (`NUM_ROWS × AVG_ROW_LEN` in `ALL_TAB_STATISTICS`),
+which reads no table data. If any table holds more than 1 GiB by that estimate, enrich stops
+before reading any table, names the large tables, and says how to go on. A table with no
+statistics, or with statistics Oracle marks stale, may be large without the check knowing it, so
+enrich names those tables and goes on.
+
+**The two keys.** `"profile"` says how the source is profiled:
+
+```json
+[{"id": "erp", "kind": "oracle", "target": "db.example.com:1521/ERP", "catalog": "erp",
+  "schema": "APP", "tables": ["ORDERS", "ORDER_LINES", "CUSTOMERS"],
+  "profile": "statistics", "exact_tables": ["CUSTOMERS"]}]
+```
+
+- `"profile": "exact"` profiles every table in full, as on any other source, with no size check.
+- `"profile": "statistics"` reads each table's description from the data dictionary and none of
+  its rows: row and null counts and an approximate distinct count from the optimizer statistics,
+  keys from the constraints and indexes the table declares, and code lists from its histograms.
+- `"exact_tables"` (with `"statistics"` only) names tables to profile in full anyway, as names or
+  `*`/`?` patterns matched without regard to case. Use it for the small tables whose exact facts
+  matter most, such as the dimensions your questions filter on. A name that matches no table is
+  refused.
+
+An unknown key in a source's entry is refused rather than ignored, so a misspelled `"profile"`
+cannot fall back to reading every table.
+
+**What statistics mode gives up.**
+
+- **Counts are estimates.** They are kept apart from exact counts. The model that describes the
+  columns sees them marked as estimates, and nothing that needs an exact count reads them: an
+  estimated column is never reported as entirely NULL, and gets no value index (so values in a
+  question are not checked against it before the query runs).
+- **Keys come only from declarations.** A column counts as unique only where an enabled,
+  validated single-column primary key or unique constraint, or a valid unique index on the plain
+  column, declares it. An approximate distinct count can never prove a key. It can show that a
+  column repeats, though, and the fan-out guard uses that. No join is inferred to or from an
+  estimated table, because checking a candidate reads its rows. Declared foreign keys are kept.
+- **The fan-out guard runs.** It refuses a sum through a join that repeats rows, reading declared
+  keys and estimates. With no partition facts, it also refuses a join to the current rows of a
+  type-2 dimension (`is_current = 1`), which an exact profile would show is safe: name that
+  dimension in `"exact_tables"` to have its partitions profiled.
+- **Code lists come only from complete frequency histograms.** A column gets a list only where
+  the histogram is `FREQUENCY` with one endpoint per distinct value, was built from every non-null
+  row in the same gather as the table's statistics, and Oracle says the table's statistics are not
+  stale; and only where every value reads back exactly. "The same gather" is read from
+  `LAST_ANALYZED`, which Oracle keeps to the second, and no dictionary view a reader can see says
+  which gather built a histogram: so of two gathers of one table within the same second, the first
+  one's histogram passes for the second's, and if the column's values changed in between without
+  the row count changing, its list can be out of date.
+  Measured on 23ai Free: Oracle often stores no text for short `VARCHAR2` values, only a numeric
+  encoding of their first bytes. mnemiq reads a value back from that encoding only on a database
+  whose character set is UTF-8 (`AL32UTF8` or `UTF8`), and only when the value is at most 5
+  printable ASCII bytes and agrees with the column's lowest and highest values. In a single-byte
+  character set a longer value can share a short one's encoding, so there such a column gets no
+  list. A value holding a NUL character can share one in any character set; no statistic shows
+  it. Oracle
+  keeps 64 bytes of a value's text, so values of 64 bytes or more give no list. Otherwise the column gets no
+  list, never a partial one. A dictionary's code meanings attach only to codes in a column's
+  list, so for a column without one only the dictionary's description is kept: name the codes
+  there, or in your definitions.
+- **Everything is as old as the statistics.** Gather them before enriching
+  (`DBMS_STATS.GATHER_TABLE_STATS`, or let Oracle's maintenance job do it), and re-enrich when
+  codes change. A code added since the statistics were gathered is missing from the column's list,
+  and the dictionary's meaning for it is dropped. Enrich reports how many tables it profiled each
+  way, and names the estimated tables that have no statistics, columns without them, or stale ones,
+  and the dictionary's code meanings it cannot apply.
+- **Nothing else reads an estimated table either.** Grounding skips joins to it, it has no value
+  index, and the examples phase (`MNEMIQ_ENRICH_EXAMPLES`), which runs the queries it writes, is
+  refused with `"statistics"`.

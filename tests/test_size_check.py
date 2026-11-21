@@ -58,8 +58,7 @@ def test_a_large_table_stops_enrich_before_any_table_is_read():
     assert refusal.startswith("enrich stopped before reading any table: 1 table(s) of source 'erp'")
     assert "ORDERS (~1.9 GiB)" in refusal and "CUSTOMERS" not in refusal
     assert '"profile": "exact"' in refusal and '"tables"' in refusal
-    # statistics mode is not in this version: the message must not send anyone to it
-    assert "statistics\"" not in refusal
+    assert '"profile": "statistics"' in refusal and '"exact_tables"' in refusal
     assert warning is None
 
 
@@ -136,7 +135,7 @@ def _wire(monkeypatch, source):
     profiled: list = []
 
     def profile(*a, **k):
-        profiled.append(a)
+        profiled.append((a, k))
         raise _Profiled
 
     monkeypatch.setattr("mnemiq.adapters.resolve.adapter_for", lambda *a, **k: source)
@@ -153,15 +152,30 @@ def test_enrich_exits_1_and_reads_no_table_on_refusal(monkeypatch, tmp_path, cap
     assert "enrich stopped before reading any table" in capsys.readouterr().err
 
 
-def test_enrich_refuses_statistics_until_it_is_built(monkeypatch, tmp_path, capsys):
-    """Taking "statistics" as "skip the check" would profile every table in full: the harm the check exists for."""
+def test_enrich_passes_the_statistics_scope(monkeypatch, tmp_path):
+    """"statistics" skips the size check, which exists for exact profiling, and reaches the profile with the tables the
+    manifest names exact."""
     from mnemiq.cli import _cmd_enrich
 
     source = _Dictionary({"ORDERS": _size(20_000_000)})
     profiled = _wire(monkeypatch, source)
-    assert _cmd_enrich(_settings(tmp_path, profile="statistics")) == 1
-    assert profiled == [] and source.asked == []
-    assert '"profile": "statistics" is not available in this version' in capsys.readouterr().err
+    with pytest.raises(_Profiled):
+        _cmd_enrich(_settings(tmp_path, profile="statistics", exact_tables=["orders", "dim_*"]))
+    assert profiled[0][1]["statistics"] == ("orders", "dim_*") and source.asked == []
+    profiled.clear()
+    with pytest.raises(_Profiled):
+        _cmd_enrich(_settings(tmp_path, profile="statistics"))
+    assert profiled[0][1]["statistics"] == ()
+
+
+@pytest.mark.parametrize("entry", [{}, {"profile": "exact"}])
+def test_enrich_profiles_exactly_unless_statistics_is_named(monkeypatch, tmp_path, entry):
+    from mnemiq.cli import _cmd_enrich
+
+    profiled = _wire(monkeypatch, _Dictionary({"ORDERS": _size(1_000)}))
+    with pytest.raises(_Profiled):
+        _cmd_enrich(_settings(tmp_path, **entry))
+    assert profiled[0][1].get("statistics") is None
 
 
 def test_enrich_prints_the_warning_and_goes_on(monkeypatch, tmp_path, capsys):
@@ -172,3 +186,139 @@ def test_enrich_prints_the_warning_and_goes_on(monkeypatch, tmp_path, capsys):
         _cmd_enrich(_settings(tmp_path))
     assert len(profiled) == 1
     assert "WARNING: 1 table(s) of source 'erp' have no table-level optimizer statistics" in capsys.readouterr().err
+
+
+# --- after the profile: how each table was profiled, and which lack statistics ---------------------
+
+def _profiled_snapshot():
+    """Two tables profiled exactly, three from statistics: one current, one with none, one stale."""
+    from mnemiq.contract import Column, Job, Snapshot
+    from mnemiq.contract.semantic import ColumnEstimate
+
+    def est(rows, stale=False, analyzed="2026-11-01"):
+        return ColumnEstimate(rows=rows, distinct=2, nulls=0, analyzed=analyzed, sampled=False, stale=stale)
+
+    columns = [
+        Column(id="ORDERS.ID", object_id="ORDERS", name="ID", row_count=10, distinct_count=10, null_count=0),
+        Column(id="CUSTOMERS.ID", object_id="CUSTOMERS", name="ID", row_count=5, distinct_count=5, null_count=0),
+        Column(id="ORDER_LINES.ID", object_id="ORDER_LINES", name="ID", estimate=est(1000)),
+        Column(id="PAYMENTS.ID", object_id="PAYMENTS", name="ID"),
+        Column(id="RETURNS.ID", object_id="RETURNS", name="ID", estimate=est(400, stale=True, analyzed="2026-01-01")),
+        Column(id="SHIPMENTS.ID", object_id="SHIPMENTS", name="ID", estimate=est(300)),
+        Column(id="SHIPMENTS.CARRIER", object_id="SHIPMENTS", name="CARRIER"),
+    ]
+    jobs = [Job(id=f"profile:{t}", source_id="erp", kind="profile", status="done", detail=d)
+            for t, d in (("ORDERS", None), ("CUSTOMERS", None), ("ORDER_LINES", "estimated"),
+                         ("PAYMENTS", "estimated"), ("RETURNS", "estimated"), ("SHIPMENTS", "estimated"))]
+    return Snapshot(version="v", source_id="erp", created_at="t", columns=columns, jobs=jobs)
+
+
+def test_the_report_counts_each_way_and_names_what_lacks_statistics():
+    from mnemiq.enrichment.statistics import profile_report
+
+    summary, warning = profile_report(_profiled_snapshot())
+    assert summary == "profiled 2 table(s) exactly, 4 from Oracle's statistics"
+    assert "1 table(s) of source 'erp' have no optimizer statistics" in warning and "PAYMENTS" in warning
+    assert "1 table(s) of source 'erp' have statistics Oracle marks stale" in warning
+    assert "RETURNS (as of 2026-01-01)" in warning and "ORDER_LINES" not in warning
+    assert "1 table(s) of source 'erp' have columns without statistics" in warning
+    assert "SHIPMENTS (1 of 2 columns)" in warning
+    assert "DBMS_STATS.GATHER_TABLE_STATS" in warning and '"exact_tables"' in warning
+
+
+def test_no_report_when_every_table_was_profiled_exactly():
+    from mnemiq.contract import Job, Snapshot
+    from mnemiq.enrichment.statistics import profile_report
+
+    snap = Snapshot(version="v", source_id="erp", created_at="t",
+                    jobs=[Job(id="profile:ORDERS", source_id="erp", kind="profile", status="done")])
+    assert profile_report(snap) == (None, None)
+
+
+def _enrich_reporting(monkeypatch, tmp_path, snapshot):
+    from mnemiq.cli import _cmd_enrich
+
+    monkeypatch.setattr("mnemiq.adapters.resolve.adapter_for", lambda *a, **k: _Dictionary({}))
+    monkeypatch.setattr("mnemiq.enrichment.pipeline.enrich_structural", lambda *a, **k: snapshot)
+
+    def stop(*a, **k):
+        raise _Profiled
+
+    monkeypatch.setattr("mnemiq.enrichment.certified.fetch_certified_records", stop)
+    with pytest.raises(_Profiled):
+        _cmd_enrich(_settings(tmp_path, profile="statistics"))
+
+
+def test_enrich_reports_how_each_table_was_profiled(monkeypatch, tmp_path, capsys):
+    _enrich_reporting(monkeypatch, tmp_path, _profiled_snapshot())
+    assert "profiled 2 table(s) exactly, 4 from Oracle's statistics" in capsys.readouterr().out
+
+
+def test_enrich_names_tables_without_statistics(monkeypatch, tmp_path, capsys):
+    _enrich_reporting(monkeypatch, tmp_path, _profiled_snapshot())
+    err = capsys.readouterr().err
+    assert "WARNING: 1 table(s) of source 'erp' have no optimizer statistics" in err and "PAYMENTS" in err
+    assert "Gather their statistics" in err
+
+
+
+def test_enrich_refuses_generated_examples_in_statistics_mode(monkeypatch, tmp_path, capsys):
+    """The examples phase runs the queries it writes against the source's tables; statistics mode reads none of them."""
+    from mnemiq.cli import _cmd_enrich
+
+    source = _Dictionary({"ORDERS": _size(1_000)})
+    profiled = _wire(monkeypatch, source)
+    settings = _settings(tmp_path, profile="statistics").model_copy(update={"enrich_examples": True})
+    assert _cmd_enrich(settings) == 1
+    assert profiled == [] and source.asked == []
+    assert 'MNEMIQ_ENRICH_EXAMPLES must be off with "profile": "statistics"' in capsys.readouterr().err
+
+
+def _dictionary_file(tmp_path, columns):
+    path = tmp_path / "dictionary.json"
+    path.write_text(json.dumps({"columns": columns}))
+    return str(path)
+
+
+def test_dictionary_meanings_that_cannot_attach_are_named():
+    """`apply_dictionary` gives a meaning only to a code in the column's list. An estimated column has a list only where
+    a histogram allowed one, so the operator's other meanings would be dropped without a word."""
+    from mnemiq.contract import CodedValue, Column, Job, Snapshot
+    from mnemiq.enrichment.dictionary import DataDictionary
+    from mnemiq.enrichment.statistics import unapplied_code_meanings
+
+    snap = Snapshot(version="v", source_id="erp", created_at="t", columns=[
+        Column(id="ORDERS.STATUS", object_id="ORDERS", name="STATUS", coded_values=[CodedValue(code="A")]),
+        Column(id="LINES.KIND", object_id="LINES", name="KIND"),
+        Column(id="LINES.UNIT", object_id="LINES", name="UNIT", coded_values=[CodedValue(code="KG")]),
+    ], jobs=[Job(id="profile:ORDERS", source_id="erp", kind="profile", status="done"),
+             Job(id="profile:LINES", source_id="erp", kind="profile", status="done", detail="estimated")])
+    dictionary = DataDictionary.model_validate({"columns": {
+        "ORDERS.STATUS": {"codes": {"A": "Active", "Z": "Zombie"}},
+        "LINES.KIND": {"codes": {"S": "Sale", "R": "Return"}},
+        "LINES.UNIT": {"codes": {"KG": "Kilogram"}},
+    }})
+    assert unapplied_code_meanings(snap, dictionary) == ["LINES.KIND (2 of 2 codes)"]
+
+
+def test_enrich_warns_when_dictionary_meanings_cannot_attach(monkeypatch, tmp_path, capsys):
+    from mnemiq.cli import _cmd_enrich
+    from mnemiq.contract import Column, Job, Snapshot
+
+    snap = Snapshot(version="v", source_id="erp", created_at="t", columns=[
+        Column(id="LINES.KIND", object_id="LINES", name="KIND")],
+        jobs=[Job(id="profile:LINES", source_id="erp", kind="profile", status="done", detail="estimated")])
+    monkeypatch.setattr("mnemiq.adapters.resolve.adapter_for", lambda *a, **k: _Dictionary({}))
+    monkeypatch.setattr("mnemiq.enrichment.pipeline.enrich_structural", lambda *a, **k: snap)
+
+    def stop(*a, **k):
+        raise _Profiled
+
+    monkeypatch.setattr("mnemiq.enrichment.certified.fetch_certified_records", stop)
+    settings = _settings(tmp_path, profile="statistics").model_copy(update={
+        "dictionary_path": _dictionary_file(tmp_path, {"LINES.KIND": {"codes": {"S": "Sale"}}})})
+    with pytest.raises(_Profiled):
+        _cmd_enrich(settings)
+    err = capsys.readouterr().err
+    assert "WARNING: the dictionary gives code meanings for 1 column(s) profiled from Oracle's statistics" in err
+    assert "LINES.KIND (1 of 1 codes)" in err and '"exact_tables"' in err
