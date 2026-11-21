@@ -86,7 +86,7 @@ PLANTED = ("total_sales", "SUM(premium)")
 RECORD_DIR = "MNEMIQ_TEST_SUPERSET_RECORD_DIR"
 # What a build answer's step may hold (`superset_build._build`).
 STEP_FIELDS = {"key", "kind", "status", "object_id", "started_at", "lease_until"}
-BUILD_FIELDS = {"build_id", "status", "dashboard_id", "steps", "checks", "ran", "message"}
+BUILD_FIELDS = {"build_id", "status", "dashboard_id", "steps", "checks", "ran", "message", "plan", "check_reasons"}
 # The calls that change something in Superset: MCP's own creates and the extension's write tools.
 WRITES = {"generate_chart", "create_dataset", "create_virtual_dataset",
           *(TOOL_PREFIX + base for base in ("create_dashboard", "create_dataset", "create_chart", "patch_chart",

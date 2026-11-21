@@ -91,7 +91,8 @@ roles = ["*"]
 guard_fanout = true
 """
 
-BUILD_ROUTES = {("POST", "/v1/superset/builds"), ("GET", "/v1/superset/builds/{build_id}"),
+BUILD_ROUTES = {("POST", "/v1/superset/builds"), ("GET", "/v1/superset/builds"),
+                ("GET", "/v1/superset/builds/{build_id}"),
                 ("POST", "/v1/superset/builds/{build_id}/next"),
                 ("GET", "/v1/superset/dashboards/{dashboard_id}/measures"),
                 ("POST", "/v1/superset/dashboards/{dashboard_id}/measures/{name}/edit"),
@@ -1013,6 +1014,39 @@ def test_a_chat_change_whose_added_chart_cannot_be_planned_still_reports_its_cha
     assert r.status_code == 200, r.text
     assert r.json()["changed"] == [chart]
     assert r.json()["added"] == {"error": {"status": 503, "detail": MODEL_UNAVAILABLE}}
+
+
+def test_unfinished_route_lists_the_callers_builds_and_calls_no_superset_tool(served, fake, world, store):
+    """The person's unfinished builds, from the store alone: each one's goal, dashboard, status, times and how many
+    of its steps are done; with `dashboard_id`, only that dashboard's."""
+    client, _ = served
+    dashboard, _ = _a_built_dashboard(client)
+    onto = _stored(store, client, dashboard_id=dashboard)
+    fresh = _stored(store, client)
+    before = len(fake.calls)
+    r = client.get("/v1/superset/builds", headers=_bearer(_token()))
+    assert r.status_code == 200, r.text
+    listed = r.json()["builds"]
+    assert {b["build_id"] for b in listed} == {onto.build_id, fresh.build_id}
+    entry = next(b for b in listed if b["build_id"] == onto.build_id)
+    assert set(entry) == {"build_id", "goal", "dashboard_id", "status", "created_at", "updated_at", "steps_done",
+                          "steps_total"}
+    assert entry["dashboard_id"] == dashboard and entry["status"] == "building"
+    assert (entry["steps_done"], entry["steps_total"]) == (0, len(onto.steps))
+    only = client.get(f"/v1/superset/builds?dashboard_id={dashboard}", headers=_bearer(_token()))
+    assert [b["build_id"] for b in only.json()["builds"]] == [onto.build_id]
+    assert fake.calls[before:] == []
+
+
+def test_the_build_answer_carries_its_plan_and_the_check_steps_reasons(served, fake, world, store):
+    client, _ = served
+    world.skewed["Policies by region"] = 1
+    first = _start(client).json()["build"]
+    assert [c["key"] for c in first["plan"]["charts"]] == ["policies_by_region"] and first["check_reasons"] == {}
+    answers = _run_to_the_end(client, first["build_id"])
+    chart = next(s["object_id"] for s in answers[-1].json()["build"]["steps"] if s["key"] == "policies_by_region")
+    assert list(answers[-1].json()["build"]["check_reasons"]) == [str(chart)]
+    assert _get(client, first["build_id"]).json()["build"]["check_reasons"] == {}
 
 
 def test_a_build_keeps_the_profile_it_started_with(profiled, fake, world, store, monkeypatch):

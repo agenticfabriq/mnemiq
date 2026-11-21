@@ -11,8 +11,8 @@ route under `/v1/superset/`.
   dashboard; asked either way, no dashboard is looked for. Onto a dashboard, the plan leaves out each chart the
   dashboard already shows (`dashboard_charts.leave_out_shown`), and the answer names each one beside the build
   (`left_out`, each `part`, `chart_id` and `title`); a goal it shows whole builds nothing and keeps nothing, and is
-  answered as `shown` (200) with those parts and mnemiq's words. Otherwise the answer is the new build (201), or the plan's
-  refusal, which is an answer too. The build keeps the profile it was asked under (`profile`, None for the
+  answered as `shown` (200) with those parts and mnemiq's words. Otherwise the answer is the new build (201), or the
+  plan's refusal, which is an answer too. The build keeps the profile it was asked under (`profile`, None for the
   deployment's default). Before anything is planned or kept, Superset is asked whether the person may build (the
   grants; a non-builder is refused as one, `NOT_A_BUILDER`, and nothing about a dashboard they named is read), then
   whether the extension is there and offers every create a build sends (`require_build_tools`: a missing one and an
@@ -22,6 +22,9 @@ route under `/v1/superset/`.
   is a 503 saying to try again; a prompt its server refuses or cuts as too long is a refused plan, since the goal and
   the schema are too large to plan in one prompt.
 - `GET /v1/superset/builds/{build_id}`: the build as it stands, read from the build store alone.
+- `GET /v1/superset/builds?dashboard_id=`: the person's builds still building, newest first (with `dashboard_id`,
+  only that dashboard's), each `build_id`, `goal`, `dashboard_id`, `status`, `created_at`, `updated_at`, `steps_done`
+  and `steps_total`, read from the build store alone: what a client offers to finish.
 - `POST /v1/superset/builds/{build_id}/next`: the build's next step, claimed, run and recorded (`builder.next_step`);
   409 while another request's step holds the build.
 
@@ -33,7 +36,7 @@ through Superset as the builder, never the source database, so they need no mnem
 **As the builder.** A route that calls Superset builds its own adapter with `superset_executor(settings, delegation)`
 from the deployment's settings, which name Superset, and the request's verified token; the planner and the builder
 call Superset only through that adapter's client. What the builder may read is what Superset says when asked as them,
-read once per request. The `GET` calls nothing.
+read once per request. The build `GET`s call nothing.
 
 **Under its profile.** A build's plan, and each of its steps, run under the settings of the profile it was started
 under, picked again at every step as `/v1/ask` picks one: a profile gone or no longer offered to the builder refuses
@@ -48,8 +51,11 @@ writes it.
 **What is answered.** A build as `_build` writes it, and nothing else: `build_id`, `status` and `dashboard_id`; its
 `steps`, each `key`, `kind`, `status`, `object_id` (what the step made), `started_at` and `lease_until` (when a running
 step's lease passes); `checks`, each chart's check status by chart id; `ran`, the step this request ran, and `message`,
-mnemiq's own words on it. Never a lease id, a step's intent, or a value. Every failure is a status and mnemiq's own
-sentence (`server/superset_refusals.py`, and `_refusal` here for the build's own).
+mnemiq's own words on it; `plan`, the build's plan as the person is shown it (`builder.plan_summary`: each chart's
+key, title, family and measures, each written measure's definition); and `check_reasons`, why each chart the check
+step did not check did not, in that step's own answer only. Never a lease id, a step's intent, or a value. Every
+failure is a status and mnemiq's own sentence (`server/superset_refusals.py`, and `_refusal` here for the build's
+own).
 """
 
 from __future__ import annotations
@@ -58,7 +64,7 @@ import logging
 from typing import Annotated, Any
 
 import psycopg
-from fastapi import Depends, FastAPI, HTTPException, Path, Response
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Response
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, model_validator
 
 from mnemiq.llm.client import ModelUnavailable
@@ -259,6 +265,8 @@ def _build(state: BuildState) -> dict:
         "checks": {str(chart_id): str(status) for chart_id, status in state.checks.items()},
         "ran": state.ran,
         "message": state.message,
+        "plan": state.plan,
+        "check_reasons": {str(chart_id): reason for chart_id, reason in state.check_reasons.items()},
     }
 
 
@@ -338,7 +346,7 @@ def _refusal(exc: Exception, doors) -> HTTPException | None:
 
 
 def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
-    """Mount the three build routes on `app`, each behind `asker`, the `/v1` door's dependency. The build store is
+    """Mount the build, measures and changes routes on `app`, each behind `asker`, the `/v1` door's dependency. The build store is
     the deployment's control Postgres (`MNEMIQ_CONTROL_DSN`); without one, every build route answers 503 naming it."""
     # The deployment's settings name Superset (its MCP URL, database and schema), so every adapter is built from them;
     # a build's plan and steps run under the settings of the profile it was started under.
@@ -403,6 +411,23 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
                                      profile_name=body.profile)
             response.status_code = status
             return answer
+
+        return answered(work)
+
+    @app.get("/v1/superset/builds")
+    def unfinished(dashboard_id: Annotated[int | None, Query(gt=0, le=MAX_ID)] = None,
+                   asking=Depends(asker)) -> dict:
+        """The person's builds still building, newest touched first, from the build store alone: what a client
+        offers to finish. With `dashboard_id`, only that dashboard's. Calls no Superset tool."""
+
+        def work() -> dict:
+            who, _ = _builder(asking, building=False)
+            listed = kept().unfinished_builds(who.tenant_id, who.principal_id, dashboard_id=dashboard_id)
+            return {"builds": [{"build_id": build.build_id, "goal": build.goal, "dashboard_id": build.dashboard_id,
+                                "status": build.status, "created_at": build.created_at,
+                                "updated_at": build.updated_at,
+                                "steps_done": sum(1 for step in build.steps if step.status == "done"),
+                                "steps_total": len(build.steps)} for build in listed]}
 
         return answered(work)
 

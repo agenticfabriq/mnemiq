@@ -26,7 +26,7 @@ import pytest
 from mnemiq.config import Settings
 from mnemiq.superset.adapter import SupersetSqlAdapter
 from mnemiq.superset.build_store import DashboardBusy, StepState
-from mnemiq.superset.builder import BuildBusy, BuildState, build_state, build_steps, next_step, start_build
+from mnemiq.superset.builder import BuildBusy, BuildState, build_state, build_steps, next_step, plan_summary, start_build
 from mnemiq.superset.chart_check import ChartStatus
 from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenRef, extension_chart_request
 from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetRefusedCaller, SupersetToolError
@@ -34,7 +34,7 @@ from mnemiq.superset.dashboard_charts import LeftOut, datasets_built_on
 from mnemiq.superset.extension import TOOL_PREFIX
 from mnemiq.superset.marker import Marker, format_marker, parse_marker
 from mnemiq.superset.measures import Measure, MeasureKind
-from mnemiq.superset.planner import BuildPlan, PlannedDataset
+from mnemiq.superset.planner import BuildPlan, PlannedDataset, plan_to_json
 from tests.superset_build_world import (
     DATABASE_ID,
     FRESH_TOKEN,
@@ -301,6 +301,49 @@ def test_failed_check_is_reported_as_what_it_is(fake, world, store):
     assert "Premium by month" not in final.message
     kept = {m.measure.name: m for m in store.measures_for(TENANT, final.dashboard_id)}
     assert kept["policies"].check_status[ids["policies_by_region"]] is ChartStatus.MISMATCH
+
+
+def test_build_answer_names_its_plan(fake, world, store):
+    """What a client shows before the first chart is made: each planned chart by key, title and family with its
+    measures by label (a saved metric by name), and each written measure's definition."""
+    state = _start(store)
+    plan = state.plan
+    assert [c["key"] for c in plan["charts"]] == [c.key for c in SIX.charts]
+    by_key = {c["key"]: c for c in plan["charts"]}
+    assert by_key["premium_by_month"] == {"key": "premium_by_month", "title": "Premium by month", "family": "line",
+                                          "measures": ["total_premium"]}
+    assert by_key["policies_kpi"]["measures"] == ["Policies"]
+    assert {"name": "policies", "label": "Policies", "expression": "COUNT(policy_id)", "kind": "count",
+            "currency": None} in plan["measures"]
+    later = build_state(store, store.load_build(TENANT, state.build_id, PRINCIPAL))
+    assert later.plan == plan
+
+
+def test_plan_summary_holds_no_filter_operand():
+    """The summary names charts and measures only: a filter's operand, a dimension or a dataset's SQL is not in it."""
+    filtered = dataclasses.replace(BY_REGION, filters=(Filter("stage", "=", "Closed Won"),))
+    summary = plan_summary(plan_to_json(BuildPlan(charts=(filtered,), measures=(POLICIES,))))
+    text = json.dumps(summary)
+    assert "Closed Won" not in text and "stage" not in text and "dimensions" not in text
+
+
+def test_check_step_answers_each_charts_reason(fake, world, store):
+    """The check step's answer names why each chart that did not check did not, by its id; a checked chart has
+    none."""
+    world.skewed["Policies by region"] = 1
+    final = _run(store, _start(store).build_id, _adapter(fake))[-1]
+    ids = _chart_ids(final)
+    assert set(final.check_reasons) == {ids["policies_by_region"]}
+    assert final.check_reasons[ids["policies_by_region"]]
+
+
+def test_check_reasons_are_not_kept(fake, world, store):
+    """The reasons ride back in the check step's own answer only: a later read of the build answers none."""
+    world.skewed["Policies by region"] = 1
+    final = _run(store, _start(store).build_id, _adapter(fake))[-1]
+    assert final.check_reasons
+    later = build_state(store, store.load_build(TENANT, final.build_id, PRINCIPAL))
+    assert later.check_reasons == {}
 
 
 # A written measure whose label rc2's MCP saves as other text (`ColumnRef.sanitize_label` escapes `<`), on a currency
