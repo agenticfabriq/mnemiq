@@ -401,6 +401,47 @@ still to come. In short:
   update it. One that has them but does not take a field a chart needs (`create_chart`'s `leave_out_no_value`, for a
   chart made with a row limit) stops the build at that chart's step, with a sentence saying to update it.
 
+## The panel
+
+The extension ([`integrations/superset`](../integrations/superset/README.md)) also puts mnemiq inside Superset 7.0 as
+the page's chat. A trigger in the page's corner opens a panel that floats over the page or docks beside it, for a
+signed-in person, with `ENABLE_EXTENSIONS` on. The panel shares Superset's React and antd, and reaches mnemiq only
+through the extension's forwarder, as the person signed in: the browser holds no mnemiq token and never learns
+mnemiq's address.
+
+- **Who sees what.** Each time the panel opens it asks mnemiq once whether this person may use it. A person Superset
+  will not let build (Alpha and sql_lab are needed) sees only the sentence that says so, and the panel asks nothing
+  else.
+- **Ask** a question about the data. The answer streams in: its sentence, the SQL (folded), and the rows it read.
+- **Build** a dashboard from a goal. mnemiq shows the plan before it makes anything, then the panel runs the build one
+  step per request, with each chart's check, and links to the result. On a dashboard, a build goes onto the
+  dashboard on screen when the goal is sent, unless "New dashboard" is ticked; off one, mnemiq may first offer a
+  dashboard that already covers the goal, to open, add to, or pass over.
+- **The dashboard's measures**, on a dashboard the person can read: each measure mnemiq keeps there, with its
+  definition and its value computed now under the person's own row rules, and Edit, Remove and Save to dataset.
+  Remove deletes the charts that show the measure (into Superset's trash, where it keeps one), and takes a chart the
+  person does not edit off the dashboard instead; it says so, and names the charts, before it does anything.
+- **Change** the dashboard on screen by chat: "show daily instead of monthly", "add a funnel of policies by status". A
+  chart setting changed by hand is kept. A removal is a proposal the person confirms, and a chart to add is built
+  onto the dashboard.
+- **Finish.** Closing the panel does not stop a build. Leaving or reloading the page stops it after the step in
+  flight, and the build stays resumable: the panel then lists the person's unfinished builds, each with Finish.
+- **What it keeps: nothing.** The conversation and a running build live in the page's memory for its life; a measure's
+  value lives only in the open measures section. Nothing is written to browser storage.
+
+The forwarder is configured in Superset's `superset_config.py`:
+
+| Setting | What it is |
+|---|---|
+| `MNEMIQ_URL` | Where Superset's web server reaches mnemiq. Required. |
+| `MNEMIQ_FORWARD_TIMEOUT_S` | How long a forwarded request may take, its whole answer read, 1 to 900 seconds. Default 600. |
+| `MNEMIQ_FORWARD_IDLE_S` | How long a chat answer's stream may go quiet between two reads, 5 to 300 seconds. Default 60. |
+
+Planning a build with a slow model can take minutes, and each forwarded request holds one of Superset's web worker
+threads while it runs. A proxy in front of Superset must allow a read timeout at least as long as
+`MNEMIQ_FORWARD_TIMEOUT_S`, and must pass a chat answer's event stream through unbuffered; size Superset's workers for
+the builds that run at once. The README lists every refusal the forwarder answers.
+
 ## What each refusal returns
 
 A request Superset refuses, or that Superset mode cannot serve, is answered with a status and one sentence saying what
