@@ -17,7 +17,7 @@ import * as core from "./test/core";
 const DIST = resolve(process.cwd(), "dist");
 const ROOT = resolve(process.cwd(), "../../..");
 // Where rc2 serves an extension's files: `/api/v1/extensions/<publisher>/<name>/<file>`.
-const BASE = "http://superset.test/api/v1/extensions/agenticfabriq/mnemiq/";
+const BASE = "https://superset.test/api/v1/extensions/agenticfabriq/mnemiq/";
 const files = () => readdirSync(DIST);
 const scripts = () => files().filter((f) => f.endsWith(".js")).map((f) => readFileSync(join(DIST, f), "utf8"));
 
