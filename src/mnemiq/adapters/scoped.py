@@ -27,7 +27,7 @@ class TablesNotFound(RuntimeError):
     """A manifest `tables` entry matched no table the source reports."""
 
 
-_BATCHED_BY_TABLE = frozenset({"dictionary", "table_sizes"})
+_BATCHED_BY_TABLE = frozenset({"dictionary", "table_sizes", "comments"})
 _BATCHED_BY_COLUMN = frozenset({"histograms"})
 
 
