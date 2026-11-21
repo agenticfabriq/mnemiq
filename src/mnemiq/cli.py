@@ -39,6 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
                                             "reads, and does the prompt fit the window? (no model call)")
     c.add_argument("--questions", required=True, help="a JSON list of {id, question, gold_sql}")
     c.add_argument("--names", action="store_true", help="also print the gold tables' names (off: counts and ids only)")
+    c.add_argument("--out", default=None, help="write the report to this file, apart from the deployment's own "
+                                               "warnings on the terminal, which can name tables: send this file")
     c.add_argument("--principal", default=None, help="identity principal (defaults to MNEMIQ_PRINCIPAL)")
     c.add_argument("--roles", default=None, help="comma-separated (defaults to MNEMIQ_ROLES)")
     w = sub.add_parser("write", help="execute a single INSERT/UPDATE/DELETE (governed)")
@@ -752,7 +754,13 @@ def _cmd_check_search(settings: Settings, args) -> int:
     with open(args.questions) as fh:
         questions = json.load(fh)
     rows, summary = check(rt, questions, _identity(args, settings))
-    print(render(rows, summary, names=args.names))
+    report = render(rows, summary, names=args.names)
+    if args.out:
+        with open(args.out, "w") as fh:
+            fh.write(report + "\n")
+        print(f"check-search: {summary['questions']} questions; the report is in {args.out}")
+    else:
+        print(report)
     return 0
 
 

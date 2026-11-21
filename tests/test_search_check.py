@@ -25,13 +25,14 @@ def test_gold_tables_are_the_engines_reading():
 class _Runtime:
     """Answers `search` with a fixed ranking, as Runtime.search returns one."""
 
-    def __init__(self, tables, ranked, fits=True):
+    def __init__(self, tables, ranked, fits=True, granted=None):
         self.snapshot = SimpleNamespace(source_bindings=[SimpleNamespace(object_id=t) for t in tables])
         self._ranked, self._fits = ranked, fits
+        self._granted = frozenset(tables if granted is None else granted)
         self.adapter = SimpleNamespace(dialect="duckdb")
 
     def search(self, question, identity):
-        return SimpleNamespace(tables=self._ranked[question],
+        return SimpleNamespace(tables=self._ranked[question], granted=self._granted,
                                fit=PromptFit(tokens=900, budget=1000 if self._fits else 800, reserve=100,
                                              counted_by="server", fits=self._fits))
 
@@ -61,7 +62,8 @@ def test_unreadable_gold_is_reported_apart():
     rows, summary = check(rt, _QUESTIONS, identity=None)
     by = {r["id"]: r for r in rows}
     assert by["q3"]["unreadable"] == "the gold SQL does not parse"
-    assert by["q4"]["unreadable"] == "the gold SQL reads 1 table(s) outside this deployment"
+    assert by["q4"]["unreadable"] == ("the gold SQL reads 1 table(s) this identity cannot see "
+                                      "(not in this deployment, or not granted)")
     assert summary["unreadable"] == 2 and summary["checked"] == 2, "neither counts as a search miss"
 
 
@@ -148,3 +150,41 @@ def test_a_qualified_gold_table_is_matched_to_the_id_the_deployment_holds():
     rows, summary = check(rt, questions, identity=None)
     assert [r.get("unreadable") for r in rows] == [None, None]
     assert summary["all_found"] == 2
+
+
+
+def test_a_gold_table_the_identity_is_not_granted_reads_as_one_outside_the_deployment():
+    # Codex's review of PR 6: a table not granted read "found 0 of 1", a search miss, while an absent one read "outside
+    # this deployment", so the check told an identity which tables exist. Search cannot find a table it may not read,
+    # so both are reported apart, alike, and neither is counted or named.
+    questions = [{"id": "q1", "question": "a", "gold_sql": "SELECT * FROM payroll"},
+                 {"id": "q2", "question": "b", "gold_sql": "SELECT * FROM nowhere"},
+                 {"id": "q3", "question": "c", "gold_sql": "SELECT * FROM orders"}]
+    rt = _Runtime(["orders", "payroll"], {"a": [], "b": [], "c": ["orders"]}, granted={"orders"})
+    rows, summary = check(rt, questions, identity=None)
+    by = {r["id"]: r for r in rows}
+    assert by["q1"]["unreadable"] == by["q2"]["unreadable"]
+    assert "payroll" not in render(rows, summary, names=True)
+    assert summary["checked"] == 1 and summary["gold_tables"] == 1
+
+
+def test_the_report_goes_to_its_own_file_apart_from_the_deployments_warnings(monkeypatch, tmp_path, capsys):
+    # Codex's review of PR 6: startup warnings can name tables and columns, so the report someone sends is a file of
+    # its own, never the terminal.
+    import logging
+
+    from mnemiq.cli import main
+
+    questions = tmp_path / "q.json"
+    questions.write_text(json.dumps(_QUESTIONS))
+    rt = _Runtime(["orders", "lines"], {q["question"]: ["orders", "lines"] for q in _QUESTIONS})
+
+    def noisy(settings):
+        logging.getLogger("mnemiq.runtime").warning("definition names codes stale.column holds none of")
+        return rt
+
+    monkeypatch.setattr("mnemiq.cli.build_runtime", noisy)
+    out = tmp_path / "report.txt"
+    assert main(["check-search", "--questions", str(questions), "--out", str(out)]) == 0
+    report = out.read_text()
+    assert "4 questions" in report and "stale.column" not in report and "orders" not in report
