@@ -1342,6 +1342,12 @@ def test_the_prompt_keeps_a_measures_condition_in_its_expression():
     assert "goes inside its expression" in system
     assert "a chart's filters narrow only what that chart shows" in system
     assert "filter them out on that chart as well" in system
+    # No ELSE on the condition: an ELSE 0 is a row COUNT counts and AVG averages in, the same wrong meaning again.
+    assert "with no ELSE on that condition" in system
+    assert "an ELSE 0 there is counted by COUNT and averaged in by AVG" in system
+    assert "at 0)" not in system
+    # A negated condition also drops the NULL rows; the model is asked to keep them where they belong.
+    assert "keep them with COALESCE or IS NULL OR" in system
 
 
 def test_a_saved_metric_on_a_0_to_100_scale_cannot_be_planned_as_a_percent():

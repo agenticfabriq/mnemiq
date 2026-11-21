@@ -344,9 +344,12 @@ column;
 - one axis shows one kind of measure.
 
 A condition that says what a written measure means (open, won, overdue, active) goes inside its expression, as \
-CASE WHEN ... THEN ... END, so the measure means its name on every chart and wherever it is saved; a chart's filters \
-narrow only what that chart shows. Where a chart should not show the rows a measure's condition leaves out (a closed \
-stage at 0), filter them out on that chart as well.
+CASE WHEN ... THEN ... END with no ELSE on that condition, so a row it leaves out adds nothing: an ELSE 0 there is \
+counted by COUNT and averaged in by AVG. The measure then means its name on every chart and wherever it is saved; a \
+chart's filters narrow only what that chart shows. A negated condition (!=, NOT IN, NOT LIKE) also leaves out the rows \
+where its column is NULL: where those rows belong to the measure, keep them with COALESCE or IS NULL OR. Where a chart \
+should not show the groups a measure's condition leaves out (a closed stage, shown empty), filter them out on that \
+chart as well.
 
 reuse_dashboard: {"id": a dashboard's id, "reason": why it already covers the goal}, only for one of the dashboards \
 listed and only when it covers the goal; the builder is then asked whether to reuse it. Otherwise null."""
