@@ -329,3 +329,190 @@ def test_the_mcp_2x_workflow_runs_this_module():
     workflow = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "mcp-2x.yml"
     runs = [line for line in workflow.read_text().splitlines() if re.search(r"\brun:.*\bpytest\b", line)]
     assert len(runs) == 1 and f"tests/{Path(__file__).name}" in runs[0].split()
+
+
+# --- A change previewed, then applied exactly: what a conversation shows before "Apply", and what "Apply" writes
+
+def _preview(fake, store, built, interpretation: Interpretation, request: str = DAILY):
+    from mnemiq.superset.chart_change import preview_change
+
+    return preview_change(_asking(fake, store, built["dashboard"]), request,
+                          interpreter=FakeInterpreter(interpretation))
+
+
+def _apply(fake, store, built, preview, *, strict: bool = True):
+    from mnemiq.superset.chart_change import apply_change
+
+    return apply_change(_asking(fake, store, built["dashboard"]), preview, strict=strict)
+
+
+def _two_edits(built) -> Interpretation:
+    return Interpretation(changes=(ChartChange(chart_id=built["policies_by_month"], set={"time_grain_sqla": "P1D"}),
+                                   ChartChange(chart_id=built["policies_by_region"], set={"row_limit": 5})))
+
+
+def _recorded(preview):
+    from mnemiq.superset.chart_change import ChangePreview
+
+    return ChangePreview.from_json(json.loads(json.dumps(preview.to_json())))
+
+
+def test_a_preview_writes_nothing(fake, world, store):
+    """A preview reads the dashboard and its charts, as the change does, and names each edit as it will be sent; it
+    writes nothing."""
+    built = _built(fake, store)
+    month = built["policies_by_month"]
+    world.charts[month]["params"]["color_scheme"] = "by hand"
+    preview = _preview(fake, store, built, _two_edits(built))
+    assert _patches(world) == []
+    first, second = preview.edits
+    assert (first.chart_id, dict(first.to_set), first.to_unset) == (month, {"time_grain_sqla": "P1D"}, ())
+    assert (second.chart_id, dict(second.to_set)) == (built["policies_by_region"], {"row_limit": 5})
+    assert first.title == "Policies by month" and first.said.startswith("Policies by month: ")
+    assert first.changed_on == world._iso(world.charts[month]["changed_on"])
+    assert preview.dashboard_changed_on == world._iso(world.dashboards[built["dashboard"]]["changed_on"])
+    assert preview.message.startswith("To change: Policies by month: ")
+
+
+def test_apply_sends_exactly_the_previewed_edits_and_asks_no_model(fake, world, store):
+    """Applied from its record, as a confirm applies it, each edit is sent as the preview names it, against the
+    `changed_on` the preview read. `apply_change` takes no model: nothing is read again by one."""
+    import inspect
+
+    from mnemiq.superset.chart_change import apply_change
+
+    assert "interpreter" not in inspect.signature(apply_change).parameters
+    built = _built(fake, store)
+    preview = _preview(fake, store, built, _two_edits(built))
+    answer = _apply(fake, store, built, _recorded(preview))
+    patches = _patches(world)
+    assert [(p["chart_id"], p["set"], p.get("unset", []), p["expect_changed_on"]) for p in patches] == [
+        (edit.chart_id, dict(edit.to_set), list(edit.to_unset), edit.changed_on) for edit in preview.edits]
+    assert answer.changed == tuple(edit.chart_id for edit in preview.edits) and answer.left == ()
+    assert world.charts[built["policies_by_month"]]["params"]["time_grain_sqla"] == "P1D"
+
+
+def test_a_previewed_filter_is_applied_from_its_record(fake, world, store):
+    """A filter the person typed is kept in the record under `operand` and sent as the preview planned it."""
+    built = _built(fake, store, BuildPlan(charts=(BY_REGION,), measures=(POLICIES,)))
+    chart = built["policies_by_region"]
+    preview = _preview(fake, store, built, Interpretation(changes=(ChartChange(
+        chart_id=chart, add_filters=({"column": "status", "op": "=", "value": "active"},)),)), "only active")
+    doc = preview.to_json()
+    assert doc["edits"][0]["change"]["add_filters"] == [{"column": "status", "op": "=", "operand": "active"}]
+    _apply(fake, store, built, _recorded(preview))
+    [patch] = _patches(world)
+    assert patch["set"] == dict(preview.edits[0].to_set)
+    assert any(f.get("subject") == "status" and f.get("comparator") == "active"
+               for f in world.charts[chart]["params"]["adhoc_filters"])
+
+
+def test_a_strict_apply_refuses_when_a_previewed_chart_changed(fake, world, store):
+    """A chart edited by hand since the preview: nothing at all is written, every edit left with the same reason, so
+    the person asks again against the dashboard as it is."""
+    from mnemiq.superset.chart_change import STALE_SINCE_PREVIEW
+
+    built = _built(fake, store)
+    preview = _recorded(_preview(fake, store, built, _two_edits(built)))
+    region = built["policies_by_region"]
+    world.charts[region]["params"] = {**world.charts[region]["params"], "color_scheme": "by hand"}
+    world.charts[region]["changed_on"] = world._stamp()
+    answer = _apply(fake, store, built, preview)
+    assert _patches(world) == []
+    assert answer.changed == ()
+    assert answer.left == tuple((edit.chart_id, STALE_SINCE_PREVIEW) for edit in preview.edits)
+    assert STALE_SINCE_PREVIEW == "it changed since the preview; ask again"
+
+
+def test_a_strict_apply_refuses_when_the_dashboard_changed(fake, world, store):
+    from mnemiq.superset.chart_change import STALE_SINCE_PREVIEW
+
+    built = _built(fake, store)
+    preview = _recorded(_preview(fake, store, built, _two_edits(built)))
+    world.dashboards[built["dashboard"]]["changed_on"] = world._stamp()
+    answer = _apply(fake, store, built, preview)
+    assert _patches(world) == [] and answer.changed == ()
+    assert answer.left == tuple((edit.chart_id, STALE_SINCE_PREVIEW) for edit in preview.edits)
+
+
+def test_a_strict_apply_refuses_a_record_whose_plan_would_differ(fake, world, store):
+    """A record whose edit would no longer plan to what was previewed (its digest) writes nothing."""
+    from mnemiq.superset.chart_change import STALE_SINCE_PREVIEW, ChangePreview
+
+    built = _built(fake, store)
+    doc = _preview(fake, store, built, _two_edits(built)).to_json()
+    doc["edits"][1]["change"]["set"] = {"row_limit": 50}
+    answer = _apply(fake, store, built, ChangePreview.from_json(doc))
+    assert _patches(world) == [] and answer.changed == ()
+    assert [chart for chart, why in answer.left if why == STALE_SINCE_PREVIEW] == [
+        built["policies_by_month"], built["policies_by_region"]]
+
+
+def test_a_strict_apply_refuses_a_stale_write_and_does_not_retry(fake, world, store):
+    """A chart edited by hand between the check and its write: the apply stops there. What was written stays, and
+    the answer names it changed and the rest left; the stale chart is not read again or written."""
+    from mnemiq.superset.chart_change import STALE_SINCE_PREVIEW
+
+    built = _built(fake, store)
+    month, region = built["policies_by_month"], built["policies_by_region"]
+    preview = _recorded(_preview(fake, store, built, _two_edits(built)))
+    seen = {"n": 0}
+
+    def hand_edit_the_second(request, _world):
+        seen["n"] += 1
+        if request["chart_id"] == region:
+            world.charts[region]["params"] = {**world.charts[region]["params"], "color_scheme": "by hand"}
+            world.charts[region]["changed_on"] = world._stamp()
+
+    world.hooks["patch_chart"] = Hook(before=hand_edit_the_second)
+    answer = _apply(fake, store, built, preview)
+    assert [p["chart_id"] for p in _patches(world)] == [month, region]
+    assert answer.changed == (month,) and answer.left == ((region, STALE_SINCE_PREVIEW),)
+    assert world.charts[region]["params"]["color_scheme"] == "by hand"
+    assert world.charts[region]["params"].get("row_limit") != 5
+
+
+def test_a_non_strict_apply_needs_the_preview_it_made(fake, world, store):
+    """The retry of today's change plans again from what the model read, which a record does not hold."""
+    built = _built(fake, store)
+    preview = _recorded(_preview(fake, store, built, _two_edits(built)))
+    with pytest.raises(ValueError):
+        _apply(fake, store, built, preview, strict=False)
+
+
+def test_a_preview_round_trips_through_json():
+    """A preview that sets every key a chart may have set by chat, unsets one and adds and drops filters: its record
+    is one a conversation keeps (`message_shape`), names no value-shaped key, and reads back as it was written."""
+    import dataclasses
+
+    from mnemiq.superset.chart_change import ChangePreview, PlannedEdit
+    from mnemiq.superset.conversations import message_shape
+    from mnemiq.superset.measure_actions import EditorsOf
+
+    lists = {"groupby", "groupbyRows", "groupbyColumns"}
+    every = {key: (["region"] if key in lists else {"symbol": "USD", "symbolPosition": "prefix"}
+                   if key == "currency_format" else True if key == "order_desc" else 10 if key == "row_limit"
+                   else "x") for key in sorted(set().union(*SETTABLE.values()))}
+    recorded = ChartChange(chart_id=7, set=every, unset=("row_limit",),
+                           add_filters=({"column": "region", "op": "IN", "value": ["west", "east"]},
+                                        {"column": "status", "op": "IS NULL", "value": None}),
+                           remove_filters=("stage",))
+    edit = PlannedEdit(chart_id=7, title="Sales", changed_on="2026-11-21T10:00:00", to_set={"row_limit": 10},
+                       to_unset=("row_limit",), said="Sales: at most 10 rows", digest="ab" * 32, recorded=recorded)
+    preview = ChangePreview(dashboard_id=3, dashboard_changed_on="2026-11-21T09:00:00", edits=(edit,),
+                            would_remove=((9, "Old"), (10, None)), add_chart=True, left=((8, "why"),),
+                            dropped=((7, "query_mode"),), not_editor=(EditorsOf(editors=("ana",), chart_id=5),),
+                            message="To change: Sales: at most 10 rows.", reason=None)
+    doc = json.loads(json.dumps(preview.to_json()))
+    message_shape({"role": "mnemiq", "kind": "change", "text": preview.message, "proposal": doc})
+    from mnemiq.superset.chart_change import PREVIEW_JSON_SHAPE
+
+    # The declared shape is the writer's own, both ways: every key written is admitted, every key admitted written.
+    assert set(doc) == set(PREVIEW_JSON_SHAPE)
+    assert set(doc["edits"][0]) == set(PREVIEW_JSON_SHAPE["edits"][0])
+    assert set(doc["edits"][0]["change"]) == set(PREVIEW_JSON_SHAPE["edits"][0]["change"])
+    assert set(doc["edits"][0]["change"]["set"]) == set(PREVIEW_JSON_SHAPE["edits"][0]["change"]["set"])
+    assert doc["edits"][0]["change"]["add_filters"][0] == {"column": "region", "op": "IN", "operand": ["west", "east"]}
+    back = ChangePreview.from_json(doc)
+    assert back == dataclasses.replace(preview, edits=(dataclasses.replace(edit, to_set={}, to_unset=()),))
+    assert back.edits[0].recorded == recorded and back.edits[0].change is None
