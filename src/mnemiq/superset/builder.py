@@ -58,6 +58,7 @@ from mnemiq.superset.chart_check import ChartStatus, check_chart
 from mnemiq.superset.charts import (
     EXTENSION_FAMILIES,
     ChartSpec,
+    Family,
     SavedRef,
     WrittenRef,
     config_chart_request,
@@ -72,7 +73,7 @@ from mnemiq.superset.planner import BuildPlan, PlannedDataset, plan_from_json, p
 from mnemiq.superset.saved_metrics import SavedMetric, normalized, read_saved_metrics
 
 __all__ = ["DASHBOARD_TITLE_MAX", "BuildBusy", "BuildState", "build_state", "build_steps", "next_step",
-           "start_build"]
+           "plan_summary", "start_build"]
 
 logger = logging.getLogger(__name__)
 
@@ -134,9 +135,35 @@ class BuildState:
     checks: dict[int, ChartStatus]
     ran: str | None = None
     message: str | None = None
+    # The build's plan, as the person is shown it (`plan_summary`): its charts and its measures' definitions.
+    plan: dict | None = None
+    # Why each chart that did not check did not, by its id: in the check step's own answer only, never kept.
+    check_reasons: dict[int, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------- starting and reading a build
+
+
+def plan_summary(plan: Mapping) -> dict:
+    """A kept plan (`planner.PLAN_JSON_SHAPE`) as the person is shown it: each chart's key, title, family and measures
+    (a written measure by its label, a saved metric by its name), and each written measure's name, label,
+    expression, kind and currency. Nothing else: no filter or its operand, dimension or dataset SQL."""
+    measures = [m for m in plan.get("measures") or [] if isinstance(m, Mapping)]
+    labels = {m.get("name"): m.get("label") for m in measures}
+    charts = []
+    for chart in plan.get("charts") or []:
+        if not isinstance(chart, Mapping):
+            continue
+        try:
+            family = Family(chart.get("family")).name.lower()
+        except ValueError:
+            family = None
+        shown = [labels.get(ref["written"], ref["written"]) if "written" in ref else ref.get("saved")
+                 for ref in chart.get("measures") or [] if isinstance(ref, Mapping)]
+        charts.append({"key": chart.get("key"), "title": chart.get("title"), "family": family, "measures": shown})
+    return {"charts": charts,
+            "measures": [{"name": m.get("name"), "label": m.get("label"), "expression": m.get("expression"),
+                          "kind": m.get("kind"), "currency": m.get("currency")} for m in measures]}
 
 
 def build_steps(plan: BuildPlan) -> list[tuple[str, str]]:
@@ -160,7 +187,8 @@ def start_build(store, *, tenant: str, principal: str, goal: str, plan: BuildPla
 
 
 def build_state(store, build: StoredBuild, *, ran: str | None = None, message: str | None = None,
-                checks: Mapping[int, ChartStatus] | None = None) -> BuildState:
+                checks: Mapping[int, ChartStatus] | None = None,
+                check_reasons: Mapping[int, str] | None = None) -> BuildState:
     """`build` as a request answers it. Its charts' check statuses are read from the dashboard's measures unless
     `checks` gives them (the check step's own). A stopped build with no `message` says why from its step's reason."""
     charts = {step.object_id for step in build.steps if step.kind == "chart" and step.object_id is not None}
@@ -177,7 +205,7 @@ def build_state(store, build: StoredBuild, *, ran: str | None = None, message: s
             message = f"this build stopped at its step {stopped.key!r}: {said}"
     return BuildState(build_id=build.build_id, status=build.status, dashboard_id=build.dashboard_id,
                       steps=[dataclasses.replace(step, lease_id=None) for step in build.steps], checks=found, ran=ran,
-                      message=message)
+                      message=message, plan=plan_summary(build.plan), check_reasons=dict(check_reasons or {}))
 
 
 # ---------------------------------------------------------------- one step
@@ -189,6 +217,7 @@ class _Outcome:
     object_id: int | None
     message: str | None = None
     checks: dict[int, ChartStatus] | None = None
+    check_reasons: dict[int, str] | None = None
 
 
 class _Stop(Exception):
@@ -339,21 +368,23 @@ def next_step(build: StoredBuild, *, client, adapter, store, snapshot, grants, s
     except Exception:
         run.finish_quietly(UNCERTAIN, run.made, "tool_error" if run.create_failed else None)
         raise
-    return _recorded(run, outcome.status, outcome.object_id, outcome.message, outcome.checks)
+    return _recorded(run, outcome.status, outcome.object_id, outcome.message, outcome.checks,
+                     check_reasons=outcome.check_reasons)
 
 
 _TAKEN_OVER = "this step ran past its lease and another request took it over; that request records it"
 
 
 def _recorded(run: _Run, status: str, object_id: int | None, message: str | None,
-              checks: dict[int, ChartStatus] | None = None, *, reason: str | None = None) -> BuildState:
+              checks: dict[int, ChartStatus] | None = None, *, reason: str | None = None,
+              check_reasons: dict[int, str] | None = None) -> BuildState:
     """The step recorded as `status`, and the build as it then is. A step another request took over meanwhile is
     that request's to record: the answer says so."""
     try:
         stored = run.finish(status, object_id, reason)
     except LeaseLost:
         return _answer(run, None, _TAKEN_OVER)
-    return build_state(run.store, stored, ran=run.key, message=message, checks=checks)
+    return build_state(run.store, stored, ran=run.key, message=message, checks=checks, check_reasons=check_reasons)
 
 
 def _answer(run: _Run, stored: StoredBuild | None, message: str) -> BuildState:
@@ -421,6 +452,10 @@ def _refused(answer: Mapping, what: str) -> _Stop:
         return _Stop("not_found", f"{what}: Superset has no such {answer['not_found']} that this builder can read")
     if answer.get("too_large"):
         return _Stop("too_large", f"{what} is larger than the extension sends")
+    if answer.get("refused") == "request" and answer.get("unknown"):
+        # An extension older than this mnemiq refuses a field it does not know (`create_chart`'s `having`, say).
+        return _Stop("extension_refused", f"Superset's mnemiq extension is older than this mnemiq and does not take "
+                                           f"what it asks for {what}: update the extension installed there")
     if "refused" in answer:
         return _Stop("extension_refused", f"the extension refused the request for {what} ({answer['refused']})")
     return _Stop("not_saved", f"Superset could not save {what}; its log says why")
@@ -685,6 +720,7 @@ def _run_check(run: _Run) -> _Outcome:
     ids = run.chart_ids()
     made = run.made_virtual_sql()
     statuses: dict[int, ChartStatus] = {}
+    reasons: dict[int, str] = {}
     off: list[str] = []
     for spec in run.plan.charts:
         chart_id = ids[spec.key]
@@ -696,6 +732,7 @@ def _run_check(run: _Run) -> _Outcome:
                             made=made)
         statuses[chart_id] = found.status
         if found.status is not ChartStatus.CHECKED:
+            reasons[chart_id] = found.reason
             off.append(f"{spec.title!r} ({found.status.value}: {found.reason})")
     build = run.build
     for row in run.store.measures_for(build.tenant_id, build.dashboard_id):
@@ -707,7 +744,7 @@ def _run_check(run: _Run) -> _Outcome:
     total = len(run.plan.charts)
     message = (f"every chart checked ({total} of {total})" if not off else
                f"{total - len(off)} of {total} charts checked; not checked: " + "; ".join(off))
-    return _Outcome(DONE, None, message=message, checks=statuses)
+    return _Outcome(DONE, None, message=message, checks=statuses, check_reasons=reasons)
 
 
 _RUNNERS: dict[str, Callable[[_Run], _Outcome]] = {"dashboard": _run_dashboard, "dataset": _run_dataset,

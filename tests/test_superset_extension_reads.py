@@ -100,13 +100,18 @@ def test_editors_of_names_editors_only_of_readable_objects(monkeypatch):
     def subject(label):
         return SimpleNamespace(label=label)
 
-    charts = {2: SimpleNamespace(editors=[subject("zed"), subject("amy"), subject("amy")])}
+    charts = {2: SimpleNamespace(editors=[subject("zed"), subject("amy"), subject("amy")]),
+              3: SimpleNamespace(editors=[subject("zed")])}
     datasets = {5: SimpleNamespace(editors=[subject("amy")])}
     monkeypatch.setattr(reads, "_chart", lambda chart_id: charts.get(chart_id))
     monkeypatch.setattr(writes, "_dataset", lambda dataset_id: datasets.get(dataset_id))
-    answer = reads.editors_of({"chart_ids": [9, 2], "dataset_ids": [5, 6]})
-    assert answer == {"charts": [{"chart_id": 2, "editors": ["amy", "zed"]}],
-                      "datasets": [{"dataset_id": 5, "editors": ["amy"]}]}
+    # The caller edits chart 2 and dataset 5, and not chart 3: each entry says so, beside the editors' labels.
+    monkeypatch.setattr(writes, "_security", lambda: SimpleNamespace(
+        is_editor=lambda resource: resource is charts[2] or resource is datasets[5]))
+    answer = reads.editors_of({"chart_ids": [9, 2, 3], "dataset_ids": [5, 6]})
+    assert answer == {"charts": [{"chart_id": 2, "is_editor": True, "editors": ["amy", "zed"]},
+                                 {"chart_id": 3, "is_editor": False, "editors": ["zed"]}],
+                      "datasets": [{"dataset_id": 5, "is_editor": True, "editors": ["amy"]}]}
     assert reads.editors_of({"chart_ids": [], "dataset_ids": []}) == {"charts": [], "datasets": []}
 
 
@@ -183,11 +188,13 @@ def test_editors_of_marks_the_entries_that_do_not_fit(monkeypatch):
     datasets = {5: SimpleNamespace(editors=[subject("amy")])}
     monkeypatch.setattr(reads, "_chart", lambda chart_id: charts.get(chart_id))
     monkeypatch.setattr(writes, "_dataset", lambda dataset_id: datasets.get(dataset_id))
+    monkeypatch.setattr(writes, "_security", lambda: SimpleNamespace(is_editor=lambda resource: True))
     answer = reads.editors_of({"chart_ids": [1, 2, 3], "dataset_ids": [5]})
     assert set(answer) == {"charts", "datasets"}
     assert [("editors" in c) for c in answer["charts"]] == [True, True, False]
-    assert answer["charts"][2] == {"chart_id": 3, "too_large": True}
-    assert answer["datasets"] == [{"dataset_id": 5, "too_large": True}]
+    # An entry cut for size still says whether the caller edits it: only its labels are left out.
+    assert answer["charts"][2] == {"chart_id": 3, "is_editor": True, "too_large": True}
+    assert answer["datasets"] == [{"dataset_id": 5, "is_editor": True, "too_large": True}]
     assert size(answer) <= reads.MAX_ANSWER_BYTES
 
 
@@ -213,6 +220,7 @@ def test_the_marks_are_counted_in_the_cap_at_the_request_limits(monkeypatch):
         datasets = {i: subject(editors=[subject(label="x" * fat)]) for i in range(1, 21)}
         monkeypatch.setattr(reads, "_chart", lambda chart_id: charts.get(chart_id))
         monkeypatch.setattr(writes, "_dataset", lambda dataset_id: datasets.get(dataset_id))
+        monkeypatch.setattr(writes, "_security", lambda: SimpleNamespace(is_editor=lambda resource: False))
         answer = reads.editors_of({"chart_ids": list(range(1, 101)), "dataset_ids": list(range(1, 21))})
         assert size(answer) <= reads.MAX_ANSWER_BYTES, (fat, size(answer))
         assert len(answer["charts"]) == 100 and len(answer["datasets"]) == 20
