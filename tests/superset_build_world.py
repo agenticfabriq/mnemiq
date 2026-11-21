@@ -40,6 +40,7 @@ from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Column, Snapshot
 from mnemiq.superset import build_store as bs
 from mnemiq.superset.build_store import BuildNotFound, StoredBuild
+from mnemiq.superset import conversations as cs
 from mnemiq.superset.extension import EXTENSION_TOOLS, TOOL_PREFIX
 from tests.superset_extension_path import use_extension_source
 
@@ -1123,3 +1124,106 @@ def _labelled_columns(config: dict) -> list[dict]:
 def dataset_id_of(world: World, table_name: str) -> int:
     [found] = [d["id"] for d in world.datasets.values() if d["table_name"] == table_name]
     return found
+
+
+class MemoryConversationStore:
+    """`ConversationStore`'s interface and rules, its rows in memory and its clock the test's: each conversation its
+    tenant's and principal's alone, appends in the order taken, a settle only from the state expected, and every
+    message held to `message_shape` as the Postgres store holds it."""
+
+    def __init__(self, clock: Clock) -> None:
+        self.clock = clock
+        self._rows: dict[tuple[str, str], dict] = {}
+        self._lock = threading.Lock()
+
+    def _now(self) -> str:
+        return bs._iso(self.clock.now())
+
+    def _row(self, tenant: str, conversation_id: str, principal: str) -> dict | None:
+        row = self._rows.get((tenant, str(conversation_id)))
+        return row if row is not None and row["principal"] == principal else None
+
+    def create(self, tenant: str, principal: str, title: str) -> cs.Conversation:
+        tenant, principal = bs._text(tenant, "tenant"), bs._text(principal, "principal")
+        cs._bounded(title, "a conversation's title", cs.MAX_TEXT)
+        now = self._now()
+        conversation_id = str(uuid.uuid4())
+        with self._lock:
+            self._rows[(tenant, conversation_id)] = {"principal": principal, "title": cs.title_of(title),
+                                                     "created_at": now, "updated_at": now, "messages": []}
+        return cs.Conversation(conversation_id=conversation_id, title=cs.title_of(title), created_at=now,
+                               updated_at=now, messages=())
+
+    def list(self, tenant: str, principal: str, *, limit: int = cs.LIST_LIMIT,
+             before: str | None = None) -> list[cs.ConversationSummary]:
+        tenant, principal, limit = bs._text(tenant, "tenant"), bs._text(principal, "principal"), cs._limit(limit)
+        after = cs.read_cursor(before) if before is not None else None
+        with self._lock:
+            mine = [(datetime.fromisoformat(row["updated_at"]), conversation_id, row)
+                    for (row_tenant, conversation_id), row in self._rows.items()
+                    if row_tenant == tenant and row["principal"] == principal]
+        # Postgres compares the uuid column as a uuid, which orders as its text does.
+        mine.sort(key=lambda each: (each[0], each[1]), reverse=True)
+        if after is not None:
+            mine = [each for each in mine if (each[0], each[1]) < after]
+        return [cs.ConversationSummary(conversation_id=conversation_id, title=row["title"],
+                                       updated_at=row["updated_at"]) for _, conversation_id, row in mine[:limit]]
+
+    def load(self, tenant: str, conversation_id: str, principal: str) -> cs.Conversation | None:
+        if (conversation := cs._conversation_id(conversation_id)) is None:
+            return None
+        with self._lock:
+            row = self._row(tenant, conversation, principal)
+            if row is None:
+                return None
+            row = copy.deepcopy(row)
+        return cs.Conversation(conversation_id=conversation, title=row["title"], created_at=row["created_at"],
+                               updated_at=row["updated_at"], messages=cs._messages(row["messages"]))
+
+    def append(self, tenant: str, conversation_id: str, principal: str, message) -> int:
+        tenant, principal = bs._text(tenant, "tenant"), bs._text(principal, "principal")
+        doc = cs.message_shape(message)
+        doc.pop("at", None)
+        if (conversation := cs._conversation_id(conversation_id)) is None:
+            raise cs.ConversationNotFound()
+        with self._lock:
+            row = self._row(tenant, conversation, principal)
+            if row is None:
+                raise cs.ConversationNotFound()
+            if len(row["messages"]) >= cs.MAX_MESSAGES:
+                raise cs.ConversationFull()
+            now = self._now()
+            row["messages"].append({**doc, "at": now})
+            if not row["title"] and doc["role"] == "person":
+                row["title"] = cs.title_of(doc["text"])
+            row["updated_at"] = now
+            return len(row["messages"]) - 1
+
+    def settle(self, tenant: str, conversation_id: str, principal: str, index: int, outcome, *,
+               expect: str) -> bool:
+        tenant, principal = bs._text(tenant, "tenant"), bs._text(principal, "principal")
+        kept = cs.outcome_shape(outcome)
+        if expect not in cs.STATES:
+            raise ValueError("a settle expects one of a proposal's states")
+        conversation, at = cs._conversation_id(conversation_id), cs._index(index)
+        if conversation is None or at is None:
+            return False
+        with self._lock:
+            row = self._row(tenant, conversation, principal)
+            if row is None or at >= len(row["messages"]):
+                return False
+            message = row["messages"][at]
+            if message.get("outcome", {}).get("state") != expect:
+                return False
+            message["outcome"] = kept
+            row["updated_at"] = self._now()
+            return True
+
+    def delete(self, tenant: str, conversation_id: str, principal: str) -> bool:
+        if (conversation := cs._conversation_id(conversation_id)) is None:
+            return False
+        with self._lock:
+            if self._row(tenant, conversation, principal) is None:
+                return False
+            del self._rows[(tenant, conversation)]
+            return True

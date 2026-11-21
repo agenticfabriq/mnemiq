@@ -812,50 +812,52 @@ def _plan_shape() -> Any:
     return planner.PLAN_JSON_SHAPE
 
 
-def _shaped(doc: Any, shape: Any, path: str) -> None:
+def _shaped(doc: Any, shape: Any, path: str, *, writer: str = "the planner",
+            kept: str = "a build keeps only its plan") -> None:
     """Refuse what `shape` (`planner.PLAN_JSON_SHAPE`'s form) does not admit, naming where by the keys admitted on
-    the way, never a key or a value it was given."""
+    the way, never a key or a value it was given. `writer` and `kept` word the refusal for the store that checks: the
+    conversation store holds its messages to a shape of the same form."""
     from mnemiq.superset.planner import SCALAR
 
     if isinstance(shape, tuple):
         refusals = []
         for each in shape:
             try:
-                return _shaped(doc, each, path)
+                return _shaped(doc, each, path, writer=writer, kept=kept)
             except ValueError as refused:
                 refusals.append(refused)
         raise refusals[0]
     if isinstance(shape, dict):
         if not isinstance(doc, Mapping):
-            raise ValueError(f"{path} holds something else where the planner writes an object")
+            raise ValueError(f"{path} holds something else where {writer} writes an object")
         for key, item in doc.items():
             if key not in shape:
-                raise ValueError(f"{path} holds a key the planner never writes there: a build keeps only its plan")
-            _shaped(item, shape[key], f"{path}.{key}")
+                raise ValueError(f"{path} holds a key {writer} never writes there: {kept}")
+            _shaped(item, shape[key], f"{path}.{key}", writer=writer, kept=kept)
     elif isinstance(shape, list):
         if not isinstance(doc, list):
-            raise ValueError(f"{path} holds something else where the planner writes a list")
+            raise ValueError(f"{path} holds something else where {writer} writes a list")
         for index, item in enumerate(doc):
-            _shaped(item, shape[0], f"{path}[{index}]")
+            _shaped(item, shape[0], f"{path}[{index}]", writer=writer, kept=kept)
     elif shape == SCALAR:
         if isinstance(doc, (Mapping, list)):
-            raise ValueError(f"{path} holds an object or a list where the planner writes a single value")
+            raise ValueError(f"{path} holds an object or a list where {writer} writes a single value")
     else:
-        raise ValueError(f"{path}: the planner's declared shape is not one the store reads")
+        raise ValueError(f"{path}: {writer}'s declared shape is not one the store reads")
 
 
-def _plain_json(doc: object, path: str) -> Any:
+def _plain_json(doc: object, path: str, *, holder: str = "a build") -> Any:
     if isinstance(doc, Mapping):
         copied = {}
         for key, item in doc.items():
             if not isinstance(key, str):
                 raise ValueError(f"{path} has a key that is not a string")
             if _folded(key) in VALUE_SHAPED_KEYS:
-                raise ValueError(f"{path} holds a key named {key!r}: a build keeps no value, row or result")
-            copied[key] = _plain_json(item, f"{path}.{key}")
+                raise ValueError(f"{path} holds a key named {key!r}: {holder} keeps no value, row or result")
+            copied[key] = _plain_json(item, f"{path}.{key}", holder=holder)
         return copied
     if isinstance(doc, (list, tuple)):
-        return [_plain_json(item, f"{path}[{index}]") for index, item in enumerate(doc)]
+        return [_plain_json(item, f"{path}[{index}]", holder=holder) for index, item in enumerate(doc)]
     if isinstance(doc, float) and not math.isfinite(doc):
         raise ValueError(f"{path} holds a number JSON cannot carry")
     if doc is None or isinstance(doc, (str, int, float)):
