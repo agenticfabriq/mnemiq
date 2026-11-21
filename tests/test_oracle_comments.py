@@ -219,3 +219,27 @@ def test_a_comment_cannot_start_a_card_line_of_its_own(tmp_path):
     snap = enrich_structural(_Shop(_shop(tmp_path), comments=({}, forged)), "shop")
     card = _orders_card(snap)
     assert not any(line.startswith(("- secret_total", "TABLE payroll")) for line in card.splitlines())
+
+
+def test_a_federated_table_comment_is_withheld_while_its_joins_are_unknown(tmp_path):
+    # Codex's second review of #280: a merged snapshot carries no relationships (`merge_snapshots` does not merge
+    # them), and an empty list read as "joins nothing" showed the comment to an identity granted the table alone.
+    from mnemiq.config import SourceSpec
+    from mnemiq.contract import JoinKey, Relationship
+    from mnemiq.semantic.federation import merge_snapshots
+
+    snap = enrich_structural(_Shop(_shop(tmp_path)), "shop")
+    rel = Relationship(id="r1", **{"from": "notes"}, to="orders", cardinality="many_to_one",
+                       join_keys=[JoinKey(left="body", right="id")])
+    snap = snap.model_copy(update={"relationships": [rel]})
+    fed = merge_snapshots([(SourceSpec(id="shop", kind="sqlite", target="x", catalog="erp", schema="main"), snap)])
+    assert any(b.comment == _TABLE_COMMENT for b in fed.source_bindings), "the merge keeps the comment"
+
+    from mnemiq.semantic.cards import build_cards
+    from mnemiq.sql.policy import AccessPolicy
+
+    card = next(c.text for c in build_cards(fed, policy=AccessPolicy(visible=frozenset({"erp.orders"})))
+                if c.object_id == "erp.orders")
+    assert _TABLE_COMMENT not in card
+    unscoped = next(c.text for c in build_cards(fed) if c.object_id == "erp.orders")
+    assert _TABLE_COMMENT in unscoped, "the indexed card, rendered without a policy, keeps it"
