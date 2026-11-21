@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 import pytest
 
 from mnemiq.superset.charts import ChartSpec, Family, WrittenRef
+from mnemiq.superset.grants import NOT_A_BUILDER
 from mnemiq.superset.measures import Measure, MeasureKind
 from mnemiq.superset.planner import BuildPlan, FakePlanner
 from tests.superset_live.live import metadata, required
@@ -234,6 +235,19 @@ def test_gamma_hears_the_roles_through_the_forwarder(live, mnemiq):
         answer = client.get(f"{FORWARD}/superset/dashboards/1/measures", headers=headers)
     assert answer.status_code == 403, (answer.status_code, answer.text[:300])
     assert "Alpha" in answer.json()["detail"] and "sql_lab" in answer.json()["detail"]
+
+
+def test_the_panels_readiness_probe_answers_through_the_forwarder(live, mnemiq):
+    """The panel's readiness probe, `GET v1/schema` through the forwarder: a builder is answered the opening
+    questions (a list), and gamma_only mnemiq's roles sentence, as a 403, which the panel shows as the whole of it."""
+    with live.signed_in(BUILDER) as (client, headers):
+        ready = client.get(f"{FORWARD}/schema", headers=headers)
+    assert ready.status_code == 200, (ready.status_code, ready.text[:300])
+    assert isinstance(ready.json()["starters"], list)
+    with live.signed_in("gamma_only") as (client, headers):
+        refused = client.get(f"{FORWARD}/schema", headers=headers)
+    assert refused.status_code == 403, (refused.status_code, refused.text[:300])
+    assert refused.json()["detail"] == NOT_A_BUILDER
 
 
 def test_an_unlisted_route_is_not_forwarded(live, mnemiq):
