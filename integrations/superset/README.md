@@ -39,12 +39,12 @@ Run `superset init` after the first load so roles receive the route's permission
 | `MNEMIQ_TOKEN_TENANT` | The `tenant` claim. |
 | `MNEMIQ_TOKEN_LIFETIME_S` | Seconds a token lives. At most 300, which is also the default. |
 | `MNEMIQ_URL` | Where the forwarder sends the panel's requests: mnemiq's address as Superset's web server reaches it, `http` or `https`, with no user, password, query or fragment (a path prefix is kept). The browser never needs to reach it. |
-| `MNEMIQ_FORWARD_TIMEOUT_S` | Seconds a forwarded request may take in all, 1 to 900. Default 600: planning a build with a slow model can take minutes, so a proxy in front of Superset must allow as long. |
-| `MNEMIQ_FORWARD_IDLE_S` | Seconds a forwarded chat answer's stream may go quiet, 5 to 300. Default 60. |
+| `MNEMIQ_FORWARD_TIMEOUT_S` | Seconds a forwarded request may take, its whole answer read, 1 to 900. Default 600: planning a build with a slow model can take minutes, so a proxy in front of Superset must allow as long. A chat answer still streaming at that time is cut. |
+| `MNEMIQ_FORWARD_IDLE_S` | Seconds a forwarded chat answer's stream may go quiet between two reads, 5 to 300. Default 60. |
 | `MNEMIQ_LOCK_TIMEOUT_S` | Seconds a write tool waits for each lock another transaction holds before it answers `{"busy": true}`. Default 30. It must be above 0 and below 45, mnemiq's default deadline for a call, or a write could land after mnemiq gave up on it: any other value is not used, and the extension logs a warning naming the setting and waits 30. On a Postgres metadata database it bounds every lock wait; on MySQL it bounds a create's wait for its marker's lock (in whole seconds), and a row's lock waits as long as the database's own setting says. So on MySQL set `innodb_lock_wait_timeout` (default 50 seconds) below 45: it bounds every row lock, a create's second lock among them. A longer wait can let a write land after mnemiq gave up on it: a create sent again then answers its object by its marker, while another write answers stale or busy. |
 
-The token settings but the lifetime are required; the route answers 503 naming the one that is missing. The forwarder
-needs `MNEMIQ_URL` and the token settings.
+The token settings are required, all but the lifetime, and the token route answers 503 naming the one that is
+missing. The forwarder needs `MNEMIQ_URL` and the token settings, and answers 503 the same way.
 
 ## The token route
 
@@ -76,9 +76,12 @@ It forwards only these mnemiq routes, each by its method: `GET /v1/schema`, `POS
 `POST /v1/superset/builds` (the `GET` with `dashboard_id` alone), `GET /v1/superset/builds/<id>`, `POST
 /v1/superset/builds/<id>/next`, `GET /v1/superset/dashboards/<id>/measures`, `POST
 /v1/superset/dashboards/<id>/measures/<name>/edit|remove|save`, and `POST /v1/superset/dashboards/<id>/changes`.
-mnemiq receives only `Authorization`, `Accept` and `Content-Type`, never Superset's cookie or CSRF header; the answer
-carries back mnemiq's status, `Content-Type` and `WWW-Authenticate`, with `Cache-Control: no-store`. Neither a token
-nor a body is logged.
+mnemiq receives only `Authorization`, `Accept` and `Content-Type` (beside the `Host` and length every request carries),
+never Superset's cookie or CSRF header, and no proxy, `.netrc` or other setting is read from the server's environment;
+no redirect is followed. The answer carries back mnemiq's status, `Content-Type` and `WWW-Authenticate`, with
+`Cache-Control: no-store`, and only when it is JSON or a chat answer's event stream. Neither a token nor a body is
+logged. Each forwarded request holds one of Superset's web worker threads while it runs, so size the workers, and any
+proxy's read timeout, for builds planned by a slow model.
 
 What it refuses, before mnemiq is called, each with its sentence as `{"detail": ...}`:
 
@@ -87,9 +90,9 @@ What it refuses, before mnemiq is called, each with its sentence as `{"detail": 
 | 403 | Nobody signed in, or an embedded guest | "the token route mints only for a signed-in Superset user" |
 | 404 | A path that is not one of the routes above | "This extension does not forward that request to mnemiq." |
 | 405 | One of those paths under another method | the same sentence |
-| 400 | A query key the route does not take, or one given twice | "This extension does not forward that request's query to mnemiq." |
+| 400 | A query key the route does not take, one given twice, or a value it does not read (`dashboard_id` a whole number) | "This extension does not forward that request's query to mnemiq." |
 | 413 | A body over 64 KiB | "The request is larger than this extension forwards to mnemiq (65,536 bytes at most)." |
-| 502 | mnemiq could not be reached | "mnemiq did not answer; try again, and if it keeps failing ask your Superset administrator to check mnemiq." |
+| 502 | mnemiq could not be reached, or answered with something other than JSON or an event stream | "mnemiq did not answer; try again, and if it keeps failing ask your Superset administrator to check mnemiq." |
 | 504 | mnemiq did not answer in time | "mnemiq took too long to answer; try again, and if it keeps happening ask your Superset administrator to check mnemiq and the timeouts in front of it." |
 | 503 | `MNEMIQ_URL` is not set or not valid | "This Superset's mnemiq extension does not know where mnemiq is: set MNEMIQ_URL in Superset's configuration." |
 

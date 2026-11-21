@@ -100,7 +100,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", required=True, type=Path, help="the directory to write dist/ and the .supx into")
     parser.add_argument("--require-frontend", action="store_true", help="refuse to pack without a built frontend")
     args = parser.parse_args(argv)
-    bundle = build(args.out, require_frontend=args.require_frontend)
+    try:
+        bundle = build(args.out, EXTENSION, require_frontend=args.require_frontend)
+    except ValueError as refused:
+        print(f"not packed: {refused}", file=sys.stderr)
+        return 1
     print(f"wrote {bundle}")
     return 0
 

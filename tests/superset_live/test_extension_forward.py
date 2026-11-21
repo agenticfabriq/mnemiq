@@ -26,6 +26,8 @@ pytestmark = pytest.mark.integration
 FORWARD = "/extensions/agenticfabriq/mnemiq/v1"
 BUILDER = "analyst"
 STORE_DATABASE = "mnemiq_build_store_forward"
+# The headers of each request mnemiq received, as it received them, in order: what the forwarder sent.
+RECEIVED: list[dict[str, str]] = []
 
 
 @pytest.fixture(scope="module")
@@ -65,7 +67,15 @@ def mnemiq(live, model, enriched, store_dsn):
         patch.setattr(runtime_module, "build_runtime", lambda s: built.setdefault("runtime", real_runtime(s)))
         patch.setattr(app_module, "_run_uvicorn", lambda app, host, port: built.update(app=app))
         app_module.serve_http(settings, host=address.hostname, port=address.port)
-    server = uvicorn.Server(uvicorn.Config(built["app"], host=address.hostname, port=address.port,
+    app = built["app"]
+
+    async def recording(scope, receive, send):
+        if scope["type"] == "http":
+            RECEIVED.append({"path": scope["path"],
+                             **{k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}})
+        await app(scope, receive, send)
+
+    server = uvicorn.Server(uvicorn.Config(recording, host=address.hostname, port=address.port,
                                            log_level="warning", lifespan="off"))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
@@ -133,23 +143,88 @@ def test_forwarder_runs_a_build_as_the_signed_in_builder(live, mnemiq, policy_id
     assert created_by == analyst
 
 
-def test_forwarder_streams_a_chat_answer(live, mnemiq, model):
-    """A chat answer comes back through the forwarder as mnemiq streams it: the run starts before the stream ends."""
+def _held_open_transactions() -> int:
+    """Connections to Superset's metadata database left idle inside a transaction for more than two seconds."""
+    [(count,)] = metadata("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND "
+                          "pid <> pg_backend_pid() AND state = 'idle in transaction' AND "
+                          "now() - state_change > interval '2 seconds'")
+    return count
+
+
+def test_the_held_transaction_count_sees_one(live):
+    """The control for the stream test's count of held connections: a transaction this test opens on Superset's
+    metadata database and leaves idle is counted."""
+    import psycopg
+
+    before = _held_open_transactions()
+    uri = required("MNEMIQ_TEST_SUPERSET_METADATA_URI")["MNEMIQ_TEST_SUPERSET_METADATA_URI"]
+    with psycopg.connect(uri, connect_timeout=10) as con:
+        con.execute("SELECT 1").fetchall()
+        time.sleep(3)
+        assert _held_open_transactions() - before >= 1
+        con.rollback()
+
+
+def test_forwarder_streams_a_chat_answer_and_holds_no_metadata_connection(live, mnemiq, model):
+    """A chat answer comes back through the forwarder as mnemiq streams it: the run's start arrives while the model is
+    still held, before it answers, so a forwarder that buffered the answer fails here. Meanwhile the request holds no
+    connection to Superset's metadata database idle in a transaction; the stream carries the forwarder's headers."""
+    released, answered = threading.Event(), threading.Event()
+
+    def hold(_count: int) -> None:
+        released.wait(20)
+        answered.set()
+
     model.sql = "SELECT count(*) AS policies FROM policy"
-    with live.signed_in(BUILDER) as (client, headers):
-        csrf = {**headers, "X-CSRFToken": live.csrf_token(client, headers)}
-        with client.stream("POST", f"{FORWARD}/chat", json={"question": "how many policies are there?",
-                                                            "mode": "thinking", "history": []},
-                           headers=csrf, timeout=120) as answer:
-            assert answer.status_code == 200, answer.status_code
-            assert answer.headers["content-type"].startswith("text/event-stream")
-            seen = []
-            for line in answer.iter_lines():
-                if line.startswith("data:"):
-                    seen.append(line)
-                    if '"RUN_STARTED"' in line:
+    model.on_call = hold
+    try:
+        before = _held_open_transactions()
+        with live.signed_in(BUILDER) as (client, headers):
+            csrf = {**headers, "X-CSRFToken": live.csrf_token(client, headers)}
+            with client.stream("POST", f"{FORWARD}/chat", json={"question": "how many policies are there?",
+                                                                "mode": "thinking", "history": []},
+                               headers=csrf, timeout=120) as answer:
+                assert answer.status_code == 200, answer.status_code
+                assert answer.headers["content-type"].startswith("text/event-stream")
+                assert answer.headers.get("x-accel-buffering") == "no"
+                assert answer.headers.get("cache-control") == "no-store"
+                lines = answer.iter_lines()
+                for line in lines:
+                    if line.startswith("data:") and '"RUN_STARTED"' in line:
                         break
-    assert seen and '"RUN_STARTED"' in seen[-1]
+                assert not answered.is_set(), "the run's start arrived only after the model answered"
+                time.sleep(3)
+                held = _held_open_transactions() - before
+                released.set()
+                ended = [line for line in lines if line.startswith("data:")]
+        assert held <= 0, f"{held} metadata connection(s) held idle in a transaction while the answer streamed"
+        assert any('"RUN_FINISHED"' in line or '"RUN_ERROR"' in line for line in ended)
+    finally:
+        released.set()
+        model.on_call = None
+
+
+def test_mnemiq_receives_only_the_forwarders_headers(live, mnemiq):
+    """What mnemiq receives for a forwarded POST: a token minted for the signed-in user, not Superset's own sign-in
+    token the browser sent; no cookie, no CSRF header, and no other header of the browser's or of the forwarder's
+    HTTP library."""
+    import jwt
+
+    RECEIVED.clear()
+    with live.signed_in(BUILDER) as (client, headers):
+        csrf = {**headers, "X-CSRFToken": live.csrf_token(client, headers), "X-Extra": "from-the-browser",
+                "User-Agent": "the-browser"}
+        assert client.cookies, "the client holds Superset's session cookie, so the test can see it is not sent"
+        answer = client.post(f"{FORWARD}/superset/builds", json={"goal": ""}, headers=csrf)
+        assert answer.status_code < 500, (answer.status_code, answer.text[:300])
+    [received] = [r for r in RECEIVED if r["path"] == "/v1/superset/builds"]
+    assert set(received) - {"path"} <= {"host", "authorization", "accept", "content-type", "content-length",
+                                        "accept-encoding"}, sorted(received)
+    assert received.get("accept-encoding", "identity") == "identity"
+    sent = headers.get("Authorization") or headers.get("authorization")
+    assert received["authorization"] != sent
+    claims = jwt.decode(received["authorization"].removeprefix("Bearer "), options={"verify_signature": False})
+    assert (claims["sub"], claims["preferred_username"]) == (BUILDER, BUILDER)
 
 
 def test_gamma_hears_the_roles_through_the_forwarder(live, mnemiq):

@@ -24,9 +24,12 @@ def _packer():
     return module
 
 
-def _build(tmp_path, *more):
+def _build(tmp_path):
+    """The backend alone, packed with an empty frontend dir given, so a developer's own built frontend changes nothing
+    here."""
     out = tmp_path / "out"
-    assert _packer().main(["--out", str(out), *more]) == 0
+    empty = tmp_path / "no-frontend"
+    _packer().build(out, frontend_dist=empty)
     return out
 
 
@@ -119,3 +122,25 @@ def test_manifest_entrypoint(tmp_path):
         assert json.loads(bundle.read("manifest.json")) == manifest
     parts = manifest["backend"]["entrypoint"].split(".")
     assert (out / "dist" / "backend" / "src" / Path(*parts)).with_suffix(".py").is_file()
+
+
+def test_the_packer_says_why_it_refuses_and_exits_1(tmp_path, capsys, monkeypatch):
+    """Asked to require a frontend where none is built, the CLI prints why and exits 1, with no traceback."""
+    packer = _packer()
+    extension = tmp_path / "extension"
+    (extension / "backend" / "src" / "pkg").mkdir(parents=True)
+    (extension / "backend" / "src" / "pkg" / "entrypoint.py").write_text("")
+    (extension / "extension.json").write_text(json.dumps({"publisher": "pub", "name": "ext", "version": "1.0.0"}))
+    monkeypatch.setattr(packer, "EXTENSION", extension)
+    assert packer.main(["--out", str(tmp_path / "out"), "--require-frontend"]) == 1
+    assert "not packed: no built frontend" in capsys.readouterr().err
+    assert packer.main(["--out", str(tmp_path / "out")]) == 0
+
+
+def test_the_extension_and_its_backend_carry_one_version():
+    """Superset's extension tooling compares the backend package's version with the extension's; they are one."""
+    import tomllib
+
+    extension = json.loads((ROOT / "integrations" / "superset" / "extension.json").read_text())
+    backend = tomllib.loads((ROOT / "integrations" / "superset" / "backend" / "pyproject.toml").read_text())
+    assert extension["version"] == backend["project"]["version"] == "0.2.0"

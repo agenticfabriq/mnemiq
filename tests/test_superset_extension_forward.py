@@ -100,11 +100,14 @@ def test_purpose_follows_the_route(signing):
     assert chat.sent[0].stream is True and build.sent[0].stream is False
 
 
+# Each path as Superset's router hands it over: decoded once. A browser's `%2f` arrives as `/`, so a name holding one
+# is two segments and matches no route; a `%2f` still in the path was encoded twice, and is refused.
 @pytest.mark.parametrize("path", [
     "/v1/ask", "/v1/whoami", "/openai/v1/chat/completions", "/mcp", "/v1/superset/builds/../x",
-    "/v1/superset/builds/%2e%2e", "//elsewhere/v1/schema", "/v1/superset/dashboards/12/measures/a%2fb/edit",
-    "/v1/superset/dashboards/12/measures/../edit", "/v1/superset/dashboards/0/measures",
-    f"/v1/superset/builds/{BUILD_ID}/next/again", "/v1/schema/",
+    "/v1/superset/builds/..", "//elsewhere/v1/schema", "/v1/superset/dashboards/12/measures/a/b/edit",
+    "/v1/superset/dashboards/12/measures/a%2fb/edit", "/v1/superset/dashboards/12/measures/../edit",
+    "/v1/superset/dashboards/12/measures/./edit", "/v1/superset/dashboards/0/measures",
+    f"/v1/superset/builds/{BUILD_ID}/next/again", "/v1/schema/", "/V1/schema",
 ])
 def test_unlisted_path_is_refused_without_calling_mnemiq(signing, path):
     found, send = _forward(signing, "POST" if path.endswith(("edit", "again")) else "GET", path)
@@ -201,12 +204,24 @@ def test_stream_passes_chunks_as_they_come(signing):
     assert next(found.chunks) == b"data: two\n\n" and made == ["first", "second"]
 
 
-def test_no_token_is_logged(signing, caplog):
+def _leaked(records, *secrets: str) -> list[str]:
+    """The log messages that hold any of `secrets`."""
+    return [record.getMessage() for record in records if any(s and s in record.getMessage() for s in secrets)]
+
+
+def test_no_token_or_body_is_logged(signing, caplog):
+    """The forwarder's own log lines, which fire when mnemiq cannot be reached or times out, hold neither the token
+    minted for that very request nor its body. The check is shown a line that does."""
     caplog.set_level(logging.DEBUG)
-    _, send = _forward(signing, "POST", "/v1/superset/builds", body=b"{}")
-    _forward(signing, send=Recorder(forward.Unreachable()))
-    token = send.sent[0].headers["authorization"].removeprefix("Bearer ")
-    assert token and all(token not in record.getMessage() for record in caplog.records)
+    body = b'{"goal": "a goal that names a customer"}'
+    for failure in (forward.Unreachable(), forward.TimedOut()):
+        send = Recorder(failure)
+        found, _ = _forward(signing, "POST", "/v1/superset/builds", body=body, send=send)
+        assert found.status in (502, 504)
+        token = send.sent[0].headers["authorization"].removeprefix("Bearer ")
+        assert caplog.records and _leaked(caplog.records, token, body.decode()) == []
+    planted = logging.LogRecord("x", logging.WARNING, __file__, 1, "sent %s", (body.decode(),), None)
+    assert _leaked([planted], body.decode()) != []
 
 
 def test_every_listed_route_forwards(signing):
@@ -215,9 +230,29 @@ def test_every_listed_route_forwards(signing):
              ("POST", "/v1/superset/builds"), ("GET", f"/v1/superset/builds/{BUILD_ID}"),
              ("POST", f"/v1/superset/builds/{BUILD_ID}/next"), ("GET", "/v1/superset/dashboards/12/measures"),
              ("POST", "/v1/superset/dashboards/12/measures/policies/edit"),
-             ("POST", "/v1/superset/dashboards/12/measures/total_premium%4012/remove"),
+             ("POST", "/v1/superset/dashboards/12/measures/total_premium@12/remove"),
              ("POST", "/v1/superset/dashboards/12/measures/policies/save"),
              ("POST", "/v1/superset/dashboards/12/changes")]
     for method, path in cases:
         found, send = _forward(signing, method, path, body=b"{}" if method == "POST" else b"")
         assert found.status == 200 and len(send.sent) == 1, (method, path, found.status)
+
+
+def test_a_measures_name_is_encoded_once_for_mnemiq(signing):
+    """The name as the router decoded it reaches mnemiq encoded once: a saved metric's `@` and a literal `%` alike."""
+    _, send = _forward(signing, "POST", "/v1/superset/dashboards/12/measures/total_premium@12/remove", body=b"{}")
+    assert send.sent[0].url.endswith("/v1/superset/dashboards/12/measures/total_premium%4012/remove")
+    _, send = _forward(signing, "POST", "/v1/superset/dashboards/12/measures/growth %25/save", body=b"{}")
+    assert send.sent[0].url.endswith("/v1/superset/dashboards/12/measures/growth%20%2525/save")
+
+
+def test_the_whole_answer_is_bounded_by_the_total_time(signing):
+    """Each outbound carries the request's whole time beside its wait for mnemiq: a stream waits the idle time between
+    reads, and its whole answer, like any other, the total time."""
+    target = ForwardConfig.from_mapping({"MNEMIQ_URL": "http://m", "MNEMIQ_FORWARD_TIMEOUT_S": 120,
+                                         "MNEMIQ_FORWARD_IDLE_S": 30})
+    send = Recorder()
+    forward_for(ANA, "POST", "/v1/chat", {}, b"{}", signing=signing, target=target, now=NOW, send=send)
+    forward_for(ANA, "GET", "/v1/schema", {}, b"", signing=signing, target=target, now=NOW, send=send)
+    (chat, schema) = send.sent
+    assert (chat.timeout_s, chat.total_s) == (30, 120) and (schema.timeout_s, schema.total_s) == (120, 120)

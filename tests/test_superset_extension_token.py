@@ -1,6 +1,7 @@
 """The Superset extension's token route: the pure minting code and the handler behind the Flask route. Neither
 module imports Flask or Superset, so these run in `unit` with no install."""
 
+import json
 import os
 import time
 from types import SimpleNamespace
@@ -205,7 +206,7 @@ def test_api_ignores_a_username_in_the_body(tmp_path):
 API_SOURCE = BACKEND_SRC / "agenticfabriq" / "mnemiq" / "api.py"
 
 
-def route(monkeypatch, user, body, config, forwarding=None) -> tuple[int, dict]:
+def route(monkeypatch, user, body, config, forwarding=None, requests_module=None):
     """What the token route's handler (`MnemiqApi.mint` in `api.py`) responds, as its status and fields, with Flask,
     Flask-AppBuilder and `superset_core` stood in: `g.user` is `user`, the request's JSON `body`, Superset's config
     `config`. Their decorators pass the handler through, so what runs is the handler alone; authentication and CSRF
@@ -222,8 +223,12 @@ def route(monkeypatch, user, body, config, forwarding=None) -> tuple[int, dict]:
         def response(self, status, **fields):
             return status, fields
 
+    class Response:
+        def __init__(self, body, status=200, content_type=None, headers=None):
+            self.body, self.status, self.content_type, self.headers = body, status, content_type, headers or {}
+
     stood_in = {
-        "flask": {"Response": object, "current_app": SimpleNamespace(config=config), "g": SimpleNamespace(user=user),
+        "flask": {"Response": Response, "current_app": SimpleNamespace(config=config), "g": SimpleNamespace(user=user),
                   "request": SimpleNamespace(get_json=lambda silent=False: body, method="GET", content_length=0,
                                              args=SimpleNamespace(to_dict=lambda flat=True: {}),
                                              get_data=lambda cache=False: b""),
@@ -239,11 +244,22 @@ def route(monkeypatch, user, body, config, forwarding=None) -> tuple[int, dict]:
         module = types.ModuleType(name)
         module.__dict__.update(attributes)
         monkeypatch.setitem(sys.modules, name, module)
+    if requests_module is not None:
+        monkeypatch.setitem(sys.modules, "requests", requests_module)
+        # urllib3 (requests' own dependency, so in Superset's image) for its marker telling it to send no header of
+        # its own; the live suite shows the real one keeps urllib3's user agent off the wire.
+        util = types.ModuleType("urllib3.util")
+        util.SKIP_HEADER = SKIP_HEADER
+        monkeypatch.setitem(sys.modules, "urllib3", types.ModuleType("urllib3"))
+        monkeypatch.setitem(sys.modules, "urllib3.util", util)
     spec = importlib.util.spec_from_file_location("token_route_under_test", API_SOURCE)
     loaded = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(loaded)
+    if forwarding == "module":
+        return loaded
     if forwarding is not None:
-        return loaded.MnemiqForward().forward(forwarding)
+        answer = loaded.MnemiqForward().forward(forwarding)
+        return answer.status, json.loads(answer.body), answer.headers
     return loaded.MnemiqApi().mint()
 
 
@@ -265,16 +281,148 @@ def test_the_route_answers_403_to_anyone_not_signed_in(monkeypatch, tmp_path):
 
 
 def test_the_forwarder_unconfigured_answers_503_naming_mnemiq_url(monkeypatch, tmp_path):
-    """Without `MNEMIQ_URL` the forwarder answers 503 with the sentence naming it, before anything is minted or sent;
-    the token settings missing, it names that one."""
+    """Without `MNEMIQ_URL` the forwarder answers 503 with the sentence naming it, as `{"detail": ...}` like every
+    refusal of its own, before anything is minted or sent; the token settings missing, it names that one."""
     from agenticfabriq.mnemiq.forward import FORWARD_NOT_CONFIGURED
 
     config = _mapping(tmp_path)
-    assert route(monkeypatch, signed_in("ana"), None, config, forwarding="schema") == (
-        503, {"message": FORWARD_NOT_CONFIGURED})
+    status, body, headers = route(monkeypatch, signed_in("ana"), None, config, forwarding="schema")
+    assert (status, body, headers.get("Cache-Control")) == (503, {"detail": FORWARD_NOT_CONFIGURED}, "no-store")
     unset = {k: v for k, v in config.items() if k != "MNEMIQ_TOKEN_TENANT"}
-    assert route(monkeypatch, signed_in("ana"), None, {**unset, "MNEMIQ_URL": "http://mnemiq:8080"},
-                 forwarding="schema") == (503, {"message": "MNEMIQ_TOKEN_TENANT is not set"})
+    status, body, _ = route(monkeypatch, signed_in("ana"), None, {**unset, "MNEMIQ_URL": "http://mnemiq:8080"},
+                            forwarding="schema")
+    assert (status, body) == (503, {"detail": "MNEMIQ_TOKEN_TENANT is not set"})
+
+
+def test_the_forwarder_refuses_a_guest_before_reading_any_setting(monkeypatch, tmp_path):
+    """A guest, or nobody signed in, is told 403 before the forwarder reads its settings: with none set, it still
+    learns nothing of how they are set."""
+    for user in (guest("admin"), anonymous()):
+        status, body, _ = route(monkeypatch, user, None, {}, forwarding="schema")
+        assert (status, body) == (403, {"detail": "the token route mints only for a signed-in Superset user"})
+
+
+# urllib3's value for `urllib3.util.SKIP_HEADER`.
+SKIP_HEADER = "@@@SKIP_HEADER@@@"
+
+
+class _FakeRequests:
+    """`requests` as the forwarder's `_send` uses it: a Session whose `request` records its arguments and answers a
+    response of `content_type` yielding `chunks` (an exception among them is raised when reached)."""
+
+    class RequestException(Exception):
+        pass
+
+    class ConnectionError(RequestException):
+        pass
+
+    class Timeout(RequestException):
+        pass
+
+    class ConnectTimeout(ConnectionError, Timeout):
+        pass
+
+    class ReadTimeout(Timeout):
+        pass
+
+    def __init__(self, *, content_type="application/json", chunks=(b'{"ok": true}',), raises=None):
+        self.calls: list[dict] = []
+        self.closed = 0
+        fake = self
+
+        class Answer:
+            status_code = 200
+            headers = {"Content-Type": content_type}
+
+            def iter_content(self, chunk_size=None):
+                for chunk in chunks:
+                    if isinstance(chunk, BaseException):
+                        raise chunk
+                    yield chunk
+
+            def close(self):
+                fake.closed += 1
+
+        class Session:
+            trust_env = True
+
+            def __init__(self):
+                self.headers = {"User-Agent": "python-requests", "Accept-Encoding": "gzip"}
+
+            def request(self, method, url, **kwargs):
+                fake.calls.append({"method": method, "url": url, "trust_env": self.trust_env,
+                                   "session_headers": dict(self.headers), **kwargs})
+                if raises is not None:
+                    raise raises
+                return Answer()
+
+            def close(self):
+                pass
+
+        self.Session = Session
+
+
+def _outbound(stream=False, total_s=600.0):
+    from agenticfabriq.mnemiq.forward import Outbound
+
+    return Outbound(method="POST", url="http://mnemiq/v1/chat", headers={"authorization": "Bearer t", "accept": "x",
+                                                                         "content-type": "application/json"},
+                    body=b"{}", timeout_s=30.0, stream=stream, total_s=total_s)
+
+
+def test_send_sends_the_outbound_exactly_and_reads_nothing_from_the_environment(monkeypatch, tmp_path):
+    """What mnemiq receives is the outbound's headers and body, no more: no proxy or `.netrc` from the environment
+    (`trust_env` off), no redirect followed; each wait bounded by the outbound's wait."""
+    fake = _FakeRequests()
+    api_module = route(monkeypatch, signed_in("ana"), None, {}, forwarding="module", requests_module=fake)
+    found = api_module._send(_outbound())
+    [call] = fake.calls
+    assert call["headers"] == {**_outbound().headers, "User-Agent": SKIP_HEADER} and call["data"] == b"{}"
+    assert call["trust_env"] is False and call["allow_redirects"] is False and call["timeout"] == (5, 30.0)
+    assert call["session_headers"] == {}
+    assert b"".join(found.chunks) == b'{"ok": true}' and fake.closed == 1
+
+
+def test_send_reads_where_mnemiq_fails_as_what_it_is(monkeypatch, tmp_path):
+    """Not reaching mnemiq is unreachable, its connection timing out included; a wait for its answer, before or while
+    the body is read, is a timeout."""
+    from agenticfabriq.mnemiq import forward
+
+    for raised, expected in ((_FakeRequests.ConnectTimeout(), forward.Unreachable),
+                             (_FakeRequests.ConnectionError(), forward.Unreachable),
+                             (_FakeRequests.ReadTimeout(), forward.TimedOut)):
+        fake = _FakeRequests(raises=raised)
+        api_module = route(monkeypatch, signed_in("ana"), None, {}, forwarding="module", requests_module=fake)
+        with pytest.raises(expected):
+            api_module._send(_outbound())
+
+    class ReadTimeoutError(Exception):
+        pass
+
+    fake = _FakeRequests(chunks=(b'{"o', _FakeRequests.ConnectionError(ReadTimeoutError("read timed out"))))
+    api_module = route(monkeypatch, signed_in("ana"), None, {}, forwarding="module", requests_module=fake)
+    with pytest.raises(forward.TimedOut):
+        api_module._send(_outbound())
+
+
+def test_send_passes_on_only_json_or_an_event_stream(monkeypatch, tmp_path):
+    from agenticfabriq.mnemiq import forward
+
+    fake = _FakeRequests(content_type="text/html")
+    api_module = route(monkeypatch, signed_in("ana"), None, {}, forwarding="module", requests_module=fake)
+    with pytest.raises(forward.Unreachable):
+        api_module._send(_outbound())
+
+
+def test_send_cuts_a_stream_at_its_total_deadline(monkeypatch, tmp_path):
+    """A stream that keeps sending (mnemiq's heartbeat) is cut once the whole answer has taken its total time."""
+    fake = _FakeRequests(content_type="text/event-stream", chunks=[b": beat\n\n"] * 100)
+    api_module = route(monkeypatch, signed_in("ana"), None, {}, forwarding="module", requests_module=fake)
+    clock = iter(float(t) for t in range(1000))
+    monkeypatch.setattr(api_module.time, "monotonic", lambda: next(clock))
+    found = api_module._send(_outbound(stream=True, total_s=5.0))
+    passed = list(found.chunks)
+    assert 0 < len(passed) < 100 and fake.closed == 1
 
 
 def csrf_problems(source: str) -> list[str]:
@@ -284,13 +432,13 @@ def csrf_problems(source: str) -> list[str]:
     import ast
 
     problems = []
-    classes = {node.name: node for node in ast.parse(source).body if isinstance(node, ast.ClassDef)}
-    # Every API class the extension mounts: the token route and the forwarder, which mints too.
-    for name in ("MnemiqApi", "MnemiqForward"):
-        node = classes.get(name)
-        if node is None:
-            problems.append(f"no {name} class")
-            continue
+    # Every API class the extension mounts (each a `RestApi`): the token route, the forwarder, and any added later.
+    classes = [node for node in ast.parse(source).body if isinstance(node, ast.ClassDef)
+               and any(getattr(base, "id", None) == "RestApi" for base in node.bases)]
+    if {node.name for node in classes} < {"MnemiqApi", "MnemiqForward"}:
+        problems.append("the token route's or the forwarder's class is missing")
+    for node in classes:
+        name = node.name
         values = [stmt.value.value for stmt in node.body if isinstance(stmt, ast.Assign)
                   and any(getattr(t, "id", None) == "csrf_exempt" for t in stmt.targets)
                   and isinstance(stmt.value, ast.Constant)]
@@ -304,5 +452,9 @@ def test_the_token_route_needs_csrf():
     # The planted defect, as the route first shipped: the class does not say, so FAB exempts the route.
     assert csrf_problems(API_SOURCE.read_text().replace("    csrf_exempt = False\n", "", 1)) == [
         "MnemiqApi.csrf_exempt is not set"]
+    source = API_SOURCE.read_text()
+    forwarder = source.index("class MnemiqForward")
+    assert csrf_problems(source[:forwarder] + source[forwarder:].replace("    csrf_exempt = False\n", "", 1)) == [
+        "MnemiqForward.csrf_exempt is not set"]
     assert csrf_problems(API_SOURCE.read_text().replace("csrf_exempt = False", "csrf_exempt = True")) == [
         "MnemiqApi.csrf_exempt is [True]", "MnemiqForward.csrf_exempt is [True]"]

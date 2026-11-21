@@ -10,8 +10,10 @@ would land under `/api/v1`.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
+from collections.abc import Iterator
 
 from flask import Response, current_app, g, request, stream_with_context
 from flask_appbuilder.api import expose, permission_name, protect, safe
@@ -60,29 +62,96 @@ class MnemiqApi(RestApi):
             return self.response(400, message=str(exc))
 
 
-def _send(outbound: forward.Outbound) -> forward.Inbound:
-    """The request sent to mnemiq with `requests` (in Superset's base requirements), never following a redirect; a
-    stream's chunks read as they arrive, each within the idle time."""
+# What a forwarded answer may be: mnemiq's JSON, or a chat answer's event stream. Anything else (a proxy's page in
+# front of mnemiq, say) is not passed on to be rendered at Superset's origin.
+_PASSED_ON = ("application/json", "text/event-stream")
+
+
+def _timed_out(exc: Exception) -> bool:
+    """Whether `requests` failed waiting for mnemiq to answer, not to connect: a read timeout, raised as is or, while a
+    body is read, wrapped in a ConnectionError (`requests.models.Response.iter_content`)."""
     import requests
 
-    try:
-        answer = requests.request(outbound.method, outbound.url, headers=outbound.headers,
-                                  data=outbound.body or None, allow_redirects=False, stream=outbound.stream,
-                                  timeout=(5, outbound.timeout_s))
-    except requests.Timeout:
-        raise forward.TimedOut() from None
-    except requests.RequestException:
-        raise forward.Unreachable() from None
+    if isinstance(exc, requests.ConnectTimeout):
+        return False
+    if isinstance(exc, requests.Timeout):
+        return True
+    seen, cause = set(), exc
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        if type(cause).__name__ in ("ReadTimeoutError", "ReadTimeout", "TimeoutError", "timeout"):
+            return True
+        cause = cause.__cause__ or cause.__context__ or (cause.args[0] if cause.args and
+                                                          isinstance(cause.args[0], BaseException) else None)
+    return False
 
-    def chunks():
+
+def _send(outbound: forward.Outbound) -> forward.Inbound:
+    """The request sent to mnemiq with `requests` (in Superset's base requirements): no proxy, `.netrc` or other setting
+    read from the environment (`trust_env` off), no redirect followed, each wait for mnemiq bounded by
+    `outbound.timeout_s` and the whole answer by `outbound.total_s`, however often mnemiq sends a heartbeat. A JSON
+    answer is read here, whole; a stream is passed on chunk by chunk, and cut at the total deadline."""
+    import requests
+    from urllib3.util import SKIP_HEADER
+
+    deadline = time.monotonic() + outbound.total_s
+    session = requests.Session()
+    session.trust_env = False
+    # No header of the session's own (its user agent, accepted encodings), nor urllib3's default user agent: mnemiq
+    # receives the outbound's headers alone, beside the host and length every request carries.
+    session.headers.clear()
+    headers = {**outbound.headers, "User-Agent": SKIP_HEADER}
+    try:
+        answer = session.request(outbound.method, outbound.url, headers=headers,
+                                 data=outbound.body or None, allow_redirects=False, stream=True,
+                                 timeout=(5, outbound.timeout_s))
+    except requests.RequestException as exc:
+        session.close()
+        raise (forward.TimedOut() if _timed_out(exc) else forward.Unreachable()) from None
+    content_type = answer.headers.get("Content-Type") or ""
+    if not content_type.startswith(_PASSED_ON):
+        answer.close()
+        session.close()
+        logger.warning("mnemiq extension: mnemiq answered a forwarded request with something other than JSON or an "
+                       "event stream")
+        raise forward.Unreachable()
+
+    def read() -> Iterator[bytes]:
+        for chunk in answer.iter_content(chunk_size=None):
+            if time.monotonic() > deadline:
+                raise forward.TimedOut()
+            yield chunk
+
+    if not outbound.stream:
         try:
-            yield from answer.iter_content(chunk_size=None)
+            body = b"".join(read())
+        except forward.TimedOut:
+            raise
+        except requests.RequestException as exc:
+            raise (forward.TimedOut() if _timed_out(exc) else forward.Unreachable()) from None
         finally:
             answer.close()
+            session.close()
+        return forward.Inbound(answer.status_code, content_type, answer.headers.get("WWW-Authenticate"), iter([body]))
 
-    return forward.Inbound(answer.status_code, answer.headers.get("Content-Type") or "application/json",
-                           answer.headers.get("WWW-Authenticate"),
-                           chunks() if outbound.stream else iter([answer.content]))
+    def streamed() -> Iterator[bytes]:
+        try:
+            yield from read()
+        except forward.TimedOut:
+            logger.warning("mnemiq extension: a forwarded stream ran past its deadline and was cut")
+        except requests.RequestException:
+            logger.warning("mnemiq extension: a forwarded stream broke before mnemiq ended it")
+        finally:
+            answer.close()
+            session.close()
+
+    return forward.Inbound(answer.status_code, content_type, answer.headers.get("WWW-Authenticate"), streamed())
+
+
+def _answer(status: int, sentence: str) -> Response:
+    """One of the forwarder's own refusals, as `forward_for` answers its others: `{"detail": ...}`, uncached."""
+    return Response(json.dumps({"detail": sentence}), status=status, content_type="application/json",
+                    headers=dict(ANSWER_HEADERS))
 
 
 @api(id="forward_api", name="mnemiq forward", description="Forwards a panel's requests to mnemiq as the signed-in user",
@@ -99,23 +168,29 @@ class MnemiqForward(RestApi):
     @safe
     @permission_name("read")
     def forward(self, rest: str) -> Response:
-        """mnemiq's answer to the request, as `forward.forward_for` decides and sends it for the signed-in user."""
+        """mnemiq's answer to the request, as `forward.forward_for` decides and sends it for the signed-in user. An
+        embedded guest or nobody signed in is refused before any setting or the body is read."""
+        if not signed_in(g.user):
+            return _answer(403, NOT_SIGNED_IN)
         try:
             target = ForwardConfig.from_mapping(current_app.config)
         except ValueError as exc:  # names the setting; never its value
             logger.warning("mnemiq extension: the forwarder is not configured: %s", exc)
-            return self.response(503, message=FORWARD_NOT_CONFIGURED)
+            return _answer(503, FORWARD_NOT_CONFIGURED)
         try:
             signing = SigningConfig.from_mapping(current_app.config)
         except ValueError as exc:
-            logger.warning("mnemiq token route is not configured: %s", exc)
-            return self.response(503, message=str(exc))
+            logger.warning("mnemiq extension: the forwarder cannot mint, its token settings are not configured: %s",
+                           exc)
+            return _answer(503, str(exc))
         body = b""
         if request.method == "POST":
             if (request.content_length or 0) > MAX_BODY:
-                body = b"x" * (MAX_BODY + 1)  # refused by size before anything is read
+                body = b"x" * (MAX_BODY + 1)  # refused by its size; nothing of it is read
             else:
-                body = request.get_data(cache=False)[: MAX_BODY + 1]
+                # Read at most one byte past the limit, whatever the request says of its length: a chunked body
+                # declares none.
+                body = request.stream.read(MAX_BODY + 1)
         found = forward_for(g.user, request.method, f"/v1/{rest}", request.args.to_dict(flat=False), body,
                             signing=signing, target=target, now=time.time(), send=_send)
         headers = dict(ANSWER_HEADERS)

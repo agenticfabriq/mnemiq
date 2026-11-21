@@ -24,7 +24,7 @@ import re
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Literal
-from urllib.parse import quote, unquote, urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 from agenticfabriq.mnemiq.token import NOT_SIGNED_IN, SigningConfig, mint, signed_in
 
@@ -49,7 +49,7 @@ ANSWER_HEADERS = {"Cache-Control": "no-store"}
 
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _INT = r"[1-9][0-9]{0,9}"
-# A measure's name: one path segment, checked once more decoded (`_name_problem`).
+# A measure's name: one path segment of the path as Superset's router decoded it, encoded once for mnemiq.
 _NAME = r"(?P<name>[^/]{1,250})"
 _ONE_ID = re.compile(_INT)
 
@@ -117,12 +117,16 @@ def _seconds(config: Mapping, name: str, default: float, low: float, high: float
 
 @dataclass(frozen=True)
 class Outbound:
+    """The request mnemiq is sent. `timeout_s` bounds each wait for mnemiq (to connect, and between two reads: a
+    stream's idle time); `total_s` bounds the whole answer, read to its end, however often mnemiq sends something."""
+
     method: str
     url: str
     headers: dict[str, str] = field(repr=False)
     body: bytes = field(repr=False)
     timeout_s: float
     stream: bool
+    total_s: float = 600.0
 
 
 @dataclass(frozen=True)
@@ -149,14 +153,14 @@ def _refusal(status: int, sentence: str) -> Inbound:
 
 
 def _name_problem(name: str) -> bool:
-    """Whether a measure's name segment could reach another route once decoded: an encoded `/`, or a `.` segment."""
-    decoded = unquote(name)
-    return "/" in decoded or decoded in (".", "..") or "%2f" in name.lower() or not decoded
+    """Whether a measure's name (as decoded once, by Superset's router) is no name: a `.` or `..` segment, or one
+    holding an encoded `/` that another decoding could turn into a path."""
+    return name in (".", "..") or "%2f" in name.lower()
 
 
 def _route(method: str, path: str) -> tuple[Route | None, bool, str]:
-    """The route `method` and `path` name, whether some route has the path under another method, and the path as
-    mnemiq is sent it (a measure's name encoded once)."""
+    """The route `method` and `path` (decoded, as Superset's router hands it over) name, whether some route has the
+    path under another method, and the path as mnemiq is sent it (a measure's name encoded once)."""
     # Each pattern is matched whole and none holds `.` or `/` but a measure's name, checked decoded below: a path
     # with a `.` or `..` segment, or two slashes, matches none.
     elsewhere = False
@@ -172,14 +176,15 @@ def _route(method: str, path: str) -> tuple[Route | None, bool, str]:
             if _name_problem(name):
                 return None, False, path
             start, end = found.span("name")
-            path = f"{path[:start]}{quote(unquote(name), safe='')}{path[end:]}"
+            path = f"{path[:start]}{quote(name, safe='')}{path[end:]}"
         return route, False, path
     return None, elsewhere, path
 
 
 def forward_for(user, method: str, path: str, query: Mapping[str, list[str]], body: bytes, *,
                 signing: SigningConfig, target: ForwardConfig, now: float, send: Send) -> Inbound:
-    """The answer to the panel's request `method path?query` with `body`, as the signed-in `user`. Checked in this
+    """The answer to the panel's request `method path?query` with `body`, as the signed-in `user`; `path` is decoded,
+    as Superset's router hands it over. Checked in this
     order, each refusal answered before mnemiq is called: the user is signed in (403), the path is a route (404),
     under its method (405), the query holds only the route's keys, each once and well formed (400), and the body is
     at most `MAX_BODY` (413). Then a token is minted for the user and the route's purpose, and the request sent."""
@@ -202,7 +207,8 @@ def forward_for(user, method: str, path: str, query: Mapping[str, list[str]], bo
         headers["content-type"] = "application/json"
     url = f"{target.url}{sent_path}" + (f"?{urlencode({k: v[0] for k, v in query.items()})}" if query else "")
     outbound = Outbound(method=method, url=url, headers=headers, body=sent_body,
-                        timeout_s=target.idle_s if route.stream else target.timeout_s, stream=route.stream)
+                        timeout_s=target.idle_s if route.stream else target.timeout_s, stream=route.stream,
+                        total_s=target.timeout_s)
     try:
         return send(outbound)
     except TimedOut:
