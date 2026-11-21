@@ -284,6 +284,12 @@ still to come. In short:
     prompt. The planning prompt holds every table, column and saved metric the builder can see, so a large schema
     needs a large window.
   - `POST /v1/superset/builds/{id}/next` runs the build's next step.
+  - With `"propose": true`, the start plans the build and keeps it as a proposal, writing nothing to Superset: a 200
+    naming the build, its goal, its dashboard and its plan. `POST /v1/superset/builds/{id}/confirm` starts it,
+    answered as `/next` answers a build, and `/next` then runs it as any build. A proposal holds no dashboard, so
+    another build of the dashboard may run meanwhile. At the confirm, a proposal onto a dashboard is refused with a 409
+    while another build of the dashboard is building, and when the dashboard changed since the plan (its `changed_on`,
+    read before planning): plan it again. A second confirm is a 409 too.
   - `GET /v1/superset/builds/{id}` reads the build as it stands. Every build answer names its plan (each chart's
     title, family and measures, and each measure mnemiq writes), and the check step's own answer says why each chart
     that did not check did not (`check_reasons`), which is not kept.
