@@ -1087,6 +1087,70 @@ def test_set_layout_adds_only_charts_the_caller_may_read(superset, monkeypatch):
     assert writes._readable_chart(12) is False and writes._readable_chart(13) is False
 
 
+def test_set_layout_does_not_expect_a_trashed_member_the_layout_no_longer_places(superset, monkeypatch):
+    """rc2 keeps a chart in the trash a member of its dashboard. `set_layout` reads which members are trashed, so a
+    layout that leaves out one the dashboard no longer places (a Remove took it off) is the whole set; the control:
+    the same layout, the member not read as trashed, is refused as dropping it."""
+    superset.charts = {11: SimpleNamespace(id=11), 12: SimpleNamespace(id=12)}
+    security = SimpleNamespace(can_access_dashboard=lambda dashboard: True, is_editor=lambda resource: True,
+                               can_access_chart=lambda chart: True)
+    monkeypatch.setattr(writes, "_security", lambda: security)
+    monkeypatch.setattr(writes, "_member_chart_ids", lambda dashboard_id: [11, 9])
+    dashboard = SimpleNamespace(id=3, changed_on=datetime.fromisoformat(WHEN),
+                                position_json=json.dumps(_one_chart_layout(11)), json_metadata=None, editors=[])
+    positions = _one_chart_layout(11)
+    positions["GRID_ID"]["children"].append("CHART-12")
+    positions["CHART-12"] = {"type": "CHART", "id": "CHART-12", "children": [],
+                             "meta": {"chartId": 12, "width": 4, "height": 50}}
+
+    def layout() -> dict:
+        found = writes.read("set_layout", {"dashboard_id": 3, "positions": positions, "add_chart_ids": [12],
+                                           "expect_changed_on": WHEN})
+        return writes._layout(found, dashboard)
+
+    monkeypatch.setattr(writes, "_trashed_chart_ids", lambda chart_ids: [])
+    assert layout() == {"refused": "chart_set", "missing": [9], "unexpected": []}
+    asked: list = []
+    monkeypatch.setattr(writes, "_trashed_chart_ids", lambda chart_ids: asked.append(chart_ids) or [9])
+    assert layout() == {"ok": True}
+    assert asked == [[11, 9]]
+
+
+def test_trashed_members_are_read_past_the_trash_filter_and_locked_until_the_layout_commits(superset, monkeypatch):
+    """`_trashed_chart_ids` locks every member's row with `lock_row` (the module's one locking read), in id order, past
+    rc2's soft-delete filter (`skip_visibility_filter`, the documented opt-out), so a trashed row is seen and locked
+    too, for the rest of the layout's transaction: a chart restored from, or moved to, the trash meanwhile waits.
+    Only the trashed ones are answered."""
+    import contextlib
+    import types
+
+    locked: list[tuple] = []
+    bypassing: list = []
+
+    @contextlib.contextmanager
+    def skip_visibility_filter(session, *classes):
+        bypassing.append(tuple(c.__name__ for c in classes))
+        try:
+            yield
+        finally:
+            bypassing.pop()
+
+    def lock_row(model, entity_id):
+        locked.append((model.__name__, entity_id, tuple(bypassing)))
+        return {9: SimpleNamespace(deleted_at=datetime.fromisoformat(WHEN)),
+                11: SimpleNamespace(deleted_at=None)}.get(entity_id)
+
+    helpers = types.ModuleType("superset.models.helpers")
+    helpers.skip_visibility_filter = skip_visibility_filter
+    monkeypatch.setitem(sys.modules, "superset.models.helpers", helpers)
+    monkeypatch.setattr(writes, "_session", lambda: SimpleNamespace())
+    monkeypatch.setattr(writes, "lock_row", lock_row)
+    assert writes._trashed_chart_ids([11, 9, 12]) == [9]
+    assert locked == [("Slice", 9, (("Slice",),)), ("Slice", 11, (("Slice",),)), ("Slice", 12, (("Slice",),))]
+    locked.clear()
+    assert writes._trashed_chart_ids([]) == [] and locked == []
+
+
 # ---------------------------------------------------------------- who becomes an editor
 
 USER, ROLE, GROUP = stubs.SubjectType.USER, stubs.SubjectType.ROLE, stubs.SubjectType.GROUP
