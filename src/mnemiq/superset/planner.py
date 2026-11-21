@@ -343,6 +343,11 @@ column;
 - sankey, box_plot and histogram cannot show currency or percent; handlebars shows count or number only;
 - one axis shows one kind of measure.
 
+A condition that says what a written measure means (open, won, overdue, active) goes inside its expression, as \
+CASE WHEN ... THEN ... END, so the measure means its name on every chart and wherever it is saved; a chart's filters \
+narrow only what that chart shows. Where a chart should not show the rows a measure's condition leaves out (a closed \
+stage at 0), filter them out on that chart as well.
+
 reuse_dashboard: {"id": a dashboard's id, "reason": why it already covers the goal}, only for one of the dashboards \
 listed and only when it covers the goal; the builder is then asked whether to reuse it. Otherwise null."""
 

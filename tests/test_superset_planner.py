@@ -1333,6 +1333,17 @@ def test_the_prompt_says_a_percent_is_a_fraction():
     assert "a percent is a fraction from 0 to 1" in system and "never multiply it by 100" in system
 
 
+def test_the_prompt_keeps_a_measures_condition_in_its_expression():
+    """A condition that defines a measure (open, won) belongs in its expression, so the measure means its name on every
+    chart, in the measures section and in a saved metric; a chart's filters only narrow that chart."""
+    model = ScriptedModel([_draft("SUM(premium)")])
+    _plan(GOAL, LLMPlanner(model), _tools())
+    system = model.sent[0]["system"]
+    assert "goes inside its expression" in system
+    assert "a chart's filters narrow only what that chart shows" in system
+    assert "filter them out on that chart as well" in system
+
+
 def test_a_saved_metric_on_a_0_to_100_scale_cannot_be_planned_as_a_percent():
     metrics = {1: [_metric(1, "win_pct", "100.0 * AVG(premium)")]}
     chart = _chart("rate", Family.BIG_NUMBER, [SavedRef("win_pct", K.PERCENT)])
