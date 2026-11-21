@@ -96,7 +96,7 @@ def rank_columns(packet: ContextPacket, snapshot, policy) -> list[tuple[str, str
     ranked = []
     for index, column in enumerate(snapshot.columns):
         table = column.object_id
-        if table not in order or not column.description:
+        if table not in order or not (column.description or column.comment):
             continue
         key = (table, column.name)
         if key in policy.denied or key in policy.masked:
@@ -105,7 +105,7 @@ def rank_columns(packet: ContextPacket, snapshot, policy) -> list[tuple[str, str
                           named_text, re.IGNORECASE) is not None
         tier = 0 if named else 1 if key in joins else 2
         score = (2 * len(question & _words(column.name.replace("_", " ")))
-                 + len(question & _words(column.description)))
+                 + len(question & _words(f"{column.description or ''} {column.comment or ''}")))
         ranked.append((tier, -score, order[table], index, key))
     ranked.sort()
     first = [entry[-1] for entry in ranked if entry[0] < 2]
@@ -116,6 +116,15 @@ def rank_columns(packet: ContextPacket, snapshot, policy) -> list[tuple[str, str
     turns = [by_table[t] for t in sorted(by_table, key=order.__getitem__)]
     shared = [column for round_ in zip_longest(*turns) for column in round_ if column is not None]
     return first + shared
+
+
+def ranked_meanings(ranked: list[tuple[str, str]], snapshot) -> list[tuple[str, str, str]]:
+    """What the fitter keeps, best first: every ranked column's comment, then every ranked column's description, each
+    in `rank_columns` order. Trimming from the end drops the model's descriptions before any comment, which a person
+    wrote; a snapshot with no comments ranks its descriptions exactly as before."""
+    by_key = {(c.object_id, c.name): c for c in snapshot.columns}
+    return ([("comment", t, c) for t, c in ranked if by_key[(t, c)].comment]
+            + [("description", t, c) for t, c in ranked if by_key[(t, c)].description])
 
 
 @dataclass
@@ -249,13 +258,15 @@ class PromptFitter:
         from mnemiq.sql.policy import build_access_policy
 
         policy = build_access_policy(snapshot, grants)
-        ranked = rank_columns(packet, snapshot, policy)
+        ranked = ranked_meanings(rank_columns(packet, snapshot, policy), snapshot)
+        described = sum(kind == "description" for kind, _, _ in ranked)
 
         def render(n: int) -> ContextPacket:
             keep = set(ranked[:n])
             texts = {c.object_id: c.text for c in build_cards(
                 snapshot, policy=policy, style=style, dialect=self.dialect,
-                describe=lambda table, column: (table, column) in keep)}
+                describe=lambda table, column: ("description", table, column) in keep,
+                comment=lambda table, column: ("comment", table, column) in keep)}
             fresh = [RetrievedCard(object_id=c.object_id, card=texts[c.object_id], score=c.score)
                      for c in packet.cards if c.object_id in texts]
             _attach_facts(fresh, snapshot.table_facts, style, grants=grants,
@@ -264,7 +275,8 @@ class PromptFitter:
             by_id = {c.object_id: c for c in fresh}
             # A card retrieval served from the stored text (no snapshot binding) is kept as served.
             cards = [by_id.get(c.object_id, c) for c in packet.cards]
-            return replace(packet, cards=cards, descriptions=(n, len(ranked)))
+            return replace(packet, cards=cards,
+                           descriptions=(sum(kind == "description" for kind, _, _ in ranked[:n]), described))
 
         def chars(candidate: ContextPacket) -> int:
             return len(system) + len(user_prompt(candidate))
@@ -322,7 +334,7 @@ class PromptFitter:
                     logger.warning("prompt window: even with no column descriptions the prompt "
                                    "needs %d tokens against %d after the reply budget; the "
                                    "server may refuse it", floor_tokens, budget())
-        logger.info("prompt window: %d of %d column descriptions sent, to fit %d tokens",
+        logger.info("prompt window: %d of %d column descriptions and comments sent, to fit %d tokens",
                     low, len(ranked), budget())
         return best
 

@@ -20,7 +20,9 @@ logger = logging.getLogger(__name__)
 
 
 # Column fields hashed only when set, so a snapshot written before they existed keeps its version.
-_HASHED_WHEN_SET = ("estimate", "declared_unique")
+_HASHED_WHEN_SET = ("estimate", "declared_unique", "comment")
+# A comment the database holds is cut to this, after the prompt screen (`sanitize`): it rides on cards and prompts.
+COMMENT_LIMIT = 300
 
 
 def _column_content(column: Column) -> dict:
@@ -29,6 +31,37 @@ def _column_content(column: Column) -> dict:
         if dumped[field] is None:
             del dumped[field]
     return dumped
+
+
+def _binding_content(binding: SourceBinding) -> dict:
+    dumped = binding.model_dump(by_alias=True)
+    if dumped.get("comment") is None:
+        dumped.pop("comment", None)  # a snapshot taken before comments existed keeps its version
+    return dumped
+
+
+def _with_comments(adapter, columns: list[Column], bindings: list[SourceBinding]):
+    """`columns` and `bindings` with the source's comments, where the adapter reads them (`comments`, Oracle's): read
+    once for the tables enriched, screened for prompts and cut to `COMMENT_LIMIT`. A failed read costs the comments
+    only, and is logged."""
+    if not callable(getattr(adapter, "comments", None)) or not bindings:
+        return columns, bindings
+    from mnemiq.enrichment.prompts import sanitize
+
+    try:
+        tables, cols = adapter.comments([b.object_id for b in bindings])
+    except Exception as exc:  # noqa: BLE001 -- documentation, never a reason to lose the profile
+        logger.warning("the source's comments could not be read (%s); none are kept", exc)
+        return columns, bindings
+
+    def clean(text):
+        return (sanitize(text, limit=COMMENT_LIMIT) or None) if text else None
+
+    columns = [c.model_copy(update={"comment": clean(cols.get((c.object_id, c.name)))})
+               if (c.object_id, c.name) in cols else c for c in columns]
+    bindings = [b.model_copy(update={"comment": clean(tables.get(b.object_id))}) if b.object_id in tables else b
+                for b in bindings]
+    return columns, bindings
 
 
 def content_version(snapshot: Snapshot) -> str:
@@ -50,7 +83,7 @@ def content_version(snapshot: Snapshot) -> str:
         "source_id": snapshot.source_id,
         "columns": [_column_content(c) for c in snapshot.columns],
         "relationships": [r.model_dump(by_alias=True) for r in snapshot.relationships],
-        "source_bindings": [b.model_dump(by_alias=True) for b in snapshot.source_bindings],
+        "source_bindings": [_binding_content(b) for b in snapshot.source_bindings],
     }
     # Included only when present, so every snapshot taken before views were discovered keeps
     # the exact version it had -- the same rule `ontology_version` follows.
@@ -416,6 +449,7 @@ def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
                         detail=json.dumps({"database_id": database_id, "schema": schema,
                                            "backend": "postgresql", "values": "not harvested"})))
 
+    columns, source_bindings = _with_comments(adapter, columns, source_bindings)
     snapshot = Snapshot(
         version="",
         source_id=source_id,

@@ -47,6 +47,7 @@ class ColumnFacts:
     estimated_rows: int | None = None
     estimated_distinct: int | None = None
     estimated_nulls: int | None = None
+    comment: str | None = None  # the source's own comment on the column, a person's text
 
 
 def render_table_facts(table: str, columns: list[ColumnFacts]) -> str:
@@ -72,6 +73,8 @@ def render_table_facts(table: str, columns: list[ColumnFacts]) -> str:
         if c.codes:
             observed = ", ".join(sanitize(v, limit=40) for v in c.codes)
             line += f" observed values: [{observed}]"
+        if c.comment:
+            line += f' database comment: "{sanitize(c.comment, limit=300)}"'
         lines.append(line)
     return "\n".join(lines)
 
