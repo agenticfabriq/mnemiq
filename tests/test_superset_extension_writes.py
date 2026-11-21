@@ -1120,11 +1120,12 @@ def test_set_layout_does_not_expect_a_trashed_member_the_layout_no_longer_places
     assert asked == [[11, 9]]
 
 
-def test_set_layout_installs_the_whole_membership_before_rc2s_command(superset, monkeypatch):
+def test_set_layout_installs_the_membership_rc2s_save_must_keep_before_its_command(superset, monkeypatch):
     """rc2 loads a dashboard's `slices` under its soft-delete filter, so the collection it diffs a layout's new
-    members against lacks a chart in the trash, and its save INSERTs that chart's junction row again. `set_layout`
-    locks every member once, a trashed one included, and installs them as the committed collection before the
-    command runs; a member whose row is gone is not in it."""
+    members against lacks a chart in the trash, and its save INSERTs a placed one's junction row again. `set_layout`
+    locks every member once and, before the command runs, installs as the committed collection the live members and
+    the trashed ones the new layout places: a trashed member the layout no longer places stays out of it, so the save
+    leaves its row (a restore puts it back), as Superset's own fix keeps it. A member whose row is gone is not in it."""
     superset.charts = {11: SimpleNamespace(id=11), 12: SimpleNamespace(id=12)}
     security = SimpleNamespace(can_access_dashboard=lambda dashboard: True, is_editor=lambda resource: True,
                                can_access_chart=lambda chart: True)
@@ -1152,8 +1153,23 @@ def test_set_layout_installs_the_whole_membership_before_rc2s_command(superset, 
                                        "expect_changed_on": WHEN})
     assert writes._layout(found, dashboard) == {"ok": True}
     assert [entry[0] for entry in superset.ran] == ["install", "UpdateDashboardCommand"]
-    assert superset.ran[0] == ("install", [9, 11])
+    assert superset.ran[0] == ("install", [11])  # 9 is in the trash and off the layout: its row stays
     assert locks == [9, 11]  # each member locked once, in id order
+    # The trashed member still placed (deleted in Superset's own way, kept on the layout) is in the baseline, so the
+    # save does not INSERT its row again.
+    superset.ran.clear()
+    placed = _one_chart_layout(11)
+    placed["GRID_ID"]["children"].append("CHART-9")
+    placed["CHART-9"] = {"type": "CHART", "id": "CHART-9", "children": [], "meta": {"chartId": 9, "width": 4, "height": 50}}
+    dashboard.position_json = json.dumps(placed)
+    both = json.loads(json.dumps(placed))
+    both["GRID_ID"]["children"].append("CHART-12")
+    both["CHART-12"] = positions["CHART-12"]
+    found_placed = writes.read("set_layout", {"dashboard_id": 3, "positions": both, "add_chart_ids": [12],
+                                              "expect_changed_on": WHEN})
+    assert writes._layout(found_placed, dashboard) == {"ok": True}
+    assert superset.ran[0] == ("install", [9, 11])
+    dashboard.position_json = json.dumps(_one_chart_layout(11))
     rows.pop(9)  # a member whose row is gone (lock_row answers None)
     superset.ran.clear()
     monkeypatch.setattr(writes, "_member_chart_ids", lambda dashboard_id: [11])

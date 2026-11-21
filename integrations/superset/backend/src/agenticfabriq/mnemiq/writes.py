@@ -1678,9 +1678,8 @@ def _locked_members(chart_ids: list[int]) -> list[Any]:
 
 
 def _install_membership_baseline(dashboard: Any, charts: list[Any]) -> None:
-    """Install `charts`, the dashboard's members as its membership table holds them (a chart in the trash included), as
-    the committed state of `dashboard.slices`, the collection rc2's `set_dash_metadata` diffs a layout's members
-    against. rc2 loads that collection under its soft-delete filter: the filter's loader criteria travel from the
+    """Install `charts`, members of the dashboard as its membership table holds them, as the committed state of
+    `dashboard.slices`, the collection rc2's `set_dash_metadata` diffs a layout's members against. rc2 loads that collection under its soft-delete filter: the filter's loader criteria travel from the
     dashboard's own load to its `slices` load, past the `skip_visibility_filter` around the assignment, so a trashed
     member is missing from it and the save INSERTs its junction row again (a duplicate key). apache/superset#45543
     installs the same baseline in Superset itself; 7.0's branch (7.0.0 RC3) does not carry it. A change to the
@@ -1722,7 +1721,11 @@ def _layout(found: dict, dashboard: Any) -> dict:
     metadata = params.layout_metadata(found["positions"], _stored_object(dashboard.json_metadata) or {})
     from superset.commands.dashboard.update import UpdateDashboardCommand
 
-    _install_membership_baseline(dashboard, locked)
+    # The members rc2's save must neither add again nor drop: the live ones, and those in the trash the new layout
+    # places. A trashed member the layout no longer places stays out, so the save leaves its row and a restore puts
+    # it back, as apache/superset#45543 keeps it.
+    placed = params._layout_chart_ids(found["positions"]) or set()
+    _install_membership_baseline(dashboard, [c for c in locked if c.deleted_at is None or c.id in placed])
     try:
         UpdateDashboardCommand(dashboard.id, {"json_metadata": json.dumps(metadata)}).run()
     except _command_errors() as exc:
