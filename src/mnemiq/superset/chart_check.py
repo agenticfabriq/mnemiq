@@ -278,6 +278,12 @@ class _Rows:
     values: dict[tuple, list]
     largest: int = 0  # the most rows any one of the side's results held
     cap: int | None = None  # the row cap put on the side's one read, when it reached it: it may hold only some groups
+    # When a read that reached its cap was made in a chart's ranking order (`_ranked_read`): that ranking, and the
+    # ranking value of the last group it read, after which every group it did not read ranks.
+    ranked: Ranking | None = None
+    through: object = None
+    # When a read that reached its cap was made in a chart's ranking order but its values cannot be ranked: why not.
+    unranked: str | None = None
 
 
 def _canonical(value):
@@ -408,10 +414,13 @@ def _filter_sql(item: Filter) -> str:
     return f"{column} {operator} {_literal(item.value)}"
 
 
-def _statement(expectation: Expectation, dataset: DatasetFacts, *, grained: bool, source: str | None = None) -> str:
+def _statement(expectation: Expectation, dataset: DatasetFacts, *, grained: bool, source: str | None = None,
+               ranking: Ranking | None = None, limit: int | None = None) -> str:
     """mnemiq's statement for the chart's query, through `measure_statement`: each metric aliased by position, the
     x-axis grouped by the grain when `grained`, as Postgres's grain expression writes it. It reads `source` when given
-    (a made dataset's SQL as Superset reads a virtual one), else the dataset's table."""
+    (a made dataset's SQL as Superset reads a virtual one), else the dataset's table. Under the chart's `ranking` its
+    groups come in that order, NULL last as `_ranking_problem` ranks it, so the deciders' row cap, or `limit`, keeps the
+    groups that decide the chart's cut."""
     saved = dict(dataset.saved_metric_sql)
     measures = tuple(Measure(name=f"m{i}", label=label,
                              expression=saved[label] if label in dataset.saved_metric_names else expression,
@@ -420,8 +429,13 @@ def _statement(expectation: Expectation, dataset: DatasetFacts, *, grained: bool
     columns = [_quoted(name) for name in expectation.dimensions]
     if grained and expectation.time_grain:
         columns[0] = f"DATE_TRUNC('{_GRAINS[expectation.time_grain]}', {columns[0]}) AS {columns[0]}"
-    return measure_statement(measures, source or _quoted(dataset.table), tuple(columns),
-                             tuple(_filter_sql(item) for item in expectation.filters))
+    sql = measure_statement(measures, source or _quoted(dataset.table), tuple(columns),
+                            tuple(_filter_sql(item) for item in expectation.filters))
+    if ranking is not None:
+        sql += f" ORDER BY m{ranking.metric_index} {'DESC' if ranking.descending else 'ASC'} NULLS LAST"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+    return sql
 
 
 def _raise_terminal(adapter) -> None:
@@ -431,9 +445,51 @@ def _raise_terminal(adapter) -> None:
         raise refused
 
 
+def _rank_key(value, descending: bool) -> tuple:
+    """Where `value` stands in a ranking: a NULL after every value, as `_ranking_problem` ranks one."""
+    if value is None:
+        return (1, 0)
+    return (0, -value if descending else value)
+
+
+def _rankable(value) -> bool:
+    return value is None or (not isinstance(value, bool) and isinstance(value, (int, float, Decimal)))
+
+
+def _first_read(ranking: Ranking | None) -> int | None:
+    """How many groups a read in `ranking`'s order asks for first: twice the chart's cut, which sees past it unless many
+    groups tie there, and keeps the answer far below Superset's MCP response size, which a full read's rows often pass.
+    None when that is no fewer than one read's cap, or there is no ranking."""
+    if ranking is None or ranking.limit < 1 or 2 * ranking.limit >= MAX_ROWS:
+        return None
+    return 2 * ranking.limit
+
+
+def _ranked_read(rows: _Rows, ranking: Ranking | None, *, nulls_last: bool, source: str) -> _Rows:
+    """`rows`, read in `ranking`'s order, marked as such when the read stopped at its cap, with the ranking value of the
+    last group it read: every group it did not read ranks after that one. Only where the order is known: each value a
+    number or NULL, and the NULLs last (`nulls_last`), or none read when the engine placed them; else why not."""
+    if rows.cap is None or ranking is None:
+        return rows
+    values = [row[ranking.metric_index] if ranking.metric_index < len(row) else None for row in rows.values.values()]
+    if not values:
+        return rows
+    if not all(map(_rankable, values)):
+        return _Rows(rows.values, rows.largest, cap=rows.cap,
+                     unranked="the chart's ranking measure holds values mnemiq cannot rank")
+    if not nulls_last and None in values:
+        return _Rows(rows.values, rows.largest, cap=rows.cap,
+                     unranked=f"{source} places groups with no value where its database does, and the {rows.cap:,} "
+                              "it read in the chart's ranking order hold some, so where its row limit cuts is not read")
+    through = max(values, key=lambda value: _rank_key(value, ranking.descending))
+    return _Rows(rows.values, rows.largest, cap=rows.cap, ranked=ranking, through=through)
+
+
 def _own_rows(sql: str, expectation: Expectation, *, chart_id: int, adapter, snapshot: Snapshot, grants: GrantSet,
               timeout_s: float, guard_fanout: bool | None, before_call: Callable[[], None] | None = None,
-              ) -> _Rows | NotCheckable:
+              ranking: Ranking | None = None, limit: int | None = None) -> _Rows | NotCheckable:
+    """mnemiq's rows from its own statement `sql`, which, under the chart's `ranking`, orders its groups by it, NULL
+    last, and asks for `limit` of them when given (`_statement`): a read of that many stopped at it."""
     if before_call is not None:
         before_call()  # once for the decided statement: its catalogue reads, its probe and its run
     try:
@@ -462,16 +518,24 @@ def _own_rows(sql: str, expectation: Expectation, *, chart_id: int, adapter, sna
             return NotCheckable("mnemiq's own rows for this chart repeat a group, so they cannot be lined up with the "
                                 "chart's")
         values[key] = [_canonical(v) for v in row[width:]]
-    cap = decided.approved.row_cap
-    return _Rows(values, table.num_rows, cap=cap if cap is not None and table.num_rows >= cap else None)
+    cap = limit if limit is not None else decided.approved.row_cap
+    return _ranked_read(_Rows(values, table.num_rows, cap=cap if cap is not None and table.num_rows >= cap else None),
+                        ranking, nulls_last=True, source=_OWN_SQL)
 
 
-def _dataset_rows(client, expectation: Expectation, dataset: DatasetFacts) -> _Rows | NotCheckable:
-    """A virtual dataset's saved metrics through `query_dataset`, which applies the dataset's own row rules."""
+def _dataset_rows(client, expectation: Expectation, dataset: DatasetFacts, ranking: Ranking | None = None,
+                  limit: int | None = None) -> _Rows | NotCheckable:
+    """A virtual dataset's saved metrics through `query_dataset`, which applies the dataset's own row rules. Under the
+    chart's `ranking` it is asked for its rows in that order (`order_by`, `order_desc`, which rc2's `build_query_dict`
+    turns into the query's ORDER BY before its `row_limit`); it takes no null order, so the engine places the NULLs. It
+    asks for `limit` rows when given, else one read's cap."""
+    row_limit = limit if limit is not None else MAX_ROWS
     request = {"dataset_id": dataset.dataset_id, "metrics": [label for label, _ in expectation.metrics],
                "columns": list(expectation.dimensions),
                "filters": [{"col": f.column, "op": f.op, "val": f.value} for f in expectation.filters],
-               "row_limit": MAX_ROWS}
+               "row_limit": row_limit}
+    if ranking is not None and ranking.metric_index < len(expectation.metrics):
+        request |= {"order_by": [expectation.metrics[ranking.metric_index][0]], "order_desc": ranking.descending}
     try:
         answer = client.call("query_dataset", request)
     except (SupersetUnavailable, SupersetToolError) as failure:
@@ -488,7 +552,8 @@ def _dataset_rows(client, expectation: Expectation, dataset: DatasetFacts) -> _R
               [_canonical(row.get(label)) for label, _ in expectation.metrics] for row in rows}
     if len(values) != len(rows):
         return NotCheckable("the dataset's rows repeat a group, so they cannot be lined up with the chart's")
-    return _Rows(values, len(rows), cap=MAX_ROWS if len(rows) >= MAX_ROWS else None)
+    return _ranked_read(_Rows(values, len(rows), cap=row_limit if len(rows) >= row_limit else None),
+                        ranking if "order_by" in request else None, nulls_last=False, source=_QUERY_DATASET)
 
 
 # ---------------------------------------------------------------- comparing
@@ -538,9 +603,7 @@ def _ranking_problem(chart: _Rows, mine: _Rows, ranking: Ranking, label: str) ->
         return NotCheckable("the chart's ranking measure holds values mnemiq cannot rank")
 
     def rank(value) -> tuple:
-        if value is None:
-            return (1, 0)
-        return (0, -value if ranking.descending else value)
+        return _rank_key(value, ranking.descending)
 
     ordered = sorted(values.values(), key=rank)
     nth = ordered[min(limit, len(ordered)) - 1]
@@ -562,6 +625,30 @@ def _ranking_problem(chart: _Rows, mine: _Rows, ranking: Ranking, label: str) ->
     return None
 
 
+def _ranking_label(labels: tuple[str, ...], ranking: Ranking) -> str:
+    return labels[ranking.metric_index] if ranking.metric_index < len(labels) else f"number {ranking.metric_index + 1}"
+
+
+def _unsettled(cap: int, source: str) -> str:
+    return (f"the {cap:,} groups {source} read in the chart's ranking order do not settle where its row limit cuts: "
+            "groups tied at the cut, or kept by its HAVING, run on past them, so not all of them were compared")
+
+
+def _cut_inside(rows: _Rows, ranking: Ranking | None) -> bool:
+    """Whether a read that stopped at its cap still decides `ranking`'s cut: it was made in that ranking's order
+    (`_ranked_read`), holds at least `ranking.limit` groups, and the last group it read ranks strictly after the
+    `ranking.limit`-th, a tie as `_ranking_problem` counts one, so every group it did not read ranks after the cut too.
+    Groups tied at the cut that run on past the read do not."""
+    if ranking is None or rows.ranked != ranking or ranking.limit < 1 or len(rows.values) < ranking.limit:
+        return False
+    index = ranking.metric_index
+    values = sorted((row[index] if index < len(row) else None for row in rows.values.values()),
+                    key=lambda value: _rank_key(value, ranking.descending))
+    nth = values[ranking.limit - 1]
+    return not _same(rows.through, nth) and _rank_key(rows.through, ranking.descending) > _rank_key(nth,
+                                                                                                  ranking.descending)
+
+
 def _compare(chart_id: int, chart: _Rows, mine: _Rows, row_limit: int | None, *, source: str,
              labels: tuple[str, ...] = (), ranking: Ranking | None = None,
              time_axis: Callable[[], bool | NotCheckable] | None = None) -> ChartCheck:
@@ -575,13 +662,25 @@ def _compare(chart_id: int, chart: _Rows, mine: _Rows, row_limit: int | None, *,
 
     if any(key in mine.values and not all(map(_same, chart.values[key], mine.values[key])) for key in shown):
         return outcome(ChartStatus.MISMATCH, f"the chart shows a value {source} does not compute")
-    if mine.cap is not None:
+    if mine.cap is not None and not _cut_inside(mine, ranking):
+        if mine.unranked is not None:
+            return outcome(ChartStatus.NOT_CHECKED, mine.unranked)
+        if mine.ranked is not None:
+            return outcome(ChartStatus.NOT_CHECKED, _unsettled(mine.cap, source))
         return outcome(ChartStatus.NOT_CHECKED, f"the chart has more groups than {source} returns in one read "
                                                 f"({mine.cap:,}), so not all of them were compared")
     if any(key not in mine.values for key in shown):
+        if mine.cap is not None and ranking is not None:
+            # A read whose cut falls inside it: a group it does not hold ranks after the cut.
+            return outcome(ChartStatus.MISMATCH, f"the chart's row limit ({ranking.limit:,}) keeps groups that are "
+                                                 f"not the {ranking.limit:,} "
+                                                 f"{'largest' if ranking.descending else 'smallest'} by "
+                                                 f"{_ranking_label(labels, ranking)!r}")
         return outcome(ChartStatus.MISMATCH, f"the chart shows a group {source} does not find")
     checked = f"the chart's numbers match {source}"
-    if len(mine.values) > len(shown):
+    # A read that stopped at its cap holds only some groups, so as many groups on both sides proves nothing: a chart
+    # showing more than its cut beside a short read of as many is read against the cut all the same.
+    if len(mine.values) > len(shown) or mine.cap is not None:
         if row_limit is None or chart.largest < row_limit:
             return outcome(ChartStatus.MISMATCH, f"{source} finds a group the chart does not show")
         cut = (f"the chart's row limit ({row_limit:,}) keeps only some of its groups, so not all of them were "
@@ -597,12 +696,18 @@ def _compare(chart_id: int, chart: _Rows, mine: _Rows, row_limit: int | None, *,
                                                     "points its query ranks first, not the latest")
         if ranking is None or ranking.limit != row_limit:
             return outcome(ChartStatus.NOT_CHECKED, cut)
-        label = labels[ranking.metric_index] if ranking.metric_index < len(labels) else f"number {ranking.metric_index + 1}"
+        label = _ranking_label(labels, ranking)
         problem = _ranking_problem(chart, mine, ranking, label)
         if isinstance(problem, NotCheckable):
             return outcome(ChartStatus.NOT_CHECKED, f"{cut}: {problem.reason}")
         if problem is not None:
             return outcome(ChartStatus.MISMATCH, problem)
+        if len(shown) > ranking.limit:
+            # Groups tied at the cut stand in for each other (`_ranking_problem`), but do not add to it: rows beyond
+            # the row limit are not the query the chart's settings describe, so no ranking is claimed for them.
+            return outcome(ChartStatus.NOT_CHECKED, f"the chart shows {len(shown):,} groups, more than its row limit "
+                                                    f"({ranking.limit:,}) keeps, so they are not the cut its settings "
+                                                    "describe, and were not compared as one")
         checked = (f"{checked}, and its row limit keeps the {row_limit:,} "
                    f"{'largest' if ranking.descending else 'smallest'} groups by {label!r}")
     if not shown:
@@ -773,6 +878,9 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
     expectation = expectation_from_form_data(form, dataset=dataset)
     if isinstance(expectation, NotCheckable):
         return not_checked(expectation.reason)
+    # Read before mnemiq's side is: its read is made in this order, so a cut over more groups than one read holds is
+    # decided by the groups it keeps.
+    ranking = ranking_of(form, expectation, dataset=dataset)
     sql, source = "", None
     if dataset.is_virtual and dataset.dataset_id in made:
         if not isinstance(dataset.sql, str) or not dataset.sql:
@@ -807,7 +915,7 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
         saved = dict(dataset.saved_metric_sql)
         if empty := [label for label, _ in expectation.metrics if label in saved and not saved[label].strip()]:
             return not_checked(f"Superset gave no expression for the saved metric {empty[0]!r}")
-        sql = _statement(expectation, dataset, grained=True, source=source)
+        sql = _statement(expectation, dataset, grained=True, source=source, ranking=ranking)
         # Checked on the statement itself, so a saved metric's own expression is covered too: `execute_sql` renders a
         # statement as a template, and the adapter would refuse it later in words about the statement, not the chart.
         if (marker := next((m for m in JINJA_DELIMITERS if m in sql), None)) is not None:
@@ -816,18 +924,32 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
     chart = _chart_rows(client, chart_id, expectation)
     if isinstance(chart, ChartCheck):
         return chart
-    if not own:
-        mine, compared = _dataset_rows(client, expectation, dataset), _QUERY_DATASET
-    else:
-        mine, compared = _own_rows(sql, expectation, chart_id=chart_id, adapter=adapter, snapshot=snapshot,
-                                   grants=grants, timeout_s=timeout_s, guard_fanout=guard_fanout,
-                                   before_call=before_call), _OWN_SQL
+    compared = _OWN_SQL if own else _QUERY_DATASET
+
+    def read(limit: int | None) -> _Rows | NotCheckable:
+        if not own:
+            return _dataset_rows(client, expectation, dataset, ranking, limit=limit)
+        statement = sql if limit is None else _statement(expectation, dataset, grained=True, source=source,
+                                                         ranking=ranking, limit=limit)
+        return _own_rows(statement, expectation, chart_id=chart_id, adapter=adapter, snapshot=snapshot, grants=grants,
+                         timeout_s=timeout_s, guard_fanout=guard_fanout, before_call=before_call, ranking=ranking,
+                         limit=limit)
+
+    # A ranked chart's groups are read in its ranking order, first only twice its cut (`_first_read`), and on up to one
+    # read's cap only when those do not settle where the cut falls.
+    first = _first_read(ranking)
+    mine = read(first)
+    if first is not None and isinstance(mine, _Rows):
+        # What the HAVING leaves of it, which may hold every group it keeps (`_left_out`): only a read still stopped at
+        # its cap whose cut it does not settle reads on.
+        kept = _left_out(mine, expectation.not_null)
+        if kept.cap is not None and not _cut_inside(kept, ranking):
+            mine = read(None)
     if isinstance(mine, NotCheckable):
         return not_checked(mine.reason)
     mine = _left_out(mine, expectation.not_null)
     labels = tuple(label for label, _ in expectation.metrics)
-    found = _compare(chart_id, chart, mine, _row_limit(form), source=compared, labels=labels,
-                     ranking=ranking_of(form, expectation, dataset=dataset),
+    found = _compare(chart_id, chart, mine, _row_limit(form), source=compared, labels=labels, ranking=ranking,
                      time_axis=_time_axis(client, form, expectation, dataset))
     found = _Numbers(found.chart_id, found.status, found.reason, found.chart_values, found.mnemiq_values, labels,
                      chart.values)
@@ -846,12 +968,17 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
 
 def _left_out(rows: _Rows, not_null: tuple[int, ...]) -> _Rows:
     """`rows` without the groups whose value at any of `not_null` is NULL: what the chart's HAVING
-    `(<metric>) IS NOT NULL` leaves out of its query. A read at its cap stays one."""
+    `(<metric>) IS NOT NULL` leaves out of its query. A read at its cap stays one, and a read in a ranking's order stays
+    in it (what is left of a ranking's first groups are the first of what is left), except one that read on into the
+    groups with no ranking value which the HAVING leaves out: those come last, so it read every group the HAVING
+    keeps."""
     if not not_null:
         return rows
     kept = {key: values for key, values in rows.values.items()
             if all(index < len(values) and values[index] is not None for index in not_null)}
-    return _Rows(kept, len(kept), cap=rows.cap)
+    if rows.ranked is not None and rows.through is None and rows.ranked.metric_index in not_null:
+        return _Rows(kept, len(kept))
+    return _Rows(kept, len(kept), cap=rows.cap, ranked=rows.ranked, through=rows.through, unranked=rows.unranked)
 
 
 class _BeforeEachCall:
