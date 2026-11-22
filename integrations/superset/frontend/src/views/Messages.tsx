@@ -22,6 +22,7 @@ const SETTLED: Record<string, string> = {
   applying: "This may or may not have been done; check the dashboard.",
   replanned: "Planned again, below.",
   declined: "Not now.",
+  partial: "Done in part; ask again for the rest.",
   chosen: "Answered, below.",
   stale: "Nothing was changed: the dashboard changed since this preview. Ask again.",
 };

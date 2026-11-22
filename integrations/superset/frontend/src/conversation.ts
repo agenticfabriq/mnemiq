@@ -23,7 +23,7 @@ export type ChangePreview = {
   dashboard_id: number;
   dashboard_changed_on: string | null;
   edits: { chart_id: number; title: string | null; changed_on: string | null; said: string; digest: string }[];
-  would_remove: { chart_id: number; title: string | null }[];
+  would_remove: { chart_id: number; title: string | null; changed_on?: string | null }[];
   add_chart: boolean;
   left: { chart_id: number; reason: string }[];
   dropped: { chart_id: number; key: string }[];
@@ -51,6 +51,8 @@ export type Message = {
   dashboard?: DashboardOf | null;
   intent?: string;
   goal?: string;
+  /** mnemiq's message: the person's message it replies to. */
+  replies_to?: number;
   answer?: { sentence: string; sql: string; grant_fingerprint: string | null; tables_used: string[] };
   build_id?: string;
   proposal?: BuildProposal | ChangePreview;
