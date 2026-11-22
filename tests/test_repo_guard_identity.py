@@ -143,3 +143,40 @@ def test_githubs_own_merge_identity_passes(repo: Path) -> None:
     _git(repo, "commit", "-qm", "Merge pull request", env=env)
     out = _guard(repo, "--range", "HEAD~1..HEAD")
     assert out.returncode == 0, out.stdout
+
+
+# -- Codex's review of #290 ------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["--staged", "--range"])
+def test_an_invalid_pattern_fails_closed_without_printing_it(repo: Path, mode: str) -> None:
+    # grep exits 2 on a bad pattern; read as "no match", a malformed list would turn the check off and report clean.
+    (repo / "a.txt").write_text("clean, changed\n")
+    _git(repo, "add", "a.txt")
+    if mode == "--range":
+        _git(repo, "commit", "-qm", "c")
+    args = ["--range", "HEAD~1..HEAD"] if mode == "--range" else ["--staged"]
+    out = _guard(repo, *args, env=_env(REPO_GUARD_IDENTITY_PATTERNS="[unclosed"))
+    assert out.returncode != 0 and "not a valid" in out.stdout + out.stderr
+    assert "[unclosed" not in out.stdout + out.stderr
+
+
+def test_range_mode_matches_an_identity_with_a_tab_in_it(repo: Path) -> None:
+    # Git accepts a tab inside a name; split on tabs, the fields shifted and an anchored pattern matched neither.
+    (repo / "a.txt").write_text("by a tabbed name\n")
+    _git(repo, "add", "a.txt")
+    env = _env(GIT_AUTHOR_NAME="Private\tPersona", GIT_AUTHOR_EMAIL="pp@mail.example")
+    _git(repo, "commit", "-qm", "t", env=env)
+    out = _guard(repo, "--range", "HEAD~1..HEAD",
+                 env=_env(REPO_GUARD_IDENTITY_PATTERNS="^Private\tPersona <pp@mail[.]example>$"))
+    assert out.returncode == 1 and "author" in out.stdout, out.stdout + out.stderr
+
+
+def test_a_traced_run_shows_neither_identity_nor_pattern(repo: Path) -> None:
+    (repo / "a.txt").write_text("clean, by the wrong identity\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "-c", "user.name=Private Persona", "-c", f"user.email={BLOCKED}@mail.example", "commit", "-qm", "x")
+    out = subprocess.run(["bash", "-x", "scripts/repo-guard.sh", "--range", "HEAD~1..HEAD"], cwd=repo, env=BASE_ENV,
+                         capture_output=True, text=True)
+    assert out.returncode == 1
+    assert BLOCKED not in out.stdout + out.stderr and "Private Persona" not in out.stdout + out.stderr

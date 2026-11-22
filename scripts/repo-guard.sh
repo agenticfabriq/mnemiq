@@ -27,6 +27,7 @@
 # --range -- skip it and say so. Install the hook or the local half never runs:
 #
 #     git config core.hooksPath .githooks
+{ set +x; } 2>/dev/null  # never traced: a trace prints the private lists and identities this reads
 set -uo pipefail
 
 MODE="${1:---staged}"
@@ -171,6 +172,21 @@ IDENTITY_SETTING="$(printf '%s' "${REPO_GUARD_IDENTITY_PATTERNS:-}" \
   | tr '[:upper:]' '[:lower:]' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
 IDENTITY_PATTERNS="${REPO_GUARD_IDENTITY_PATTERNS:-}"
 CHECK_IDENTITY=1
+# grep exits 2 on a pattern it cannot compile, and a test that reads 2 as "no match" turns the check off while reporting
+# clean. So an identity is matched only through identity_match, which tells the three apart, and the error is reported
+# without the pattern or grep's own text, either of which would put the list in a public log.
+identity_match() {  # 0 match, 1 no match, 2 the pattern is not a valid regex
+  local rc
+  printf '%s\n' "$1" | grep -Eiq -- "$IDENTITY_PATTERNS" 2>/dev/null
+  rc=$?
+  [ "$rc" -le 1 ] && return "$rc"
+  return 2
+}
+identity_pattern_invalid() {
+  echo "repo-guard: BLOCKED [config]: REPO_GUARD_IDENTITY_PATTERNS is not a valid extended regex; the identity check"
+  echo "  cannot run, so nothing passes it. (The pattern is not printed: it is private.)"
+  exit 2
+}
 if [ "$MODE" = "--all" ]; then
   CHECK_IDENTITY=0
 elif [ "$IDENTITY_SETTING" = "off" ]; then
@@ -309,34 +325,40 @@ done < <(list_files)
 # The identity checks. Under --staged the identity the commit will carry, which is local output and may name it. Under
 # --range each commit's, naming only the commit and the field: a CI log is public, and printing the identity or the
 # pattern would publish what the list exists to keep out.
+if [ "$CHECK_IDENTITY" -eq 1 ]; then
+  identity_match ""
+  [ $? -eq 2 ] && identity_pattern_invalid
+fi
 if [ "$CHECK_IDENTITY" -eq 1 ] && [ "$MODE" = "--staged" ]; then
   for who in AUTHOR COMMITTER; do
     ident="$(git var "GIT_${who}_IDENT" 2>/dev/null | sed -E 's/ [0-9]+ [+-][0-9]{4}$//')"
-    if printf '%s\n' "$ident" | grep -Eiq -- "$IDENTITY_PATTERNS"; then
-      echo "BLOCKED [identity]: this commit's $(printf '%s' "$who" | tr '[:upper:]' '[:lower:]') is on the private identity list: $ident"
-      echo "  Set this checkout's public identity (git config user.name and user.email), then commit again."
-      fail=1
-    fi
+    identity_match "$ident"
+    case $? in
+      0) echo "BLOCKED [identity]: this commit's $(printf '%s' "$who" | tr '[:upper:]' '[:lower:]') is on the private identity list: $ident"
+         echo "  Set this checkout's public identity (git config user.name and user.email), then commit again."
+         fail=1 ;;
+      2) identity_pattern_invalid ;;
+    esac
   done
 fi
 if [ "$CHECK_IDENTITY" -eq 1 ] && [ "$MODE" = "--range" ]; then
-  if ! idents="$(git log --format='%H%x09%an <%ae>%x09%cn <%ce>' "$RANGE" 2>/dev/null)"; then
+  if ! git rev-list --count "$RANGE" >/dev/null 2>&1; then
     echo "repo-guard: BLOCKED [instrument]: git could not read the range '$RANGE' for identities." >&2
     exit 2
   fi
-  while IFS="$(printf '\t')" read -r sha author committer; do
-    [ -n "$sha" ] || continue
-    if printf '%s\n' "$author" | grep -Eiq -- "$IDENTITY_PATTERNS"; then
-      echo "BLOCKED [identity]: commit ${sha:0:8}'s author is on the private identity list"
-      fail=1
-    fi
-    if printf '%s\n' "$committer" | grep -Eiq -- "$IDENTITY_PATTERNS"; then
-      echo "BLOCKED [identity]: commit ${sha:0:8}'s committer is on the private identity list"
-      fail=1
-    fi
-  done <<EOF_IDENTS
-$idents
-EOF_IDENTS
+  # Each field NUL-terminated and read without a command substitution, which would drop the NULs: a name may hold a
+  # tab, and tab-split fields shifted so an exact pattern matched neither (Codex's review of #290).
+  while IFS= read -r -d '' sha && IFS= read -r -d '' author && IFS= read -r -d '' committer; do
+    sha="${sha#$'\n'}"
+    for field in author committer; do
+      if [ "$field" = author ]; then value="$author"; else value="$committer"; fi
+      identity_match "$value"
+      case $? in
+        0) echo "BLOCKED [identity]: commit ${sha:0:8}'s $field is on the private identity list"; fail=1 ;;
+        2) identity_pattern_invalid ;;
+      esac
+    done
+  done < <(git log -z --format='%H%x00%an <%ae>%x00%cn <%ce>' "$RANGE" 2>/dev/null)
 fi
 
 if [ "$fail" -ne 0 ]; then
