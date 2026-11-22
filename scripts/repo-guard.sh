@@ -184,6 +184,35 @@ identity_match() {  # 0 match, 1 no match, 2 the pattern is not a valid regex
   [ "$rc" -le 1 ] && return "$rc"
   return 2
 }
+# One commit's identities: its author, its committer, and every line of its message, since GitHub credits a co-author
+# named there (Co-authored-by, read its own way, so not git's trailer parse, which sees only the last paragraph) and a
+# listed identity written anywhere in a message is in public history too. A record whose sha is not 40 hex digits means
+# the fields shifted (a NUL inside a value), so it is refused rather than read. Prints only the short SHA and the field.
+check_identity_record() {  # sha author committer message
+  local field value line
+  if ! [[ "$1" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "repo-guard: BLOCKED [instrument]: an identity record's first field is not a commit SHA (fields shifted?)." >&2
+    exit 2
+  fi
+  for field in author committer; do
+    if [ "$field" = author ]; then value="$2"; else value="$3"; fi
+    identity_match "$value"
+    case $? in
+      0) echo "BLOCKED [identity]: commit ${1:0:8}'s $field is on the private identity list"; fail=1 ;;
+      2) identity_pattern_invalid ;;
+    esac
+  done
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    identity_match "$line"
+    case $? in
+      0) echo "BLOCKED [identity]: commit ${1:0:8}'s message names an identity on the private identity list"; fail=1 ;;
+      2) identity_pattern_invalid ;;
+    esac
+  done <<EOF_MESSAGE
+$4
+EOF_MESSAGE
+}
 identity_pattern_invalid() {
   echo "repo-guard: BLOCKED [config]: REPO_GUARD_IDENTITY_PATTERNS is not a valid extended regex; the identity check"
   echo "  cannot run, so nothing passes it. (The pattern is not printed: it is private.)"
@@ -358,18 +387,13 @@ if [ "$CHECK_IDENTITY" -eq 1 ] && [ "$MODE" = "--range" ]; then
   seen=0
   # Each field NUL-terminated and read without a command substitution, which would drop the NULs: a name may hold a
   # tab, and tab-split fields shifted so an exact pattern matched neither (Codex's review of #290).
-  while IFS= read -r -d '' sha && IFS= read -r -d '' author && IFS= read -r -d '' committer; do
+  while IFS= read -r -d '' sha && IFS= read -r -d '' author && IFS= read -r -d '' committer \
+        && IFS= read -r -d '' message; do
     sha="${sha#$'\n'}"
     seen=$((seen + 1))
-    for field in author committer; do
-      if [ "$field" = author ]; then value="$author"; else value="$committer"; fi
-      identity_match "$value"
-      case $? in
-        0) echo "BLOCKED [identity]: commit ${sha:0:8}'s $field is on the private identity list"; fail=1 ;;
-        2) identity_pattern_invalid ;;
-      esac
-    done
-  done < <(git log -z --format='%H%x00%an <%ae>%x00%cn <%ce>' "$RANGE" 2>/dev/null)
+    check_identity_record "$sha" "$author" "$committer" "$message"
+  done < <(git log -z --format='%H%x00%an <%ae>%x00%cn <%ce>%x00%B' \
+             "$RANGE" 2>/dev/null)
   # A git log that failed inside the process substitution reads as no commits; every commit in the range must be read.
   if [ "$seen" -ne "$expected" ]; then
     echo "repo-guard: BLOCKED [instrument]: read the identities of $seen of $expected commit(s) in '$RANGE'." >&2
@@ -377,26 +401,24 @@ if [ "$CHECK_IDENTITY" -eq 1 ] && [ "$MODE" = "--range" ]; then
   fi
   echo "repo-guard: identity: $seen commit(s) checked."
 fi
-# `--identities`: a pull request's commit identities on stdin, as NUL-terminated triples (sha, author, committer), each
-# triple optionally followed by a newline. identity-guard.yml runs it under pull_request_target, so a fork's pull request
+# `--identities`: a pull request's commit identities on stdin, as NUL-terminated records of four fields (sha, author,
+# committer, the whole message), each optionally followed by a newline, as scripts/repo-guard-identities.py writes them. identity-guard.yml runs it under pull_request_target, so a fork's pull request
 # is checked too: that job runs this repository's code with the secret and reads the identities from GitHub's API, never
 # the fork's code. REPO_GUARD_IDENTITY_EXPECTED is the pull request's own commit count; fewer identities read fails.
 if [ "$MODE" = "--identities" ] && [ "$CHECK_IDENTITY" -eq 1 ]; then
+  if ! [[ "${REPO_GUARD_IDENTITY_EXPECTED:-}" =~ ^[0-9]+$ ]]; then
+    echo "repo-guard: BLOCKED [config]: --identities needs REPO_GUARD_IDENTITY_EXPECTED, the pull request's commit count." >&2
+    exit 2
+  fi
   seen=0
-  while IFS= read -r -d '' sha && IFS= read -r -d '' author && IFS= read -r -d '' committer; do
+  while IFS= read -r -d '' sha && IFS= read -r -d '' author && IFS= read -r -d '' committer \
+        && IFS= read -r -d '' message; do
     sha="${sha#$'\n'}"
     seen=$((seen + 1))
-    for field in author committer; do
-      if [ "$field" = author ]; then value="$author"; else value="$committer"; fi
-      identity_match "$value"
-      case $? in
-        0) echo "BLOCKED [identity]: commit ${sha:0:8}'s $field is on the private identity list"; fail=1 ;;
-        2) identity_pattern_invalid ;;
-      esac
-    done
+    check_identity_record "$sha" "$author" "$committer" "$message"
   done
-  expected="${REPO_GUARD_IDENTITY_EXPECTED:-}"
-  if [ -n "$expected" ] && [ "$seen" -ne "$expected" ]; then
+  expected="$REPO_GUARD_IDENTITY_EXPECTED"
+  if [ "$seen" -ne "$expected" ]; then
     echo "repo-guard: BLOCKED [instrument]: read the identities of $seen of $expected commit(s) the pull request has." >&2
     exit 2
   fi

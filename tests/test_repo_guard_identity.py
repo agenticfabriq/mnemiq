@@ -10,6 +10,7 @@ a CI log is public.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -252,8 +253,9 @@ def test_a_list_required_but_missing_fails_instead_of_skipping(repo: Path) -> No
 # code, and feeds them here as NUL-terminated triples: sha, author, committer.
 
 
-def _identities(repo: Path, triples: list[tuple[str, str, str]], **env) -> subprocess.CompletedProcess:
-    data = "".join(f"{s}\0{a}\0{c}\0\n" for s, a, c in triples).encode()
+def _identities(repo: Path, triples: list[tuple], **env) -> subprocess.CompletedProcess:
+    # Each record: sha, author, committer, and the commit's whole message (every line is checked).
+    data = "".join(f"{t[0]}\0{t[1]}\0{t[2]}\0{t[3] if len(t) > 3 else ''}\0\n" for t in triples).encode()
     return subprocess.run(["bash", "scripts/repo-guard.sh", "--identities"], cwd=repo, input=data,
                           env=_env(**env), capture_output=True)
 
@@ -296,3 +298,83 @@ def test_identities_mode_needs_no_name_list(repo: Path) -> None:
     # It runs in CI, where the name list never is.
     out = _identities(repo, [CLEAN], REPO_GUARD_IDENTITY_EXPECTED="1", REPO_GUARD_NAME_PATTERNS=None)
     assert out.returncode == 0, out.stdout + out.stderr
+
+
+
+# -- Co-authored-by: GitHub credits a co-author named in a commit message's trailers ------------------------------------
+
+
+def test_range_mode_catches_a_listed_co_author(repo: Path) -> None:
+    (repo / "a.txt").write_text("with a co-author\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-qm", f"change\n\nCo-authored-by: Private Persona <{BLOCKED}@mail.example>")
+    sha = _git(repo, "rev-parse", "--short=8", "HEAD").strip()
+    out = _guard(repo, "--range", "HEAD~1..HEAD")
+    assert out.returncode == 1 and f"commit {sha}'s message" in out.stdout
+    assert BLOCKED not in out.stdout + out.stderr
+
+
+def test_range_mode_passes_a_clean_co_author(repo: Path) -> None:
+    (repo / "a.txt").write_text("with a clean co-author\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-qm", "change\n\nCo-authored-by: Someone Else <else@mail.example>")
+    assert _guard(repo, "--range", "HEAD~1..HEAD").returncode == 0
+
+
+def test_identities_mode_catches_a_listed_co_author(repo: Path) -> None:
+    co = ("d" * 40, "Hidden Dim <hd@mail.example>", "GitHub <noreply@github.com>",
+          f"Someone Else <else@mail.example>\nPrivate Persona <{BLOCKED}@mail.example>")
+    out = _identities(repo, [co], REPO_GUARD_IDENTITY_EXPECTED="1")
+    assert out.returncode == 1 and b"commit dddddddd's message" in out.stdout
+    assert BLOCKED.encode() not in out.stdout + out.stderr
+
+
+
+# -- the e2e lane's review of 9d51a1dc ----------------------------------------------------------------------------------
+
+
+def test_a_listed_identity_anywhere_in_a_message_is_blocked(repo: Path) -> None:
+    # git's trailer parser reads only the last paragraph, and GitHub reads co-authors its own way: every line is checked.
+    (repo / "a.txt").write_text("named mid-message\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-qm", f"change\n\nCo-authored-by: Private Persona <{BLOCKED}@mail.example>\n\nmore text")
+    out = _guard(repo, "--range", "HEAD~1..HEAD")
+    assert out.returncode == 1 and "message" in out.stdout
+
+
+def test_identities_mode_refuses_a_shifted_record(repo: Path) -> None:
+    # A NUL inside a name splits it, every later field shifts, and a listed identity lands in the sha slot unread.
+    data = (b"a" * 40 + b"\0Pub\0x <p@mail.example>\0GitHub <noreply@github.com>\0\0\n"
+            + b"b" * 40 + b"\0Hidden Dim <hd@mail.example>\0Private Persona <" + BLOCKED.encode() + b"@mail.example>\0\0\n")
+    out = subprocess.run(["bash", "scripts/repo-guard.sh", "--identities"], cwd=repo, input=data,
+                         env=_env(REPO_GUARD_IDENTITY_EXPECTED="2"), capture_output=True)
+    assert out.returncode == 2 and b"not a commit SHA" in out.stderr, out.stdout + out.stderr
+
+
+def test_identities_mode_requires_an_expected_count(repo: Path) -> None:
+    out = _identities(repo, [], REPO_GUARD_IDENTITY_EXPECTED=None)
+    assert out.returncode == 2 and b"REPO_GUARD_IDENTITY_EXPECTED" in out.stdout + out.stderr
+
+
+ENCODER = Path(__file__).resolve().parents[1] / "scripts" / "repo-guard-identities.py"
+
+
+def _encode(lines: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(["python3", "-I", str(ENCODER)], input="\n".join(lines).encode(), capture_output=True)
+
+
+def test_the_encoder_writes_nul_terminated_records() -> None:
+    line = json.dumps({"sha": "a" * 40, "a": "Hidden Dim <hd@x>", "c": "GitHub <noreply@github.com>", "m": "one\ntwo"})
+    out = _encode([line])
+    assert out.returncode == 0 and out.stdout == b"a" * 40 + b"\0Hidden Dim <hd@x>\0GitHub <noreply@github.com>\0one\ntwo\0"
+
+
+@pytest.mark.parametrize("record", [
+    {"sha": "a" * 40, "a": "Pub\u0000x <p@x>", "c": "GitHub <noreply@github.com>", "m": ""},
+    {"sha": "a" * 40, "a": "Pub\nx <p@x>", "c": "GitHub <noreply@github.com>", "m": ""},
+    {"sha": "a" * 40, "a": "Hidden Dim <hd@x>", "c": "GitHub <noreply@github.com>", "m": "nul\u0000here"},
+    {"sha": "not-a-sha", "a": "Hidden Dim <hd@x>", "c": "GitHub <noreply@github.com>", "m": ""},
+])
+def test_the_encoder_refuses_a_value_that_could_shift_fields(record: dict) -> None:
+    out = _encode([json.dumps(record)])
+    assert out.returncode == 1 and out.stdout == b""
