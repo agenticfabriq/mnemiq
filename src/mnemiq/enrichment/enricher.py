@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
+import threading
 from typing import Protocol
 
 from mnemiq.enrichment.prompts import (
@@ -51,6 +54,7 @@ class Enricher(Protocol):
 class LLMEnricher:
     """The stochastic proposer. Its output is screened before it can reach the snapshot."""
 
+
     def __init__(self, client, max_tokens: int = 4000) -> None:
         # Generous budget: reasoning models spend tokens before emitting any content, and a
         # tight cap yields an empty string rather than an error.
@@ -71,9 +75,62 @@ class LLMEnricher:
             failures += why
         return TableAnnotation(table=table, columns=columns, failures=failures)
 
+    def annotate_tables(self, requests: Sequence[tuple[str, list[ColumnFacts], str]],
+                        concurrency: int = 1) -> list[TableAnnotation]:
+        """`annotate` for each (table, facts, grounding), in request order, with the chunk calls of every table run on
+        one pool of `concurrency` workers, so a wide table's chunks do not wait in a row. Each table's results are
+        joined in chunk order, so the annotations do not depend on which call finished first, and `annotate`'s rule
+        holds per table: once a call finds the endpoint down, that table's chunks not yet started are recorded as not
+        asked, while other tables go on. At 1 it is `annotate`, called per table in order."""
+        if concurrency <= 1:
+            return [self.annotate(table, facts, grounding) for table, facts, grounding in requests]
+        spans = [(i, start, min(start + CHUNK_COLUMNS, len(facts)))
+                 for i, (_, facts, _) in enumerate(requests) for start in range(0, len(facts), CHUNK_COLUMNS)]
+        down: dict[int, str] = {}
+        guard = threading.Lock()
+        # Set when the waiting thread is interrupted (Ctrl-C reaches it alone): no chunk then starts, and no running one
+        # asks again, retries and splits included (`_annotate_chunk` reads it before every call).
+        stop = threading.Event()  # this run's alone: a later call on this enricher cannot clear it
+
+        def run(span: tuple[int, int, int]) -> tuple[list, list[str]]:
+            i, start, end = span
+            table, facts, grounding = requests[i]
+            with guard:
+                stopped = down.get(i) or ("interrupted" if stop.is_set() else "")
+            if stopped:
+                return [], [_span(start, end, len(facts)) + f"not asked -- {stopped}"]
+            try:
+                described, why, failed = self._annotate_span(table, facts, start, end, grounding, stop=stop)
+            except Exception as exc:  # noqa: BLE001 -- fail-soft per chunk, as enrich_semantic is per table
+                return [], [_span(start, end, len(facts)) + f"the call failed: {type(exc).__name__}"]
+            if failed:
+                with guard:
+                    down.setdefault(i, failed)
+            return described, why
+
+        pool = ThreadPoolExecutor(max_workers=concurrency)
+        try:
+            results = dict(zip(spans, pool.map(run, spans)))
+        except BaseException:
+            stop.set()
+            pool.shutdown(wait=False, cancel_futures=True)  # a call in flight ends on the client's request timeout
+            raise
+        pool.shutdown(wait=True)
+        annotations = []
+        for i, (table, facts, _) in enumerate(requests):
+            columns: list = []
+            failures: list[str] = []
+            for span in (s for s in spans if s[0] == i):
+                described, why = results[span]
+                columns += described
+                failures += why
+            annotations.append(TableAnnotation(table=table, columns=columns, failures=failures))
+        return annotations
+
     def _annotate_span(self, table: str, facts: list[ColumnFacts], start: int, end: int,
                        grounding: str, root: bool = True,
-                       empty_split: bool = True) -> tuple[list, list[str], str]:
+                       empty_split: bool = True,
+                       stop: threading.Event | None = None) -> tuple[list, list[str], str]:
         """Columns start..end described, why any span yielded none, and -- when every attempt
         raised -- the endpoint's failure, so the caller stops asking. A span whose reply was cut
         off is split in half and tried again, down to _MIN_SPLIT columns -- a column count does
@@ -84,14 +141,14 @@ class LLMEnricher:
         # The root gets its usual retry up front; a split span is asked once, and retried below
         # only for a failure that is not about size.
         described, why, down = self._annotate_chunk(table, chunk, others, grounding,
-                                                    2 if root else 1)
+                                                    2 if root else 1, stop=stop)
         too_big = _size_failure(why, empty_split)
         if not described and not root and not too_big:
             # A split span gets its retry before the endpoint counts as down: one passing fault
             # on a half must not abandon the table. Down only if BOTH asks went unanswered -- a
             # first reply, however garbled, means the endpoint is up.
             answered = not down
-            described, why, down = self._annotate_chunk(table, chunk, others, grounding, 1)
+            described, why, down = self._annotate_chunk(table, chunk, others, grounding, 1, stop=stop)
             down = "" if answered else down
             too_big = _size_failure(why, empty_split)
         if described:
@@ -100,18 +157,21 @@ class LLMEnricher:
             middle = start + len(chunk) // 2
             keep = empty_split and why != EMPTY  # an empty reply splits once, no further
             left, left_why, down = self._annotate_span(table, facts, start, middle, grounding,
-                                                       False, keep)
+                                                       False, keep, stop=stop)
             if down:
                 return left, [*left_why, _span(middle, end, len(facts)) + f"not asked -- {down}"], down
             right, right_why, down = self._annotate_span(table, facts, middle, end, grounding,
-                                                         False, keep)
+                                                         False, keep, stop=stop)
             return left + right, left_why + right_why, down
         return [], [_span(start, end, len(facts), whole=len(chunk) == len(facts)) + why], down
 
     def _annotate_chunk(self, table: str, chunk: list[ColumnFacts], others: list[ColumnFacts],
-                        grounding: str, attempts: int = 2) -> tuple[list, str, str]:
+                        grounding: str, attempts: int = 2,
+                        stop: threading.Event | None = None) -> tuple[list, str, str]:
         """The columns described in one call, why none were if none were, and the endpoint's
         failure when no attempt got a reply at all."""
+        if stop is not None and stop.is_set():
+            return [], "not asked -- interrupted", "interrupted"
         facts_block = render_table_facts(table, chunk)
         if others:
             names = ", ".join(sanitize(f.name) for f in others[:_CONTEXT_NAMES])
@@ -122,6 +182,8 @@ class LLMEnricher:
         allowed = _allowed(chunk)
         why, replied = "", False
         for _attempt in range(attempts):  # one retry by default; models drop the channel occasionally
+            if stop is not None and stop.is_set():  # interrupted between attempts: ask nothing more
+                return [], "not asked -- interrupted", "interrupted"
             try:
                 raw = self._client.complete(system, user, max_tokens=self._max_tokens)
             except Exception as exc:  # noqa: BLE001 -- keep the chunks already described
