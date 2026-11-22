@@ -427,7 +427,7 @@ fi
 
 if [ "$MODE" = "--identities" ]; then
   if [ "$fail" -ne 0 ]; then
-    echo "repo-guard: blocked: a commit's author or committer is on the private identity list."
+    echo "repo-guard: blocked: a commit's identity (author, committer or message) is on the private identity list."
     exit 1
   fi
   echo "repo-guard: identity clean."
