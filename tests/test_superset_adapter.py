@@ -14,6 +14,7 @@ import time
 import pytest
 
 from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
+from mnemiq.execute.cut import sent_of
 from mnemiq.execute.runner import ExecutionError, QueryCancelledError, SourceUnavailableError, run
 from mnemiq.sql.prove import Proof, prove_outcome
 from mnemiq.superset.adapter import JINJA_DELIMITERS, TRANSPORT_MARGIN_S, SupersetSqlAdapter
@@ -49,7 +50,11 @@ def _failed(error_type: str, error: str = "Superset's own words") -> dict:
     return {"success": False, "rows": None, "columns": None, "error": error, "error_type": error_type}
 
 
-def _adapter(answer: dict | Exception = REGION_COUNTS, **kwargs) -> SupersetSqlAdapter:
+def _adapter(answer: dict | Exception | list = REGION_COUNTS, **kwargs) -> SupersetSqlAdapter:
+    """The adapter over a recording client answering `answer`, or each of a list of answers in turn."""
+    if isinstance(answer, list):
+        pending = list(answer)
+        answer = lambda request: pending.pop(0)  # noqa: E731
     return SupersetSqlAdapter(RecordingClient(answer), database_id=7, schema="sales", **kwargs)
 
 
@@ -412,3 +417,127 @@ def test_no_other_failure_is_remembered(answer):
     with pytest.raises(Exception):
         adapter.user_functions()
     assert adapter.terminal_refusal is None
+
+
+# ---------------------------------------------------------------- an answer larger than one response
+
+
+def _rows(n: int) -> dict:
+    return {**REGION_COUNTS, "rows": [{"region": f"r{i}", "policy_count": i} for i in range(n)], "row_count": n}
+
+
+# rc2 cut the answer to fit: the top-level rows it kept are the answer's first rows.
+CUT = {**_rows(2), "_response_truncated": True, "_truncation_notes": ["Result truncated: 2 of 250 rows returned"]}
+
+
+def test_a_cut_answer_is_its_prefix_marked():
+    adapter = _adapter(CUT)
+    table = adapter.execute_answer(SQL)
+    assert table.num_rows == 2 and sent_of(table) == 2
+    assert len(adapter.client.calls) == 1
+
+
+def test_a_refused_answer_is_asked_again_with_a_limit_sized_from_the_refusal():
+    """61,234 bytes against a 50,000 limit, for at most the deciders' 1,000 rows: asked again for 653 rows."""
+    adapter = _adapter([TOO_LARGE, REGION_COUNTS])
+    table = adapter.execute_answer(SQL)
+    first, second = adapter.client.calls
+    assert "limit" not in first.request and second.request["limit"] == 653
+    assert table.num_rows == 1 and sent_of(table) is None  # fewer rows than asked for: the whole answer
+    assert sent_of(_adapter([TOO_LARGE, _rows(653)]).execute_answer(SQL)) == 653
+
+
+def test_a_re_asked_answer_that_comes_back_cut_is_its_prefix():
+    assert sent_of(_adapter([TOO_LARGE, CUT]).execute_answer(SQL)) == 2
+
+
+def test_refused_at_every_size_down_to_one_row_is_a_cut_result():
+    """The same refusal after a re-ask says the limit did not bind, so one row is asked for; one row refused is a row too
+    large to send, and ends it, as a result too large always did."""
+    adapter = _adapter([TOO_LARGE] * 4)
+    with pytest.raises(ResultCut):
+        adapter.execute_answer(SQL)
+    assert [call.request.get("limit") for call in adapter.client.calls] == [None, 653, 1]
+
+
+def test_a_refusal_without_its_sizes_is_a_cut_result():
+    bare = SupersetResponseTooLarge("Superset's answer to execute_sql was larger than its MCP service will send; ask "
+                                    "for less", detail="Error: the answer was too large")
+    adapter = _adapter([bare])
+    with pytest.raises(ResultCut):
+        adapter.execute_answer(SQL)
+    assert len(adapter.client.calls) == 1
+
+
+def test_an_answer_cut_to_no_rows_is_a_cut_result():
+    with pytest.raises(ResultCut):
+        _adapter({**_rows(0), "_response_truncated": True}).execute_answer(SQL)
+
+
+def test_an_answer_run_reads_through_execute_answer_and_other_runs_still_refuse_a_cut():
+    """The runner's `answer=True` is the answer's read; every other run of the same cut payload is repaired as before."""
+    assert sent_of(run(_adapter(CUT), SQL, answer=True).table) == 2
+    with pytest.raises(ExecutionError):
+        run(_adapter(CUT), SQL)
+
+
+def test_a_re_ask_never_asks_for_more_rows_than_the_statement_limits():
+    """`execute_sql`'s limit replaces the statement's own, so a re-ask of `LIMIT 10` asks for fewer than 10, never more."""
+    adapter = _adapter([TOO_LARGE, REGION_COUNTS])
+    adapter.execute_answer("SELECT region FROM policies LIMIT 10")
+    assert adapter.client.calls[1].request["limit"] == 6  # floor(10 * 50,000 / 61,234 * 0.8)
+
+
+def test_a_statement_whose_limit_cannot_be_read_is_not_asked_again():
+    adapter = _adapter([TOO_LARGE])
+    with pytest.raises(ResultCut):
+        adapter.execute_answer("SELEC this is not a statement")
+    assert len(adapter.client.calls) == 1
+
+
+def _sized(rows: int, width: int, allowed: int = 50_000, first: int | None = None):
+    """A source holding `rows` rows of `width` characters that answers as rc2 does: each row twice (`rows` and the
+    statement's own data), refused, with its size, when the answer passes `allowed` bytes."""
+    import json
+
+    def answer(request):
+        n = min(rows, request.get("limit") or rows)
+        data = [{"region": f"r{i:04}", "wide": "x" * (first if i == 0 and first is not None else width)}
+                for i in range(n)]
+        payload = {**REGION_COUNTS, "columns": [{"name": "region", "type": "object"}, {"name": "wide", "type": "object"}],
+                   "rows": data, "row_count": n, "statements": [{"data": {"rows": data}}]}
+        size = len(json.dumps(payload))
+        if size > allowed:
+            return SupersetResponseTooLarge("too large", detail=f"Error: Response too large: {size:,} bytes "
+                                                                f"(limit: {allowed:,})")
+        return payload
+    return answer
+
+
+def test_a_wide_result_of_few_rows_is_answered_with_the_rows_that_fit():
+    """30 rows of 2,000 characters: a re-ask sized from the deciders' cap does not bind, so one row is measured, and the
+    next ask is sized from it."""
+    adapter = _adapter(_sized(30, 2000))
+    table = adapter.execute_answer(SQL)
+    limits = [call.request.get("limit") for call in adapter.client.calls]
+    assert 1 in limits and len(limits) <= 4, limits
+    assert sent_of(table) == table.num_rows and 5 <= table.num_rows < 30, (table.num_rows, limits)
+
+
+def test_a_short_first_row_before_wide_ones_keeps_the_row_it_measured():
+    """The one row measured is narrower than the rest, so the ask sized from it is refused again: the measured row is
+    still the answer's first, and it is the answer, said so, rather than none."""
+    adapter = _adapter(_sized(30, 2000, first=10))
+    table = adapter.execute_answer(SQL)
+    limits = [call.request.get("limit") for call in adapter.client.calls]
+    assert sent_of(table) == table.num_rows >= 1 and table.column("region")[0].as_py() == "r0000", limits
+    assert limits[-1] is not None and limits[-1] < limits[1], limits  # the ask after the measure stays below the refused one
+
+
+def test_the_ask_after_the_measure_stays_below_the_last_refused_one():
+    """Five rows of 20,000 characters under `LIMIT 50`: the one-row measure would size the next ask past the 10 rows
+    just refused; it stays below them."""
+    adapter = _adapter(_sized(5, 20000, first=10))
+    adapter.execute_answer("SELECT region, wide FROM policies LIMIT 50")
+    limits = [call.request.get("limit") for call in adapter.client.calls]
+    assert limits[2] == 1 and limits[-1] < limits[1], limits

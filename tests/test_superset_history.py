@@ -245,13 +245,17 @@ def test_nothing_runs_when_nothing_is_granted(fake):
 # --- failing closed -----------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("rerun", [
-    {**_result(("west", 16666)), "_response_truncated": True},
-    RuntimeError(f"Response too large: the answer is larger than the response size allows ({SAID})"),
-], ids=["cut-to-size", "too-large-to-send"])
-def test_a_cut_rerun_leaves_no_rows(fake, rerun):
-    """Part of a result reads as all of it, so a result Superset cut, or would not send at all, gives none."""
-    _serve(fake, rerun)
+def test_a_cut_rerun_keeps_its_first_rows(fake):
+    """The earlier answer was given as its first rows, and a turn keeps a few rows at most, an antecedent, not a second
+    result: a rerun Superset cut to size keeps those first rows."""
+    _serve(fake, {**_result(("west", 16666)), "_response_truncated": True})
+    [turn] = _history([_turn()], _adapter(fake))
+    assert turn.rows and turn.rows[0][0] == "west"
+    assert len(_reruns(fake)) == 1
+
+
+def test_a_rerun_too_large_to_send_without_its_size_leaves_no_rows(fake):
+    _serve(fake, RuntimeError(f"Response too large: the answer is larger than the response size allows ({SAID})"))
     [turn] = _history([_turn()], _adapter(fake))
     assert turn.rows == [] and turn.columns == []
     assert SAID not in repr(turn)

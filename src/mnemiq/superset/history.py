@@ -82,8 +82,10 @@ def _rows_now(sql: str, *, grants: GrantSet, snapshot: Snapshot, adapter, timeou
         logger.info("no table is granted, so the earlier turn is not run again and keeps no rows")
         return None
     try:
+        # Read as the answer was (`execute_answer`): a turn keeps a few rows at most, an antecedent, not a second
+        # result, and the answer was given as its first rows when it was larger than one response.
         outcome = run_decided(sql, adapter=adapter, snapshot=snapshot, grants=grants, timeout_s=timeout_s,
-                              guard_fanout=guard_fanout, values=values)
+                              guard_fanout=guard_fanout, values=values, answer=True)
     except ExecutionError as exc:
         # Every failure of the run reaches here as one: a result cut to size, a time limit, a cancel, a refusal, and
         # Superset not answering. What Superset said is in the exception's detail, or in the one it was raised from.
@@ -128,7 +130,7 @@ def decide_statement(sql: str, *, adapter, snapshot: Snapshot, grants: GrantSet,
 
 
 def run_decided(sql: str, *, adapter, snapshot: Snapshot, grants: GrantSet, timeout_s: float,
-                guard_fanout: bool | None, values=None) -> Decided | Refusal:
+                guard_fanout: bool | None, values=None, answer: bool = False) -> Decided | Refusal:
     """Decide `sql` under `grants`, and when it is approved run the approved statement through `adapter` as the person.
 
     A refusal is returned. A run that fails raises `ExecutionError`, whose detail is the caller's to log."""
@@ -136,4 +138,4 @@ def run_decided(sql: str, *, adapter, snapshot: Snapshot, grants: GrantSet, time
                                values=values)
     if not isinstance(verdict, Approved):
         return verdict
-    return Decided(verdict, run(adapter, verdict.target_sql, timeout_s=timeout_s).table)
+    return Decided(verdict, run(adapter, verdict.target_sql, timeout_s=timeout_s, answer=answer).table)

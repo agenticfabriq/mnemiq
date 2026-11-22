@@ -21,6 +21,7 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
+from mnemiq.agent.loop import response_sentence
 from mnemiq.contract import HistoryTurn, IdentityContext
 from mnemiq.contract.seams import DeferralReason
 from mnemiq.runtime import build_runtime
@@ -36,13 +37,14 @@ from mnemiq.superset.client import (
     SupersetRefusedCaller,
     SupersetResponseTooLarge,
 )
+from mnemiq.execute.cut import sent_of
 from mnemiq.superset.executor import superset_executor
 from mnemiq.superset.grants import NOT_A_BUILDER, _probe, _tables, resolve_grants
 from mnemiq.superset.payload import _CUT as CUT
+from mnemiq.superset.payload import ResultCut
 from mnemiq.superset.payload import table_from_payload
 from mnemiq.superset.service import ServiceKey, enrichment_adapter
 from mnemiq.superset.settings import SUPERSET_SOURCE_JOB
-from tests.sweep.stub_model import _WRITER, _messages, _proposal
 from tests.superset_live.live import (
     SCHEMA,
     SOURCE_ID,
@@ -62,7 +64,6 @@ QUESTION = "How many policies are there in each region?"
 REGION_COUNTS = "SELECT region, COUNT(*) AS n FROM policy GROUP BY region"
 # Every row of `policy`, each column named: the decider refuses `SELECT *`.
 WIDE = "SELECT id, region, status, premium, issued, doc FROM policy"
-AGGREGATE = "SELECT status, COUNT(*) AS n FROM policy GROUP BY status"
 # A statement that runs for several seconds on the seeded Postgres.
 SLOW = "SELECT count(*) AS n FROM generate_series(1, 100000000) AS g"
 TRUTH_BY_REGION = "SELECT region, count(*) FROM policy GROUP BY region"
@@ -361,44 +362,37 @@ def test_a_token_without_supersets_scopes_is_refused(live, model, enriched, reco
 # --- L6 ---------------------------------------------------------------------------------------------------------------
 
 
-def test_a_large_result_is_cut_never_complete(live, model, enriched, recorder):
-    """L6. `analyst`, whom no row rule narrows, is answered from every row of `policy`, its columns named (the decider
-    refuses `SELECT *`): 300 rows, past Superset's default response size guard once `execute_sql` carries each row
-    twice. The answer is repaired or stated as cut, never answered as all 300 rows, nor as the part Superset sent:
+def test_a_large_result_is_answered_with_its_first_rows_never_as_complete(live, model, enriched, recorder):
+    """L6. `analyst`, whom no row rule narrows, asks for every row of `policy`, its columns named (the decider refuses
+    `SELECT *`): 300 rows, past Superset's default response size guard once `execute_sql` carries each row twice.
+    The answer is the result's first rows, said so, never all 300 rows nor a failure:
 
-    - A model that writes the same statement on every attempt is told each time that Superset cut the result, and the
-      answer ends failed (`execution_failed`, not deferred) with no preview: every statement that ran came back
-      marked `_response_truncated`, or refused as too large to send (`SupersetResponseTooLarge`).
-    - A model that answers the cut with an aggregate is answered with the aggregate, each status's count in the
-      source."""
+    - at least one statement that ran came back cut (`_response_truncated`) or refused as too large to send
+      (`SupersetResponseTooLarge`), the premise;
+    - the answer is given, neither failed nor deferred; its preview is capped at fewer than 300 rows, every one of them a
+      row of `policy`; and its sentence ends with the rows Superset sends in one answer (`response_sentence`);
+    - the model is never told the result was cut: an answer that is long is not a statement to repair."""
     settings, _ = enriched
     assert ground_truth(live, "SELECT count(*) FROM policy") == [(300,)]
     runtime = build_runtime(settings)
     model.sql = WIDE
     mark, asked = recorder.mark(), len(model.requests)
     answer = ask(runtime, live, "analyst")
-    assert answer.failed and not answer.deferred, answer.answer
-    assert answer.reason_code == DeferralReason.EXECUTION_FAILED and answer.preview is None
     statements = [call for call in recorder.since(mark) if call.answers]
-    assert statements and all((call.payload or {}).get("_response_truncated")
-                              or isinstance(call.raised, SupersetResponseTooLarge) for call in statements)
-    assert CUT in json.dumps(model.requests[asked:])  # the model was told why
-    observe("L6", answer=answer.answer, failed=answer.failed, deferred=answer.deferred, reason=str(answer.reason_code),
-            statements=len(statements), rows_sent=[len((call.payload or {}).get("rows") or []) for call in statements],
-            how=[type(call.raised).__name__ if call.raised else "_response_truncated" for call in statements])
-
-    def aggregate_once_cut(request):
-        system, user = _messages(request)
-        return _proposal(AGGREGATE) if _WRITER in system and CUT in user else None
-
-    model.rule = aggregate_once_cut
-    try:
-        repaired = ask(runtime, live, "analyst")
-    finally:
-        model.rule = None
-    assert rows_of(repaired) == sorted([status, n] for status, n in ground_truth(
-        live, "SELECT status, count(*) FROM policy GROUP BY status"))
-    observe("L6", repaired=repaired.answer, rows=repaired.preview.rows, attempts=repaired.attempts)
+    assert any((call.payload or {}).get("_response_truncated") or isinstance(call.raised, SupersetResponseTooLarge)
+               for call in statements), "the premise: Superset cut or refused the result"
+    assert not answer.failed and not answer.deferred, answer.answer
+    preview = answer.preview
+    assert preview is not None and preview.capped and 0 < preview.row_count < 300, preview
+    assert response_sentence(preview.row_count) in answer.answer, answer.answer
+    ids = {row[0] for row in ground_truth(live, "SELECT id FROM policy")}
+    assert preview.rows and all(row[0] in ids for row in preview.rows)
+    assert CUT not in json.dumps(model.requests[asked:])  # never handed to the model to shrink
+    observe("L6", answer=answer.answer, rows=preview.row_count, statements=len(statements),
+            limits=[(call.request or {}).get("limit") for call in statements],
+            how=[type(call.raised).__name__ if call.raised else
+                 ("_response_truncated" if (call.payload or {}).get("_response_truncated") else "whole")
+                 for call in statements])
 
 
 # --- L7 ---------------------------------------------------------------------------------------------------------------
@@ -654,3 +648,20 @@ def test_a_statement_past_its_time_limit_reads_as_timed_out(live, enriched, monk
     waited = time.perf_counter() - started
     assert isinstance(gave_up.value.__cause__, SupersetCallTimedOut)
     observe("timeout", superset_answered_after=round(ran, 2), transport_gave_up_after=round(waited, 2))
+
+
+LONG_ROWS = "SELECT g, repeat('x', 120) AS wide FROM generate_series(1, 1000) AS g ORDER BY g"
+
+
+def test_an_answer_larger_than_one_response_is_its_first_rows(live, enriched):
+    """1,000 rows of 120 characters each: more than rc2's MCP service sends in one response, whose answer carries each
+    row twice. Read as an answer (`execute_answer`), they are the statement's own first rows, marked with how many came;
+    read as any other result (`execute_arrow`), they are refused, as before."""
+    settings, _ = enriched
+    adapter = superset_executor(settings, DelegatedToken(live.token("analyst")))
+    table = adapter.execute_answer(LONG_ROWS)
+    sent = sent_of(table)
+    assert sent is not None and 0 < sent < 1000 and table.num_rows == sent, (sent, table.num_rows)
+    assert table.column("g").to_pylist() == list(range(1, sent + 1))
+    with pytest.raises(ResultCut):
+        adapter.execute_arrow(LONG_ROWS)

@@ -34,6 +34,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, Strict
 
 from mnemiq.agent.loop import result_preview
 from mnemiq.contract import HistoryTurn
+from mnemiq.execute.cut import sent_of
 from mnemiq.execute.runner import ExecutionError
 from mnemiq.generate.plan_query import deferral_of_refusal
 from mnemiq.server.sse import chat_stream, frame
@@ -686,8 +687,9 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
             grants = runtime.builder_grants(adapter)
             settings = runtime.build_profile(None, who).settings
             try:
+                # Read as an answer is (`execute_answer`): larger than one response, its first rows, said so.
                 outcome = run_decided(answer["sql"], adapter=adapter, snapshot=runtime.snapshot, grants=grants,
-                                      timeout_s=DEFAULT_TIMEOUT_S, guard_fanout=settings.guard_fanout)
+                                      timeout_s=DEFAULT_TIMEOUT_S, guard_fanout=settings.guard_fanout, answer=True)
             except ExecutionError as exc:
                 logger.warning("a reopened answer's query did not run again: %s", exc.full_text)
                 return {"refused": RERUN_FAILED}
@@ -696,7 +698,8 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
                 return {"refused": deferred.reason if deferred is not None else RERUN_REFUSED}
             cap = getattr(outcome.approved, "row_cap", None)
             preview = result_preview(outcome.table, RESULT_ROWS,
-                                     capped=cap is not None and outcome.table.num_rows >= cap)
+                                     capped=(cap is not None and outcome.table.num_rows >= cap)
+                                     or sent_of(outcome.table) is not None)
             return {"columns": preview.columns, "rows": preview.rows, "row_count": preview.row_count,
                     "truncated": preview.truncated, "capped": preview.capped}
 

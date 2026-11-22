@@ -30,6 +30,7 @@ from mnemiq.execute.runner import (
     SourceUnavailableError,
     run,
 )
+from mnemiq.execute.cut import sent_of
 from mnemiq.execute.select import (
     ClusterView,
     SelectorRead,
@@ -112,6 +113,13 @@ def cap_sentence(row_cap: int) -> str:
     """Said after the model, like the other disclosures: a cut result must not pass a step that
     could present 1,000 rows as the whole answer."""
     return (f"These results stop at the {row_cap:,}-row limit, so there may be more: counts and "
+            "totals over them are not the whole.")
+
+
+def response_sentence(sent: int) -> str:
+    """Said after the model, as `cap_sentence` is: the answer is the first rows its source sent in one response, so the
+    rows are not all of them."""
+    return (f"These results stop at the {sent:,} rows Superset sends in one answer, so there may be more: counts and "
             "totals over them are not the whole.")
 
 
@@ -501,7 +509,7 @@ class Agent:
             else:
                 try:
                     with step(emit, Stage.EXECUTE):
-                        result = run(self.adapter, approved.target_sql, timeout_s=self.timeout_s)
+                        result = run(self.adapter, approved.target_sql, timeout_s=self.timeout_s, answer=True)
                 except SourceUnavailableError as exc:
                     # Not the statement's failure, so not fed back: the model would rewrite a correct
                     # query because the network failed (M188). A failure, not a deferral (M6), as the
@@ -638,7 +646,7 @@ class Agent:
         if hit is not None:
             return from_ipc(hit)
         try:
-            result = run(self.adapter, approved.target_sql, timeout_s=self.timeout_s)
+            result = run(self.adapter, approved.target_sql, timeout_s=self.timeout_s, answer=True)
         except (SourceUnavailableError, QueryCancelledError):
             raise
         except ExecutionError as exc:
@@ -985,6 +993,7 @@ class Agent:
         attempts: int | None = None,
     ) -> AgentAnswer:
         cut = _cut(approved, table)
+        sent = sent_of(table)  # the first rows of an answer its source cut to fit one response (`execute_answer`)
         trace = build_trace(
             question=packet.question,
             approved=approved,
@@ -1013,9 +1022,9 @@ class Agent:
             lineage_disclosure_sentence(trace.lineage_completeness,
                                         list(trace.lineage_unresolved),
                                         list(trace.lineage_reasons)),
-            cap_sentence(cut) if cut is not None else "",
+            response_sentence(sent) if sent is not None else cap_sentence(cut) if cut is not None else "",
         ) if note]
-        preview = result_preview(table, self.preview_rows, capped=cut is not None)
+        preview = result_preview(table, self.preview_rows, capped=cut is not None or sent is not None)
         # Verified, so nothing after this point withdraws the rows: the prose, the trace's total and the notes follow,
         # and none of them declines. Sent with the notes, so a reader of the table alone still reads what was withheld
         # or cut, and with the preview and trace the final answer is built from, so the two cannot differ.

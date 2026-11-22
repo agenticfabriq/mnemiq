@@ -47,8 +47,9 @@ _CUT = "Superset cut this result to fit its response size; aggregate, or select 
 
 class ResultCut(RuntimeError):
     """The result was larger than Superset's MCP service sends: cut to fit (`_response_truncated`), so the rows that
-    arrived are not all of them, or not sent at all (the adapter raises this for that too). Never read as the answer,
-    since a count or a sum over part of the rows reads as one over all of them: the statement's to make smaller."""
+    arrived are not all of them, or not sent at all (the adapter raises this for that too). Never read as a whole result,
+    since a count or a sum over part of the rows reads as one over all of them: the statement's to make smaller. An
+    answer to a question is the one read that keeps such rows, marked as its first rows (`execute_answer`)."""
 
 
 class SupersetAccessRefused(RuntimeError):
@@ -69,6 +70,17 @@ def read_execute_response(payload: dict) -> pa.Table:
     columns, rows = payload.get("columns"), payload.get("rows")
     if columns is None or rows is None:
         # Superset's answer to statements none of which returns rows: no SELECT among them.
+        raise SupersetQueryFailed("the statement returned no result set; send one SELECT")
+    return table_from_payload(columns, rows)
+
+
+def read_execute_prefix(payload: dict) -> pa.Table:
+    """The rows a successful `execute_sql` payload carries at its top level, whether or not Superset cut them to fit its
+    response size: a cut answer keeps its first rows there (`truncate_query_result` keeps the longest prefix that fits),
+    so these are the answer's first rows. Only an answer read as such may be read this way (`execute_answer`)."""
+    check_execute_response(payload)
+    columns, rows = payload.get("columns"), payload.get("rows")
+    if columns is None or rows is None:
         raise SupersetQueryFailed("the statement returned no result set; send one SELECT")
     return table_from_payload(columns, rows)
 
