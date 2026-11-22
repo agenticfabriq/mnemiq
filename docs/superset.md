@@ -472,8 +472,10 @@ mnemiq's address.
   else.
 - **One box.** The person types; mnemiq works out whether it is a question, a dashboard to build, or a change to the
   dashboard on screen (see [Conversations](#conversations)), and asks back, with three choices, when it cannot tell.
-- **Their conversations**, kept by mnemiq: Conversations lists them, newest first, and opens one; New starts another,
-  which mnemiq makes with its first message. Each message shows the dashboard it was sent from when that changed.
+- **Their conversations**, kept by mnemiq: Conversations lists them, newest first, and opens one, or deletes one after
+  a second click; New starts another, which mnemiq makes with its first message. Each message shows the dashboard it
+  was sent from when that changed. While a message, a Build it or an Apply is in flight, the panel stays on its
+  conversation.
 - **Ask** a question about the data. The answer streams in: its sentence, the SQL (folded), and the rows it read. Reopened
   later, an answer shows its sentence as it was written then and its SQL, and Show results runs that SQL again as the
   person, now; the rows are kept only while the card is open.
@@ -485,10 +487,12 @@ mnemiq's address.
   definition and its value computed now under the person's own row rules, and Edit, Remove and Save to dataset.
   Remove deletes the charts that show the measure (into Superset's trash, where it keeps one), and takes a chart the
   person does not edit off the dashboard instead; it says so, and names the charts, before it does anything.
-- **Change** the dashboard on screen: "show daily instead of monthly". mnemiq shows each chart's edit, and the charts
-  the change would remove, each with its own tick; Apply writes exactly what it showed, and nothing when the
-  dashboard or a chart changed since. A chart setting changed by hand is kept. Build it and Apply are offered only on
-  the dashboard they are for, and Not now sets a proposal aside.
+- **Change** the dashboard on screen: "show daily instead of monthly". mnemiq shows each chart's edit, what it will not
+  change, and the charts the change would delete, each with its own tick. Apply writes exactly what it showed, and
+  nothing when the dashboard or a chart changed since; a chart changed by hand while it writes stops it there, and the
+  card says what was changed and what was left. A chart setting changed by hand is kept. Build it and Apply are
+  offered only on the dashboard they are for, read from the address when clicked, Build it not while another build
+  runs on the page, and Not now sets a proposal aside.
 - **Finish.** Closing the panel does not stop a build. Leaving or reloading the page stops it after the step in
   flight, and the build stays resumable: the panel then lists the person's unfinished builds (on a dashboard, that
   dashboard's), each with Finish and Not now.

@@ -1,6 +1,7 @@
 import React, { useState, type CSSProperties } from "react";
 import { Alert, Button, Checkbox, Table, Typography, theme } from "antd";
 import type { PanelApi } from "../api";
+import { ALREADY_BUILDING } from "../build";
 import {
   isChangePreview,
   showResults,
@@ -8,11 +9,13 @@ import {
   type ChangePreview,
   type Choose,
   type Message,
+  type Page,
   type Results,
 } from "../conversation";
 import { pageAppRoot } from "../page";
-import type { Cell } from "../shared";
+import type { Cell, Turn } from "../shared";
 import { confirmInPanel, declineInPanel } from "../talk";
+import { AnswerCard } from "./AnswerCard";
 
 const dashboardUrl = (id: number) => `${pageAppRoot()}/dashboard/${id}/`;
 
@@ -22,39 +25,53 @@ const SETTLED: Record<string, string> = {
   applying: "This may or may not have been done; check the dashboard.",
   replanned: "Planned again, below.",
   declined: "Not now.",
-  partial: "Done in part; ask again for the rest.",
   chosen: "Answered, below.",
   stale: "Nothing was changed: the dashboard changed since this preview. Ask again.",
+  partial: "Done in part; ask again for the rest.",
 };
+const DELETES = "Removing a chart deletes it: Superset moves it to its trash, or deletes it for good where it keeps none.";
 
 type Props = {
   api: PanelApi;
   messages: Message[];
   conversationId: string | null;
-  /** The dashboard on screen, when the person may read it: a proposal is confirmed only from its own. */
+  /** The dashboard on screen, as the page context last read it: what Build it and Apply are offered on. Each confirm
+   * reads it again from the address when it is clicked (`pageNow`). */
   onScreenId: number | null;
+  pageNow: () => Promise<Page>;
   /** Sends a message again where the person chose, after a question back. */
   onChoose: (text: string, choose: Choose) => void;
+  /** A message, confirm or decline in flight. */
   busy: boolean;
+  /** A build being planned or run on this page, which another Build it waits for. */
+  building: boolean;
+  /** The answer just given, shown as it streamed in place of its kept card. */
+  fresh: { conversationId: string; index: number; turn: Turn } | null;
 };
 
 /** The conversation as mnemiq keeps it: each message, with the dashboard it was sent from when that changed, and
  * each proposal's answers while it waits. */
-export function Messages({ api, messages, conversationId, onScreenId, onChoose, busy }: Props) {
+export function Messages(props: Props) {
+  const { messages } = props;
   const { token } = theme.useToken();
   const muted: CSSProperties = { color: token.colorTextSecondary };
+  let lastPlace: number | null | undefined;
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: token.padding }}>
-      {messages.map((message, position) => {
-        const before = position > 0 ? messages[position - 1].dashboard?.id ?? null : undefined;
-        const here = message.dashboard?.id ?? null;
-        const moved = message.role === "person" && here !== null && here !== before;
+      {messages.map((message) => {
+        let marker: string | null = null;
+        if (message.role === "person") {
+          const here = message.dashboard?.id ?? null;
+          if (here !== lastPlace && !(lastPlace === undefined && here === null)) {
+            marker = here === null ? "off a dashboard" : `on ${message.dashboard?.title ?? "a dashboard"}`;
+          }
+          lastPlace = here;
+        }
         return (
-          <div key={message.index} data-message={message.index}
+          <div key={`${props.conversationId}:${message.index}`} data-message={message.index}
             style={{ display: "flex", flexDirection: "column", gap: token.paddingXS }}>
-            {moved ? <span style={{ ...muted, fontSize: token.fontSizeSM }}>on {message.dashboard?.title ?? "a dashboard"}</span> : null}
-            <Shown api={api} message={message} previous={messages[position - 1]} conversationId={conversationId}
-              onScreenId={onScreenId} onChoose={onChoose} busy={busy} muted={muted} />
+            {marker ? <span style={{ ...muted, fontSize: token.fontSizeSM }}>{marker}</span> : null}
+            <Shown {...props} message={message} muted={muted} />
           </div>
         );
       })}
@@ -62,8 +79,8 @@ export function Messages({ api, messages, conversationId, onScreenId, onChoose, 
   );
 }
 
-function Shown({ api, message, previous, conversationId, onScreenId, onChoose, busy, muted }:
-  Omit<Props, "messages"> & { message: Message; previous?: Message; muted: CSSProperties }) {
+function Shown(props: Props & { message: Message; muted: CSSProperties }) {
+  const { api, message, messages, conversationId, onChoose, busy, muted, fresh, pageNow, building } = props;
   const { token } = theme.useToken();
   if (message.role === "person") {
     return (
@@ -72,18 +89,25 @@ function Shown({ api, message, previous, conversationId, onScreenId, onChoose, b
     );
   }
   if (message.kind === "answer" && message.answer) {
+    if (fresh && fresh.conversationId === conversationId && fresh.index === message.index) {
+      return <AnswerCard turn={fresh.turn} />;
+    }
     return <KeptAnswer api={api} message={message} conversationId={conversationId} muted={muted} />;
   }
   if (message.kind === "clarify" && message.clarify) {
-    const text = previous?.role === "person" ? previous.text : null;
+    // The message it replies to, by its index; before mnemiq named it, the one just before.
+    const replied = typeof message.replies_to === "number"
+      ? messages.find((m) => m.index === message.replies_to)
+      : messages.find((m) => m.index === message.index - 1);
+    const text = replied?.role === "person" ? replied.text : null;
     return (
       <section aria-label="Question back" style={{ display: "flex", flexDirection: "column", gap: 4 }}>
         <span>{message.clarify.question}</span>
         {text ? (
-          <div style={{ display: "flex", gap: 8 }}>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             {(["ask", "build", "change"] as const).map((choose) => (
               <Button key={choose} size="small" disabled={busy} onClick={() => onChoose(text, choose)}>
-                {choose === "ask" ? "Answer it" : choose === "build" ? "Build it" : "Change the dashboard"}
+                {choose === "ask" ? "Answer it" : choose === "build" ? "Plan a build" : "Change the dashboard"}
               </Button>
             ))}
           </div>
@@ -92,13 +116,14 @@ function Shown({ api, message, previous, conversationId, onScreenId, onChoose, b
     );
   }
   if (message.proposal && isChangePreview(message.proposal)) {
-    return <Preview api={api} message={message} preview={message.proposal} onScreenId={onScreenId} muted={muted} />;
+    return <Preview {...props} preview={message.proposal} />;
   }
   if (message.proposal) {
-    return <Proposal api={api} message={message} proposal={message.proposal} onScreenId={onScreenId} muted={muted} />;
+    return <Proposal {...props} proposal={message.proposal} />;
   }
   if (message.offer) {
     const waiting = message.outcome?.state === "offered";
+    const choose = (choice: "add" | "new") => void confirmInPanel(api, message, { choice }, pageNow);
     return (
       <section aria-label="Offer" style={{ display: "flex", flexDirection: "column", gap: 4 }}>
         <span>{message.text}</span>
@@ -107,12 +132,8 @@ function Shown({ api, message, previous, conversationId, onScreenId, onChoose, b
           <a href={dashboardUrl(message.offer.dashboard_id)}>Open it</a>
           {waiting ? (
             <>
-              <Button size="small" onClick={() => void confirmInPanel(api, message, { choice: "add", dashboard_id: onScreenId })}>
-                Add these charts to it
-              </Button>
-              <Button size="small" onClick={() => void confirmInPanel(api, message, { choice: "new", dashboard_id: onScreenId })}>
-                Build a new one
-              </Button>
+              <Button size="small" disabled={busy || building} onClick={() => choose("add")}>Add these charts to it</Button>
+              <Button size="small" disabled={busy || building} onClick={() => choose("new")}>Build a new one</Button>
             </>
           ) : <span style={muted}>{SETTLED[message.outcome?.state ?? ""] ?? ""}</span>}
         </div>
@@ -141,7 +162,7 @@ function Shown({ api, message, previous, conversationId, onScreenId, onChoose, b
 }
 
 /** A kept answer: its sentence as written then, its SQL folded, and its table run again as the person on request.
- * The rows live in this card's state alone, so closing the panel drops them. */
+ * The rows live in this card's state alone, so closing the panel, or moving to another conversation, drops them. */
 function KeptAnswer({ api, message, conversationId, muted }:
   { api: PanelApi; message: Message; conversationId: string | null; muted: CSSProperties }) {
   const answer = message.answer!;
@@ -191,22 +212,15 @@ function KeptAnswer({ api, message, conversationId, muted }:
   );
 }
 
-/** A build waiting for "Build it": its plan, and Build it only on the dashboard it is for. */
-function Proposal({ api, message, proposal, onScreenId, muted }:
-  { api: PanelApi; message: Message; proposal: BuildProposal; onScreenId: number | null; muted: CSSProperties }) {
+/** A build waiting for "Build it": its plan, and Build it only on the dashboard it is for, and not while this page
+ * plans or runs another build. A build left mid-confirm (`applying`) can be confirmed again: mnemiq reads the build's
+ * own state. */
+function Proposal({ api, message, proposal, onScreenId, muted, busy, building, pageNow }:
+  Props & { message: Message; proposal: BuildProposal; muted: CSSProperties }) {
   const { token } = theme.useToken();
-  const [sending, setSending] = useState(false);
   const state = message.outcome?.state;
   const here = proposal.dashboard_id === null || proposal.dashboard_id === onScreenId;
-  const answer = async (confirm: boolean) => {
-    setSending(true);
-    try {
-      if (confirm) await confirmInPanel(api, message, { dashboard_id: onScreenId });
-      else await declineInPanel(api, message);
-    } finally {
-      setSending(false);
-    }
-  };
+  const waiting = state === "proposed" || state === "applying";
   return (
     <section aria-label="Proposal" style={{ display: "flex", flexDirection: "column", gap: token.paddingXS,
       padding: token.paddingSM, border: `1px solid ${token.colorBorderSecondary}`, borderRadius: token.borderRadius }}>
@@ -221,43 +235,39 @@ function Proposal({ api, message, proposal, onScreenId, muted }:
       {proposal.left_out?.length ? (
         <div style={muted}>Already on the dashboard: {proposal.left_out.map((part) => part.part).join("; ")}</div>
       ) : null}
-      {state === "proposed" ? (
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <Button type="primary" size="small" disabled={!here || sending} onClick={() => void answer(true)}>Build it</Button>
-          <Button size="small" disabled={sending} onClick={() => void answer(false)}>Not now</Button>
+      {state === "applying" ? <span style={muted}>{SETTLED.applying}</span> : null}
+      {waiting ? (
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <Button type="primary" size="small" disabled={!here || busy || building}
+            onClick={() => void confirmInPanel(api, message, {}, pageNow)}>Build it</Button>
+          <Button size="small" disabled={busy} onClick={() => void declineInPanel(api, message)}>Not now</Button>
           {!here && proposal.dashboard_id !== null ? (
             <a href={dashboardUrl(proposal.dashboard_id)}>Open the dashboard this is for</a>
           ) : null}
+          {building ? <span style={muted}>{ALREADY_BUILDING}</span> : null}
         </div>
       ) : <span style={muted}>{SETTLED[state ?? ""] ?? ""}</span>}
     </section>
   );
 }
 
-/** A change waiting for "Apply": each chart's edit as it will be written, the charts it would remove (each confirmed
- * by its own tick), and Apply only on the dashboard it was previewed on. */
-function Preview({ api, message, preview, onScreenId, muted }:
-  { api: PanelApi; message: Message; preview: ChangePreview; onScreenId: number | null; muted: CSSProperties }) {
+/** A change waiting for "Apply": mnemiq's words for it (what will and will not change), each chart's edit as it
+ * will be written, the charts it would remove (each confirmed by its own tick, and said to delete), and Apply only on
+ * the dashboard it was previewed on. Once answered, what came of it, chart by chart. */
+function Preview({ api, message, preview, onScreenId, muted, busy, pageNow }:
+  Props & { message: Message; preview: ChangePreview; muted: CSSProperties }) {
   const { token } = theme.useToken();
   const [removing, setRemoving] = useState<number[]>([]);
-  const [sending, setSending] = useState(false);
   const state = message.outcome?.state;
+  const outcome = message.outcome;
   const here = preview.dashboard_id === onScreenId;
-  const answer = async (confirm: boolean) => {
-    setSending(true);
-    try {
-      if (confirm) {
-        await confirmInPanel(api, message, { dashboard_id: onScreenId,
-          ...(removing.length ? { remove_chart_ids: removing } : {}) });
-      } else await declineInPanel(api, message);
-    } finally {
-      setSending(false);
-    }
-  };
+  const titled = (id: number) => preview.edits.find((edit) => edit.chart_id === id)?.title
+    ?? preview.would_remove.find((chart) => chart.chart_id === id)?.title ?? `chart ${id}`;
   const nothing = preview.edits.length === 0 && removing.length === 0;
   return (
     <section aria-label="Preview" style={{ display: "flex", flexDirection: "column", gap: token.paddingXS,
       padding: token.paddingSM, border: `1px solid ${token.colorBorderSecondary}`, borderRadius: token.borderRadius }}>
+      {message.text ? <span>{message.text}</span> : null}
       {preview.edits.length ? (
         <ul aria-label="Edits" style={{ margin: 0, paddingLeft: 18 }}>
           {preview.edits.map((edit) => <li key={edit.chart_id}>{edit.said}</li>)}
@@ -265,33 +275,41 @@ function Preview({ api, message, preview, onScreenId, muted }:
       ) : null}
       {preview.would_remove.length && state === "proposed" ? (
         <section aria-label="To remove" style={{ display: "flex", flexDirection: "column" }}>
+          <span style={{ color: token.colorError }}>{DELETES}</span>
           {preview.would_remove.map((chart) => (
             <Checkbox key={chart.chart_id} checked={removing.includes(chart.chart_id)}
               onChange={(event) => setRemoving((now) => event.target.checked
                 ? [...now, chart.chart_id] : now.filter((id) => id !== chart.chart_id))}>
-              Remove {chart.title ?? `chart ${chart.chart_id}`}
+              Delete {chart.title ?? `chart ${chart.chart_id}`}
             </Checkbox>
           ))}
         </section>
       ) : null}
-      {preview.left.map((left) => <span key={`l${left.chart_id}`} style={muted}>Chart {left.chart_id} is left as it is: {left.reason}</span>)}
-      {preview.not_editor.map((entry) => (
+      {state === "proposed" ? preview.not_editor.map((entry) => (
         <span key={`e${entry.chart_id}`} style={muted}>
-          Chart {entry.chart_id} is not yours to edit{entry.editors.length ? `; its editors are ${entry.editors.join(", ")}` : ""}.
+          {titled(entry.chart_id ?? 0)} is not yours to edit{entry.editors.length ? `; its editors are ${entry.editors.join(", ")}` : ""}.
         </span>
-      ))}
+      )) : null}
       {state === "proposed" ? (
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <Button type="primary" size="small" disabled={!here || sending || nothing} onClick={() => void answer(true)}>Apply</Button>
-          <Button size="small" disabled={sending} onClick={() => void answer(false)}>Not now</Button>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <Button type="primary" danger={removing.length > 0} size="small" disabled={!here || busy || nothing}
+            onClick={() => void confirmInPanel(api, message,
+              removing.length ? { remove_chart_ids: removing } : {}, pageNow)}>Apply</Button>
+          <Button size="small" disabled={busy} onClick={() => void declineInPanel(api, message)}>Not now</Button>
           {!here ? <a href={dashboardUrl(preview.dashboard_id)}>Open the dashboard this is for</a> : null}
         </div>
       ) : (
-        <span style={muted}>
-          {state === "partial"
-            ? `Partly done: chart${(message.outcome?.changed ?? []).length === 1 ? "" : "s"} ${(message.outcome?.changed ?? []).join(", ")} changed; the rest changed since the preview. Ask again for those.`
-            : SETTLED[state ?? ""] ?? ""}
-        </span>
+        <section aria-label="What came of it" style={{ display: "flex", flexDirection: "column", gap: 2, ...muted }}>
+          <span>{SETTLED[state ?? ""] ?? ""}</span>
+          {outcome?.changed?.length ? <span>Changed: {outcome.changed.map(titled).join(", ")}.</span> : null}
+          {outcome?.removed?.length ? <span>Deleted: {outcome.removed.map(titled).join(", ")}.</span> : null}
+          {(outcome?.left ?? []).map((left) => <span key={`l${left.chart_id}`}>{titled(left.chart_id)} left as it is: {left.reason}.</span>)}
+          {(state === "done" || state === "partial") && here ? (
+            <Button size="small" style={{ alignSelf: "flex-start" }} onClick={() => window.location.reload()}>
+              Reload to see the changes
+            </Button>
+          ) : null}
+        </section>
       )}
     </section>
   );

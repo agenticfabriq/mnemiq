@@ -99,15 +99,13 @@ const OFF_A_DASHBOARD = "Ask about your data, or describe a dashboard to build";
  * message in flight and the build running; the dashboard's measures; and one box to write in. */
 function Ready({ api, starters }: { api: PanelApi; starters: string[] }) {
   const { dashboard } = usePageContext();
-  const { conversationId, messages, turns, sending, notice } = useSyncExternalStore(subscribe, getSnapshot);
+  const { conversationId, messages, turns, sending, notice, fresh, runningBuild, planning } =
+    useSyncExternalStore(subscribe, getSnapshot);
   const { token } = theme.useToken();
   useEffect(() => driver.attach(api), [api]);
   const onScreen = dashboard?.readable && dashboard.id !== null ? dashboard : null;
-  const send = (text: string, choose?: Choose) => {
-    if (sending) return false;
-    void pageNow().then((page) => sendInPanel(api, text, page, choose));
-    return true;
-  };
+  // Accepted only when the screen is free, and held from that moment, before the page is looked up.
+  const send = (text: string, choose?: Choose) => sendInPanel(api, text, pageNow, choose);
   const placeholder = onScreen === null ? OFF_A_DASHBOARD : onScreen.hasCharts === false ? DESCRIBE : ANYTHING;
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: token.padding }}>
@@ -126,8 +124,9 @@ function Ready({ api, starters }: { api: PanelApi; starters: string[] }) {
           ))}
         </section>
       ) : null}
-      <Messages api={api} messages={messages} conversationId={conversationId} onScreenId={onScreen?.id ?? null}
-        onChoose={(text, choose) => send(text, choose)} busy={sending} />
+      <Messages key={conversationId ?? "new"} api={api} messages={messages} conversationId={conversationId}
+        onScreenId={onScreen?.id ?? null} pageNow={pageNow} onChoose={(text, choose) => send(text, choose)}
+        busy={sending} building={runningBuild !== null || planning} fresh={fresh} />
       <Conversation turns={turns} />
       <BuildCard onScreenId={onScreen?.id ?? null} />
       {notice ? <Alert type="warning" showIcon message={notice} /> : null}
