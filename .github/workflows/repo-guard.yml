@@ -34,6 +34,11 @@ jobs:
           # what nothing opened, which was precisely the mismatch M97 named.
           fetch-depth: 0
       - name: Scan the commits this push ADDS, not just the tree it leaves
+        # The identity check reads each commit's author and committer against a private list held in a repository
+        # secret. The script prints only the commit and the field on a hit, never the identity or the pattern, since this
+        # log is public. A fork's pull request receives no secret, so for it the check is skipped and the step says so.
+        env:
+          REPO_GUARD_IDENTITY_PATTERNS: ${{ secrets.REPO_GUARD_IDENTITY_PATTERNS }}
         # M97: `--all` resolves to `git ls-files`, so a branch whose commit N adds a secret and
         # commit N+1 removes it scans clean while the secret stays permanently readable in the
         # pushed public history. This is what the `fetch-depth: 0` above was always for; until now

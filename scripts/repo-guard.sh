@@ -156,6 +156,39 @@ elif [ -z "$NAMES_SETTING" ]; then
 fi
 NAME_PATTERNS="${REPO_GUARD_NAME_PATTERNS:-}"
 
+# Who a commit says made it. A checkout without a repository-local identity commits as the machine's global one, and the
+# content checks above pass such a commit: on 2026-11-21 seven commits from a scratch clone reached main as the
+# maintainer's private identity, and main's history had to be rewritten. So each commit's author and committer are read
+# against a private identity list, resolved like the name list (environment, then .env) with the same three states,
+# `off`, a regex, or unset. Unset blocks a commit (--staged), since a checkout with no identity configured is the case
+# this exists for; in --range it is skipped and said, as CI on a fork's pull request receives no secret. --all scans a
+# tree, which has no commits.
+if [ -z "${REPO_GUARD_IDENTITY_PATTERNS:-}" ] && [ -f .env ]; then
+  REPO_GUARD_IDENTITY_PATTERNS="$(grep '^REPO_GUARD_IDENTITY_PATTERNS=' .env | head -1 | cut -d= -f2- \
+    | sed -e "s/^['\"]//" -e "s/['\"]\$//")"
+fi
+IDENTITY_SETTING="$(printf '%s' "${REPO_GUARD_IDENTITY_PATTERNS:-}" \
+  | tr '[:upper:]' '[:lower:]' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+IDENTITY_PATTERNS="${REPO_GUARD_IDENTITY_PATTERNS:-}"
+CHECK_IDENTITY=1
+if [ "$MODE" = "--all" ]; then
+  CHECK_IDENTITY=0
+elif [ "$IDENTITY_SETTING" = "off" ]; then
+  CHECK_IDENTITY=0
+  echo "repo-guard: identity check off -- no identity list on this machine."
+elif [ -z "$IDENTITY_SETTING" ]; then
+  if [ "$MODE" = "--staged" ]; then
+    echo "repo-guard: BLOCKED [config]: REPO_GUARD_IDENTITY_PATTERNS is not set."
+    echo "Set it in .env (gitignored) or the environment, as REPO_GUARD_NAME_PATTERNS is:"
+    echo "  off        you are contributing and hold no list -- the check is skipped"
+    echo "  <regex>    the identities that must never author or commit here -- the check runs"
+    exit 1
+  fi
+  CHECK_IDENTITY=0
+  echo "repo-guard: identity check skipped -- no identity list here (in CI: the repository secret is unset, or the"
+  echo "  pull request comes from a fork, which receives no secret)."
+fi
+
 # Secret shapes. Never commit these.
 SECRET_PATTERNS='(sk-[A-Za-z0-9]{16,}|AF_SECRET_KEY|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|xox[baprs]-[A-Za-z0-9-]{8,})'
 
@@ -272,6 +305,39 @@ while IFS= read -r -d '' f; do
     fail=1
   fi
 done < <(list_files)
+
+# The identity checks. Under --staged the identity the commit will carry, which is local output and may name it. Under
+# --range each commit's, naming only the commit and the field: a CI log is public, and printing the identity or the
+# pattern would publish what the list exists to keep out.
+if [ "$CHECK_IDENTITY" -eq 1 ] && [ "$MODE" = "--staged" ]; then
+  for who in AUTHOR COMMITTER; do
+    ident="$(git var "GIT_${who}_IDENT" 2>/dev/null | sed -E 's/ [0-9]+ [+-][0-9]{4}$//')"
+    if printf '%s\n' "$ident" | grep -Eiq -- "$IDENTITY_PATTERNS"; then
+      echo "BLOCKED [identity]: this commit's $(printf '%s' "$who" | tr '[:upper:]' '[:lower:]') is on the private identity list: $ident"
+      echo "  Set this checkout's public identity (git config user.name and user.email), then commit again."
+      fail=1
+    fi
+  done
+fi
+if [ "$CHECK_IDENTITY" -eq 1 ] && [ "$MODE" = "--range" ]; then
+  if ! idents="$(git log --format='%H%x09%an <%ae>%x09%cn <%ce>' "$RANGE" 2>/dev/null)"; then
+    echo "repo-guard: BLOCKED [instrument]: git could not read the range '$RANGE' for identities." >&2
+    exit 2
+  fi
+  while IFS="$(printf '\t')" read -r sha author committer; do
+    [ -n "$sha" ] || continue
+    if printf '%s\n' "$author" | grep -Eiq -- "$IDENTITY_PATTERNS"; then
+      echo "BLOCKED [identity]: commit ${sha:0:8}'s author is on the private identity list"
+      fail=1
+    fi
+    if printf '%s\n' "$committer" | grep -Eiq -- "$IDENTITY_PATTERNS"; then
+      echo "BLOCKED [identity]: commit ${sha:0:8}'s committer is on the private identity list"
+      fail=1
+    fi
+  done <<EOF_IDENTS
+$idents
+EOF_IDENTS
+fi
 
 if [ "$fail" -ne 0 ]; then
   echo
