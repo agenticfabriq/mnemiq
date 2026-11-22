@@ -368,8 +368,8 @@ class Settings(BaseSettings):
         description="seconds each statement enrich sends to a source may run before it is cut (0: no limit)")
     enrich_concurrency: int = Field(
         # 1 by default: measured on a five-table, 1,527-column schema with a 27B model on vLLM, four calls at once
-        # described 3.2 times as fast and about 5% fewer columns, the shortfall on its widest table, with no reply cut
-        # or retried. Set it to trade coverage for speed (docs/settings.md).
+        # described 3.2 times as fast and about 5% fewer columns, the shortfall on its widest table; the cause is not
+        # settled. Set it to trade coverage for speed (docs/settings.md).
         default=1, ge=1,
         description="description calls enrich runs at once against the model server (chunks of every table); 1 is "
                     "one after another")
