@@ -551,6 +551,7 @@ def _cmd_enrich(settings: Settings) -> int:
             logger.warning("enrich grounding disabled: %s", exc)
             retriever = None
     snap = enrich_semantic(snap, LLMEnricher(LLMClient(settings)), protected=_protected,
+                           concurrency=settings.enrich_concurrency,
                            retriever=retriever)
     if _dict:
         snap = apply_dictionary(snap, _dict)         # the operator's final override

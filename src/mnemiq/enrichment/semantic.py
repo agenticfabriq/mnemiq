@@ -62,13 +62,16 @@ def _annotated(column: Column, annotation: ColumnAnnotation) -> Column:
 
 def enrich_semantic(
     snapshot: Snapshot, enricher: Enricher, protected: frozenset[str] = frozenset(),
-    retriever=None,
+    retriever=None, concurrency: int = 1,
 ) -> Snapshot:
     """The only LLM phase: give the structural facts their business meaning.
 
     The enricher proposes; this function decides. Annotations are merged onto a *copy* of the
     snapshot -- structural facts (types, codes, relationships) are annotated, never
     overwritten -- and the result is re-versioned.
+
+    `concurrency` above 1 asks an enricher that can (`annotate_tables`) for every table's chunks at
+    once, that many at a time (`enrich_concurrency`); the merge below is the same, in table order.
     """
     by_table: dict[str, list[Column]] = {}
     for column in snapshot.columns:
@@ -82,6 +85,7 @@ def enrich_semantic(
 
     annotated: dict[str, Column] = {}
     jobs: list[Job] = []
+    requests: list[tuple[str, list, str]] = []
     for table, columns in by_table.items():
         grounding = ""
         if retriever is not None:
@@ -89,13 +93,10 @@ def enrich_semantic(
                 grounding = retriever.grounding_for(table, columns)
             except Exception:
                 grounding = ""  # degrade-to-local: grounding is optional, never fatal
-        try:
-            annotation = enricher.annotate(table, _facts(columns, fk_map), grounding)
-            failed_call = ""
-        except Exception as exc:
-            # Fail-soft: a rate-limit costs us a table, not the run. The type only: a provider's
-            # exception text can carry hosts and keys, and the job outlives the run.
-            annotation, failed_call = None, f"the call failed: {type(exc).__name__}"
+        requests.append((table, _facts(columns, fk_map), grounding))
+
+    for (table, columns), (annotation, failed_call) in zip(by_table.items(),
+                                                           _annotated_tables(enricher, requests, concurrency)):
 
         if annotation is None or not annotation.columns:
             # The cause on the job (M112): an undescribed table used to be a bare `failed` that
@@ -147,6 +148,26 @@ def enrich_semantic(
     )
     enriched.version = content_version(enriched)
     return enriched
+
+
+def _annotated_tables(enricher: Enricher, requests: list[tuple[str, list, str]],
+                      concurrency: int) -> list[tuple[object, str]]:
+    """(annotation, why the call failed) per request. In parallel through `annotate_tables` where the enricher has it
+    and `concurrency` is above 1; otherwise one `annotate` per table, as before, each failing alone: a rate-limit costs
+    a table, not the run. The type only: a provider's exception text can carry hosts and keys, and the job outlives
+    the run."""
+    if concurrency > 1 and callable(getattr(enricher, "annotate_tables", None)):
+        try:
+            return [(a, "") for a in enricher.annotate_tables(requests, concurrency=concurrency)]
+        except Exception as exc:  # noqa: BLE001 -- each chunk already fails alone; this is the pool itself failing
+            return [(None, f"the call failed: {type(exc).__name__}")] * len(requests)
+    out: list[tuple[object, str]] = []
+    for table, facts, grounding in requests:
+        try:
+            out.append((enricher.annotate(table, facts, grounding), ""))
+        except Exception as exc:  # noqa: BLE001 -- fail-soft per table, as above
+            out.append((None, f"the call failed: {type(exc).__name__}"))
+    return out
 
 
 def semantic_warnings(snapshot: Snapshot) -> list[str]:
