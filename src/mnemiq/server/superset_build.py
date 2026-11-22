@@ -61,6 +61,8 @@ own).
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Annotated, Any
 
 import psycopg
@@ -102,7 +104,7 @@ from mnemiq.superset.measure_actions import DashboardUnreadable as _MeasuresUnre
 from mnemiq.superset.measures import MAX_LABEL, MeasureKind
 from mnemiq.superset.planner import MAX_DESCRIPTION, MAX_GOAL, BuildPlan, PlanContext, PlanRefused, plan_build
 
-__all__ = ["READ_SCOPES", "WRITE_SCOPES", "BuildAlreadyStarted", "PlanStale", "confirm_proposed_build",
+__all__ = ["READ_SCOPES", "WRITE_SCOPES", "BuildAlreadyStarted", "BuildKit", "PlanStale", "confirm_proposed_build",
            "mount_superset_build"]
 
 logger = logging.getLogger(__name__)
@@ -405,7 +407,21 @@ def _refusal(exc: Exception, doors) -> HTTPException | None:
     return refused(exc, doors)
 
 
-def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
+@dataclass(frozen=True)
+class BuildKit:
+    """What the panel's conversation routes share with the build routes, so a build or a change asked in a
+    conversation is planned, checked and refused exactly as the build routes do it: the build store (`kept`), a goal
+    planned and started or proposed (`started`), who asks about a dashboard (`asking`), and a failure answered as the
+    build routes answer it (`answered`)."""
+
+    kept: Callable[[], Any]
+    started: Callable[..., tuple[int, dict]]
+    asking: Callable[..., Asking]
+    answered: Callable[[Callable[[], Any]], Any]
+    deployment: Any
+
+
+def mount_superset_build(app: FastAPI, runtime, doors, asker) -> BuildKit:
     """Mount the build, measures and changes routes on `app`, each behind `asker`, the `/v1` door's dependency. The build store is
     the deployment's control Postgres (`MNEMIQ_CONTROL_DSN`); without one, every build route answers 503 naming it."""
     # The deployment's settings name Superset (its MCP URL, database and schema), so every adapter is built from them;
@@ -617,3 +633,5 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
             return answer
 
         return answered(work)
+
+    return BuildKit(kept=kept, started=started, asking=asking, answered=answered, deployment=deployment)

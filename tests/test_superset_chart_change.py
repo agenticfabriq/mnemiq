@@ -551,3 +551,99 @@ def test_a_model_that_sets_the_filters_itself_still_gives_a_record_a_conversatio
     assert answer.changed == (chart,)
     [patch] = _patches(world)
     assert patch["set"] == dict(preview.edits[0].to_set)
+
+
+# --- A confirmed removal is held to the preview as an edit is
+
+def _preview_removing(fake, store, built, *, with_edit: bool):
+    month, region = built["policies_by_month"], built["policies_by_region"]
+    changes = (ChartChange(chart_id=month, set={"time_grain_sqla": "P1D"}),) if with_edit else ()
+    return _recorded(_preview(fake, store, built, Interpretation(changes=changes, remove_chart_ids=(region,)),
+                              "drop the region chart"))
+
+
+def _hand_edited(world, chart: int) -> None:
+    world.charts[chart]["params"] = {**world.charts[chart]["params"], "color_scheme": "by hand"}
+    world.charts[chart]["changed_on"] = world._stamp()
+
+
+def test_a_preview_reads_each_chart_it_would_remove():
+    """The record of a removal names each chart with the `changed_on` the preview read it at."""
+    from mnemiq.superset.chart_change import PREVIEW_JSON_SHAPE
+
+    assert set(PREVIEW_JSON_SHAPE["would_remove"][0]) == {"chart_id", "title", "changed_on"}
+
+
+def test_a_confirmed_removal_from_a_fresh_preview_removes_the_chart(fake, world, store):
+    from mnemiq.superset.chart_change import apply_change
+
+    built = _built(fake, store)
+    region = built["policies_by_region"]
+    preview = _preview_removing(fake, store, built, with_edit=False)
+    assert dict(preview.would_remove_changed_on)[region] == world._iso(world.charts[region]["changed_on"])
+    answer = apply_change(_asking(fake, store, built["dashboard"]), preview, strict=True, remove=(region,))
+    assert answer.removed == (region,) and region in world.trashed
+    assert answer.would_remove == () and "once confirmed" not in answer.message
+
+
+def test_a_stale_preview_removes_nothing(fake, world, store):
+    """A chart the preview would remove, edited since: nothing is removed, and it is left with the stale reason."""
+    from mnemiq.superset.chart_change import STALE_SINCE_PREVIEW, apply_change
+
+    built = _built(fake, store)
+    region = built["policies_by_region"]
+    preview = _preview_removing(fake, store, built, with_edit=False)
+    _hand_edited(world, region)
+    answer = apply_change(_asking(fake, store, built["dashboard"]), preview, strict=True, remove=(region,))
+    assert answer.removed == () and region not in world.trashed
+    assert "delete_chart" not in [c.tool for c in fake.calls]
+    assert (region, STALE_SINCE_PREVIEW) in answer.left
+
+
+def test_a_stale_edit_beside_a_removal_removes_nothing(fake, world, store):
+    """The preview is approved whole: an edited chart changed since it was read stops the removal too."""
+    from mnemiq.superset.chart_change import apply_change
+
+    built = _built(fake, store)
+    month, region = built["policies_by_month"], built["policies_by_region"]
+    preview = _preview_removing(fake, store, built, with_edit=True)
+    _hand_edited(world, month)
+    answer = apply_change(_asking(fake, store, built["dashboard"]), preview, strict=True, remove=(region,))
+    assert answer.changed == () and answer.removed == () and region not in world.trashed
+    assert "delete_chart" not in [c.tool for c in fake.calls] and _patches(world) == []
+
+
+def test_only_a_chart_the_preview_would_remove_is_removed(fake, world, store):
+    from mnemiq.superset.chart_change import apply_change
+
+    built = _built(fake, store)
+    preview = _preview_removing(fake, store, built, with_edit=False)
+    with pytest.raises(ValueError):
+        apply_change(_asking(fake, store, built["dashboard"]), preview, strict=True,
+                     remove=(built["policies_by_month"],))
+    with pytest.raises(ValueError):
+        apply_change(_asking(fake, store, built["dashboard"]), preview, strict=False,
+                     remove=(built["policies_by_region"],))
+
+
+def test_a_strict_apply_interrupted_mid_write_names_what_was_written(fake, world, store):
+    """Superset failing on the second write: the first stays written and is named, the second is named as not known
+    to be written, and the failure is raised for the caller to say so."""
+    from mnemiq.superset.chart_change import ChangeInterrupted
+
+    built = _built(fake, store)
+    month, region = built["policies_by_month"], built["policies_by_region"]
+    preview = _recorded(_preview(fake, store, built, _two_edits(built)))
+    seen = {"n": 0}
+
+    def fail_the_second(request, _world):
+        seen["n"] += 1
+        if seen["n"] == 2:
+            raise RuntimeError("Superset went away")
+
+    world.hooks["patch_chart"] = Hook(before=fail_the_second)
+    with pytest.raises(ChangeInterrupted) as stopped:
+        _apply(fake, store, built, preview)
+    assert stopped.value.answer.changed == (month,)
+    assert [chart for chart, _ in stopped.value.answer.left] == [region]
+    assert world.charts[month]["params"]["time_grain_sqla"] == "P1D"
