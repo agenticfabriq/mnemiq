@@ -40,9 +40,12 @@ jobs:
       # which receive no secrets -- the same trap that currently breaks repo-guard on fork PRs.
       # A literal that matches nothing works everywhere, and costs nothing: this suite exercises
       # the hook's structure and repo-guard's SECRET scan, neither of which needs the real list.
+      # The identity list is the same: `--staged` fails closed without it, and a placeholder matching nothing tests the
+      # hook's structure; the identity check itself is tested in tests/test_repo_guard_identity.py.
       - run: bash scripts/test-pre-commit-hook.sh
         env:
           REPO_GUARD_NAME_PATTERNS: zzz_placeholder_matches_nothing_zzz
+          REPO_GUARD_IDENTITY_PATTERNS: zzz_placeholder_matches_nothing_zzz
       # Runs on the CI awk, which is the point: `--range` matches in awk, and its secret pattern
       # needs interval expressions this machine has and mawk historically did not. The suite's
       # cases that EXPECT a catch are what turn red there: on such a runner they get the

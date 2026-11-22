@@ -1,0 +1,53 @@
+name: identity-guard
+# Who each commit of a pull request says made it, for every pull request, a fork's included.
+#
+# repo-guard.yml checks commit identities against a private list held in a repository secret, but a fork's pull request
+# receives no secret in its own runs, so there the check is skipped: a commit forged with a listed identity could reach
+# main through a fork. This job runs under pull_request_target, which runs THIS repository's code with its secrets, and
+# it is safe only because it never touches the fork's code:
+#   - it checks out the base commit, never the pull request's head, and keeps no credentials in the checkout;
+#   - it reads the commits of the triggering revision (the event's base and head SHAs, pinned) from GitHub's API,
+#     refuses any value that could shift fields (scripts/repo-guard-identities.py), and passes them to the base's
+#     scripts/repo-guard.sh on stdin; nothing the pull request controls is interpolated into a shell command;
+#   - it prints only a commit's short SHA and "author", "committer" or "message" on a hit, never the identity or pattern.
+# The API lists at most 250 commits; a longer pull request cannot be checked whole and fails.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  identity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - name: Check each commit's author, committer and message against the private identity list
+        # Read at the triggering event's own base and head SHAs, which cannot change: the pull request's commit list read
+        # by number is whatever the branch holds when the API answers, so a force-push of as many clean commits could
+        # pass a blocked revision (Codex's third review of #290). The count comes from the same pinned comparison and
+        # must equal the event's.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_COMMITS: ${{ github.event.pull_request.commits }}
+          REPO_GUARD_IDENTITY_PATTERNS: ${{ secrets.REPO_GUARD_IDENTITY_PATTERNS }}
+          REPO_GUARD_IDENTITY_REQUIRED: "1"
+        run: |
+          set -euo pipefail
+          compare="repos/${GITHUB_REPOSITORY}/compare/${BASE_SHA}...${HEAD_SHA}"
+          total="$(gh api "${compare}?per_page=1" --jq .total_commits)"
+          if [ "$total" != "$EVENT_COMMITS" ]; then
+            echo "identity-guard: the pinned comparison has $total commit(s), the event $EVENT_COMMITS: refusing." >&2
+            exit 2
+          fi
+          gh api --paginate "${compare}?per_page=100" \
+            --jq '.commits[] | {sha, a: (.commit.author.name + " <" + .commit.author.email + ">"), c: (.commit.committer.name + " <" + .commit.committer.email + ">"), m: .commit.message}' \
+            | python3 -I scripts/repo-guard-identities.py \
+            | REPO_GUARD_IDENTITY_EXPECTED="$total" bash scripts/repo-guard.sh --identities

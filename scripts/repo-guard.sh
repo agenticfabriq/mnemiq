@@ -27,6 +27,7 @@
 # --range -- skip it and say so. Install the hook or the local half never runs:
 #
 #     git config core.hooksPath .githooks
+{ set +x; } 2>/dev/null  # never traced: a trace prints the private lists and identities this reads
 set -uo pipefail
 
 MODE="${1:---staged}"
@@ -43,8 +44,8 @@ list_files() {
   # fault (the review gate on the fix, twice: `core.quotePath=false` covers the last case alone).
   if [ "$MODE" = "--all" ]; then
     git ls-files -z
-  elif [ "$MODE" = "--range" ]; then
-    :   # --range does not scan paths; see scan_range
+  elif [ "$MODE" = "--range" ] || [ "$MODE" = "--identities" ]; then
+    :   # neither scans paths: --range reads its commits (scan_range), --identities reads identities from stdin
   else
     # R and T too: a renamed file's staged content is scanned like any other's (without R, `git mv
     # b c` plus a blocked line appended to c showed as R096 and passed, where the same edit
@@ -136,7 +137,9 @@ CHECK_NAMES=1
 # CI, whose log is public on a public repo, and enforcing the list there would LEAK it -- a
 # flagged word in a public log tells every reader that word is on the blocklist. A fork's pull
 # request could not receive the secret that carries it anyway.
-if [ "$MODE" = "--all" ] || [ "$MODE" = "--range" ]; then
+if [ "$MODE" = "--identities" ]; then
+  CHECK_NAMES=0   # it reads identities, never content
+elif [ "$MODE" = "--all" ] || [ "$MODE" = "--range" ]; then
   CHECK_NAMES=0
   echo "repo-guard: proprietary-name check SKIPPED -- it runs locally only, by design."
   echo "  Secret shapes and home paths are checked below; neither needs configuration."
@@ -155,6 +158,90 @@ elif [ -z "$NAMES_SETTING" ]; then
   exit 1
 fi
 NAME_PATTERNS="${REPO_GUARD_NAME_PATTERNS:-}"
+
+# Who a commit says made it. A checkout without a repository-local identity commits as the machine's global one, and the
+# content checks above pass such a commit: on 2026-11-21 seven commits from a scratch clone reached main as the
+# maintainer's private identity, and main's history had to be rewritten. So each commit's author and committer are read
+# against a private identity list, resolved like the name list (environment, then .env) with the same three states,
+# `off`, a regex, or unset. Unset blocks a commit (--staged), since a checkout with no identity configured is the case
+# this exists for; in --range it is skipped and said, as CI on a fork's pull request receives no secret. --all scans a
+# tree, which has no commits.
+if [ -z "${REPO_GUARD_IDENTITY_PATTERNS:-}" ] && [ -f .env ]; then
+  REPO_GUARD_IDENTITY_PATTERNS="$(grep '^REPO_GUARD_IDENTITY_PATTERNS=' .env | head -1 | cut -d= -f2- \
+    | sed -e "s/^['\"]//" -e "s/['\"]\$//")"
+fi
+IDENTITY_SETTING="$(printf '%s' "${REPO_GUARD_IDENTITY_PATTERNS:-}" \
+  | tr '[:upper:]' '[:lower:]' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+IDENTITY_PATTERNS="${REPO_GUARD_IDENTITY_PATTERNS:-}"
+CHECK_IDENTITY=1
+# grep exits 2 on a pattern it cannot compile, and a test that reads 2 as "no match" turns the check off while reporting
+# clean. So an identity is matched only through identity_match, which tells the three apart, and the error is reported
+# without the pattern or grep's own text, either of which would put the list in a public log.
+identity_match() {  # 0 match, 1 no match, 2 the pattern is not a valid regex
+  local rc
+  printf '%s\n' "$1" | grep -Eiq -- "$IDENTITY_PATTERNS" 2>/dev/null
+  rc=$?
+  [ "$rc" -le 1 ] && return "$rc"
+  return 2
+}
+# One commit's identities: its author, its committer, and every line of its message, since GitHub credits a co-author
+# named there (Co-authored-by, read its own way, so not git's trailer parse, which sees only the last paragraph) and a
+# listed identity written anywhere in a message is in public history too. A record whose sha is not 40 hex digits means
+# the fields shifted (a NUL inside a value), so it is refused rather than read. Prints only the short SHA and the field.
+check_identity_record() {  # sha author committer message
+  local field value line
+  if ! [[ "$1" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "repo-guard: BLOCKED [instrument]: an identity record's first field is not a commit SHA (fields shifted?)." >&2
+    exit 2
+  fi
+  for field in author committer; do
+    if [ "$field" = author ]; then value="$2"; else value="$3"; fi
+    identity_match "$value"
+    case $? in
+      0) echo "BLOCKED [identity]: commit ${1:0:8}'s $field is on the private identity list"; fail=1 ;;
+      2) identity_pattern_invalid ;;
+    esac
+  done
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    identity_match "$line"
+    case $? in
+      0) echo "BLOCKED [identity]: commit ${1:0:8}'s message names an identity on the private identity list"; fail=1 ;;
+      2) identity_pattern_invalid ;;
+    esac
+  done <<EOF_MESSAGE
+$4
+EOF_MESSAGE
+}
+identity_pattern_invalid() {
+  echo "repo-guard: BLOCKED [config]: REPO_GUARD_IDENTITY_PATTERNS is not a valid extended regex; the identity check"
+  echo "  cannot run, so nothing passes it. (The pattern is not printed: it is private.)"
+  exit 2
+}
+if [ "$MODE" = "--all" ]; then
+  CHECK_IDENTITY=0
+elif [ "$IDENTITY_SETTING" = "off" ]; then
+  CHECK_IDENTITY=0
+  echo "repo-guard: identity check off -- no identity list on this machine."
+elif [ -z "$IDENTITY_SETTING" ]; then
+  if [ "$MODE" = "--staged" ]; then
+    echo "repo-guard: BLOCKED [config]: REPO_GUARD_IDENTITY_PATTERNS is not set."
+    echo "Set it in .env (gitignored) or the environment, as REPO_GUARD_NAME_PATTERNS is:"
+    echo "  off        you are contributing and hold no list -- the check is skipped"
+    echo "  <regex>    the identities that must never author or commit here -- the check runs"
+    exit 1
+  fi
+  # CI sets REPO_GUARD_IDENTITY_REQUIRED on a same-repo push or pull request, where the secret is always given: empty
+  # there means it was deleted or renamed, and a green "skipped" would hide that the check stopped (the e2e lane).
+  if [ "${REPO_GUARD_IDENTITY_REQUIRED:-}" = "1" ]; then
+    echo "repo-guard: BLOCKED [config]: REPO_GUARD_IDENTITY_PATTERNS is not set, and this run requires it (a push or"
+    echo "  pull request from this repository receives the secret; is it deleted or renamed?)."
+    exit 1
+  fi
+  CHECK_IDENTITY=0
+  echo "repo-guard: identity check skipped -- no identity list here (in CI: a pull request from a fork, which receives"
+  echo "  no secret, or a bot's)."
+fi
 
 # Secret shapes. Never commit these.
 SECRET_PATTERNS='(sk-[A-Za-z0-9]{16,}|AF_SECRET_KEY|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|xox[baprs]-[A-Za-z0-9-]{8,})'
@@ -273,6 +360,79 @@ while IFS= read -r -d '' f; do
   fi
 done < <(list_files)
 
+# The identity checks. Under --staged the identity the commit will carry, which is local output and may name it. Under
+# --range each commit's, naming only the commit and the field: a CI log is public, and printing the identity or the
+# pattern would publish what the list exists to keep out.
+if [ "$CHECK_IDENTITY" -eq 1 ]; then
+  identity_match ""
+  [ $? -eq 2 ] && identity_pattern_invalid
+fi
+if [ "$CHECK_IDENTITY" -eq 1 ] && [ "$MODE" = "--staged" ]; then
+  for who in AUTHOR COMMITTER; do
+    ident="$(git var "GIT_${who}_IDENT" 2>/dev/null | sed -E 's/ [0-9]+ [+-][0-9]{4}$//')"
+    identity_match "$ident"
+    case $? in
+      0) echo "BLOCKED [identity]: this commit's $(printf '%s' "$who" | tr '[:upper:]' '[:lower:]') is on the private identity list: $ident"
+         echo "  Set this checkout's public identity (git config user.name and user.email), then commit again."
+         fail=1 ;;
+      2) identity_pattern_invalid ;;
+    esac
+  done
+fi
+if [ "$CHECK_IDENTITY" -eq 1 ] && [ "$MODE" = "--range" ]; then
+  if ! expected="$(git rev-list --count "$RANGE" 2>/dev/null)"; then
+    echo "repo-guard: BLOCKED [instrument]: git could not read the range '$RANGE' for identities." >&2
+    exit 2
+  fi
+  seen=0
+  # Each field NUL-terminated and read without a command substitution, which would drop the NULs: a name may hold a
+  # tab, and tab-split fields shifted so an exact pattern matched neither (Codex's review of #290).
+  while IFS= read -r -d '' sha && IFS= read -r -d '' author && IFS= read -r -d '' committer \
+        && IFS= read -r -d '' message; do
+    sha="${sha#$'\n'}"
+    seen=$((seen + 1))
+    check_identity_record "$sha" "$author" "$committer" "$message"
+  done < <(git log -z --format='%H%x00%an <%ae>%x00%cn <%ce>%x00%B' \
+             "$RANGE" 2>/dev/null)
+  # A git log that failed inside the process substitution reads as no commits; every commit in the range must be read.
+  if [ "$seen" -ne "$expected" ]; then
+    echo "repo-guard: BLOCKED [instrument]: read the identities of $seen of $expected commit(s) in '$RANGE'." >&2
+    exit 2
+  fi
+  echo "repo-guard: identity: $seen commit(s) checked."
+fi
+# `--identities`: a pull request's commit identities on stdin, as NUL-terminated records of four fields (sha, author,
+# committer, the whole message), each optionally followed by a newline, as scripts/repo-guard-identities.py writes them. identity-guard.yml runs it under pull_request_target, so a fork's pull request
+# is checked too: that job runs this repository's code with the secret and reads the identities from GitHub's API, never
+# the fork's code. REPO_GUARD_IDENTITY_EXPECTED is the pull request's own commit count; fewer identities read fails.
+if [ "$MODE" = "--identities" ] && [ "$CHECK_IDENTITY" -eq 1 ]; then
+  if ! [[ "${REPO_GUARD_IDENTITY_EXPECTED:-}" =~ ^[0-9]+$ ]]; then
+    echo "repo-guard: BLOCKED [config]: --identities needs REPO_GUARD_IDENTITY_EXPECTED, the pull request's commit count." >&2
+    exit 2
+  fi
+  seen=0
+  while IFS= read -r -d '' sha && IFS= read -r -d '' author && IFS= read -r -d '' committer \
+        && IFS= read -r -d '' message; do
+    sha="${sha#$'\n'}"
+    seen=$((seen + 1))
+    check_identity_record "$sha" "$author" "$committer" "$message"
+  done
+  expected="$REPO_GUARD_IDENTITY_EXPECTED"
+  if [ "$seen" -ne "$expected" ]; then
+    echo "repo-guard: BLOCKED [instrument]: read the identities of $seen of $expected commit(s) the pull request has." >&2
+    exit 2
+  fi
+  echo "repo-guard: identity: $seen commit(s) checked."
+fi
+
+if [ "$MODE" = "--identities" ]; then
+  if [ "$fail" -ne 0 ]; then
+    echo "repo-guard: blocked: a commit's identity (author, committer or message) is on the private identity list."
+    exit 1
+  fi
+  echo "repo-guard: identity clean."
+  exit 0
+fi
 if [ "$fail" -ne 0 ]; then
   echo
   echo "repo-guard: commit blocked. Remove the offending content (or route secrets/URLs through"

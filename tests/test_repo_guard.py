@@ -23,7 +23,9 @@ KEY_SHAPE = "AKIA" + "Q" * 16  # a secret shape the script blocks, never spelled
 # git runs under an empty global config and no system one, so a contributor's settings (a signing
 # key, `core.quotePath=false`) cannot colour what the script sees (the review gate on the fix).
 ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
-       "REPO_GUARD_NAME_PATTERNS": BLOCKED_NAME}
+       "REPO_GUARD_NAME_PATTERNS": BLOCKED_NAME,
+       # The identity check (tests/test_repo_guard_identity.py) fails closed when unset; a list no test identity matches.
+       "REPO_GUARD_IDENTITY_PATTERNS": "nobody-in-these-tests"}
 
 
 def _git(repo: Path, *args: str) -> str:
