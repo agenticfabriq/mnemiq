@@ -36,9 +36,11 @@ from mnemiq.superset.client import (
     SupersetRefusedCaller,
     SupersetResponseTooLarge,
 )
+from mnemiq.execute.cut import sent_of
 from mnemiq.superset.executor import superset_executor
 from mnemiq.superset.grants import NOT_A_BUILDER, _probe, _tables, resolve_grants
 from mnemiq.superset.payload import _CUT as CUT
+from mnemiq.superset.payload import ResultCut
 from mnemiq.superset.payload import table_from_payload
 from mnemiq.superset.service import ServiceKey, enrichment_adapter
 from mnemiq.superset.settings import SUPERSET_SOURCE_JOB
@@ -654,3 +656,20 @@ def test_a_statement_past_its_time_limit_reads_as_timed_out(live, enriched, monk
     waited = time.perf_counter() - started
     assert isinstance(gave_up.value.__cause__, SupersetCallTimedOut)
     observe("timeout", superset_answered_after=round(ran, 2), transport_gave_up_after=round(waited, 2))
+
+
+WIDE = "SELECT g, repeat('x', 120) AS wide FROM generate_series(1, 1000) AS g ORDER BY g"
+
+
+def test_an_answer_larger_than_one_response_is_its_first_rows(live, enriched):
+    """1,000 rows of 120 characters each: more than rc2's MCP service sends in one response, whose answer carries each
+    row twice. Read as an answer (`execute_answer`), they are the statement's own first rows, marked with how many came;
+    read as any other result (`execute_arrow`), they are refused, as before."""
+    settings, _ = enriched
+    adapter = superset_executor(settings, DelegatedToken(live.token("analyst")))
+    table = adapter.execute_answer(WIDE)
+    sent = sent_of(table)
+    assert sent is not None and 0 < sent < 1000 and table.num_rows == sent, (sent, table.num_rows)
+    assert table.column("g").to_pylist() == list(range(1, sent + 1))
+    with pytest.raises(ResultCut):
+        adapter.execute_arrow(WIDE)

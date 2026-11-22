@@ -57,13 +57,15 @@ measured against that Superset.
 - **The tools mnemiq calls left on.** `execute_sql`, `list_datasets` and `get_database_info` must not be in
   `MCP_DISABLED_TOOLS`. Tool search (`MCP_TOOL_SEARCH_CONFIG`) may stay on: Superset 7.0.0rc2 serves a tool called by
   name either way (measured).
-- **Results sent whole.** Superset's response size guard (`MCP_RESPONSE_SIZE_CONFIG`, 50,000 bytes by default) cuts
-  a larger `execute_sql` result by dropping rows. mnemiq never answers from a cut result: it asks the model to
-  aggregate or select less, and if the model cannot, the builder reads "Could not answer this question: the database
-  rejected every attempt. The source rejected this query.", which does not say the result was too large. So a large
-  result is never answered unless you take `execute_sql` out of the guard, which is the better fix, or raise its
-  `max_bytes` to about twice the size of the largest result you want answered: the guard measures the whole answer,
-  and `execute_sql`'s answer carries every row twice, once as the result's rows and again in the statement's own data.
+- **Results that fit one response.** Superset's response size guard (`MCP_RESPONSE_SIZE_CONFIG`, 50,000 bytes by
+  default) cuts a larger `execute_sql` result by dropping rows, or refuses it when no cut fits. An answer to a question
+  is then the result's first rows: those Superset kept, or, when it refused, those a smaller `limit` brings under the
+  guard, asked again up to three times, each sized from Superset's refusal. The answer says so: "These results stop at
+  the N rows Superset sends in one answer, so there may be more: counts and totals over them are not the whole."
+  Nothing else mnemiq reads, a chart's check, the catalogue or a plan's probe, is read from a cut result. For whole
+  results, take `execute_sql` out of the guard, which is the better fix, or raise its `max_bytes` to about twice the
+  size of the largest result you want answered whole: the guard measures the whole answer, and `execute_sql`'s answer
+  carries every row twice, once as the result's rows and again in the statement's own data.
   To take `execute_sql` out, add it to the guard's `excluded_tools`:
 
   ```python
