@@ -73,6 +73,17 @@ def read_execute_response(payload: dict) -> pa.Table:
     return table_from_payload(columns, rows)
 
 
+def read_execute_prefix(payload: dict) -> pa.Table:
+    """The rows a successful `execute_sql` payload carries at its top level, whether or not Superset cut them to fit its
+    response size: a cut answer keeps its first rows there (`truncate_query_result` keeps the longest prefix that fits),
+    so these are the answer's first rows. Only an answer read as such may be read this way (`execute_answer`)."""
+    check_execute_response(payload)
+    columns, rows = payload.get("columns"), payload.get("rows")
+    if columns is None or rows is None:
+        raise SupersetQueryFailed("the statement returned no result set; send one SELECT")
+    return table_from_payload(columns, rows)
+
+
 def check_execute_response(payload: dict) -> None:
     """Raise what a failed `execute_sql` payload means; return for a successful one, whatever it carries."""
     if payload.get("success") is True:

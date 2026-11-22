@@ -16,6 +16,7 @@ result cache.
 from __future__ import annotations
 
 import math
+import re
 from functools import cached_property
 
 import pyarrow as pa
@@ -31,7 +32,15 @@ from mnemiq.superset.client import (
     SupersetResponseTooLarge,
     SupersetUnavailable,
 )
-from mnemiq.superset.payload import ResultCut, SupersetQueryFailed, check_execute_response, read_execute_response
+from mnemiq.execute.cut import mark_sent
+from mnemiq.sql.guard import MAX_ROWS
+from mnemiq.superset.payload import (
+    ResultCut,
+    SupersetQueryFailed,
+    check_execute_response,
+    read_execute_prefix,
+    read_execute_response,
+)
 from mnemiq.superset.pg_catalog import PostgresCatalogue
 from mnemiq.superset.settings import SUPERSET_DIALECT
 
@@ -55,6 +64,15 @@ TRANSPORT_MARGIN_S = 15.0
 # make smaller, so both raise `ResultCut`.
 _TOO_LARGE_TO_SEND = ("Superset would not send this result, which is larger than its response size allows; aggregate, "
                       "or select fewer rows or columns.")
+
+# What a refusal of a result too large to send says of its size: `Response too large: <N> bytes (limit: <M>)`
+# (`superset/mcp_service/middleware.py`). An answer asked again is sized from it.
+_REFUSED_SIZE = re.compile(r"Response too large: ([\d,]+) bytes \(limit: ([\d,]+)\)")
+# How many times an answer refused as too large is asked again for fewer rows, each sized from the latest refusal, and
+# the share of the limit each aims for. rc2's answer carries its rows twice (`rows` and `statements`), so a size read
+# off a refusal already counts both.
+_RE_ASKS = 3
+_AIM = 0.8
 
 # The refusals that end a request wherever they are met: of the caller, of the caller's roles, and one Superset does not
 # explain. Each stays the same for every later call the request makes, so no rewrite or retry can help. Superset's
@@ -117,6 +135,35 @@ class SupersetSqlAdapter:
         """`sql`'s result as the database answers it now: Superset is asked to run it (`force_refresh`) rather than
         answer from its result cache, as the plan check's reads of a filter's value need. Raises as `execute_arrow`."""
         return self._result(sql, timeout_s, force_refresh=True)
+
+    def execute_answer(self, sql: str, timeout_s: float | None = None) -> pa.Table:
+        """`sql`'s result as an answer: whole, or, when it is larger than Superset's MCP service sends in one response,
+        its first rows, marked with how many (`mark_sent`), for the answer to say it stops there. Superset cuts such an
+        answer to the rows that fit, or refuses it when no cut fits; a refused answer is asked again with
+        `execute_sql`'s `limit`, which Superset sets in the statement, sized from the refusal, up to `_RE_ASKS` times.
+        One still refused, or cut to no rows, raises `ResultCut`, as `execute_arrow` does for any answer too large.
+
+        Only for the answer to a question: every other read (a check, a catalogue page, a plan's probe) compares or
+        decides on all of a result, and reads it with `execute_arrow`, which a cut result never reaches."""
+        limit: int | None = None
+        for asked in range(_RE_ASKS + 1):
+            try:
+                payload = self._execute_sql(sql, timeout_s, row_limit=limit)
+            except SupersetResponseTooLarge as refused:
+                sizes = _refused_size(refused)
+                if sizes is None or asked == _RE_ASKS:
+                    raise ResultCut(_TOO_LARGE_TO_SEND) from refused
+                sent_bytes, allowed = sizes
+                limit = max(1, math.floor((limit or MAX_ROWS) * allowed / sent_bytes * _AIM))
+                continue
+            if payload.get("_response_truncated"):
+                table = read_execute_prefix(payload)
+                if not table.num_rows:
+                    raise ResultCut(_TOO_LARGE_TO_SEND)
+                return mark_sent(table, table.num_rows)
+            table = read_execute_response(payload)
+            return mark_sent(table, limit) if limit is not None and table.num_rows >= limit else table
+        raise AssertionError("unreachable: the last refusal raises")
 
     def execute(self, sql: str) -> list[tuple]:
         return _tuples(self.execute_arrow(sql))
@@ -223,7 +270,7 @@ class SupersetSqlAdapter:
         return read_execute_response(payload)
 
     def _execute_sql(self, sql: str, timeout_s: float | None, *, dry_run: bool = False,
-                     force_refresh: bool = False) -> dict:
+                     force_refresh: bool = False, row_limit: int | None = None) -> dict:
         for delimiter in JINJA_DELIMITERS:
             if delimiter in sql:
                 raise SupersetQueryFailed(f"the statement holds {delimiter}, which Superset reads as a template "
@@ -232,6 +279,8 @@ class SupersetSqlAdapter:
         request = {"database_id": self._database_id, "sql": sql, "schema": self._schema, "timeout": limit}
         if dry_run:
             request["dry_run"] = True
+        if row_limit is not None:
+            request["limit"] = row_limit  # Superset sets it as the statement's LIMIT, in place
         if force_refresh or self._refresh_every_statement:
             request["force_refresh"] = True
         try:
@@ -246,6 +295,16 @@ class SupersetSqlAdapter:
             if kept is None or (isinstance(exc, SupersetRefusedCaller) and not isinstance(kept, SupersetRefusedCaller)):
                 self._terminal_refusal = exc
             raise
+
+
+def _refused_size(refused: SupersetResponseTooLarge) -> tuple[int, int] | None:
+    """The bytes a refused answer held and the bytes Superset allows, read off its refusal, or None when it does not
+    say."""
+    found = _REFUSED_SIZE.search(refused.detail or "")
+    if found is None:
+        return None
+    sent_bytes, allowed = (int(group.replace(",", "")) for group in found.groups())
+    return (sent_bytes, allowed) if sent_bytes > 0 and allowed > 0 else None
 
 
 def _tuples(table: pa.Table) -> list[tuple]:

@@ -14,6 +14,7 @@ import time
 import pytest
 
 from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
+from mnemiq.execute.cut import sent_of
 from mnemiq.execute.runner import ExecutionError, QueryCancelledError, SourceUnavailableError, run
 from mnemiq.sql.prove import Proof, prove_outcome
 from mnemiq.superset.adapter import JINJA_DELIMITERS, TRANSPORT_MARGIN_S, SupersetSqlAdapter
@@ -49,7 +50,11 @@ def _failed(error_type: str, error: str = "Superset's own words") -> dict:
     return {"success": False, "rows": None, "columns": None, "error": error, "error_type": error_type}
 
 
-def _adapter(answer: dict | Exception = REGION_COUNTS, **kwargs) -> SupersetSqlAdapter:
+def _adapter(answer: dict | Exception | list = REGION_COUNTS, **kwargs) -> SupersetSqlAdapter:
+    """The adapter over a recording client answering `answer`, or each of a list of answers in turn."""
+    if isinstance(answer, list):
+        pending = list(answer)
+        answer = lambda request: pending.pop(0)  # noqa: E731
     return SupersetSqlAdapter(RecordingClient(answer), database_id=7, schema="sales", **kwargs)
 
 
@@ -412,3 +417,58 @@ def test_no_other_failure_is_remembered(answer):
     with pytest.raises(Exception):
         adapter.user_functions()
     assert adapter.terminal_refusal is None
+
+
+# ---------------------------------------------------------------- an answer larger than one response
+
+
+def _rows(n: int) -> dict:
+    return {**REGION_COUNTS, "rows": [{"region": f"r{i}", "policy_count": i} for i in range(n)], "row_count": n}
+
+
+# rc2 cut the answer to fit: the top-level rows it kept are the answer's first rows.
+CUT = {**_rows(2), "_response_truncated": True, "_truncation_notes": ["Result truncated: 2 of 250 rows returned"]}
+
+
+def test_a_cut_answer_is_its_prefix_marked():
+    adapter = _adapter(CUT)
+    table = adapter.execute_answer(SQL)
+    assert table.num_rows == 2 and sent_of(table) == 2
+    assert len(adapter.client.calls) == 1
+
+
+def test_a_refused_answer_is_asked_again_with_a_limit_sized_from_the_refusal():
+    """61,234 bytes against a 50,000 limit, for at most the deciders' 1,000 rows: asked again for 653 rows."""
+    adapter = _adapter([TOO_LARGE, REGION_COUNTS])
+    table = adapter.execute_answer(SQL)
+    first, second = adapter.client.calls
+    assert "limit" not in first.request and second.request["limit"] == 653
+    assert table.num_rows == 1 and sent_of(table) is None  # fewer rows than asked for: the whole answer
+    assert sent_of(_adapter([TOO_LARGE, _rows(653)]).execute_answer(SQL)) == 653
+
+
+def test_a_re_asked_answer_that_comes_back_cut_is_its_prefix():
+    assert sent_of(_adapter([TOO_LARGE, CUT]).execute_answer(SQL)) == 2
+
+
+def test_refused_three_times_more_is_a_cut_result():
+    """Each re-ask is smaller than the last, and the fourth refusal ends it, as a result too large always did."""
+    adapter = _adapter([TOO_LARGE] * 4)
+    with pytest.raises(ResultCut):
+        adapter.execute_answer(SQL)
+    limits = [call.request.get("limit") for call in adapter.client.calls]
+    assert len(limits) == 4 and limits[0] is None and limits[1] > limits[2] > limits[3] >= 1
+
+
+def test_a_refusal_without_its_sizes_is_a_cut_result():
+    bare = SupersetResponseTooLarge("Superset's answer to execute_sql was larger than its MCP service will send; ask "
+                                    "for less", detail="Error: the answer was too large")
+    adapter = _adapter([bare])
+    with pytest.raises(ResultCut):
+        adapter.execute_answer(SQL)
+    assert len(adapter.client.calls) == 1
+
+
+def test_an_answer_cut_to_no_rows_is_a_cut_result():
+    with pytest.raises(ResultCut):
+        _adapter({**_rows(0), "_response_truncated": True}).execute_answer(SQL)
