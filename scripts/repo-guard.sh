@@ -200,9 +200,16 @@ elif [ -z "$IDENTITY_SETTING" ]; then
     echo "  <regex>    the identities that must never author or commit here -- the check runs"
     exit 1
   fi
+  # CI sets REPO_GUARD_IDENTITY_REQUIRED on a same-repo push or pull request, where the secret is always given: empty
+  # there means it was deleted or renamed, and a green "skipped" would hide that the check stopped (the e2e lane).
+  if [ "${REPO_GUARD_IDENTITY_REQUIRED:-}" = "1" ]; then
+    echo "repo-guard: BLOCKED [config]: REPO_GUARD_IDENTITY_PATTERNS is not set, and this run requires it (a push or"
+    echo "  pull request from this repository receives the secret; is it deleted or renamed?)."
+    exit 1
+  fi
   CHECK_IDENTITY=0
-  echo "repo-guard: identity check skipped -- no identity list here (in CI: the repository secret is unset, or the"
-  echo "  pull request comes from a fork, which receives no secret)."
+  echo "repo-guard: identity check skipped -- no identity list here (in CI: a pull request from a fork, which receives"
+  echo "  no secret, or a bot's)."
 fi
 
 # Secret shapes. Never commit these.
@@ -366,6 +373,7 @@ if [ "$CHECK_IDENTITY" -eq 1 ] && [ "$MODE" = "--range" ]; then
     echo "repo-guard: BLOCKED [instrument]: read the identities of $seen of $expected commit(s) in '$RANGE'." >&2
     exit 2
   fi
+  echo "repo-guard: identity: $seen commit(s) checked."
 fi
 
 if [ "$fail" -ne 0 ]; then

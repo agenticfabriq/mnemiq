@@ -196,3 +196,51 @@ def test_a_failed_identity_read_is_an_error_not_a_clean_pass(repo: Path, tmp_pat
     env = _env(PATH=f"{shim}:{os.environ['PATH']}")
     out = _guard(repo, "--range", "HEAD~1..HEAD", env=env)
     assert out.returncode == 2 and "0 of 1" in out.stderr, out.stdout + out.stderr
+
+
+# -- the e2e lane's review of #290 (mutation-tested) -----------------------------------------------------------------
+
+
+def test_range_mode_catches_a_committer_alone(repo: Path) -> None:
+    # The incident's shape: one of the seven commits had the private identity as committer only.
+    (repo / "a.txt").write_text("committed by the wrong identity\n")
+    _git(repo, "add", "a.txt")
+    env = _env(GIT_COMMITTER_NAME="Private Persona", GIT_COMMITTER_EMAIL=f"{BLOCKED}@mail.example")
+    _git(repo, "commit", "-qm", "c", env=env)
+    sha = _git(repo, "rev-parse", "--short=8", "HEAD").strip()
+    out = _guard(repo, "--range", "HEAD~1..HEAD")
+    assert out.returncode == 1 and f"commit {sha}'s committer" in out.stdout
+    assert "author is on" not in out.stdout, "the author is clean here"
+
+
+@pytest.mark.parametrize("mode", ["--staged", "--range"])
+def test_the_match_ignores_case(repo: Path, mode: str) -> None:
+    # A pattern written lowercase against a capitalised identity: the likeliest silent miss.
+    upper = BLOCKED.upper()
+    (repo / "a.txt").write_text("by a capitalised identity\n")
+    _git(repo, "add", "a.txt")
+    env = _env(GIT_AUTHOR_NAME="Private Persona", GIT_AUTHOR_EMAIL=f"{upper}@MAIL.EXAMPLE")
+    if mode == "--range":
+        _git(repo, "commit", "-qm", "u", env=env)
+        out = _guard(repo, "--range", "HEAD~1..HEAD")
+    else:
+        out = _guard(repo, "--staged", env=env)
+    assert out.returncode == 1 and "author" in out.stdout
+
+
+def test_range_mode_says_how_many_commits_it_checked(repo: Path) -> None:
+    (repo / "a.txt").write_text("one\n")
+    _git(repo, "commit", "-qam", "one")
+    (repo / "a.txt").write_text("two\n")
+    _git(repo, "commit", "-qam", "two")
+    out = _guard(repo, "--range", "HEAD~2..HEAD")
+    assert out.returncode == 0 and "identity: 2 commit(s) checked" in out.stdout
+
+
+def test_a_list_required_but_missing_fails_instead_of_skipping(repo: Path) -> None:
+    # In CI on a same-repo push or pull request the secret is required: missing means deleted or renamed, not a fork.
+    (repo / "a.txt").write_text("clean\n...")
+    _git(repo, "commit", "-qam", "r")
+    out = _guard(repo, "--range", "HEAD~1..HEAD",
+                 env=_env(REPO_GUARD_IDENTITY_PATTERNS=None, REPO_GUARD_IDENTITY_REQUIRED="1"))
+    assert out.returncode == 1 and "REPO_GUARD_IDENTITY_PATTERNS is not set" in out.stdout
