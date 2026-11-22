@@ -11,6 +11,10 @@ name: identity-guard
 #     scripts/repo-guard.sh on stdin; nothing the pull request controls is interpolated into a shell command;
 #   - it prints only a commit's short SHA and "author", "committer" or "message" on a hit, never the identity or pattern.
 # The API lists at most 250 commits; a longer pull request cannot be checked whole and fails.
+# It can also fail closed with "the pinned comparison has N commit(s), the event M". That means the event's base SHA
+# is older than base-branch commits the pull request already holds (main moved, and the branch merged it, before the
+# event was cut), so the pinned comparison counts those commits too. It is not an identity finding: push again, or
+# re-run once the base has settled, and the new event's base SHA brings the counts back into agreement.
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
