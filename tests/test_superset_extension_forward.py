@@ -107,7 +107,8 @@ def test_purpose_follows_the_route(signing):
     "/v1/superset/builds/..", "//elsewhere/v1/schema", "/v1/superset/dashboards/12/measures/a/b/edit",
     "/v1/superset/dashboards/12/measures/a%2fb/edit", "/v1/superset/dashboards/12/measures/../edit",
     "/v1/superset/dashboards/12/measures/./edit", "/v1/superset/dashboards/0/measures",
-    f"/v1/superset/builds/{BUILD_ID}/next/again", "/v1/schema/", "/V1/schema",
+    f"/v1/superset/builds/{BUILD_ID}/next/again", f"/v1/superset/builds/{BUILD_ID}/confirm/again", "/v1/schema/",
+    "/V1/schema",
 ])
 def test_unlisted_path_is_refused_without_calling_mnemiq(signing, path):
     found, send = _forward(signing, "POST" if path.endswith(("edit", "again")) else "GET", path)
@@ -228,7 +229,8 @@ def test_every_listed_route_forwards(signing):
     """Each route the panel uses is forwarded, by its method, with its purpose."""
     cases = [("GET", "/v1/schema"), ("POST", "/v1/chat"), ("GET", "/v1/superset/builds"),
              ("POST", "/v1/superset/builds"), ("GET", f"/v1/superset/builds/{BUILD_ID}"),
-             ("POST", f"/v1/superset/builds/{BUILD_ID}/next"), ("GET", "/v1/superset/dashboards/12/measures"),
+             ("POST", f"/v1/superset/builds/{BUILD_ID}/next"), ("POST", f"/v1/superset/builds/{BUILD_ID}/confirm"),
+             ("GET", "/v1/superset/dashboards/12/measures"),
              ("POST", "/v1/superset/dashboards/12/measures/policies/edit"),
              ("POST", "/v1/superset/dashboards/12/measures/total_premium@12/remove"),
              ("POST", "/v1/superset/dashboards/12/measures/policies/save"),

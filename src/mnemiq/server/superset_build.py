@@ -71,13 +71,21 @@ from mnemiq.llm.client import ModelUnavailable
 from mnemiq.profiles import UnknownProfile
 from mnemiq.server.superset_refusals import NotForBuilding
 from mnemiq.server.v1_refusals import NotPermitted, refused, unknown_profile
-from mnemiq.superset.build_store import MAX_ID, BuildNotFound, BuildStore, BuildStoreMissing, DashboardBusy
+from mnemiq.superset.build_store import (
+    MAX_ID,
+    PROPOSED,
+    BuildNotFound,
+    BuildStore,
+    BuildStoreMissing,
+    DashboardBusy,
+    StoredBuild,
+)
 from mnemiq.superset.builder import BuildBusy, BuildState, build_state, next_step, start_build
 from mnemiq.superset.chart_change import ChangeAnswer, change_dashboard
 from mnemiq.superset.client import SupersetToolError
 from mnemiq.superset.dashboard_charts import LeftOut, datasets_built_on
 from mnemiq.superset.executor import SupersetCredentialMissing, superset_executor
-from mnemiq.superset.extension import ExtensionMissing, dashboard_editorship, require_build_tools
+from mnemiq.superset.extension import ExtensionMissing, call_tool, dashboard_editorship, require_build_tools
 from mnemiq.superset.measure_actions import (
     ActionRefused,
     ActionResult,
@@ -94,7 +102,8 @@ from mnemiq.superset.measure_actions import DashboardUnreadable as _MeasuresUnre
 from mnemiq.superset.measures import MAX_LABEL, MeasureKind
 from mnemiq.superset.planner import MAX_DESCRIPTION, MAX_GOAL, BuildPlan, PlanContext, PlanRefused, plan_build
 
-__all__ = ["READ_SCOPES", "WRITE_SCOPES", "mount_superset_build"]
+__all__ = ["READ_SCOPES", "WRITE_SCOPES", "BuildAlreadyStarted", "PlanStale", "confirm_proposed_build",
+           "mount_superset_build"]
 
 logger = logging.getLogger(__name__)
 
@@ -122,12 +131,60 @@ class DashboardUnreadable(Exception):
     """`dashboard_id` names no dashboard the builder can read: none of that id, or one they may not read."""
 
 
+class PlanStale(Exception):
+    """The dashboard a proposed build was planned onto changed since its plan, so the plan is not confirmed."""
+
+    def __init__(self) -> None:
+        super().__init__("The dashboard changed since this plan; plan it again.")
+
+
+class BuildAlreadyStarted(Exception):
+    """A confirm of a build that is no longer a proposal: confirmed already, from another tab or a second click."""
+
+    def __init__(self) -> None:
+        super().__init__("This build was already started.")
+
+
 class NotAnEditor(Exception):
     """The builder reads the dashboard but does not edit it. `editors` are their labels, for the HTTP answer only."""
 
     def __init__(self, dashboard_id: int, editors: list) -> None:
         named = f"; its editors are {', '.join(str(label) for label in editors)}" if editors else ""
         super().__init__(f"This builder is not an editor of dashboard {dashboard_id}{named}.")
+
+
+def _changed_on(client, dashboard_id: int) -> str:
+    """The dashboard's `changed_on`, as the extension's `get_layout` answers it to the builder: what a proposal is
+    planned against and read again at its confirm. DashboardUnreadable when they cannot read it."""
+    answer = call_tool(client, "get_layout", {"dashboard_id": dashboard_id})
+    if answer.get("dashboard_id") != dashboard_id or not isinstance(answer.get("changed_on"), str):
+        raise DashboardUnreadable()
+    return answer["changed_on"]
+
+
+def confirm_proposed_build(asking, builds, build_id: str, *, deployment) -> StoredBuild:
+    """Start the person's proposed build: the one confirm the confirm route and a conversation's confirm make. A build
+    onto a dashboard is confirmed only while the dashboard's `changed_on` is the one its plan was made against
+    (`PlanStale` otherwise); `DashboardBusy` while another build of it is building, the proposal kept;
+    `BuildAlreadyStarted` once it is no longer a proposal; BuildNotFound unless it is the person's."""
+    who, delegation = _builder(asking, building=True)
+    build = builds.load_build(who.tenant_id, build_id, who.principal_id)
+    if build is None:
+        raise BuildNotFound()
+    if build.status != PROPOSED:
+        raise BuildAlreadyStarted()
+    if build.dashboard_id is not None:
+        client = superset_executor(deployment, delegation).client
+        if _changed_on(client, build.dashboard_id) != build.planned_against:
+            raise PlanStale()
+    try:
+        return builds.confirm_build(who.tenant_id, build.build_id, who.principal_id)
+    except BuildNotFound:
+        # Confirmed meanwhile, from another tab: said as a second confirm is.
+        again = builds.load_build(who.tenant_id, build.build_id, who.principal_id)
+        if again is not None and again.status != PROPOSED:
+            raise BuildAlreadyStarted() from None
+        raise
 
 
 def _held_to_its_editors(client, dashboard_id: int) -> None:
@@ -157,6 +214,8 @@ class StartBody(BaseModel):
     # A new dashboard, whatever a plan would offer.
     fresh: StrictBool = False
     profile: StrictStr | None = None  # None: the deployment's default
+    # Plan it and keep it as a proposal, writing nothing to Superset until the person confirms it.
+    propose: StrictBool = False
 
     @model_validator(mode="after")
     def _one_answer(self) -> StartBody:
@@ -317,7 +376,7 @@ def _builder(asking, *, building: bool, reading: bool = False):
 def _refusal(exc: Exception, doors) -> HTTPException | None:
     """The response a failure of a build route becomes: the build's own here, Superset's and Superset mode's as every
     `/v1` route answers them (`v1_refusals.refused`). None for anything else, which stays a 500."""
-    if isinstance(exc, (BuildBusy, DashboardBusy)):
+    if isinstance(exc, (BuildBusy, DashboardBusy, PlanStale, BuildAlreadyStarted)):
         return HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, (BuildNotFound, MeasureNotFound)):
         return HTTPException(status_code=404, detail=str(exc))
@@ -372,9 +431,10 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
             raise answer from None
 
     def started(asking_, goal: str, *, dashboard_id: int | None, fresh: bool, profile_name: str | None,
-                ) -> tuple[int, dict]:
+                propose: bool = False) -> tuple[int, dict]:
         """A goal planned and, when its plan is one, started as a build: the status and the answer, as the start route
-        gives them. A change asked by chat that adds a chart runs it too, onto its dashboard."""
+        gives them. A change asked by chat that adds a chart runs it too, onto its dashboard. Proposed, the build is
+        kept waiting for its confirm and nothing is written to Superset: a 200 naming it and its plan."""
         who, delegation = _builder(asking_, building=True)
         builds = kept()
         profile = runtime.build_profile(profile_name, who)
@@ -386,8 +446,11 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
         # Before anything is planned or kept: every write of a build goes through the extension, which must be
         # one that makes every object a build makes.
         require_build_tools(adapter.client)
+        planned_against = None
         if dashboard_id is not None:
             _held_to_its_editors(adapter.client, dashboard_id)
+            if propose:  # read before planning, so a change made while it plans is one its confirm sees
+                planned_against = _changed_on(adapter.client, dashboard_id)
         built_on = (datasets_built_on(builds.measures_for(who.tenant_id, dashboard_id))
                     if dashboard_id is not None else None)
         plan = plan_build(goal, planner=planner, client=adapter.client, adapter=adapter,
@@ -399,8 +462,15 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
             return 200, _offer(plan, planner.titles)
         if dashboard_id is not None and not plan.charts:
             return 200, _shown(dashboard_id, plan.left_out)
-        answer = {"build": _build(start_build(builds, tenant=who.tenant_id, principal=who.principal_id, goal=goal,
-                                              plan=plan, dashboard_id=dashboard_id, profile=profile_name))}
+        state = start_build(builds, tenant=who.tenant_id, principal=who.principal_id, goal=goal, plan=plan,
+                            dashboard_id=dashboard_id, profile=profile_name, proposed=propose,
+                            planned_against=planned_against)
+        if propose:
+            proposal = {"build_id": state.build_id, "goal": goal, "dashboard_id": dashboard_id, "plan": state.plan}
+            if plan.left_out:
+                proposal["left_out"] = _left_out(plan.left_out)
+            return 200, {"proposal": proposal}
+        answer = {"build": _build(state)}
         if plan.left_out:
             answer["left_out"] = _left_out(plan.left_out)
         return 201, answer
@@ -409,7 +479,7 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
     def start(body: StartBody, response: Response, asking=Depends(asker)) -> dict:
         def work() -> dict:
             status, answer = started(asking, body.goal, dashboard_id=body.dashboard_id, fresh=body.fresh,
-                                     profile_name=body.profile)
+                                     profile_name=body.profile, propose=body.propose)
             response.status_code = status
             return answer
 
@@ -461,6 +531,19 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> None:
             grants = runtime.builder_grants(adapter)
             return {"build": _build(next_step(build, client=adapter.client, adapter=adapter, store=builds,
                                               snapshot=runtime.snapshot, grants=grants, settings=profile.settings))}
+
+        return answered(work)
+
+    @app.post("/v1/superset/builds/{build_id}/confirm")
+    def confirm(build_id: str, asking=Depends(asker)) -> dict:
+        """Start the person's proposed build, the person's "Build it", answered as `/next` answers a build. The panel
+        then runs its steps with `/next`, as for any build."""
+
+        def work() -> dict:
+            _builder(asking, building=True)
+            builds = kept()
+            stored = confirm_proposed_build(asking, builds, build_id, deployment=deployment)
+            return {"build": _build(build_state(builds, stored))}
 
         return answered(work)
 

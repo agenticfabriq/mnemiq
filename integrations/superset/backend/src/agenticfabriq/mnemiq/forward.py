@@ -73,6 +73,7 @@ ROUTES: tuple[Route, ...] = (
     Route("POST", re.compile(r"/v1/superset/builds"), "build"),
     Route("GET", re.compile(rf"/v1/superset/builds/{_UUID}"), "build"),
     Route("POST", re.compile(rf"/v1/superset/builds/{_UUID}/next"), "build"),
+    Route("POST", re.compile(rf"/v1/superset/builds/{_UUID}/confirm"), "build"),
     Route("GET", re.compile(rf"/v1/superset/dashboards/{_INT}/measures"), "build"),
     Route("POST", re.compile(rf"/v1/superset/dashboards/{_INT}/measures/{_NAME}/(edit|remove|save)"), "build"),
     Route("POST", re.compile(rf"/v1/superset/dashboards/{_INT}/changes"), "build"),

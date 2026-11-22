@@ -115,7 +115,7 @@ def _fold(name: str) -> str:
 # The store's tables and their columns, each in its order.
 STORE_COLUMNS = {
     BUILD_TABLE: ["tenant_id", "build_id", "principal_id", "dashboard_id", "goal", "profile", "plan", "steps", "status",
-                  "created_at", "updated_at"],
+                  "created_at", "updated_at", "planned_against"],
     MEASURE_TABLE: ["tenant_id", "dashboard_id", "name", "definition", "chart_ids", "made_dataset_ids",
                     "check_status", "updated_at"],
 }
@@ -1344,3 +1344,123 @@ def test_a_new_dashboard_step_takes_its_dashboard_from_a_build_left_untouched(st
     assert done.dashboard_id == 12 and done.step("dashboard").status == "done"
     stale = store.load_build(TENANT, holder.build_id, ANA)
     assert stale.status == "failed" and stale.step("dashboard").reason == "abandoned"
+
+
+# --- A build that waits as a proposal until the person confirms it
+
+PLANNED_AGAINST = "2026-11-21T10:00:00.000000+00:00"
+
+
+def test_a_proposal_holds_no_dashboard_and_runs_nothing(store):
+    """A proposed build is kept with the dashboard's `changed_on` it was planned against, is no unfinished build, does
+    not hold its dashboard's one live build, and has no step to claim until it is confirmed."""
+    proposal = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12, proposed=True,
+                                  planned_against=PLANNED_AGAINST)
+    assert (proposal.status, proposal.planned_against, proposal.dashboard_id) == ("proposed", PLANNED_AGAINST, 12)
+    assert store.load_build(TENANT, proposal.build_id, ANA) == proposal
+    assert store.unfinished_builds(TENANT, ANA) == []
+    assert store.dashboard_building(TENANT, 12) is False
+    other = store.create_build(TENANT, BO, GOAL, PLAN, STEPS, dashboard_id=12)
+    assert other.status == "building"
+    with pytest.raises(BuildNotFound):
+        store.claim_next_step(TENANT, proposal.build_id, ANA, _intent("dashboard", "dashboard"))
+    assert store.load_build(TENANT, proposal.build_id, ANA).steps == proposal.steps
+
+
+def test_a_build_started_at_once_has_nothing_planned_against(store):
+    build = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12)
+    assert (build.status, build.planned_against) == ("building", None)
+
+
+def test_confirm_starts_a_proposal_once(store):
+    proposal = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12, proposed=True,
+                                  planned_against=PLANNED_AGAINST)
+    with pytest.raises(BuildNotFound):
+        store.confirm_build(TENANT, proposal.build_id, BO)
+    with pytest.raises(BuildNotFound):
+        store.confirm_build(OTHER_TENANT, proposal.build_id, ANA)
+    confirmed = store.confirm_build(TENANT, proposal.build_id, ANA)
+    assert (confirmed.status, confirmed.planned_against) == ("building", PLANNED_AGAINST)
+    assert store.unfinished_builds(TENANT, ANA) == [confirmed]
+    assert store.dashboard_building(TENANT, 12) is True
+    with pytest.raises(BuildNotFound):
+        store.confirm_build(TENANT, proposal.build_id, ANA)
+    claimed = store.claim_next_step(TENANT, proposal.build_id, ANA, _intent("dashboard", "dashboard"))
+    assert claimed.key == "dashboard"
+
+
+def test_confirm_on_a_busy_dashboard_is_refused_and_the_proposal_stays(store):
+    proposal = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12, proposed=True)
+    store.create_build(TENANT, BO, GOAL, PLAN, STEPS, dashboard_id=12)
+    with pytest.raises(DashboardBusy):
+        store.confirm_build(TENANT, proposal.build_id, ANA)
+    assert store.load_build(TENANT, proposal.build_id, ANA).status == "proposed"
+
+
+def test_two_confirms_at_once_confirm_once(stores):
+    pair = [stores(), stores()]
+    proposal = pair[0].create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12, proposed=True)
+    pair[1].load_build(TENANT, proposal.build_id, ANA)  # connected
+    barrier = threading.Barrier(2)
+    confirmed, refused = [], []
+
+    def confirm(each: BuildStore) -> None:
+        barrier.wait()
+        try:
+            confirmed.append(each.confirm_build(TENANT, proposal.build_id, ANA))
+        except BuildNotFound:
+            refused.append(True)
+
+    threads = [threading.Thread(target=confirm, args=(each,)) for each in pair]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert (len(confirmed), len(refused)) == (1, 1)
+
+
+def test_withdraw_removes_only_a_proposal(store):
+    proposal = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12, proposed=True)
+    building = store.create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=13)
+    assert store.withdraw_proposal(TENANT, building.build_id, ANA) is False
+    assert store.withdraw_proposal(TENANT, proposal.build_id, BO) is False
+    assert store.withdraw_proposal(TENANT, str(uuid.uuid4()), ANA) is False
+    assert store.withdraw_proposal(TENANT, "not-an-id", ANA) is False
+    assert store.withdraw_proposal(TENANT, proposal.build_id, ANA) is True
+    assert store.load_build(TENANT, proposal.build_id, ANA) is None
+    assert store.load_build(TENANT, building.build_id, ANA) == building
+
+
+def test_an_existing_build_table_gains_planned_against(store_dsn, stores):
+    """A deployment whose build table was made before proposals: the next store to connect adds the column, and the
+    builds already kept read as started at once."""
+    first = stores()
+    kept = first.create_build(TENANT, ANA, GOAL, PLAN, STEPS)
+    first.close()
+    with psycopg.connect(store_dsn, autocommit=True) as con:
+        con.execute(sql.SQL("ALTER TABLE {} DROP COLUMN planned_against").format(sql.Identifier(BUILD_TABLE)))
+    later = stores()
+    assert later.load_build(TENANT, kept.build_id, ANA).planned_against is None
+    proposal = later.create_build(TENANT, ANA, GOAL, PLAN, STEPS, proposed=True, planned_against=PLANNED_AGAINST)
+    assert later.load_build(TENANT, proposal.build_id, ANA).planned_against == PLANNED_AGAINST
+
+
+@pytest.mark.parametrize("planned_against", ["", "   ", 7])
+def test_a_proposal_planned_against_nothing_readable_is_refused(planned_against):
+    with pytest.raises(ValueError):
+        _offline_store().create_build(TENANT, ANA, GOAL, PLAN, STEPS, dashboard_id=12, proposed=True,
+                                      planned_against=planned_against)
+
+
+def test_a_store_connecting_while_a_transaction_reads_the_builds_does_not_wait(store_dsn, stores):
+    """A store connecting (a server starting, or a broken connection made again) while another transaction holds the
+    build table open, as a long report or a dump does: its tables are found as they are, and it answers at once,
+    rather than waiting on a lock its own setup asks for."""
+    first = stores()
+    kept = first.create_build(TENANT, ANA, GOAL, PLAN, STEPS)
+    with psycopg.connect(store_dsn) as reader:  # a transaction left open, reading the builds
+        reader.execute(sql.SQL("SELECT count(*) FROM {}").format(sql.Identifier(BUILD_TABLE))).fetchone()
+        started = time.monotonic()
+        assert stores().load_build(TENANT, kept.build_id, ANA) == kept
+        assert time.monotonic() - started < 5
+        reader.rollback()

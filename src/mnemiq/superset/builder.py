@@ -69,7 +69,7 @@ from mnemiq.superset.extension import call_tool, dashboard_editorship
 from mnemiq.superset.layout import layout_chart_ids, layout_positions
 from mnemiq.superset.marker import format_marker
 from mnemiq.superset.measures import Measure
-from mnemiq.superset.planner import BuildPlan, PlannedDataset, plan_from_json, plan_to_json, with_made_datasets
+from mnemiq.superset.planner import SCALAR, BuildPlan, PlannedDataset, plan_from_json, plan_to_json, with_made_datasets
 from mnemiq.superset.saved_metrics import SavedMetric, normalized, read_saved_metrics
 
 __all__ = ["DASHBOARD_TITLE_MAX", "BuildBusy", "BuildState", "build_state", "build_steps", "next_step",
@@ -144,6 +144,14 @@ class BuildState:
 # ---------------------------------------------------------------- starting and reading a build
 
 
+# What `plan_summary` writes, in `planner.PLAN_JSON_SHAPE`'s form: what a conversation keeps of a proposed build's plan,
+# since the build store keeps the plan itself. The builder's tests hold the writer to it.
+PLAN_SUMMARY_JSON: dict = {
+    "charts": [{"key": SCALAR, "title": SCALAR, "family": SCALAR, "measures": [SCALAR]}],
+    "measures": [{"name": SCALAR, "label": SCALAR, "expression": SCALAR, "kind": SCALAR, "currency": SCALAR}],
+}
+
+
 def plan_summary(plan: Mapping) -> dict:
     """A kept plan (`planner.PLAN_JSON_SHAPE`) as the person is shown it: each chart's key, title, family and measures
     (a written measure by its label, a saved metric by its name), and each written measure's name, label,
@@ -174,15 +182,19 @@ def build_steps(plan: BuildPlan) -> list[tuple[str, str]]:
 
 
 def start_build(store, *, tenant: str, principal: str, goal: str, plan: BuildPlan,
-                dashboard_id: int | None = None, profile: str | None = None) -> BuildState:
+                dashboard_id: int | None = None, profile: str | None = None, proposed: bool = False,
+                planned_against: str | None = None) -> BuildState:
     """A new build of `plan`, on the existing dashboard `dashboard_id` or a new one, kept with the profile it was
     started under (None: the deployment's default). Refused (ValueError) while the plan still offers a dashboard to
     reuse, which the builder answers first; `DashboardBusy` while another build of the dashboard is building and has
-    been touched within `build_store.ABANDONED_AFTER_S`."""
+    been touched within `build_store.ABANDONED_AFTER_S`. A `proposed` build waits for the person's confirm, holding
+    no dashboard and refused by no build running on it; `planned_against` is the dashboard's `changed_on` read before
+    it was planned."""
     if plan.awaiting_choice:
         raise ValueError("this plan offers a dashboard to reuse: answer reuse or fresh before it is built")
     stored = store.create_build(tenant, principal, goal, plan_to_json(plan), build_steps(plan),
-                                dashboard_id=dashboard_id, profile=profile)
+                                dashboard_id=dashboard_id, profile=profile, proposed=proposed,
+                                planned_against=planned_against)
     return build_state(store, stored)
 
 

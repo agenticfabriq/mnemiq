@@ -63,7 +63,7 @@ if TYPE_CHECKING:
     from mnemiq.config import Settings
 
 __all__ = ["ABANDONED_AFTER_S", "BUILD_TABLE", "DEFAULT_LEASE_S", "LOCK_TIMEOUT_MS", "MAX_ID", "MAX_UNFINISHED",
-           "MEASURE_TABLE", "REASONS",
+           "MEASURE_TABLE", "PROPOSED", "REASONS",
            "STATEMENT_TIMEOUT_MS", "STEP_KINDS", "STORE_MISSING", "VALUE_SHAPED_KEYS",
            "BuildNotFound", "BuildStore", "BuildStoreMissing", "DashboardBusy", "DashboardMeasure", "LeaseLost",
            "StepBusy", "StepState", "StoredBuild"]
@@ -85,6 +85,9 @@ _FINISHED_AS = frozenset({DONE, FAILED, UNCERTAIN})
 
 # A build's own status, read from its steps on every write: any step failed, every step done, or neither.
 BUILDING = "building"
+# A build planned and waiting for the person to confirm it: it holds no dashboard, and has no step to claim, until
+# `confirm_build` makes it `building`.
+PROPOSED = "proposed"
 
 # The names a value, a row, a result or a sample is kept under. No key of a stored plan reads, folded (`_folded`), as
 # one of them.
@@ -120,7 +123,7 @@ STORE_MISSING = ("Building a dashboard needs mnemiq's control Postgres, where ea
                  "set MNEMIQ_CONTROL_DSN.")
 
 _BUILD_COLUMNS = ("tenant_id, build_id, principal_id, dashboard_id, goal, profile, plan, steps, status, created_at, "
-                  "updated_at")
+                  "updated_at, planned_against")
 _MEASURE_COLUMNS = "name, definition, chart_ids, made_dataset_ids, check_status, updated_at"
 
 _CREATE_BUILD = f"""
@@ -153,6 +156,9 @@ CREATE TABLE IF NOT EXISTS {MEASURE_TABLE} (
 _LIVE_DASHBOARD = f"{BUILD_TABLE}_live_dashboard"
 _CREATE_LIVE_DASHBOARD = (f"CREATE UNIQUE INDEX IF NOT EXISTS {_LIVE_DASHBOARD} ON {BUILD_TABLE} "
                           f"(tenant_id, dashboard_id) WHERE status = '{BUILDING}' AND dashboard_id IS NOT NULL")
+# The dashboard's `changed_on` a proposal was planned against, read again when it is confirmed. Added to a table made
+# before proposals were kept, so an existing deployment's builds read as started at once (null).
+_ADD_PLANNED_AGAINST = f"ALTER TABLE {BUILD_TABLE} ADD COLUMN IF NOT EXISTS planned_against text"
 # A builder's builds by status: what the list of their unfinished builds reads.
 _CREATE_PRINCIPAL_INDEX = (f"CREATE INDEX IF NOT EXISTS {BUILD_TABLE}_principal ON {BUILD_TABLE} "
                            "(tenant_id, principal_id, status)")
@@ -236,6 +242,8 @@ class StoredBuild:
     # The profile the build was started under, whose settings each of its steps runs under; None: the deployment's
     # default.
     profile: str | None = None
+    # The dashboard's `changed_on` the build was planned against, kept for a proposal onto a dashboard; None otherwise.
+    planned_against: str | None = None
 
     def step(self, key: str) -> StepState:
         for step in self.steps:
@@ -291,26 +299,70 @@ class BuildStore:
 
     def create_build(self, tenant: str, principal: str, goal: str, plan: Mapping[str, Any],
                      steps: Sequence[tuple[str, str]], *, dashboard_id: int | None = None,
-                     profile: str | None = None) -> StoredBuild:
+                     profile: str | None = None, proposed: bool = False,
+                     planned_against: str | None = None) -> StoredBuild:
         """A new build of `steps`, each a `(key, kind)` pair, every one pending. `dashboard_id` is the existing
         dashboard a build works on; a new dashboard's id is the build's once its dashboard step is done. `profile` is
-        the profile it was started under, None for the deployment's default."""
+        the profile it was started under, None for the deployment's default. A `proposed` build waits for
+        `confirm_build`, holding no dashboard meanwhile; `planned_against` is the dashboard's `changed_on` its plan
+        was made against, read again when it is confirmed."""
         tenant, principal = _text(tenant, "tenant"), _text(principal, "principal")
         goal = _text(goal, "goal")
         profile = None if profile is None else _text(profile, "profile")
         dashboard_id = _id(dashboard_id, "a build's dashboard id", optional=True)
+        if type(proposed) is not bool:
+            raise ValueError("whether a build is proposed is true or false")
+        planned_against = None if planned_against is None else _text(planned_against, "dashboard's changed_on")
         plan = _plan(plan)
         build_id = uuid.uuid4()
         step_list = _new_steps(str(build_id), steps)
         with self._connection() as con, _live_dashboard(), con.transaction():
-            if dashboard_id is not None:
+            if dashboard_id is not None and not proposed:
                 _release_abandoned(con, tenant, dashboard_id)
             row = con.execute(
                 f"INSERT INTO {BUILD_TABLE} (tenant_id, build_id, principal_id, dashboard_id, goal, profile, plan, "
-                f"steps, status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING {_BUILD_COLUMNS}, now()",
-                (tenant, build_id, principal, dashboard_id, goal, profile, Jsonb(plan), Jsonb(step_list), BUILDING),
+                f"steps, status, planned_against) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                f"RETURNING {_BUILD_COLUMNS}, now()",
+                (tenant, build_id, principal, dashboard_id, goal, profile, Jsonb(plan), Jsonb(step_list),
+                 PROPOSED if proposed else BUILDING, planned_against),
             ).fetchone()
         return _stored_build(row)
+
+    def confirm_build(self, tenant: str, build_id: str, principal: str) -> StoredBuild:
+        """Start the person's proposed build: `building` from now, its dashboard's one live build. `DashboardBusy`
+        while another build of the dashboard is building, the proposal kept; BuildNotFound unless the build is this
+        tenant's and principal's and still proposed, so a second confirm, or two at once, starts it once."""
+        tenant, principal = _text(tenant, "tenant"), _text(principal, "principal")
+        build = _build_uuid(build_id)
+        if build is None:
+            raise BuildNotFound()
+        with self._connection() as con, _live_dashboard(), con.transaction():
+            row = con.execute(
+                f"SELECT dashboard_id FROM {BUILD_TABLE} WHERE tenant_id = %s AND build_id = %s "
+                "AND principal_id = %s AND status = %s FOR UPDATE", (tenant, build, principal, PROPOSED)).fetchone()
+            if row is None:
+                raise BuildNotFound()
+            if row[0] is not None:
+                _release_abandoned(con, tenant, row[0])
+            written = con.execute(
+                f"UPDATE {BUILD_TABLE} SET status = %s, updated_at = now() WHERE tenant_id = %s AND build_id = %s "
+                f"AND status = %s RETURNING {_BUILD_COLUMNS}, now()", (BUILDING, tenant, build, PROPOSED)).fetchone()
+        if written is None:  # not reached while the row is held: a second guard, not a path
+            raise BuildNotFound()
+        return _stored_build(written)
+
+    def withdraw_proposal(self, tenant: str, build_id: str, principal: str) -> bool:
+        """Delete the person's build while it is still proposed: what a proposal planned again replaces. False for
+        any other build, which is kept."""
+        tenant, principal = _text(tenant, "tenant"), _text(principal, "principal")
+        build = _build_uuid(build_id)
+        if build is None:
+            return False
+        with self._connection() as con:
+            row = con.execute(
+                f"DELETE FROM {BUILD_TABLE} WHERE tenant_id = %s AND build_id = %s AND principal_id = %s "
+                "AND status = %s RETURNING 1", (tenant, build, principal, PROPOSED)).fetchone()
+        return row is not None
 
     def load_build(self, tenant: str, build_id: str, principal: str) -> StoredBuild | None:
         """The build, read by its tenant and its principal only; None for any other, as for an id that names none."""
@@ -493,7 +545,9 @@ class BuildStore:
         with one compare-and-set `UPDATE`: only while the steps are still as read. A write that finds them changed reads
         the row again and lets `change` decide again. `change` returns the new steps (None: write nothing), the
         dashboard id, and the result; this returns the result and the build as written."""
-        where = "tenant_id = %s AND build_id = %s" + ("" if principal is None else " AND principal_id = %s")
+        # A proposal has no step to change until it is confirmed: it reads here as no build.
+        where = (f"tenant_id = %s AND build_id = %s AND status <> '{PROPOSED}'"
+                 + ("" if principal is None else " AND principal_id = %s"))
         key = (tenant, build) if principal is None else (tenant, build, principal)
         with self._connection() as con:
             for _ in range(_ATTEMPTS):
@@ -579,6 +633,11 @@ def _make_tables(con: psycopg.Connection) -> None:
     with con.transaction():
         con.execute("SELECT pg_advisory_xact_lock(%s)", (_DDL_LOCK,))
         con.execute(_CREATE_BUILD)
+        # Only when the column is missing: `ALTER TABLE` takes the table's strongest lock even when it adds nothing, so
+        # run on every connect it would wait behind any open transaction reading the builds.
+        if con.execute("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() "
+                       "AND table_name = %s AND column_name = 'planned_against'", (BUILD_TABLE,)).fetchone() is None:
+            con.execute(_ADD_PLANNED_AGAINST)
         con.execute(_CREATE_LIVE_DASHBOARD)
         con.execute(_CREATE_PRINCIPAL_INDEX)
         con.execute(_CREATE_MEASURE)
@@ -683,10 +742,12 @@ def _kept_intent(intent: dict | None) -> dict | None:
 
 
 def _stored_build(row: tuple) -> StoredBuild:
-    tenant, build, principal, dashboard_id, goal, profile, plan, steps, status, created_at, updated_at, now = row
+    (tenant, build, principal, dashboard_id, goal, profile, plan, steps, status, created_at, updated_at,
+     planned_against, now) = row
     return StoredBuild(tenant_id=tenant, build_id=str(build), principal_id=principal, dashboard_id=dashboard_id,
                        goal=goal, plan=plan, steps=tuple(_step_state(step, now) for step in steps), status=status,
-                       created_at=_iso(created_at), updated_at=_iso(updated_at), profile=profile)
+                       created_at=_iso(created_at), updated_at=_iso(updated_at), profile=profile,
+                       planned_against=planned_against)
 
 
 def _dashboard_measure(row: tuple) -> DashboardMeasure:
@@ -812,50 +873,52 @@ def _plan_shape() -> Any:
     return planner.PLAN_JSON_SHAPE
 
 
-def _shaped(doc: Any, shape: Any, path: str) -> None:
+def _shaped(doc: Any, shape: Any, path: str, *, writer: str = "the planner",
+            kept: str = "a build keeps only its plan") -> None:
     """Refuse what `shape` (`planner.PLAN_JSON_SHAPE`'s form) does not admit, naming where by the keys admitted on
-    the way, never a key or a value it was given."""
+    the way, never a key or a value it was given. `writer` and `kept` word the refusal for the store that checks: the
+    conversation store holds its messages to a shape of the same form."""
     from mnemiq.superset.planner import SCALAR
 
     if isinstance(shape, tuple):
         refusals = []
         for each in shape:
             try:
-                return _shaped(doc, each, path)
+                return _shaped(doc, each, path, writer=writer, kept=kept)
             except ValueError as refused:
                 refusals.append(refused)
         raise refusals[0]
     if isinstance(shape, dict):
         if not isinstance(doc, Mapping):
-            raise ValueError(f"{path} holds something else where the planner writes an object")
+            raise ValueError(f"{path} holds something else where {writer} writes an object")
         for key, item in doc.items():
             if key not in shape:
-                raise ValueError(f"{path} holds a key the planner never writes there: a build keeps only its plan")
-            _shaped(item, shape[key], f"{path}.{key}")
+                raise ValueError(f"{path} holds a key {writer} never writes there: {kept}")
+            _shaped(item, shape[key], f"{path}.{key}", writer=writer, kept=kept)
     elif isinstance(shape, list):
         if not isinstance(doc, list):
-            raise ValueError(f"{path} holds something else where the planner writes a list")
+            raise ValueError(f"{path} holds something else where {writer} writes a list")
         for index, item in enumerate(doc):
-            _shaped(item, shape[0], f"{path}[{index}]")
+            _shaped(item, shape[0], f"{path}[{index}]", writer=writer, kept=kept)
     elif shape == SCALAR:
         if isinstance(doc, (Mapping, list)):
-            raise ValueError(f"{path} holds an object or a list where the planner writes a single value")
+            raise ValueError(f"{path} holds an object or a list where {writer} writes a single value")
     else:
-        raise ValueError(f"{path}: the planner's declared shape is not one the store reads")
+        raise ValueError(f"{path}: {writer}'s declared shape is not one the store reads")
 
 
-def _plain_json(doc: object, path: str) -> Any:
+def _plain_json(doc: object, path: str, *, holder: str = "a build") -> Any:
     if isinstance(doc, Mapping):
         copied = {}
         for key, item in doc.items():
             if not isinstance(key, str):
                 raise ValueError(f"{path} has a key that is not a string")
             if _folded(key) in VALUE_SHAPED_KEYS:
-                raise ValueError(f"{path} holds a key named {key!r}: a build keeps no value, row or result")
-            copied[key] = _plain_json(item, f"{path}.{key}")
+                raise ValueError(f"{path} holds a key named {key!r}: {holder} keeps no value, row or result")
+            copied[key] = _plain_json(item, f"{path}.{key}", holder=holder)
         return copied
     if isinstance(doc, (list, tuple)):
-        return [_plain_json(item, f"{path}[{index}]") for index, item in enumerate(doc)]
+        return [_plain_json(item, f"{path}[{index}]", holder=holder) for index, item in enumerate(doc)]
     if isinstance(doc, float) and not math.isfinite(doc):
         raise ValueError(f"{path} holds a number JSON cannot carry")
     if doc is None or isinstance(doc, (str, int, float)):
