@@ -465,23 +465,31 @@ mnemiq's address.
 - **Who sees what.** Each time the panel opens it asks mnemiq once whether this person may use it. A person Superset
   will not let build (Alpha and sql_lab are needed) sees only the sentence that says so, and the panel asks nothing
   else.
-- **Ask** a question about the data. The answer streams in: its sentence, the SQL (folded), and the rows it read.
-- **Build** a dashboard from a goal. mnemiq shows the plan before it makes anything, then the panel runs the build one
-  step per request, with each chart's check, and links to the result. On a dashboard, a build goes onto the
-  dashboard on screen when the goal is sent, unless "New dashboard" is ticked; off one, mnemiq may first offer a
-  dashboard that already covers the goal, with Open it, Add these charts to it, and Build a new one.
+- **One box.** The person types; mnemiq works out whether it is a question, a dashboard to build, or a change to the
+  dashboard on screen (see [Conversations](#conversations)), and asks back, with three choices, when it cannot tell.
+- **Their conversations**, kept by mnemiq: Conversations lists them, newest first, and opens one; New starts another,
+  which mnemiq makes with its first message. Each message shows the dashboard it was sent from when that changed.
+- **Ask** a question about the data. The answer streams in: its sentence, the SQL (folded), and the rows it read. Reopened
+  later, an answer shows its sentence as it was written then and its SQL, and Show results runs that SQL again as the
+  person, now; the rows are kept only while the card is open.
+- **Build** a dashboard. mnemiq shows the plan and makes nothing until Build it; then the panel runs the build one step
+  per request, with each chart's check, and links to the result. A build onto a dashboard goes onto the one on screen,
+  and on a dashboard with no charts the box opens with "Describe what this dashboard should show". Off a dashboard,
+  mnemiq may first offer one that already covers the goal, with Open it, Add these charts to it, and Build a new one.
 - **The dashboard's measures**, on a dashboard the person can read: each measure mnemiq keeps there, with its
   definition and its value computed now under the person's own row rules, and Edit, Remove and Save to dataset.
   Remove deletes the charts that show the measure (into Superset's trash, where it keeps one), and takes a chart the
   person does not edit off the dashboard instead; it says so, and names the charts, before it does anything.
-- **Change** the dashboard on screen by chat: "show daily instead of monthly", "add a funnel of policies by status". A
-  chart setting changed by hand is kept. A removal is a proposal the person confirms, and a chart to add is built
-  onto the dashboard.
+- **Change** the dashboard on screen: "show daily instead of monthly". mnemiq shows each chart's edit, and the charts
+  the change would remove, each with its own tick; Apply writes exactly what it showed, and nothing when the
+  dashboard or a chart changed since. A chart setting changed by hand is kept. Build it and Apply are offered only on
+  the dashboard they are for, and Not now sets a proposal aside.
 - **Finish.** Closing the panel does not stop a build. Leaving or reloading the page stops it after the step in
   flight, and the build stays resumable: the panel then lists the person's unfinished builds (on a dashboard, that
   dashboard's), each with Finish and Not now.
-- **What it keeps: nothing.** The conversation and a running build live in the page's memory for its life; a measure's
-  value lives only in the open measures section. Nothing is written to browser storage.
+- **What it keeps: nothing of its own.** mnemiq keeps the conversations; the panel holds what is on screen, and a
+  running build, in the page's memory for its life. A reopened answer's rows and a measure's value live only in their
+  open card or section. Nothing is written to browser storage.
 
 The forwarder is configured in Superset's `superset_config.py`, beside the token settings the extension's README lists
 (it mints each request's token with them):
