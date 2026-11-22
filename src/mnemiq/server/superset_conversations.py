@@ -23,7 +23,6 @@ kept nowhere.
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import json
 import logging
 from collections.abc import AsyncIterator, Callable
@@ -51,12 +50,13 @@ from mnemiq.server.superset_build import (
 from mnemiq.sql.verdict import Refusal
 from mnemiq.superset.build_store import MAX_ID, BuildNotFound, BuildStoreMissing, DashboardBusy
 from mnemiq.superset.builder import build_state
+from mnemiq.superset.build_store import PROPOSED
 from mnemiq.superset.chart_change import (
     STALE_SINCE_PREVIEW,
     ChangeAnswer,
+    ChangeInterrupted,
     ChangePreview,
     apply_change,
-    change_dashboard,
     preview_change,
 )
 from mnemiq.superset.conversations import (
@@ -84,6 +84,8 @@ NOT_YOURS = "This person has no conversation of that id."
 NO_SUCH_MESSAGE = "This conversation has no message of that number."
 NOT_WAITING = "Nothing in this message waits for a confirm."
 ALREADY_DONE = "This was already done."
+MAYBE_DONE = "This may or may not have been done; check the dashboard."
+SET_ASIDE = "This was set aside; ask again to have it planned anew."
 OPEN_IT = "Open the dashboard this was for, then confirm."
 REPLANNED = {DashboardBusy: "The dashboard is being built; this was planned again.",
              PlanStale: "The dashboard changed since this plan; it was planned again."}
@@ -102,7 +104,8 @@ HISTORY_TURNS = 5
 RESULT_ROWS = 100
 _KIND = {Intent.ASK: "ask", Intent.BUILD_ONTO: "build", Intent.BUILD_NEW: "build", Intent.CHANGE: "change",
          Intent.UNCLEAR: "note"}
-_SETTLED = frozenset({"applying", "done", "refused", "stale", "partial", "replanned", "chosen", "declined"})
+_SETTLED = frozenset({"done", "refused", "stale", "partial", "replanned", "chosen"})
+_ANSWERED = {"applying": MAYBE_DONE, "declined": SET_ASIDE, **{state: ALREADY_DONE for state in _SETTLED}}
 _STREAM_HEADERS = {"cache-control": "no-cache", "x-accel-buffering": "no"}
 _Id = Annotated[int, Path(ge=0, lt=MAX_MESSAGES)]
 
@@ -167,11 +170,18 @@ def _history(conversation: Conversation) -> list[HistoryTurn]:
     """The conversation's latest answers with SQL, each as the question it answered, its SQL and its grant
     fingerprint: what a follow-up ask is reminded of. Never a row: the Ask path runs the newest again as the person."""
     turns, question = [], None
+    asked = {message.index: message.doc.get("text") for message in conversation.messages
+             if message.doc.get("role") == "person"}
     for message in conversation.messages:
         doc = message.doc
         if doc.get("role") == "person":
             question = doc.get("text")
-        elif doc.get("kind") == "answer" and question and (doc.get("answer") or {}).get("sql"):
+            continue
+        # Paired by the question it replies to, so two tabs asking at once are never crossed; by order only for an
+        # answer kept without it.
+        replied = asked.get(doc["replies_to"]) if isinstance(doc.get("replies_to"), int) else question
+        if doc.get("kind") == "answer" and replied and (doc.get("answer") or {}).get("sql"):
+            question = replied
             answer = doc["answer"]
             turns.append(HistoryTurn(question=question, sql=answer["sql"],
                                      tables_used=list(answer.get("tables_used") or []),
@@ -191,6 +201,41 @@ async def _off(work: Callable, *args) -> Any:
     starts an event loop of its own there, which it refuses to do on a thread its async library reads as running one
     (`asyncio.to_thread` copies that reading across)."""
     return await asyncio.get_running_loop().run_in_executor(None, lambda: work(*args))
+
+
+# The asks being read to their end, held so a task whose reader left is not collected before it keeps its answer.
+_reading: set[asyncio.Task] = set()
+
+
+async def _ask_and_keep(stream: AsyncIterator[str], *, keep_answer: Callable[[dict], int],
+                        keep_note: Callable[[str], int], out: asyncio.Queue) -> None:
+    """Read the Ask path's `stream` to its end, putting each frame on `out` for whoever is reading the response, with
+    the answer kept (`keep_answer`, then a `mnemiq.recorded` frame) as it is given, or the run's error kept as a note.
+    `out` ends with None. Nothing here waits on the reader: one that left stops reading, and the answer is kept."""
+    try:
+        async for chunk in stream:
+            event = json.loads(chunk[6:]) if chunk.startswith("data: ") else {}
+            if event.get("type") == "CUSTOM" and event.get("name") == "mnemiq.answer":
+                out.put_nowait(chunk)
+                out.put_nowait(_custom("mnemiq.recorded", {"index": await _off(keep_answer, event.get("value") or {})}))
+                continue
+            if event.get("type") == "RUN_ERROR":
+                kept = await _off(keep_note, str(event.get("message") or _OPAQUE))
+                out.put_nowait(_custom("mnemiq.recorded", {"index": kept}))
+            out.put_nowait(chunk)
+    except Exception:
+        logger.exception("an ask in a conversation could not be kept")
+        out.put_nowait(frame({"type": "RUN_ERROR", "message": _OPAQUE}))
+    finally:
+        out.put_nowait(None)
+
+
+def _outcome(state: str, answer: ChangeAnswer) -> dict:
+    return {"state": state, "changed": list(answer.changed),
+            "left": [{"chart_id": chart_id, "reason": reason} for chart_id, reason in answer.left],
+            "dropped": [{"chart_id": chart_id, "key": key} for chart_id, key in answer.dropped],
+            "not_editor": [{"chart_id": e.chart_id, "editors": list(e.editors)} for e in answer.not_editor],
+            "removed": list(answer.removed), "permanent": answer.permanent}
 
 
 def _refusal_detail(exc: Exception, doors) -> str | None:
@@ -242,7 +287,8 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
     def settle(who, conversation_id: str, index: int, outcome: dict, expect: str) -> bool:
         return held().settle(who.tenant_id, conversation_id, who.principal_id, index, outcome, expect=expect)
 
-    def kept_start(who, conversation_id: str, answer: dict, *, goal: str, dashboard) -> tuple[str, dict, dict]:
+    def kept_start(who, conversation_id: str, answer: dict, *, goal: str, dashboard,
+                   replies_to: int | None = None) -> tuple[str, dict, dict]:
         """A start's answer kept as mnemiq's message: its frame's name, the frame's value, and the message as kept."""
         if "proposal" in answer:
             proposal = answer["proposal"]
@@ -252,7 +298,9 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
             name, value = "mnemiq.proposal", dict(proposal)
         elif "offer" in answer:
             offer = answer["offer"]
-            doc = {"role": "mnemiq", "kind": "build", "text": offer["message"], "dashboard": dashboard, "goal": goal,
+            named = repr(offer["title"]) if offer.get("title") else f"dashboard {offer['dashboard_id']}"
+            said = (f"{named} already covers this. Open it, add these charts to it, or build a new dashboard.")
+            doc = {"role": "mnemiq", "kind": "build", "text": said, "dashboard": dashboard, "goal": goal,
                    "offer": {"dashboard_id": offer["dashboard_id"], "title": offer.get("title"),
                              "reason": offer.get("reason")},
                    "outcome": {"state": "offered"}}
@@ -269,18 +317,22 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
             name, value = "mnemiq.shown", dict(shown)
         else:
             raise RuntimeError("a proposed start answered with something a conversation does not keep")
+        if replies_to is not None:
+            doc["replies_to"] = replies_to
         index = keep(who, conversation_id, doc)
         return name, {"index": index, **value}, {"index": index, **doc}
 
     def proposed(asking_, who, conversation_id: str, goal: str, *, dashboard_id, dashboard, fresh=False,
-                 profile=None) -> tuple[str, dict, dict]:
+                 profile=None, replies_to: int | None = None) -> tuple[str, dict, dict]:
         _, answer = build.started(asking_, goal, dashboard_id=dashboard_id, fresh=fresh, profile_name=profile,
                                   propose=True)
-        return kept_start(who, conversation_id, answer, goal=goal, dashboard=dashboard)
+        return kept_start(who, conversation_id, answer, goal=goal, dashboard=dashboard, replies_to=replies_to)
 
-    def note(who, conversation_id: str, text: str, dashboard) -> int:
-        return keep(who, conversation_id, {"role": "mnemiq", "kind": "note", "text": text[:MAX_TEXT],
-                                           "dashboard": dashboard})
+    def note(who, conversation_id: str, text: str, dashboard, replies_to: int | None = None) -> int:
+        doc = {"role": "mnemiq", "kind": "note", "text": text[:MAX_TEXT], "dashboard": dashboard}
+        if replies_to is not None:
+            doc["replies_to"] = replies_to
+        return keep(who, conversation_id, doc)
 
     # --- the conversations
 
@@ -347,14 +399,15 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
         is yielded as itself): planning can take longer than a proxy waits on a quiet stream."""
         task = asyncio.ensure_future(_off(work))
         while True:
-            try:
-                yield await asyncio.wait_for(asyncio.shield(task), heartbeat_s)
-                return
-            except TimeoutError:
+            # The heartbeat is told from the work's own outcome by whether the task is done, never by an exception's
+            # type: work that raises TimeoutError is a failure to answer, not a beat to wait out again.
+            done, _ = await asyncio.wait({task}, timeout=heartbeat_s)
+            if not done:
                 yield ": keep-alive\n\n"
-            except Exception as exc:  # the work's own failure, answered by the caller
-                yield exc
-                return
+                continue
+            failure = task.exception()
+            yield failure if failure is not None else task.result()
+            return
 
     async def converse(asking_, who, found: Conversation, profile, body: MessageBody) -> AsyncIterator[str]:
         conversation_id = found.conversation_id
@@ -387,7 +440,7 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
         yield _custom("mnemiq.routed", {"intent": intent.value, "text": routed.text if routed else body.text,
                                         "index": index})
         if intent is Intent.ASK:
-            async for chunk in asked(asking_, who, found, body, dashboard):
+            async for chunk in asked(asking_, who, found, body, dashboard, index):
                 yield chunk
             return
         yield frame({"type": "RUN_STARTED", "runId": f"{conversation_id}:{index}"})
@@ -395,17 +448,18 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
             question = routed.question if routed is not None and routed.question else CHOOSE_QUESTION
             clarify = {"question": question, "choices": CHOICES}
             kept = await _off(keep, who, conversation_id, {
-                "role": "mnemiq", "kind": "clarify", "text": question, "dashboard": dashboard, "clarify": clarify})
+                "role": "mnemiq", "kind": "clarify", "text": question, "dashboard": dashboard, "clarify": clarify,
+                "replies_to": index})
             yield _custom("mnemiq.clarify", {"index": kept, **clarify})
             yield frame({"type": "RUN_FINISHED", "runId": f"{conversation_id}:{index}"})
             return
 
         def acted() -> list[str]:
             if intent is Intent.CHANGE:
-                return changed(asking_, who, conversation_id, routed.text, body, dashboard)
+                return changed(asking_, who, conversation_id, routed.text, body, dashboard, index)
             name, value, _ = proposed(asking_, who, conversation_id, routed.text,
                                       dashboard_id=body.dashboard_id if intent is Intent.BUILD_ONTO else None,
-                                      dashboard=dashboard, profile=body.profile)
+                                      dashboard=dashboard, profile=body.profile, replies_to=index)
             return [_custom(name, value)]
 
         async for item in waited(acted):
@@ -417,14 +471,15 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
                 if detail is None:
                     logger.error("a conversation's message failed", exc_info=item)
                     detail = _OPAQUE
-                await _off(note, who, conversation_id, detail, dashboard)
+                await _off(note, who, conversation_id, detail, dashboard, index)
                 yield frame({"type": "RUN_ERROR", "message": detail})
                 return
             for chunk in item:
                 yield chunk
         yield frame({"type": "RUN_FINISHED", "runId": f"{conversation_id}:{index}"})
 
-    def changed(asking_, who, conversation_id: str, request: str, body: MessageBody, dashboard) -> list[str]:
+    def changed(asking_, who, conversation_id: str, request: str, body: MessageBody, dashboard,
+                replies_to: int) -> list[str]:
         """A change previewed and kept waiting for "Apply"; a chart it asks for proposed beside it as a build."""
         ask = build.asking(asking_, body.dashboard_id, changing=True)
         interpreter = runtime.build_profile(body.profile, who).interpreter
@@ -434,36 +489,40 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
         record = preview.to_json()
         if preview.edits or preview.would_remove:
             doc = {"role": "mnemiq", "kind": "change", "text": preview.message[:MAX_TEXT], "dashboard": dashboard,
-                   "proposal": record, "outcome": {"state": "proposed"}}
+                   "proposal": record, "outcome": {"state": "proposed"}, "replies_to": replies_to}
         else:
-            doc = {"role": "mnemiq", "kind": "note", "text": preview.message[:MAX_TEXT], "dashboard": dashboard}
+            doc = {"role": "mnemiq", "kind": "note", "text": preview.message[:MAX_TEXT], "dashboard": dashboard,
+                   "replies_to": replies_to}
         frames = [_custom("mnemiq.preview", {"index": keep(who, conversation_id, doc), **record})]
         if preview.add_chart:
             name, value, _ = proposed(asking_, who, conversation_id, request, dashboard_id=body.dashboard_id,
-                                      dashboard=dashboard, profile=body.profile)
+                                      dashboard=dashboard, profile=body.profile, replies_to=replies_to)
             frames.append(_custom(name, value))
         return frames
 
-    async def asked(asking_, who, found: Conversation, body: MessageBody, dashboard) -> AsyncIterator[str]:
-        """The Ask path's frames, unchanged, with the answer kept as its sentence and SQL once it is given."""
+    async def asked(asking_, who, found: Conversation, body: MessageBody, dashboard,
+                    question: int) -> AsyncIterator[str]:
+        """The Ask path's frames, unchanged, with the answer kept as its sentence and SQL once it is given. The stream
+        is read to its end on a task of its own, so an answer whose reader left (the panel closed or reloaded) is
+        kept all the same."""
         conversation_id = found.conversation_id
+
+        def keep_answer(value: dict) -> int:
+            return keep(who, conversation_id, {
+                "role": "mnemiq", "kind": "answer", "text": "", "dashboard": dashboard, "replies_to": question,
+                "answer": {"sentence": str(value.get("answer") or "")[:MAX_TEXT], "sql": value.get("sql") or "",
+                           "grant_fingerprint": value.get("grant_fingerprint"),
+                           "tables_used": [str(t) for t in value.get("tables_used") or []]}})
+
         stream = chat_stream(runtime, asking_.identity, body.text, body.mode, heartbeat_s=heartbeat_s,
                              history=_history(found), profile=body.profile, **asking_.handed)
-        async for chunk in stream:
-            event = json.loads(chunk[6:]) if chunk.startswith("data: ") else {}
-            if event.get("type") == "CUSTOM" and event.get("name") == "mnemiq.answer":
-                yield chunk
-                value = event.get("value") or {}
-                doc = {"role": "mnemiq", "kind": "answer", "text": "", "dashboard": dashboard, "answer": {
-                    "sentence": str(value.get("answer") or "")[:MAX_TEXT], "sql": value.get("sql") or "",
-                    "grant_fingerprint": value.get("grant_fingerprint"),
-                    "tables_used": [str(t) for t in value.get("tables_used") or []]}}
-                yield _custom("mnemiq.recorded", {"index": await _off(keep, who, conversation_id, doc)})
-                continue
-            if event.get("type") == "RUN_ERROR":
-                kept = await _off(note, who, conversation_id, str(event.get("message") or _OPAQUE),
-                                               dashboard)
-                yield _custom("mnemiq.recorded", {"index": kept})
+        out: asyncio.Queue = asyncio.Queue()
+        task = asyncio.ensure_future(_ask_and_keep(
+            stream, keep_answer=lambda value: keep_answer(value),
+            keep_note=lambda text: note(who, conversation_id, text, dashboard, question), out=out))
+        _reading.add(task)
+        task.add_done_callback(_reading.discard)
+        while (chunk := await out.get()) is not None:
             yield chunk
 
     # --- a confirm
@@ -476,8 +535,10 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
             state = (doc.get("outcome") or {}).get("state")
             if state == "offered":
                 return chose(asking_, who, conversation_id, index, doc, body)
-            if state in _SETTLED:
-                return _conflict(ALREADY_DONE)
+            if state == "applying" and doc.get("kind") == "build" and recovered(who, conversation_id, index, doc):
+                state = "proposed"
+            if state in _ANSWERED:
+                return _conflict(_ANSWERED[state])
             if state != "proposed":
                 return _conflict(NOT_WAITING)
             if doc.get("kind") == "change":
@@ -485,6 +546,18 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
             return started_build(asking_, who, conversation_id, index, doc, body)
 
         return answered(work)
+
+    def recovered(who, conversation_id: str, index: int, doc: dict) -> bool:
+        """A build's message left `applying` (a server stopped between claiming "Build it" and recording it) set right
+        from the build store, which knows: still proposed, the message waits again (True); started since, it was
+        done."""
+        build_id = (doc.get("proposal") or {}).get("build_id")
+        found = build.kept().load_build(who.tenant_id, build_id, who.principal_id) if build_id else None
+        if found is not None and found.status == PROPOSED:
+            return settle(who, conversation_id, index, {"state": "proposed"}, "applying")
+        if found is not None:
+            settle(who, conversation_id, index, {"state": "done", "build_id": build_id}, "applying")
+        return False
 
     def started_build(asking_, who, conversation_id: str, index: int, doc: dict, body: ConfirmBody):
         """The person's "Build it": the build confirmed as the build route confirms it, or planned again."""
@@ -533,23 +606,19 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
         ask = build.asking(asking_, preview.dashboard_id, changing=True)
         if not settle(who, conversation_id, index, {"state": "applying"}, "proposed"):
             return _conflict(ALREADY_DONE)
-        # From here an exception leaves the message `applying`: some of it may have been written.
-        answer = apply_change(ask, preview, strict=True) if preview.edits else ChangeAnswer()
-        if removing:
-            removed = change_dashboard(ask, "", interpreter=None, confirmed_removal=removing)
-            answer = dataclasses.replace(answer, removed=removed.removed, permanent=removed.permanent,
-                                         left=answer.left + removed.left,
-                                         not_editor=answer.not_editor + removed.not_editor,
-                                         message=" ".join(m for m in (answer.message, removed.message) if m))
-        answer = dataclasses.replace(answer, would_remove=())
+        try:
+            answer = apply_change(ask, preview, strict=True, remove=removing)
+        except ChangeInterrupted as stopped:
+            # Written in part before Superset stopped answering: recorded as it is known, never applied again.
+            settle(who, conversation_id, index, _outcome("partial", stopped.answer), "applying")
+            raise stopped.__cause__ or stopped from None
+        except Exception:
+            # Failed before its first write: nothing was written, so the preview waits for its confirm again.
+            settle(who, conversation_id, index, {"state": "proposed"}, "applying")
+            raise
         stale = [chart_id for chart_id, why in answer.left if why == STALE_SINCE_PREVIEW]
         state = ("partial" if answer.changed or answer.removed else "stale") if stale else "done"
-        outcome = {"state": state, "changed": list(answer.changed),
-                   "left": [{"chart_id": chart_id, "reason": reason} for chart_id, reason in answer.left],
-                   "dropped": [{"chart_id": chart_id, "key": key} for chart_id, key in answer.dropped],
-                   "not_editor": [{"chart_id": e.chart_id, "editors": list(e.editors)} for e in answer.not_editor],
-                   "removed": list(answer.removed), "permanent": answer.permanent}
-        settle(who, conversation_id, index, outcome, "applying")
+        settle(who, conversation_id, index, _outcome(state, answer), "applying")
         return {"change": _changed(answer), "state": state}
 
     def chose(asking_, who, conversation_id: str, index: int, doc: dict, body: ConfirmBody):
@@ -576,7 +645,7 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
             doc = message_at(found, index).doc
             state = (doc.get("outcome") or {}).get("state")
             if state not in ("proposed", "offered"):
-                return _conflict(ALREADY_DONE if state in _SETTLED else NOT_WAITING)
+                return _conflict(_ANSWERED.get(state, NOT_WAITING))
             if not settle(who, conversation_id, index, {"state": "declined"}, state):
                 return _conflict(ALREADY_DONE)
             if doc.get("build_id"):
