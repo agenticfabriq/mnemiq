@@ -164,7 +164,8 @@ def test_the_cli_describes_with_enrich_concurrency(monkeypatch, tmp_path):
     with pytest.raises(_Stop):
         _cmd_enrich(settings)
     assert seen.get("concurrency") == 3
-    assert Settings(sources_path=str(manifest)).enrich_concurrency == 4
+    # Off unless set: measured, four calls at once described fewer columns of a wide table (docs/settings.md).
+    assert Settings(sources_path=str(manifest)).enrich_concurrency == 1
 
 
 def test_an_interrupt_starts_no_further_calls():
