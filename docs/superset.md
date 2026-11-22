@@ -284,6 +284,12 @@ still to come. In short:
     prompt. The planning prompt holds every table, column and saved metric the builder can see, so a large schema
     needs a large window.
   - `POST /v1/superset/builds/{id}/next` runs the build's next step.
+  - With `"propose": true`, the start plans the build and keeps it as a proposal, writing nothing to Superset: a 200
+    naming the build, its goal, its dashboard and its plan. `POST /v1/superset/builds/{id}/confirm` starts it,
+    answered as `/next` answers a build, and `/next` then runs it as any build. A proposal holds no dashboard, so
+    another build of the dashboard may run meanwhile. At the confirm, a proposal onto a dashboard is refused with a 409
+    while another build of the dashboard is building, and when the dashboard changed since the plan (its `changed_on`,
+    read before planning): plan it again. A second confirm is a 409 too.
   - `GET /v1/superset/builds/{id}` reads the build as it stands. Every build answer names its plan (each chart's
     title, family and measures, and each measure mnemiq writes), and the check step's own answer says why each chart
     that did not check did not (`check_reasons`), which is not kept.
@@ -404,6 +410,55 @@ still to come. In short:
   update it. One that has them but does not take a field a chart needs (`create_chart`'s `leave_out_no_value`, for a
   chart made with a row limit) stops the build at that chart's step, with a sentence saying to update it.
 
+## Conversations
+
+A person's conversations with mnemiq in the panel are kept in the control Postgres beside the builds
+(`mnemiq_superset_conversation`, made the first time the store connects), each its tenant's and person's alone: another
+person's conversation id is a 404 on every route, and says nothing of it. The panel's forwarder mints each request a
+token for building; mnemiq asks of it `db.read` for every route, and Superset's write scopes for a build or a change.
+`MNEMIQ_CONTROL_DSN` unset answers each route with a 503, as the build routes do.
+
+- `GET /v1/superset/conversations` lists the person's conversations, newest first (`limit`, at most 100; `before`,
+  the `next` cursor of the page before). `POST /v1/superset/conversations` starts one; its title is set from its first
+  message. `GET .../{id}` reads one with its messages. `POST .../{id}/delete` deletes it, withdrawing the builds it
+  proposed that nobody confirmed; a build it started keeps its own record.
+- `POST .../{id}/messages` sends a message, with the dashboard on screen (`dashboard_id`, its title and whether it has
+  charts, as the panel shows them), and answers an event stream. The profile's model first reads what the message
+  asks, in one small call (`mnemiq.routed`): a question about the data, charts for the dashboard on screen, a new
+  dashboard, a change of the dashboard on screen, or that it cannot tell. Then:
+  - **a question** streams exactly as `/v1/chat` streams it, the conversation's earlier answers as its history;
+  - **a build** is planned and kept as a proposal that writes nothing to Superset (`mnemiq.proposal`), or answered
+    as an offer of a dashboard that covers it, a refused plan, or a dashboard that already shows it all;
+  - **a change** is previewed with nothing written (`mnemiq.preview`): each chart's edit, and the charts it would
+    remove;
+  - **a message it cannot read**, or one that asks for a change or for charts off a dashboard, is a question back
+    with three choices (`mnemiq.clarify`); `choose` sends the message again where the person chose.
+  A build or a change reaches the planner or the change reader rewritten to stand alone ("add that as a chart here"
+  names what "that" was), and the person sees it in the plan or the preview. A question reaches the Ask path exactly
+  as typed.
+- `POST .../{id}/messages/{n}/confirm` is the person's "Build it" or "Apply", sent from the dashboard the proposal is
+  for (a 409 from anywhere else, the proposal kept). The message is claimed before anything is written, so a second
+  confirm, from a double click or another tab, is a 409 and does nothing.
+  - A build is confirmed as the build route confirms it; on a dashboard another build is building, or one changed
+    since the plan, the proposal is withdrawn and the goal planned again, as a new message that waits in turn.
+  - A change is written exactly as previewed, with no second reading by the model. Nothing is written when the
+    dashboard or a chart the preview names changed since it was read; a chart changed by hand between the check
+    and its write stops the rest, what was written named.
+  - A removal the preview proposed is done only for the charts the confirm names (`remove_chart_ids`), and only
+    once every edit beside it is written: a chart to remove that changed since the preview, like a stale edit,
+    leaves the whole preview unwritten.
+  - A confirm that fails before anything is written leaves the proposal waiting; one that fails partway is recorded
+    as done in part, naming what was written, and is not applied again.
+  - An offered dashboard takes `choice`: `add` proposes this goal's charts onto it, `new` a new dashboard.
+- `POST .../{id}/messages/{n}/decline` is "Not now": the proposal is set aside, and a build's withdrawn.
+- `POST .../{id}/messages/{n}/results` runs a kept answer's SQL again, decided as a new question's SQL is and run as
+  the person, now: its rows are answered and kept nowhere. SQL the person can no longer run is answered with the Ask
+  path's own sentence.
+
+A conversation keeps each question, mnemiq's sentence for it and its SQL, a build's plan as the person was shown it,
+and a change's preview (a filter's typed value among it). It keeps no row of results: every message is held to an
+allow-list of its keys at every depth, and any key a value, a row or a sample is kept under is refused.
+
 ## The panel
 
 The extension ([`integrations/superset`](../integrations/superset/README.md)) also puts mnemiq inside Superset 7.0 as
@@ -415,23 +470,35 @@ mnemiq's address.
 - **Who sees what.** Each time the panel opens it asks mnemiq once whether this person may use it. A person Superset
   will not let build (Alpha and sql_lab are needed) sees only the sentence that says so, and the panel asks nothing
   else.
-- **Ask** a question about the data. The answer streams in: its sentence, the SQL (folded), and the rows it read.
-- **Build** a dashboard from a goal. mnemiq shows the plan before it makes anything, then the panel runs the build one
-  step per request, with each chart's check, and links to the result. On a dashboard, a build goes onto the
-  dashboard on screen when the goal is sent, unless "New dashboard" is ticked; off one, mnemiq may first offer a
-  dashboard that already covers the goal, with Open it, Add these charts to it, and Build a new one.
+- **One box.** The person types; mnemiq works out whether it is a question, a dashboard to build, or a change to the
+  dashboard on screen (see [Conversations](#conversations)), and asks back, with three choices, when it cannot tell.
+- **Their conversations**, kept by mnemiq: Conversations lists them, newest first, and opens one, or deletes one after
+  a second click; New starts another, which mnemiq makes with its first message. Each message shows the dashboard it
+  was sent from when that changed. While a message, a Build it or an Apply is in flight, the panel stays on its
+  conversation.
+- **Ask** a question about the data. The answer streams in: its sentence, the SQL (folded), and the rows it read. Reopened
+  later, an answer shows its sentence as it was written then and its SQL, and Show results runs that SQL again as the
+  person, now; the rows are kept only while the card is open.
+- **Build** a dashboard. mnemiq shows the plan and makes nothing until Build it; then the panel runs the build one step
+  per request, with each chart's check, and links to the result. A build onto a dashboard goes onto the one on screen,
+  and on a dashboard with no charts the box opens with "Describe what this dashboard should show". Off a dashboard,
+  mnemiq may first offer one that already covers the goal, with Open it, Add these charts to it, and Build a new one.
 - **The dashboard's measures**, on a dashboard the person can read: each measure mnemiq keeps there, with its
   definition and its value computed now under the person's own row rules, and Edit, Remove and Save to dataset.
   Remove deletes the charts that show the measure (into Superset's trash, where it keeps one), and takes a chart the
   person does not edit off the dashboard instead; it says so, and names the charts, before it does anything.
-- **Change** the dashboard on screen by chat: "show daily instead of monthly", "add a funnel of policies by status". A
-  chart setting changed by hand is kept. A removal is a proposal the person confirms, and a chart to add is built
-  onto the dashboard.
+- **Change** the dashboard on screen: "show daily instead of monthly". mnemiq shows each chart's edit, what it will not
+  change, and the charts the change would delete, each with its own tick. Apply writes exactly what it showed, and
+  nothing when the dashboard or a chart changed since; a chart changed by hand while it writes stops it there, and the
+  card says what was changed and what was left. A chart setting changed by hand is kept. Build it and Apply are
+  offered only on the dashboard they are for, read from the address when clicked, Build it not while another build
+  runs on the page, and Not now sets a proposal aside.
 - **Finish.** Closing the panel does not stop a build. Leaving or reloading the page stops it after the step in
   flight, and the build stays resumable: the panel then lists the person's unfinished builds (on a dashboard, that
   dashboard's), each with Finish and Not now.
-- **What it keeps: nothing.** The conversation and a running build live in the page's memory for its life; a measure's
-  value lives only in the open measures section. Nothing is written to browser storage.
+- **What it keeps: nothing of its own.** mnemiq keeps the conversations; the panel holds what is on screen, and a
+  running build, in the page's memory for its life. A reopened answer's rows and a measure's value live only in their
+  open card or section. Nothing is written to browser storage.
 
 The forwarder is configured in Superset's `superset_config.py`, beside the token settings the extension's README lists
 (it mints each request's token with them):

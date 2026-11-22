@@ -2345,3 +2345,19 @@ def test_batched_dictionary_reads_live():
     pairs = [(t, s.column) for t in ("T_CLAIM", "T_REGION") for s in facts.statistics[t]]
     got = a.histograms(pairs)
     assert all(got[p] == a.histogram(*p) for p in pairs)
+
+
+def test_comments_read_live():
+    """Oracle's table and column comments come back from the dictionary as the database holds them; an empty comment
+    is absent."""
+    with contextlib.closing(_adapter(read_only=False)) as w:
+        w.execute("COMMENT ON TABLE t_claim IS 'One row per claim.'")
+        w.execute("COMMENT ON COLUMN t_claim.id IS 'The claim number'")
+    try:
+        tables, columns = _adapter().comments(["T_CLAIM", "T_REGION"])
+        assert tables.get("T_CLAIM") == "One row per claim." and "T_REGION" not in tables
+        assert columns.get(("T_CLAIM", "ID")) == "The claim number"
+    finally:
+        with contextlib.closing(_adapter(read_only=False)) as w:
+            w.execute("COMMENT ON TABLE t_claim IS ''")
+            w.execute("COMMENT ON COLUMN t_claim.id IS ''")

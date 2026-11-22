@@ -2359,6 +2359,35 @@ def test_a_build_onto_a_dashboard_after_a_remove_lays_out(live, served, model, p
     observe("after-a-remove", dashboard_id=dashboard_id, trashed_members=len(set(ids) & members))
 
 
+def test_a_build_onto_a_dashboard_holding_a_chart_deleted_in_superset_lays_out(live, served, model, policy_id):
+    """A chart deleted the way Superset deletes one (MCP `delete_chart`) goes to the trash and keeps its place on the
+    dashboard's layout. A build onto that dashboard afterwards keeps it placed, as the layout check expects, and lays
+    its own chart out."""
+    _, plan = _policy_charts(policy_id)
+    run = run_build(live, served, model, plan, "deleted-in-superset", goal="policies counted, one then deleted")
+    assert_ran_to_the_end(run)
+    dashboard_id = run.final["dashboard_id"]
+    ids = _built_charts(run, plan)
+    deleted = ids["counted_by_status"]
+    assert as_user(live, BUILDER).call("delete_chart", {"identifier": deleted}).get("success") is True
+    [(trashed,)] = metadata("SELECT deleted_at IS NOT NULL FROM slices WHERE id = %s", (deleted,))
+    assert trashed
+    again_counted = Measure(name="policies_beside_a_deleted_chart", label="Policies beside a deleted chart",
+                            expression="COUNT(id)", kind=MeasureKind.COUNT, dataset_id=policy_id,
+                            description="Policies", asked_by="")
+    kpi = ChartSpec(key="beside_a_deleted_chart_kpi", family=Family.BIG_NUMBER, title="Policies beside a deleted chart",
+                    dataset_id=policy_id, measures=(WrittenRef(again_counted),), dimensions=(), time_column=None,
+                    time_grain=None, filters=(), row_limit=None, source=None, target=None)
+    again = run_build(live, served, model, BuildPlan(charts=(kpi,), measures=(again_counted,)),
+                      "deleted-in-superset-onto", goal="policies beside a deleted chart", dashboard_id=dashboard_id)
+    assert_ran_to_the_end(again)
+    [(position,)] = metadata("SELECT position_json FROM dashboards WHERE id = %s", (dashboard_id,))
+    placed = {node["meta"]["chartId"] for node in json.loads(position).values()
+              if isinstance(node, dict) and node.get("type") == "CHART"}
+    assert deleted in placed and ids["counted_by_region"] in placed, placed
+    observe("deleted-in-superset", dashboard_id=dashboard_id, placed=len(placed))
+
+
 def test_a_goal_built_onto_its_own_dashboard_builds_nothing(live, served, model, policy_id):
     """Task 13a on rc2: the two-chart goal analyst built, asked again onto the dashboard it made, is answered as
     `shown`, naming both charts, and nothing is kept or made. This holds mnemiq's reading of a planned chart to what

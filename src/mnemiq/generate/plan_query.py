@@ -351,15 +351,7 @@ def plan_query(
             # out of them. Third exit of the same kind, and the naming is what makes this one
             # worth keeping when it is safe -- a caller told WHICH table it lacks can ask for it.
             logger.warning("unauthorized table refused: %r", verdict.subject)
-            return Deferred(
-                reason=(
-                    f"Answering this would require access to {verdict.subject!r}, "
-                    "which you do not have."
-                    if not carries_source_words
-                    else "Answering this would require access you do not have."
-                ),
-                code=DeferralReason.AUTHORIZATION,
-            )
+            return deferral_of_refusal(verdict, carries_source_words)
 
         if not verdict.repairable:
             # The generalisation of the branch above, and it took until M98 to notice the branch
@@ -407,6 +399,26 @@ def plan_query(
         reason=f"Could not produce a valid query after {max_attempts} attempts. {reason}",
         code=DeferralReason.INVALID_QUERY,
     )
+
+
+def deferral_of_refusal(verdict: Refusal, carries_source_words: bool = False) -> Deferred | None:
+    """What the Ask path answers a refusal it does not hand back to the model: a table this identity may not read, in
+    words that name it unless the model was shown the source's, or a refusal no rewrite can fix (`_not_our_sql`).
+    None for one the model would be asked to repair. Also what a statement asked again later is answered with, so a
+    reopened answer that no longer runs says so in the Ask path's own words."""
+    if verdict.code == RefusalCode.UNAUTHORIZED_TABLE:
+        return Deferred(
+            reason=(
+                f"Answering this would require access to {verdict.subject!r}, "
+                "which you do not have."
+                if not carries_source_words
+                else "Answering this would require access you do not have."
+            ),
+            code=DeferralReason.AUTHORIZATION,
+        )
+    if not verdict.repairable:
+        return _not_our_sql(verdict, carries_source_words)
+    return None
 
 
 def _not_our_sql(verdict, carries_source_words: bool) -> Deferred:

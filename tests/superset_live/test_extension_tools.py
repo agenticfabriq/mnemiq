@@ -600,7 +600,9 @@ def test_token_route_refuses_an_embedded_guest(live, extension, built_extension)
     import httpx
 
     secret = secrets_module.token_urlsafe(32)
-    port = 18090
+    # A port no other process holds: on a fixed one, a Superset already listening there (another stack on the same
+    # machine) answers the health check below, and the test would ask the wrong server.
+    port = _free_port()
     url = f"http://127.0.0.1:{port}"
 
     def up(_output: bytes) -> bool:
@@ -626,6 +628,15 @@ def test_token_route_refuses_an_embedded_guest(live, extension, built_extension)
         assert asked.json() == {"message": "the token route mints only for a signed-in Superset user"}
         assert forged.status_code == 401, forged.status_code
         assert _claims(live, replace(live, url=url).minted("west", "build"))["sub"] == "west"
+
+
+def _free_port() -> int:
+    """A port on 127.0.0.1 that was free a moment ago, as the operating system picks one."""
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
 
 
 def _serve(settings, monkeypatch):
@@ -792,6 +803,37 @@ def test_charts_made_by_the_extension_read_checked_by_the_value_check(live, exte
     assert ratio.chart_values is None and ratio.mnemiq_values is None
     assert not [c for c in recorder.calls if c.tool == "get_chart_data"
                 and c.request.get("identifier") == ids["ratio_pivot"]]
+
+
+def test_a_time_axis_its_row_limit_cuts_reads_not_checked(live, extension, policy_id, recorder):
+    """A monthly line of premium with a row limit of 3, made by the extension as a chart made by hand would be: rc2's
+    query ranks by the measure before its LIMIT and the axis sorts by time afterwards, so it shows the 3 largest months,
+    not the latest. The check reads it as not checked and says why. The control: the same line with no row limit is
+    checked, all 12 months."""
+    client = as_user(live, BUILDER)
+    build = new_build(client, "time-axis-cut")
+    total = written(policy_id, "total premium", "SUM(premium)")
+    line = dict(measures=(total,), time_column="issued", time_grain="P1M")
+    ids = {"cut": made_chart(build, spec(Family.LINE, policy_id, row_limit=3, **line), "cut"),
+           "whole": made_chart(build, spec(Family.LINE, policy_id, **line), "whole")}
+    adapter = SupersetSqlAdapter(client, database_id=live.database_id, schema="public")
+    checks = {name: check_chart(adapter, chart_id=chart_id, dataset_id=policy_id,
+                                kinds={"total premium": MeasureKind.CURRENCY}, saved={}, snapshot=POLICY,
+                                grants=GrantSet(frozenset({"policy"})), guard_fanout=False)
+              for name, chart_id in ids.items()}
+    shown = client.call("get_chart_data", {"identifier": ids["cut"]}).get("data") or []
+    largest = ground_truth(live, "SELECT SUM(premium) FROM policy GROUP BY date_trunc('month', issued) "
+                                 "ORDER BY 1 DESC LIMIT 3")
+    observe("time-axis cut", **{name: (ids[name], check.status.value, check.reason) for name, check in checks.items()},
+            shown=len(shown))
+    assert checks["whole"].status is ChartStatus.CHECKED and len(checks["whole"].chart_values) == 12
+    assert len(shown) == 3
+    assert sorted(float(next(v for k, v in row.items() if k != "issued")) for row in shown) == sorted(
+        float(total) for (total,) in largest)  # rc2 kept the 3 largest months
+    cut = checks["cut"]
+    assert cut.status is ChartStatus.NOT_CHECKED, cut.reason
+    assert cut.reason.endswith("its x-axis is a time axis, where a row limit keeps the points its query ranks first, "
+                               "not the latest"), cut.reason
 
 
 # --- patch_chart ----------------------------------------------------------------------------------------------------

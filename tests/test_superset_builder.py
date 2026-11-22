@@ -327,6 +327,19 @@ def test_plan_summary_holds_no_filter_operand():
     assert "Closed Won" not in text and "stage" not in text and "dimensions" not in text
 
 
+def test_plan_summary_writes_the_shape_a_conversation_keeps():
+    """`PLAN_SUMMARY_JSON`, the shape a conversation holds a proposed build's plan to, is the summary's own: every key
+    the summary writes is admitted, and every key admitted is one it writes."""
+    from mnemiq.superset.build_store import _shaped
+    from mnemiq.superset.builder import PLAN_SUMMARY_JSON
+
+    summary = plan_summary(plan_to_json(BuildPlan(charts=(BY_REGION,), measures=(POLICIES,))))
+    _shaped(summary, PLAN_SUMMARY_JSON, "summary")
+    assert set(summary) == set(PLAN_SUMMARY_JSON)
+    assert set(summary["charts"][0]) == set(PLAN_SUMMARY_JSON["charts"][0])
+    assert set(summary["measures"][0]) == set(PLAN_SUMMARY_JSON["measures"][0])
+
+
 def test_check_step_answers_each_charts_reason(fake, world, store):
     """The check step's answer names why each chart that did not check did not, by its id; a checked chart has
     none."""
@@ -510,7 +523,8 @@ def test_a_planned_chart_the_dashboard_shows_is_left_out_and_named(fake, world, 
     pytest.param(dataclasses.replace(BY_REGION, filters=(Filter("premium", ">", 50),)), id="another filter"),
     pytest.param(dataclasses.replace(BY_REGION, measures=(WrittenRef(DISTINCT),)), id="another measure definition"),
     pytest.param(dataclasses.replace(BY_REGION, family=Family.LINE), id="another family"),
-    pytest.param(dataclasses.replace(BY_MONTH, row_limit=5), id="another row limit"),
+    # On a categorical chart: a time axis takes no row limit (the planner refuses one), and a bar's is a ranking.
+    pytest.param(dataclasses.replace(BY_REGION, row_limit=5), id="another row limit"),
 ])
 def test_a_near_match_is_not_left_out(fake, world, store, near):
     """A planned chart that differs from the dashboard's in one thing it shows is not one the dashboard shows."""

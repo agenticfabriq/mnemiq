@@ -6,7 +6,7 @@ import { PanelApi } from "./api";
 import { BuildDriver, CHECK_WORDS, driver, resetBuilds, type BuildView, type PlanSummary } from "./build";
 import { BuildCard } from "./views/BuildCard";
 import { getSnapshot, resetStore, update } from "./store";
-import { resetAsking } from "./ask";
+import { resetTalk } from "./talk";
 import { resetDismissed } from "./views/Unfinished";
 
 const BASE = "/extensions/agenticfabriq/mnemiq/v1";
@@ -77,7 +77,7 @@ const nexts = (calls: Call[]) => calls.filter((c) => c.path === `/superset/build
 beforeEach(() => {
   host.reset();
   resetStore();
-  resetAsking();
+  resetTalk();
   resetBuilds();
   resetDismissed();
   history.replaceState(null, "", "/chart/list/");
@@ -302,7 +302,12 @@ describe("finishing and the page", () => {
     const { fetchFn } = server({
       "GET /schema": () => json(200, { tables: [], starters: ["How many claims are open?"] }),
       "GET /api/v1/dashboard/7": () => json(200, { id: 7, result: { id: 7, dashboard_title: "Claims" } }),
-      "POST /chat": () => new Response(chat, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      "POST /superset/conversations": () => json(201, { conversation: { id: "1a2b3c4d-0000-4000-8000-000000000001", title: "", created_at: "x",
+        updated_at: "y", messages: [] } }),
+      "POST /superset/conversations/1a2b3c4d-0000-4000-8000-000000000001/messages": () =>
+        new Response(chat, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      "GET /superset/conversations/1a2b3c4d-0000-4000-8000-000000000001": () => json(200, { conversation: { id: "1a2b3c4d-0000-4000-8000-000000000001", title: "How many claims are open?",
+        created_at: "x", updated_at: "y", messages: [{ index: 0, role: "person", kind: "ask", text: "How many claims are open?" }] } }),
       "POST /superset/builds": () => json(201, { build: view(0) }),
       [`POST /superset/builds/${BUILD_ID}/next`]: stepping(),
       "GET /superset/builds": () => json(200, { builds: finishing ? [{ build_id: FINISHED, goal: "claims by region",
@@ -316,7 +321,8 @@ describe("finishing and the page", () => {
     const { Panel } = await import("./Panel");
     render(<Panel />);
     fireEvent.click(await screen.findByRole("button", { name: "How many claims are open?" }));
-    await vi.waitFor(() => expect(getSnapshot().turns.at(-1)?.status).toBe("complete"));
+    await vi.waitFor(() => expect(getSnapshot().messages).toHaveLength(1));
+    await vi.waitFor(() => expect(getSnapshot().sending).toBe(false));
     await act(async () => { await driver.start("open claims", { dashboardId: 7 }); });
     await vi.waitFor(() => expect(getSnapshot().build?.view?.status).toBe("done"));
     // A Finish, through the banner: the list now holds a stopped build.
@@ -347,72 +353,7 @@ async function inPanel(path: string, handlers: Record<string, Handler>) {
   return served;
 }
 
-/** Sends `goal` with Build, from the composer, "New dashboard" ticked when `fresh`. */
-function sendBuild(goal: string, { fresh = false } = {}) {
-  fireEvent.click(screen.getByText("Build", { exact: true }));
-  fireEvent.change(screen.getByRole("textbox", { name: "Describe the dashboard" }), { target: { value: goal } });
-  if (fresh) fireEvent.click(screen.getByRole("checkbox", { name: "New dashboard" }));
-  fireEvent.click(screen.getByRole("button", { name: "Build" }));
-}
-
 const starts = (calls: Call[]) => calls.filter((c) => c.method === "POST" && c.path === "/superset/builds");
-const DASHBOARDS: Record<string, Handler> = {
-  "GET /api/v1/dashboard/1": () => json(200, { id: 1, result: { id: 1, dashboard_title: "One" } }),
-  "GET /api/v1/dashboard/2": () => json(200, { id: 2, result: { id: 2, dashboard_title: "Two" } }),
-  "GET /api/v1/dashboard/9": () => json(403, { message: "Forbidden" }),
-};
-
-describe("building from the composer", () => {
-  it("Build sends what the composer says: neither off a dashboard, the dashboard on screen on one, fresh when ticked", async () => {
-    const answered: Handler = () => json(200, { offer: { dashboard_id: 12, title: "Claims", reason: null, message: "covered" } });
-    const off = await inPanel("/chart/list/", { "POST /superset/builds": answered });
-    sendBuild("open claims");
-    await vi.waitFor(() => expect(starts(off.calls)).toHaveLength(1));
-    expect(starts(off.calls)[0].body).toEqual({ goal: "open claims" });
-    expect(await screen.findByRole("button", { name: "Add these charts to it" })).toBeTruthy();
-    cleanup();
-    resetStore();
-    const on = await inPanel("/dashboard/1/", { ...DASHBOARDS, "POST /superset/builds": answered });
-    await screen.findByRole("region", { name: "This dashboard" });
-    sendBuild("open claims");
-    await vi.waitFor(() => expect(starts(on.calls)).toHaveLength(1));
-    expect(starts(on.calls)[0].body).toEqual({ goal: "open claims", dashboard_id: 1 });
-    cleanup();
-    resetStore();
-    const ticked = await inPanel("/dashboard/1/", { ...DASHBOARDS, "POST /superset/builds": answered });
-    await screen.findByRole("region", { name: "This dashboard" });
-    sendBuild("open claims", { fresh: true });
-    await vi.waitFor(() => expect(starts(ticked.calls)).toHaveLength(1));
-    expect(starts(ticked.calls)[0].body).toEqual({ goal: "open claims", fresh: true });
-  });
-
-  it("a Build goes to the dashboard on screen when it is sent, before the page context has caught up", async () => {
-    let release = () => {};
-    const held = new Promise<void>((done) => { release = done; });
-    const served = await inPanel("/dashboard/1/", {
-      ...DASHBOARDS,
-      "GET /api/v1/dashboard/2": async () => { await held; return json(200, { id: 2, result: { id: 2, dashboard_title: "Two" } }); },
-      "POST /superset/builds": () => json(200, { refused: { reason: "nothing to plan", parts: [] } }),
-    });
-    await screen.findByRole("region", { name: "This dashboard" });
-    // Superset moves to dashboard 2 with no page event, and the panel has not read the path again yet.
-    history.pushState(null, "", "/dashboard/2/");
-    sendBuild("open claims");
-    await new Promise((done) => setTimeout(done, 30));
-    expect(starts(served.calls)).toEqual([]);
-    release();
-    await vi.waitFor(() => expect(starts(served.calls)).toHaveLength(1));
-    expect(starts(served.calls)[0].body).toEqual({ goal: "open claims", dashboard_id: 2 });
-  });
-
-  it("a Build on a dashboard the person cannot read is planned as one off a dashboard, naming nothing", async () => {
-    const served = await inPanel("/dashboard/9/", { ...DASHBOARDS,
-      "POST /superset/builds": () => json(200, { refused: { reason: "nothing to plan", parts: [] } }) });
-    sendBuild("open claims");
-    await vi.waitFor(() => expect(starts(served.calls)).toHaveLength(1));
-    expect(starts(served.calls)[0].body).toEqual({ goal: "open claims" });
-  });
-});
 
 describe("one build at a time", () => {
   it("a second start while one plans sends nothing and leaves the card as it was", async () => {
