@@ -108,7 +108,8 @@ def test_purpose_follows_the_route(signing):
     "/v1/superset/dashboards/12/measures/a%2fb/edit", "/v1/superset/dashboards/12/measures/../edit",
     "/v1/superset/dashboards/12/measures/./edit", "/v1/superset/dashboards/0/measures",
     f"/v1/superset/builds/{BUILD_ID}/next/again", f"/v1/superset/builds/{BUILD_ID}/confirm/again", "/v1/schema/",
-    "/V1/schema",
+    "/V1/schema", f"/v1/superset/conversations/{BUILD_ID}/messages/01/confirm",
+    f"/v1/superset/conversations/{BUILD_ID}/messages/1/again", f"/v1/superset/conversations/{BUILD_ID}/delete/again",
 ])
 def test_unlisted_path_is_refused_without_calling_mnemiq(signing, path):
     found, send = _forward(signing, "POST" if path.endswith(("edit", "again")) else "GET", path)
@@ -234,7 +235,14 @@ def test_every_listed_route_forwards(signing):
              ("POST", "/v1/superset/dashboards/12/measures/policies/edit"),
              ("POST", "/v1/superset/dashboards/12/measures/total_premium@12/remove"),
              ("POST", "/v1/superset/dashboards/12/measures/policies/save"),
-             ("POST", "/v1/superset/dashboards/12/changes")]
+             ("POST", "/v1/superset/dashboards/12/changes"),
+             ("GET", "/v1/superset/conversations"), ("POST", "/v1/superset/conversations"),
+             ("GET", f"/v1/superset/conversations/{BUILD_ID}"),
+             ("POST", f"/v1/superset/conversations/{BUILD_ID}/delete"),
+             ("POST", f"/v1/superset/conversations/{BUILD_ID}/messages"),
+             ("POST", f"/v1/superset/conversations/{BUILD_ID}/messages/0/confirm"),
+             ("POST", f"/v1/superset/conversations/{BUILD_ID}/messages/12/decline"),
+             ("POST", f"/v1/superset/conversations/{BUILD_ID}/messages/3/results")]
     for method, path in cases:
         found, send = _forward(signing, method, path, body=b"{}" if method == "POST" else b"")
         assert found.status == 200 and len(send.sent) == 1, (method, path, found.status)
@@ -258,3 +266,20 @@ def test_the_whole_answer_is_bounded_by_the_total_time(signing):
     forward_for(ANA, "GET", "/v1/schema", {}, b"", signing=signing, target=target, now=NOW, send=send)
     (chat, schema) = send.sent
     assert (chat.timeout_s, chat.total_s) == (30, 120) and (schema.timeout_s, schema.total_s) == (120, 120)
+
+
+def test_a_message_is_forwarded_as_a_stream_on_a_build_token(signing):
+    _, sent = _forward(signing, "POST", f"/v1/superset/conversations/{BUILD_ID}/messages", body=b"{}")
+    assert sent.sent[0].stream is True
+    assert _claims(sent.sent[0])["scope"].split() == list(BUILD_SCOPES)
+
+
+@pytest.mark.parametrize(("query", "status"), [
+    ({"limit": ["30"]}, 200), ({"limit": ["100"]}, 200), ({"limit": ["101"]}, 400), ({"limit": ["0"]}, 400),
+    ({"before": [f"2026-11-21T10:00:00.000000+00:00|{BUILD_ID}"]}, 200), ({"before": ["yesterday"]}, 400),
+    ({"before": [f"2026-11-21T10:00:00.000000+00:00|{BUILD_ID}"], "limit": ["5"]}, 200),
+    ({"dashboard_id": ["12"]}, 400),
+])
+def test_the_conversation_list_takes_only_its_page(signing, query, status):
+    found, sent = _forward(signing, "GET", "/v1/superset/conversations", query=query)
+    assert found.status == status and len(sent.sent) == (1 if status == 200 else 0)

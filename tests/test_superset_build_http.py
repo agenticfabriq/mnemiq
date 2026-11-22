@@ -99,10 +99,20 @@ BUILD_ROUTES = {("POST", "/v1/superset/builds"), ("GET", "/v1/superset/builds"),
                 ("POST", "/v1/superset/dashboards/{dashboard_id}/measures/{name}/edit"),
                 ("POST", "/v1/superset/dashboards/{dashboard_id}/measures/{name}/remove"),
                 ("POST", "/v1/superset/dashboards/{dashboard_id}/measures/{name}/save"),
-                ("POST", "/v1/superset/dashboards/{dashboard_id}/changes")}
+                ("POST", "/v1/superset/dashboards/{dashboard_id}/changes"),
+                # The panel's conversations (`superset_conversations`), held to the same door, store and modes.
+                ("GET", "/v1/superset/conversations"), ("POST", "/v1/superset/conversations"),
+                ("GET", "/v1/superset/conversations/{conversation_id}"),
+                ("POST", "/v1/superset/conversations/{conversation_id}/delete"),
+                ("POST", "/v1/superset/conversations/{conversation_id}/messages"),
+                ("POST", "/v1/superset/conversations/{conversation_id}/messages/{index}/confirm"),
+                ("POST", "/v1/superset/conversations/{conversation_id}/messages/{index}/decline"),
+                ("POST", "/v1/superset/conversations/{conversation_id}/messages/{index}/results")}
 # Each measure action's body, as the panel sends it.
 ACTION_BODIES = {"edit": {"label": "Policies", "expression": "COUNT(DISTINCT policy_id)", "kind": "count"},
-                 "remove": {"chart_ids": [1]}, "save": {}, "changes": {"request": "show daily"}, "confirm": {}}
+                 "remove": {"chart_ids": [1]}, "save": {}, "changes": {"request": "show daily"}, "confirm": {},
+                 "messages": {"text": "how many policies?"}, "decline": {}, "results": {}, "delete": {},
+                 "conversations": {}}
 # The calls that change something in Superset, which a refused request never makes. The build's probe of the
 # extension, its `create_dataset` with an empty request, changes nothing: `_writes` passes over it.
 WRITES = {"generate_chart", "create_dataset", "create_virtual_dataset",
@@ -261,7 +271,8 @@ def _routes(app) -> set[tuple[str, str]]:
 
 def _call(client, method: str, path: str, token: str | None):
     action = path.rsplit("/", 1)[-1]
-    path = path.replace("{build_id}", str(uuid.uuid4())).replace("{dashboard_id}", "900").replace("{name}", "policies")
+    path = (path.replace("{build_id}", str(uuid.uuid4())).replace("{dashboard_id}", "900")
+            .replace("{name}", "policies").replace("{conversation_id}", str(uuid.uuid4())).replace("{index}", "1"))
     headers = _bearer(token) if token is not None else {}
     body = ACTION_BODIES.get(action, {"goal": GOAL})
     return client.post(path, json=body, headers=headers) if method == "POST" else client.get(path, headers=headers)

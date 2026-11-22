@@ -410,6 +410,50 @@ still to come. In short:
   update it. One that has them but does not take a field a chart needs (`create_chart`'s `leave_out_no_value`, for a
   chart made with a row limit) stops the build at that chart's step, with a sentence saying to update it.
 
+## Conversations
+
+A person's conversations with mnemiq in the panel are kept in the control Postgres beside the builds
+(`mnemiq_superset_conversation`, made the first time the store connects), each its tenant's and person's alone: another
+person's conversation id is a 404 on every route, and says nothing of it. Each route takes a token minted for
+building, and `MNEMIQ_CONTROL_DSN` unset answers each with a 503, as the build routes do.
+
+- `GET /v1/superset/conversations` lists the person's conversations, newest first (`limit`, at most 100; `before`,
+  the `next` cursor of the page before). `POST /v1/superset/conversations` starts one; its title is set from its first
+  message. `GET .../{id}` reads one with its messages. `POST .../{id}/delete` deletes it, withdrawing the builds it
+  proposed that nobody confirmed; a build it started keeps its own record.
+- `POST .../{id}/messages` sends a message, with the dashboard on screen (`dashboard_id`, its title and whether it has
+  charts, as the panel shows them), and answers an event stream. The profile's model first reads what the message
+  asks, in one small call (`mnemiq.routed`): a question about the data, charts for the dashboard on screen, a new
+  dashboard, a change of the dashboard on screen, or that it cannot tell. Then:
+  - **a question** streams exactly as `/v1/chat` streams it, the conversation's earlier answers as its history;
+  - **a build** is planned and kept as a proposal that writes nothing to Superset (`mnemiq.proposal`), or answered
+    as an offer of a dashboard that covers it, a refused plan, or a dashboard that already shows it all;
+  - **a change** is previewed with nothing written (`mnemiq.preview`): each chart's edit, and the charts it would
+    remove;
+  - **a message it cannot read**, or one that asks for a change or for charts off a dashboard, is a question back
+    with three choices (`mnemiq.clarify`); `choose` sends the message again where the person chose.
+  A build or a change reaches the planner or the change reader rewritten to stand alone ("add that as a chart here"
+  names what "that" was), and the person sees it in the plan or the preview. A question reaches the Ask path exactly
+  as typed.
+- `POST .../{id}/messages/{n}/confirm` is the person's "Build it" or "Apply", sent from the dashboard the proposal is
+  for (a 409 from anywhere else, the proposal kept). The message is claimed before anything is written, so a second
+  confirm, from a double click or another tab, is a 409 and does nothing.
+  - A build is confirmed as the build route confirms it; on a dashboard another build is building, or one changed
+    since the plan, the proposal is withdrawn and the goal planned again, as a new message that waits in turn.
+  - A change is written exactly as previewed, with no second reading by the model. Nothing is written when the
+    dashboard or a chart the preview names changed since it was read; a chart changed by hand between the check
+    and its write stops the rest, what was written named.
+  - A removal the preview proposed is done only for the charts the confirm names (`remove_chart_ids`).
+  - An offered dashboard takes `choice`: `add` proposes this goal's charts onto it, `new` a new dashboard.
+- `POST .../{id}/messages/{n}/decline` is "Not now": the proposal is set aside, and a build's withdrawn.
+- `POST .../{id}/messages/{n}/results` runs a kept answer's SQL again, decided as a new question's SQL is and run as
+  the person, now: its rows are answered and kept nowhere. SQL the person can no longer run is answered with the Ask
+  path's own sentence.
+
+A conversation keeps each question, mnemiq's sentence for it and its SQL, a build's plan as the person was shown it,
+and a change's preview (a filter's typed value among it). It keeps no row of results: every message is held to an
+allow-list of its keys at every depth, and any key a value, a row or a sample is kept under is refused.
+
 ## The panel
 
 The extension ([`integrations/superset`](../integrations/superset/README.md)) also puts mnemiq inside Superset 7.0 as

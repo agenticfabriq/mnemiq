@@ -23,6 +23,7 @@ from mnemiq.server.openai_compat import mount_openai
 from mnemiq.server.serialize import answer_payload
 from mnemiq.server.sse import chat_stream
 from mnemiq.server.superset_build import mount_superset_build
+from mnemiq.server.superset_conversations import mount_superset_conversations
 from mnemiq.server.v1_refusals import NotPermitted, refused, unknown_profile
 
 logger = logging.getLogger(__name__)
@@ -235,7 +236,8 @@ def build_app(
 
     mount_openai(app, runtime, doors, heartbeat_s=heartbeat_s)
     if superset:
-        mount_superset_build(app, runtime, doors, asker)
+        build = mount_superset_build(app, runtime, doors, asker)
+        mount_superset_conversations(app, runtime, doors, asker, build, heartbeat_s=heartbeat_s)
 
     # Mounted last, so it can only claim paths no API route above already answered.
     built = static_dir if static_dir is not None else STATIC_DIR
