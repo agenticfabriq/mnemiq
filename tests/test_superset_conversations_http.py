@@ -518,3 +518,204 @@ def test_deleting_a_conversation_withdraws_its_waiting_proposals(served, fake, w
     assert client.post(f"{PREFIX}/{talk}/delete", headers=_bearer(_token())).status_code == 204
     tenant, principal = _whoami(client, _token())
     assert store.load_build(tenant, proposal["build_id"], principal) is None
+
+
+# --- the review's fixes: removals held to the preview, failures that strand nothing, answers paired with questions
+
+
+def _previewing_a_removal(client, runtime, world, *, with_edit: bool):
+    dashboard, chart, title = _dashboard_with_charts(client, world)
+    changes = (ChartChange(chart_id=chart, set={"row_limit": 2}),) if with_edit else ()
+    runtime.profiles[runtime.default_profile].interpreter = FakeInterpreter(Interpretation(
+        changes=changes, remove_chart_ids=(chart,)))
+    _routing(runtime, Routed(Intent.CHANGE, "drop the policies chart"))
+    talk = _new(client)
+    preview = _custom(_send(client, talk, "drop it", dashboard_id=dashboard, dashboard_has_charts=True),
+                      "mnemiq.preview")
+    return talk, preview, dashboard, chart
+
+
+def test_a_confirmed_removal_from_a_fresh_preview_removes_the_chart(served, fake, world, store):
+    client, runtime = served
+    talk, preview, dashboard, chart = _previewing_a_removal(client, runtime, world, with_edit=False)
+    r = _confirm(client, talk, preview["index"], dashboard_id=dashboard, remove_chart_ids=[chart])
+    assert r.status_code == 200, r.text
+    assert r.json()["state"] == "done" and r.json()["change"]["removed"] == [chart]
+    assert chart in world.trashed
+
+
+def test_a_stale_preview_removes_nothing_through_the_confirm(served, fake, world, store):
+    from mnemiq.superset.chart_change import STALE_SINCE_PREVIEW
+
+    client, runtime = served
+    talk, preview, dashboard, chart = _previewing_a_removal(client, runtime, world, with_edit=False)
+    world.charts[chart]["params"] = {**world.charts[chart]["params"], "color_scheme": "by hand"}
+    world.charts[chart]["changed_on"] = world._stamp()
+    r = _confirm(client, talk, preview["index"], dashboard_id=dashboard, remove_chart_ids=[chart])
+    assert r.status_code == 200, r.text
+    assert r.json()["state"] == "stale" and chart not in world.trashed
+    assert "delete_chart" not in [call.tool for call in fake.calls]
+    outcome = _read(client, talk)["messages"][preview["index"]]["outcome"]
+    assert {"chart_id": chart, "reason": STALE_SINCE_PREVIEW} in outcome["left"]
+
+
+def test_only_a_chart_the_preview_would_remove_is_confirmed_for_removal(served, fake, world, store):
+    client, runtime = served
+    talk, preview, dashboard, chart = _previewing_a_removal(client, runtime, world, with_edit=False)
+    r = _confirm(client, talk, preview["index"], dashboard_id=dashboard, remove_chart_ids=[chart + 1000])
+    assert r.status_code == 422, r.text
+    assert _read(client, talk)["messages"][preview["index"]]["outcome"] == {"state": "proposed"}
+
+
+def test_a_change_that_fails_before_writing_can_be_confirmed_again(served, fake, world, store):
+    """Superset failing on the confirm's first read (the dashboard's layout): nothing was written, so the preview
+    waits again. (A chart that cannot be read is no failure of the confirm: it reads as changed, and nothing is
+    written.)"""
+    client, runtime = served
+    dashboard, chart, _ = _dashboard_with_charts(client, world)
+    runtime.profiles[runtime.default_profile].interpreter = FakeInterpreter(Interpretation(
+        changes=(ChartChange(chart_id=chart, set={"row_limit": 2}),)))
+    _routing(runtime, Routed(Intent.CHANGE, "top two"))
+    talk = _new(client)
+    preview = _custom(_send(client, talk, "top two", dashboard_id=dashboard, dashboard_has_charts=True),
+                      "mnemiq.preview")
+    world.hooks["get_layout"] = Hook(before=lambda request, _w: (_ for _ in ()).throw(RuntimeError("down")))
+    failed = _confirm(client, talk, preview["index"], dashboard_id=dashboard)
+    assert failed.status_code >= 400, failed.text
+    assert _read(client, talk)["messages"][preview["index"]]["outcome"] == {"state": "proposed"}
+    world.hooks.pop("get_layout")
+    again = _confirm(client, talk, preview["index"], dashboard_id=dashboard)
+    assert again.status_code == 200 and again.json()["state"] == "done", again.text
+
+
+def test_a_change_interrupted_mid_write_is_recorded_partial(served, fake, world, store):
+    from mnemiq.superset.chart_change import NOT_ANSWERED
+
+    client, runtime = served
+    dashboard, chart, _ = _dashboard_with_charts(client, world)
+    runtime.profiles[runtime.default_profile].interpreter = FakeInterpreter(Interpretation(
+        changes=(ChartChange(chart_id=chart, set={"row_limit": 2}),)))
+    _routing(runtime, Routed(Intent.CHANGE, "top two"))
+    talk = _new(client)
+    preview = _custom(_send(client, talk, "top two", dashboard_id=dashboard, dashboard_has_charts=True),
+                      "mnemiq.preview")
+    world.hooks["patch_chart"] = Hook(before=lambda request, _w: (_ for _ in ()).throw(RuntimeError("down")))
+    _confirm(client, talk, preview["index"], dashboard_id=dashboard)
+    outcome = _read(client, talk)["messages"][preview["index"]]["outcome"]
+    assert outcome["state"] == "partial"
+    assert outcome["left"] == [{"chart_id": chart, "reason": NOT_ANSWERED}]
+    again = _confirm(client, talk, preview["index"], dashboard_id=dashboard)
+    assert again.status_code == 409 and again.json()["detail"] == "This was already done."
+
+
+def test_a_build_left_applying_is_confirmed_from_the_builds_own_state(served, fake, world, store, talks):
+    """A server that stopped between claiming a "Build it" and recording it: the build store says whether it was
+    confirmed, so the message is set right rather than left saying it was done."""
+    client, runtime = served
+    _routing(runtime, Routed(Intent.BUILD_NEW, "policies by region"))
+    talk = _new(client)
+    proposal = _custom(_send(client, talk, "build policies by region"), "mnemiq.proposal")
+    tenant, principal = _whoami(client, _token())
+    assert talks.settle(tenant, talk, principal, proposal["index"], {"state": "applying"}, expect="proposed")
+    r = _confirm(client, talk, proposal["index"], dashboard_id=None)
+    assert r.status_code == 200, r.text
+    assert r.json()["build"]["status"] == "building"
+    assert _read(client, talk)["messages"][proposal["index"]]["outcome"]["state"] == "done"
+
+
+def test_a_change_left_applying_says_it_may_or_may_not_be_done(served, fake, world, store, talks):
+    client, runtime = served
+    dashboard, chart, _ = _dashboard_with_charts(client, world)
+    runtime.profiles[runtime.default_profile].interpreter = FakeInterpreter(Interpretation(
+        changes=(ChartChange(chart_id=chart, set={"row_limit": 2}),)))
+    _routing(runtime, Routed(Intent.CHANGE, "top two"))
+    talk = _new(client)
+    preview = _custom(_send(client, talk, "top two", dashboard_id=dashboard, dashboard_has_charts=True),
+                      "mnemiq.preview")
+    tenant, principal = _whoami(client, _token())
+    talks.settle(tenant, talk, principal, preview["index"], {"state": "applying"}, expect="proposed")
+    r = _confirm(client, talk, preview["index"], dashboard_id=dashboard)
+    assert r.status_code == 409
+    assert r.json()["detail"] == "This may or may not have been done; check the dashboard."
+
+
+def test_a_worker_that_times_out_ends_the_stream(served, fake, world, store):
+    """A plan whose own work raises TimeoutError ends the stream with its error, never an endless keep-alive."""
+    client, runtime = served
+
+    class Late:
+        def plan(self, goal, context):
+            raise TimeoutError("the model took too long")
+
+    _planned(runtime, Late())
+    _routing(runtime, Routed(Intent.BUILD_NEW, "policies by region"))
+    talk = _new(client)
+    done: list = []
+    sender = threading.Thread(target=lambda: done.append(_send(client, talk, "build policies by region")))
+    sender.start()
+    sender.join(30)
+    assert not sender.is_alive(), "the stream did not end"
+    assert done[0][-1]["type"] == "RUN_ERROR"
+
+
+def test_each_answer_is_kept_with_the_question_it_answers(served, monkeypatch):
+    """Two tabs asking at once: each answer names the question it replies to, and a follow-up's history pairs them by
+    that, never by their order."""
+    client, runtime = served
+    _routing(runtime, Routed(Intent.ASK, "x"))
+    _answering(monkeypatch)
+    talk = _new(client)
+    _send(client, talk, "how many policies by region?")
+    [question, answer] = _read(client, talk)["messages"]
+    assert answer["replies_to"] == question["index"]
+    mod = _module()
+    from mnemiq.superset.conversations import Conversation, Message
+
+    docs = [{"role": "person", "kind": "ask", "text": "Q1"}, {"role": "person", "kind": "ask", "text": "Q2"},
+            {"role": "mnemiq", "kind": "answer", "text": "", "replies_to": 0,
+             "answer": {"sentence": "a1", "sql": "SELECT 1", "grant_fingerprint": "g", "tables_used": []}},
+            {"role": "mnemiq", "kind": "answer", "text": "", "replies_to": 1,
+             "answer": {"sentence": "a2", "sql": "SELECT 2", "grant_fingerprint": "g", "tables_used": []}}]
+    talk_ = Conversation(conversation_id="c", title="", created_at="t", updated_at="t", messages=tuple(
+        Message(i, d["role"], d["kind"], d["text"], "t", d) for i, d in enumerate(docs)))
+    assert [(turn.question, turn.sql) for turn in mod._history(talk_)] == [("Q1", "SELECT 1"), ("Q2", "SELECT 2")]
+
+
+def test_an_ask_whose_reader_left_keeps_its_answer():
+    """The panel closed or reloaded mid-answer: the Ask path's stream is read to its end all the same, and its answer
+    kept, so the question is never left with nothing after it."""
+    import asyncio
+
+    mod = _module()
+    kept: list = []
+
+    async def answer():
+        yield frame({"type": "RUN_STARTED", "runId": "r"})
+        await asyncio.sleep(0.05)
+        yield frame({"type": "CUSTOM", "name": "mnemiq.answer", "value": {"answer": SENTENCE, "sql": SQL}})
+        yield frame({"type": "RUN_FINISHED", "runId": "r"})
+
+    async def run():
+        out: asyncio.Queue = asyncio.Queue()
+        task = asyncio.ensure_future(mod._ask_and_keep(answer(), keep_answer=lambda value: kept.append(value) or 1,
+                                                       keep_note=lambda text: kept.append(text) or 1, out=out))
+        await out.get()  # the reader reads one frame, then leaves
+        await task
+        return task
+
+    asyncio.run(run())
+    assert kept == [{"answer": SENTENCE, "sql": SQL}]
+
+
+def test_a_kept_offer_is_in_the_conversations_words(served, fake, world, store):
+    import dataclasses
+
+    client, runtime = served
+    _dashboard(world, 900, title="Policies at a glance")
+    offer = dataclasses.replace(ONE_BAR, reuse_candidates=(900,), reuse_reason="It already shows policies.")
+    _planned(runtime, FakePlanner([offer, ONE_BAR]))
+    _routing(runtime, Routed(Intent.BUILD_NEW, "policies by region"))
+    talk = _new(client)
+    offered = _custom(_send(client, talk, "build me policies by region"), "mnemiq.offer")
+    text = _read(client, talk)["messages"][offered["index"]]["text"]
+    assert "dashboard_id" not in text and "fresh" not in text and "Policies at a glance" in text
