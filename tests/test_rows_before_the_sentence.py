@@ -15,13 +15,14 @@ import json
 import pyarrow as pa
 from fastapi.testclient import TestClient
 
-from mnemiq.agent.loop import AgentAnswer, cap_sentence
+from mnemiq.agent.loop import AgentAnswer, cap_sentence, response_sentence
 from mnemiq.agent.modes import MODES, build_agent
 from mnemiq.agent.synthesize import FakeSynthesizer
 from mnemiq.authz.grants import GrantSet
 from mnemiq.cache.store import L1Cache, TwoTierCache
 from mnemiq.contract import Column, IdentityContext, Snapshot
 from mnemiq.contract.seams import append_notes
+from mnemiq.execute.cut import mark_sent
 from mnemiq.generate.generator import FakeGenerator
 from mnemiq.llm.client import ModelUnavailable, PromptCut
 from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
@@ -63,10 +64,10 @@ def _packet() -> ContextPacket:
                          grant_fingerprint=_GRANTS.fingerprint, enrichment_version="v1")
 
 
-def _ask(replies=(_GOOD,), synth=None, table=None, mode="instant"):
+def _ask(replies=(_GOOD,), synth=None, table=None, mode="instant", adapter=None):
     events: list[dict] = []
     agent = build_agent(MODES[mode], generator=FakeGenerator(list(replies)), synthesizer=synth or FakeSynthesizer("prose"),
-                        adapter=_Adapter(table), cache=TwoTierCache(L1Cache()), corrector=None, values=None,
+                        adapter=adapter or _Adapter(table), cache=TwoTierCache(L1Cache()), corrector=None, values=None,
                         selector=None)
     answer = agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY, emit=events.append)
     return answer, events
@@ -303,3 +304,34 @@ def test_every_eval_runner_that_copies_an_answer_copies_the_flag():
     runners = [p for p in root.glob("*.py") if "result.candidates_executed = answer.candidates_executed" in p.read_text()]
     assert len(runners) >= 2, "the scan found the runners, so it checks something"
     assert [p.name for p in runners if "result.prose_failed = answer.prose_failed" not in p.read_text()] == []
+
+
+# --- an answer larger than its source sends in one response --------------------------------------------------------------
+
+
+class _CutAdapter(_Adapter):
+    """A source that sends an answer's first rows only, marked (`execute_answer`), as Superset mode's adapter does for an
+    answer larger than one MCP response. Every other read is answered whole."""
+
+    def execute_answer(self, sql, timeout_s=None):
+        return mark_sent(self.table, self.table.num_rows)
+
+
+_NINETY_TWO = pa.table({"n": list(range(92))})
+
+
+def test_an_answer_cut_to_its_sources_response_says_so():
+    answer, events = _ask(adapter=_CutAdapter(_NINETY_TWO))
+    assert answer.answer.endswith(response_sentence(92))
+    assert cap_sentence(1000) not in answer.answer
+    assert answer.preview.capped and answer.preview.row_count == 92
+    [early] = _results(events)
+    assert response_sentence(92) in early["notes"]
+
+
+def test_the_cut_keeps_deep_modes_candidates_agreeing():
+    candidates = MODES["deep"].candidates
+    answer, _ = _ask(replies=[_GOOD] * (candidates * 3), mode="deep", adapter=_CutAdapter(_NINETY_TWO))
+    assert answer.candidates_executed and not answer.deferred and not answer.failed
+    # Deep mode says how many candidates agreed after the notes, the cut's among them.
+    assert response_sentence(92) in answer.answer and answer.answer.endswith("candidates agreed.)")

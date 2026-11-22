@@ -756,3 +756,20 @@ def test_a_kept_offer_is_in_the_conversations_words(served, fake, world, store):
     offered = _custom(_send(client, talk, "build me policies by region"), "mnemiq.offer")
     text = _read(client, talk)["messages"][offered["index"]]["text"]
     assert "dashboard_id" not in text and "fresh" not in text and "Policies at a glance" in text
+
+
+def test_results_show_the_rows_that_fit(served, fake, world, talks, monkeypatch):
+    """A reopened answer larger than Superset sends in one response is shown as its first rows, said to be capped."""
+    client, runtime = served
+    _routing(runtime, Routed(Intent.ASK, "x"))
+    _answering(monkeypatch)
+    talk = _new(client)
+    _send(client, talk, "how many policies by region?")
+    world.hooks["execute_sql"] = Hook(instead=lambda request, _world: (
+        {"success": True, "columns": [{"name": "region", "type": "object"}, {"name": "policies", "type": "int64"}],
+         "rows": [{"region": "West", "policies": 9876}], "row_count": 1, "_response_truncated": True}
+        if "GROUP BY region" in request.get("sql", "") and "mnemiq_probe" not in request.get("sql", "") else None))
+    r = client.post(f"{PREFIX}/{talk}/messages/1/results", headers=_bearer(_token()))
+    assert r.status_code == 200, r.text
+    shown = r.json()
+    assert shown["rows"] == [["West", 9876]] and shown["capped"] is True

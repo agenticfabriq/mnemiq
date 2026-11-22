@@ -128,7 +128,7 @@ def decide_statement(sql: str, *, adapter, snapshot: Snapshot, grants: GrantSet,
 
 
 def run_decided(sql: str, *, adapter, snapshot: Snapshot, grants: GrantSet, timeout_s: float,
-                guard_fanout: bool | None, values=None) -> Decided | Refusal:
+                guard_fanout: bool | None, values=None, answer: bool = False) -> Decided | Refusal:
     """Decide `sql` under `grants`, and when it is approved run the approved statement through `adapter` as the person.
 
     A refusal is returned. A run that fails raises `ExecutionError`, whose detail is the caller's to log."""
@@ -136,4 +136,4 @@ def run_decided(sql: str, *, adapter, snapshot: Snapshot, grants: GrantSet, time
                                values=values)
     if not isinstance(verdict, Approved):
         return verdict
-    return Decided(verdict, run(adapter, verdict.target_sql, timeout_s=timeout_s).table)
+    return Decided(verdict, run(adapter, verdict.target_sql, timeout_s=timeout_s, answer=answer).table)

@@ -74,10 +74,14 @@ def _timed_out(timeout_s: float) -> ExecutionError:
     )
 
 
-def run(adapter, sql: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> ExecutionResult:
+def run(adapter, sql: str, timeout_s: float = DEFAULT_TIMEOUT_S, *, answer: bool = False) -> ExecutionResult:
+    """`sql` run on `adapter`. `answer` says it is the statement whose rows answer a question: an adapter that can read
+    one larger than its source sends in one response as its first rows (`execute_answer`, marked with how many) reads it
+    so; every other run reads all of a result or fails."""
     started = time.perf_counter()
+    read = getattr(adapter, "execute_answer", None) if answer else None
     try:
-        table = adapter.execute_arrow(sql, timeout_s=timeout_s)
+        table = read(sql, timeout_s=timeout_s) if read is not None else adapter.execute_arrow(sql, timeout_s=timeout_s)
     except ExecutionError:
         # Already in this form, with its two halves assigned. Re-wrapping would demote a
         # sentence we wrote into `source_detail` and hide it from the caller -- which the old

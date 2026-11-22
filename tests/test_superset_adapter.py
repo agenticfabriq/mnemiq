@@ -472,3 +472,10 @@ def test_a_refusal_without_its_sizes_is_a_cut_result():
 def test_an_answer_cut_to_no_rows_is_a_cut_result():
     with pytest.raises(ResultCut):
         _adapter({**_rows(0), "_response_truncated": True}).execute_answer(SQL)
+
+
+def test_an_answer_run_reads_through_execute_answer_and_other_runs_still_refuse_a_cut():
+    """The runner's `answer=True` is the answer's read; every other run of the same cut payload is repaired as before."""
+    assert sent_of(run(_adapter(CUT), SQL, answer=True).table) == 2
+    with pytest.raises(ExecutionError):
+        run(_adapter(CUT), SQL)
