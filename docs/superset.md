@@ -453,10 +453,11 @@ token for building; mnemiq asks of it `db.read` for every route, and Superset's 
 - `POST .../{id}/messages/{n}/decline` is "Not now": the proposal is set aside, and a build's withdrawn.
 - `POST .../{id}/messages/{n}/results` runs a kept answer's SQL again, decided as a new question's SQL is and run as
   the person, now: its rows are answered and kept nowhere. SQL the person can no longer run is answered with the Ask
-  path's own sentence.
+  path's own sentence. An answer mnemiq declined or could not give has nothing to run again (404).
 
 A conversation keeps each question, mnemiq's sentence for it and its SQL, a build's plan as the person was shown it,
-and a change's preview (a filter's typed value among it). It keeps no row of results: every message is held to an
+and a change's preview (a filter's typed value among it). An answer mnemiq declined or could not give keeps that too,
+with its reason's code, and is no follow-up's history. It keeps no row of results: every message is held to an
 allow-list of its keys at every depth, and any key a value, a row or a sample is kept under is refused.
 
 ## The panel
@@ -478,7 +479,8 @@ mnemiq's address.
   conversation.
 - **Ask** a question about the data. The answer streams in: its sentence, the SQL (folded), and the rows it read. Reopened
   later, an answer shows its sentence as it was written then and its SQL, and Show results runs that SQL again as the
-  person, now; the rows are kept only while the card is open.
+  person, now; the rows are kept only while the card is open. One mnemiq declined or could not give reopens as it
+  read then: its reason and what to try next, and no Show results.
 - **Build** a dashboard. mnemiq shows the plan and makes nothing until Build it; then the panel runs the build one step
   per request, with each chart's check, and links to the result. A build onto a dashboard goes onto the one on screen,
   and on a dashboard with no charts the box opens with "Describe what this dashboard should show". Off a dashboard,

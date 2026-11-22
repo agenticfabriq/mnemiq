@@ -180,13 +180,20 @@ def _history(conversation: Conversation) -> list[HistoryTurn]:
         # Paired by the question it replies to, so two tabs asking at once are never crossed; by order only for an
         # answer kept without it.
         replied = asked.get(doc["replies_to"]) if isinstance(doc.get("replies_to"), int) else question
-        if doc.get("kind") == "answer" and replied and (doc.get("answer") or {}).get("sql"):
+        # An answer mnemiq withheld or could not give is no history, as the workbench's own history leaves it out.
+        if doc.get("kind") == "answer" and replied and (doc.get("answer") or {}).get("sql") \
+                and not _withheld(doc["answer"]):
             question = replied
             answer = doc["answer"]
             turns.append(HistoryTurn(question=question, sql=answer["sql"],
                                      tables_used=list(answer.get("tables_used") or []),
                                      grant_fingerprint=answer.get("grant_fingerprint") or ""))
     return turns[-HISTORY_TURNS:]
+
+
+def _withheld(answer: dict) -> bool:
+    """An answer the Ask path declined to give (`deferred`) or could not give (`failed`)."""
+    return bool(answer.get("deferred") or answer.get("failed"))
 
 
 def _planned_said(proposal: dict) -> str:
@@ -508,11 +515,18 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
         conversation_id = found.conversation_id
 
         def keep_answer(value: dict) -> int:
+            kept = {"sentence": str(value.get("answer") or "")[:MAX_TEXT], "sql": value.get("sql") or "",
+                    "grant_fingerprint": value.get("grant_fingerprint"),
+                    "tables_used": [str(t) for t in value.get("tables_used") or []]}
+            if _withheld(value):
+                # Declined or not given: kept as that, with its reason's code, so the reopened message reads as the
+                # live one did, and never as an answer whose sentence is the reason.
+                reason = value.get("reason_code")
+                kept |= {"deferred": bool(value.get("deferred")), "failed": bool(value.get("failed")),
+                         "reason_code": str(reason) if reason else None}
             return keep(who, conversation_id, {
                 "role": "mnemiq", "kind": "answer", "text": "", "dashboard": dashboard, "replies_to": question,
-                "answer": {"sentence": str(value.get("answer") or "")[:MAX_TEXT], "sql": value.get("sql") or "",
-                           "grant_fingerprint": value.get("grant_fingerprint"),
-                           "tables_used": [str(t) for t in value.get("tables_used") or []]}})
+                "answer": kept})
 
         stream = chat_stream(runtime, asking_.identity, body.text, body.mode, heartbeat_s=heartbeat_s,
                              history=_history(found), profile=body.profile, **asking_.handed)
@@ -664,7 +678,8 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
         def work() -> dict:
             who, found = mine(asking_, conversation_id)
             answer = message_at(found, index).doc.get("answer") or {}
-            if not answer.get("sql"):
+            # A statement mnemiq did not stand behind is not run again as an answer.
+            if not answer.get("sql") or _withheld(answer):
                 raise HTTPException(status_code=404, detail=NO_ANSWER)
             _, delegation = _builder(asking_, building=False)
             adapter = superset_executor(deployment, delegation)

@@ -86,7 +86,9 @@ MESSAGE_JSON_SHAPE: dict = {
     "intent": SCALAR, "goal": SCALAR,
     # mnemiq's message: the index of the person's message it replies to.
     "replies_to": SCALAR,
-    "answer": {"sentence": SCALAR, "sql": SCALAR, "grant_fingerprint": SCALAR, "tables_used": [SCALAR]},
+    # An answer mnemiq withheld (declined) or could not give also keeps which, and its reason's code.
+    "answer": {"sentence": SCALAR, "sql": SCALAR, "grant_fingerprint": SCALAR, "tables_used": [SCALAR],
+               "deferred": SCALAR, "failed": SCALAR, "reason_code": SCALAR},
     "build_id": SCALAR,
     # A build waiting for "Build it", or a change's preview waiting for "Apply" (`ChangePreview.to_json`).
     "proposal": (_BUILD_PROPOSAL_JSON, PREVIEW_JSON_SHAPE),

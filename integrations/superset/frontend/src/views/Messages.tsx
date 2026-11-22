@@ -13,7 +13,7 @@ import {
   type Results,
 } from "../conversation";
 import { pageAppRoot } from "../page";
-import type { Cell, Turn } from "../shared";
+import { DISPOSITION_LABEL, REASONS, type Cell, type DeferralReason, type Disposition, type Turn } from "../shared";
 import { confirmInPanel, declineInPanel } from "../talk";
 import { AnswerCard } from "./AnswerCard";
 
@@ -162,10 +162,13 @@ function Shown(props: Props & { message: Message; muted: CSSProperties }) {
 }
 
 /** A kept answer: its sentence as written then, its SQL folded, and its table run again as the person on request.
- * The rows live in this card's state alone, so closing the panel, or moving to another conversation, drops them. */
+ * The rows live in this card's state alone, so closing the panel, or moving to another conversation, drops them. One
+ * mnemiq declined or could not give reads as the live card read it: its reason and next step, and no table to run. */
 function KeptAnswer({ api, message, conversationId, muted }:
   { api: PanelApi; message: Message; conversationId: string | null; muted: CSSProperties }) {
   const answer = message.answer!;
+  const outcome: Disposition = answer.failed ? "failed" : answer.deferred ? "declined" : "answered";
+  const reason = answer.reason_code ? REASONS[answer.reason_code as DeferralReason] : undefined;
   const [results, setResults] = useState<Results | null>(null);
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
@@ -181,14 +184,19 @@ function KeptAnswer({ api, message, conversationId, muted }:
   return (
     <article style={{ display: "flex", flexDirection: "column", gap: 4 }}>
       {answer.sentence ? <Typography.Paragraph style={{ margin: 0 }}>{answer.sentence}</Typography.Paragraph> : null}
-      {message.at ? <span style={{ ...muted, fontSize: 12 }}>Answered {message.at.slice(0, 10)}</span> : null}
+      {message.at ? (
+        <span style={{ ...muted, fontSize: 12 }}>{DISPOSITION_LABEL[outcome]} {message.at.slice(0, 10)}</span>
+      ) : null}
+      {outcome !== "answered" && reason ? (
+        <Alert type={outcome === "failed" ? "error" : "warning"} showIcon message={reason.title} description={reason.next} />
+      ) : null}
       {answer.sql ? (
         <details>
           <summary style={muted}>SQL</summary>
           <pre style={{ whiteSpace: "pre-wrap", margin: 0 }}><code>{answer.sql}</code></pre>
         </details>
       ) : null}
-      {answer.sql && results === null ? (
+      {answer.sql && outcome === "answered" && results === null ? (
         <Button size="small" style={{ alignSelf: "flex-start" }} loading={loading} onClick={() => void show()}>
           Show results
         </Button>
