@@ -48,7 +48,7 @@ jobs:
       - run: uv sync --extra dev
       # `-ra`, not `-rs`: an explicit `-r` replaces pytest's default `fE`, and a summary that lists skips but drops
       # failures and errors would hide the lines this job exists to show.
-      - run: uv run pytest -q -ra tests/test_superset_build_store.py tests/test_superset_builder.py
+      - run: uv run pytest -q -ra tests/test_superset_build_store.py tests/test_superset_builder.py tests/test_superset_conversation_store.py
         # tests/test_superset_build_store.py reads these two lines, by the names its gate reads, and fails in `unit`
         # if either goes missing or is renamed on one side only.
         env:

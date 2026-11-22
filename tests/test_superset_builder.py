@@ -327,6 +327,19 @@ def test_plan_summary_holds_no_filter_operand():
     assert "Closed Won" not in text and "stage" not in text and "dimensions" not in text
 
 
+def test_plan_summary_writes_the_shape_a_conversation_keeps():
+    """`PLAN_SUMMARY_JSON`, the shape a conversation holds a proposed build's plan to, is the summary's own: every key
+    the summary writes is admitted, and every key admitted is one it writes."""
+    from mnemiq.superset.build_store import _shaped
+    from mnemiq.superset.builder import PLAN_SUMMARY_JSON
+
+    summary = plan_summary(plan_to_json(BuildPlan(charts=(BY_REGION,), measures=(POLICIES,))))
+    _shaped(summary, PLAN_SUMMARY_JSON, "summary")
+    assert set(summary) == set(PLAN_SUMMARY_JSON)
+    assert set(summary["charts"][0]) == set(PLAN_SUMMARY_JSON["charts"][0])
+    assert set(summary["measures"][0]) == set(PLAN_SUMMARY_JSON["measures"][0])
+
+
 def test_check_step_answers_each_charts_reason(fake, world, store):
     """The check step's answer names why each chart that did not check did not, by its id; a checked chart has
     none."""
