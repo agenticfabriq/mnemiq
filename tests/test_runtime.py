@@ -94,11 +94,18 @@ class _Con:
 
 
 def test_schema_returns_only_granted_objects():
+    # Each card the caller's re-render of the current snapshot; without a snapshot none is served (M274, in
+    # tests/test_stale_cards_fail_closed.py).
+    from mnemiq.contract import Column, Snapshot
+
+    snap = Snapshot(version="v1", source_id="s", created_at="t", columns=[
+        Column(id="claim.id", object_id="claim", name="id"), Column(id="party.id", object_id="party", name="id")])
     con = _Con([("claim", "TABLE claim ..."), ("party", "TABLE party ...")])
-    rt = Runtime(con=con, snapshot=None, adapter=None, agent=None, embedder=None,
+    rt = Runtime(con=con, snapshot=snap, adapter=None, agent=None, embedder=None,
                  authz=_StaticAuthz("claim"), settings=None)
     got = rt.schema(_identity())
-    assert got == [{"object_id": "claim", "card": "TABLE claim ..."}]
+    assert [c["object_id"] for c in got] == ["claim"]
+    assert got[0]["card"].startswith("TABLE claim")
 
 
 def test_schema_is_empty_under_denyall():

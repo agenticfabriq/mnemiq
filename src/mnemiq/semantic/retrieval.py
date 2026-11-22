@@ -468,14 +468,18 @@ def retrieve(
                 snapshot, policy=build_access_policy(snapshot, grants), style=card_style,
                 dialect=dialect)
         }
+    # With a snapshot, only the scoped re-render is ever served (M274). The stored card is enrich time's whole-snapshot
+    # text, denied columns and their values included, and the index can hold a table the current snapshot no longer does
+    # (between a re-enrich that drops or renames it and the next build): that card is left out, never served stored.
+    # Without a snapshot (scripts and eval that pass none) the stored card is what there is.
     packet.cards = [
         RetrievedCard(
             object_id=object_id,
-            card=scoped.get(object_id, cards[object_id][0]),
+            card=scoped[object_id] if snapshot is not None else cards[object_id][0],
             score=score,
         )
         for object_id, score in top
-        if object_id in cards
+        if object_id in cards and (snapshot is None or object_id in scoped)
     ]
     packet.enrichment_version = next(iter(cards.values()))[1] if cards else None
     _attach_facts(packet.cards, table_facts, card_style, grants=grants, columns=columns,
