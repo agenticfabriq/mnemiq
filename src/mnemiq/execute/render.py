@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pyarrow as pa
 
+from mnemiq.execute.cut import sent_of
+
 # Long enough that ordinary values -- names, codes, dates, amounts -- are never cut, so the
 # marker means something when it does appear. 120 silently halved schema and description
 # columns, and a model cannot tell a value that ends from one that was cut.
@@ -62,9 +64,14 @@ def render_result(table: pa.Table, max_rows: int = 50, max_cell: int = MAX_CELL,
         shortened = shortened or any(cut for _, cut in rendered)
         lines.append(" | ".join(text for text, _ in rendered))
 
+    sent = sent_of(table)
     if cut_at is not None:
         # Not a total: the query stopped at the engine's limit and may have more (M118).
         lines.append(f"... showing {shown} rows; the query stopped at the {cut_at:,}-row limit, "
+                     "so there may be more -- do not report a total or a count of these rows")
+    elif sent is not None:
+        # Not a total either: the source sent only the answer's first rows, all it sends in one response.
+        lines.append(f"... showing {shown} rows; the source sent only the first {sent:,} rows of the answer, "
                      "so there may be more -- do not report a total or a count of these rows")
     elif shown < total:
         lines.append(f"... showing {shown} of {total} rows (truncated)")

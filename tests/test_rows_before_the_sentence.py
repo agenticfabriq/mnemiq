@@ -335,3 +335,10 @@ def test_the_cut_keeps_deep_modes_candidates_agreeing():
     assert answer.candidates_executed and not answer.deferred and not answer.failed
     # Deep mode says how many candidates agreed after the notes, the cut's among them.
     assert response_sentence(92) in answer.answer and answer.answer.endswith("candidates agreed.)")
+
+
+def test_the_writer_is_told_a_cut_answer_is_not_the_whole():
+    synth = FakeSynthesizer("prose")
+    _ask(adapter=_CutAdapter(_NINETY_TWO), synth=synth)
+    [call] = synth.calls
+    assert "do not report a total or a count" in call["rendered"]

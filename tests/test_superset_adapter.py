@@ -451,13 +451,13 @@ def test_a_re_asked_answer_that_comes_back_cut_is_its_prefix():
     assert sent_of(_adapter([TOO_LARGE, CUT]).execute_answer(SQL)) == 2
 
 
-def test_refused_three_times_more_is_a_cut_result():
-    """Each re-ask is smaller than the last, and the fourth refusal ends it, as a result too large always did."""
+def test_refused_at_every_size_down_to_one_row_is_a_cut_result():
+    """The same refusal after a re-ask says the limit did not bind, so one row is asked for; one row refused is a row too
+    large to send, and ends it, as a result too large always did."""
     adapter = _adapter([TOO_LARGE] * 4)
     with pytest.raises(ResultCut):
         adapter.execute_answer(SQL)
-    limits = [call.request.get("limit") for call in adapter.client.calls]
-    assert len(limits) == 4 and limits[0] is None and limits[1] > limits[2] > limits[3] >= 1
+    assert [call.request.get("limit") for call in adapter.client.calls] == [None, 653, 1]
 
 
 def test_a_refusal_without_its_sizes_is_a_cut_result():
@@ -479,3 +479,45 @@ def test_an_answer_run_reads_through_execute_answer_and_other_runs_still_refuse_
     assert sent_of(run(_adapter(CUT), SQL, answer=True).table) == 2
     with pytest.raises(ExecutionError):
         run(_adapter(CUT), SQL)
+
+
+def test_a_re_ask_never_asks_for_more_rows_than_the_statement_limits():
+    """`execute_sql`'s limit replaces the statement's own, so a re-ask of `LIMIT 10` asks for fewer than 10, never more."""
+    adapter = _adapter([TOO_LARGE, REGION_COUNTS])
+    adapter.execute_answer("SELECT region FROM policies LIMIT 10")
+    assert adapter.client.calls[1].request["limit"] == 6  # floor(10 * 50,000 / 61,234 * 0.8)
+
+
+def test_a_statement_whose_limit_cannot_be_read_is_not_asked_again():
+    adapter = _adapter([TOO_LARGE])
+    with pytest.raises(ResultCut):
+        adapter.execute_answer("SELEC this is not a statement")
+    assert len(adapter.client.calls) == 1
+
+
+def _sized(rows: int, width: int, allowed: int = 50_000):
+    """A source holding `rows` rows of `width` characters that answers as rc2 does: each row twice (`rows` and the
+    statement's own data), refused, with its size, when the answer passes `allowed` bytes."""
+    import json
+
+    def answer(request):
+        n = min(rows, request.get("limit") or rows)
+        data = [{"region": f"r{i:04}", "wide": "x" * width} for i in range(n)]
+        payload = {**REGION_COUNTS, "columns": [{"name": "region", "type": "object"}, {"name": "wide", "type": "object"}],
+                   "rows": data, "row_count": n, "statements": [{"data": {"rows": data}}]}
+        size = len(json.dumps(payload))
+        if size > allowed:
+            return SupersetResponseTooLarge("too large", detail=f"Error: Response too large: {size:,} bytes "
+                                                                f"(limit: {allowed:,})")
+        return payload
+    return answer
+
+
+def test_a_wide_result_of_few_rows_is_answered_with_the_rows_that_fit():
+    """30 rows of 2,000 characters: a re-ask sized from the deciders' cap does not bind, so one row is measured, and the
+    next ask is sized from it."""
+    adapter = _adapter(_sized(30, 2000))
+    table = adapter.execute_answer(SQL)
+    limits = [call.request.get("limit") for call in adapter.client.calls]
+    assert 1 in limits and len(limits) <= 4, limits
+    assert sent_of(table) == table.num_rows and 5 <= table.num_rows < 30, (table.num_rows, limits)

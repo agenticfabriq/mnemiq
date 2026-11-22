@@ -24,7 +24,9 @@ measured against that Superset.
   its own. Superset has no column rules for SQL, so mnemiq masks no column: every column of a table a builder may read
   is theirs to read.
 - **What it sends.** Each statement goes to `execute_sql` with the database, the schema, the statement and a time
-  limit. mnemiq never sends `limit` or `template_params`. A statement holding `{{`, `{%` or `{#` is never sent,
+  limit. mnemiq never sends `template_params`, and sends `limit` only to ask again for an answer Superset refused as
+  larger than one response, below the statement's own LIMIT (see "Results that fit one response" below). A statement
+  holding `{{`, `{%` or `{#` is never sent,
   since Superset would render it as a template. Superset applies its row rules to each statement before it runs it.
 - **Caching.** mnemiq keeps no result cache in this mode. Superset's own result cache (`DATA_CACHE_CONFIG`) may stay
   on: it keys a result on the statement after row rules are applied, so a narrowed row rule never meets an old entry
