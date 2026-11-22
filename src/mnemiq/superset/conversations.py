@@ -84,6 +84,8 @@ MESSAGE_JSON_SHAPE: dict = {
     "dashboard": (_DASHBOARD_JSON, SCALAR),
     # The person's message: what it was routed to, and for a build or a change the goal or request as it stands alone.
     "intent": SCALAR, "goal": SCALAR,
+    # mnemiq's message: the index of the person's message it replies to.
+    "replies_to": SCALAR,
     "answer": {"sentence": SCALAR, "sql": SCALAR, "grant_fingerprint": SCALAR, "tables_used": [SCALAR]},
     "build_id": SCALAR,
     # A build waiting for "Build it", or a change's preview waiting for "Apply" (`ChangePreview.to_json`).
