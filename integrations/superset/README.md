@@ -58,7 +58,8 @@ signed in.
 
 - **One box, one conversation.** Type a question, a dashboard to build, or a change to the dashboard on screen; mnemiq
   works out which, and asks back when it cannot tell. The person's conversations are kept by mnemiq, so they are there
-  after a reload, in another tab and on any dashboard: Conversations lists them, newest first, and New starts one.
+  after a reload, in another tab and on any dashboard: Conversations lists them, newest first, and deletes one; New
+  starts one.
 - **Ask** a question about the data, and see the answer and its SQL (folded); Show results runs its SQL again as the
   person, now, for an answer reopened later.
 - **Build** a dashboard: mnemiq shows the plan and builds nothing until Build it, then makes it one step at a time, with

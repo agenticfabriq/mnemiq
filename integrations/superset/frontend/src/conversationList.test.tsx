@@ -148,8 +148,7 @@ describe("one conversation", () => {
     resetStore();
     await opened();
     expect(screen.queryByText("There are 412 open claims.")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Conversations" }));
-    fireEvent.click(await screen.findByRole("listitem"));
+    await openListed("how many claims are open?");
     await screen.findByText("There are 412 open claims.");
     expect(screen.getByText("how many claims are open?")).toBeTruthy();
   });
@@ -237,9 +236,7 @@ describe("one conversation", () => {
     const { calls, kept } = mnemiq((_text, _body, keep) => answered(keep));
     kept[OTHER] = [{ index: 0, role: "person", kind: "ask", text: "an older question" }];
     await opened();
-    fireEvent.click(screen.getByRole("button", { name: "Conversations" }));
-    fireEvent.click(await screen.findByRole("listitem"));
-    await screen.findByText("an older question");
+    await openListed("an older question");
     fireEvent.click(screen.getByRole("button", { name: "New" }));
     expect(screen.queryByText("an older question")).toBeNull();
     await say("how many claims are open?");
@@ -289,5 +286,275 @@ describe("one conversation", () => {
     await screen.findByText("There are 412 open claims.");
     expect(calls.filter((c) => c.path.endsWith("/messages"))[0].body).toEqual({ text: "How many claims are open?" });
     expect(screen.queryByRole("region", { name: "Starters" })).toBeNull();
+  });
+
+});
+
+/** Wraps the stubbed fetch: a call whose path matches waits for `hold` and answers `answer` when one is given. */
+function wrapFetch(rules: { match: RegExp; hold?: Promise<void>; answer?: (path: string, body: unknown) => Response }[]) {
+  const inner = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input, init) => {
+    const url = String(input);
+    const path = (url.startsWith(BASE) ? url.slice(BASE.length) : url).split("?")[0];
+    for (const rule of rules) {
+      if (rule.match.test(path)) {
+        if (rule.hold) await rule.hold;
+        if (rule.answer) return rule.answer(path, init?.body ? JSON.parse(String(init.body)) : null);
+      }
+    }
+    return inner(input, init);
+  }));
+}
+
+function held() {
+  let release = () => {};
+  const hold = new Promise<void>((done) => { release = done; });
+  return { hold, release };
+}
+
+const proposalIn = (goal: string, dashboardId: number | null): Message[] => [
+  { index: 0, role: "person", kind: "build", text: goal },
+  { index: 1, role: "mnemiq", kind: "build", text: "I'll add 1 chart: Open claims.", build_id: BUILD, replies_to: 0,
+    proposal: { build_id: BUILD, goal, dashboard_id: dashboardId, plan: PLAN }, outcome: { state: "proposed" } } as Message,
+];
+
+async function openListed(text: string) {
+  fireEvent.click(screen.getByRole("button", { name: "Conversations" }));
+  fireEvent.click(await screen.findByRole("button", { name: new RegExp(`^${text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`) }));
+  await screen.findByText(text);
+}
+
+describe("conversations kept apart, and confirms sent from where the person is", () => {
+  it("a fresh answer's table stays on screen once the ask ends, and a reopened one is run again", async () => {
+    mnemiq((_text, _body, keep) => [
+      { type: "RUN_STARTED", runId: "r" },
+      { type: "CUSTOM", name: "mnemiq.result", value: { sql: "SELECT count(*) FROM claim", tables_used: ["claim"],
+        preview: { columns: ["open_claims"], rows: [[7777]], row_count: 1, truncated: false } } },
+      { type: "TEXT_MESSAGE_CONTENT", messageId: "m", delta: "There are many open claims." },
+      { type: "CUSTOM", name: "mnemiq.answer", value: { answer: "There are many open claims.", deferred: false,
+        failed: false, reason_code: null, sql: "SELECT count(*) FROM claim", tables_used: ["claim"],
+        preview: { columns: ["open_claims"], rows: [[7777]], row_count: 1, truncated: false } } },
+      { type: "CUSTOM", name: "mnemiq.recorded", value: { index: keep({ kind: "answer", answer: {
+        sentence: "There are many open claims.", sql: "SELECT count(*) FROM claim", grant_fingerprint: "g",
+        tables_used: ["claim"] } }) } },
+      { type: "RUN_FINISHED", runId: "r" },
+    ]);
+    await opened();
+    await say("how many claims are open?");
+    await screen.findByText("There are many open claims.");
+    expect(screen.getByText("7777")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "New" }));
+    expect(screen.queryByText("7777")).toBeNull();
+    await openListed("how many claims are open?");
+    expect(screen.queryByText("7777")).toBeNull();
+    expect(screen.getByRole("button", { name: "Show results" })).toBeTruthy();
+  });
+
+  it("a shown table stays with its own conversation", async () => {
+    const { kept } = mnemiq(() => []);
+    kept[OTHER] = [{ index: 0, role: "person", kind: "ask", text: "q one" },
+      { index: 1, role: "mnemiq", kind: "answer", text: "", replies_to: 0, answer: { sentence: "Answer one",
+        sql: "SELECT 1", grant_fingerprint: "g", tables_used: [] } } as Message];
+    kept[TALK] = [{ index: 0, role: "person", kind: "ask", text: "q two" },
+      { index: 1, role: "mnemiq", kind: "answer", text: "", replies_to: 0, answer: { sentence: "Answer two",
+        sql: "SELECT 2", grant_fingerprint: "g", tables_used: [] } } as Message];
+    wrapFetch([{ match: /\/messages\/1\/results$/, answer: (path) => json(200, { columns: ["n"],
+      rows: [[path.includes(OTHER) ? 1111 : 2222]], row_count: 1, truncated: false, capped: false }) }]);
+    await opened();
+    await openListed("q one");
+    fireEvent.click(screen.getByRole("button", { name: "Show results" }));
+    await screen.findByText("1111");
+    await openListed("q two");
+    expect(screen.queryByText("1111")).toBeNull();
+    expect(screen.getByRole("button", { name: "Show results" })).toBeTruthy();
+  });
+
+  it("a confirm that answers late leaves the person in the conversation they moved to", async () => {
+    const { kept, calls } = mnemiq((_text, _body, keep) => answered(keep));
+    kept[OTHER] = proposalIn("build a claims dashboard", null);
+    const { hold, release } = held();
+    wrapFetch([{ match: /\/confirm$/, hold }]);
+    await opened();
+    await openListed("build a claims dashboard");
+    fireEvent.click(within(screen.getByRole("region", { name: "Proposal" })).getByRole("button", { name: "Build it" }));
+    // A confirm in flight holds the screen: the person cannot switch away from it, nor press New.
+    await waitFor(() => expect((screen.getByRole("button", { name: "New" }) as HTMLButtonElement).disabled).toBe(true));
+    release();
+    await waitFor(() => expect(calls.some((c) => c.path.endsWith("/next"))).toBe(true));
+    await waitFor(() => expect((screen.getByRole("button", { name: "New" }) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole("button", { name: "New" }));
+    await say("how many claims are open?");
+    expect(getSnapshot().conversationId).toBe(TALK);
+    expect(calls.filter((c) => c.path.endsWith("/messages")).at(-1)!.path).toContain(TALK);
+  });
+
+  it("a conversation read that answers late does not replace the one the person moved to", async () => {
+    const { kept } = mnemiq(() => []);
+    kept[OTHER] = [{ index: 0, role: "person", kind: "ask", text: "q one" }];
+    kept[TALK] = [{ index: 0, role: "person", kind: "ask", text: "q two" }];
+    const { hold, release } = held();
+    wrapFetch([{ match: new RegExp(`/superset/conversations/${OTHER}$`), hold }]);
+    await opened();
+    fireEvent.click(screen.getByRole("button", { name: "Conversations" }));
+    fireEvent.click(await screen.findByRole("button", { name: /^q one/ }));
+    await openListed("q two");
+    release();
+    await new Promise((done) => setTimeout(done, 50));
+    expect(getSnapshot().conversationId).toBe(TALK);
+    expect(screen.queryByText("q one")).toBeNull();
+  });
+
+  it("Build it is refused while this page runs another build, and says so", async () => {
+    const { calls, kept } = mnemiq(() => []);
+    const FIRST = "aaaaaaaa-0000-4000-8000-00000000000a";
+    const { hold, release } = held();
+    wrapFetch([{ match: new RegExp(`/superset/builds/${FIRST}/next$`), hold, answer: () => json(200, { build: {
+      build_id: FIRST, status: "done", dashboard_id: 3, steps: [], checks: {}, ran: null, message: null, plan: PLAN,
+      check_reasons: {} } }) }]);
+    kept[OTHER] = proposalIn("build a claims dashboard", null);
+    await opened();
+    const { driver } = await import("./build");
+    act(() => { driver.resume("goal one", {}, FIRST); });
+    await openListed("build a claims dashboard");
+    const card = screen.getByRole("region", { name: "Proposal" });
+    expect((within(card).getByRole("button", { name: "Build it" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(within(card).getByText(/already being planned or run/)).toBeTruthy();
+    expect(calls.some((c) => c.path.endsWith("/confirm"))).toBe(false);
+    release();
+    await waitFor(() => expect((within(screen.getByRole("region", { name: "Proposal" }))
+      .getByRole("button", { name: "Build it" }) as HTMLButtonElement).disabled).toBe(false));
+  });
+
+  it("Build it in the second the page context lags the URL is refused, and says where to go", async () => {
+    const { calls } = mnemiq((text, _body, keep) => {
+      const index = keep({ kind: "build", text: "I'll add 1 chart to this dashboard: Open claims.", build_id: BUILD,
+        proposal: { build_id: BUILD, goal: text, dashboard_id: 7, plan: PLAN }, outcome: { state: "proposed" } });
+      return [{ type: "RUN_STARTED", runId: "r" }, { type: "CUSTOM", name: "mnemiq.proposal", value: { index } },
+        { type: "RUN_FINISHED", runId: "r" }];
+    }, { 7: { title: "Claims", charts: [] }, 8: { title: "Other", charts: ["x"] } });
+    onDashboard(7);
+    await opened();
+    await say("add open claims here");
+    const card = await screen.findByRole("region", { name: "Proposal" });
+    await waitFor(() => expect((within(card).getByRole("button", { name: "Build it" }) as HTMLButtonElement).disabled).toBe(false));
+    // Superset moves to dashboard 8 with no page event; the page context reads the path once a second.
+    history.replaceState(null, "", "/dashboard/8/");
+    fireEvent.click(within(card).getByRole("button", { name: "Build it" }));
+    await screen.findByText("Open the dashboard this was for, then confirm.");
+    expect(calls.some((c) => c.path.endsWith("/confirm"))).toBe(false);
+    history.replaceState(null, "", "/dashboard/7/");
+    fireEvent.click(within(screen.getByRole("region", { name: "Proposal" })).getByRole("button", { name: "Build it" }));
+    await waitFor(() => expect(calls.find((c) => c.path.endsWith("/confirm"))?.body).toEqual({ dashboard_id: 7 }));
+  });
+
+  it("Build it is offered only on the proposal's dashboard", async () => {
+    const { kept } = mnemiq(() => [], { 7: { title: "Claims", charts: [] }, 8: { title: "Other", charts: ["x"] } });
+    kept[OTHER] = proposalIn("add open claims here", 7);
+    onDashboard(8);
+    await opened();
+    await openListed("add open claims here");
+    const card = screen.getByRole("region", { name: "Proposal" });
+    await waitFor(() => expect(within(card).getByRole("link", { name: "Open the dashboard this is for" })).toBeTruthy());
+    expect((within(card).getByRole("button", { name: "Build it" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("a message is reserved before the dashboard on screen is looked up: a second send waits, and New is held", async () => {
+    const { calls } = mnemiq((_text, _body, keep) => answered(keep), { 7: { title: "Claims", charts: ["a"] } });
+    const { hold, release } = held();
+    wrapFetch([{ match: /^\/api\/v1\/dashboard\/7$/, hold }]);
+    onDashboard(7);
+    await opened();
+    const box = screen.getByRole("textbox", { name: "Message mnemiq" });
+    fireEvent.change(box, { target: { value: "first" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect((screen.getByRole("button", { name: "New" }) as HTMLButtonElement).disabled).toBe(true));
+    fireEvent.change(box, { target: { value: "second" } });
+    expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((box as HTMLTextAreaElement).value).toBe("second");
+    release();
+    await waitFor(() => expect(getSnapshot().sending).toBe(false));
+    expect(calls.filter((c) => c.path.endsWith("/messages")).map((c) => c.body?.text)).toEqual(["first"]);
+  });
+
+  it("a question back resends the message it replied to", async () => {
+    const { kept, calls } = mnemiq((_text, _body, keep) => answered(keep));
+    kept[OTHER] = [{ index: 0, role: "person", kind: "note", text: "claims" },
+      { index: 1, role: "person", kind: "build", text: "add a revenue chart" },
+      { index: 2, role: "mnemiq", kind: "clarify", text: "Which do you mean?", replies_to: 0,
+        clarify: { question: "Which do you mean?", choices: ["ask", "build", "change"] } } as Message];
+    await opened();
+    await openListed("claims");
+    expect(screen.queryByRole("button", { name: "Build it" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Answer it" }));
+    await waitFor(() => expect(calls.some((c) => c.path.endsWith("/messages"))).toBe(true));
+    expect(calls.find((c) => c.path.endsWith("/messages"))!.body).toEqual({ text: "claims", choose: "ask" });
+  });
+
+  it("Show results that no longer runs says why, with no table", async () => {
+    const { kept } = mnemiq(() => []);
+    kept[OTHER] = [{ index: 0, role: "person", kind: "ask", text: "q one" },
+      { index: 1, role: "mnemiq", kind: "answer", text: "", answer: { sentence: "Answer one", sql: "SELECT 1",
+        grant_fingerprint: "g", tables_used: [] } } as Message];
+    wrapFetch([{ match: /\/results$/, answer: () => json(200, { refused: "The table is not one you may read." }) }]);
+    await opened();
+    await openListed("q one");
+    fireEvent.click(screen.getByRole("button", { name: "Show results" }));
+    await screen.findByText("The table is not one you may read.");
+    expect(screen.queryByRole("table")).toBeNull();
+  });
+
+  it("each message shows the dashboard it was sent from when that changed", async () => {
+    const { kept } = mnemiq(() => []);
+    kept[OTHER] = [
+      { index: 0, role: "person", kind: "ask", text: "first", dashboard: { id: 7, title: "Claims" } },
+      { index: 1, role: "person", kind: "ask", text: "second", dashboard: { id: 7, title: "Claims" } },
+      { index: 2, role: "person", kind: "ask", text: "third", dashboard: { id: 8, title: "Sales" } },
+      { index: 3, role: "person", kind: "ask", text: "fourth", dashboard: null },
+    ];
+    await opened();
+    await openListed("first");
+    expect(screen.getAllByText("on Claims")).toHaveLength(1);
+    expect(screen.getAllByText("on Sales")).toHaveLength(1);
+    expect(screen.getAllByText("off a dashboard")).toHaveLength(1);
+  });
+
+  it("a change preview names what will not change, warns that a removal deletes, and reads its outcome", async () => {
+    const { kept } = mnemiq(() => [], { 7: { title: "Sales", charts: ["a"] } });
+    kept[OTHER] = [{ index: 0, role: "person", kind: "change", text: "top five, drop the pie" },
+      { index: 1, role: "mnemiq", kind: "change", text: "To change: Sales: at most 5 rows. Not changed by chat: query_mode on chart 12.",
+        replies_to: 0, proposal: { dashboard_id: 7, dashboard_changed_on: "t", edits: [{ chart_id: 12, title: "Sales",
+          changed_on: "t", said: "Sales: at most 5 rows", digest: "d" }], would_remove: [{ chart_id: 13, title: "Pie" }],
+        add_chart: false, left: [], dropped: [{ chart_id: 12, key: "query_mode" }], not_editor: [], message: "m",
+        reason: null }, outcome: { state: "proposed" } } as Message];
+    onDashboard(7);
+    await opened();
+    await openListed("top five, drop the pie");
+    const card = screen.getByRole("region", { name: "Preview" });
+    expect(within(card).getByText(/Not changed by chat: query_mode on chart 12/)).toBeTruthy();
+    expect(within(card).getByText(/deletes/)).toBeTruthy();
+    kept[OTHER][1].outcome = { state: "partial", changed: [12], left: [{ chart_id: 13, reason:
+      "Superset stopped answering before this was done; check the dashboard" }], removed: [] };
+    await openListed("top five, drop the pie");
+    const after = screen.getByRole("region", { name: "Preview" });
+    const came = within(after).getByRole("region", { name: "What came of it" });
+    expect(within(came).getByText("Changed: Sales.")).toBeTruthy();
+    expect(within(came).getByText(/Pie left as it is: Superset stopped answering before this was done/)).toBeTruthy();
+  });
+
+  it("a conversation is deleted from the list, and the screen cleared when it was on it", async () => {
+    const { kept, calls } = mnemiq(() => []);
+    kept[OTHER] = [{ index: 0, role: "person", kind: "ask", text: "q one" }];
+    wrapFetch([{ match: new RegExp(`/superset/conversations/${OTHER}/delete$`), answer: () => {
+      delete kept[OTHER];
+      return json(204, null);
+    } }]);
+    await opened();
+    await openListed("q one");
+    fireEvent.click(screen.getByRole("button", { name: "Conversations" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete q one" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete it" }));
+    await waitFor(() => expect(getSnapshot().conversationId).toBeNull());
+    expect(screen.queryByText("q one")).toBeNull();
+    expect(calls.some((c) => c.path.endsWith("/delete"))).toBe(false);  // the wrapped call, not the server's
   });
 });
