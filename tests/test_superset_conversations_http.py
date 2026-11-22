@@ -73,7 +73,8 @@ def _routing(runtime, *routed) -> FakeIntentReader:
     return reader
 
 
-def _answering(monkeypatch, seen: list | None = None, *, fingerprint: str = "g1"):
+def _answering(monkeypatch, seen: list | None = None, *, fingerprint: str = "g1", sentence: str = SENTENCE,
+               deferred: bool = False, failed: bool = False, reason_code: str | None = None):
     """The Ask path, standing in at the name the conversation routes call: what `chat_stream` yields for one answer,
     its rows ahead of the prose, and each call recorded."""
 
@@ -86,11 +87,11 @@ def _answering(monkeypatch, seen: list | None = None, *, fingerprint: str = "g1"
             "sql": SQL, "tables_used": ["policy"], "preview": {"columns": ["region", "policies"],
                                                                "rows": [["West", 12]], "row_count": 1}}})
         yield frame({"type": "TEXT_MESSAGE_START", "messageId": "m1", "role": "assistant"})
-        yield frame({"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": SENTENCE})
+        yield frame({"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": sentence})
         yield frame({"type": "TEXT_MESSAGE_END", "messageId": "m1"})
         yield frame({"type": "CUSTOM", "name": "mnemiq.answer", "value": {
-            "answer": SENTENCE, "sql": SQL, "grant_fingerprint": fingerprint, "tables_used": ["policy"],
-            "deferred": False, "failed": False}})
+            "answer": sentence, "sql": SQL, "grant_fingerprint": fingerprint, "tables_used": ["policy"],
+            "deferred": deferred, "failed": failed, "reason_code": reason_code}})
         yield frame({"type": "RUN_FINISHED", "runId": "r1"})
 
     monkeypatch.setattr(_module(), "chat_stream", chat_stream)
@@ -223,6 +224,42 @@ def test_an_ask_carries_the_earlier_answers_as_history_with_their_fingerprints_a
     [turn] = seen[1]["history"]
     assert (turn.question, turn.sql, turn.grant_fingerprint, turn.rows, turn.columns) == (
         "how many policies by region?", SQL, "g1", [], [])
+
+
+WITHHELD = "The result may not correctly answer the question."
+
+
+@pytest.mark.parametrize("deferred, failed, code", [(True, False, "verification"), (False, True, "execution_failed")],
+                         ids=["declined", "could-not-answer"])
+def test_an_answer_mnemiq_withheld_is_kept_as_withheld_with_its_reason(served, talks, monkeypatch, deferred, failed,
+                                                                       code):
+    """The Ask path declined to answer, or could not: the conversation keeps that, and its reason's code, so the
+    reopened message reads as the live one did, never as an answer whose sentence is the reason."""
+    client, runtime = served
+    _routing(runtime, Routed(Intent.ASK, "x"))
+    _answering(monkeypatch, sentence=WITHHELD, deferred=deferred, failed=failed, reason_code=code)
+    talk = _new(client)
+    _send(client, talk, "accounts that need attention right away")
+    _, answer = _read(client, talk)["messages"]
+    assert answer["answer"] == {"sentence": WITHHELD, "sql": SQL, "grant_fingerprint": "g1", "tables_used": ["policy"],
+                                "deferred": deferred, "failed": failed, "reason_code": code}
+
+
+def test_an_answer_mnemiq_withheld_is_no_follow_ups_history_and_shows_no_results(served, fake, monkeypatch):
+    """As the workbench's history leaves out a declined or failed answer, so does a conversation's; and its statement,
+    which mnemiq did not stand behind, is not run again as an answer."""
+    client, runtime = served
+    seen: list = []
+    _routing(runtime, Routed(Intent.ASK, "x"))
+    _answering(monkeypatch, seen, sentence=WITHHELD, deferred=True, reason_code="verification")
+    talk = _new(client)
+    _send(client, talk, "accounts that need attention right away")
+    _send(client, talk, "and by region?")
+    assert seen[1]["history"] == []
+    r = client.post(f"{PREFIX}/{talk}/messages/1/results", headers=_bearer(_token()))
+    assert r.status_code == 404 and r.json()["detail"] == _module().NO_ANSWER
+    assert not any(call.tool == "execute_sql" and "GROUP BY region" in call.request.get("sql", "")
+                   for call in fake.calls)
 
 
 # --- building

@@ -5,6 +5,7 @@ import { host } from "./test/core";
 import { Panel } from "./Panel";
 import { resetBuilds } from "./build";
 import type { Message } from "./conversation";
+import { REASONS } from "./shared";
 import { getSnapshot, resetStore } from "./store";
 import { resetTalk } from "./talk";
 import { resetDismissed } from "./views/Unfinished";
@@ -367,6 +368,20 @@ describe("conversations kept apart, and confirms sent from where the person is",
     await openListed("q two");
     expect(screen.queryByText("1111")).toBeNull();
     expect(screen.getByRole("button", { name: "Show results" })).toBeTruthy();
+  });
+
+  it("a reopened answer mnemiq withheld reads as withheld, with its reason, and offers no results", async () => {
+    const { kept } = mnemiq(() => []);
+    kept[TALK] = [{ index: 0, role: "person", kind: "ask", text: "accounts that need attention" },
+      { index: 1, role: "mnemiq", kind: "answer", text: "", replies_to: 0, at: "2026-11-22T04:31:48Z", answer: {
+        sentence: "The result may not correctly answer the question.", sql: "SELECT 1", grant_fingerprint: "g",
+        tables_used: [], deferred: true, failed: false, reason_code: "verification" } } as Message];
+    await opened();
+    await openListed("accounts that need attention");
+    expect(screen.getByText(REASONS.verification.title)).toBeTruthy();
+    expect(screen.getByText(/^Declined 2026-11-22/)).toBeTruthy();
+    expect(screen.queryByText(/^Answered /)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Show results" })).toBeNull();
   });
 
   it("a confirm that answers late leaves the person in the conversation they moved to", async () => {

@@ -53,7 +53,9 @@ export type Message = {
   goal?: string;
   /** mnemiq's message: the person's message it replies to. */
   replies_to?: number;
-  answer?: { sentence: string; sql: string; grant_fingerprint: string | null; tables_used: string[] };
+  // An answer mnemiq declined to give (`deferred`) or could not give (`failed`) keeps which, and its reason's code.
+  answer?: { sentence: string; sql: string; grant_fingerprint: string | null; tables_used: string[];
+    deferred?: boolean; failed?: boolean; reason_code?: string | null };
   build_id?: string;
   proposal?: BuildProposal | ChangePreview;
   offer?: { dashboard_id: number; title: string | null; reason: string | null };
