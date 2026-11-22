@@ -56,10 +56,17 @@ mnemiq's chat inside Superset 7.0: a trigger at the page's corner opens a panel 
 beside it. It shares Superset's React and antd, and reaches mnemiq only through the forwarder below, as the person
 signed in.
 
-- **Ask** a question about the data, and see the answer, its SQL (folded) and the rows it read.
-- **Build** a dashboard from a goal: mnemiq shows the plan first, then makes it one step at a time, with each chart's
-  check. On a dashboard, a build goes onto the dashboard on screen unless "New dashboard" is ticked. A dashboard that
-  already covers the goal is offered first, with the choice to open it, add the charts to it, or build a new one.
+- **One box, one conversation.** Type a question, a dashboard to build, or a change to the dashboard on screen; mnemiq
+  works out which, and asks back when it cannot tell. The person's conversations are kept by mnemiq, so they are there
+  after a reload, in another tab and on any dashboard: Conversations lists them, newest first, and deletes one; New
+  starts one.
+- **Ask** a question about the data, and see the answer and its SQL (folded); Show results runs its SQL again as the
+  person, now, for an answer reopened later.
+- **Build** a dashboard: mnemiq shows the plan and builds nothing until Build it, then makes it one step at a time, with
+  each chart's check. A build onto a dashboard goes onto the one on screen; on an empty one, the box invites a
+  description of what it should show. A dashboard that already covers the goal is offered first.
+- **Change** the dashboard on screen: mnemiq shows each chart's edit, and writes nothing until Apply, which writes
+  exactly what it showed. Build it and Apply are offered only on the dashboard they are for.
 - **Finish** a build that stopped: closing the panel does not stop one, but leaving or reloading the page stops it
   after the step in flight, and the panel offers to finish it.
 - A person Superset will not let build sees only the sentence that says which roles building needs.

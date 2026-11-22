@@ -60,14 +60,14 @@ describe("usePageContext", () => {
     host.navigate("dashboard");
     history.pushState(null, "", "/dashboard/1/");
     const { result } = renderHook(() => usePageContext({ appRoot: "", fetchFn }));
-    await waitFor(() => expect(result.current.dashboard).toEqual({ ref: "1", id: 1, title: "One", readable: true }));
+    await waitFor(() => expect(result.current.dashboard).toEqual({ ref: "1", id: 1, title: "One", readable: true, hasCharts: null }));
     const fired: string[] = [];
     navigation.onDidChangePage((page) => fired.push(page));
     host.navigate("dashboard"); // rc2 derives the same page: no event
     history.pushState(null, "", "/dashboard/2/");
     expect(fired).toEqual([]);
     await act(async () => { vi.advanceTimersByTime(1000); });
-    await waitFor(() => expect(result.current.dashboard).toEqual({ ref: "2", id: 2, title: "Two", readable: true }));
+    await waitFor(() => expect(result.current.dashboard).toEqual({ ref: "2", id: 2, title: "Two", readable: true, hasCharts: null }));
     expect(result.current.page).toBe("dashboard");
   });
 
@@ -77,7 +77,7 @@ describe("usePageContext", () => {
     history.pushState(null, "", "/analytics/dashboard/sales-kpis/");
     const { result } = renderHook(() => usePageContext({ appRoot: "/analytics", fetchFn }));
     await waitFor(() => expect(result.current.dashboard).toEqual(
-      { ref: "sales-kpis", id: 12, title: "Sales KPIs", readable: true }));
+      { ref: "sales-kpis", id: 12, title: "Sales KPIs", readable: true, hasCharts: null }));
     const [url, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe("/analytics/api/v1/dashboard/sales-kpis");
     expect(init).toMatchObject({ credentials: "same-origin" });

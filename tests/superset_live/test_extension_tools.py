@@ -600,7 +600,9 @@ def test_token_route_refuses_an_embedded_guest(live, extension, built_extension)
     import httpx
 
     secret = secrets_module.token_urlsafe(32)
-    port = 18090
+    # A port no other process holds: on a fixed one, a Superset already listening there (another stack on the same
+    # machine) answers the health check below, and the test would ask the wrong server.
+    port = _free_port()
     url = f"http://127.0.0.1:{port}"
 
     def up(_output: bytes) -> bool:
@@ -626,6 +628,15 @@ def test_token_route_refuses_an_embedded_guest(live, extension, built_extension)
         assert asked.json() == {"message": "the token route mints only for a signed-in Superset user"}
         assert forged.status_code == 401, forged.status_code
         assert _claims(live, replace(live, url=url).minted("west", "build"))["sub"] == "west"
+
+
+def _free_port() -> int:
+    """A port on 127.0.0.1 that was free a moment ago, as the operating system picks one."""
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
 
 
 def _serve(settings, monkeypatch):
