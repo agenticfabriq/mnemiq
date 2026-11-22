@@ -414,8 +414,9 @@ still to come. In short:
 
 A person's conversations with mnemiq in the panel are kept in the control Postgres beside the builds
 (`mnemiq_superset_conversation`, made the first time the store connects), each its tenant's and person's alone: another
-person's conversation id is a 404 on every route, and says nothing of it. Each route takes a token minted for
-building, and `MNEMIQ_CONTROL_DSN` unset answers each with a 503, as the build routes do.
+person's conversation id is a 404 on every route, and says nothing of it. The panel's forwarder mints each request a
+token for building; mnemiq asks of it `db.read` for every route, and Superset's write scopes for a build or a change.
+`MNEMIQ_CONTROL_DSN` unset answers each route with a 503, as the build routes do.
 
 - `GET /v1/superset/conversations` lists the person's conversations, newest first (`limit`, at most 100; `before`,
   the `next` cursor of the page before). `POST /v1/superset/conversations` starts one; its title is set from its first
@@ -443,7 +444,11 @@ building, and `MNEMIQ_CONTROL_DSN` unset answers each with a 503, as the build r
   - A change is written exactly as previewed, with no second reading by the model. Nothing is written when the
     dashboard or a chart the preview names changed since it was read; a chart changed by hand between the check
     and its write stops the rest, what was written named.
-  - A removal the preview proposed is done only for the charts the confirm names (`remove_chart_ids`).
+  - A removal the preview proposed is done only for the charts the confirm names (`remove_chart_ids`), and only
+    once every edit beside it is written: a chart to remove that changed since the preview, like a stale edit,
+    leaves the whole preview unwritten.
+  - A confirm that fails before anything is written leaves the proposal waiting; one that fails partway is recorded
+    as done in part, naming what was written, and is not applied again.
   - An offered dashboard takes `choice`: `add` proposes this goal's charts onto it, `new` a new dashboard.
 - `POST .../{id}/messages/{n}/decline` is "Not now": the proposal is set aside, and a build's withdrawn.
 - `POST .../{id}/messages/{n}/results` runs a kept answer's SQL again, decided as a new question's SQL is and run as
