@@ -72,3 +72,42 @@ def test_the_schema_endpoint_serves_no_card_without_a_snapshot(tmp_path):
     rt = Runtime(con=_store(tmp_path), snapshot=None, adapter=None, agent=None, embedder=None,
                  authz=_Authz(), settings=None)
     assert rt.schema(IDENTITY) == []
+
+
+def _store_with_examples(tmp_path):
+    from mnemiq.contract import Example
+    from mnemiq.semantic.store import build_example_index
+
+    con = _store(tmp_path)
+    indexed = INDEXED.model_copy(update={"examples": [
+        Example(question="payroll salary band", sql="SELECT salary_band FROM payroll", tables=["payroll"],
+                object_id="payroll"),
+        Example(question="orders amount", sql="SELECT amount FROM orders", tables=["orders"], object_id="orders")]})
+    build_example_index(con, indexed, FakeEmbedder())
+    return con
+
+
+def test_an_example_on_a_table_the_current_snapshot_does_not_hold_is_withheld(tmp_path):
+    # Codex's review of #288: the cards were left out, but example retrieval still took every granted table, and the
+    # current snapshot holds no columns of the dropped table to deny, so its stored example SQL reached the prompt.
+    con = _store_with_examples(tmp_path)
+    packet = retrieve(con, "payroll salary band", IDENTITY, _Authz(), FakeEmbedder(), k=12,
+                      snapshot=CURRENT, grants=_Authz().grants_for(IDENTITY))
+    assert not any("payroll" in e.tables or "salary_band" in e.sql for e in packet.examples)
+    assert any(e.tables == ["orders"] for e in packet.examples), "an example on a held table is still served"
+
+
+def test_no_eligible_table_means_no_example_and_no_failure(tmp_path, caplog):
+    # Granted only the dropped table: nothing is eligible, which is an empty answer, not a failed query.
+    import logging
+
+    class OnlyPayroll:
+        def grants_for(self, _identity):
+            return GrantSet(frozenset({"payroll"}))
+
+    con = _store_with_examples(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        packet = retrieve(con, "payroll salary band", IDENTITY, OnlyPayroll(), FakeEmbedder(), k=12,
+                          snapshot=CURRENT, grants=OnlyPayroll().grants_for(IDENTITY))
+    assert packet.examples == [] and packet.cards == []
+    assert "example retrieval failed" not in caplog.text
