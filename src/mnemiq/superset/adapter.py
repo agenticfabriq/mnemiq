@@ -159,13 +159,19 @@ class SupersetSqlAdapter:
         refused_at: int | None = None  # the size of the last refusal
         allowed = 0
         probing = False
+        measured: pa.Table | None = None  # the one row measured, the answer's first: kept should a later ask be refused
+        refused_limit = bound  # the last limit refused, which no later ask reaches
         for asked in range(_RE_ASKS + 1):
             try:
                 payload = self._execute_sql(sql, timeout_s, row_limit=limit)
             except SupersetResponseTooLarge as refused:
                 sizes = _refused_size(refused)
                 if sizes is None or bound is None or asked == _RE_ASKS or limit == 1:
+                    if measured is not None:
+                        return mark_sent(measured, measured.num_rows)
                     raise ResultCut(_TOO_LARGE_TO_SEND) from refused
+                if limit is not None:
+                    refused_limit = limit
                 sent_bytes, allowed = sizes
                 if limit is not None and sent_bytes == refused_at:
                     limit, probing = 1, True
@@ -185,7 +191,9 @@ class SupersetSqlAdapter:
                 fit = math.floor(allowed * _AIM / max(1, _payload_size(payload)))
                 if fit <= 1 or asked == _RE_ASKS:
                     return mark_sent(table, table.num_rows)
-                limit = min(fit, bound)
+                # Sized from one row, which may be narrower than the rest: kept, and the ask stays below the refused one.
+                measured = table
+                limit = max(2, min(fit, refused_limit - 1))
                 continue
             return mark_sent(table, limit) if limit is not None and table.num_rows >= limit else table
         raise AssertionError("unreachable: the last ask returns or raises")

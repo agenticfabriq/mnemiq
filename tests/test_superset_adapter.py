@@ -495,14 +495,15 @@ def test_a_statement_whose_limit_cannot_be_read_is_not_asked_again():
     assert len(adapter.client.calls) == 1
 
 
-def _sized(rows: int, width: int, allowed: int = 50_000):
+def _sized(rows: int, width: int, allowed: int = 50_000, first: int | None = None):
     """A source holding `rows` rows of `width` characters that answers as rc2 does: each row twice (`rows` and the
     statement's own data), refused, with its size, when the answer passes `allowed` bytes."""
     import json
 
     def answer(request):
         n = min(rows, request.get("limit") or rows)
-        data = [{"region": f"r{i:04}", "wide": "x" * width} for i in range(n)]
+        data = [{"region": f"r{i:04}", "wide": "x" * (first if i == 0 and first is not None else width)}
+                for i in range(n)]
         payload = {**REGION_COUNTS, "columns": [{"name": "region", "type": "object"}, {"name": "wide", "type": "object"}],
                    "rows": data, "row_count": n, "statements": [{"data": {"rows": data}}]}
         size = len(json.dumps(payload))
@@ -521,3 +522,22 @@ def test_a_wide_result_of_few_rows_is_answered_with_the_rows_that_fit():
     limits = [call.request.get("limit") for call in adapter.client.calls]
     assert 1 in limits and len(limits) <= 4, limits
     assert sent_of(table) == table.num_rows and 5 <= table.num_rows < 30, (table.num_rows, limits)
+
+
+def test_a_short_first_row_before_wide_ones_keeps_the_row_it_measured():
+    """The one row measured is narrower than the rest, so the ask sized from it is refused again: the measured row is
+    still the answer's first, and it is the answer, said so, rather than none."""
+    adapter = _adapter(_sized(30, 2000, first=10))
+    table = adapter.execute_answer(SQL)
+    limits = [call.request.get("limit") for call in adapter.client.calls]
+    assert sent_of(table) == table.num_rows >= 1 and table.column("region")[0].as_py() == "r0000", limits
+    assert limits[-1] is not None and limits[-1] < limits[1], limits  # the ask after the measure stays below the refused one
+
+
+def test_the_ask_after_the_measure_stays_below_the_last_refused_one():
+    """Five rows of 20,000 characters under `LIMIT 50`: the one-row measure would size the next ask past the 10 rows
+    just refused; it stays below them."""
+    adapter = _adapter(_sized(5, 20000, first=10))
+    adapter.execute_answer("SELECT region, wide FROM policies LIMIT 50")
+    limits = [call.request.get("limit") for call in adapter.client.calls]
+    assert limits[2] == 1 and limits[-1] < limits[1], limits
