@@ -110,6 +110,8 @@ class LoadedProfile:
     planner: Any = None
     # The reader of a dashboard change asked by chat, on the same client (`assembly.Components.interpreter`).
     interpreter: Any = None
+    # The intent step of the panel's conversation, on the same client (`assembly.Components.intent`).
+    intent: Any = None
 
 
 @dataclass(frozen=True)
@@ -1385,7 +1387,7 @@ def build_runtime(settings: Settings) -> Runtime:
         }
         loaded[profile_name] = LoadedProfile(profile, profile_version(profile.settings, dialect), profile.settings, modes,
                                              agents, kit.fitter, clients, planner=kit.planner,
-                                             interpreter=kit.interpreter)
+                                             interpreter=kit.interpreter, intent=kit.intent)
     default = loaded[default_profile]
     commit = read_engine_commit(settings.engine_commit)
     answer_log = build_answer_log(settings)
