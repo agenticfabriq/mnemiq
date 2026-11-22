@@ -939,9 +939,12 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
     # read's cap only when those do not settle where the cut falls.
     first = _first_read(ranking)
     mine = read(first)
-    if first is not None and isinstance(mine, _Rows) and mine.cap is not None \
-            and not _cut_inside(_left_out(mine, expectation.not_null), ranking):
-        mine = read(None)
+    if first is not None and isinstance(mine, _Rows):
+        # What the HAVING leaves of it, which may hold every group it keeps (`_left_out`): only a read still stopped at
+        # its cap whose cut it does not settle reads on.
+        kept = _left_out(mine, expectation.not_null)
+        if kept.cap is not None and not _cut_inside(kept, ranking):
+            mine = read(None)
     if isinstance(mine, NotCheckable):
         return not_checked(mine.reason)
     mine = _left_out(mine, expectation.not_null)

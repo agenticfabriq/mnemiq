@@ -2331,6 +2331,9 @@ def test_a_having_that_leaves_fewer_groups_than_the_cut_past_a_full_read_is_chec
     shown = sorted(((r, v) for r, v in rows if v is not None), key=lambda row: -row[1])
     check = _ranked_cut(fake, shown, rows, row_limit=50, adhoc_filters=[copy.deepcopy(WEB_ONLY), LEFT_OUT])
     assert check.status is ChartStatus.CHECKED, check.reason
+    # The first read already holds every group the HAVING keeps: a read on, up to one read's cap, would be a statement
+    # whose answer can pass Superset's MCP response size, for nothing.
+    assert len(_statements(fake)) == 1, _statements(fake)
 
 
 def test_a_having_on_another_measure_that_leaves_fewer_groups_than_the_cut_in_a_full_read_is_not_checked(fake):
