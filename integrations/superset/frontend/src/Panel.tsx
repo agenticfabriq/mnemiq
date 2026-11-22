@@ -1,20 +1,20 @@
 import React, { useEffect, useMemo, useState, useSyncExternalStore, type CSSProperties } from "react";
-import { Button, Spin, theme } from "antd";
+import { Alert, Button, Spin, theme } from "antd";
 import { authentication, chat } from "@apache-superset/core";
 import { PanelApi } from "./api";
-import { askInPanel } from "./ask";
 import { driver } from "./build";
-import { changeInPanel } from "./change";
-import { isRunning } from "./shared";
+import type { Choose, Page } from "./conversation";
 import { dashboardRefOf, pageAppRoot, resolveDashboard, usePageContext } from "./page";
 import { probe, type Readiness } from "./readiness";
 import { getSnapshot, subscribe } from "./store";
+import { sendInPanel } from "./talk";
 import { BuildCard } from "./views/BuildCard";
-import { ChangeCard } from "./views/ChangeCard";
 import { Composer } from "./views/Composer";
 import { Conversation } from "./views/Conversation";
+import { ConversationList } from "./views/ConversationList";
 import { Header } from "./views/Header";
 import { Measures } from "./views/Measures";
+import { Messages } from "./views/Messages";
 import { UnfinishedBuilds } from "./views/Unfinished";
 
 // 640 px tall, at most 80% of the window: `min(640px, 80vh)`, spelt so jsdom, whose CSS parser drops `min()`, keeps it.
@@ -77,60 +77,61 @@ function Body() {
   return <Ready api={api} starters={readiness.starters} />;
 }
 
-/** The panel for a person mnemiq answers: the dashboard on screen, when they may read it; their unfinished builds;
- * the opening questions until the first is asked; the conversation and the build; and the composer. */
+/** Where a message is sent from, worked out when it is sent: the dashboard on the path on screen then, resolved as the
+ * person (Superset moves between dashboards with no page event, so the page context may be a second behind), or no
+ * dashboard off one or on one they cannot read. */
+async function pageNow(): Promise<Page> {
+  const root = pageAppRoot();
+  const ref = dashboardRefOf(window.location.pathname, root);
+  if (ref === null) return { dashboardId: null, dashboardTitle: null, dashboardHasCharts: null };
+  const found = await resolveDashboard(root, ref);
+  return found.readable && found.id !== null
+    ? { dashboardId: found.id, dashboardTitle: found.title, dashboardHasCharts: found.hasCharts ?? null }
+    : { dashboardId: null, dashboardTitle: null, dashboardHasCharts: null };
+}
+
+export const DESCRIBE = "Describe what this dashboard should show";
+const ANYTHING = "Ask about your data, build a dashboard, or change this one";
+const OFF_A_DASHBOARD = "Ask about your data, or describe a dashboard to build";
+
+/** The panel for a person mnemiq answers: their conversations and New; the dashboard on screen, when they may read
+ * it; their unfinished builds; the opening questions until the conversation has a message; the conversation, the
+ * message in flight and the build running; the dashboard's measures; and one box to write in. */
 function Ready({ api, starters }: { api: PanelApi; starters: string[] }) {
   const { dashboard } = usePageContext();
-  const { turns, runningBuild, planning, change: changing } = useSyncExternalStore(subscribe, getSnapshot);
+  const { conversationId, messages, turns, sending, notice, fresh, runningBuild, planning } =
+    useSyncExternalStore(subscribe, getSnapshot);
   const { token } = theme.useToken();
   useEffect(() => driver.attach(api), [api]);
   const onScreen = dashboard?.readable && dashboard.id !== null ? dashboard : null;
-  const asking = isRunning(turns);
-  const ask = (question: string) => askInPanel(api, question);
-  // The target is worked out when the goal is sent, from the path on screen then (Superset moves between dashboards
-  // with no page event, so the page context may be a second behind): that dashboard, resolved as the person; a new one
-  // when ticked; and, off a dashboard or on one they cannot read, neither, so mnemiq may offer one that covers it.
-  const build = (goal: string, fresh: boolean) => {
-    if (driver.busy()) return false;
-    const root = pageAppRoot();
-    void driver.start(goal, fresh ? { fresh: true } : async () => {
-      const ref = dashboardRefOf(window.location.pathname, root);
-      if (ref === null) return {};
-      const found = await resolveDashboard(root, ref);
-      return found.readable && found.id !== null ? { dashboardId: found.id } : {};
-    });
-    return true;
-  };
-  // A change goes to the dashboard on screen when it is sent, and only to one the person may read.
-  const change = (request: string) => changeInPanel(api, request, async () => {
-    const root = pageAppRoot();
-    const ref = dashboardRefOf(window.location.pathname, root);
-    if (ref === null) return null;
-    const found = await resolveDashboard(root, ref);
-    return found.readable ? found.id : null;
-  });
+  // Accepted only when the screen is free, and held from that moment, before the page is looked up.
+  const send = (text: string, choose?: Choose) => sendInPanel(api, text, pageNow, choose);
+  const placeholder = onScreen === null ? OFF_A_DASHBOARD : onScreen.hasCharts === false ? DESCRIBE : ANYTHING;
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: token.padding }}>
+      <ConversationList api={api} current={conversationId} busy={sending} />
       {onScreen ? (
         <section aria-label="This dashboard" style={{ color: token.colorTextSecondary }}>
           On <strong style={{ color: token.colorText }}>{onScreen.title ?? "this dashboard"}</strong>
         </section>
       ) : null}
-      {onScreen?.id != null ? <Measures key={onScreen.id} api={api} dashboardId={onScreen.id} /> : null}
       <UnfinishedBuilds api={api} dashboardId={onScreen?.id ?? null} />
-      {turns.length === 0 && starters.length > 0 ? (
+      {messages.length === 0 && turns.length === 0 && starters.length > 0 ? (
         <section aria-label="Starters" style={{ display: "flex", flexDirection: "column", gap: token.paddingXS }}>
           {starters.map((starter) => (
-            <Button key={starter} disabled={asking} onClick={() => ask(starter)}
+            <Button key={starter} disabled={sending} onClick={() => send(starter)}
               style={{ textAlign: "left", whiteSpace: "normal", height: "auto" }}>{starter}</Button>
           ))}
         </section>
       ) : null}
+      <Messages key={conversationId ?? "new"} api={api} messages={messages} conversationId={conversationId}
+        onScreenId={onScreen?.id ?? null} pageNow={pageNow} onChoose={(text, choose) => send(text, choose)}
+        busy={sending} building={runningBuild !== null || planning} fresh={fresh} />
       <Conversation turns={turns} />
       <BuildCard onScreenId={onScreen?.id ?? null} />
-      <ChangeCard api={api} onScreenId={onScreen?.id ?? null} />
-      <Composer busy={{ ask: asking, build: planning || runningBuild !== null, change: changing?.sending ?? false }}
-        onDashboard={onScreen ? onScreen.title ?? "this dashboard" : null} onAsk={ask} onBuild={build} onChange={change} />
+      {notice ? <Alert type="warning" showIcon message={notice} /> : null}
+      {onScreen?.id != null ? <Measures key={onScreen.id} api={api} dashboardId={onScreen.id} /> : null}
+      <Composer busy={sending} placeholder={placeholder} onSend={(text) => send(text)} />
     </div>
   );
 }
