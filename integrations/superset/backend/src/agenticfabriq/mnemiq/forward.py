@@ -52,6 +52,8 @@ ANSWER_HEADERS = {"Cache-Control": "no-store"}
 
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _INT = r"[1-9][0-9]{0,9}"
+# A message's place in its conversation, from 0.
+_INDEX = r"(0|[1-9][0-9]{0,3})"
 # A measure's name: one path segment of the path as Superset's router decoded it, encoded once for mnemiq.
 _NAME = r"(?P<name>[^/]{1,250})"
 _ONE_ID = re.compile(_INT)
@@ -73,12 +75,27 @@ ROUTES: tuple[Route, ...] = (
     Route("POST", re.compile(r"/v1/superset/builds"), "build"),
     Route("GET", re.compile(rf"/v1/superset/builds/{_UUID}"), "build"),
     Route("POST", re.compile(rf"/v1/superset/builds/{_UUID}/next"), "build"),
+    Route("POST", re.compile(rf"/v1/superset/builds/{_UUID}/confirm"), "build"),
     Route("GET", re.compile(rf"/v1/superset/dashboards/{_INT}/measures"), "build"),
     Route("POST", re.compile(rf"/v1/superset/dashboards/{_INT}/measures/{_NAME}/(edit|remove|save)"), "build"),
     Route("POST", re.compile(rf"/v1/superset/dashboards/{_INT}/changes"), "build"),
+    # The panel's conversations: each person's own, a message answered as a stream.
+    Route("GET", re.compile(r"/v1/superset/conversations"), "build", frozenset({"before", "limit"})),
+    Route("POST", re.compile(r"/v1/superset/conversations"), "build"),
+    Route("GET", re.compile(rf"/v1/superset/conversations/{_UUID}"), "build"),
+    Route("POST", re.compile(rf"/v1/superset/conversations/{_UUID}/delete"), "build"),
+    Route("POST", re.compile(rf"/v1/superset/conversations/{_UUID}/messages"), "build", stream=True),
+    Route("POST", re.compile(rf"/v1/superset/conversations/{_UUID}/messages/{_INDEX}/(confirm|decline|results)"),
+          "build"),
 )
 # Each query key a route takes, and what its one value must be.
-_QUERY_VALUES: dict[str, re.Pattern[str]] = {"dashboard_id": _ONE_ID}
+_QUERY_VALUES: dict[str, re.Pattern[str]] = {
+    "dashboard_id": _ONE_ID,
+    # The conversation list's page: a cursor the list gave (when the last one shown was updated, and its id), and
+    # how many to list.
+    "before": re.compile(rf"\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}:\d{{2}}:\d{{2}}\.\d{{6}}\+00:00\|{_UUID}"),
+    "limit": re.compile(r"[1-9][0-9]?|100"),
+}
 
 
 @dataclass(frozen=True)

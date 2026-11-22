@@ -6,7 +6,18 @@ import { navigation } from "@apache-superset/core";
 
 export type Page = ReturnType<typeof navigation.getPage>;
 
-export type DashboardContext = { ref: string; id: number | null; title: string | null; readable: boolean };
+/** A dashboard as Superset answers it to the person: its id and title, and whether it places any chart (null when
+ * Superset's answer does not say). */
+export type DashboardContext = { ref: string; id: number | null; title: string | null; readable: boolean;
+  hasCharts?: boolean | null };
+
+/** Whether Superset's answer for a dashboard says it holds charts: its `charts` list, or else its layout's chart
+ * entries; null when it says neither. */
+export function hasChartsOf(result: { charts?: unknown; position_json?: unknown }): boolean | null {
+  if (Array.isArray(result.charts)) return result.charts.length > 0;
+  if (typeof result.position_json === "string") return /"type"\s*:\s*"CHART"/.test(result.position_json);
+  return null;
+}
 
 export type PageContext = { page: Page; dashboard: DashboardContext | null };
 
@@ -56,10 +67,11 @@ export async function resolveDashboard(root: string, ref: string, fetchFn?: type
     const response = await ask(`${root}/api/v1/dashboard/${encodeURIComponent(ref)}`, { credentials: "same-origin",
       redirect: "manual", headers: { Accept: "application/json" } });
     if (!response.ok) return unreadable;
-    const result = ((await response.json()) as { result?: { id?: unknown; dashboard_title?: unknown } })?.result;
+    const result = ((await response.json()) as { result?: { id?: unknown; dashboard_title?: unknown; charts?: unknown;
+      position_json?: unknown } })?.result;
     return typeof result?.id === "number"
       ? { ref, id: result.id, title: typeof result.dashboard_title === "string" ? result.dashboard_title : null,
-          readable: true }
+          readable: true, hasCharts: hasChartsOf(result) }
       : unreadable;
   } catch {
     return unreadable;

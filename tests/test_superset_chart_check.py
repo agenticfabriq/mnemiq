@@ -108,7 +108,11 @@ def _dataset(*, virtual: bool = False, metrics=(), schema: str = SCHEMA, databas
     return {"id": dataset_id, "table_name": "policy", "schema": schema,
             "database_id": database_id, "is_virtual": virtual, "sql": "SELECT * FROM policy" if virtual else None,
             "metrics": [{"metric_name": name, "verbose_name": None, "expression": expression, "description": None,
-                         "d3format": None} for name, expression in metrics]}
+                         "d3format": None} for name, expression in metrics],
+            # rc2's `TableColumnInfo`: the fake table's columns, `is_dttm` on its one time column.
+            "columns": [{"column_name": name, "type": kind, "is_dttm": name == "order_date"}
+                        for name, kind in (("order_date", "DATE"), ("region", "VARCHAR"), ("channel", "VARCHAR"),
+                                           ("premium", "NUMERIC"))]}
 
 
 def _chart_data(columns, *rows, **more) -> dict:
@@ -2033,6 +2037,121 @@ def _cut(fake, chart_rows, mnemiq_rows, **form):
     _serve(fake, form_data=_bar(**form), chart=_chart_data(["region", "Total premium"], *chart_rows),
            mnemiq=_result(*mnemiq_rows, columns=(("region", "object"), ("m0", "float64"))))
     return _check(fake)
+
+
+SIX_MONTHS = tuple((f"2026-{month:02d}-01T00:00:00", value)
+                   for month, value in zip(range(1, 7), (5.0, 40.0, 10.0, 30.0, 20.0, 50.0)))
+# What rc2's query keeps under a row limit of 3, ordered by the measure before its LIMIT, then sorted by time on the axis.
+LARGEST_THREE_MONTHS = tuple(sorted(sorted(SIX_MONTHS, key=lambda row: -row[1])[:3]))
+TIME_AXIS_CUT = ("the chart's row limit (3) keeps only some of its groups, so not all of them were compared: its x-axis "
+                 "is a time axis, where a row limit keeps the points its query ranks first, not the latest")
+
+
+def _timeline(fake, chart_rows, *, dataset=None, **form):
+    _serve(fake, form_data=_line(**form), chart=_chart_data(["order_date", "Total premium"], *chart_rows),
+           mnemiq=_result(*SIX_MONTHS, columns=(("order_date", "datetime64[ns]"), ("m0", "float64"))),
+           dataset=dataset)
+    return _check(fake)
+
+
+def _column_reads(fake) -> int:
+    return sum(1 for call in fake.calls if call.tool.endswith("get_dataset_info")
+               and "columns" in (call.request.get("select_columns") or []))
+
+
+def test_a_time_axis_its_row_limit_cuts_is_not_checked(fake):
+    """rc2's time-series query orders by the chart's measure before its LIMIT and the axis sorts by time afterwards, so
+    a row limit of 3 keeps the 3 largest months, not the latest: a cut mnemiq does not call checked on a time axis,
+    though the kept months are the largest. Superset's own test of a time axis is the column's `is_dttm`."""
+    check = _timeline(fake, LARGEST_THREE_MONTHS, row_limit=3)
+    assert check.status is ChartStatus.NOT_CHECKED and check.reason == TIME_AXIS_CUT
+    assert _column_reads(fake) == 1
+
+
+def test_a_categorical_bar_its_row_limit_cuts_still_ranks(fake):
+    """A bar by region is no time axis (`region` is not `is_dttm`): its row limit keeps its top groups, a ranking the
+    check reads and calls checked."""
+    check = _cut(fake, [("c", 50.0), ("d", 30.0)], [("c", 50.0), ("d", 30.0), ("e", 10.0)], row_limit=2)
+    assert check.status is ChartStatus.CHECKED and check.reason == RANKED.format(n=2, order="largest")
+
+
+def test_an_unreadable_axis_under_a_cut_is_not_checked(fake):
+    """When mnemiq cannot read whether the x-axis is a time axis, a cut chart is not checked, never checked."""
+    answer = _dataset()
+    answer.pop("columns")
+    check = _timeline(fake, LARGEST_THREE_MONTHS, row_limit=3, dataset=answer)
+    assert check.status is ChartStatus.NOT_CHECKED
+    assert check.reason.startswith("the chart's row limit (3) keeps only some of its groups, so not all of them were "
+                                   "compared: mnemiq could not read whether its x-axis is a time axis")
+
+
+def _with_columns_answer(fake, answer) -> None:
+    """The dataset's answer to the axis read alone (`select_columns: ["columns"]`), the rest of its answer as before:
+    `answer` is the reply, or an exception the reply raises (an error result)."""
+    def reply(request, authorization):
+        if "columns" not in (request.get("select_columns") or []):
+            return _dataset()
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    fake.reply("get_dataset_info", reply)
+
+
+@pytest.mark.parametrize("columns", [
+    pytest.param([], id="no columns at all"),
+    pytest.param([{"column_name": "region", "type": "VARCHAR", "is_dttm": False}], id="the axis not among them"),
+    pytest.param([{"column_name": "order_date", "type": "DATE"}], id="the axis with no is_dttm"),
+    pytest.param([{"column_name": "order_date", "type": "DATE", "is_dttm": None}], id="the axis with is_dttm unknown"),
+])
+def test_an_axis_superset_does_not_resolve_under_a_cut_is_not_checked(fake, columns):
+    """Only a column Superset says is no time column (`is_dttm` false) lets a cut chart be read as a ranking: an axis
+    missing from the columns, or one whose flag is absent or unknown, is not checked."""
+    _serve(fake, form_data=_line(row_limit=3), chart=_chart_data(["order_date", "Total premium"], *LARGEST_THREE_MONTHS),
+           mnemiq=_result(*SIX_MONTHS, columns=(("order_date", "datetime64[ns]"), ("m0", "float64"))))
+    _with_columns_answer(fake, {"columns": columns})
+    check = _check(fake)
+    assert check.status is ChartStatus.NOT_CHECKED, check.reason
+    assert "mnemiq could not read whether its x-axis is a time axis" in check.reason
+
+
+@pytest.mark.parametrize("answer", [
+    pytest.param({"columns": [{"column_name": "region", "type": "VARCHAR", "is_dttm": False}],
+                  "_response_truncated": True}, id="cut to fit, the axis left out"),
+    # Cut to fit, whatever it still lists: an answer Superset says it shortened is not read at all.
+    pytest.param({"columns": [{"column_name": "order_date", "type": "DATE", "is_dttm": False}],
+                  "_response_truncated": True}, id="cut to fit, the axis listed"),
+    pytest.param({"error": "Superset broke", "error_type": "InternalError"}, id="an error answer"),
+    pytest.param(RuntimeError("Superset refused the read"), id="a raised error"),
+])
+def test_a_columns_read_that_is_cut_or_fails_under_a_cut_is_not_checked(fake, answer):
+    """rc2 shortens a list to fit its response size and keeps it a valid list, so only `_response_truncated` says the
+    axis may be missing; that, an error answer and a refused call are all not checked, never checked."""
+    _serve(fake, form_data=_line(row_limit=3), chart=_chart_data(["order_date", "Total premium"], *LARGEST_THREE_MONTHS),
+           mnemiq=_result(*SIX_MONTHS, columns=(("order_date", "datetime64[ns]"), ("m0", "float64"))))
+    _with_columns_answer(fake, answer)
+    check = _check(fake)
+    assert check.status is ChartStatus.NOT_CHECKED, check.reason
+    assert "mnemiq could not read whether its x-axis is a time axis" in check.reason
+
+
+def test_a_table_grouped_by_a_time_column_under_a_cut_still_ranks(fake):
+    """A table shows its rows in its measure's order and has no x-axis: grouped by a date and cut by its row limit, it
+    is a ranking the check reads, and the axis is never asked about."""
+    form = _table(groupby=["order_date"], row_limit=3)
+    largest = sorted(SIX_MONTHS, key=lambda row: -row[1])[:3]
+    _serve(fake, form_data=form, chart=_chart_data(["order_date", "Total premium"], *largest),
+           mnemiq=_result(*SIX_MONTHS, columns=(("order_date", "datetime64[ns]"), ("m0", "float64"))))
+    check = _check(fake)
+    assert check.status is ChartStatus.CHECKED, check.reason
+    assert _column_reads(fake) == 0
+
+
+def test_a_time_axis_nothing_cuts_reads_no_columns(fake):
+    """The axis is read only when a row limit cuts the chart: a line showing every month asks Superset nothing more."""
+    check = _timeline(fake, SIX_MONTHS)
+    assert check.status is ChartStatus.CHECKED, check.reason
+    assert _column_reads(fake) == 0
 
 
 NULL_KEPT = ("the chart's row limit ({n}) keeps groups with no value for 'Total premium' and leaves out groups that "

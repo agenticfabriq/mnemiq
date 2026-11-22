@@ -30,6 +30,7 @@ def _facts(
             estimated_rows=c.estimate.rows if c.estimate else None,
             estimated_distinct=c.estimate.distinct if c.estimate else None,
             estimated_nulls=c.estimate.nulls if c.estimate else None,
+            comment=c.comment,
         )
         for c in columns
     ]

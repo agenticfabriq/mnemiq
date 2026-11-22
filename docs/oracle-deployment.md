@@ -262,6 +262,41 @@ statements rather than several per table. Each statement is bounded by the probe
 (`MNEMIQ_ORACLE_PROBE_TIMEOUT_S`, 30 s by default); a batch that fails is read table by table
 instead, and enrich logs why.
 
+**Comments.** In either mode, enrich reads each table's and column's comment from the dictionary
+(`ALL_TAB_COMMENTS`, `ALL_COL_COMMENTS`), reading no table data, and keeps it apart from the
+model's description: the describing model is given it as the database's own text, and the card
+prints it, so table search reads it too. When a prompt must be trimmed to fit the model's window,
+every model description goes before any comment. Instant mode's bare cards still carry names and
+types only, without comments.
+
+A comment is free text a person wrote, and can name or describe any table or column in the schema.
+So comments, a table's and a column's alike, are shown only to someone who may see every table
+enriched and is denied or masked no column; anyone else gets cards without them (their model
+descriptions, which are scoped column by column, stay). A role granted the whole schema with no
+column policy sees every comment.
+
+A comment is database text, like a column name or a glossary definition, and is treated the same
+way: its whitespace is flattened (so it cannot start a line of its own on a card), it is cut to
+300 characters, and phrases that address the model are screened out. That screen is defence in
+depth, not a guarantee: a comment written as an instruction still reaches the model. What bounds
+it is downstream. The describing model's reply may annotate only the columns it was asked about
+and explain only codes that were observed, and every statement the model writes for an answer is
+refused unless it is a single read within the person's grants, so a comment can steer an answer
+only within what that person may already read. Whoever can comment on
+a table (its owner, or a holder of `COMMENT ANY TABLE`) can write into the prompt.
+
+**Checking table search.** On a few tables every table reaches the prompt; on hundreds, each
+question's retrieval picks `MNEMIQ_RETRIEVAL_K` of them (24 by default), and a question whose
+tables it misses cannot be answered. `mnemiq check-search --questions questions.json` asks each
+question as answering would, up to the model call (no model is asked), and says where each table
+its gold SQL reads was found, and whether the prompt fits the model's window. The file is a JSON
+list of `{"id", "question", "gold_sql"}`, and the identity is the one `ask` would use (`--principal`,
+`--roles`). The report holds counts and question ids only, unless `--names` is given: write it with
+`--out report.txt` and share that file, not the terminal, where the deployment's own startup
+warnings can name tables and columns. A gold query that does not parse, or reads a table the
+identity cannot see (absent from the deployment or not granted, which read alike), is reported
+apart, never as a search miss.
+
 **What statistics mode gives up.**
 
 - **Counts are estimates.** They are kept apart from exact counts. The model that describes the

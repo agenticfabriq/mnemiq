@@ -110,6 +110,8 @@ class LoadedProfile:
     planner: Any = None
     # The reader of a dashboard change asked by chat, on the same client (`assembly.Components.interpreter`).
     interpreter: Any = None
+    # The intent step of the panel's conversation, on the same client (`assembly.Components.intent`).
+    intent: Any = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +121,15 @@ class Usage:
     calls: int
     prompt_tokens: int
     completion_tokens: int
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    """`Runtime.search`'s answer: the tables retrieval put before the model, best first, and whether the prompt fits."""
+
+    tables: list[str]
+    fit: object = None  # PromptFit, None where the deployment fits nothing
+    granted: frozenset[str] = frozenset()  # the tables the search's grants cover, by exact id, as retrieval matches
 
 
 @dataclass
@@ -275,6 +286,53 @@ class Runtime:
             return self.snapshot.source_id
         return (self.settings.source_id if self.settings else None) or "unknown"
 
+    def _retrieve(self, question: str, identity, authz, grants, settings, name: str, picked):
+        """The packet `ask` retrieves, and `search` with it: one call, so the table-search check scores exactly what
+        answering reads (the two doors, M81)."""
+        return retrieve(
+            self.con, question, identity, authz, self.embedder,
+            # The default lives on the Settings field, not here. It was written out as a
+            # literal 12 and silently kept the old value when the measured default moved
+            # to 24 -- a second copy of a number is a second thing to forget.
+            k=settings.retrieval_k if settings else DEFAULT_RETRIEVAL_K,
+            table_facts=self.snapshot.table_facts if self.snapshot else (),
+            # Both doors pass this or the eval measures a prompt form `ask` cannot emit
+            # -- the M81 shape the two-doors guard exists to catch, which it did.
+            card_style=self._card_style(name, picked),
+            dialect=getattr(self.adapter, "dialect", None),
+            # Definitions ride with the snapshot: the glossary channel had no runtime
+            # producer until the ontology digest, so this stayed unfed from Plan 08 until SP1.
+            definitions=self.snapshot.definitions if self.snapshot else (),
+            # Certified metrics and dimensions were appended to the snapshot by
+            # `apply_certified` and passed to nothing -- five of the fs corpus's twenty-eight
+            # records reaching the model not at all, and the five carrying the most explicit
+            # meaning.
+            metrics=self.snapshot.metrics if self.snapshot else (),
+            dimensions=self.snapshot.dimensions if self.snapshot else (),
+            columns=self.snapshot.columns if self.snapshot else (),
+            ontology_index=self.ontology,
+            # M4: lets retrieve re-render each card against this identity's column policy.
+            snapshot=self.snapshot,
+            grants=grants,
+        )
+
+    def search(self, question: str, identity: IdentityContext, profile: str | None = None) -> SearchResult:
+        """What `ask` would put before the model for `question`, without asking it: the tables retrieval ranks, best
+        first, and whether the fitted prompt fits the window (`PromptFitter.measure`). The table-search check's door.
+        Direct mode only: in Superset mode retrieval waits on the person's own token."""
+        if self._superset_mode:
+            raise ValueError("search needs a direct deployment: in Superset mode answering asks as the person")
+        picked = self._picked(profile, identity)
+        name = self.router.route(question, None)
+        settings, fitter = (picked.settings, picked.fitter) if picked else (self.settings, self.fitter)
+        grants = self.authz.grants_for(identity)
+        self.reload_if_stale()
+        packet = self._retrieve(question, identity, self.authz, grants, settings, name, picked)
+        packet.history = scope_history(None, grants.fingerprint)
+        fit = (fitter.measure(packet, self.snapshot, grants, card_style=self._card_style(name, picked))
+               if fitter is not None else None)
+        return SearchResult(tables=[c.object_id for c in packet.cards], fit=fit, granted=frozenset(grants.objects))
+
     def ask(
         self,
         question: str,
@@ -333,32 +391,7 @@ class Runtime:
             self.reload_if_stale()
             started = time.perf_counter()
         with step(emit, Stage.RETRIEVE, mode=name):
-            packet = retrieve(
-                self.con, question, identity, authz, self.embedder,
-                # The default lives on the Settings field, not here. It was written out as a
-                # literal 12 and silently kept the old value when the measured default moved
-                # to 24 -- a second copy of a number is a second thing to forget.
-                k=settings.retrieval_k if settings else DEFAULT_RETRIEVAL_K,
-                table_facts=self.snapshot.table_facts if self.snapshot else (),
-                # Both doors pass this or the eval measures a prompt form `ask` cannot emit
-                # -- the M81 shape the two-doors guard exists to catch, which it did.
-                card_style=self._card_style(name, picked),
-                dialect=getattr(self.adapter, "dialect", None),
-                # Definitions ride with the snapshot: the glossary channel had no runtime
-                # producer until the ontology digest, so this stayed unfed from Plan 08 until SP1.
-                definitions=self.snapshot.definitions if self.snapshot else (),
-                # Certified metrics and dimensions were appended to the snapshot by
-                # `apply_certified` and passed to nothing -- five of the fs corpus's twenty-eight
-                # records reaching the model not at all, and the five carrying the most explicit
-                # meaning.
-                metrics=self.snapshot.metrics if self.snapshot else (),
-                dimensions=self.snapshot.dimensions if self.snapshot else (),
-                columns=self.snapshot.columns if self.snapshot else (),
-                ontology_index=self.ontology,
-                # M4: lets retrieve re-render each card against this identity's column policy.
-                snapshot=self.snapshot,
-                grants=grants,
-            )
+            packet = self._retrieve(question, identity, authz, grants, settings, name, picked)
         if superset:
             # No few-shot example is served, whatever the store holds, as no value index is (`NoValueIndex`): an
             # example's SQL can carry a literal read with another credential, outside Superset's row rules, and the
@@ -1354,7 +1387,7 @@ def build_runtime(settings: Settings) -> Runtime:
         }
         loaded[profile_name] = LoadedProfile(profile, profile_version(profile.settings, dialect), profile.settings, modes,
                                              agents, kit.fitter, clients, planner=kit.planner,
-                                             interpreter=kit.interpreter)
+                                             interpreter=kit.interpreter, intent=kit.intent)
     default = loaded[default_profile]
     commit = read_engine_commit(settings.engine_commit)
     answer_log = build_answer_log(settings)

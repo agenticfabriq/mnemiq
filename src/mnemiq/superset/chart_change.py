@@ -23,6 +23,7 @@ the dashboard does not place is never read or written.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import logging
 import re
@@ -45,6 +46,7 @@ from mnemiq.superset.charts import Family, Filter, _adhoc_filter
 from mnemiq.superset.dashboard_charts import _OPERATOR, datasets_built_on
 from mnemiq.superset.display_format import metric_label
 from mnemiq.superset.extension import call_tool
+from mnemiq.superset.planner import SCALAR
 from mnemiq.superset.measure_actions import (
     Asking,
     EditorsOf,
@@ -57,8 +59,10 @@ from mnemiq.superset.measure_actions import (
     _take_off,
 )
 
-__all__ = ["SETTABLE", "ChangeAnswer", "ChartChange", "FakeInterpreter", "Interpretation", "LLMChangeInterpreter",
-           "change_dashboard", "change_prompt", "dashboard_summary"]
+__all__ = ["NOT_ANSWERED", "PREVIEW_JSON_SHAPE", "SETTABLE", "STALE_SINCE_PREVIEW", "ChangeAnswer", "ChangeInterrupted",
+           "ChangePreview", "ChartChange",
+           "FakeInterpreter", "Interpretation", "LLMChangeInterpreter", "PlannedEdit", "apply_change",
+           "change_dashboard", "change_prompt", "dashboard_summary", "preview_change"]
 
 logger = logging.getLogger(__name__)
 
@@ -174,14 +178,20 @@ def dashboard_summary(asking: Asking) -> dict:
     charts, facts = [], {}
     for chart_id in sorted(placed):
         read = read_chart(asking.client, chart_id)
-        dataset = dataset_of(read.form_data, built_on.get(chart_id, 0)) if read.form_data else built_on.get(chart_id)
-        if type(dataset) is int and dataset > 0 and dataset not in facts:
-            facts[dataset] = read_dataset_facts(asking.client, dataset)
-        found = facts.get(dataset) if type(dataset) is int else None
+        found = _facts_of(asking, read, built_on, facts)
         summary = _chart_summary(read, found)
         summary["columns"] = _table_columns(asking, found)
         charts.append(summary)
     return {"charts": charts}
+
+
+def _facts_of(asking: Asking, read: ChartRead, built_on: Mapping[int, int], facts: dict):
+    """The facts of the dataset `read` shows, read once per dataset into `facts`; None when it has none mnemiq reads."""
+    chart_id = read.chart_id
+    dataset = dataset_of(read.form_data, built_on.get(chart_id, 0)) if read.form_data else built_on.get(chart_id)
+    if type(dataset) is int and dataset > 0 and dataset not in facts:
+        facts[dataset] = read_dataset_facts(asking.client, dataset)
+    return facts.get(dataset) if type(dataset) is int else None
 
 
 _SYSTEM = """You change a Superset dashboard as a person asks, by naming the settings of its charts to change. \
@@ -372,28 +382,208 @@ def _planned(change: ChartChange, read: ChartRead, columns: set[str]) -> _Planne
     return _Planned(to_set, to_unset, sorted(set(dropped)))
 
 
-def _send(asking: Asking, chart_id: int, read: ChartRead, planned: _Planned) -> dict:
+def _send(asking: Asking, chart_id: int, changed_on: str | None, planned: _Planned) -> dict:
     return call_tool(asking.client, "patch_chart", {"chart_id": chart_id, "set": planned.to_set,
                                                      "unset": planned.to_unset,
-                                                     "expect_changed_on": read.changed_on})
+                                                     "expect_changed_on": changed_on})
 
 
-def change_dashboard(asking: Asking, request: str, *, interpreter,
-                     confirmed_removal: Sequence[int] = ()) -> ChangeAnswer:
-    """Make `request` on the dashboard, as the person asking: read the dashboard's charts, have `interpreter` read the
-    request against them, and write only what it names, as `SETTABLE` and `_valid` allow. A chart the request reads
-    as removing is only proposed (`would_remove`); `confirmed_removal` names the charts the person confirmed, which
-    are removed and nothing else is done (the model is not asked)."""
-    if confirmed_removal:
-        return _confirmed(asking, tuple(dict.fromkeys(confirmed_removal)))
+# A previewed change no longer matches the dashboard or a chart it names: what a confirm answers for each edit it did
+# not write.
+STALE_SINCE_PREVIEW = "it changed since the preview; ask again"
+# A chart a strict apply was writing, or about to remove, when Superset stopped answering: it may or may not be done.
+NOT_ANSWERED = "Superset stopped answering before this was done; check the dashboard"
+
+
+class ChangeInterrupted(Exception):
+    """A strict apply that failed after its first write was sent: `answer` names what was written and what may or may
+    not have been. The failure itself is the cause."""
+
+    def __init__(self, answer: ChangeAnswer) -> None:
+        super().__init__("a change stopped partway")
+        self.answer = answer
+
+
+@dataclass(frozen=True)
+class PlannedEdit:
+    """One chart's change as a preview names it: the keys it will set and unset, against the chart's `changed_on` as
+    the preview read it, and mnemiq's words for it (`said`). `recorded` is what the model read, held to the keys and
+    filters that made the plan, and `digest` names the plan exactly: a confirm plans the chart again from `recorded`,
+    as it reads now, and writes only when that plan has this digest. `change` (the model's reading as it came) and
+    `columns` (the person's columns of its table) are held in memory only, for today's retry of a stale write."""
+
+    chart_id: int
+    title: str | None
+    changed_on: str | None
+    to_set: Mapping
+    to_unset: tuple[str, ...]
+    said: str
+    digest: str
+    recorded: ChartChange
+    change: ChartChange | None = None
+    columns: frozenset[str] | None = None
+
+
+@dataclass(frozen=True)
+class ChangePreview:
+    """What a request will do to a dashboard, read and planned with nothing written: its edits, the charts it reads
+    as removing (`would_remove`), whether it asks for a chart the dashboard lacks, and what it leaves, drops, or may not
+    change, with mnemiq's words. `dashboard_changed_on` is the dashboard's, read before anything else."""
+
+    dashboard_id: int
+    dashboard_changed_on: str | None
+    edits: tuple[PlannedEdit, ...] = ()
+    would_remove: tuple[tuple[int, str | None], ...] = ()
+    add_chart: bool = False
+    # Each chart it would remove, with the `changed_on` the preview read it at: a confirmed removal is held to it.
+    would_remove_changed_on: tuple[tuple[int, str], ...] = ()
+    left: tuple[tuple[int, str], ...] = ()
+    dropped: tuple[tuple[int, str], ...] = ()
+    not_editor: tuple[EditorsOf, ...] = ()
+    message: str = ""
+    reason: str | None = None
+
+    def to_json(self) -> dict:
+        """The preview as a conversation keeps it (`PREVIEW_JSON_SHAPE`): each edit's `recorded` reading, a filter's
+        literal under `operand`, never the model's own `value` key; no edit's keys to send, which its digest names."""
+        return {"dashboard_id": self.dashboard_id, "dashboard_changed_on": self.dashboard_changed_on,
+                "edits": [{"chart_id": edit.chart_id, "title": edit.title, "changed_on": edit.changed_on,
+                           "said": edit.said, "digest": edit.digest, "change": _change_json(edit.recorded)}
+                          for edit in self.edits],
+                "would_remove": [{"chart_id": chart_id, "title": title,
+                                  "changed_on": dict(self.would_remove_changed_on).get(chart_id)}
+                                 for chart_id, title in self.would_remove],
+                "add_chart": self.add_chart,
+                "left": [{"chart_id": chart_id, "reason": reason} for chart_id, reason in self.left],
+                "dropped": [{"chart_id": chart_id, "key": key} for chart_id, key in self.dropped],
+                "not_editor": [{"chart_id": e.chart_id, "editors": list(e.editors)} for e in self.not_editor],
+                "message": self.message, "reason": self.reason}
+
+    @classmethod
+    def from_json(cls, doc: Mapping) -> ChangePreview:
+        """`to_json`'s record read back: each edit with its `recorded` reading and digest, nothing to send until a
+        strict apply plans it again."""
+        return cls(
+            dashboard_id=doc["dashboard_id"], dashboard_changed_on=doc.get("dashboard_changed_on"),
+            edits=tuple(PlannedEdit(chart_id=edit["chart_id"], title=edit.get("title"),
+                                    changed_on=edit.get("changed_on"), to_set={}, to_unset=(), said=edit["said"],
+                                    digest=edit["digest"], recorded=_change_of(edit["chart_id"], edit["change"]))
+                        for edit in doc.get("edits") or []),
+            would_remove=tuple((item["chart_id"], item.get("title")) for item in doc.get("would_remove") or []),
+            would_remove_changed_on=tuple((item["chart_id"], item["changed_on"]) for item in doc.get("would_remove") or []
+                                          if isinstance(item.get("changed_on"), str)),
+            add_chart=doc.get("add_chart") is True,
+            left=tuple((item["chart_id"], item["reason"]) for item in doc.get("left") or []),
+            dropped=tuple((item["chart_id"], item["key"]) for item in doc.get("dropped") or []),
+            not_editor=tuple(EditorsOf(editors=tuple(item.get("editors") or ()), chart_id=item["chart_id"])
+                             for item in doc.get("not_editor") or []),
+            message=doc.get("message") or "", reason=doc.get("reason"))
+
+
+_SETTING_JSON = (SCALAR, [SCALAR], {"symbol": SCALAR, "symbolPosition": SCALAR})
+_CHANGE_JSON = {"set": {key: _SETTING_JSON for key in sorted(set().union(*SETTABLE.values()))},
+                "unset": [SCALAR],
+                "add_filters": [{"column": SCALAR, "op": SCALAR, "operand": (SCALAR, [SCALAR])}],
+                "remove_filters": [SCALAR]}
+# What `ChangePreview.to_json` writes, in `planner.PLAN_JSON_SHAPE`'s form: the conversation store's allow-list of a
+# kept preview. This module's tests hold the writer to it.
+PREVIEW_JSON_SHAPE: dict = {
+    "dashboard_id": SCALAR, "dashboard_changed_on": SCALAR,
+    "edits": [{"chart_id": SCALAR, "title": SCALAR, "changed_on": SCALAR, "said": SCALAR, "digest": SCALAR,
+               "change": _CHANGE_JSON}],
+    "would_remove": [{"chart_id": SCALAR, "title": SCALAR, "changed_on": SCALAR}], "add_chart": SCALAR,
+    "left": [{"chart_id": SCALAR, "reason": SCALAR}], "dropped": [{"chart_id": SCALAR, "key": SCALAR}],
+    "not_editor": [{"chart_id": SCALAR, "editors": [SCALAR]}], "message": SCALAR, "reason": SCALAR,
+}
+
+
+def _change_json(change: ChartChange) -> dict:
+    return {"set": dict(change.set), "unset": list(change.unset),
+            "add_filters": [{"column": item.get("column"), "op": item.get("op"), "operand": item.get("value")}
+                            for item in change.add_filters],
+            "remove_filters": list(change.remove_filters)}
+
+
+def _change_of(chart_id: int, doc: Mapping) -> ChartChange:
+    return ChartChange(chart_id=chart_id, set=dict(doc.get("set") or {}), unset=tuple(doc.get("unset") or ()),
+                       add_filters=tuple({"column": item.get("column"), "op": item.get("op"),
+                                          "value": item.get("operand")} for item in doc.get("add_filters") or []),
+                       remove_filters=tuple(doc.get("remove_filters") or ()))
+
+
+def _digest(planned: _Planned) -> str:
+    """What a chart's write sends, named: equal for two plans exactly when they set and unset the same."""
+    return hashlib.sha256(json.dumps({"set": planned.to_set, "unset": list(planned.to_unset)}, sort_keys=True,
+                                     separators=(",", ":"), default=str).encode()).hexdigest()
+
+
+def _recorded(change: ChartChange, planned: _Planned) -> ChartChange:
+    """`change` held to what made `planned`: the keys it sets and unsets, and its filters only when the plan writes
+    them. Planned again against the same chart, it plans the same."""
+    filters = "adhoc_filters" in planned.to_set
+    # A chart's filters are changed through `add_filters` and `remove_filters` only: an `adhoc_filters` the model put
+    # in `set` is never settable, and its plan's `adhoc_filters` comes from the filters it adds and drops.
+    return ChartChange(chart_id=change.chart_id,
+                       set={key: value for key, value in change.set.items()
+                            if key in planned.to_set and key != "adhoc_filters"},
+                       unset=tuple(key for key in change.unset if key in planned.to_unset),
+                       add_filters=tuple({"column": item.get("column"), "op": item.get("op"),
+                                          "value": item.get("value")} for item in change.add_filters)
+                       if filters else (),
+                       remove_filters=tuple(change.remove_filters) if filters else ())
+
+
+def _family_word(viz_type) -> str:
+    family = _family(viz_type) if isinstance(viz_type, str) else None
+    return family.name.lower().replace("_", " ") if family else str(viz_type)
+
+
+def _edit_said(read: ChartRead, change: ChartChange, planned: _Planned) -> str:
+    """mnemiq's words for one chart's planned change: its title, then each thing that changes."""
+    parts = []
+    for key, value in planned.to_set.items():
+        if key == "viz_type":
+            parts.append(f"{_family_word(read.viz_type)} → {_family_word(value)}")
+        elif key == "time_grain_sqla":
+            parts.append(f"time grain {value}")
+        elif key == "row_limit":
+            parts.append(f"at most {value} rows")
+        elif key in ("groupby", "groupbyRows", "groupbyColumns"):
+            parts.append(f"{'grouped' if key == 'groupby' else key} by {', '.join(map(str, value)) or 'nothing'}")
+        elif key == "order_desc":
+            parts.append("largest first" if value else "smallest first")
+        elif key == "adhoc_filters":
+            for item in change.add_filters:
+                operand = "" if item.get("value") is None else f" {item.get('value')}"
+                parts.append(f"filter {item.get('column')} {item.get('op')}{operand}")
+            for column in change.remove_filters:
+                parts.append(f"no filter on {column}")
+        else:
+            parts.append(f"{key} {value}")
+    parts += [f"{key} cleared" for key in planned.to_unset]
+    return f"{read.title or f'chart {read.chart_id}'}: {'; '.join(parts)}"
+
+
+def _dashboard_changed_on(asking: Asking) -> str | None:
+    answer = call_tool(asking.client, "get_layout", {"dashboard_id": asking.dashboard_id})
+    if answer.get("dashboard_id") != asking.dashboard_id or not isinstance(answer.get("changed_on"), str):
+        return None
+    return answer["changed_on"]
+
+
+def preview_change(asking: Asking, request: str, *, interpreter) -> ChangePreview:
+    """What `request` would do on the dashboard, as the person asking, with nothing written: the dashboard's
+    `changed_on` read first, then its charts, `interpreter`'s reading of the request against them, and each chart's
+    change planned as `SETTABLE` and `_valid` allow. A chart the request reads as removing is only proposed."""
     request = " ".join((request or "").split())[:_MAX_REQUEST]
+    stamped = _dashboard_changed_on(asking)
     summary = dashboard_summary(asking)
     placed = {chart["id"] for chart in summary["charts"]}
     columns_of = {chart["id"]: set(chart.get("columns") or []) for chart in summary["charts"]}
     read = interpreter.interpret(request, summary)
     left: list[tuple[int, str]] = []
     dropped: list[tuple[int, str]] = []
-    wanted: dict[int, tuple[ChartChange, ChartRead, _Planned]] = {}
+    wanted: dict[int, PlannedEdit] = {}
     for change in read.changes:
         if change.chart_id not in placed:
             left.append((change.chart_id, "it is not a chart of this dashboard"))
@@ -402,44 +592,161 @@ def change_dashboard(asking: Asking, request: str, *, interpreter,
         if current.form_data is None:
             left.append((change.chart_id, current.unreadable or "its settings could not be read"))
             continue
-        planned = _planned(change, current, columns_of.get(change.chart_id, set()))
+        columns = columns_of.get(change.chart_id, set())
+        planned = _planned(change, current, columns)
         dropped += [(change.chart_id, key) for key in planned.dropped]
         if planned.to_set or planned.to_unset:
-            wanted[change.chart_id] = (change, current, planned)
+            wanted[change.chart_id] = PlannedEdit(
+                chart_id=change.chart_id, title=current.title, changed_on=current.changed_on,
+                to_set=planned.to_set, to_unset=tuple(planned.to_unset), said=_edit_said(current, change, planned),
+                digest=_digest(planned), recorded=_recorded(change, planned), change=change,
+                columns=frozenset(columns))
     titles = {chart["id"]: chart.get("title") for chart in summary["charts"]}
     would_remove = tuple((chart_id, titles.get(chart_id)) for chart_id in dict.fromkeys(read.remove_chart_ids)
                          if chart_id in placed)
     left += [(chart_id, "it is not a chart of this dashboard") for chart_id in read.remove_chart_ids
              if chart_id not in placed]
     editorship = _editorship(asking, chart_ids=wanted)
-    not_editor = list(_not_editors(editorship, "chart", wanted))
+    not_editor = tuple(_not_editors(editorship, "chart", wanted))
     for entry in not_editor:
         wanted.pop(entry.chart_id, None)
-    changed = []
-    for chart_id, (change, current, planned) in wanted.items():
+    removing_read = tuple((chart_id, read_chart(asking.client, chart_id).changed_on) for chart_id, _ in would_remove)
+    preview = ChangePreview(dashboard_id=asking.dashboard_id, dashboard_changed_on=stamped,
+                            edits=tuple(wanted.values()), would_remove=would_remove, add_chart=read.add_chart,
+                            would_remove_changed_on=tuple((c, at) for c, at in removing_read if isinstance(at, str)),
+                            left=tuple(left), dropped=tuple(sorted(dropped)), not_editor=not_editor,
+                            reason=read.reason)
+    return dataclasses.replace(preview, message=_previewed(preview))
+
+
+def apply_change(asking: Asking, preview: ChangePreview, *, strict: bool, remove: Sequence[int] = ()) -> ChangeAnswer:
+    """Write `preview`'s edits, as the person asking, with no model call, then check again each changed chart that
+    shows a measure the dashboard keeps. `strict` is a confirm's: the person approved the preview whole, so nothing is
+    written unless the dashboard, every edited chart and every chart in `remove` are as the preview read them and each
+    edit plans again to its digest; a write Superset still answers stale stops the apply there, and `remove`, charts
+    the preview would remove that the person confirmed, are removed only once every edit is written. A strict apply
+    that fails after its first write raises `ChangeInterrupted`, naming what was written. Not strict is the change
+    asked by the changes route, its preview made just before: a stale write is read again, planned again and retried
+    once, and it removes nothing."""
+    if preview.dashboard_id != asking.dashboard_id:
+        raise ValueError("a preview is applied to the dashboard it was made on")
+    remove = tuple(dict.fromkeys(remove))
+    if remove and not strict:
+        raise ValueError("a removal is confirmed by a strict apply of the preview that proposed it")
+    if not set(remove) <= {chart_id for chart_id, _ in preview.would_remove}:
+        raise ValueError("only a chart the preview would remove can be confirmed for removal")
+    if not strict:
+        changed, left, not_editor = _writes(asking, preview)
+        removed = ChangeAnswer()
+    else:
+        changed, left, not_editor, removed = _strict_writes(asking, preview, remove)
+    if changed:
+        _recheck_kept(asking, changed)
+    answer = ChangeAnswer(changed=tuple(changed), left=preview.left + tuple(left) + removed.left,
+                          dropped=preview.dropped, not_editor=preview.not_editor + tuple(not_editor) + removed.not_editor,
+                          removed=removed.removed, permanent=removed.permanent, add_chart=preview.add_chart,
+                          # A confirm settles what the preview proposed: nothing is left to confirm.
+                          would_remove=() if strict else preview.would_remove)
+    return dataclasses.replace(answer, message=_said(answer, preview.reason))
+
+
+def _writes(asking: Asking, preview: ChangePreview) -> tuple[list, list, list]:
+    changed, left, not_editor = [], [], []
+    for edit in preview.edits:
+        if edit.change is None or edit.columns is None:
+            raise ValueError("a change applied on its own preview's reading needs the preview that read it")
+        changed_on, planned = edit.changed_on, _Planned(dict(edit.to_set), list(edit.to_unset), [])
         for attempt in range(2):
-            answer = _send(asking, chart_id, current, planned)
+            answer = _send(asking, edit.chart_id, changed_on, planned)
             if answer.get("ok") is True:
-                changed.append(chart_id)
+                changed.append(edit.chart_id)
                 break
             if answer.get("not_editor"):
                 not_editor.append(EditorsOf(editors=tuple(str(e) for e in answer.get("editors") or []),
-                                            chart_id=chart_id))
+                                            chart_id=edit.chart_id))
                 break
             if not answer.get("stale") or attempt:
-                left.append((chart_id, "it kept changing while it was changed" if answer.get("stale")
+                left.append((edit.chart_id, "it kept changing while it was changed" if answer.get("stale")
                              else "Superset did not take the change"))
                 break
-            current = read_chart(asking.client, chart_id)
+            current = read_chart(asking.client, edit.chart_id)
             if current.form_data is None:
-                left.append((chart_id, current.unreadable or "its settings could not be read"))
+                left.append((edit.chart_id, current.unreadable or "its settings could not be read"))
                 break
-            planned = _planned(change, current, columns_of.get(chart_id, set()))
-    if changed:
-        _recheck_kept(asking, changed)
-    answer = ChangeAnswer(changed=tuple(changed), left=tuple(left), dropped=tuple(sorted(dropped)),
-                          not_editor=tuple(not_editor), add_chart=read.add_chart, would_remove=would_remove)
-    return dataclasses.replace(answer, message=_said(answer, read.reason))
+            changed_on, planned = current.changed_on, _planned(edit.change, current, set(edit.columns))
+    return changed, left, not_editor
+
+
+def _strict_writes(asking: Asking, preview: ChangePreview,
+                   remove: tuple[int, ...]) -> tuple[list, list, list, ChangeAnswer]:
+    stale = [(edit.chart_id, STALE_SINCE_PREVIEW) for edit in preview.edits]
+    stale += [(chart_id, STALE_SINCE_PREVIEW) for chart_id in remove]
+    nothing = ChangeAnswer()
+    if not preview.edits and not remove:
+        return [], [], [], nothing
+    if preview.dashboard_changed_on is None or _dashboard_changed_on(asking) != preview.dashboard_changed_on:
+        return [], stale, [], nothing
+    built_on = datasets_built_on(asking.store.measures_for(asking.tenant, asking.dashboard_id))
+    facts: dict = {}
+    sends = []
+    for edit in preview.edits:
+        current = read_chart(asking.client, edit.chart_id)
+        if current.form_data is None or current.changed_on is None or current.changed_on != edit.changed_on:
+            return [], stale, [], nothing
+        columns = set(_table_columns(asking, _facts_of(asking, current, built_on, facts)))
+        planned = _planned(edit.recorded, current, columns)
+        if _digest(planned) != edit.digest:
+            return [], stale, [], nothing
+        sends.append((edit, planned))
+    read_at = dict(preview.would_remove_changed_on)
+    for chart_id in remove:
+        current = read_chart(asking.client, chart_id)
+        if read_at.get(chart_id) is None or current.changed_on != read_at[chart_id]:
+            return [], stale, [], nothing
+    # Read again just before the first write: a layout changed while the charts were read stops the apply too. What
+    # is left open is the writes themselves, each of which `patch_chart` holds to its own chart's `changed_on`.
+    if _dashboard_changed_on(asking) != preview.dashboard_changed_on:
+        return [], stale, [], nothing
+    changed, left, not_editor = [], [], []
+    for index, (edit, planned) in enumerate(sends):
+        try:
+            answer = _send(asking, edit.chart_id, edit.changed_on, planned)
+        except Exception as exc:
+            unknown = [(later.chart_id, NOT_ANSWERED) for later, _ in sends[index:]]
+            raise ChangeInterrupted(ChangeAnswer(changed=tuple(changed), left=tuple(left + unknown), not_editor=tuple(
+                not_editor))) from exc
+        if answer.get("ok") is True:
+            changed.append(edit.chart_id)
+        elif answer.get("not_editor"):
+            not_editor.append(EditorsOf(editors=tuple(str(e) for e in answer.get("editors") or []),
+                                        chart_id=edit.chart_id))
+        elif answer.get("stale"):
+            # Superset writes one chart at a time: what was written stays, and nothing more is.
+            left += [(later.chart_id, STALE_SINCE_PREVIEW) for later, _ in sends[index:]]
+            left += [(chart_id, STALE_SINCE_PREVIEW) for chart_id in remove]
+            return changed, left, not_editor, nothing
+        else:
+            left.append((edit.chart_id, "Superset did not take the change"))
+    if not remove:
+        return changed, left, not_editor, nothing
+    try:
+        removed = _confirmed(asking, remove)
+    except Exception as exc:
+        raise ChangeInterrupted(ChangeAnswer(changed=tuple(changed), left=tuple(
+            left + [(chart_id, NOT_ANSWERED) for chart_id in remove]), not_editor=tuple(not_editor))) from exc
+    return changed, left, not_editor, removed
+
+
+def change_dashboard(asking: Asking, request: str, *, interpreter,
+                     confirmed_removal: Sequence[int] = ()) -> ChangeAnswer:
+    """Make `request` on the dashboard, as the person asking: read the dashboard's charts, have `interpreter` read the
+    request against them, and write only what it names, as `SETTABLE` and `_valid` allow (`preview_change`, then
+    `apply_change` not strict). A chart the request reads as removing is only proposed (`would_remove`);
+    `confirmed_removal` names the charts the person confirmed, which are removed and nothing else is done (the model
+    is not asked)."""
+    if confirmed_removal:
+        return _confirmed(asking, tuple(dict.fromkeys(confirmed_removal)))
+    return apply_change(asking, preview_change(asking, request, interpreter=interpreter), strict=False)
 
 
 def _confirmed(asking: Asking, removing: tuple[int, ...]) -> ChangeAnswer:
@@ -493,6 +800,17 @@ def _recheck_kept(asking: Asking, changed: list[int]) -> None:
         if mine:
             statuses = _recheck(asking, mine, row.measure.dataset_id)
             _put(asking, row, check_status={**row.check_status, **statuses})
+
+
+def _previewed(preview: ChangePreview) -> str:
+    """mnemiq's words for a preview: each edit it would make, then what else the request reads as, leaves or drops."""
+    nothing = "Nothing on the dashboard was changed."
+    rest = _said(ChangeAnswer(left=preview.left, dropped=preview.dropped, not_editor=preview.not_editor,
+                              add_chart=preview.add_chart, would_remove=preview.would_remove), None)
+    if preview.edits:
+        head = "To change: " + "; ".join(edit.said for edit in preview.edits) + "."
+        return head if rest == nothing else f"{head} {rest}"
+    return preview.reason or "Nothing on the dashboard would change." if rest == nothing else rest
 
 
 def _said(answer: ChangeAnswer, reason: str | None) -> str:
