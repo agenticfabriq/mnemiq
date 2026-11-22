@@ -180,3 +180,19 @@ def test_a_traced_run_shows_neither_identity_nor_pattern(repo: Path) -> None:
                          capture_output=True, text=True)
     assert out.returncode == 1
     assert BLOCKED not in out.stdout + out.stderr and "Private Persona" not in out.stdout + out.stderr
+
+
+def test_a_failed_identity_read_is_an_error_not_a_clean_pass(repo: Path, tmp_path: Path) -> None:
+    # Codex's second review of #290: the range validated, then the identity `git log` failed inside the process
+    # substitution, and the loop read no commits and reported clean. Every commit in the range must be read.
+    (repo / "a.txt").write_text("clean again\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-qm", "y")
+    real = shutil.which("git")
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "git").write_text(f'#!/bin/bash\nfor a in "$@"; do [ "$a" = "-z" ] && exit 128; done\nexec "{real}" "$@"\n')
+    (shim / "git").chmod(0o755)
+    env = _env(PATH=f"{shim}:{os.environ['PATH']}")
+    out = _guard(repo, "--range", "HEAD~1..HEAD", env=env)
+    assert out.returncode == 2 and "0 of 1" in out.stderr, out.stdout + out.stderr

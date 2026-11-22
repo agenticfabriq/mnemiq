@@ -342,14 +342,16 @@ if [ "$CHECK_IDENTITY" -eq 1 ] && [ "$MODE" = "--staged" ]; then
   done
 fi
 if [ "$CHECK_IDENTITY" -eq 1 ] && [ "$MODE" = "--range" ]; then
-  if ! git rev-list --count "$RANGE" >/dev/null 2>&1; then
+  if ! expected="$(git rev-list --count "$RANGE" 2>/dev/null)"; then
     echo "repo-guard: BLOCKED [instrument]: git could not read the range '$RANGE' for identities." >&2
     exit 2
   fi
+  seen=0
   # Each field NUL-terminated and read without a command substitution, which would drop the NULs: a name may hold a
   # tab, and tab-split fields shifted so an exact pattern matched neither (Codex's review of #290).
   while IFS= read -r -d '' sha && IFS= read -r -d '' author && IFS= read -r -d '' committer; do
     sha="${sha#$'\n'}"
+    seen=$((seen + 1))
     for field in author committer; do
       if [ "$field" = author ]; then value="$author"; else value="$committer"; fi
       identity_match "$value"
@@ -359,6 +361,11 @@ if [ "$CHECK_IDENTITY" -eq 1 ] && [ "$MODE" = "--range" ]; then
       esac
     done
   done < <(git log -z --format='%H%x00%an <%ae>%x00%cn <%ce>' "$RANGE" 2>/dev/null)
+  # A git log that failed inside the process substitution reads as no commits; every commit in the range must be read.
+  if [ "$seen" -ne "$expected" ]; then
+    echo "repo-guard: BLOCKED [instrument]: read the identities of $seen of $expected commit(s) in '$RANGE'." >&2
+    exit 2
+  fi
 fi
 
 if [ "$fail" -ne 0 ]; then
