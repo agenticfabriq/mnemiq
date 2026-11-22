@@ -2212,12 +2212,187 @@ def test_a_ranked_cut_on_a_dataset_this_build_made_is_ranked_too(fake):
     assert check.status is ChartStatus.MISMATCH and check.reason == NULL_KEPT.format(n=2, order="largest")
 
 
-def test_a_read_at_its_cap_is_never_ranked(fake):
-    """A pin, not a new behaviour: mnemiq's own read stopped at its cap, so its groups are not all there to rank, and
-    the cap's reason stands before any ranking is read."""
-    rows = [(f"g{i:04}", float(i)) for i in range(1000)]
-    check = _cut(fake, [("g0999", 999.0), ("g0998", 998.0)], rows, row_limit=2)
-    assert check.status is ChartStatus.NOT_CHECKED and "returns in one read" in check.reason
+# ---------------------------------------------------------------- a ranked cut over more groups than one read holds
+
+# More groups than mnemiq's one read holds (`MAX_ROWS`, 1,000), each with its own value: the demo's top-50 customers
+# chart ranked 2,621 customers this way.
+MANY = [(f"g{i:04}", float(i)) for i in range(2621)]
+CAPPED = "returns in one read"
+UNSETTLED = "read in the chart's ranking order do not settle where its row limit cuts"
+BEYOND_THE_CUT = ("the chart shows {shown} groups, more than its row limit ({n}) keeps, so they are not the cut its "
+                  "settings describe, and were not compared as one")
+
+
+def _database(rows):
+    """`execute_sql` answered by DuckDB from a `policy` table holding one web policy per `(region, premium)` in `rows`:
+    the check's statement runs as sent, the deciders' row cap included, so its order and the cap meet as they do in the
+    database, where a fake that ignores the statement would agree with any order."""
+    import duckdb
+    import pyarrow as pa
+
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA public")
+    con.execute("SET search_path = 'public'")
+    source = pa.table({"region": [r for r, _ in rows], "premium": pa.array([v for _, v in rows], pa.float64())})
+    con.register("source", source)
+    con.execute("CREATE TABLE public.policy AS SELECT TIMESTAMP '2026-01-01' AS order_date, region, 'web' AS channel, "
+                "premium FROM source")
+
+    def run(sql: str) -> dict:
+        cursor = con.execute(sql)
+        names = [d[0] for d in cursor.description]
+        return _result(*cursor.fetchall(),
+                       columns=tuple((name, "object" if name == "region" else "float64") for name in names))
+
+    return run
+
+
+def _ranked_cut(fake, chart_rows, rows, **form):
+    _serve(fake, form_data=_bar(**form), chart=_chart_data(["region", "Total premium"], *chart_rows),
+           mnemiq=_database(rows))
+    return _check(fake)
+
+
+def test_a_ranked_cut_over_more_groups_than_one_read_holds_is_checked(fake):
+    """mnemiq's own read is ordered by the chart's ranking and asks first for twice its cut, which settles it: one short
+    statement, far below Superset's MCP response size, where a read of one cap's groups often is not."""
+    check = _ranked_cut(fake, [("g2620", 2620.0), ("g2619", 2619.0)], MANY, row_limit=2)
+    assert check.status is ChartStatus.CHECKED and check.reason == RANKED.format(n=2, order="largest")
+    [statement] = _statements(fake)
+    assert re.search(r'ORDER BY "?m0"? DESC NULLS LAST LIMIT 4$', statement), statement
+
+
+def test_a_ranked_cut_with_the_builders_having_over_more_groups_than_one_read_holds_is_checked(fake):
+    """The builder's top-N shape: the HAVING leaves out groups with no value for the measure the chart ranks by."""
+    check = _ranked_cut(fake, [("g2620", 2620.0), ("g2619", 2619.0)], MANY, row_limit=2,
+                        adhoc_filters=[copy.deepcopy(WEB_ONLY), LEFT_OUT])
+    assert check.status is ChartStatus.CHECKED and check.reason == RANKED.format(n=2, order="largest")
+
+
+def test_an_ascending_ranked_cut_over_more_groups_than_one_read_holds_is_checked(fake):
+    check = _ranked_cut(fake, [("g0000", 0.0), ("g0001", 1.0)], MANY, row_limit=2, order_desc=False)
+    assert check.status is ChartStatus.CHECKED and check.reason == RANKED.format(n=2, order="smallest")
+
+
+@pytest.mark.parametrize("kept", [("g2617", 2617.0), ("g0005", 5.0)], ids=["inside-the-read", "past-the-read"])
+def test_a_ranked_cut_over_more_groups_than_one_read_holds_that_keeps_others_is_a_mismatch(fake, kept):
+    check = _ranked_cut(fake, [("g2620", 2620.0), kept], MANY, row_limit=2)
+    assert check.status is ChartStatus.MISMATCH and check.reason == NOT_FIRST.format(n=2, order="largest")
+
+
+def test_a_chart_showing_more_groups_than_its_cut_beside_a_short_read_of_as_many_is_a_mismatch(fake):
+    """Superset answers four groups for a row limit of 2 (a saved query context can carry another limit): the short read
+    holds the same four, so the two sides have as many groups, and the cut is still read, which leaves two out."""
+    top_four = [(f"g{i}", float(i)) for i in range(2620, 2616, -1)]
+    check = _ranked_cut(fake, top_four, MANY, row_limit=2)
+    assert check.status is ChartStatus.MISMATCH and check.reason == NOT_FIRST.format(n=2, order="largest")
+
+
+def test_a_chart_showing_tied_groups_beyond_its_cut_is_not_checked(fake):
+    """Three groups for a row limit of 2, the last two tied at the cut: ties stand in for each other but do not add to
+    the cut, so the chart's rows are not the cut its settings describe, and no ranking is claimed for them."""
+    rows = [("top", 9.0), ("a", 1.0), ("b", 1.0)] + [(f"l{i:04}", -float(i)) for i in range(2000)]
+    check = _ranked_cut(fake, [("top", 9.0), ("a", 1.0), ("b", 1.0)], rows, row_limit=2)
+    assert check.status is ChartStatus.NOT_CHECKED and check.reason == BEYOND_THE_CUT.format(shown=3, n=2)
+
+
+def test_groups_tied_at_the_cut_past_the_first_read_are_read_on_to_the_cap(fake):
+    """The first read's groups all tie at the cut, so it reads on in the same order to one read's cap, where a group past
+    the ties settles it."""
+    rows = [("top", 9.0)] + [(f"t{i:02}", 1.0) for i in range(10)] + [(f"h{i:04}", 0.5) for i in range(2000)]
+    check = _ranked_cut(fake, [("top", 9.0), ("t07", 1.0)], rows, row_limit=2)
+    assert check.status is ChartStatus.CHECKED and check.reason == RANKED.format(n=2, order="largest")
+    first, then = _statements(fake)
+    assert first.endswith("NULLS LAST LIMIT 4") and then.endswith("NULLS LAST LIMIT 1000"), (first, then)
+
+
+def test_groups_tied_at_the_cut_past_what_one_read_holds_are_not_checked(fake):
+    """The groups tied with the last one kept go on past one read's cap, so the chart may hold one mnemiq never read."""
+    rows = [("top", 9.0)] + [(f"t{i:04}", 1.0) for i in range(1500)]
+    check = _ranked_cut(fake, [("top", 9.0), ("t1499", 1.0)], rows, row_limit=2)
+    assert check.status is ChartStatus.NOT_CHECKED and UNSETTLED in check.reason, check.reason
+
+
+def test_groups_tied_at_the_cut_within_float_noise_are_read_on_and_stand_in_for_each_other(fake):
+    """A tie as `_ranking_problem` counts one (`_same`): the first read's last group differs from the cut's value by float
+    noise alone, so it does not settle the cut. Read on, every group is there, and a group a little smaller again
+    stands in for the chart's last one."""
+    rows = [("top", 9.0)] + [(f"a{i}", 0.30000000000000004) for i in range(2)] \
+        + [(f"b{i:03}", 0.3) for i in range(600)] + [(f"c{i:03}", 0.29999999999999993) for i in range(100)]
+    check = _ranked_cut(fake, [("top", 9.0), ("c000", 0.29999999999999993)], rows, row_limit=2)
+    assert check.status is ChartStatus.CHECKED, check.reason
+    assert len(_statements(fake)) == 2
+
+
+def test_a_having_that_leaves_fewer_groups_than_the_cut_past_a_full_read_is_checked(fake):
+    """Groups with no value sort last, so a read that reached them holds every group with one: what the HAVING keeps is
+    all there, though the read stopped at its cap."""
+    rows = [(f"v{i:02}", float(i)) for i in range(30)] + [(f"n{i:04}", None) for i in range(2000)]
+    shown = sorted(((r, v) for r, v in rows if v is not None), key=lambda row: -row[1])
+    check = _ranked_cut(fake, shown, rows, row_limit=50, adhoc_filters=[copy.deepcopy(WEB_ONLY), LEFT_OUT])
+    assert check.status is ChartStatus.CHECKED, check.reason
+    # The first read already holds every group the HAVING keeps: a read on, up to one read's cap, would be a statement
+    # whose answer can pass Superset's MCP response size, for nothing.
+    assert len(_statements(fake)) == 1, _statements(fake)
+
+
+def test_a_having_on_another_measure_that_leaves_fewer_groups_than_the_cut_in_a_full_read_is_not_checked(fake):
+    """The HAVING leaves out groups by a measure the read was not ordered by, so the groups it keeps past the read are
+    not known to be none: fewer than the cut are left of the read, and the cut is not read."""
+    large = PREMIUM | {"label": "Large premium", "sqlExpression": "SUM(CASE WHEN premium > 2600 THEN premium END)"}
+    shown = [(f"g{i:04}", float(i), float(i)) for i in range(2620, 2600, -1)]
+    _serve(fake, form_data=_bar(metrics=[copy.deepcopy(PREMIUM), large], row_limit=50,
+                                adhoc_filters=[copy.deepcopy(WEB_ONLY), _having(not_null_condition(
+                                    "SUM(CASE WHEN premium > 2600 THEN premium END)"))]),
+           chart=_chart_data(["region", "Total premium", "Large premium"], *shown), mnemiq=_database(MANY))
+    check = _check(fake)
+    assert check.status is ChartStatus.NOT_CHECKED and UNSETTLED in check.reason, check.reason
+
+
+def test_an_unranked_cut_over_more_groups_than_one_read_holds_is_not_checked(fake):
+    """A bar sorted by a column: mnemiq reads no ranking for it, so its read is in no order and the cap's reason stands."""
+    check = _ranked_cut(fake, [("g0000", 0.0), ("g0001", 1.0)], MANY, row_limit=2,
+                        order_by_cols=['["region", true]'])
+    assert check.status is ChartStatus.NOT_CHECKED and CAPPED in check.reason
+    assert "ORDER BY" not in _statements(fake)[0]
+
+
+def _saved_cut(fake, chart_rows, rows, *, nulls_first: bool):
+    """A chart of a saved metric over a virtual dataset, checked through `query_dataset`, answered as rc2 builds its
+    query: `order_by` and `order_desc` sort the rows before its `row_limit`, NULLs placed as the engine places them."""
+    def answer(request, authorization):
+        found = list(rows)
+        if request.get("order_by") == [M_SAVED]:
+            valued = sorted((row for row in found if row[1] is not None), key=lambda row: row[1],
+                            reverse=bool(request.get("order_desc")))
+            empty = [row for row in found if row[1] is None]
+            found = empty + valued if nulls_first else valued + empty
+        found = found[:request["row_limit"]]
+        return {"dataset_id": DATASET_ID, "dataset_name": "policy", "columns": [{"name": "region"}, {"name": M_SAVED}],
+                "data": [{"region": r, M_SAVED: v} for r, v in found], "row_count": len(found),
+                "total_rows": len(found)}
+
+    _serve(fake, form_data=_bar(metrics=[M_SAVED], row_limit=2), chart=_chart_data(["region", M_SAVED], *chart_rows),
+           dataset=_dataset(virtual=True, metrics=[(M_SAVED, "SUM(premium)")]))
+    fake.reply("query_dataset", answer)
+    record = SavedMetric(dataset_id=DATASET_ID, name=M_SAVED, expression="SUM(premium)", verbose_name=None,
+                         d3format=None, currency=None, certified_by=None, warning_text=None)
+    return _check(fake, kinds={M_SAVED: MeasureKind.CURRENCY}, saved={M_SAVED: record})
+
+
+def test_a_ranked_cut_through_query_dataset_over_more_groups_than_one_read_holds_is_checked(fake):
+    check = _saved_cut(fake, [("g2620", 2620.0), ("g2619", 2619.0)], MANY, nulls_first=True)
+    assert check.status is ChartStatus.CHECKED, check.reason
+    [query] = [call.request for call in fake.calls if call.tool == "query_dataset"]
+    assert (query["order_by"], query["order_desc"], query["row_limit"]) == ([M_SAVED], True, 4)
+
+
+def test_a_capped_query_dataset_read_holding_a_group_with_no_value_is_not_checked(fake):
+    """`query_dataset` takes no null order and the engine picks one: a capped read that holds a group with no value may
+    have spent its rows on such groups, so where its cut falls is not read."""
+    rows = [(f"n{i:02}", None) for i in range(10)] + MANY
+    check = _saved_cut(fake, [("g2620", 2620.0), ("g2619", 2619.0)], rows, nulls_first=True)
+    assert check.status is ChartStatus.NOT_CHECKED and "places groups with no value" in check.reason, check.reason
 
 
 

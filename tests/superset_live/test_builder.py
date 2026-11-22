@@ -44,6 +44,7 @@ from mnemiq.superset.build_store import BUILD_TABLE, MEASURE_TABLE
 from mnemiq.superset.builder import start_build
 from mnemiq.superset.chart_form import _NOT_CHECKED_TYPES
 from mnemiq.sql.fanout_check import guard_on, key_facts
+from mnemiq.sql.guard import MAX_ROWS
 from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenRef, generate_chart_request
 from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetRefusedCaller, SupersetUnavailable
 from mnemiq.superset.executor import superset_executor
@@ -307,6 +308,17 @@ def sales_table(live) -> Iterator[ModuleTable]:
         yield table
 
 
+@pytest.fixture(scope="module")
+def accounts_table(live) -> Iterator[ModuleTable]:
+    """`live_accounts_<random>`: 2,500 accounts, each with an amount of its own, more groups than mnemiq's value check
+    reads in one statement (`MAX_ROWS`). Made before the module enriches, so its snapshot holds it, and no Superset
+    dataset exists for it; removed once the module is done (`module_table`)."""
+    with module_table(live, "live_accounts", "account text PRIMARY KEY, amount numeric(10, 2) NOT NULL",
+                      "(account, amount) SELECT 'a' || lpad(g::text, 4, '0'), g * 1.25 "
+                      "FROM generate_series(1, 2500) AS g") as table:
+        yield table
+
+
 # Each of the seed's three regions with its manager and a status of its own: `status` is a column `policy` has too, so
 # on a join of the two the joined dataset names policy's `policy_status`. Only west's is 'active', so a metric that read
 # the region's status where it means the policy's would add up all of west's premium instead.
@@ -325,7 +337,7 @@ def region_table(live) -> Iterator[ModuleTable]:
 
 
 @pytest.fixture(scope="module")
-def enriched(live, model, tmp_path_factory, sales_table, region_table):
+def enriched(live, model, tmp_path_factory, sales_table, region_table, accounts_table):
     """The suite's `enriched` (`conftest.py`), with the module's own tables made first, so the snapshot holds them: the
     store every test here answers from, enriched through Superset as the service user and built."""
     settings = superset_settings(live, model, tmp_path_factory.mktemp("superset-store") / "store.duckdb")
@@ -1057,6 +1069,40 @@ def test_a_bar_whose_row_limit_cuts_groups_is_checked_as_a_ranking(live, served,
     assert len(bars) == 10 and all(row.get("Cancelled premium") is not None for row in bars), len(bars)
     assert_no_model_call(run)
     observe(name, chart_id=chart_id, check=run.final["checks"], bars=len(bars))
+
+
+def test_a_ranked_bar_over_more_groups_than_one_read_holds_is_checked(live, served, model, accounts_table):
+    """The ten largest of 2,500 accounts: a bar by account of `SUM(amount)`, row limit 10, on a dataset the build makes
+    on the module's table. The premise, measured first: more accounts than mnemiq's value check reads in one statement.
+    mnemiq's own statement is ordered by the chart's ranking, so the groups its one read holds decide the cut.
+    Expected: the build runs to `done`; the chart's check is `checked`; the bars, read as the builder, are the source's
+    ten largest accounts; no model client is made or called."""
+    name = accounts_table.name
+    [(accounts,)] = ground_truth(live, f'SELECT count(DISTINCT account) FROM public."{name}"')
+    assert accounts > MAX_ROWS, accounts
+    amount = Measure(name="account_amount", label="Account amount", expression="SUM(amount)",
+                     kind=MeasureKind.CURRENCY, dataset_id=-1, description="Amount by account", asked_by="")
+    bar = ChartSpec(key="largest_accounts", family=Family.BAR, title="Largest accounts", dataset_id=-1,
+                    measures=(WrittenRef(amount),), dimensions=("account",), time_column=None, time_grain=None,
+                    filters=(), row_limit=10, source=None, target=None)
+    plan = BuildPlan(charts=(bar,), measures=(amount,),
+                     datasets=(PlannedDataset(key="dataset_1", placeholder=-1, table=name),))
+    run = run_build(live, served, model, plan, "ranked past one read", goal="the largest accounts")
+    record("ranked past one read", summary(run, served, plan) if run.build_id else {"stopped": run.stopped})
+    raw = {step["key"]: step for step in served.raw_steps(run.build_id)} if run.build_id else {}
+    # What the build made, for the table's teardown, before anything is asserted.
+    accounts_table.dashboard_id = run.final.get("dashboard_id")
+    accounts_table.dataset_id = (raw.get("dataset_1") or {}).get("object_id")
+    accounts_table.chart_ids = [made for made in [(raw.get(bar.key) or {}).get("object_id")] if made is not None]
+    assert_ran_to_the_end(run)
+    chart_id = raw[bar.key]["object_id"]
+    assert run.final["checks"].get(str(chart_id)) == "checked", (run.final["checks"], run.last_step.get("message"))
+    builder = SupersetMcp(live.mcp_url, DelegatedToken(live.minted(BUILDER, "build")), timeout_s=90)
+    bars = builder.call("get_chart_data", {"identifier": chart_id}).get("data") or []
+    truth = ground_truth(live, f'SELECT account FROM public."{name}" ORDER BY amount DESC LIMIT 10')
+    assert sorted(row.get("account") for row in bars) == sorted(account for (account,) in truth), bars
+    assert_no_model_call(run)
+    observe("ranked past one read", chart_id=chart_id, check=run.final["checks"], bars=len(bars))
 
 
 RANKED_FAMILIES = (Family.BAR, Family.LINE, Family.AREA, Family.SCATTER, Family.TABLE, Family.PIE, Family.GAUGE,
