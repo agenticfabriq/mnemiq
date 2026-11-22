@@ -536,18 +536,18 @@ class Runtime:
         pii_level and their harvested coded values. The card is re-rendered per identity now; the
         stored one stays identity-independent because it is what gets embedded and indexed.
         """
+        if self.snapshot is None:
+            # Nothing to scope a card against, so no card is served: the stored one is unscoped (M274).
+            return []
         rows = self.con.execute("SELECT object_id, card FROM semantic_object").fetchall()
         allowed = grants.objects
-        visible = [(oid, card) for oid, card in rows if oid in allowed]
-        if self.snapshot is None:
-            return [{"object_id": oid, "card": card} for oid, card in visible]
         scoped = {
             card.object_id: card.text
             for card in build_cards(self.snapshot, policy=build_access_policy(self.snapshot, grants))
         }
-        return [
-            {"object_id": oid, "card": scoped.get(oid, card)} for oid, card in visible
-        ]
+        # Only the scoped re-render: an indexed table the current snapshot no longer holds is left out, never served
+        # as its stored, whole-snapshot card (M274).
+        return [{"object_id": oid, "card": scoped[oid]} for oid, _ in rows if oid in allowed and oid in scoped]
 
     def write(self, sql: str, identity: IdentityContext) -> WriteResult:
         """Governed write: the caller supplies SQL; the decider screens it, then it executes

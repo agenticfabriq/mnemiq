@@ -199,6 +199,8 @@ def _retrieve_examples(con, embedding, allowed: set[str], k: int = 5, *,
     few-shot, not per-table. Never surfaces an example touching a table outside the grants, nor
     one reading a column the identity does not read raw (`not_raw`, M144): its SQL would show the
     model that column's name and use, which the card withheld."""
+    if not allowed:
+        return []  # no eligible table: an empty answer, not a query `IN ()` would fail
     placeholders = ", ".join("?" for _ in allowed)
     # Never built -- checked explicitly, by name, schema AND catalog (matching
     # DefinitionIndex.nearest's identical check; a same-named table in a different attached
@@ -468,14 +470,18 @@ def retrieve(
                 snapshot, policy=build_access_policy(snapshot, grants), style=card_style,
                 dialect=dialect)
         }
+    # With a snapshot, only the scoped re-render is ever served (M274). The stored card is enrich time's whole-snapshot
+    # text, denied columns and their values included, and the index can hold a table the current snapshot no longer does
+    # (between a re-enrich that drops or renames it and the next build): that card is left out, never served stored.
+    # Without a snapshot (scripts and eval that pass none) the stored card is what there is.
     packet.cards = [
         RetrievedCard(
             object_id=object_id,
-            card=scoped.get(object_id, cards[object_id][0]),
+            card=scoped[object_id] if snapshot is not None else cards[object_id][0],
             score=score,
         )
         for object_id, score in top
-        if object_id in cards
+        if object_id in cards and (snapshot is None or object_id in scoped)
     ]
     packet.enrichment_version = next(iter(cards.values()))[1] if cards else None
     _attach_facts(packet.cards, table_facts, card_style, grants=grants, columns=columns,
@@ -489,8 +495,11 @@ def retrieve(
     packet.metrics = select_metrics(table_ids, metrics, grants, columns=columns)
     packet.dimensions = select_dimensions(table_ids, dimensions, grants, columns=columns)
     not_raw = frozenset((c.object_id, c.name) for c in columns if not read_raw(c, grants))
-    packet.examples = _retrieve_examples(con, embedding, set(grants.objects), k=k,
-                                         not_raw=not_raw)
+    # With a snapshot, an example qualifies only on granted tables the snapshot holds (M274): an example on a table it no
+    # longer holds would pass the column check, which has no columns of that table to deny, and show its SQL. Every
+    # table the example reads is checked against this set, its own included.
+    eligible = set(grants.objects) & set(scoped) if snapshot is not None else set(grants.objects)
+    packet.examples = _retrieve_examples(con, embedding, eligible, k=k, not_raw=not_raw)
     if ontology_index is not None and packet.cards:
         packet.concepts = _resolve_concepts(
             question, columns, {c.object_id for c in packet.cards}, ontology_index, grants
