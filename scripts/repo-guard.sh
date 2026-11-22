@@ -44,8 +44,8 @@ list_files() {
   # fault (the review gate on the fix, twice: `core.quotePath=false` covers the last case alone).
   if [ "$MODE" = "--all" ]; then
     git ls-files -z
-  elif [ "$MODE" = "--range" ]; then
-    :   # --range does not scan paths; see scan_range
+  elif [ "$MODE" = "--range" ] || [ "$MODE" = "--identities" ]; then
+    :   # neither scans paths: --range reads its commits (scan_range), --identities reads identities from stdin
   else
     # R and T too: a renamed file's staged content is scanned like any other's (without R, `git mv
     # b c` plus a blocked line appended to c showed as R096 and passed, where the same edit
@@ -137,7 +137,9 @@ CHECK_NAMES=1
 # CI, whose log is public on a public repo, and enforcing the list there would LEAK it -- a
 # flagged word in a public log tells every reader that word is on the blocklist. A fork's pull
 # request could not receive the secret that carries it anyway.
-if [ "$MODE" = "--all" ] || [ "$MODE" = "--range" ]; then
+if [ "$MODE" = "--identities" ]; then
+  CHECK_NAMES=0   # it reads identities, never content
+elif [ "$MODE" = "--all" ] || [ "$MODE" = "--range" ]; then
   CHECK_NAMES=0
   echo "repo-guard: proprietary-name check SKIPPED -- it runs locally only, by design."
   echo "  Secret shapes and home paths are checked below; neither needs configuration."
@@ -375,7 +377,40 @@ if [ "$CHECK_IDENTITY" -eq 1 ] && [ "$MODE" = "--range" ]; then
   fi
   echo "repo-guard: identity: $seen commit(s) checked."
 fi
+# `--identities`: a pull request's commit identities on stdin, as NUL-terminated triples (sha, author, committer), each
+# triple optionally followed by a newline. identity-guard.yml runs it under pull_request_target, so a fork's pull request
+# is checked too: that job runs this repository's code with the secret and reads the identities from GitHub's API, never
+# the fork's code. REPO_GUARD_IDENTITY_EXPECTED is the pull request's own commit count; fewer identities read fails.
+if [ "$MODE" = "--identities" ] && [ "$CHECK_IDENTITY" -eq 1 ]; then
+  seen=0
+  while IFS= read -r -d '' sha && IFS= read -r -d '' author && IFS= read -r -d '' committer; do
+    sha="${sha#$'\n'}"
+    seen=$((seen + 1))
+    for field in author committer; do
+      if [ "$field" = author ]; then value="$author"; else value="$committer"; fi
+      identity_match "$value"
+      case $? in
+        0) echo "BLOCKED [identity]: commit ${sha:0:8}'s $field is on the private identity list"; fail=1 ;;
+        2) identity_pattern_invalid ;;
+      esac
+    done
+  done
+  expected="${REPO_GUARD_IDENTITY_EXPECTED:-}"
+  if [ -n "$expected" ] && [ "$seen" -ne "$expected" ]; then
+    echo "repo-guard: BLOCKED [instrument]: read the identities of $seen of $expected commit(s) the pull request has." >&2
+    exit 2
+  fi
+  echo "repo-guard: identity: $seen commit(s) checked."
+fi
 
+if [ "$MODE" = "--identities" ]; then
+  if [ "$fail" -ne 0 ]; then
+    echo "repo-guard: blocked: a commit's author or committer is on the private identity list."
+    exit 1
+  fi
+  echo "repo-guard: identity clean."
+  exit 0
+fi
 if [ "$fail" -ne 0 ]; then
   echo
   echo "repo-guard: commit blocked. Remove the offending content (or route secrets/URLs through"

@@ -49,7 +49,9 @@ machine for names on a private blocklist.
 - It also checks who each commit says made it: the author and committer against a private identity
   list, `REPO_GUARD_IDENTITY_PATTERNS`, read like the name list (`off` for a contributor; unset blocks
   a commit). Before a commit it reads the identity the commit will carry; with `--range`, and in CI from
-  a repository secret, it reads each commit's, printing only the commit and the field on a hit.
+  a repository secret, it reads each commit's, printing only the commit and the field on a hit. A fork's
+  pull request receives no secret in its own runs, so `identity-guard.yml` (`pull_request_target`)
+  checks every pull request's commit identities from GitHub's API, never running the fork's code.
 - **Commit only from the main checkout or one of its worktrees.** A fresh clone has no
   repository-local identity and commits as the machine's global one, which content checks cannot
   see: that is how a maintainer's private identity once reached `main`, which then had to be

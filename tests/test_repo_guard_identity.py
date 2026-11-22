@@ -244,3 +244,55 @@ def test_a_list_required_but_missing_fails_instead_of_skipping(repo: Path) -> No
     out = _guard(repo, "--range", "HEAD~1..HEAD",
                  env=_env(REPO_GUARD_IDENTITY_PATTERNS=None, REPO_GUARD_IDENTITY_REQUIRED="1"))
     assert out.returncode == 1 and "REPO_GUARD_IDENTITY_PATTERNS is not set" in out.stdout
+
+
+# -- --identities: a fork's pull request, checked from its commit metadata alone ----------------------------------------
+# A fork's pull request receives no secret in its own runs. A pull_request_target job (identity-guard.yml) runs this
+# repository's code with the secret, reads the pull request's commit identities from GitHub's API, never the fork's
+# code, and feeds them here as NUL-terminated triples: sha, author, committer.
+
+
+def _identities(repo: Path, triples: list[tuple[str, str, str]], **env) -> subprocess.CompletedProcess:
+    data = "".join(f"{s}\0{a}\0{c}\0\n" for s, a, c in triples).encode()
+    return subprocess.run(["bash", "scripts/repo-guard.sh", "--identities"], cwd=repo, input=data,
+                          env=_env(**env), capture_output=True)
+
+
+CLEAN = ("a" * 40, "Hidden Dim <hd@mail.example>", "GitHub <noreply@github.com>")
+LISTED = ("b" * 40, f"Private Persona <{BLOCKED}@mail.example>", "GitHub <noreply@github.com>")
+
+
+def test_identities_mode_passes_clean_commits_and_counts_them(repo: Path) -> None:
+    out = _identities(repo, [CLEAN, CLEAN], REPO_GUARD_IDENTITY_EXPECTED="2")
+    assert out.returncode == 0 and b"identity: 2 commit(s) checked" in out.stdout
+
+
+def test_identities_mode_blocks_a_listed_identity_without_printing_it(repo: Path) -> None:
+    out = _identities(repo, [CLEAN, LISTED], REPO_GUARD_IDENTITY_EXPECTED="2")
+    assert out.returncode == 1 and b"commit bbbbbbbb's author" in out.stdout
+    assert BLOCKED.encode() not in out.stdout + out.stderr and b"Private Persona" not in out.stdout + out.stderr
+
+
+def test_identities_mode_reads_a_tab_holding_name_whole(repo: Path) -> None:
+    tabbed = ("c" * 40, "Private\tPersona <pp@mail.example>", "GitHub <noreply@github.com>")
+    out = _identities(repo, [tabbed], REPO_GUARD_IDENTITY_EXPECTED="1",
+                      REPO_GUARD_IDENTITY_PATTERNS="^Private\tPersona <pp@mail[.]example>$")
+    assert out.returncode == 1 and b"author" in out.stdout
+
+
+def test_identities_mode_refuses_fewer_identities_than_the_pull_request_has(repo: Path) -> None:
+    # The API returns at most 250 commits; a longer pull request cannot be checked whole, so it fails.
+    out = _identities(repo, [CLEAN], REPO_GUARD_IDENTITY_EXPECTED="3")
+    assert out.returncode == 2 and b"1 of 3" in out.stderr
+
+
+def test_identities_mode_requires_its_list(repo: Path) -> None:
+    out = _identities(repo, [CLEAN], REPO_GUARD_IDENTITY_EXPECTED="1", REPO_GUARD_IDENTITY_PATTERNS=None,
+                      REPO_GUARD_IDENTITY_REQUIRED="1")
+    assert out.returncode == 1 and b"REPO_GUARD_IDENTITY_PATTERNS is not set" in out.stdout
+
+
+def test_identities_mode_needs_no_name_list(repo: Path) -> None:
+    # It runs in CI, where the name list never is.
+    out = _identities(repo, [CLEAN], REPO_GUARD_IDENTITY_EXPECTED="1", REPO_GUARD_NAME_PATTERNS=None)
+    assert out.returncode == 0, out.stdout + out.stderr
