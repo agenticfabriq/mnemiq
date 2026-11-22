@@ -367,8 +367,12 @@ class Settings(BaseSettings):
         default=600.0, ge=0,
         description="seconds each statement enrich sends to a source may run before it is cut (0: no limit)")
     enrich_concurrency: int = Field(
-        default=4, ge=1,
-        description="description calls enrich runs at once against the model server (chunks of every table)")
+        # 1 by default: measured on a five-table, 1,527-column schema with a 27B model on vLLM, four calls at once
+        # described 3.2 times as fast and about 5% fewer columns, the shortfall on its widest table, with no reply cut
+        # or retried. Set it to trade coverage for speed (docs/settings.md).
+        default=1, ge=1,
+        description="description calls enrich runs at once against the model server (chunks of every table); 1 is "
+                    "one after another")
     dictionary_path: str | None = Field(default=None, description="operator code data-dictionary JSON path (grounds code meanings)")
     ontology_records_path: str | None = Field(default=None, description="ontology records JSON path (binds code schemes, grounds bare codes)")
     verity_records_url: str | None = Field(default=None, description=f"Verity GET {CERTIFIED_RECORDS_PATH} endpoint (governed certified records). NOT the sibling without `/open`, and DO NOT change the page size to make that one fit: it accepts no `since`, so ANY page size it tolerates -- 0 included -- makes every pull a full dump merged as though it were a delta, silently, while this pull's default 500 makes it refuse outright. Loud is the better failure. Verity's published OpenAPI is where that endpoint's missing `since` and its own limit ceiling are declared")
