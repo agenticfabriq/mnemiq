@@ -1,0 +1,427 @@
+"""`scripts/copy_oracle_to_duckdb.py`: Oracle tables into one DuckDB file to enrich, read-only, disk estimate first.
+
+Enriching on a DuckDB copy and serving the store on Oracle is the route a large schema can afford, and nothing made the
+copy: a design partner would have written one by hand, and lost the names' case, the comments and the declared keys on
+the way. These tests drive the script against a fake connection, whose `fetch_df_batches` yields Arrow tables and whose
+cursor answers the dictionary queries from canned rows, so no Oracle is needed. What they pin: nothing is read past
+`--max-gb` or past a name DuckDB cannot keep apart; a table a stopped copy left behind is never one a resume skips as
+done; each table is read in its own read-only transaction; comments and keys arrive where the DuckDB adapter reads them.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+from decimal import Decimal
+
+import duckdb
+import pyarrow as pa
+import pytest
+
+import scripts.copy_oracle_to_duckdb as copy
+from mnemiq.adapters.duckdb import DuckDBAdapter
+from mnemiq.config import SourceSpec
+from scripts.copy_oracle_to_duckdb import (
+    Estimate,
+    comment_statements,
+    copy_table,
+    declared_key_rows,
+    estimate,
+    main,
+    select_tables,
+    source_entry,
+)
+
+_ORDERS = pa.schema([("ID", pa.int64()), ("Status", pa.large_string())])
+_CUSTOMER = pa.schema([("ID", pa.int64()), ("NAME", pa.large_string())])
+
+
+def _batch(schema: pa.Schema, ids: range) -> pa.Table:
+    return pa.table({schema.names[0]: list(ids), schema.names[1]: [f"v{i}" for i in ids]}, schema=schema)
+
+
+class _Cursor:
+    def __init__(self, fake: "_Oracle") -> None:
+        self._fake = fake
+        self._rows: list[tuple] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql: str, parameters=None, **binds):
+        self._fake.log.append(sql)
+        low = " ".join(sql.lower().split())
+        if low.startswith("set transaction"):
+            self._rows = []
+        elif "from dual" in low:
+            self._rows = [(self._fake.user,)]
+        elif "from all_tables" in low:
+            self._rows = list(self._fake.stats)
+        elif "from all_tab_columns" in low:
+            self._rows = [(t, c) for t, schema in self._fake.schemas.items() for c in schema.names]
+        elif "from all_tab_comments" in low:
+            self._rows = list(self._fake.table_comments.items())
+        elif "from all_col_comments" in low:
+            self._rows = [(t, c, text) for (t, c), text in self._fake.column_comments.items()]
+        elif "from all_constraints" in low:
+            self._rows = list(self._fake.keys)
+        elif "from user_lobs" in low:
+            self._rows = list(self._fake.lobs)
+        else:
+            raise AssertionError(f"the fake does not answer {sql!r}")
+
+    def fetchall(self):
+        return self._rows
+
+
+class _Oracle:
+    """A connection the script reads through: dictionary rows by query, table rows as Arrow batches."""
+
+    def __init__(self, batches: dict[str, list[pa.Table]], schemas: dict[str, pa.Schema] | None = None, *,
+                 stats=None, table_comments=None, column_comments=None, keys=(), lobs=(), user="READER",
+                 fail_on: tuple[str, int] | None = None) -> None:
+        self.batches = batches
+        self.schemas = schemas or {t: b[0].schema for t, b in batches.items()}
+        self.stats = stats if stats is not None else [(t, 10, 100) for t in self.schemas]
+        self.table_comments = table_comments or {}
+        self.column_comments = column_comments or {}
+        self.keys = list(keys)
+        self.lobs = list(lobs)
+        self.user = user
+        self.fail_on = fail_on
+        self.on_fail = lambda: None  # what a test looks at the moment the copy stops, before anything cleans up
+        self.log: list = []
+        self.fetched: list[str] = []
+
+    def cursor(self):
+        return _Cursor(self)
+
+    def rollback(self):
+        self.log.append("ROLLBACK")
+
+    def close(self):
+        self.log.append("CLOSE")
+
+    @staticmethod
+    def _table(statement: str) -> str:
+        return statement.split(".")[-1].split()[0].strip('"')
+
+    def fetch_df_batches(self, statement, parameters=None, size=None, **kwargs):
+        table = self._table(statement)
+        self.fetched.append(table)
+        for i, batch in enumerate(self.batches[table]):
+            if self.fail_on == (table, i):
+                self.on_fail()
+                raise RuntimeError("the connection was lost")
+            self.log.append(("batch", table, i))
+            yield batch
+
+    def fetch_df_all(self, statement, parameters=None, arraysize=None, **kwargs):
+        assert "WHERE 1 = 0" in statement
+        return self.schemas[self._table(statement)].empty_table()
+
+
+_SOURCE = {"id": "plant", "kind": "oracle", "target": "db.example:1521/APP", "catalog": "plant", "schema": "APP",
+           "tables": ["ORDERS", "CUSTOMER"]}
+
+
+@pytest.fixture
+def deployment(tmp_path, monkeypatch):
+    """A manifest naming one Oracle source, its credentials in the environment, and a seam for the fake."""
+    manifest = tmp_path / "sources.json"
+    manifest.write_text(json.dumps([_SOURCE]))
+    monkeypatch.setenv("MNEMIQ_SOURCES_PATH", str(manifest))
+    monkeypatch.setenv("MNEMIQ_ORACLE_USER", "READER")
+    monkeypatch.setenv("MNEMIQ_ORACLE_PASSWORD", "not-a-real-password")
+    for name in ("MNEMIQ_ORACLE_CONFIG_DIR", "MNEMIQ_ORACLE_WALLET_PASSWORD"):
+        monkeypatch.delenv(name, raising=False)
+
+    def run(fake: _Oracle, *flags: str) -> int:
+        monkeypatch.setattr(copy, "connect", lambda spec, settings: fake)
+        return main(["--out", str(tmp_path / "copy.duckdb"), *flags])
+
+    run.out = str(tmp_path / "copy.duckdb")
+    run.manifest = manifest
+    return run
+
+
+def _shop(**kwargs) -> _Oracle:
+    return _Oracle({"ORDERS": [_batch(_ORDERS, range(3)), _batch(_ORDERS, range(3, 5))],
+                    "CUSTOMER": [_batch(_CUSTOMER, range(2))]}, **kwargs)
+
+
+def _tables(path: str, read_only: bool = True) -> dict[str, int]:
+    con = duckdb.connect(path, read_only=read_only)
+    try:
+        names = [r[0] for r in con.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'").fetchall()]
+        return {n: con.execute(f'SELECT count(*) FROM main."{n}"').fetchone()[0] for n in names}
+    finally:
+        con.close()
+
+
+def test_select_tables_matches_patterns_without_case():
+    owner = ["ORDERS", "ORDER_LINES", "CUSTOMER"]
+    assert select_tables(owner, ("order*",)) == ["ORDERS", "ORDER_LINES"]
+    assert select_tables(owner, ()) == owner
+    assert select_tables(owner, ("customer", "orders")) == ["ORDERS", "CUSTOMER"], "the owner's order is kept"
+
+
+def test_estimate_sums_rows_times_length_and_names_unanalyzed():
+    est = estimate([("A", 10, 100), ("B", None, 50)], None)
+    assert est == Estimate(total_bytes=1000, per_table={"A": 1000, "B": 0}, unanalyzed=["B"], lob_bytes=None)
+    assert estimate([("A", 10, 100), ("C", 5, None)], 500).total_bytes == 1500, "LOB segments add when seen"
+
+
+def test_the_copy_refuses_past_max_gb_before_reading_a_row(deployment, capsys):
+    fake = _shop(stats=[("ORDERS", 11_000_000, 1000), ("CUSTOMER", 0, 10)])
+    assert deployment(fake, "--max-gb", "10") == 2
+    assert fake.fetched == []
+    out = capsys.readouterr()
+    assert "11.00 GB" in out.out and "--max-gb" in out.err
+    assert not os.path.exists(deployment.out), "no file is made for a copy that does not start"
+
+
+def test_the_estimate_is_printed_before_any_row_is_read(deployment, capsys):
+    fake = _shop(stats=[("ORDERS", 5, 100), ("CUSTOMER", None, None)])
+    printed: list[str] = []
+    real = fake.fetch_df_batches
+
+    def watched(*args, **kwargs):
+        printed.append(capsys.readouterr().out)
+        return real(*args, **kwargs)
+
+    fake.fetch_df_batches = watched
+    assert deployment(fake) == 0
+    assert printed, "a table was read"
+    assert "0.00 GB" in printed[0] and "CUSTOMER" in printed[0], "the estimate and the unanalyzed table, first"
+
+
+def test_comment_statements_escape_quotes_and_quote_names():
+    statements = comment_statements({"ORDER": "the customer's order"}, {("ORDER", "Status"): "it's 'open'"})
+    assert statements == [
+        "COMMENT ON TABLE \"ORDER\" IS 'the customer''s order'",
+        "COMMENT ON COLUMN \"ORDER\".\"Status\" IS 'it''s ''open'''",
+    ]
+    con = duckdb.connect(":memory:")
+    con.execute('CREATE TABLE "ORDER" ("Status" VARCHAR)')
+    for statement in statements:
+        con.execute(statement)
+    assert con.execute("SELECT comment FROM duckdb_tables() WHERE table_name = 'ORDER'").fetchone()[0] == \
+        "the customer's order"
+    assert con.execute("SELECT comment FROM duckdb_columns() WHERE column_name = 'Status'").fetchone()[0] == \
+        "it's 'open'"
+
+
+def test_a_name_holding_a_double_quote_is_quoted_whole():
+    assert comment_statements({'A"B': "x"}, {}) == ["COMMENT ON TABLE \"A\"\"B\" IS 'x'"]
+
+
+def test_a_table_is_copied_with_oracles_names_and_all_rows(tmp_path):
+    fake = _shop()
+    duck = duckdb.connect(str(tmp_path / "c.duckdb"))
+    assert copy_table(fake, duck, "APP", "ORDERS", 3) == 5
+    assert duck.execute('SELECT count(*) FROM main."ORDERS"').fetchone()[0] == 5
+    assert [r[0] for r in duck.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'ORDERS' "
+        "ORDER BY ordinal_position").fetchall()] == ["ID", "Status"]
+    assert duck.execute("SELECT table_name FROM information_schema.tables").fetchall() == [("ORDERS",)]
+
+
+def test_the_table_is_read_by_its_qualified_quoted_name(tmp_path):
+    seen: list[str] = []
+    fake = _shop()
+    real = fake.fetch_df_batches
+    fake.fetch_df_batches = lambda statement, **kw: (seen.append(statement), real(statement, **kw))[1]
+    copy_table(fake, duckdb.connect(str(tmp_path / "c.duckdb")), "APP", "ORDERS", 3)
+    assert seen == ['SELECT * FROM "APP"."ORDERS"']
+
+
+def test_an_empty_table_is_copied_with_its_columns(tmp_path):
+    fake = _Oracle({"ORDERS": []}, {"ORDERS": _ORDERS})
+    duck = duckdb.connect(str(tmp_path / "c.duckdb"))
+    assert copy_table(fake, duck, "APP", "ORDERS", 3) == 0
+    assert duck.execute('SELECT count(*) FROM main."ORDERS"').fetchone()[0] == 0
+    assert [r[0] for r in duck.execute('DESCRIBE main."ORDERS"').fetchall()] == ["ID", "Status"]
+
+
+def test_numbers_and_dates_land_as_the_duckdb_types_they_hold(tmp_path):
+    # NUMBER(10) arrives as decimal128(10, 0) when decimals are fetched: an integer that fits 64 bits lands as BIGINT,
+    # NUMBER(12,2) stays exact, and an Oracle DATE (seconds) lands as DuckDB's plain TIMESTAMP.
+    schema = pa.schema([("N10", pa.decimal128(10, 0)), ("N12_2", pa.decimal128(12, 2)),
+                        ("N38", pa.decimal128(38, 0)), ("D", pa.timestamp("s")), ("F", pa.float64())])
+    batch = pa.table({"N10": [Decimal(7)], "N12_2": [Decimal("1.25")], "N38": [Decimal(12345678901234567890)],
+                      "D": [dt.datetime(2026, 1, 2, 3, 4, 5)], "F": [0.5]}, schema=schema)
+    duck = duckdb.connect(str(tmp_path / "c.duckdb"))
+    copy_table(_Oracle({"T": [batch]}), duck, "APP", "T", 10)
+    types = dict(duck.execute('SELECT column_name, data_type FROM information_schema.columns').fetchall())
+    assert types == {"N10": "BIGINT", "N12_2": "DECIMAL(12,2)", "N38": "DECIMAL(38,0)", "D": "TIMESTAMP",
+                     "F": "DOUBLE"}
+    assert duck.execute('SELECT "N38", "N12_2" FROM "T"').fetchone() == (Decimal(12345678901234567890),
+                                                                       Decimal("1.25"))
+
+
+def test_a_stopped_copy_leaves_no_table_a_resume_would_skip(deployment):
+    stopped = _shop(fail_on=("ORDERS", 1))
+    at_the_stop: dict[str, int] = {}
+    # The file as a killed process would leave it: read when the copy stops, before any handler can tidy up. (A second
+    # connection in the same process, so not read-only: DuckDB refuses one file opened with two configurations.)
+    stopped.on_fail = lambda: at_the_stop.update(_tables(deployment.out, read_only=False))
+    with pytest.raises(RuntimeError, match="connection was lost"):
+        deployment(stopped)
+    assert at_the_stop and "ORDERS" not in at_the_stop, "mid-table, the rows are only under the staging name"
+    assert "ORDERS" not in _tables(deployment.out)
+    assert not [t for t in _tables(deployment.out) if t.casefold().startswith("orders")], "no partial table left"
+    assert stopped.log[-2:] == ["ROLLBACK", "CLOSE"], "the stopped table's transaction ended"
+    resumed = _shop()
+    assert deployment(resumed) == 0
+    assert _tables(deployment.out) == {"ORDERS": 5, "CUSTOMER": 2}
+    assert "ORDERS" in resumed.fetched
+
+
+def test_a_partial_table_a_killed_copy_left_is_dropped_before_the_table_starts(deployment):
+    con = duckdb.connect(deployment.out)
+    con.execute('CREATE TABLE main."ORDERS__partial" AS SELECT 1 AS "ID", \'x\' AS "Status"')
+    con.close()
+    assert deployment(_shop()) == 0
+    assert _tables(deployment.out) == {"ORDERS": 5, "CUSTOMER": 2}
+
+
+def test_each_table_is_copied_in_its_own_read_only_transaction(deployment):
+    fake = _shop()
+    assert deployment(fake) == 0
+    log = fake.log
+    for table in ("ORDERS", "CUSTOMER"):
+        batches = [i for i, entry in enumerate(log) if isinstance(entry, tuple) and entry[1] == table]
+        first, last = batches[0], batches[-1]
+        # Adjacent, not merely earlier and later: one transaction around both tables would put the other table's
+        # batches next to these, with no ROLLBACK and SET between them.
+        assert log[first - 2:first] == ["ROLLBACK", "SET TRANSACTION READ ONLY"], f"{table} starts its own"
+        assert log[last + 1] == "ROLLBACK", f"{table}'s transaction ends right after its last batch"
+        between = log[first:last + 1]
+        assert all(isinstance(e, tuple) and e[1] == table for e in between), "no other read inside it"
+    assert not [e for e in log if isinstance(e, str) and e.split()[0].upper() not in
+                ("SET", "ROLLBACK", "SELECT", "CLOSE")], "nothing but SELECT reaches Oracle"
+
+
+def test_a_copied_table_is_skipped_unless_replace(deployment, capsys):
+    assert deployment(_shop()) == 0
+    again = _shop()
+    assert deployment(again) == 0
+    assert again.fetched == [], "both tables were in the file"
+    assert "already in" in capsys.readouterr().out
+    replaced = _shop()
+    assert deployment(replaced, "--replace") == 0
+    assert replaced.fetched == ["ORDERS", "CUSTOMER"]
+    assert _tables(deployment.out) == {"ORDERS": 5, "CUSTOMER": 2}, "replaced, not appended"
+
+
+def test_keys_with_both_ends_copied_are_written_to_the_keys_table(deployment):
+    keys = [("ORDERS", "CUSTOMER_ID", "CUSTOMER", "ID", "FK_ORD_CUST"),
+            ("ORDERS", "STORE_ID", "STORE", "ID", "FK_ORD_STORE")]
+    assert deployment(_shop(keys=keys)) == 0
+    con = duckdb.connect(deployment.out, read_only=True)
+    assert con.execute("SELECT * FROM mnemiq.declared_keys").fetchall() == [keys[0]]
+    con.close()
+    # The DuckDB adapter reads what the copy wrote: the join between the two, not either end alone.
+    assert DuckDBAdapter.duckdb(deployment.out).foreign_keys() == [keys[0]]
+
+
+def test_declared_key_rows_keeps_keys_whose_both_ends_are_copied():
+    rows = [("A", "X", "B", "Y", "K1"), ("A", "Z", "C", "W", "K2"), ("C", "W", "A", "X", "K3")]
+    assert declared_key_rows(rows, {"A", "B"}) == [rows[0]]
+
+
+def test_keys_are_read_only_within_the_owner(deployment):
+    fake = _shop()
+    deployment(fake)
+    statement = next(e for e in fake.log if isinstance(e, str) and "all_constraints" in e.lower())
+    assert "r_owner = c.owner" in " ".join(statement.lower().split()), "a key into another schema is left out"
+
+
+def test_comments_reach_the_file_where_the_duckdb_adapter_reads_them(deployment):
+    fake = _shop(table_comments={"ORDERS": "One row per order", "OTHER": "not copied"},
+                 column_comments={("ORDERS", "Status"): "O open, C closed", ("ORDERS", "GONE"): "no such column"})
+    assert deployment(fake) == 0
+    assert DuckDBAdapter.duckdb(deployment.out).comments(["ORDERS", "CUSTOMER"]) == (
+        {"ORDERS": "One row per order"}, {("ORDERS", "Status"): "O open, C closed"})
+
+
+def test_names_that_differ_only_in_case_are_refused_before_any_row(deployment, capsys):
+    tables = _Oracle({"Orders": [_batch(_ORDERS, range(1))], "ORDERS": [_batch(_ORDERS, range(1))]})
+    deployment.manifest.write_text(json.dumps([{**_SOURCE, "tables": ["orders"]}]))
+    assert deployment(tables) == 2
+    assert tables.fetched == []
+    err = capsys.readouterr().err
+    assert "'Orders'" in err and "'ORDERS'" in err
+    columns = _Oracle({"ORDERS": [pa.schema([("STATUS", pa.int64()), ("Status", pa.int64())]).empty_table()]})
+    deployment.manifest.write_text(json.dumps([{**_SOURCE, "tables": ["ORDERS"]}]))
+    assert deployment(columns) == 2
+    assert columns.fetched == []
+    err = capsys.readouterr().err
+    assert "'STATUS'" in err and "'Status'" in err
+
+
+def test_a_table_named_like_another_tables_staging_copy_is_refused(deployment):
+    fake = _Oracle({"ORDERS": [_batch(_ORDERS, range(1))], "ORDERS__PARTIAL": [_batch(_ORDERS, range(1))]})
+    deployment.manifest.write_text(json.dumps([{**_SOURCE, "tables": ["ORDERS*"]}]))
+    assert deployment(fake) == 2
+    assert fake.fetched == []
+
+
+def test_a_pattern_matching_no_table_is_refused(deployment, capsys):
+    deployment.manifest.write_text(json.dumps([{**_SOURCE, "tables": ["ORDERS", "ORDRES"]}]))
+    fake = _shop()
+    assert deployment(fake) == 2
+    assert fake.fetched == [] and "ORDRES" in capsys.readouterr().err
+
+
+def test_the_copys_source_entry_matches_the_oracle_source(deployment, capsys):
+    spec = SourceSpec(id="plant", kind="oracle", target="db.example:1521/APP", catalog="plant", schema="APP",
+                      tables=("ORDERS", "CUSTOMER"), profile="statistics", exact_tables=("ORDERS",))
+    assert source_entry(spec, "/data/copy.duckdb", ["ORDERS", "CUSTOMER"]) == {
+        "id": "plant", "kind": "duckdb", "target": "/data/copy.duckdb", "catalog": "plant", "schema": "main",
+        "tables": ["ORDERS", "CUSTOMER"]}
+    assert deployment(_shop()) == 0
+    with open(deployment.out + ".source.json") as fh:
+        written = json.load(fh)
+    assert written == [{"id": "plant", "kind": "duckdb", "target": deployment.out, "catalog": "plant",
+                        "schema": "main", "tables": ["ORDERS", "CUSTOMER"]}]
+    out = capsys.readouterr().out
+    assert "mnemiq enrich" in out and "mnemiq build" in out and deployment.out + ".source.json" in out
+
+
+def test_the_written_entry_is_a_manifest_mnemiq_reads(deployment, monkeypatch):
+    from mnemiq.config import Settings
+
+    assert deployment(_shop()) == 0
+    monkeypatch.setenv("MNEMIQ_SOURCES_PATH", deployment.out + ".source.json")
+    (spec,) = Settings().source_specs()
+    assert (spec.kind, spec.target, spec.schema, spec.tables) == ("duckdb", deployment.out, "main",
+                                                                  ("ORDERS", "CUSTOMER"))
+
+
+def test_the_only_oracle_source_is_chosen_and_another_is_refused(deployment, tmp_path):
+    other = {"id": "local", "kind": "duckdb", "target": str(tmp_path / "x.duckdb"), "catalog": "local",
+             "schema": "main"}
+    deployment.manifest.write_text(json.dumps([other, _SOURCE]))
+    assert deployment(_shop()) == 0
+    assert deployment(_shop(), "--source-id", "local") == 2
+    deployment.manifest.write_text(json.dumps([_SOURCE, {**_SOURCE, "id": "plant2"}]))
+    assert deployment(_shop()) == 2, "two Oracle sources and no --source-id"
+
+
+def test_missing_credentials_are_refused_before_connecting(deployment, monkeypatch, capsys):
+    monkeypatch.delenv("MNEMIQ_ORACLE_PASSWORD")
+    fake = _shop()
+    assert deployment(fake) == 2
+    assert fake.log == [] and "MNEMIQ_ORACLE_PASSWORD" in capsys.readouterr().err
+
+
+def test_the_password_is_never_printed(deployment, capsys):
+    deployment(_shop())
+    out = capsys.readouterr()
+    assert "not-a-real-password" not in out.out + out.err
