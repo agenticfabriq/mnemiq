@@ -21,6 +21,11 @@ files as immutable for a year, and no source map is packed.
 
 ## Install
 
+Each release of the extension carries the bundle ready made: `mnemiq-<version>.supx` and its SHA-256 under the
+repository's [Releases](https://github.com/agenticfabriq/mnemiq/releases), built from the tagged commit, whose mnemiq
+server it goes with. Put the `.supx` in a folder of its own and name that folder in `EXTENSIONS_PATH`; or build it
+yourself (above) and name the build directory in `LOCAL_EXTENSIONS`.
+
 In `superset_config.py`, then restart Superset (extensions load at startup):
 
 ```python
