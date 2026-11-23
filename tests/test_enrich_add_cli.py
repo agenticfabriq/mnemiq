@@ -134,3 +134,65 @@ def test_add_discovers_views_again_and_keeps_an_earlier_failure_visible(shop, mo
     assert _cmd_enrich(settings(["customers"]), add=True) == 0
     job = next(j for j in _latest(settings(["customers"])).jobs if j.id == "discover:views")
     assert job.status == "failed" and "without --add" in (job.detail or "")
+
+
+# The certified set and the operator's dictionary overlay every column, but a run applies them to its own subset only.
+# Under --add they are laid again over the merged snapshot (Codex's third review): otherwise a column kept from an
+# earlier run stays unclassified after a certified dimension marks it personal, and its values are indexed; and the
+# join pass, which reads joins again over the union, would drop a certified join no key or name can recover.
+from mnemiq.contract import CertifiedRecord  # noqa: E402
+from mnemiq.enrichment.certified import CertifiedSet  # noqa: E402
+
+
+def _certified(object_type: str, object_id: str, payload: dict) -> CertifiedRecord:
+    return CertifiedRecord.model_validate({
+        "envelope": {"object_type": object_type, "object_id": object_id, "version": "v1", "source_system": "verity",
+                     "provenance": {"status": "certified", "certifier": "reviewer@acme"}},
+        "payload": payload})
+
+
+def _indexed_columns(settings: Settings) -> set[str]:
+    con = init_store(settings.store_path)
+    try:
+        return {row[0] for row in con.execute("SELECT DISTINCT object_id || '.' || column_name FROM value_index").fetchall()}
+    finally:
+        con.close()
+
+
+def test_a_certification_made_after_a_kept_run_classifies_its_columns_and_keeps_certified_joins(shop, monkeypatch):
+    _path, settings, _runs = shop
+    assert _cmd_enrich(settings(["customers"])) == 0
+    assert "customers.region" in _indexed_columns(settings(["customers"])), "the control: open, so indexed"
+
+    certified = CertifiedSet([
+        _certified("dimension", "region_dim", {"id": "region_dim", "label": "Region", "source": "customers",
+                                               "expr": "region", "pii_level": "pii"}),
+        _certified("relationship", "orders.status->customers", {
+            "id": "orders.status->customers", "from": "orders", "to": "customers", "cardinality": "many_to_one",
+            "join_keys": [{"left": "status", "right": "region"}]}),
+    ], available=True)
+    monkeypatch.setattr("mnemiq.enrichment.certified.fetch_certified_records", lambda settings: certified)
+    assert _cmd_enrich(settings(["orders"]), add=True) == 0
+
+    snap = _latest(settings(["orders"]))
+    region = next(c for c in snap.columns if c.id == "customers.region")
+    assert region.pii_levels() == frozenset({"pii"}), "the kept column is classified by the dimension now certified"
+    assert "customers.region" not in _indexed_columns(settings(["orders"])), "and its values are no longer indexed"
+    assert [d.id for d in snap.dimensions] == ["region_dim"], "laid once, not appended twice"
+    assert [r.id for r in snap.relationships].count("orders.status->customers") == 1, "the certified join is kept"
+
+
+def test_add_refuses_before_any_model_call_when_the_ontology_changed(shop, capsys):
+    from mnemiq.store.snapshot_store import save_snapshot
+
+    _path, settings, runs = shop
+    assert _cmd_enrich(settings(["customers"])) == 0
+    con = init_store(settings(["customers"]).store_path)
+    try:
+        save_snapshot(con, _latest(settings(["customers"])).model_copy(update={"ontology_version": "older",
+                                                                               "version": "v-older"}))
+    finally:
+        con.close()
+    assert _cmd_enrich(settings(["orders"]), add=True) == 1
+    assert "ontology" in capsys.readouterr().err
+    assert runs == ["called"], "refused before the second run's model calls"

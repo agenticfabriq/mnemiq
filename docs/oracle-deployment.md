@@ -293,9 +293,12 @@ most of a run's time), and the joins are read again over all of them: declared k
 dictionary for every table, and inference among the tables profiled exactly, each table in the
 mode its own run used, so no estimated table's rows are read. Views are discovered again too, and
 if an earlier run's view discovery did not complete, the view inventory stays unavailable (row-
-filtered views are refused) until a run without `--add` discovers them. `--add` refuses before reading
+filtered views are refused) until a run without `--add` discovers them. The certified set and the
+dictionary are laid again over every table, so a certification made since an earlier batch reaches its
+columns. `--add` refuses before reading
 anything when the store holds no snapshot of the source, or when the source no longer reports a
-table the snapshot holds. A table whose profile fails in an `--add` run keeps its earlier
+table the snapshot holds, and before any model call when the ontology changed since. A table whose
+profile fails in an `--add` run keeps its earlier
 enrichment, and enrich says so. Worked examples written for an earlier batch predate the later
 tables, so none spans batches until those tables are enriched again. To serve the result, list
 every table enriched under `"tables"`, or none.

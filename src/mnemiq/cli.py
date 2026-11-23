@@ -559,6 +559,13 @@ def _cmd_enrich(settings: Settings, add: bool = False) -> int:
         # store key is snap.version). code_scheme carries only the scheme id/label, so the columns
         # alone would not reflect it.
         snap = snap.model_copy(update={"ontology_version": _onto.version})
+    if kept is not None and kept.ontology_version != snap.ontology_version:
+        # Before grounding reads values and before any model call. The kept tables' code bindings were made under the
+        # earlier ontology, and a merged snapshot carries one ontology version for every table.
+        print(f"source {spec.id!r}: --add keeps the earlier tables' code bindings, made under ontology version "
+              f"{kept.ontology_version or '(none)'}, and this run's is {snap.ontology_version or '(none)'}: run "
+              "without --add so every table is bound under one", file=sys.stderr)
+        return 1
 
     # precedence: ontology < correlated < lookup < certified < dictionary
     if not superset:
@@ -611,7 +618,9 @@ def _cmd_enrich(settings: Settings, add: bool = False) -> int:
         # reads under the statement time limit): the run's own sees only its subset, and its scoped view keeps only
         # keys with both ends in it. Views are discovered again the way the run discovers them.
         from mnemiq.adapters.resolve import adapter_for
-        from mnemiq.enrichment.accumulate import merge_run, union_relationships, union_spec, union_views, views_spec
+        from mnemiq.enrichment.accumulate import (
+            merge_run, reapply_overlays, union_relationships, union_spec, union_views, views_spec,
+        )
 
         snap, kept_failed = merge_run(kept, snap)
         for table in kept_failed:
@@ -630,6 +639,9 @@ def _cmd_enrich(settings: Settings, add: bool = False) -> int:
         snap = snap.model_copy(update={"relationships": relationships, "views": views,
                                        "jobs": [*(j for j in snap.jobs if j.id not in (join_job.id, views_job.id)),
                                                 join_job, views_job]})
+        # The certified set and the dictionary reached only the run's subset; laid again over every table, after the
+        # join pass so the certified joins it dropped come back.
+        snap = reapply_overlays(snap, _certified_set, _dict)
         snap.version = content_version(snap)
 
     # What the statement time limit cut before the save, on the snapshot; the closing warning names the value index's too.

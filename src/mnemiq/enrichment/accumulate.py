@@ -236,3 +236,34 @@ def union_views(views_adapter, kept: Snapshot, snapshot: Snapshot) -> tuple[list
         status, detail = "failed", ("an earlier run's view discovery did not complete and its scope is not recorded: "
                                     "enrich without --add to discover the views again")
     return views, Job(id=VIEWS_JOB, source_id=snapshot.source_id, kind="discover", status=status, detail=detail)
+
+
+def _laid_by(entry, payload) -> bool:
+    """Whether `entry` is what laying `payload` put in a list: the same id where the type has one (a dimension whose
+    level was unrecognised is laid as a copy with the strictest level, so equality would miss it), else equal."""
+    if hasattr(payload, "id") and hasattr(entry, "id"):
+        return entry.id == payload.id
+    return entry == payload
+
+
+def reapply_overlays(snapshot: Snapshot, certified, dictionary) -> Snapshot:
+    """--add: the certified set and the operator's dictionary laid again over the merged snapshot. A run lays them over
+    its own subset only (`apply_certified_set`, `apply_dictionary`), so a column kept from an earlier run would miss a
+    classification certified since (a personal dimension over it, which gates value harvesting), and the join pass,
+    which reads joins again over the union, has dropped the certified joins. What the run's laying appended (the
+    certified standalone records and `certified:*` jobs) is taken out first, since laying appends rather than replaces.
+    Precedence stays as one run's: certified, then the dictionary, the operator's final override."""
+    from mnemiq.enrichment.certified import _STANDALONE, apply_certified_set
+    from mnemiq.enrichment.grounding import apply_dictionary
+
+    payloads: dict[str, list] = {}
+    for record in certified.records:
+        payloads.setdefault(record.envelope.object_type, []).append(record.payload)
+    update: dict[str, object] = {
+        attr: [entry for entry in getattr(snapshot, attr)
+               if not any(_laid_by(entry, p) for p in payloads.get(object_type, []))]
+        for object_type, attr in _STANDALONE.items() if payloads.get(object_type)
+    }
+    update["jobs"] = [j for j in snapshot.jobs if not j.id.startswith("certified:")]
+    laid, _protected = apply_certified_set(snapshot.model_copy(update=update, deep=True), certified)
+    return apply_dictionary(laid, dictionary) if dictionary else laid
