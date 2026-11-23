@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import threading
+from collections.abc import Sequence
 
 import duckdb
 import pyarrow as pa
@@ -342,6 +343,33 @@ class DuckDBAdapter:
             [self._catalog, self._table_schema],
         ).fetchall()
         return [(r[0], r[1], r[2]) for r in rows]
+
+    def comments(self, tables: Sequence[str]) -> tuple[dict[str, str], dict[tuple[str, str], str]]:
+        """The tables' comments and their columns', from DuckDB's own catalogue, for a DuckDB file: the shape
+        `OracleAdapter.comments` reads, so a store built on a DuckDB copy of an Oracle schema keeps the comments the copy
+        wrote as `COMMENT ON`. An empty comment is absent.
+
+        Only a DuckDB file is asked. Every other kind this class attaches answers `({}, {})`: DuckDB's scanner reports
+        no comment for an attached SQLite or Postgres table, so an empty answer is the truth there, not a failed read.
+        Catalog and schema are matched without regard to case and by parameter, as `introspect` matches them; the
+        tables exactly, since they are the names `introspect` reported."""
+        if self._attach_type != "DUCKDB":
+            return {}, {}
+        names = list(dict.fromkeys(tables))
+        if not names:
+            return {}, {}
+        scope = [self._catalog, self._table_schema, names]
+        table_comments = {table: text for table, text in self._con.execute(
+            "SELECT table_name, comment FROM duckdb_tables() "
+            "WHERE lower(database_name) = lower(?) AND lower(schema_name) = lower(?) "
+            "AND list_contains(?, table_name) AND comment IS NOT NULL AND comment <> '' "
+            "ORDER BY table_name", scope).fetchall()}
+        column_comments = {(table, column): text for table, column, text in self._con.execute(
+            "SELECT table_name, column_name, comment FROM duckdb_columns() "
+            "WHERE lower(database_name) = lower(?) AND lower(schema_name) = lower(?) "
+            "AND list_contains(?, table_name) AND comment IS NOT NULL AND comment <> '' "
+            "ORDER BY table_name, column_index", scope).fetchall()}
+        return table_comments, column_comments
 
     def foreign_keys(self) -> list[tuple[str, str, str, str, str]]:
         """Declared FKs: (from_table, from_col, to_table, to_col, constraint_id), one row for each
