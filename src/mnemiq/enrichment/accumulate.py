@@ -272,10 +272,12 @@ def ground_across_subsets(adapter, snapshot: Snapshot, crossing: list[Relationsh
     a run grounded are not grounded again (Codex's fifth review of --add).
 
     Two things only. A declared key column carries no harvested vocabulary in a run that sees the key, since profiling
-    leaves key columns unharvested; a run whose scope left out the key's other end harvested its values, identifiers, so
-    on every declared key column only the codes lookup grounding created stay. Then lookup grounding runs once along the
-    joins no single run saw (`crossing`), with the precedence `ground_codes` gives it over what the column holds. The
-    certified set and the dictionary, which outrank it, are laid after (`reapply_overlays`)."""
+    leaves key columns unharvested: its codes are the ones lookup grounding gives it. A run whose scope left out the
+    key's other end harvested its values, identifiers, so on every declared key column a code stays only if its lookup
+    gives it, whatever an overlay has since restated (the dictionary marks a code it restates `dictionary`, so the mark
+    cannot tell; Codex's sixth review). Then lookup grounding runs once along the joins no single run saw (`crossing`),
+    with the precedence `ground_codes` gives it over what the column holds. The certified set and the dictionary, which
+    outrank it, are laid after (`reapply_overlays`)."""
     from mnemiq.contract import CodedValue
     from mnemiq.enrichment.grounding import _safe, ground_from_lookup
 
@@ -284,9 +286,15 @@ def ground_across_subsets(adapter, snapshot: Snapshot, crossing: list[Relationsh
     except Exception as exc:  # noqa: BLE001 -- as profiling's own read: no keys read, no codes taken out
         logger.warning("the declared keys could not be read for the merged tables (%s)", type(exc).__name__)
         keys = set()
-    columns = [col.model_copy(update={"coded_values": [cv for cv in col.coded_values if cv.source == "lookup"]})
-               if (col.object_id, col.name) in keys and any(cv.source != "lookup" for cv in col.coded_values)
-               else col for col in snapshot.columns]
+    key_joins = [r for r in snapshot.relationships if any((r.from_, k.left) in keys for k in r.join_keys)]
+    provided = (_safe(ground_from_lookup, adapter, snapshot.model_copy(update={"relationships": key_joins}))
+                if key_joins else {})
+    columns = []
+    for col in snapshot.columns:
+        if (col.object_id, col.name) in keys:
+            given = provided.get(col.id, {})
+            col = col.model_copy(update={"coded_values": [cv for cv in col.coded_values if cv.code in given]})
+        columns.append(col)
     snapshot = snapshot.model_copy(update={"columns": columns})
     if not crossing:
         return snapshot

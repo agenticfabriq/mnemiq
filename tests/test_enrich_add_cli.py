@@ -284,8 +284,17 @@ def _normalised(snap) -> dict:
     (["status", "orders", "events"], ["tickets", "customers", "claim*", "product", "order_lines", "person", "stage",
                                       "cases"]),
 ])
-def test_add_over_subsets_gives_what_one_run_over_all_of_them_gives(shop, first, second):
-    path, settings, _runs = shop
+def test_add_over_subsets_gives_what_one_run_over_all_of_them_gives(shop, first, second, tmp_path):
+    path, base_settings, _runs = shop
+    # The operator's dictionary restates a lookup code on a key column and a harvested code, so the overlays are
+    # compared too.
+    dictionary = tmp_path / "dictionary.json"
+    dictionary.write_text(json.dumps({"columns": {"tickets.status_id": {"codes": {"1": "Opened"}},
+                                                  "orders.status": {"codes": {"A": "Active (dictionary)"}}}}))
+
+    def settings(tables):
+        return base_settings(tables).model_copy(update={"dictionary_path": str(dictionary)})
+
     con = sqlite3.connect(path)
     con.executescript(LOOKUP + """
         CREATE TABLE claim (id INTEGER PRIMARY KEY, region TEXT, amount REAL);
@@ -310,3 +319,33 @@ def test_add_over_subsets_gives_what_one_run_over_all_of_them_gives(shop, first,
     single, added = _normalised(_latest(union)), _normalised(_latest(settings(second)))
     for part in single:
         assert added[part] == single[part], part
+
+
+def test_a_dictionary_override_of_a_lookup_code_survives_an_unrelated_add(shop, tmp_path):
+    # Codex's sixth review: a key column keeps the codes its lookup gives it, whatever overlay has since restated them;
+    # the dictionary marks the code it restates `dictionary`, and taking every code not marked `lookup` lost it.
+    path, settings, _runs = shop
+    con = sqlite3.connect(path)
+    con.executescript("""
+        CREATE TABLE states (code TEXT PRIMARY KEY, label TEXT);
+        CREATE TABLE tasks (id INTEGER PRIMARY KEY, state TEXT REFERENCES states(code));
+        INSERT INTO states VALUES ('A', 'Active'), ('B', 'Blocked');
+        INSERT INTO tasks VALUES (1, 'A'), (2, 'B'), (3, 'A');
+    """)
+    con.commit()
+    con.close()
+    dictionary = tmp_path / "dictionary.json"
+    dictionary.write_text(json.dumps({"columns": {"tasks.state": {"codes": {"A": "Approved"}}}}))
+
+    def with_dictionary(s: Settings, store: str | None = None) -> Settings:
+        update = {"dictionary_path": str(dictionary)}
+        if store:
+            update["store_path"] = s.store_path.replace("store.duckdb", store)
+        return s.model_copy(update=update)
+
+    union = with_dictionary(settings(["states", "tasks", "customers"]), "single.duckdb")
+    assert _cmd_enrich(union) == 0
+    assert ("A", "Approved", "dictionary") in _coded(union, "tasks.state"), "the control: one run keeps the override"
+    assert _cmd_enrich(with_dictionary(settings(["states", "tasks"]))) == 0
+    assert _cmd_enrich(with_dictionary(settings(["customers"])), add=True) == 0
+    assert _coded(settings(["customers"]), "tasks.state") == _coded(union, "tasks.state")
