@@ -417,3 +417,34 @@ def test_examples_tied_on_the_embedding_come_back_in_one_order_however_they_were
         return [e.question for e in _retrieve_examples(con, qvec, allowed={"claim"}, k=5, not_raw=frozenset())]
 
     assert stored(["zeta case", "beta case"]) == stored(["beta case", "zeta case"]) == ["beta case", "zeta case"]
+
+
+# M278: M149's tie-break holds for exact ties only. DuckDB sums BM25 in parallel, so cards that differ only in a name of
+# the same length (a family of same-shaped tables) score a last bit apart from one execution to the next, the tie-break
+# never applies, and which members make the cut changes per call. Found on Spider 2.0-Lite, where the same lexical query
+# gave 16 different orders in 30 runs at 8 threads.
+def _family_snapshot(names: list[str]) -> Snapshot:
+    """Same-shaped tables: identical columns, names of one length, so BM25 scores them alike. The column names repeat
+    words, so a card holds a term more than once and its score is a sum of several unequal parts: the case where the
+    order of summation shows (with five plain names every part is equal and the scores tie exactly)."""
+    cols = ["provider_provider_0", "taxonomy_notes_1", "code_specialty_2", "classification_taxonomy_3", "specialty_status_4"]
+    return Snapshot(
+        version="v1", source_id="acme", created_at="2026-11-23T00:00:00Z",
+        source_bindings=[SourceBinding(id=f"sb:{t}", source_id="acme", object_id=t, source_object=t,
+                                       binding_type="table") for t in names],
+        columns=[Column(id=f"{t}.{c}", object_id=t, name=c, data_type="text") for t in names for c in cols],
+    )
+
+
+def test_a_table_family_ranks_in_one_order_on_every_call_when_duckdb_runs_in_parallel(tmp_path):
+    names = [f"code_set_{n:03d}" for n in range(60)]
+    con = init_store(str(tmp_path / "family.duckdb"))
+    build_index(con, _family_snapshot(names), _Pointing())
+    con.execute("SET threads TO 8")
+    question = "provider taxonomy code classification specialty group description"
+    orders = {tuple(c.object_id for c in retrieve(con, question, _identity(), _StaticAuthz(*names), _Pointing(),
+                                                  k=24).cards)
+              for _ in range(30)}
+    assert len(orders) == 1
+    # And it is the tie-break's order, not a fixed accident: equal cards come back by id.
+    assert list(orders.pop()) == names[:24]

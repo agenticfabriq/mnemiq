@@ -403,6 +403,10 @@ def retrieve(
 
     # Both rankings break ties by object_id. DuckDB returns tied rows in no fixed order, and `_rank` numbers rows by
     # position, so without it the same question could reach the generator with its cards in another order (M149).
+    # BM25 sorts on its score rounded to 9 places (M278): DuckDB sums a card's term scores in parallel, so cards that
+    # differ only in their name (a family of same-shaped tables) score a last bit apart per execution, and the
+    # sort key can be evaluated apart from the returned score. Unrounded, those near-ties never reach the tie-break and
+    # which members make the cut changes per call. The cosine query below computes each row alone and needs no rounding.
     lexical = con.execute(
         f"""
         SELECT object_id, score FROM (
@@ -411,7 +415,7 @@ def retrieve(
           FROM semantic_object
           WHERE object_id IN ({placeholders})
         ) WHERE score IS NOT NULL
-        ORDER BY score DESC, object_id LIMIT ?
+        ORDER BY round(score, 9) DESC, object_id LIMIT ?
         """,
         [question, *allowed, k],
     ).fetchall()
