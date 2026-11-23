@@ -313,6 +313,7 @@ def _print_estimate(est: Estimate, tables: list[str], lob_note: str | None) -> N
     if est.unanalyzed:
         print(f"{len(est.unanalyzed)} table(s) have no statistics and add nothing to the estimate: "
               + ", ".join(est.unanalyzed))
+    sys.stdout.flush()  # before any refusal on stderr, so a log of both reads in the order they happened
 
 
 def _duck_tables(duck) -> list[str]:
@@ -373,9 +374,11 @@ def _copy(conn, spec: SourceSpec, args, out: str) -> int:
     try:
         present = {t.casefold() for t in _duck_tables(duck)}
         started = time.monotonic()
+        skipped = 0
         for table in tables:
             if table.casefold() in present and not args.replace:
-                print(f"{table}: already in {out}, skipped (--replace copies it again)")
+                print(f"{table}: already in {out}, skipped (--replace copies it again)", flush=True)
+                skipped += 1
                 continue
             t0 = time.monotonic()
             rows = copy_table(conn, duck, owner, table, args.batch_rows)
@@ -397,8 +400,9 @@ def _copy(conn, spec: SourceSpec, args, out: str) -> int:
     with open(entry_path, "w") as fh:
         json.dump([source_entry(spec, out, tables)], fh, indent=1)
         fh.write("\n")
-    print(f"copied {len(tables)} table(s) in {time.monotonic() - started:.1f} s, with {len(statements)} comment(s) and "
-          f"{len(key_rows)} declared key column pair(s)")
+    print(f"{len(tables)} table(s) in the file: {len(tables) - skipped} copied, {skipped} already there, in "
+          f"{time.monotonic() - started:.1f} s; {len(statements)} comment(s) and {len(key_rows)} declared key column "
+          "pair(s) written")
     print(f"""
 Next:
   1. Done: the tables are in {out}, schema main, named as Oracle stores them.

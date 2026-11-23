@@ -349,10 +349,13 @@ def test_each_table_is_copied_in_its_own_read_only_transaction(deployment):
 
 def test_a_copied_table_is_skipped_unless_replace(deployment, capsys):
     assert deployment(_shop()) == 0
+    assert "2 table(s) in the file: 2 copied, 0 already there" in capsys.readouterr().out
     again = _shop()
     assert deployment(again) == 0
     assert again.fetched == [], "both tables were in the file"
-    assert "already in" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "already in" in out
+    assert "2 table(s) in the file: 0 copied, 2 already there" in out, "the summary counts what this run copied"
     replaced = _shop()
     assert deployment(replaced, "--replace") == 0
     assert replaced.fetched == ["ORDERS", "CUSTOMER"]
