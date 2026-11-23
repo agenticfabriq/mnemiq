@@ -217,3 +217,48 @@ def test_codes_are_grounded_from_a_lookup_table_enriched_in_another_subset(shop)
     assert _cmd_enrich(settings(["tickets"]), add=True) == 0
     column = next(c for c in _latest(settings(["tickets"])).columns if c.id == "tickets.status_id")
     assert {(cv.code, cv.meaning) for cv in column.coded_values} >= {("1", "Open"), ("2", "Closed")}
+
+
+# Codex's fifth review: what --add gives a column must be what one run over the same tables gives it. Each test runs
+# both, a single run in its own store as the control, and compares the column.
+def _coded(settings: Settings, column_id: str) -> set[tuple]:
+    column = next(c for c in _latest(settings).columns if c.id == column_id)
+    return {(cv.code, cv.meaning, cv.source) for cv in column.coded_values}
+
+
+def _one_run_and_add(shop, script: str, first: list[str], second: list[str], column_id: str):
+    path, settings, _runs = shop
+    con = sqlite3.connect(path)
+    con.executescript(script)
+    con.commit()
+    con.close()
+    union = settings([*first, *second])
+    union = union.model_copy(update={"store_path": union.store_path.replace("store.duckdb", "single.duckdb")})
+    assert _cmd_enrich(union) == 0
+    assert _cmd_enrich(settings(first)) == 0
+    assert _cmd_enrich(settings(second), add=True) == 0
+    return _coded(union, column_id), _coded(settings(second), column_id)
+
+
+def test_a_key_column_pointing_into_another_subset_keeps_no_harvested_identifiers(shop):
+    # Profiling leaves a declared key's values unharvested, but a run's scoped view drops a key into another subset.
+    single, added = _one_run_and_add(shop, """
+        CREATE TABLE person (code TEXT PRIMARY KEY);
+        CREATE TABLE events (id INTEGER PRIMARY KEY, owner TEXT REFERENCES person(code));
+        INSERT INTO person VALUES ('person-123'), ('person-456');
+        INSERT INTO events VALUES (1, 'person-123'), (2, 'person-456'), (3, 'person-123');
+    """, ["person"], ["events"], "events.owner")
+    assert added == single
+
+
+def test_grounding_across_subsets_matches_one_run_with_an_unmatched_lookup_code(shop):
+    # Grounding twice is not grounding once: lookup grounding creates codes, which a second pass's correlated grounding
+    # then reads. 99 is in no lookup row; the sibling label column says what it is. The lookup pair is enriched in one
+    # run, and an unrelated table added after must leave its column as it was.
+    single, added = _one_run_and_add(shop, """
+        CREATE TABLE stage (id INTEGER PRIMARY KEY, label TEXT);
+        CREATE TABLE cases (id INTEGER PRIMARY KEY, stage_id INTEGER REFERENCES stage(id), stage_label TEXT);
+        INSERT INTO stage VALUES (1, 'Open');
+        INSERT INTO cases VALUES (1, 1, 'Local open'), (2, 99, 'Escalated'), (3, 1, 'Local open'), (4, 99, 'Escalated');
+    """, ["stage", "cases"], ["customers"], "cases.stage_id")
+    assert added == single
