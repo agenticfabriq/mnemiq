@@ -23,6 +23,17 @@ _DOLLAR_TAG = "$q$"
 # relationships made from them, does not rest on DuckDB keeping `postgres_query`'s row order.
 _DECLARED_KEYS_ORDER = "from_table, key_position, constraint_name"
 
+# Where a DuckDB file records the foreign keys its source declared: a schema of its own, outside `main`, so no reader
+# of the source's tables takes it for one. `scripts/copy_oracle_to_duckdb.py` writes it; `foreign_keys` reads it.
+KEYS_SCHEMA = "mnemiq"
+KEYS_TABLE = "declared_keys"
+
+
+def _quoted(identifier: str) -> str:
+    """`identifier` as a DuckDB quoted identifier, an embedded double quote doubled."""
+    return '"' + identifier.replace('"', '""') + '"'
+
+
 # Every schema name a Postgres database stores. The configured schema is matched against them on
 # DuckDB's side, without regard to case, as `introspect` and `list_columns` match it.
 _PG_SCHEMAS = "SELECT nspname FROM pg_catalog.pg_namespace"
@@ -378,14 +389,15 @@ class DuckDBAdapter:
         A Postgres source is read by the statement the Superset catalogue reads keys with
         (`DECLARED_KEYS`), run whole in Postgres through `postgres_query`, in this adapter's own
         schema, by the name Postgres stores it under (`_stored_schema`): only keys declared there
-        whose target is there too, never a partition's copy of one. Only a Postgres source is read
-        for keys: a SQLite source, whose keys DuckDB's scanner does not expose, and a DuckDB file
-        return []. A read that fails returns [] as well, and enrichment infers relationships from
-        the data instead; it logs a WARNING naming the exception's type, never its text, which can
-        carry the DSN, or saying why the schema could not be resolved.
+        whose target is there too, never a partition's copy of one. A DuckDB file is read from its
+        `mnemiq.declared_keys` table when it holds one (`_declared_keys_table`), and reports none
+        when it does not. A SQLite source, whose keys DuckDB's scanner does not expose, returns [].
+        A read that fails returns [] as well, and enrichment infers relationships from the data
+        instead; it logs a WARNING naming the exception's type, never its text, which can carry
+        the DSN, or saying why the schema could not be resolved.
         """
         if not self._fk_via_postgres:
-            return []
+            return self._declared_keys_table() if self._attach_type == "DUCKDB" else []
         try:
             schema = self._stored_schema()
             rows = self._con.execute(
@@ -398,6 +410,31 @@ class DuckDBAdapter:
             logger.warning("the declared foreign keys of Postgres schema %r could not be read (%s); "
                            "relationships will be inferred from the data instead",
                            self._table_schema, why)
+            return []
+        return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
+
+    def _declared_keys_table(self) -> list[tuple[str, str, str, str, str]]:
+        """A DuckDB file's declared keys, from the table `scripts/copy_oracle_to_duckdb.py` writes them to.
+
+        DuckDB enforces no key a copy could carry over without refusing an orphan row, so the copy records Oracle's
+        declared keys as rows in `mnemiq.declared_keys` (`KEYS_SCHEMA`, `KEYS_TABLE`). It lives outside `main` so that
+        `introspect` and `list_columns`, which read only the configured schema, never enrich it as a table. Read only
+        when `information_schema.tables` holds it in this file's catalog; a file without one reports no keys. Ordered by
+        `from_table, constraint_name, from_column`, so a composite key's pairs come out in one order on every call."""
+        found = self._con.execute(
+            "SELECT table_catalog FROM information_schema.tables "
+            "WHERE lower(table_catalog) = lower(?) AND table_schema = ? AND table_name = ?",
+            [self._catalog, KEYS_SCHEMA, KEYS_TABLE]).fetchall()
+        if not found:
+            return []
+        try:
+            rows = self._con.execute(
+                "SELECT from_table, from_column, to_table, to_column, constraint_name "
+                f"FROM {_quoted(found[0][0])}.{KEYS_SCHEMA}.{KEYS_TABLE} "
+                "ORDER BY from_table, constraint_name, from_column").fetchall()
+        except Exception as exc:  # noqa: BLE001 -- a malformed table: enrichment falls back to inference
+            logger.warning("the declared foreign keys in %s.%s could not be read (%s); relationships will be "
+                           "inferred from the data instead", KEYS_SCHEMA, KEYS_TABLE, type(exc).__name__)
             return []
         return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
 
