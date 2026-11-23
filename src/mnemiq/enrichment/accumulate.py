@@ -19,9 +19,13 @@ logger = logging.getLogger(__name__)
 
 # Every Snapshot field and how a merge treats it. A field added to Snapshot later fails
 # `test_every_snapshot_field_has_a_merge_rule` until it is given a rule here, so --add never keeps or drops it silently.
-#   per_table      the kept entry for a kept table, the run's for the run's tables (by `object_id`)
+#   per_table      the run's entry for each object it holds or table it bound, the kept one for every other (by
+#                  `object_id`; a view need not be bound as a table)
+#   union          views: in the merge, as per_table with discovery done only if both runs' was; then discovered again
+#                  over the union by the caller (`union_views`), since a run discovers views only within its subset
 #   examples       a kept example survives only if it reads no table the run enriched again
-#   jobs           a per-table job goes with its table; source-level jobs are the run's, the partitions job is merged
+#   jobs           a per-table job (`profile:*`, `facts:<t>`) goes with its table; source-level jobs are the run's,
+#                  except the partitions and view-discovery jobs, which keep the weaker of the two runs'
 #   run            the run's, since it applied the current records, certified set and ontology
 #   relationships  re-derived over the union by the caller (`union_relationships`); here, a consistent interim
 #   version        recomputed by the caller (`content_version`)
@@ -31,7 +35,7 @@ MERGE_FIELDS: dict[str, str] = {
     "created_at": "run",
     "ontology_version": "run",
     "columns": "per_table",
-    "views": "per_table",
+    "views": "union",
     "dimensions": "run",
     "metrics": "run",
     "definitions": "run",
@@ -45,13 +49,17 @@ MERGE_FIELDS: dict[str, str] = {
     "examples": "examples",
     "certified_refs": "run",
 }
-_PER_TABLE = tuple(field for field, rule in MERGE_FIELDS.items() if rule == "per_table")
+_PER_TABLE = tuple(field for field, rule in MERGE_FIELDS.items() if rule in ("per_table", "union"))
+VIEWS_JOB = "discover:views"
 
 
 def _job_table(job: Job, known: set[str]) -> str | None:
-    """The table a per-table job is about, by the ids `enrich_structural` writes: `profile:<t>` (kind `profile`),
-    `profile:<t>.<column>` (`profile:column`) and `profile:<t>:exact` (`profile:exact`). None for a source-level job.
-    Matched against the known tables rather than split on the first dot, because a table name can hold one."""
+    """The table a per-table job is about, by the ids enrichment writes: `profile:<t>` (kind `profile`),
+    `profile:<t>.<column>` (`profile:column`), `profile:<t>:exact` (`profile:exact`) and `facts:<t>` (`facts`). None for
+    a source-level job. Matched against the known tables rather than split on the first dot, because a table name can
+    hold one."""
+    if job.kind == "facts" and job.id.startswith("facts:"):
+        return job.id[len("facts:"):]
     if job.id == PARTITIONS_JOB or not job.id.startswith("profile:"):
         return None
     rest = job.id[len("profile:"):]
@@ -103,7 +111,7 @@ def _merged_partitions(kept: Job | None, run: Job | None, run_tables: set[str], 
     return base.model_copy(update={"status": status, "detail": "; ".join(failures)[:2000] or None})
 
 
-def merge_snapshots(kept: Snapshot, run: Snapshot) -> tuple[Snapshot, list[str]]:
+def merge_run(kept: Snapshot, run: Snapshot) -> tuple[Snapshot, list[str]]:
     """`run`, a run over some of the source's tables, merged into `kept`, the source's latest snapshot. Returns the
     merged snapshot and the tables whose profile failed in this run but which `kept` still holds: those keep their
     earlier entries and job, so the caller warns about them rather than reporting them excluded."""
@@ -116,8 +124,9 @@ def merge_snapshots(kept: Snapshot, run: Snapshot) -> tuple[Snapshot, list[str]]
 
     update: dict[str, object] = {}
     for field in _PER_TABLE:
-        update[field] = ([entry for entry in getattr(kept, field) if entry.object_id in stay]
-                         + [entry for entry in getattr(run, field) if entry.object_id not in stay])
+        replaced = run_tables | {entry.object_id for entry in getattr(run, field)}
+        update[field] = ([entry for entry in getattr(kept, field) if entry.object_id not in replaced]
+                         + list(getattr(run, field)))
 
     def reads(example) -> set[str]:
         return set(example.tables or [example.object_id])
@@ -131,9 +140,18 @@ def merge_snapshots(kept: Snapshot, run: Snapshot) -> tuple[Snapshot, list[str]]
             jobs.append(job)
     for job in run.jobs:
         table = _job_table(job, known)
-        if job.id == PARTITIONS_JOB or (table is not None and table in stay):
+        if job.id in (PARTITIONS_JOB, VIEWS_JOB) or (table is not None and table in stay):
             continue
         jobs.append(job)
+    # View discovery is the run's over its subset only, so its `done` cannot vouch for a kept run whose discovery did
+    # not complete: the view floor reads this job (`inventory_for`), and a `done` over a partial inventory lets a
+    # row-filtered view through. Done only when both were; the caller then discovers again over the union.
+    discoveries = [next((j for j in snap.jobs if j.id == VIEWS_JOB), None) for snap in (kept, run)]
+    if any(j is not None for j in discoveries):
+        both = all(j is not None and j.status == "done" for j in discoveries)
+        base = next(j for j in reversed(discoveries) if j is not None)
+        jobs.append(base.model_copy(update={"status": "done" if both else "failed",
+                                            "detail": None if both else "a run's view discovery did not complete"}))
     partitions = _merged_partitions(next((j for j in kept.jobs if j.id == PARTITIONS_JOB), None),
                                     next((j for j in run.jobs if j.id == PARTITIONS_JOB), None), run_tables, known)
     if partitions is not None:
@@ -184,3 +202,33 @@ def union_relationships(union_adapter, snapshot: Snapshot, *,
         relationships, status = [], "failed"
     return relationships, Job(id="infer:relationships", source_id=snapshot.source_id, kind="join", status=status,
                               detail=_listed(failures))
+
+
+def views_spec(spec: SourceSpec, kept: Snapshot, snapshot: Snapshot) -> SourceSpec:
+    """`spec` scoped for discovering views again under --add: every table `snapshot` binds, every view either snapshot
+    already knows (a view need not be bound as a table), and the current manifest's own patterns, so the views this run
+    would have discovered alone are discovered too."""
+    known_views = sorted({v.object_id for v in kept.views} | {v.object_id for v in snapshot.views})
+    names = [*union_spec(spec, snapshot).tables, *(glob.escape(v) for v in known_views), *spec.tables]
+    return dataclasses.replace(spec, tables=tuple(dict.fromkeys(names)))
+
+
+def union_views(views_adapter, kept: Snapshot, snapshot: Snapshot) -> tuple[list, Job]:
+    """The views of the merged snapshot, discovered again through `views_adapter` (`views_spec`), and the
+    `discover:views` job. Failed when the source does not answer, as `enrich_structural` records it, and failed too while
+    the kept snapshot's own discovery never completed: that run's scope is not recorded, so a fresh discovery over the
+    union cannot know it covered those views, and the view floor must keep refusing until a run without --add does."""
+    from mnemiq.contract.semantic import ViewDefinition
+
+    try:
+        views = [ViewDefinition(object_id=name, definition=body, dialect=dialect)
+                 for name, body, dialect in views_adapter.view_definitions()]
+        status, detail = "done", None
+    except Exception as exc:  # noqa: BLE001 -- as enrich_structural: no answer leaves the inventory unavailable
+        logger.warning("the views across the merged tables could not be read (%s)", type(exc).__name__)
+        views, status, detail = [], "failed", None
+    kept_job = next((j for j in kept.jobs if j.id == VIEWS_JOB), None)
+    if status == "done" and (kept_job is None or kept_job.status != "done"):
+        status, detail = "failed", ("an earlier run's view discovery did not complete and its scope is not recorded: "
+                                    "enrich without --add to discover the views again")
+    return views, Job(id=VIEWS_JOB, source_id=snapshot.source_id, kind="discover", status=status, detail=detail)

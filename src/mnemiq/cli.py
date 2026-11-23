@@ -604,30 +604,37 @@ def _cmd_enrich(settings: Settings, add: bool = False) -> int:
         )
     from mnemiq.enrichment.deadline import EnrichDeadline, time_limit_job, time_limit_warning
 
-    union = None
+    union = union_for_views = None
     if kept is not None:
         # --add: the run's tables replace their entries in the latest snapshot, every other table keeps its own. The
         # joins are read again over all of them through an adapter scoped to the union, built as the run's is: the
         # run's own sees only its subset, and its scoped view keeps only keys with both ends in it.
         from mnemiq.adapters.resolve import adapter_for
-        from mnemiq.enrichment.accumulate import merge_snapshots, union_relationships, union_spec
+        from mnemiq.enrichment.accumulate import merge_run, union_relationships, union_spec, union_views, views_spec
 
-        snap, kept_failed = merge_snapshots(kept, snap)
+        snap, kept_failed = merge_run(kept, snap)
         for table in kept_failed:
             print(f"WARNING: source {spec.id!r}: {table} is kept from the earlier run: its profile failed in this one",
                   file=sys.stderr)
-        union = EnrichDeadline(adapter_for(union_spec(spec, snap), settings,
-                                           statement_timeout_s=settings.enrich_statement_timeout_s or None),
-                               settings.enrich_statement_timeout_s)
+        def scoped(view_of):
+            return EnrichDeadline(adapter_for(view_of, settings,
+                                              statement_timeout_s=settings.enrich_statement_timeout_s or None),
+                                  settings.enrich_statement_timeout_s)
+
+        union = scoped(union_spec(spec, snap))
         relationships, join_job = union_relationships(union, snap, harvest_values=not superset)
-        snap = snap.model_copy(update={"relationships": relationships,
-                                       "jobs": [*(j for j in snap.jobs if j.id != join_job.id), join_job]})
+        # Views too: the view floor reads `discover:views`, and the run discovered views only within its subset.
+        union_for_views = scoped(views_spec(spec, kept, snap))
+        views, views_job = union_views(union_for_views, kept, snap)
+        snap = snap.model_copy(update={"relationships": relationships, "views": views,
+                                       "jobs": [*(j for j in snap.jobs if j.id not in (join_job.id, views_job.id)),
+                                                join_job, views_job]})
         snap.version = content_version(snap)
 
     # What the statement time limit cut before the save, on the snapshot; the closing warning names the value index's too.
     # Under --add the union's reads are cut by the same limit, and one job names both.
-    cuts = [c for c in (time_limit_job(adapter, snap.source_id),
-                        time_limit_job(union, snap.source_id) if union is not None else None) if c is not None]
+    cuts = [c for c in (time_limit_job(a, snap.source_id) for a in (adapter, union, union_for_views) if a is not None)
+            if c is not None]
     if cuts:
         cut = cuts[0].model_copy(update={"detail": "; ".join(c.detail for c in cuts if c.detail) or None})
         snap = snap.model_copy(update={"jobs": [*snap.jobs, cut]})
@@ -698,8 +705,9 @@ def _cmd_enrich(settings: Settings, add: bool = False) -> int:
 
     if warning := partition_warning(snap):
         print(warning, file=sys.stderr)
-    if union is not None and (union_warning := time_limit_warning(union, snap.source_id)):
-        print(union_warning, file=sys.stderr)
+    for extra in (union, union_for_views):
+        if extra is not None and (extra_warning := time_limit_warning(extra, snap.source_id)):
+            print(extra_warning, file=sys.stderr)
     if warning := time_limit_warning(adapter, snap.source_id):
         print(warning, file=sys.stderr)
     return 0

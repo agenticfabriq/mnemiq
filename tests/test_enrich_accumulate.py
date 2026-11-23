@@ -6,7 +6,7 @@ import pytest
 
 from mnemiq.contract import Column, Snapshot, SourceBinding
 from mnemiq.contract.semantic import Example, Job, Quality, TableFacts, ViewDefinition
-from mnemiq.enrichment.accumulate import MERGE_FIELDS, merge_snapshots
+from mnemiq.enrichment.accumulate import MERGE_FIELDS, merge_run
 from mnemiq.sql.fanout_check import PARTITIONS_JOB
 
 
@@ -37,7 +37,7 @@ def test_every_snapshot_field_has_a_merge_rule():
 
 
 def test_kept_tables_keep_their_descriptions():
-    merged, kept_failed = merge_snapshots(_snap({"a": "kept-a"}), _snap({"b": "run-b"}))
+    merged, kept_failed = merge_run(_snap({"a": "kept-a"}), _snap({"b": "run-b"}))
     assert {b.object_id for b in merged.source_bindings} == {"a", "b"}
     assert _described(merged, "a") == "kept-a"
     assert _described(merged, "b") == "run-b"
@@ -55,7 +55,7 @@ def test_re_adding_a_table_replaces_every_per_table_entry():
         "qualities": [Quality(id="q:a", object_id="a", name="n", status="ok", threshold="1", observed_value="1")]})
     run = _snap({"a": "new-a"}, facts=[TableFacts(object_id="a", grain="new grain")],
                 examples=[Example(question="new a?", sql="SELECT 2 FROM a", tables=["a"], object_id="a")])
-    merged, _ = merge_snapshots(kept, run)
+    merged, _ = merge_run(kept, run)
 
     assert [c.description for c in merged.columns if c.object_id == "a"] == ["new-a"]
     assert [f.grain for f in merged.table_facts if f.object_id == "a"] == ["new grain"]
@@ -70,14 +70,14 @@ def test_an_example_reading_a_re_added_table_is_dropped_even_when_it_belongs_to_
     kept = _snap({"a": "a", "c": "c"},
                  examples=[Example(question="a and c?", sql="SELECT 1 FROM c JOIN a", tables=["c", "a"],
                                    object_id="c")])
-    merged, _ = merge_snapshots(kept, _snap({"a": "a2"}))
+    merged, _ = merge_run(kept, _snap({"a": "a2"}))
     assert merged.examples == []
 
 
 def test_a_re_added_table_whose_profile_failed_keeps_its_earlier_enrichment():
     kept = _snap({"a": "kept-a"})
     run = _snap({}, jobs=[Job(id="profile:a", source_id="src", kind="profile", status="failed", detail="boom")])
-    merged, kept_failed = merge_snapshots(kept, run)
+    merged, kept_failed = merge_run(kept, run)
 
     assert _described(merged, "a") == "kept-a"
     assert [j.status for j in merged.jobs if j.id == "profile:a"] == ["done"]
@@ -86,7 +86,7 @@ def test_a_re_added_table_whose_profile_failed_keeps_its_earlier_enrichment():
 
 def test_a_new_table_whose_profile_failed_keeps_the_runs_failed_job():
     run = _snap({}, jobs=[Job(id="profile:b", source_id="src", kind="profile", status="failed", detail="boom")])
-    merged, kept_failed = merge_snapshots(_snap({"a": "kept-a"}), run)
+    merged, kept_failed = merge_run(_snap({"a": "kept-a"}), run)
     assert [j.status for j in merged.jobs if j.id == "profile:b"] == ["failed"]
     assert kept_failed == []
 
@@ -99,7 +99,7 @@ def test_a_new_table_whose_profile_failed_keeps_the_runs_failed_job():
     (("done", None), ("partial", "b.flag: boom"), "partial"),
 ])
 def test_the_partitions_job_reports_the_weaker_of_the_two_runs(kept, run, expected):
-    merged, _ = merge_snapshots(_snap({"c": "c"}, partitions=kept), _snap({"b": "b"}, partitions=run))
+    merged, _ = merge_run(_snap({"c": "c"}, partitions=kept), _snap({"b": "b"}, partitions=run))
     (job,) = [j for j in merged.jobs if j.id == PARTITIONS_JOB]
     assert job.status == expected
 
@@ -108,11 +108,11 @@ def test_a_kept_partition_failure_goes_once_its_table_is_profiled_again():
     # The warning names the tables whose current-row joins the guard will refuse; a table this run profiled again
     # no longer belongs in it.
     kept = _snap({"a": "a", "c": "c"}, partitions=("partial", "a.flag: boom; c.flag: bang"))
-    merged, _ = merge_snapshots(kept, _snap({"a": "a2"}, partitions=("done", None)))
+    merged, _ = merge_run(kept, _snap({"a": "a2"}, partitions=("done", None)))
     (job,) = [j for j in merged.jobs if j.id == PARTITIONS_JOB]
     assert (job.status, job.detail) == ("partial", "c.flag: bang")
 
-    merged, _ = merge_snapshots(_snap({"a": "a"}, partitions=("partial", "a.flag: boom")),
+    merged, _ = merge_run(_snap({"a": "a"}, partitions=("partial", "a.flag: boom")),
                                 _snap({"a": "a2"}, partitions=("done", None)))
     (job,) = [j for j in merged.jobs if j.id == PARTITIONS_JOB]
     assert (job.status, job.detail) == ("done", None)
@@ -123,7 +123,7 @@ def test_the_runs_global_entries_win():
 
     kept = _snap({"a": "a"}, definitions=[Definition(id="d:old", term="old", domain="x", definition="old")])
     run = _snap({"b": "b"}, definitions=[Definition(id="d:new", term="new", domain="x", definition="new")])
-    merged, _ = merge_snapshots(kept, run)
+    merged, _ = merge_run(kept, run)
     assert [d.id for d in merged.definitions] == ["d:new"]
     assert merged.created_at == run.created_at
 
@@ -166,7 +166,7 @@ def _accumulate(inner, path, *runs):
     """Each run over its own subset, merged in order, then joins over the union."""
     merged = runs[0]
     for run in runs[1:]:
-        merged, _ = merge_snapshots(merged, run)
+        merged, _ = merge_run(merged, run)
     union = TableScopedAdapter(inner, union_spec(_spec(path, ()), merged).tables, "shop")
     return union_relationships(union, merged, harvest_values=True)
 
@@ -202,9 +202,9 @@ def test_a_kept_table_keeps_its_own_runs_profile_mode(shop_path):
     inner = _Recording(SQLiteAdapter(shop_path))
     exact_customers = _run(inner, ("customers",))
     estimated_orders = _run(inner, ("orders",), statistics=())
-    merged, _ = merge_snapshots(exact_customers, estimated_orders)
+    merged, _ = merge_run(exact_customers, estimated_orders)
     assert estimated_tables(merged) == frozenset({"orders"})
-    merged, _ = merge_snapshots(estimated_orders, exact_customers)
+    merged, _ = merge_run(estimated_orders, exact_customers)
     assert estimated_tables(merged) == frozenset({"orders"})
 
 
@@ -235,3 +235,82 @@ def test_joins_within_one_subset_and_across_subsets_are_all_kept(shop_path):
     relationships, _ = _accumulate(inner, shop_path, first, _run(inner, ("orders",)), _run(inner, ("customers",)))
     pairs = [(r.from_, r.to) for r in relationships]
     assert ("order_lines", "product") in pairs and ("orders", "customers") in pairs
+
+
+# Views. `discover:views` covers a source: done only once the source answered for every view in scope, and the view
+# floor relies on it (`inventory_for`, `check_views`). A run discovers views within its own subset, so its `done` cannot
+# vouch for an earlier run whose discovery failed: taken as the merged status, it let a row-filtered view through
+# (Codex's adversarial review of --add).
+import sqlglot  # noqa: E402
+
+from mnemiq.contract.semantic import Job as _Job  # noqa: E402
+from mnemiq.enrichment.accumulate import union_views, views_spec  # noqa: E402
+from mnemiq.sql.verdict import RefusalCode  # noqa: E402
+from mnemiq.sql.views import check_views, inventory_for  # noqa: E402
+
+CLAIM_V_SQL = sqlglot.parse_one("SELECT id, amount FROM claim_v", read="duckdb")
+
+
+def _discovery(status: str) -> _Job:
+    return _Job(id="discover:views", source_id="src", kind="discover", status=status)
+
+
+@pytest.fixture
+def claims_path(tmp_path):
+    path = tmp_path / "claims.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript("""
+        CREATE TABLE claim (id INTEGER PRIMARY KEY, region TEXT, amount REAL);
+        CREATE TABLE other (x INTEGER);
+        CREATE VIEW claim_v AS SELECT id, region, amount FROM claim;
+        INSERT INTO claim VALUES (1, 'west', 10.0), (2, 'east', 20.0);
+        INSERT INTO other VALUES (1);
+    """)
+    con.commit()
+    con.close()
+    return str(path)
+
+
+def test_a_successful_subset_cannot_clear_an_earlier_view_discovery_failure():
+    kept = _snap({"claim": "c", "claim_v": "v"}, jobs=[_discovery("failed")])
+    merged, _ = merge_run(kept, _snap({"other": "o"}, jobs=[_discovery("done")]))
+    refusal = check_views(CLAIM_V_SQL, inventory_for(merged), {"claim"})
+    assert refusal is not None and refusal.code is RefusalCode.VIEW_INVENTORY_UNAVAILABLE
+
+
+def test_a_kept_view_not_bound_as_a_table_stays_in_the_interim_inventory():
+    kept = _snap({"claim": "c"}, jobs=[_discovery("done")]).model_copy(update={"views": [
+        ViewDefinition(object_id="claim_v", definition="SELECT id, region, amount FROM claim", dialect="duckdb")]})
+    merged, _ = merge_run(kept, _snap({"other": "o"}, jobs=[_discovery("done")]))
+    refusal = check_views(CLAIM_V_SQL, inventory_for(merged), {"claim"})
+    assert refusal is not None and refusal.code is RefusalCode.UNGOVERNED_VIEW
+
+
+def test_views_are_discovered_again_over_the_union(claims_path):
+    inner = SQLiteAdapter(claims_path)
+    first = _run(inner, ("claim*",))
+    assert "claim_v" in {v.object_id for v in first.views}
+    merged, _ = merge_run(first, _run(inner, ("other",)))
+    scoped = TableScopedAdapter(inner, views_spec(_spec(claims_path, ("other",)), first, merged).tables, "shop")
+    views, job = union_views(scoped, first, merged)
+    assert "claim_v" in {v.object_id for v in views} and (job.id, job.status) == ("discover:views", "done")
+    final = merged.model_copy(update={"views": views, "jobs": [*(j for j in merged.jobs if j.id != job.id), job]})
+    refusal = check_views(CLAIM_V_SQL, inventory_for(final), {"claim"})
+    assert refusal is not None and refusal.code is RefusalCode.UNGOVERNED_VIEW, "the view floor still fires"
+
+
+def test_union_views_stays_failed_while_an_earlier_discovery_never_completed(claims_path):
+    # The earlier run's scope is not recorded, so a fresh discovery over the union cannot know it covered those views.
+    kept = _snap({"claim": "c"}, jobs=[_discovery("failed")])
+    merged, _ = merge_run(kept, _snap({"other": "o"}, jobs=[_discovery("done")]))
+    _views, job = union_views(SQLiteAdapter(claims_path), kept, merged)
+    assert job.status == "failed" and "without --add" in (job.detail or "")
+
+
+def test_a_kept_tables_facts_job_stays_and_a_re_added_tables_is_replaced():
+    facts = [_Job(id="facts:a", source_id="src", kind="facts", status="failed"),
+             _Job(id="facts:c", source_id="src", kind="facts", status="done")]
+    run = _snap({"a": "a2"}, jobs=[_Job(id="facts:a", source_id="src", kind="facts", status="done")])
+    merged, _ = merge_run(_snap({"a": "a", "c": "c"}, jobs=facts), run)
+    assert sorted((j.id, j.status) for j in merged.jobs if j.kind == "facts") == [("facts:a", "done"),
+                                                                                    ("facts:c", "done")]

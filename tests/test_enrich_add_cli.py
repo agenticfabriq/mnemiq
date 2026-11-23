@@ -116,3 +116,21 @@ def test_the_command_line_flag_reaches_enrich(monkeypatch):
     cli_seen = seen.pop("add")
     cli.main(["enrich"])
     assert (cli_seen, seen["add"]) == (True, False)
+
+
+def test_add_discovers_views_again_and_keeps_an_earlier_failure_visible(shop, monkeypatch):
+    # The view floor reads `discover:views` (`inventory_for`): the --add run's own discovery covers only its subset, so
+    # an earlier failure must survive it, and the job must be the union pass's, not the subset's.
+    _path, settings, _runs = shop
+
+    def unanswered(self):
+        raise RuntimeError("the source did not answer")
+
+    with monkeypatch.context() as m:
+        m.setattr(SQLiteAdapter, "view_definitions", unanswered)
+        assert _cmd_enrich(settings(["orders"])) == 0
+    assert next(j for j in _latest(settings(["orders"])).jobs if j.id == "discover:views").status == "failed"
+
+    assert _cmd_enrich(settings(["customers"]), add=True) == 0
+    job = next(j for j in _latest(settings(["customers"])).jobs if j.id == "discover:views")
+    assert job.status == "failed" and "without --add" in (job.detail or "")
