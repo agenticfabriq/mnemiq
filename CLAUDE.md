@@ -42,10 +42,11 @@ machine for names on a private blocklist.
   else from this checkout's own `./.env` (never the main checkout's), so a worktree needs its own
   `.env` unless the variable is exported. A contributor sets it to `off`, as `.env.example` does,
   which turns the name check off. Only when neither gives a value is every commit blocked.
-- On a maintainer's machine, check the commit hook's guard line reads `clean (names, secrets, home
-  paths)`. (The `--range` run always skips names and says so.) If the hook prints
-  `proprietary-name check off` instead, this checkout has no list (a worktree whose `.env`
-  was copied from `.env.example`, say), and its commits are not checked for names.
+- On a maintainer's machine, check the commit hook's guard line reads `clean (names, identities,
+  secrets, home paths)`. (The `--range` run always skips names and says so.) If the hook prints
+  `proprietary-name check off` or `identity check off` instead, this checkout has no such list (a
+  worktree whose `.env` was copied from `.env.example`, say), and its commits are not checked for
+  names or identities.
 - CI skips the name check, because a public log would reveal the list.
 - It also checks who each commit says made it: the author and committer against a private identity
   list, `REPO_GUARD_IDENTITY_PATTERNS`, read like the name list (`off` for a contributor; unset blocks
