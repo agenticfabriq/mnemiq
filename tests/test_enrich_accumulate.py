@@ -351,3 +351,22 @@ def test_a_view_discovery_the_source_did_not_answer_says_so():
     merged, _ = merge_run(kept, _snap({"other": "o"}, jobs=[_discovery("done")]))
     _views, job = union_views(Silent(), kept, merged)
     assert job.status == "failed" and "TimeoutError" in (job.detail or "")
+
+
+def test_a_kept_tables_semantic_job_stays_with_it():
+    # Codex's fourth review: a failed description job is what the closing report warns from, and what says to retry.
+    kept = _snap({"orders": "", "c": "c"},
+                 jobs=[_Job(id="semantic:orders", source_id="src", kind="semantic", status="failed",
+                            detail="TimeoutError")])
+    merged, _ = merge_run(kept, _snap({"customers": "x"}))
+    assert [(j.id, j.status) for j in merged.jobs if j.id.startswith("semantic:")] == [("semantic:orders", "failed")]
+
+
+def test_a_per_table_job_of_any_kind_goes_with_its_table_and_source_jobs_stay_the_runs():
+    kept = _snap({"a": "a", "a.b": "ab"}, jobs=[_Job(id="newkind:a.b", source_id="src", kind="newkind", status="done"),
+                                                _Job(id="infer:relationships", source_id="src", kind="join",
+                                                     status="failed")])
+    run = _snap({"a": "a2"}, jobs=[_Job(id="infer:relationships", source_id="src", kind="join", status="done")])
+    merged, _ = merge_run(kept, run)
+    assert ("newkind:a.b", "done") in [(j.id, j.status) for j in merged.jobs], "a.b stays, so its job does"
+    assert [(j.id, j.status) for j in merged.jobs if j.id == "infer:relationships"] == [("infer:relationships", "done")]

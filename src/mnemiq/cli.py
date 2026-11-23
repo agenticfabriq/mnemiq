@@ -639,6 +639,9 @@ def _cmd_enrich(settings: Settings, add: bool = False) -> int:
         snap = snap.model_copy(update={"relationships": relationships, "views": views,
                                        "jobs": [*(j for j in snap.jobs if j.id not in (join_job.id, views_job.id)),
                                                 join_job, views_job]})
+        # Lookup grounding reads a code's meaning across a join, and no single run saw a join between subsets: grounded
+        # again over the union (estimated tables left out, as in a run), before the overlays that outrank it.
+        snap = ground_codes(union, snap, dictionary=None, ontology=_onto)
         # The certified set and the dictionary reached only the run's subset; laid again over every table, after the
         # join pass so the certified joins it dropped come back.
         snap = reapply_overlays(snap, _certified_set, _dict)

@@ -196,3 +196,24 @@ def test_add_refuses_before_any_model_call_when_the_ontology_changed(shop, capsy
     assert _cmd_enrich(settings(["orders"]), add=True) == 1
     assert "ontology" in capsys.readouterr().err
     assert runs == ["called"], "refused before the second run's model calls"
+
+
+LOOKUP = """
+CREATE TABLE status (id INTEGER PRIMARY KEY, label TEXT);
+CREATE TABLE tickets (id INTEGER PRIMARY KEY, status_id INTEGER REFERENCES status(id));
+INSERT INTO status VALUES (1, 'Open'), (2, 'Closed');
+INSERT INTO tickets VALUES (1, 1), (2, 2), (3, 1), (4, 1);
+"""
+
+
+def test_codes_are_grounded_from_a_lookup_table_enriched_in_another_subset(shop):
+    # Codex's fourth review: lookup grounding reads a code's meaning across a join, and no single run saw this one.
+    path, settings, _runs = shop
+    con = sqlite3.connect(path)
+    con.executescript(LOOKUP)
+    con.commit()
+    con.close()
+    assert _cmd_enrich(settings(["status"])) == 0
+    assert _cmd_enrich(settings(["tickets"]), add=True) == 0
+    column = next(c for c in _latest(settings(["tickets"])).columns if c.id == "tickets.status_id")
+    assert {(cv.code, cv.meaning) for cv in column.coded_values} >= {("1", "Open"), ("2", "Closed")}

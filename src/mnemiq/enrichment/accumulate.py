@@ -53,24 +53,21 @@ _PER_TABLE = tuple(field for field, rule in MERGE_FIELDS.items() if rule in ("pe
 VIEWS_JOB = "discover:views"
 
 
+# Jobs about the whole source: the run's, except the partitions and view-discovery jobs, which merge_run reconciles.
+# Every other job whose id names a table after its kind (`profile:<t>`, `profile:<t>.<column>`, `profile:<t>:exact`,
+# `facts:<t>`, `semantic:<t>`, and any kind added later) goes with that table, so a kept table keeps its record of what
+# failed, which the closing report warns from (Codex's fourth review found `semantic:<t>` dropped).
+_SOURCE_JOBS = frozenset({"infer:relationships", VIEWS_JOB, PARTITIONS_JOB, "superset:source", "enrich:time-limit"})
+
+
 def _job_table(job: Job, known: set[str]) -> str | None:
-    """The table a per-table job is about, by the ids enrichment writes: `profile:<t>` (kind `profile`),
-    `profile:<t>.<column>` (`profile:column`), `profile:<t>:exact` (`profile:exact`) and `facts:<t>` (`facts`). None for
-    a source-level job. Matched against the known tables rather than split on the first dot, because a table name can
-    hold one."""
-    if job.kind == "facts" and job.id.startswith("facts:"):
-        return job.id[len("facts:"):]
-    if job.id == PARTITIONS_JOB or not job.id.startswith("profile:"):
+    """The table a per-table job is about, or None for a job about the whole source. Matched against the known tables
+    rather than split on a dot, because a table name can hold one: the longest table the id names after its kind."""
+    if job.id in _SOURCE_JOBS or job.id.startswith("certified:") or ":" not in job.id:
         return None
-    rest = job.id[len("profile:"):]
-    if job.kind == "profile":
-        return rest
-    if job.kind == "profile:exact" and rest.endswith(":exact"):
-        return rest[: -len(":exact")]
-    if job.kind == "profile:column":
-        matches = [t for t in known if rest.startswith(f"{t}.")]
-        return max(matches, key=len) if matches else None
-    return None
+    rest = job.id.split(":", 1)[1]
+    matches = [t for t in known if rest == t or rest.startswith(f"{t}.") or rest.startswith(f"{t}:")]
+    return max(matches, key=len) if matches else None
 
 
 def _failure_entries(detail: str | None, known: set[str]) -> list[tuple[str | None, str]]:
