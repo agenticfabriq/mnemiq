@@ -53,3 +53,13 @@ def test_the_workflow_checks_the_tag_before_it_packs_the_frontend_and_publishes(
     assert order == sorted(order), order
     packing = text[text.index("scripts/build_superset_extension.py"):].split("\n", 1)[0]
     assert "--require-frontend" in packing
+
+
+def test_the_workflow_publishes_only_a_commit_on_main_that_the_tag_still_names():
+    """A tag on a commit not on main is refused before anything is built, and the release is made only while the tag,
+    as GitHub resolves it, still names the commit built; releases of one tag run one at a time."""
+    text = WORKFLOW.read_text()
+    assert "fetch-depth: 0" in text and "concurrency:" in text
+    on_main = text.index('git merge-base --is-ancestor "$GITHUB_SHA" origin/main')
+    tag_still = text.index('"$GITHUB_SHA"', text.index("commits/$TAG"))
+    assert on_main < text.index("pnpm install") and tag_still < text.index("gh release create")

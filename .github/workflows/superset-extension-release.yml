@@ -10,11 +10,23 @@ on:
 permissions:
   contents: write
 
+# One release of a tag at a time: a tag moved while its first build runs waits for it.
+concurrency:
+  group: superset-extension-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The tagged commit is on main
+        run: |
+          git fetch --quiet origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "the tagged commit $GITHUB_SHA is not on main: tag a commit main holds"; exit 1; }
       - name: The tag names the manifest's version
         id: bundle
         env:
@@ -50,6 +62,9 @@ jobs:
           TAG: ${{ github.ref_name }}
           BUNDLE: ${{ steps.bundle.outputs.file }}
         run: |
+          # The tag, as GitHub resolves it now, must still name the commit built: a tag moved since gets no bundle.
+          named="$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)"
+          test "$named" = "$GITHUB_SHA" || { echo "the tag $TAG now names $named, not the built $GITHUB_SHA"; exit 1; }
           {
             cat integrations/superset/RELEASE_NOTES.md
             echo
