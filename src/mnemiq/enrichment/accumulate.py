@@ -207,7 +207,10 @@ def union_relationships(union_adapter, snapshot: Snapshot, *,
 def views_spec(spec: SourceSpec, kept: Snapshot, snapshot: Snapshot) -> SourceSpec:
     """`spec` scoped for discovering views again under --add: every table `snapshot` binds, every view either snapshot
     already knows (a view need not be bound as a table), and the current manifest's own patterns, so the views this run
-    would have discovered alone are discovered too."""
+    would have discovered alone are discovered too. A manifest with no `tables` means the whole source, and stays so:
+    narrowed to known names, a view no earlier run saw would drop out of a discovery then recorded done."""
+    if not spec.tables:
+        return spec
     known_views = sorted({v.object_id for v in kept.views} | {v.object_id for v in snapshot.views})
     names = [*union_spec(spec, snapshot).tables, *(glob.escape(v) for v in known_views), *spec.tables]
     return dataclasses.replace(spec, tables=tuple(dict.fromkeys(names)))
@@ -226,7 +229,8 @@ def union_views(views_adapter, kept: Snapshot, snapshot: Snapshot) -> tuple[list
         status, detail = "done", None
     except Exception as exc:  # noqa: BLE001 -- as enrich_structural: no answer leaves the inventory unavailable
         logger.warning("the views across the merged tables could not be read (%s)", type(exc).__name__)
-        views, status, detail = [], "failed", None
+        views, status = [], "failed"
+        detail = f"the source did not answer when its views were read ({type(exc).__name__}): enrich again"
     kept_job = next((j for j in kept.jobs if j.id == VIEWS_JOB), None)
     if status == "done" and (kept_job is None or kept_job.status != "done"):
         status, detail = "failed", ("an earlier run's view discovery did not complete and its scope is not recorded: "

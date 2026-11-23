@@ -314,3 +314,40 @@ def test_a_kept_tables_facts_job_stays_and_a_re_added_tables_is_replaced():
     merged, _ = merge_run(_snap({"a": "a", "c": "c"}, jobs=facts), run)
     assert sorted((j.id, j.status) for j in merged.jobs if j.kind == "facts") == [("facts:a", "done"),
                                                                                     ("facts:c", "done")]
+
+
+def _views_adapter(path: str, spec: SourceSpec):
+    """As the CLI builds it: `adapter_for` scopes only when the spec lists tables."""
+    inner = SQLiteAdapter(path)
+    return TableScopedAdapter(inner, spec.tables, "shop") if spec.tables else inner
+
+
+def test_an_unrestricted_manifest_discovers_every_view_again_and_a_chained_add_keeps_it(claims_path):
+    # Codex's second review: no "tables" means the whole source, and narrowing the retry to known names let a view no
+    # earlier run had seen (unbound, here created after it) drop out of a discovery then recorded done.
+    kept = _snap({"claim": "c"}, jobs=[_discovery("done")])
+    run = _snap({"other": "o"}, jobs=[_discovery("failed")])
+    merged, _ = merge_run(kept, run)
+    spec = views_spec(_spec(claims_path, ()), kept, merged)
+    assert spec.tables == (), "an unrestricted manifest stays unrestricted"
+    views, job = union_views(_views_adapter(claims_path, spec), kept, merged)
+    final = merged.model_copy(update={"views": views, "jobs": [*(j for j in merged.jobs if j.id != job.id), job]})
+    refusal = check_views(CLAIM_V_SQL, inventory_for(final), {"claim"})
+    assert refusal is not None and refusal.code is RefusalCode.UNGOVERNED_VIEW
+
+    # A chained --add over a narrower manifest still discovers it: the view is known now.
+    later, _ = merge_run(final, _snap({"other": "o2"}, jobs=[_discovery("done")]))
+    spec = views_spec(_spec(claims_path, ("other",)), final, later)
+    views, job = union_views(_views_adapter(claims_path, spec), final, later)
+    assert "claim_v" in {v.object_id for v in views} and job.status == "done"
+
+
+def test_a_view_discovery_the_source_did_not_answer_says_so():
+    class Silent:
+        def view_definitions(self):
+            raise TimeoutError("no answer")
+
+    kept = _snap({"claim": "c"}, jobs=[_discovery("done")])
+    merged, _ = merge_run(kept, _snap({"other": "o"}, jobs=[_discovery("done")]))
+    _views, job = union_views(Silent(), kept, merged)
+    assert job.status == "failed" and "TimeoutError" in (job.detail or "")

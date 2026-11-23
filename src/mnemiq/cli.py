@@ -607,8 +607,9 @@ def _cmd_enrich(settings: Settings, add: bool = False) -> int:
     union = union_for_views = None
     if kept is not None:
         # --add: the run's tables replace their entries in the latest snapshot, every other table keeps its own. The
-        # joins are read again over all of them through an adapter scoped to the union, built as the run's is: the
-        # run's own sees only its subset, and its scoped view keeps only keys with both ends in it.
+        # joins are read again over all of them through an adapter scoped to the union, built as the run's is (its
+        # reads under the statement time limit): the run's own sees only its subset, and its scoped view keeps only
+        # keys with both ends in it. Views are discovered again the way the run discovers them.
         from mnemiq.adapters.resolve import adapter_for
         from mnemiq.enrichment.accumulate import merge_run, union_relationships, union_spec, union_views, views_spec
 
