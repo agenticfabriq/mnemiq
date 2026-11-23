@@ -1,0 +1,59 @@
+name: superset-extension-release
+
+# A tag `superset-extension-v<version>` publishes the Superset extension built from the tagged commit: the tag checked
+# against the manifest's version, the panel built and tested as CI does, the bundle packed with its frontend, and the
+# bundle and its SHA-256 attached to a GitHub Release for that tag.
+on:
+  push:
+    tags: ["superset-extension-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag names the manifest's version
+        id: bundle
+        env:
+          TAG: ${{ github.ref_name }}
+        run: echo "file=$(python3 scripts/check_extension_release.py "$TAG")" >> "$GITHUB_OUTPUT"
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: integrations/superset/frontend/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: integrations/superset/frontend/pnpm-lock.yaml
+      - name: The panel, built and tested
+        working-directory: integrations/superset/frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm typecheck
+          pnpm test
+          pnpm build
+          pnpm test:bundle
+      - name: The extension, packed with its frontend
+        env:
+          BUNDLE: ${{ steps.bundle.outputs.file }}
+        run: |
+          python3 scripts/build_superset_extension.py --out build/superset-extension --require-frontend
+          cd build/superset-extension
+          test -f "$BUNDLE"
+          sha256sum "$BUNDLE" > "$BUNDLE.sha256"
+      - name: The release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          BUNDLE: ${{ steps.bundle.outputs.file }}
+        run: |
+          {
+            cat integrations/superset/RELEASE_NOTES.md
+            echo
+            echo "Built from \`$GITHUB_SHA\`: run the mnemiq server from the same commit."
+          } > release-notes.md
+          gh release create "$TAG" "build/superset-extension/$BUNDLE" "build/superset-extension/$BUNDLE.sha256" \
+            --verify-tag --title "Superset extension ${TAG#superset-extension-v}" --notes-file release-notes.md
