@@ -6,9 +6,16 @@ descriptions included, which are the expensive part to redo.
 """
 from __future__ import annotations
 
-from mnemiq.contract import Snapshot
+import dataclasses
+import glob
+import logging
+
+from mnemiq.config import SourceSpec
+from mnemiq.contract import Relationship, Snapshot
 from mnemiq.contract.semantic import Job
 from mnemiq.sql.fanout_check import PARTITIONS_JOB
+
+logger = logging.getLogger(__name__)
 
 # Every Snapshot field and how a merge treats it. A field added to Snapshot later fails
 # `test_every_snapshot_field_has_a_merge_rule` until it is given a rule here, so --add never keeps or drops it silently.
@@ -138,3 +145,42 @@ def merge_snapshots(kept: Snapshot, run: Snapshot) -> tuple[Snapshot, list[str]]
     update["relationships"] = ([r for r in kept.relationships if r.from_ in stay and r.to in stay]
                                + list(run.relationships))
     return run.model_copy(update=update, deep=True), kept_failed
+
+
+def estimated_tables(snapshot: Snapshot) -> frozenset[str]:
+    """The tables profiled from the source's statistics, each as its own run recorded it (`profile:<t>` done with detail
+    "estimated"), never by the current run's `exact_tables`: a table kept from an exact run stays measured."""
+    return frozenset(j.id.removeprefix("profile:") for j in snapshot.jobs
+                     if j.kind == "profile" and j.status == "done" and j.detail == "estimated")
+
+
+def union_spec(spec: SourceSpec, snapshot: Snapshot) -> SourceSpec:
+    """`spec` scoped to every table `snapshot` binds. Each name is escaped, because the manifest's `tables` are matched
+    as patterns: a table named `a[1]` would otherwise also match `a1`."""
+    return dataclasses.replace(spec, tables=tuple(glob.escape(t) for t in
+                                                  sorted(b.object_id for b in snapshot.source_bindings)))
+
+
+def union_relationships(union_adapter, snapshot: Snapshot, *,
+                        harvest_values: bool) -> tuple[list[Relationship], Job]:
+    """The joins of the merged snapshot's tables, read again through `union_adapter`, which the caller scopes to them
+    (`union_spec`): declared keys from the source, and inference among the tables profiled exactly, as
+    `enrich_structural` reads them for one run. Returns the relationships and the `infer:relationships` job."""
+    from mnemiq.catalog import introspect
+    from mnemiq.enrichment.joins import build_relationships
+    from mnemiq.enrichment.pipeline import _listed
+    from mnemiq.enrichment.profiling import unharvested
+
+    profiled = {j.id.removeprefix("profile:") for j in snapshot.jobs if j.kind == "profile" and j.status == "done"}
+    failures: list[str] = []
+    try:
+        catalog = [t for t in introspect(union_adapter) if t.name in profiled]
+        relationships = build_relationships(union_adapter, catalog, **unharvested(harvest_values), failures=failures,
+                                            estimated=estimated_tables(snapshot))
+        status = "partial" if failures else "done"
+    except Exception as exc:  # noqa: BLE001 -- as the run's own join pass: a failure costs the joins, not the snapshot
+        logger.warning("the joins across the merged tables could not be read (%s); none are kept",
+                       type(exc).__name__)
+        relationships, status = [], "failed"
+    return relationships, Job(id="infer:relationships", source_id=snapshot.source_id, kind="join", status=status,
+                              detail=_listed(failures))

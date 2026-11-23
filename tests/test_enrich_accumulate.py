@@ -126,3 +126,112 @@ def test_the_runs_global_entries_win():
     merged, _ = merge_snapshots(kept, run)
     assert [d.id for d in merged.definitions] == ["d:new"]
     assert merged.created_at == run.created_at
+
+
+# Joins across subsets. No single run sees both ends of a join between subsets: the run's adapter is scoped to its own
+# tables, and `TableScopedAdapter.foreign_keys` keeps only keys with both ends in scope. `union_relationships` reads
+# them again through an adapter scoped to the union.
+import fnmatch  # noqa: E402
+import sqlite3  # noqa: E402
+
+from mnemiq.adapters.scoped import TableScopedAdapter  # noqa: E402
+from mnemiq.adapters.sqlite import SQLiteAdapter  # noqa: E402
+from mnemiq.config import SourceSpec  # noqa: E402
+from mnemiq.enrichment.accumulate import estimated_tables, union_relationships, union_spec  # noqa: E402
+from mnemiq.enrichment.pipeline import enrich_structural  # noqa: E402
+from tests.test_statistics_enrich import SHOP, _Recording, _touches  # noqa: E402
+
+
+@pytest.fixture
+def shop_path(tmp_path):
+    path = tmp_path / "shop.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript(SHOP)
+    con.commit()
+    con.close()
+    return str(path)
+
+
+def _spec(path: str, tables: tuple[str, ...]) -> SourceSpec:
+    return SourceSpec(id="shop", kind="sqlite", target=path, catalog="shop", schema="main", tables=tables)
+
+
+def _run(inner, tables: tuple[str, ...], statistics=None) -> Snapshot:
+    scoped = TableScopedAdapter(inner, tables, "shop")
+    return enrich_structural(scoped, "shop") if statistics is None else enrich_structural(scoped, "shop",
+                                                                                         statistics=statistics)
+
+
+def _accumulate(inner, path, *runs):
+    """Each run over its own subset, merged in order, then joins over the union."""
+    merged = runs[0]
+    for run in runs[1:]:
+        merged, _ = merge_snapshots(merged, run)
+    union = TableScopedAdapter(inner, union_spec(_spec(path, ()), merged).tables, "shop")
+    return union_relationships(union, merged, harvest_values=True)
+
+
+@pytest.mark.parametrize("order", [("orders", "customers"), ("customers", "orders")])
+def test_a_declared_key_crossing_subsets_survives_in_both_directions(shop_path, order):
+    inner = SQLiteAdapter(shop_path)
+    runs = [_run(inner, (table,)) for table in order]
+    assert not any(r.to == "customers" for run in runs for r in run.relationships), "no single run sees the key"
+    relationships, job = _accumulate(inner, shop_path, *runs)
+    assert ("orders", "customers") in [(r.from_, r.to) for r in relationships]
+    assert (job.id, job.status) == ("infer:relationships", "done")
+
+
+def test_an_inferred_join_crossing_subsets_is_found_in_exact_mode(shop_path):
+    inner = SQLiteAdapter(shop_path)
+    relationships, _ = _accumulate(inner, shop_path, _run(inner, ("product",)), _run(inner, ("order_lines",)))
+    assert any(r.from_ == "order_lines" and r.to == "product" for r in relationships)
+
+
+def test_statistics_mode_infers_between_exact_tables_of_different_runs_and_never_to_an_estimated_one(shop_path):
+    inner = _Recording(SQLiteAdapter(shop_path))
+    runs = [_run(inner, ("product",), statistics=("product",)),
+            _run(inner, ("order_lines",), statistics=("order_lines",)),
+            _run(inner, ("orders",), statistics=())]
+    relationships, _ = _accumulate(inner, shop_path, *runs)
+    pairs = [(r.from_, r.to) for r in relationships]
+    assert ("order_lines", "product") in pairs, "both ends profiled exactly, each in its own run"
+    assert ("order_lines", "orders") not in pairs, "orders is estimated: a candidate would read its rows"
+
+
+def test_a_kept_table_keeps_its_own_runs_profile_mode(shop_path):
+    inner = _Recording(SQLiteAdapter(shop_path))
+    exact_customers = _run(inner, ("customers",))
+    estimated_orders = _run(inner, ("orders",), statistics=())
+    merged, _ = merge_snapshots(exact_customers, estimated_orders)
+    assert estimated_tables(merged) == frozenset({"orders"})
+    merged, _ = merge_snapshots(estimated_orders, exact_customers)
+    assert estimated_tables(merged) == frozenset({"orders"})
+
+
+def test_union_spec_escapes_names_that_look_like_patterns():
+    snap = _snap({"a[1]": "x", "b": "y"})
+    (pattern_a, pattern_b) = union_spec(_spec("unused", ("a*",)), snap).tables
+    assert fnmatch.fnmatchcase("a[1]", pattern_a) and not fnmatch.fnmatchcase("a1", pattern_a)
+    assert pattern_b == "b"
+
+
+def test_the_union_pass_reads_no_estimated_tables_rows_and_infers_nothing_to_one(shop_path):
+    # The statistics-mode guarantee holds across runs: product is estimated in its own run, so the join to it that an
+    # exact profile would infer (test_an_inferred_join_crossing_subsets_is_found_in_exact_mode) is not looked for.
+    inner = _Recording(SQLiteAdapter(shop_path))
+    runs = [_run(inner, ("product",), statistics=()), _run(inner, ("order_lines",), statistics=("order_lines",))]
+    inner.sql.clear()
+    relationships, _ = _accumulate(inner, shop_path, *runs)
+    assert not any(r.to == "product" for r in relationships)
+    assert not [sql for sql in inner.sql if _touches(sql, "product")], "an estimated table's rows were read"
+
+
+def test_joins_within_one_subset_and_across_subsets_are_all_kept(shop_path):
+    # One subset already holds a join (order_lines to product); the key from orders to customers crosses two others.
+    # A merge that kept the interim joins instead of reading them again would lose the crossing one.
+    inner = SQLiteAdapter(shop_path)
+    first = _run(inner, ("product", "order_lines"))
+    assert any(r.from_ == "order_lines" and r.to == "product" for r in first.relationships)
+    relationships, _ = _accumulate(inner, shop_path, first, _run(inner, ("orders",)), _run(inner, ("customers",)))
+    pairs = [(r.from_, r.to) for r in relationships]
+    assert ("order_lines", "product") in pairs and ("orders", "customers") in pairs
