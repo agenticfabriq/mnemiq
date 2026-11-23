@@ -439,8 +439,14 @@ if [ "$fail" -ne 0 ]; then
   echo "env vars and a gitignored .env)."
   exit 1
 fi
+# The line names what ran, identities included: CLAUDE.md asks a maintainer to read it to see which checks ran (the owui
+# lane's review of the identity check).
+checked=""
+[ "$CHECK_NAMES" -eq 1 ] && checked="names, "
+[ "$CHECK_IDENTITY" -eq 1 ] && checked="${checked}identities, "
+checked="${checked}secrets, home paths"
 if [ "$CHECK_NAMES" -eq 1 ]; then
-  echo "repo-guard: clean (names, secrets, home paths)."
+  echo "repo-guard: clean ($checked)."
 else
-  echo "repo-guard: clean (secrets, home paths; names are checked locally)."
+  echo "repo-guard: clean ($checked; names are checked locally)."
 fi

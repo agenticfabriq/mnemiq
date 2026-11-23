@@ -378,3 +378,26 @@ def test_the_encoder_writes_nul_terminated_records() -> None:
 def test_the_encoder_refuses_a_value_that_could_shift_fields(record: dict) -> None:
     out = _encode([json.dumps(record)])
     assert out.returncode == 1 and out.stdout == b""
+
+
+# -- the summary line says what ran (the owui lane) ---------------------------------------------------------------------
+
+
+def test_the_clean_line_names_identities_when_they_were_checked(repo: Path) -> None:
+    _stage(repo)
+    out = _guard(repo, "--staged", env=_env(REPO_GUARD_NAME_PATTERNS="zzz_matches_nothing_zzz"))
+    assert out.returncode == 0 and "repo-guard: clean (names, identities, secrets, home paths)." in out.stdout
+
+
+def test_the_clean_line_leaves_identities_out_when_the_check_is_off(repo: Path) -> None:
+    _stage(repo)
+    out = _guard(repo, "--staged", env=_env(REPO_GUARD_NAME_PATTERNS="zzz_matches_nothing_zzz",
+                                             REPO_GUARD_IDENTITY_PATTERNS="off"))
+    assert out.returncode == 0 and "repo-guard: clean (names, secrets, home paths)." in out.stdout
+
+
+def test_range_mode_clean_line_names_identities(repo: Path) -> None:
+    (repo / "a.txt").write_text("one\n")
+    _git(repo, "commit", "-qam", "one")
+    out = _guard(repo, "--range", "HEAD~1..HEAD")
+    assert out.returncode == 0 and "repo-guard: clean (identities, secrets, home paths; names are checked locally)." in out.stdout
