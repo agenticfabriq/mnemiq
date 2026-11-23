@@ -262,3 +262,51 @@ def test_grounding_across_subsets_matches_one_run_with_an_unmatched_lookup_code(
         INSERT INTO cases VALUES (1, 1, 'Local open'), (2, 99, 'Escalated'), (3, 1, 'Local open'), (4, 99, 'Escalated');
     """, ["stage", "cases"], ["customers"], "cases.stage_id")
     assert added == single
+
+
+def _normalised(snap) -> dict:
+    """A snapshot as a single run and --add must agree on it: everything but what is per run by design (descriptions,
+    which the stub tags with the run; the version and timestamp; job order)."""
+    return {
+        "bindings": sorted(b.object_id for b in snap.source_bindings),
+        "columns": sorted((c.model_copy(update={"description": None}).model_dump_json() for c in snap.columns)),
+        "relationships": sorted(r.model_dump_json() for r in snap.relationships),
+        "views": sorted(v.model_dump_json() for v in snap.views),
+        "dimensions": sorted(d.model_dump_json() for d in snap.dimensions),
+        "definitions": sorted(d.model_dump_json() for d in snap.definitions),
+        "jobs": sorted((j.id, j.status) for j in snap.jobs if not j.id.startswith("semantic:")),
+    }
+
+
+@pytest.mark.parametrize("first,second", [
+    (["customers", "orders", "stage", "cases", "person"],
+     ["product", "order_lines", "status", "tickets", "claim*", "events"]),
+    (["status", "orders", "events"], ["tickets", "customers", "claim*", "product", "order_lines", "person", "stage",
+                                      "cases"]),
+])
+def test_add_over_subsets_gives_what_one_run_over_all_of_them_gives(shop, first, second):
+    path, settings, _runs = shop
+    con = sqlite3.connect(path)
+    con.executescript(LOOKUP + """
+        CREATE TABLE claim (id INTEGER PRIMARY KEY, region TEXT, amount REAL);
+        CREATE VIEW claim_v AS SELECT id, region, amount FROM claim;
+        INSERT INTO claim VALUES (1, 'west', 10.0), (2, 'east', 20.0);
+        CREATE TABLE person (code TEXT PRIMARY KEY);
+        CREATE TABLE events (id INTEGER PRIMARY KEY, owner TEXT REFERENCES person(code));
+        INSERT INTO person VALUES ('person-123'), ('person-456');
+        INSERT INTO events VALUES (1, 'person-123'), (2, 'person-456'), (3, 'person-123');
+        CREATE TABLE stage (id INTEGER PRIMARY KEY, label TEXT);
+        CREATE TABLE cases (id INTEGER PRIMARY KEY, stage_id INTEGER REFERENCES stage(id), stage_label TEXT);
+        INSERT INTO stage VALUES (1, 'Open');
+        INSERT INTO cases VALUES (1, 1, 'Local open'), (2, 99, 'Escalated'), (3, 1, 'Local open'), (4, 99, 'Escalated');
+    """)
+    con.commit()
+    con.close()
+    union = settings([*first, *second])
+    union = union.model_copy(update={"store_path": union.store_path.replace("store.duckdb", "single.duckdb")})
+    assert _cmd_enrich(union) == 0
+    assert _cmd_enrich(settings(first)) == 0
+    assert _cmd_enrich(settings(second), add=True) == 0
+    single, added = _normalised(_latest(union)), _normalised(_latest(settings(second)))
+    for part in single:
+        assert added[part] == single[part], part
