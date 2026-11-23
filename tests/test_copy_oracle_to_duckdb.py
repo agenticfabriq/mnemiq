@@ -12,7 +12,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
-from decimal import Decimal
 
 import duckdb
 import pyarrow as pa
@@ -95,6 +94,7 @@ class _Oracle:
         self.on_fail = lambda: None  # what a test looks at the moment the copy stops, before anything cleans up
         self.log: list = []
         self.fetched: list[str] = []
+        self.fetch_kwargs: list[dict] = []
 
     def cursor(self):
         return _Cursor(self)
@@ -112,6 +112,7 @@ class _Oracle:
     def fetch_df_batches(self, statement, parameters=None, size=None, **kwargs):
         table = self._table(statement)
         self.fetched.append(table)
+        self.fetch_kwargs.append(kwargs)
         for i, batch in enumerate(self.batches[table]):
             if self.fail_on == (table, i):
                 self.on_fail()
@@ -121,6 +122,7 @@ class _Oracle:
 
     def fetch_df_all(self, statement, parameters=None, arraysize=None, **kwargs):
         assert "WHERE 1 = 0" in statement
+        self.fetch_kwargs.append(kwargs)
         return self.schemas[self._table(statement)].empty_table()
 
 
@@ -249,19 +251,57 @@ def test_an_empty_table_is_copied_with_its_columns(tmp_path):
 
 
 def test_numbers_and_dates_land_as_the_duckdb_types_they_hold(tmp_path):
-    # NUMBER(10) arrives as decimal128(10, 0) when decimals are fetched: an integer that fits 64 bits lands as BIGINT,
-    # NUMBER(12,2) stays exact, and an Oracle DATE (seconds) lands as DuckDB's plain TIMESTAMP.
-    schema = pa.schema([("N10", pa.decimal128(10, 0)), ("N12_2", pa.decimal128(12, 2)),
-                        ("N38", pa.decimal128(38, 0)), ("D", pa.timestamp("s")), ("F", pa.float64())])
-    batch = pa.table({"N10": [Decimal(7)], "N12_2": [Decimal("1.25")], "N38": [Decimal(12345678901234567890)],
-                      "D": [dt.datetime(2026, 1, 2, 3, 4, 5)], "F": [0.5]}, schema=schema)
+    # The driver's own mapping, decimals off: NUMBER(p, 0) with p up to 18 as int64, any other NUMBER as double. An
+    # Oracle DATE (seconds) and a TIMESTAMP(3) (milliseconds) land as DuckDB's plain TIMESTAMP, widened without loss.
+    schema = pa.schema([("N10", pa.int64()), ("N", pa.float64()), ("D", pa.timestamp("s")),
+                        ("T3", pa.timestamp("ms")), ("T6", pa.timestamp("us"))])
+    when = dt.datetime(2026, 1, 2, 3, 4, 5, 123000)
+    batch = pa.table({"N10": [7], "N": [0.5], "D": [when.replace(microsecond=0)], "T3": [when], "T6": [when]},
+                     schema=schema)
     duck = duckdb.connect(str(tmp_path / "c.duckdb"))
-    copy_table(_Oracle({"T": [batch]}), duck, "APP", "T", 10)
+    fake = _Oracle({"T": [batch]})
+    copy_table(fake, duck, "APP", "T", 10)
     types = dict(duck.execute('SELECT column_name, data_type FROM information_schema.columns').fetchall())
-    assert types == {"N10": "BIGINT", "N12_2": "DECIMAL(12,2)", "N38": "DECIMAL(38,0)", "D": "TIMESTAMP",
-                     "F": "DOUBLE"}
-    assert duck.execute('SELECT "N38", "N12_2" FROM "T"').fetchone() == (Decimal(12345678901234567890),
-                                                                       Decimal("1.25"))
+    assert types == {"N10": "BIGINT", "N": "DOUBLE", "D": "TIMESTAMP", "T3": "TIMESTAMP", "T6": "TIMESTAMP"}
+    assert duck.execute('SELECT "D", "T3" FROM "T"').fetchone() == (when.replace(microsecond=0), when)
+
+
+def test_numbers_are_fetched_without_decimals(tmp_path):
+    # python-oracledb 4.0.2's decimal fetch returned a decimal128 column one value short in some later batches of a
+    # large table (measured, batches of 50,000 and 100,000; whole when one batch held every row). So the copy
+    # asks for the driver's default mapping, by name, whatever `oracledb.defaults.fetch_decimals` is set to.
+    fake = _Oracle({"ORDERS": [_batch(_ORDERS, range(2))], "EMPTY": []}, {"ORDERS": _ORDERS, "EMPTY": _ORDERS})
+    duck = duckdb.connect(str(tmp_path / "c.duckdb"))
+    copy_table(fake, duck, "APP", "ORDERS", 10)
+    copy_table(fake, duck, "APP", "EMPTY", 10)
+    assert fake.fetch_kwargs and all(kw.get("fetch_decimals") is False for kw in fake.fetch_kwargs)
+
+
+class _Malformed:
+    """What `pa.table` made of the driver's short batch: a table Arrow's own validation refuses."""
+
+    num_rows = 3
+
+    def validate(self, *, full=False):
+        raise pa.ArrowInvalid("Column 1 named Status expected length 3 but got length 2")
+
+
+def test_a_batch_arrow_finds_malformed_stops_the_copy_with_nothing_landed(tmp_path, monkeypatch):
+    fake = _shop()
+    real = copy.pa.table
+    seen: list[int] = []
+
+    def table(obj):
+        seen.append(1)
+        return _Malformed() if len(seen) == 2 else real(obj)
+
+    monkeypatch.setattr(copy.pa, "table", table)
+    duck = duckdb.connect(str(tmp_path / "c.duckdb"))
+    with pytest.raises(RuntimeError, match="malformed batch") as raised:
+        copy_table(fake, duck, "APP", "ORDERS", 3)
+    assert "ORDERS" in str(raised.value) and "batch 2" in str(raised.value)
+    assert duck.execute("SELECT count(*) FROM information_schema.tables").fetchone()[0] == 0
+    assert fake.log[-1] == "ROLLBACK"
 
 
 def test_a_stopped_copy_leaves_no_table_a_resume_would_skip(deployment):

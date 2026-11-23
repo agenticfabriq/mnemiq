@@ -28,10 +28,12 @@ What it does, in order:
 - **Writes the copy's source entry** to `<out>.source.json` (`kind: duckdb`, the Oracle source's `id` and `catalog`,
   `schema: main`, the tables) and prints the steps that follow.
 
-Types: a `NUMBER(p, s)` arrives exact, as BIGINT when `s` is 0 and `p` at most 18 and as DECIMAL(p, s) otherwise; a
-`NUMBER` declared with no precision arrives as DOUBLE, the only type its values all fit, so digits past about 15
-significant ones are lost; `DATE` lands as TIMESTAMP; CLOB and BLOB values as VARCHAR and BLOB (each under 1 GB: the
-DataFrame fetch reads a LOB's value whole, whatever `oracledb.defaults.fetch_lobs` says, measured on 4.0.2).
+Types are python-oracledb's own mapping: a `NUMBER(p, 0)` with `p` at most 18 lands as BIGINT, exact; every other
+`NUMBER` (a scale, a precision past 18, or none declared) as DOUBLE, so digits past about 15 significant ones are lost.
+Its exact decimal fetch is not used: on python-oracledb 4.0.2 it returned a decimal column one value short in later
+batches of a large table (measured), and each batch is checked with Arrow's own validation, so a malformed one stops
+the copy rather than land. `DATE` and `TIMESTAMP` land as TIMESTAMP; CLOB and BLOB values as VARCHAR and BLOB (each
+under 1 GB: the DataFrame fetch reads a LOB's value whole, whatever `oracledb.defaults.fetch_lobs` says, measured).
 """
 from __future__ import annotations
 
@@ -167,18 +169,27 @@ def _read_only(conn):
         conn.rollback()
 
 
+def _whole(batch, table: str, number: int) -> pa.Table:
+    """The driver's batch as an Arrow table, refused unless Arrow's own validation passes. `pa.table` imports a
+    DataFrame through the C data interface without checking it, and python-oracledb 4.0.2 has handed over a batch with
+    one column a value short (its decimal fetch, measured): stored, it would be a table whose rows no longer line up."""
+    data = pa.table(batch)
+    try:
+        data.validate()
+    except pa.ArrowInvalid as exc:
+        raise RuntimeError(f"python-oracledb returned a malformed batch for {table!r} (batch {number}): {exc}; "
+                           "the copy stops rather than store it") from exc
+    return data
+
+
 def _for_duckdb(table: pa.Table) -> pa.Table:
-    """A fetched batch with the types DuckDB should store: an integer decimal that fits 64 bits as int64 (decimals are
-    fetched so `NUMBER(p, s)` stays exact, and `NUMBER(10)` is an integer, not a DECIMAL(10,0)), and a timestamp in
-    seconds or milliseconds (an Oracle `DATE`, `TIMESTAMP(3)`) in microseconds, DuckDB's own TIMESTAMP. Both widen
-    without loss."""
+    """A fetched batch with a timestamp in seconds or milliseconds (an Oracle `DATE`, `TIMESTAMP(3)`) widened to
+    microseconds, without loss, so it lands as DuckDB's own TIMESTAMP rather than TIMESTAMP_S or TIMESTAMP_MS."""
     fields = []
     changed = False
     for field in table.schema:
         kind = field.type
-        if pa.types.is_decimal(kind) and kind.scale == 0 and kind.precision <= 18:
-            kind = pa.int64()
-        elif pa.types.is_timestamp(kind) and kind.unit in ("s", "ms"):
+        if pa.types.is_timestamp(kind) and kind.unit in ("s", "ms"):
             kind = pa.timestamp("us", tz=kind.tz)
         changed = changed or kind != field.type
         fields.append(field.with_type(kind))
@@ -210,14 +221,15 @@ def copy_table(conn, duck, owner: str, table: str, batch_rows: int) -> int:
     created = False
     try:
         with _read_only(conn):
-            for batch in conn.fetch_df_batches(select, size=batch_rows, fetch_decimals=True):
-                data = _for_duckdb(pa.table(batch))
+            # `fetch_decimals` named, so a changed `oracledb.defaults` cannot turn the short-batch decimal fetch on.
+            for number, batch in enumerate(conn.fetch_df_batches(select, size=batch_rows, fetch_decimals=False), 1):
+                data = _for_duckdb(_whole(batch, table, number))
                 _append(duck, staging, data, create=not created)
                 created = True
                 rows += data.num_rows
             if not created:
-                empty = conn.fetch_df_all(f"{select} WHERE 1 = 0", fetch_decimals=True)
-                _append(duck, staging, _for_duckdb(pa.table(empty)), create=True)
+                empty = conn.fetch_df_all(f"{select} WHERE 1 = 0", fetch_decimals=False)
+                _append(duck, staging, _for_duckdb(_whole(empty, table, 1)), create=True)
     except BaseException:
         # Best effort: the next run drops a leftover before it starts the table, so a failure here hides nothing.
         with contextlib.suppress(Exception):
