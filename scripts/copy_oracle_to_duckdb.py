@@ -19,8 +19,9 @@ What it does, in order:
   `ROLLBACK` after), `SELECT` only, streamed with python-oracledb's `fetch_df_batches` into the file's `main` schema
   under the exact names Oracle stores. One transaction per table, not one for the whole copy: a read-consistent view
   held for hours makes Oracle's undo reach back to the copy's start, and a long copy fails with ORA-01555.
-- **Resumes.** A table lands as `<TABLE>__partial` and is renamed only once its last row is in, so a stopped copy never
-  leaves a table a rerun would take for done. A table already in the file is skipped unless `--replace`.
+- **Resumes.** Each table is copied in one DuckDB transaction, committed after its last row, so a copy stopped
+  mid-table, even by the process dying, leaves no trace of that table. A table already in the file is skipped unless
+  `--replace`.
 - **Comments and keys.** `ALL_TAB_COMMENTS` and `ALL_COL_COMMENTS` become DuckDB `COMMENT ON` statements, and the keys
   `ALL_CONSTRAINTS` declares between copied tables of the owner become rows of `mnemiq.declared_keys`. The DuckDB
   adapter reads both, so a store enriched on the copy keeps them. Nothing in DuckDB enforces a key, so an orphan row
@@ -52,8 +53,6 @@ from mnemiq.adapters.duckdb import KEYS_SCHEMA, KEYS_TABLE
 from mnemiq.config import Settings, SourceSpec
 from mnemiq.duckdb_extensions import connect_duckdb
 
-# A table being copied lands under this suffix and is renamed when its last row is in.
-STAGING_SUFFIX = "__partial"
 REFUSED = 2
 
 _TABLES = "SELECT table_name, num_rows, avg_row_len FROM all_tables WHERE owner = :owner ORDER BY table_name"
@@ -210,35 +209,28 @@ def _append(duck, table: str, data: pa.Table, *, create: bool) -> None:
 def copy_table(conn, duck, owner: str, table: str, batch_rows: int) -> int:
     """Copy `owner.table` into `duck`'s `main` under the same name, in one read-only transaction; the rows copied.
 
-    The rows land in `<table>__partial`, dropped first if a stopped copy left one, and the table is renamed into place
-    only after its last batch, in one DuckDB transaction with dropping the table it replaces. So the file never holds
-    `<table>` with fewer rows than Oracle gave: a copy stopped mid-table leaves nothing a resume would skip as done.
-    A table with no rows is created from `SELECT * ... WHERE 1 = 0`, so it keeps its columns."""
-    staging = table + STAGING_SUFFIX
-    duck.execute(f"DROP TABLE IF EXISTS main.{_quoted(staging)}")
+    The DuckDB side is one transaction too: dropping the table it replaces, creating it, every batch, committed only
+    after the last. So no other name is ever used (a staging name could be a real table of the schema), and a copy that
+    stops mid-table, by an error or by the process dying, leaves no trace of the table and keeps the one it was
+    replacing: DuckDB 1.5.4 discards an uncommitted transaction on restart, measured with 231 MB already written to the
+    file when the process was killed. A table with no rows is created from `SELECT * ... WHERE 1 = 0`, so it keeps its
+    columns."""
     select = f"SELECT * FROM {_quoted(owner)}.{_quoted(table)}"
     rows = 0
     created = False
+    duck.execute("BEGIN TRANSACTION")
     try:
+        duck.execute(f"DROP TABLE IF EXISTS main.{_quoted(table)}")
         with _read_only(conn):
             # `fetch_decimals` named, so a changed `oracledb.defaults` cannot turn the short-batch decimal fetch on.
             for number, batch in enumerate(conn.fetch_df_batches(select, size=batch_rows, fetch_decimals=False), 1):
                 data = _for_duckdb(_whole(batch, table, number))
-                _append(duck, staging, data, create=not created)
+                _append(duck, table, data, create=not created)
                 created = True
                 rows += data.num_rows
             if not created:
                 empty = conn.fetch_df_all(f"{select} WHERE 1 = 0", fetch_decimals=False)
-                _append(duck, staging, _for_duckdb(_whole(empty, table, 1)), create=True)
-    except BaseException:
-        # Best effort: the next run drops a leftover before it starts the table, so a failure here hides nothing.
-        with contextlib.suppress(Exception):
-            duck.execute(f"DROP TABLE IF EXISTS main.{_quoted(staging)}")
-        raise
-    duck.execute("BEGIN TRANSACTION")
-    try:
-        duck.execute(f"DROP TABLE IF EXISTS main.{_quoted(table)}")
-        duck.execute(f"ALTER TABLE main.{_quoted(staging)} RENAME TO {_quoted(table)}")
+                _append(duck, table, _for_duckdb(_whole(empty, table, 1)), create=True)
         duck.execute("COMMIT")
     except BaseException:
         with contextlib.suppress(Exception):
@@ -280,15 +272,12 @@ def _choose_source(specs: list[SourceSpec], source_id: str | None) -> SourceSpec
 
 
 def _case_clashes(tables: list[str], columns: list[tuple[str, str]]) -> list[str]:
-    """Names DuckDB would take for one: tables, or columns of one table, equal without regard to case, and a table
-    whose name is another's staging name."""
+    """Names DuckDB would take for one: tables, or columns of one table, equal without regard to case."""
     clashes: list[str] = []
     by_fold: dict[str, list[str]] = {}
     for t in tables:
         by_fold.setdefault(t.casefold(), []).append(t)
     clashes += [f"tables {', '.join(map(repr, names))}" for names in by_fold.values() if len(names) > 1]
-    clashes += [f"tables {t!r} and {by_fold[(t + STAGING_SUFFIX).casefold()][0]!r} (the copy stages {t!r} under "
-                f"{t + STAGING_SUFFIX!r})" for t in tables if (t + STAGING_SUFFIX).casefold() in by_fold]
     selected = set(tables)
     per_table: dict[str, dict[str, list[str]]] = {}
     for t, c in columns:

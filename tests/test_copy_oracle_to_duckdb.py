@@ -306,13 +306,18 @@ def test_a_batch_arrow_finds_malformed_stops_the_copy_with_nothing_landed(tmp_pa
 
 def test_a_stopped_copy_leaves_no_table_a_resume_would_skip(deployment):
     stopped = _shop(fail_on=("ORDERS", 1))
-    at_the_stop: dict[str, int] = {}
-    # The file as a killed process would leave it: read when the copy stops, before any handler can tidy up. (A second
+    at_the_stop: dict[str, int] | None = None
+
+    def look():
+        nonlocal at_the_stop
+        at_the_stop = _tables(deployment.out, read_only=False)
+
+    # The file as another connection sees it: read when the copy stops, before any handler can tidy up. (A second
     # connection in the same process, so not read-only: DuckDB refuses one file opened with two configurations.)
-    stopped.on_fail = lambda: at_the_stop.update(_tables(deployment.out, read_only=False))
+    stopped.on_fail = look
     with pytest.raises(RuntimeError, match="connection was lost"):
         deployment(stopped)
-    assert at_the_stop and "ORDERS" not in at_the_stop, "mid-table, the rows are only under the staging name"
+    assert at_the_stop is not None and "ORDERS" not in at_the_stop, "mid-table, no other connection sees the table"
     assert "ORDERS" not in _tables(deployment.out)
     assert not [t for t in _tables(deployment.out) if t.casefold().startswith("orders")], "no partial table left"
     assert stopped.log[-2:] == ["ROLLBACK", "CLOSE"], "the stopped table's transaction ended"
@@ -322,12 +327,60 @@ def test_a_stopped_copy_leaves_no_table_a_resume_would_skip(deployment):
     assert "ORDERS" in resumed.fetched
 
 
-def test_a_partial_table_a_killed_copy_left_is_dropped_before_the_table_starts(deployment):
-    con = duckdb.connect(deployment.out)
-    con.execute('CREATE TABLE main."ORDERS__partial" AS SELECT 1 AS "ID", \'x\' AS "Status"')
-    con.close()
+_KILLED_MID_TABLE = """
+import os, signal, sys
+import duckdb, pyarrow as pa
+from scripts.copy_oracle_to_duckdb import copy_table
+
+class Cursor:
+    def __enter__(self): return self
+    def __exit__(self, *exc): return False
+    def execute(self, sql, *args, **kwargs): pass
+
+class Killed:
+    def cursor(self): return Cursor()
+    def rollback(self): pass
+    def fetch_df_batches(self, statement, parameters=None, size=None, **kwargs):
+        yield pa.table({"ID": list(range(3)), "Status": ["a", "b", "c"]})
+        os.kill(os.getpid(), signal.SIGKILL)  # the process dies mid-table: no handler, no rollback, nothing tidied
+
+copy_table(Killed(), duckdb.connect(sys.argv[1]), "APP", "ORDERS", 3)
+"""
+
+
+def test_a_process_killed_mid_table_leaves_no_table_at_all(tmp_path):
+    import signal
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    out = str(tmp_path / "c.duckdb")
+    root = Path(__file__).resolve().parents[1]
+    killed = subprocess.run([sys.executable, "-c", _KILLED_MID_TABLE, out], env={**os.environ, "PYTHONPATH": str(root)},
+                            capture_output=True, text=True)
+    assert killed.returncode == -signal.SIGKILL, killed.stderr
+    assert _tables(out) == {}, "the table and its first batch were never committed"
+    duck = duckdb.connect(out)
+    assert copy_table(_shop(), duck, "APP", "ORDERS", 3) == 5, "a rerun copies it whole"
+    duck.close()
+    assert _tables(out) == {"ORDERS": 5}
+
+
+def test_a_real_table_named_like_another_with_partial_appended_survives_copying_it(deployment):
+    # `X__partial` was the copy's staging name for X; an Oracle table of that name, copied earlier, is a table like any.
+    both = {"ORDERS__partial": [_batch(_ORDERS, range(4))], "ORDERS": [_batch(_ORDERS, range(5))]}
+    deployment.manifest.write_text(json.dumps([{**_SOURCE, "tables": ["ORDERS__partial"]}]))
+    assert deployment(_Oracle(both)) == 0
+    deployment.manifest.write_text(json.dumps([{**_SOURCE, "tables": ["ORDERS"]}]))
+    assert deployment(_Oracle(both)) == 0
+    assert _tables(deployment.out) == {"ORDERS__partial": 4, "ORDERS": 5}
+
+
+def test_a_stopped_replace_keeps_the_table_it_was_replacing(deployment):
     assert deployment(_shop()) == 0
-    assert _tables(deployment.out) == {"ORDERS": 5, "CUSTOMER": 2}
+    with pytest.raises(RuntimeError, match="connection was lost"):
+        deployment(_shop(fail_on=("ORDERS", 1)), "--replace")
+    assert _tables(deployment.out)["ORDERS"] == 5
 
 
 def test_each_table_is_copied_in_its_own_read_only_transaction(deployment):
@@ -408,11 +461,11 @@ def test_names_that_differ_only_in_case_are_refused_before_any_row(deployment, c
     assert "'STATUS'" in err and "'Status'" in err
 
 
-def test_a_table_named_like_another_tables_staging_copy_is_refused(deployment):
-    fake = _Oracle({"ORDERS": [_batch(_ORDERS, range(1))], "ORDERS__PARTIAL": [_batch(_ORDERS, range(1))]})
+def test_a_table_and_one_named_like_its_old_staging_copy_are_both_copied(deployment):
+    fake = _Oracle({"ORDERS": [_batch(_ORDERS, range(1))], "ORDERS__PARTIAL": [_batch(_ORDERS, range(2))]})
     deployment.manifest.write_text(json.dumps([{**_SOURCE, "tables": ["ORDERS*"]}]))
-    assert deployment(fake) == 2
-    assert fake.fetched == []
+    assert deployment(fake) == 0
+    assert _tables(deployment.out) == {"ORDERS": 1, "ORDERS__PARTIAL": 2}
 
 
 def test_a_pattern_matching_no_table_is_refused(deployment, capsys):

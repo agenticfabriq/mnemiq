@@ -396,10 +396,11 @@ not copied, is left out. Nothing in DuckDB enforces a key, so an orphan row cann
 **How it reads Oracle.** `SELECT` only, each table in its own read-only transaction (a single
 transaction held for the whole copy would need Oracle's undo to reach back to its start, and a long
 copy would fail with ORA-01555). Rows arrive in batches (`--batch-rows`, 100,000 by default), each
-checked with Arrow's own validation before it is stored. A table lands under a staging name and is
-renamed when its last row is in, so a copy that stops part way, for any reason, leaves no table a
-rerun would take for whole: run it again and it copies what is missing, skipping the tables already
-there (`--replace` copies those again too).
+checked with Arrow's own validation before it is stored. Each table is copied in one DuckDB
+transaction, committed after its last row, so a copy that stops part way, even by the process dying,
+leaves no trace of the table it was copying (and, with `--replace`, keeps the copy it was replacing):
+run it again and it copies what is missing, skipping the tables already there (`--replace` copies
+those again too).
 
 **What it costs.**
 
