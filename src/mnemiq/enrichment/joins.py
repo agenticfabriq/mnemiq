@@ -9,15 +9,30 @@ from mnemiq.enrichment.profiling import ColumnStats, profile_column, unharvested
 logger = logging.getLogger(__name__)
 
 
-def _comparable(expr: str, dialect: str) -> str:
+# The first word of a declared type, before any "(", that holds a number on the sources compared as text below:
+# DuckDB's, Postgres's (`double precision`), MySQL's (`int unsigned`), SQLite's and the warehouses'.
+_NUMERIC_BASES = frozenset({
+    "TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER",
+    "UBIGINT", "UHUGEINT", "INT1", "INT2", "INT4", "INT8", "SERIAL", "SMALLSERIAL", "BIGSERIAL", "DECIMAL", "NUMERIC",
+    "NUMBER", "REAL", "FLOAT", "FLOAT4", "FLOAT8", "DOUBLE"})
+
+
+def _numeric(data_type: str | None) -> bool:
+    words = (data_type or "").split("(", 1)[0].upper().split()
+    return bool(words) and words[0] in _NUMERIC_BASES
+
+
+def _comparable(expr: str, dialect: str, *, numbers: bool = False) -> str:
     """`expr` as the orphan check compares it.
 
-    Elsewhere as text, because a catalog can mix typed and CSV-inferred all-text tables, where INTEGER 1 and TEXT '1'
-    must still match. Oracle natively, as the join the relationship describes will compare: it refuses
+    Natively where both sides are numbers (`numbers`), as the join the relationship describes will compare them: as
+    text one number is 1, 1.00 or 1.0 by its type, and a DuckDB copy of Oracle lands each NUMBER as BIGINT, DECIMAL(p, s)
+    or DOUBLE by its declaration. Elsewhere as text, because a catalog can mix typed and CSV-inferred all-text tables,
+    where INTEGER 1 and TEXT '1' must still match. Oracle natively always: it refuses
     `CAST(x AS VARCHAR)` with ORA-00906 (a VARCHAR2 needs a length, measured on 23.26), sqlglot's transpile gives
     `CAST(x AS CLOB)`, which it cannot compare with `=`, and `TO_CHAR` of a DATE follows the session's format, which
     can drop the time and make two different keys one. Types that do not compare raise, and the candidate is skipped."""
-    return expr if dialect == "oracle" else f"CAST({expr} AS VARCHAR)"
+    return expr if dialect == "oracle" or numbers else f"CAST({expr} AS VARCHAR)"
 
 
 def _stem(column: str) -> str:
@@ -103,8 +118,9 @@ def infer_relationships(adapter, catalog: list[TableInfo], *, harvest_values: bo
                 # inclusion dependency, compared as `_comparable` says. A NULL child value means "no
                 # parent", not a broken reference.
                 dialect = getattr(adapter, "dialect", "duckdb")
-                in_parent = _comparable(f'p."{col.name}"', dialect)
-                in_child = _comparable(f'c."{col.name}"', dialect)
+                numbers = _numeric(_declared_type(parent.name, col.name)) and _numeric(col.data_type)
+                in_parent = _comparable(f'p."{col.name}"', dialect, numbers=numbers)
+                in_child = _comparable(f'c."{col.name}"', dialect, numbers=numbers)
                 orphans = adapter.execute(
                     f'SELECT count(*) FROM "{child.name}" c '
                     f'WHERE c."{col.name}" IS NOT NULL AND NOT EXISTS ('

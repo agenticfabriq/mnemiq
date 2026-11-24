@@ -1,4 +1,5 @@
 import duckdb
+import pytest
 
 from mnemiq.catalog import ColumnInfo, TableInfo
 from mnemiq.enrichment.joins import infer_relationships
@@ -92,6 +93,47 @@ def test_cross_type_join_keys_compare_as_text():
     ]
     rels = infer_relationships(_DuckAdapter(con), catalog)
     assert any(r.from_ == "child" and r.to == "parent" for r in rels)
+
+
+def _numeric_keys(parent_type: str, child_type: str, child_rows: str):
+    con = duckdb.connect()
+    con.execute(f'CREATE TABLE parent ("parent_id" {parent_type})')
+    con.execute("INSERT INTO parent VALUES (1),(2)")
+    con.execute(f'CREATE TABLE child ("child_id" INTEGER, "parent_id" {child_type})')
+    con.execute(f"INSERT INTO child VALUES {child_rows}")
+    catalog = [
+        TableInfo("parent", [ColumnInfo("parent_id", parent_type)]),
+        TableInfo("child", [ColumnInfo("child_id", "INTEGER"), ColumnInfo("parent_id", child_type)]),
+    ]
+    return infer_relationships(_DuckAdapter(con), catalog)
+
+
+@pytest.mark.parametrize(("parent_type", "child_type"), [
+    ("DECIMAL(19,0)", "DECIMAL(19,2)"), ("BIGINT", "DOUBLE"), ("DECIMAL(12,2)", "DOUBLE")])
+def test_numeric_join_keys_of_different_types_compare_as_numbers(parent_type, child_type):
+    # A DuckDB copy of Oracle lands each NUMBER as BIGINT, DECIMAL(p, s) or DOUBLE by its declaration, where as text
+    # one number is 1, 1.00 or 1.0; Oracle, and the join the relationship describes, compare them as numbers.
+    rels = _numeric_keys(parent_type, child_type, "(10, 1), (11, 2)")
+    assert [(r.from_, r.to) for r in rels] == [("child", "parent")]
+
+
+def test_a_text_parent_key_still_matches_a_numeric_child():
+    # The mirror of INTEGER against TEXT: the parent from an all-text CSV, the child typed. Either side text is text:
+    # natively, DuckDB would cast the parent's 'X1' to a number and raise, and the relationship would go unchecked.
+    con = duckdb.connect()
+    con.execute('CREATE TABLE parent ("parent_id" VARCHAR)')
+    con.execute("INSERT INTO parent VALUES ('1'), ('2'), ('X1')")
+    con.execute('CREATE TABLE child ("child_id" INTEGER, "parent_id" DECIMAL(19,0))')
+    con.execute("INSERT INTO child VALUES (10, 1), (11, 2)")
+    catalog = [
+        TableInfo("parent", [ColumnInfo("parent_id", "VARCHAR")]),
+        TableInfo("child", [ColumnInfo("child_id", "INTEGER"), ColumnInfo("parent_id", "DECIMAL(19,0)")]),
+    ]
+    assert [(r.from_, r.to) for r in infer_relationships(_DuckAdapter(con), catalog)] == [("child", "parent")]
+
+
+def test_numeric_join_keys_still_refuse_an_orphan():
+    assert _numeric_keys("DECIMAL(19,0)", "DECIMAL(19,2)", "(10, 1), (11, 2.5)") == []
 
 
 # --- Plan 11: declared foreign keys ---------------------------------------------------
@@ -268,16 +310,17 @@ def test_orphan_query_compares_natively_on_oracle():
     assert ("invoice", "customer") in {(r.from_, r.to) for r in rels}
 
 
-def test_orphan_query_unchanged_on_duckdb():
-    recorder = _KeyRecorder(None)
-    infer_relationships(recorder, _invoices())
-    orphan = next(sql for sql in recorder.sql if "NOT EXISTS" in sql and '"customer_id"' in sql)
-    assert orphan == (
-        'SELECT count(*) FROM "invoice" c '
-        'WHERE c."customer_id" IS NOT NULL AND NOT EXISTS ('
-        '  SELECT 1 FROM "customer" p '
-        '  WHERE CAST(p."customer_id" AS VARCHAR) = CAST(c."customer_id" AS VARCHAR))'
-    )
+def test_orphan_query_on_duckdb_compares_as_text_unless_both_keys_are_numbers():
+    def orphan_check(child_key_type: str) -> str:
+        catalog = _invoices()
+        catalog[1] = TableInfo("invoice", [ColumnInfo("invoice_id", "NUMBER"), ColumnInfo("customer_id", child_key_type)])
+        recorder = _KeyRecorder(None)
+        infer_relationships(recorder, catalog)
+        return next(sql for sql in recorder.sql if "NOT EXISTS" in sql and '"customer_id"' in sql)
+
+    head = 'SELECT count(*) FROM "invoice" c WHERE c."customer_id" IS NOT NULL AND NOT EXISTS (  SELECT 1 FROM "customer" p '
+    assert orphan_check("NUMBER") == head + '  WHERE p."customer_id" = c."customer_id")'
+    assert orphan_check("VARCHAR") == head + '  WHERE CAST(p."customer_id" AS VARCHAR) = CAST(c."customer_id" AS VARCHAR))'
 
 
 def test_a_candidate_that_cannot_be_checked_costs_only_itself(caplog):
