@@ -8,7 +8,7 @@ import { dashboardRefOf, pageAppRoot, resolveDashboard, usePageContext } from ".
 import { probe, type Readiness } from "./readiness";
 import { takeReloaded } from "./reload";
 import { getSnapshot, subscribe } from "./store";
-import { openConversation, sendInPanel } from "./talk";
+import { reopenConversation, sendInPanel } from "./talk";
 import { BuildCard } from "./views/BuildCard";
 import { Composer } from "./views/Composer";
 import { Conversation } from "./views/Conversation";
@@ -108,7 +108,7 @@ function Ready({ api, starters }: { api: PanelApi; starters: string[] }) {
   // opening after the reload, before anything can be on screen.
   useEffect(() => {
     const reopened = takeReloaded();
-    if (reopened !== null) void openConversation(api, reopened);
+    if (reopened !== null) void reopenConversation(api, reopened);
   }, [api]);
   const onScreen = dashboard?.readable && dashboard.id !== null ? dashboard : null;
   // Accepted only when the screen is free, and held from that moment, before the page is looked up.

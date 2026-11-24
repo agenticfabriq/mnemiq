@@ -72,6 +72,20 @@ export async function openConversation(api: PanelApi, id: string): Promise<strin
   return reread(api, id, on);
 }
 
+/** Reopens conversation `id` after the panel's own Reload (`reload.ts`), the screen held until it is read, so nothing is
+ * sent into a new conversation meanwhile, and a read that lands later replaces nothing the person did. */
+export async function reopenConversation(api: PanelApi, id: string): Promise<string | null> {
+  const controller = hold();
+  if (controller === null) return null;
+  const on = ++screen;
+  update((state) => ({ ...state, turns: [], fresh: null, notice: null }));
+  try {
+    return await reread(api, id, on);
+  } finally {
+    release(controller);
+  }
+}
+
 /** A new conversation: the screen cleared, and the conversation made by mnemiq when its first message is sent. */
 export function newConversation(): boolean {
   if (holding !== null) return false;

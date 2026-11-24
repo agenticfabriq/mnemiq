@@ -593,6 +593,24 @@ describe("conversations kept apart, and confirms sent from where the person is",
     expect(screen.queryByText("bookings as bars")).toBeNull();
   });
 
+  it("the conversation a Reload carried holds the screen while it is read, so nothing is sent into a new one", async () => {
+    const { kept, calls } = mnemiq(() => []);
+    kept[OTHER] = [{ index: 0, role: "person", kind: "ask", text: "q one" }];
+    const { hold, release } = held();
+    wrapFetch([{ match: new RegExp(`/superset/conversations/${OTHER}$`), hold }]);
+    history.replaceState(null, "", `/superset/welcome/#mnemiq-conversation=${OTHER}`);
+    const box = await opened();
+    await waitFor(() => expect(getSnapshot().sending).toBe(true));
+    fireEvent.change(box, { target: { value: "too soon" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(calls.filter((c) => c.method === "POST")).toEqual([]);
+    release();
+    await screen.findByText("q one");
+    await waitFor(() => expect(getSnapshot().sending).toBe(false));
+    expect(getSnapshot().conversationId).toBe(OTHER);
+    expect(calls.filter((c) => c.method === "POST")).toEqual([]);
+  });
+
   it("a reloaded page's fragment that names no conversation of this person opens nothing and is cleared", async () => {
     const { calls } = mnemiq(() => []);
     history.replaceState(null, "", "/superset/welcome/#mnemiq-conversation=not%20an%20id");
