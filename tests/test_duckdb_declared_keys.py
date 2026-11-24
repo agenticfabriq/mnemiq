@@ -8,6 +8,7 @@ Oracle schema had only the joins inference could find. The copy writes Oracle's 
 from __future__ import annotations
 
 import duckdb
+import pytest
 
 from mnemiq.adapters.duckdb import DuckDBAdapter
 from mnemiq.adapters.scoped import TableScopedAdapter
@@ -101,3 +102,19 @@ def test_a_scoped_source_keeps_only_keys_with_both_ends_in_scope(tmp_path):
     source = DuckDBAdapter.duckdb(_shop(tmp_path, [_ROW]))
     assert TableScopedAdapter(source, ("orders",), "src").foreign_keys() == []
     assert TableScopedAdapter(source, ("orders", "customer"), "src").foreign_keys() == [_KEY]
+
+
+@pytest.mark.parametrize("tables", [(), ("*",), ("declared_keys",)], ids=["unrestricted", "wildcard", "explicit"])
+@pytest.mark.parametrize("schema", ["mnemiq", "MNEMIQ", "Mnemiq"])
+def test_the_files_own_records_schema_is_refused_as_the_source_schema(tmp_path, tables, schema):
+    # The copy's bookkeeping (declared keys, its source, its state) lives in schema `mnemiq`; a manifest naming that
+    # schema would enrich those records as the source's tables.
+    from mnemiq.adapters.resolve import SourceUnconfigured, adapter_for
+    from mnemiq.config import SourceSpec
+
+    spec = SourceSpec(id="copy", kind="duckdb", target=_shop(tmp_path, [_ROW]), catalog="copy", schema=schema,
+                      tables=tables)
+    with pytest.raises(SourceUnconfigured) as raised:
+        adapter_for(spec, None)
+    message = str(raised.value)
+    assert "\n" not in message and message.startswith("source 'copy': ") and "main" in message

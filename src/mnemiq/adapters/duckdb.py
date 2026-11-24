@@ -29,6 +29,10 @@ KEYS_SCHEMA = "mnemiq"
 KEYS_TABLE = "declared_keys"
 
 
+class ReservedSchema(ValueError):
+    """A DuckDB-file source names the schema mnemiq keeps its own records of a copy in, as if it held the tables."""
+
+
 def _quoted(identifier: str) -> str:
     """`identifier` as a DuckDB quoted identifier, an embedded double quote doubled."""
     return '"' + identifier.replace('"', '""') + '"'
@@ -288,6 +292,12 @@ class DuckDBAdapter:
         local_only: bool = False,
         statement_timeout_s: float | None = None,
     ) -> None:
+        if attach_type.upper() == "DUCKDB" and table_schema.casefold() == KEYS_SCHEMA:
+            # Refused before the file is opened: every reader of the source's tables reads the configured schema, so
+            # naming this one would enrich the copy's declared keys, source and state as tables of the source.
+            raise ReservedSchema(
+                f"schema {table_schema!r} of a DuckDB file holds mnemiq's own records of a copy (its declared keys, "
+                "source and state), not tables to enrich; name the schema that holds the tables, usually main")
         self._catalog = catalog
         self._table_schema = table_schema
         self._fk_via_postgres = fk_via_postgres
