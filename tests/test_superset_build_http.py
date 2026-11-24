@@ -855,6 +855,29 @@ def test_a_goal_the_dashboard_shows_whole_is_answered_and_nothing_is_kept(served
     assert len(store._builds) == builds and set(world.charts) == charts
 
 
+def test_a_build_onto_a_dashboard_is_planned_with_the_measures_it_keeps(served, fake, world, store, monkeypatch):
+    """The route hands the plan the measures the store keeps for the dashboard it builds onto (`kept`), so a written
+    measure that takes a kept name or label goes back to the model instead of stopping the confirmed build; a build of
+    a dashboard of its own is handed none."""
+    client, _ = served
+    first = _start(client).json()["build"]
+    final = _run_to_the_end(client, first["build_id"])[-1].json()["build"]
+    module = _build_module()
+    real, seen = module.plan_build, []
+
+    def plan(*args, **kwargs):
+        seen.append(kwargs.get("kept"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(module, "plan_build", plan)
+    tenant = next(iter(store._builds))[0]
+    kept = tuple(row.measure for row in store.measures_for(tenant, final["dashboard_id"]))
+    assert [m.name for m in kept] == ["policies"], kept
+    _start(client, dashboard_id=final["dashboard_id"])
+    _start(client)
+    assert seen == [kept, ()], seen
+
+
 def test_a_build_onto_a_dashboard_names_what_it_left_out(served, fake, world, store):
     """A plan of which the dashboard shows one chart builds the other and names the one left out beside the build."""
     client, runtime = served

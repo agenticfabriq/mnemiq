@@ -408,6 +408,74 @@ def test_two_written_measures_with_one_label_are_refused():
     assert "measure 'total_premium'" not in _parts(refused)
 
 
+# A dashboard keeps each measure on one dataset: a build onto it that makes a dataset of its own makes the same formula
+# a measure of its own, which needs a name and a label the dashboard does not keep.
+ELSEWHERE = 53  # a dataset mnemiq made for the dashboard, which is no table's of the catalogue
+
+
+def _one_bar(measure: Measure) -> BuildPlan:
+    return _valid_plan(measures=(measure,), charts=(_chart("by_region", Family.BAR, [WrittenRef(measure)],
+                                                           dims=["region"]),))
+
+
+def test_a_measure_named_as_one_the_dashboard_keeps_elsewhere_goes_back_for_a_name_of_its_own():
+    """The dashboard keeps `total_premium` (SUM(premium)) on a dataset of its own; the plan writes the same formula on
+    the policy table. The plan's measure is refused, repairable, in words that say the dashboard keeps that name; the
+    renamed plan passes. Before, the plan passed and its build stopped at its first step on `measure_conflict`."""
+    kept = dataclasses.replace(PREMIUM, dataset_id=ELSEWHERE)
+    renamed = _measure("premium_on_policy", "Premium")
+    planner = FakePlanner([_one_bar(PREMIUM), _one_bar(renamed)])
+    assert _plan(GOAL, planner, _tools(), kept=(kept,)) == _one_bar(renamed)
+    [part] = planner.contexts[1].repair.refused
+    assert part.part == "measure 'total_premium'" and part.repairable, part
+    assert "this dashboard keeps" in part.reason and "name" in part.reason, part
+    refused = _plan(GOAL, FakePlanner(_one_bar(PREMIUM)), _tools(), kept=(kept,))
+    assert isinstance(refused, PlanRefused) and "this dashboard keeps" in _parts(refused)["measure 'total_premium'"]
+
+
+def test_a_measure_labelled_as_one_the_dashboard_keeps_is_refused():
+    """A label is a dashboard's too: Superset keys a chart's values by label, and the panel's Edit holds every label
+    of a dashboard's measures apart, so a new name with a kept label is refused as well, whatever its dataset."""
+    kept = dataclasses.replace(PREMIUM, name="premium_kept", dataset_id=ELSEWHERE)
+    refused = _plan(GOAL, FakePlanner(_one_bar(PREMIUM)), _tools(), kept=(kept,))
+    assert isinstance(refused, PlanRefused), refused
+    reason = _parts(refused)["measure 'total_premium'"]
+    assert "this dashboard keeps" in reason and "label" in reason, reason
+    on_policy = dataclasses.replace(kept, dataset_id=1)
+    refused = _plan(GOAL, FakePlanner(_one_bar(PREMIUM)), _tools(), kept=(on_policy,))
+    assert isinstance(refused, PlanRefused) and "label" in _parts(refused)["measure 'total_premium'"]
+
+
+def test_the_measure_the_dashboard_keeps_is_planned_again_as_it_is():
+    """The same measure (its name, its kind, its dataset, its expression once normalized) is the one the dashboard
+    keeps, which the build adds the new charts to: it passes, as its build merges it."""
+    kept = dataclasses.replace(PREMIUM, expression="sum( premium )")
+    assert _plan(GOAL, FakePlanner(_one_bar(PREMIUM)), _tools(), kept=(kept,)) == _one_bar(PREMIUM)
+
+
+def test_a_kept_name_on_the_same_dataset_with_another_expression_is_refused():
+    kept = dataclasses.replace(PREMIUM, expression="AVG(premium)")
+    refused = _plan(GOAL, FakePlanner(_one_bar(PREMIUM)), _tools(), kept=(kept,))
+    assert isinstance(refused, PlanRefused) and "this dashboard keeps" in _parts(refused)["measure 'total_premium'"]
+
+
+def test_the_planner_is_told_the_measures_the_dashboard_keeps_and_a_fresh_build_hears_nothing_of_them():
+    """The measures a dashboard keeps reach the model in the user prompt, each with its label, expression and kind,
+    and its table where its dataset is a table's; a build with none kept is sent the prompt it was sent before."""
+    kept = (dataclasses.replace(PREMIUM, dataset_id=ELSEWHERE), dataclasses.replace(CLAIMS, name="claims_kept"))
+    told = FakePlanner(_one_bar(_measure("premium_on_policy", "Premium")))
+    _plan(GOAL, told, _tools(), kept=kept)
+    system, user = plan_prompt(GOAL, told.contexts[0])
+    assert "this dashboard already keeps" in user and "never one of theirs" in user, user
+    assert '"name": "total_premium"' in user and '"label": "Total premium"' in user, user
+    assert '"expression": "SUM(premium)"' in user and '"table": "claim"' in user, user
+    fresh = FakePlanner(_one_bar(PREMIUM))
+    _plan(GOAL, fresh, _tools())
+    plain_system, plain_user = plan_prompt(GOAL, fresh.contexts[0])
+    assert plain_system == system and "keeps" not in plain_user
+    assert plain_user == plan_prompt(GOAL, dataclasses.replace(told.contexts[0], kept=()))[1]
+
+
 def test_saved_ref_named_like_a_dimension_is_refused():
     metrics = {1: [_metric(1, "region", "COUNT(DISTINCT region)")]}
     plan = _valid_plan(measures=(), charts=(_chart("by_region", Family.BAR, [SavedRef("region", K.COUNT)],
@@ -2317,6 +2385,28 @@ def test_a_carried_label_another_measure_has_takes_its_table_and_is_refused_when
     assert _parts(refused) == {"measure 'open_paid_by_region'": (
         "its label 'Open claims paid' is another measure's, or a saved metric's on the join, and so is 'Open claims "
         "paid (claim)'; give the other measure a label of its own")}
+
+
+def test_a_carried_metric_holds_its_label_and_name_apart_from_the_measures_the_dashboard_keeps():
+    """A joined table's saved metric carried onto a build's join is a measure of the dashboard too: where its label is
+    one the dashboard keeps, its table is appended, as for another measure of the plan; where the plan's name for it
+    is one the dashboard keeps, it goes back for a name of its own (a carried measure is on a dataset the build makes,
+    so it is never the kept one)."""
+    def plan() -> BuildPlan:
+        return BuildPlan(charts=(_chart("carried", Family.BAR, [OPEN_PAID_REF], dataset_id=-1, dims=["region"]),),
+                         measures=(), reuse_candidates=(),
+                         datasets=(PlannedDataset(key="dataset_1", placeholder=-1, join=JOIN),))
+
+    tools = _tools(metrics=SAVED_ON_TABLES, extension=CERTIFIED)
+    labelled = _measure("kept_paid", "Open claims paid", "SUM(amount)", K.CURRENCY, dataset_id=ELSEWHERE)
+    checked = _plan(GOAL, FakePlanner(plan()), tools, snapshot=KEYED, settings=GUARDED, kept=(labelled,))
+    assert isinstance(checked, BuildPlan), checked
+    assert [m.label for m in checked.measures] == ["Open claims paid (claim)"]
+    named = _measure("open_paid_by_region", "Paid elsewhere", "SUM(amount)", K.CURRENCY, dataset_id=ELSEWHERE)
+    refused = _plan(GOAL, FakePlanner(plan()), tools, snapshot=KEYED, settings=GUARDED, kept=(named,))
+    assert isinstance(refused, PlanRefused), refused
+    reason = _parts(refused)["measure 'open_paid_by_region'"]
+    assert "this dashboard keeps" in reason and "name" in reason, reason
 
 
 def test_one_carried_metric_on_two_charts_is_one_measure_decided_against_both_charts_columns():

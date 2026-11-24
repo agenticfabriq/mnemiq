@@ -105,6 +105,18 @@ def read_saved_metrics(client, *, dataset_ids: tuple[int, ...]) -> list[SavedMet
     return saved
 
 
+def same_definition(kept: Measure, planned: Measure) -> bool:
+    """Whether `planned` is the measure `kept`: its kind and dataset the same, its expression the same once normalized
+    (as written, when it does not parse). A dataset is part of a measure: the same formula on another dataset is
+    another measure, which its dashboard keeps apart."""
+    if kept.kind != planned.kind or kept.dataset_id != planned.dataset_id:
+        return False
+    try:
+        return normalized(kept.expression) == normalized(planned.expression)
+    except SqlglotError:
+        return kept.expression.strip() == planned.expression.strip()
+
+
 def reusable(measure: Measure, saved: list[SavedMetric]) -> SavedMetric | None:
     """The saved metric on the measure's dataset that says what the measure says, certified ones first, then by name."""
     try:

@@ -1231,6 +1231,20 @@ def test_a_measure_kept_with_another_definition_after_the_first_step_still_stops
     assert "create_chart" not in _tools(fake) and "'policies'" in stopped.message
 
 
+def test_a_label_the_dashboard_keeps_under_another_name_stops_the_build_at_its_first_step(fake, world, store):
+    """A dashboard's measures hold their labels apart as they hold their names: Superset keys a chart's values by
+    label, and the panel's Edit refuses a label another measure has. A planned measure whose label the dashboard keeps
+    under another name (whatever its definition) stops the build before anything is made, as a planned name does; the
+    plan check refuses it first, so only a measure kept after the plan meets this."""
+    dashboard, existing = _existing_dashboard(world)
+    _kept_measure(store, dashboard, dataclasses.replace(POLICIES, name="policies_kept"), (existing,))
+    build = _start(store, ONE_BAR, dashboard_id=dashboard).build_id
+    stopped = _next(store, build, _adapter(fake))
+    assert stopped.status == "failed" and _step(stopped, "dashboard").reason == "measure_conflict", stopped.message
+    assert "label" in stopped.message and repr(POLICIES.label) in stopped.message, stopped.message
+    assert not set(_tools(fake)) & set(_MAKES), _tools(fake)
+
+
 def test_the_same_definition_merges_its_charts(fake, world, store):
     """The same measure (its expression equal once normalized, its kind and dataset the same) gains the new chart
     beside those it had, and keeps their statuses."""

@@ -467,11 +467,14 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> BuildKit:
             _held_to_its_editors(adapter.client, dashboard_id)
             if propose:  # read before planning, so a change made while it plans is one its confirm sees
                 planned_against = _changed_on(adapter.client, dashboard_id)
-        built_on = (datasets_built_on(builds.measures_for(who.tenant_id, dashboard_id))
-                    if dashboard_id is not None else None)
+        # The measures the dashboard keeps, read once: the datasets its charts are on, and the names and labels a
+        # plan onto it leaves to them.
+        on_it = builds.measures_for(who.tenant_id, dashboard_id) if dashboard_id is not None else []
+        built_on = datasets_built_on(on_it) if dashboard_id is not None else None
         plan = plan_build(goal, planner=planner, client=adapter.client, adapter=adapter,
                           snapshot=runtime.snapshot, grants=grants, settings=profile.settings,
-                          offer_reuse=dashboard_id is None and not fresh, onto=dashboard_id, built_on=built_on)
+                          offer_reuse=dashboard_id is None and not fresh, onto=dashboard_id, built_on=built_on,
+                          kept=tuple(row.measure for row in on_it))
         if isinstance(plan, PlanRefused):
             return 200, _refused_plan(plan)
         if plan.awaiting_choice:
