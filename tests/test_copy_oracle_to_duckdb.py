@@ -724,3 +724,58 @@ def test_the_password_is_never_printed(deployment, capsys):
     deployment(_shop())
     out = capsys.readouterr()
     assert "not-a-real-password" not in out.out + out.err
+
+
+def test_the_file_records_a_copy_complete_only_once_everything_is_published(deployment, monkeypatch):
+    # An interrupted --replace left new tables beside the old keys and comments, and nothing said so.
+    assert deployment(_shop()) == 0
+    assert DuckDBAdapter.duckdb(deployment.out).copy_state() == "complete"
+    with pytest.raises(RuntimeError, match="connection was lost"):
+        deployment(_shop(fail_on=("CUSTOMER", 0)), "--replace")  # ORDERS replaced, CUSTOMER stopped mid-table
+    assert DuckDBAdapter.duckdb(deployment.out).copy_state() == "copying"
+
+    def keys_fail(duck, rows):
+        raise RuntimeError("stopped while publishing the keys")
+
+    real = copy._write_keys
+    monkeypatch.setattr(copy, "_write_keys", keys_fail)
+    with pytest.raises(RuntimeError, match="publishing the keys"):
+        deployment(_shop(), "--replace")  # every table replaced, the keys never published
+    assert DuckDBAdapter.duckdb(deployment.out).copy_state() == "copying"
+    monkeypatch.setattr(copy, "_write_keys", real)
+    assert deployment(_shop()) == 0
+    assert DuckDBAdapter.duckdb(deployment.out).copy_state() == "complete"
+
+
+def test_a_file_the_copy_did_not_make_records_no_copy_state(tmp_path):
+    import sqlite3
+
+    path = str(tmp_path / "plain.duckdb")
+    duckdb.connect(path).execute("CREATE TABLE t (x INTEGER)").close()
+    assert DuckDBAdapter.duckdb(path).copy_state() is None
+    lite = tmp_path / "plain.sqlite"
+    sqlite3.connect(lite).executescript("CREATE TABLE t (x INTEGER);")
+    assert DuckDBAdapter.sqlite(str(lite)).copy_state() is None
+
+
+def test_enrich_and_refresh_refuse_a_copy_that_did_not_finish(deployment, monkeypatch, capsys, tmp_path):
+    from mnemiq.cli import _cmd_enrich, _cmd_refresh, _enrichment_source
+    from mnemiq.config import Settings
+
+    assert deployment(_shop()) == 0
+    entry = deployment.out + ".source.json"
+
+    def settings() -> Settings:
+        return Settings(sources_path=entry, store_path=str(tmp_path / "store.duckdb"),
+                        llm_base_url="http://127.0.0.1:9/v1", llm_api_key="x", llm_model="m")
+
+    _enrichment_source(settings())  # a finished copy is a source like any
+    with pytest.raises(RuntimeError):
+        deployment(_shop(fail_on=("CUSTOMER", 0)), "--replace")
+    capsys.readouterr()
+    assert _cmd_enrich(settings()) == 1
+    err = capsys.readouterr().err.strip()
+    assert "\n" not in err and "copy_oracle_to_duckdb" in err and "rerun" in err and "'copying'" in err
+    assert not os.path.exists(tmp_path / "store.duckdb"), "refused before the store is opened"
+    assert _cmd_refresh(settings()) == 1
+    assert "copy_oracle_to_duckdb" in capsys.readouterr().err

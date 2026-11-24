@@ -27,6 +27,8 @@ _DECLARED_KEYS_ORDER = "from_table, key_position, constraint_name"
 # of the source's tables takes it for one. `scripts/copy_oracle_to_duckdb.py` writes it; `foreign_keys` reads it.
 KEYS_SCHEMA = "mnemiq"
 KEYS_TABLE = "declared_keys"
+# The copy's progress, one row: `copying` from its first write, `complete` once its tables, comments and keys are all in.
+COPY_STATE_TABLE = "copy_state"
 
 
 class ReservedSchema(ValueError):
@@ -422,6 +424,23 @@ class DuckDBAdapter:
                            self._table_schema, why)
             return []
         return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
+
+    def copy_state(self) -> str | None:
+        """What a DuckDB file made by `scripts/copy_oracle_to_duckdb.py` records of that copy: `complete`, or `copying`
+        when a copy stopped before its tables, comments and keys were all published (an interrupted `--replace` leaves
+        new tables beside old keys). None for a file with no such record, as any DuckDB file the copy did not make, and
+        for every other kind this class attaches."""
+        if self._attach_type != "DUCKDB":
+            return None
+        found = self._con.execute(
+            "SELECT table_catalog FROM information_schema.tables "
+            "WHERE lower(table_catalog) = lower(?) AND table_schema = ? AND table_name = ?",
+            [self._catalog, KEYS_SCHEMA, COPY_STATE_TABLE]).fetchall()
+        if not found:
+            return None
+        row = self._con.execute(
+            f"SELECT state FROM {_quoted(found[0][0])}.{KEYS_SCHEMA}.{COPY_STATE_TABLE}").fetchone()
+        return row[0] if row else None
 
     def _declared_keys_table(self) -> list[tuple[str, str, str, str, str]]:
         """A DuckDB file's declared keys, from the table `scripts/copy_oracle_to_duckdb.py` writes them to.

@@ -409,7 +409,10 @@ password) and each
 table copied whole (`mnemiq.copied_tables`), so a file holding another source's copy, or tables with
 no record of their source, is refused before Oracle is reached: copy into a new `--out` instead. The
 copy holds the file from that check to its end, so a second copy into it, or anything else opening
-it, is refused until the first is done.
+it, is refused until the first is done. Until a run has published its tables, comments and keys,
+the file records the copy as unfinished (`mnemiq.copy_state`), and `mnemiq enrich` and `mnemiq
+refresh` refuse it, saying to rerun the copy: a `--replace` stopped part way would otherwise be
+enriched with new tables beside old keys.
 
 **What it costs.**
 

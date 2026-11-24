@@ -386,7 +386,7 @@ def _enrichment_source(settings: Settings):
 
     Raises `SourceUnconfigured`, `UnknownSourceKind` or `SupersetConfigError`, each with a sentence.
     """
-    from mnemiq.adapters.resolve import adapter_for, source_spec
+    from mnemiq.adapters.resolve import SourceUnconfigured, adapter_for, source_spec
 
     if settings.superset_mode:
         # Imported here and nowhere else in the engine: the module that reads the service key.
@@ -401,7 +401,14 @@ def _enrichment_source(settings: Settings):
     # A Postgres source also gets it as its connection's statement timeout, the bound that stops the server's scan:
     # DuckDB's interrupt, which EnrichDeadline sends, waits for a streaming scan to finish (M152).
     limit = settings.enrich_statement_timeout_s or None
-    return spec, EnrichDeadline(adapter_for(spec, settings, statement_timeout_s=limit), settings.enrich_statement_timeout_s)
+    adapter = adapter_for(spec, settings, statement_timeout_s=limit)
+    # A DuckDB copy of Oracle that stopped part way (`scripts/copy_oracle_to_duckdb.py`) can hold new tables beside
+    # old keys and comments; one with no record of a copy is any DuckDB file, and is read as before.
+    state = adapter.copy_state() if spec.kind == "duckdb" else None
+    if state not in (None, "complete"):
+        raise SourceUnconfigured(f"source {spec.id!r}: {spec.target} records a copy that did not finish (state "
+                                 f"{state!r}): rerun scripts/copy_oracle_to_duckdb.py to finish it, then enrich")
+    return spec, EnrichDeadline(adapter, settings.enrich_statement_timeout_s)
 
 
 def _kept_for_add(settings: Settings, spec):

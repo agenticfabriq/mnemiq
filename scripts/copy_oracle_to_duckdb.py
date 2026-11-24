@@ -53,7 +53,7 @@ from fnmatch import fnmatchcase
 import duckdb
 import pyarrow as pa
 
-from mnemiq.adapters.duckdb import KEYS_SCHEMA, KEYS_TABLE
+from mnemiq.adapters.duckdb import COPY_STATE_TABLE, KEYS_SCHEMA, KEYS_TABLE
 from mnemiq.config import Settings, SourceSpec
 from mnemiq.duckdb_extensions import connect_duckdb
 
@@ -419,6 +419,16 @@ def _check_file(state: _FileState, source: CopySource, out: str) -> None:
                        f"{state.source.db_unique_name}/{state.source.con_name}; copy into a new --out")
 
 
+def _set_state(duck, state: str) -> None:
+    """The copy's progress in the file, in its own transaction: `copying` before its first write, `complete` only after
+    its tables, comments and keys are all published. `mnemiq enrich` refuses a file that records anything else."""
+    duck.execute("BEGIN TRANSACTION")
+    duck.execute(f"CREATE SCHEMA IF NOT EXISTS {KEYS_SCHEMA}")
+    duck.execute(f"CREATE OR REPLACE TABLE {KEYS_SCHEMA}.{COPY_STATE_TABLE} (state VARCHAR, updated_at TIMESTAMPTZ)")
+    duck.execute(f"INSERT INTO {KEYS_SCHEMA}.{COPY_STATE_TABLE} VALUES (?, now())", [state])
+    duck.execute("COMMIT")
+
+
 def _record_source(duck, source: CopySource) -> None:
     duck.execute("BEGIN TRANSACTION")
     duck.execute(f"CREATE SCHEMA IF NOT EXISTS {KEYS_SCHEMA}")
@@ -522,6 +532,7 @@ def _write(conn, duck, spec: SourceSpec, args, out: str, plan: _Plan, *, source:
            state: _FileState) -> int:
     owner, owner_tables, tables = plan.owner, plan.owner_tables, plan.tables
     table_comments, column_comments, keys = plan.table_comments, plan.column_comments, plan.keys
+    _set_state(duck, "copying")
     if state.source is None:
         _record_source(duck, source)
     # Skipped only when recorded complete and still there: a table present without the record is copied again.
@@ -546,6 +557,7 @@ def _write(conn, duck, spec: SourceSpec, args, out: str, plan: _Plan, *, source:
         duck.execute(statement)
     key_rows = declared_key_rows([tuple(r) for r in keys], in_file & set(owner_tables))
     _write_keys(duck, key_rows)
+    _set_state(duck, "complete")
     duck.execute("CHECKPOINT")
     entry_path = out + ".source.json"
     with open(entry_path, "w") as fh:
