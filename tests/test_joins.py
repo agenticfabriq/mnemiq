@@ -2,7 +2,7 @@ import duckdb
 import pytest
 
 from mnemiq.catalog import ColumnInfo, TableInfo
-from mnemiq.enrichment.joins import _compares_as_numbers, infer_relationships
+from mnemiq.enrichment.joins import infer_relationships
 
 
 class _DuckAdapter:
@@ -110,7 +110,7 @@ def _numeric_keys(parent_type: str, child_type: str, child_rows: str):
 
 @pytest.mark.parametrize(("parent_type", "child_type"), [
     ("DECIMAL(19,0)", "DECIMAL(19,2)"), ("BIGINT", "DECIMAL(19,2)"), ("DECIMAL(12,2)", "DOUBLE"),
-    ("INTEGER", "DOUBLE")])
+    ("INTEGER", "DOUBLE"), ("BIGINT", "DOUBLE")])
 def test_numeric_join_keys_of_different_types_compare_as_numbers(parent_type, child_type):
     # A DuckDB copy of Oracle lands each NUMBER as BIGINT, DECIMAL(p, s) or DOUBLE by its declaration, where as text
     # one number is 1, 1.00 or 1.0; Oracle, and the join the relationship describes, compare them as numbers.
@@ -120,8 +120,7 @@ def test_numeric_join_keys_of_different_types_compare_as_numbers(parent_type, ch
 
 def test_a_double_key_does_not_vouch_for_exact_keys_it_cannot_tell_apart():
     # Codex's second review of the exact-number copy: compared as a DOUBLE, two DECIMAL(38, 0) keys past 2^53 are one
-    # number, so one child row joins both parents. A double holds 15 significant digits exactly; past them the pair is
-    # compared as text, as before, and the child's 9007199254740992.0 matches neither parent.
+    # number, so one child row joins both parents, though each parent key is unique in its own type.
     con = duckdb.connect()
     con.execute('CREATE TABLE parent ("parent_id" DECIMAL(38,0))')
     con.execute("INSERT INTO parent VALUES (9007199254740992), (9007199254740993)")
@@ -150,24 +149,26 @@ def test_a_text_parent_key_still_matches_a_numeric_child():
     assert [(r.from_, r.to) for r in infer_relationships(_DuckAdapter(con), catalog)] == [("child", "parent")]
 
 
-@pytest.mark.parametrize(("parent_type", "child_type", "natively"), [
-    ("DECIMAL(19,0)", "DECIMAL(19,2)", True),   # exact against exact compares exactly
-    ("BIGINT", "DECIMAL(38,0)", True),
-    ("DOUBLE", "FLOAT8", True),                 # floating against floating, as the source keeps them
-    ("DECIMAL(15,2)", "DOUBLE", True),          # an exact type within a double's 15 digits
-    ("DOUBLE", "INTEGER", True),
-    ("DECIMAL(16,0)", "DOUBLE", False),         # past them, two keys can become one
-    ("BIGINT", "DOUBLE", False),
-    ("NUMERIC", "DOUBLE", False),               # a precision not declared is not known to fit
-    ("INTEGER", "FLOAT", False),                # a single holds 6 digits
-    ("DECIMAL(6,2)", "REAL", True),
-    ("INTEGER", "VARCHAR", False),              # text on either side is text
-    ("BOOLEAN", "INTEGER", False),
-    (None, "INTEGER", False),
-])
-def test_keys_compare_as_numbers_only_where_no_two_keys_can_become_one(parent_type, child_type, natively):
-    assert _compares_as_numbers(parent_type, child_type) is natively
-    assert _compares_as_numbers(child_type, parent_type) is natively
+def test_exact_keys_a_source_compares_in_floating_point_do_not_vouch_for_a_join_either():
+    # Codex's third review: DuckDB compares HUGEINT with UHUGEINT as DOUBLE (its EXPLAIN), so two exact types can merge
+    # keys too. Which comparisons a source widens is the source's to say, so the check asks it, under the predicate.
+    con = duckdb.connect()
+    con.execute('CREATE TABLE parent ("parent_id" HUGEINT)')
+    con.execute("INSERT INTO parent VALUES (18014398509481984), (18014398509481985)")
+    con.execute('CREATE TABLE child ("child_id" INTEGER, "parent_id" UHUGEINT)')
+    con.execute("INSERT INTO child VALUES (10, 18014398509481986)")
+    catalog = [
+        TableInfo("parent", [ColumnInfo("parent_id", "HUGEINT")]),
+        TableInfo("child", [ColumnInfo("child_id", "INTEGER"), ColumnInfo("parent_id", "UHUGEINT")]),
+    ]
+    assert con.execute('SELECT count(*) FROM child c JOIN parent p ON p."parent_id" = c."parent_id"').fetchone() == (2,)
+    assert infer_relationships(_DuckAdapter(con), catalog) == []
+
+
+def test_child_rows_sharing_a_key_are_not_a_fan_out():
+    # Many child rows to one parent is the many-to-one itself: the check counts each child value once.
+    assert [(r.from_, r.to) for r in _numeric_keys("DECIMAL(12,2)", "DOUBLE", "(10, 1), (11, 1), (12, 1), (13, 2)")] == [
+        ("child", "parent")]
 
 
 def test_numeric_join_keys_still_refuse_an_orphan():
@@ -359,6 +360,22 @@ def test_orphan_query_on_duckdb_compares_as_text_unless_both_keys_are_numbers():
     head = 'SELECT count(*) FROM "invoice" c WHERE c."customer_id" IS NOT NULL AND NOT EXISTS (  SELECT 1 FROM "customer" p '
     assert orphan_check("NUMBER") == head + '  WHERE p."customer_id" = c."customer_id")'
     assert orphan_check("VARCHAR") == head + '  WHERE CAST(p."customer_id" AS VARCHAR) = CAST(c."customer_id" AS VARCHAR))'
+
+
+def test_on_oracle_keys_of_different_declared_types_are_checked_for_a_fan_out():
+    """Oracle compares natively always, and a NUMBER against a BINARY_DOUBLE is compared in binary floating point; the
+    recorder answers every count with 10, so here the source says a child value meets two parents. Keys of one type
+    are not asked: the parent was counted unique in that type."""
+    mixed = _invoices()
+    mixed[1] = TableInfo("invoice", [ColumnInfo("invoice_id", "NUMBER"), ColumnInfo("customer_id", "BINARY_DOUBLE")])
+    recorder = _KeyRecorder("oracle")
+    rels = infer_relationships(recorder, mixed)
+    fan_out = [sql for sql in recorder.sql if "HAVING count(*) > 1" in sql]
+    assert ("invoice", "customer") not in {(r.from_, r.to) for r in rels}
+    assert len(fan_out) == 1 and 'ON p."customer_id" = d.v' in fan_out[0]
+    same = _KeyRecorder("oracle")
+    assert ("invoice", "customer") in {(r.from_, r.to) for r in infer_relationships(same, _invoices())}
+    assert not [sql for sql in same.sql if "HAVING" in sql]
 
 
 def test_a_candidate_that_cannot_be_checked_costs_only_itself(caplog):
