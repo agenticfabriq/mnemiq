@@ -1,4 +1,5 @@
 import duckdb
+import pytest
 
 from mnemiq.catalog import ColumnInfo, TableInfo
 from mnemiq.enrichment.joins import infer_relationships
@@ -92,6 +93,103 @@ def test_cross_type_join_keys_compare_as_text():
     ]
     rels = infer_relationships(_DuckAdapter(con), catalog)
     assert any(r.from_ == "child" and r.to == "parent" for r in rels)
+
+
+def _numeric_keys(parent_type: str, child_type: str, child_rows: str):
+    con = duckdb.connect()
+    con.execute(f'CREATE TABLE parent ("parent_id" {parent_type})')
+    con.execute("INSERT INTO parent VALUES (1),(2)")
+    con.execute(f'CREATE TABLE child ("child_id" INTEGER, "parent_id" {child_type})')
+    con.execute(f"INSERT INTO child VALUES {child_rows}")
+    catalog = [
+        TableInfo("parent", [ColumnInfo("parent_id", parent_type)]),
+        TableInfo("child", [ColumnInfo("child_id", "INTEGER"), ColumnInfo("parent_id", child_type)]),
+    ]
+    return infer_relationships(_DuckAdapter(con), catalog)
+
+
+@pytest.mark.parametrize(("parent_type", "child_type"), [
+    ("DECIMAL(19,0)", "DECIMAL(19,2)"), ("BIGINT", "DECIMAL(19,2)"), ("DECIMAL(12,2)", "DOUBLE"),
+    ("INTEGER", "DOUBLE"), ("BIGINT", "DOUBLE")])
+def test_numeric_join_keys_of_different_types_compare_as_numbers(parent_type, child_type):
+    # A DuckDB copy of Oracle lands each NUMBER as BIGINT, DECIMAL(p, s) or DOUBLE by its declaration, where as text
+    # one number is 1, 1.00 or 1.0; Oracle, and the join the relationship describes, compare them as numbers.
+    rels = _numeric_keys(parent_type, child_type, "(10, 1), (11, 2)")
+    assert [(r.from_, r.to) for r in rels] == [("child", "parent")]
+
+
+def test_a_double_key_does_not_vouch_for_exact_keys_it_cannot_tell_apart():
+    # Codex's second review of the exact-number copy: compared as a DOUBLE, two DECIMAL(38, 0) keys past 2^53 are one
+    # number, so one child row joins both parents, though each parent key is unique in its own type.
+    con = duckdb.connect()
+    con.execute('CREATE TABLE parent ("parent_id" DECIMAL(38,0))')
+    con.execute("INSERT INTO parent VALUES (9007199254740992), (9007199254740993)")
+    con.execute('CREATE TABLE child ("child_id" INTEGER, "parent_id" DOUBLE)')
+    con.execute("INSERT INTO child VALUES (10, 9007199254740992)")
+    catalog = [
+        TableInfo("parent", [ColumnInfo("parent_id", "DECIMAL(38,0)")]),
+        TableInfo("child", [ColumnInfo("child_id", "INTEGER"), ColumnInfo("parent_id", "DOUBLE")]),
+    ]
+    assert con.execute('SELECT count(*) FROM child c JOIN parent p ON p."parent_id" = c."parent_id"').fetchone() == (2,)
+    assert infer_relationships(_DuckAdapter(con), catalog) == []
+
+
+def _text_parent(values: str, child_type: str, failures: list | None = None):
+    con = duckdb.connect()
+    con.execute('CREATE TABLE parent ("parent_id" VARCHAR)')
+    con.execute(f"INSERT INTO parent VALUES {values}")
+    con.execute(f'CREATE TABLE child ("child_id" INTEGER, "parent_id" {child_type})')
+    con.execute("INSERT INTO child VALUES (10, 1), (11, 2)")
+    catalog = [
+        TableInfo("parent", [ColumnInfo("parent_id", "VARCHAR")]),
+        TableInfo("child", [ColumnInfo("child_id", "INTEGER"), ColumnInfo("parent_id", child_type)]),
+    ]
+    return [(r.from_, r.to) for r in infer_relationships(_DuckAdapter(con), catalog, failures=failures)]
+
+
+def test_a_text_parent_key_still_matches_a_numeric_child():
+    # The mirror of INTEGER against TEXT: the parent from an all-text CSV, the child typed.
+    assert _text_parent("('1'), ('2')", "DECIMAL(19,0)") == [("child", "parent")]
+
+
+def test_text_keys_one_number_in_the_join_do_not_vouch_for_it():
+    # Codex's fifth review: as text '1' and '01' are two parents and the child's 1 meets one, but the relationship is
+    # stored as plain equality, and the join compares natively, where 1 meets both. The fan-out is asked of that join.
+    assert _text_parent("('1'), ('01'), ('2')", "INTEGER") == []
+
+
+def test_a_text_key_the_join_cannot_read_as_a_number_is_not_inferred_and_is_said():
+    # The parent's 'X1' matches nothing as text, but the join reads the key as a number and raises on it: a relationship
+    # whose join raises is not one, so the candidate is skipped and recorded, as a check that could not run.
+    failures: list[str] = []
+    assert _text_parent("('1'), ('2'), ('X1')", "DECIMAL(19,0)", failures) == []
+    assert len(failures) == 1 and failures[0].startswith("child.parent_id -> parent:")
+
+
+def test_exact_keys_a_source_compares_in_floating_point_do_not_vouch_for_a_join_either():
+    # Codex's third review: DuckDB compares HUGEINT with UHUGEINT as DOUBLE (its EXPLAIN), so two exact types can merge
+    # keys too. Which comparisons a source widens is the source's to say, so the check asks it, under the predicate.
+    con = duckdb.connect()
+    con.execute('CREATE TABLE parent ("parent_id" HUGEINT)')
+    con.execute("INSERT INTO parent VALUES (18014398509481984), (18014398509481985)")
+    con.execute('CREATE TABLE child ("child_id" INTEGER, "parent_id" UHUGEINT)')
+    con.execute("INSERT INTO child VALUES (10, 18014398509481986)")
+    catalog = [
+        TableInfo("parent", [ColumnInfo("parent_id", "HUGEINT")]),
+        TableInfo("child", [ColumnInfo("child_id", "INTEGER"), ColumnInfo("parent_id", "UHUGEINT")]),
+    ]
+    assert con.execute('SELECT count(*) FROM child c JOIN parent p ON p."parent_id" = c."parent_id"').fetchone() == (2,)
+    assert infer_relationships(_DuckAdapter(con), catalog) == []
+
+
+def test_child_rows_sharing_a_key_are_not_a_fan_out():
+    # Many child rows to one parent is the many-to-one itself: the check counts each child value once.
+    assert [(r.from_, r.to) for r in _numeric_keys("DECIMAL(12,2)", "DOUBLE", "(10, 1), (11, 1), (12, 1), (13, 2)")] == [
+        ("child", "parent")]
+
+
+def test_numeric_join_keys_still_refuse_an_orphan():
+    assert _numeric_keys("DECIMAL(19,0)", "DECIMAL(19,2)", "(10, 1), (11, 2.5)") == []
 
 
 # --- Plan 11: declared foreign keys ---------------------------------------------------
@@ -221,9 +319,10 @@ class _KeyRecorder:
     `count(*), count(DISTINCT), count()` gives 10, 10, 10 and the orphan count gives 0. `fail_on` names a column whose
     orphan query raises, as Oracle raised ORA-00906 on `CAST(... AS VARCHAR)` (measured on 23.26, 2026-11-19)."""
 
-    def __init__(self, dialect: str | None, fks=(), fail_on: str | None = None, catalog=()):
+    def __init__(self, dialect: str | None, fks=(), fail_on: str | None = None, catalog=(), fan_out: int = 0):
         if dialect is not None:
             self.dialect = dialect
+        self._fan_out = fan_out
         self.sql: list[str] = []
         self._fks = list(fks)
         self._fail_on = fail_on
@@ -240,6 +339,8 @@ class _KeyRecorder:
 
     def execute(self, sql):
         self.sql.append(sql)
+        if "HAVING count(*) > 1" in sql:  # child values that meet two parents
+            return [(self._fan_out,)]
         if "NOT EXISTS" in sql:
             if self._fail_on and f'"{self._fail_on}"' in sql:
                 raise RuntimeError("ORA-00942: table or view does not exist")
@@ -268,16 +369,44 @@ def test_orphan_query_compares_natively_on_oracle():
     assert ("invoice", "customer") in {(r.from_, r.to) for r in rels}
 
 
-def test_orphan_query_unchanged_on_duckdb():
-    recorder = _KeyRecorder(None)
-    infer_relationships(recorder, _invoices())
-    orphan = next(sql for sql in recorder.sql if "NOT EXISTS" in sql and '"customer_id"' in sql)
-    assert orphan == (
-        'SELECT count(*) FROM "invoice" c '
-        'WHERE c."customer_id" IS NOT NULL AND NOT EXISTS ('
-        '  SELECT 1 FROM "customer" p '
-        '  WHERE CAST(p."customer_id" AS VARCHAR) = CAST(c."customer_id" AS VARCHAR))'
-    )
+def test_orphan_query_on_duckdb_compares_as_text_unless_both_keys_are_numbers():
+    def orphan_check(child_key_type: str) -> str:
+        catalog = _invoices()
+        catalog[1] = TableInfo("invoice", [ColumnInfo("invoice_id", "NUMBER"), ColumnInfo("customer_id", child_key_type)])
+        recorder = _KeyRecorder(None)
+        infer_relationships(recorder, catalog)
+        return next(sql for sql in recorder.sql if "NOT EXISTS" in sql and '"customer_id"' in sql)
+
+    head = 'SELECT count(*) FROM "invoice" c WHERE c."customer_id" IS NOT NULL AND NOT EXISTS (  SELECT 1 FROM "customer" p '
+    assert orphan_check("NUMBER") == head + '  WHERE p."customer_id" = c."customer_id")'
+    assert orphan_check("VARCHAR") == head + '  WHERE CAST(p."customer_id" AS VARCHAR) = CAST(c."customer_id" AS VARCHAR))'
+
+
+def test_every_candidate_is_checked_for_a_fan_out_under_the_join_predicate():
+    """The parent is counted unique in its own type and collation, which is not always how the join compares (a DOUBLE
+    against DECIMAL(38, 0) past 2^53, DuckDB's HUGEINT against UHUGEINT, a NOCASE collation), so the source is asked,
+    for every candidate, whether a child value meets two parents."""
+    fanned = _KeyRecorder("oracle", fan_out=1)
+    assert ("invoice", "customer") not in {(r.from_, r.to) for r in infer_relationships(fanned, _invoices())}
+    clean = _KeyRecorder("oracle")
+    assert ("invoice", "customer") in {(r.from_, r.to) for r in infer_relationships(clean, _invoices())}
+    checks = [sql for sql in clean.sql if "HAVING count(*) > 1" in sql and '"customer_id"' in sql]
+    assert len(checks) == 1 and 'ON p."customer_id" = d.v' in checks[0]
+
+
+def test_keys_one_collation_makes_equal_do_not_vouch_for_a_join():
+    # Codex's fourth review: under NOCASE 'a' and 'A' are two distinct parent values, and a child's 'a' meets both.
+    con = duckdb.connect()
+    con.execute('CREATE TABLE parent ("parent_id" VARCHAR COLLATE NOCASE)')
+    con.execute("INSERT INTO parent VALUES ('a'), ('A')")
+    con.execute('CREATE TABLE child ("child_id" INTEGER, "parent_id" VARCHAR COLLATE NOCASE)')
+    con.execute("INSERT INTO child VALUES (10, 'a')")
+    catalog = [
+        TableInfo("parent", [ColumnInfo("parent_id", "VARCHAR")]),
+        TableInfo("child", [ColumnInfo("child_id", "INTEGER"), ColumnInfo("parent_id", "VARCHAR")]),
+    ]
+    assert con.execute('SELECT count(*) FROM child c JOIN parent p ON p."parent_id" = c."parent_id"').fetchone() == (2,)
+    assert infer_relationships(_DuckAdapter(con), catalog) == []
 
 
 def test_a_candidate_that_cannot_be_checked_costs_only_itself(caplog):

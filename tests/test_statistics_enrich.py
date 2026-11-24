@@ -216,7 +216,10 @@ def test_estimated_columns_are_never_harvested_without_values(shop):
 
 # The statements `enrich_structural(shop, "shop")` sends with no setting, and the snapshot's version, pinned before
 # statistics mode was added (this branch at 206eeb96, whose `enrich_structural` sends what main 5f0ca71a sends).
-TODAYS_STATEMENTS = ("de846434b63c2801", 11)
+# Moved once since, by join inference, the snapshot unchanged: its orphan query compares the two INTEGER keys
+# natively, and a fan-out query under the same predicate follows it; with those two undone the statements are
+# de846434b63c2801, 11, the digest pinned before.
+TODAYS_STATEMENTS = ("590ecea8ec3bd4ae", 12)
 TODAYS_VERSION = "bae721c4ab36"
 
 

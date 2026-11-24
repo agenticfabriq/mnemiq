@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 
 import duckdb
 import pyarrow as pa
@@ -39,6 +40,24 @@ def _batch(schema: pa.Schema, ids: range) -> pa.Table:
     return pa.table({schema.names[0]: list(ids), schema.names[1]: [f"v{i}" for i in ids]}, schema=schema)
 
 
+# The words Oracle refuses as a bind variable's name (ORA-01745), measured on Oracle Database 23.26
+# Free by binding each of the SQL Language Reference's reserved words: all but COLUMN_VALUE and
+# NESTED_TABLE_ID. The fake refuses them too, so a statement the server would refuse fails here.
+_REFUSED_BIND_NAMES = frozenset("""
+    ACCESS ADD ALL ALTER AND ANY AS ASC AUDIT BETWEEN BY CHAR CHECK CLUSTER COLUMN COMMENT COMPRESS
+    CONNECT CREATE CURRENT DATE DECIMAL DEFAULT DELETE DESC DISTINCT DROP ELSE EXCLUSIVE EXISTS FILE
+    FLOAT FOR FROM GRANT GROUP HAVING IDENTIFIED IMMEDIATE IN INCREMENT INDEX INITIAL INSERT INTEGER
+    INTERSECT INTO IS LEVEL LIKE LOCK LONG MAXEXTENTS MINUS MLSLABEL MODE MODIFY NOAUDIT NOCOMPRESS
+    NOT NOWAIT NULL NUMBER OF OFFLINE ON ONLINE OPTION OR ORDER PCTFREE PRIOR PUBLIC RAW RENAME
+    RESOURCE REVOKE ROW ROWID ROWNUM ROWS SELECT SESSION SET SHARE SIZE SMALLINT START SUCCESSFUL
+    SYNONYM SYSDATE TABLE THEN TO TRIGGER UID UNION UNIQUE UPDATE USER VALIDATE VALUES VARCHAR
+    VARCHAR2 VIEW WHENEVER WHERE WITH""".split())
+
+
+def _bind_names(sql: str) -> set[str]:
+    return {name.upper() for name in re.findall(r":([A-Za-z_][A-Za-z0-9_$#]*)", re.sub(r"'[^']*'", "", sql))}
+
+
 class _Cursor:
     def __init__(self, fake: "_Oracle") -> None:
         self._fake = fake
@@ -51,6 +70,8 @@ class _Cursor:
         return False
 
     def execute(self, sql: str, parameters=None, **binds):
+        refused = _bind_names(sql) & _REFUSED_BIND_NAMES
+        assert not refused, f"ORA-01745: invalid host/bind variable name {sorted(refused)} in {sql!r}"
         self._fake.log.append(sql)
         if self._fake.on_query is not None and "from all_tables" in sql.lower():
             hook, self._fake.on_query = self._fake.on_query, None
@@ -64,6 +85,8 @@ class _Cursor:
             self._rows = [(self._fake.user,)]
         elif "from all_tables" in low:
             self._rows = list(self._fake.stats)
+        elif "data_precision" in low:
+            self._rows = list(self._fake.declared[parameters["table_name"]])
         elif "from all_tab_columns" in low:
             self._rows = [(t, c) for t, schema in self._fake.schemas.items() for c in schema.names]
         elif "from all_tab_comments" in low:
@@ -81,14 +104,33 @@ class _Cursor:
         return self._rows
 
 
+def _declared_like(schema: pa.Schema) -> list[tuple]:
+    """`ALL_TAB_COLUMNS` rows (name, type, precision, scale) a column of the driver's default type could come from."""
+    rows = []
+    for field in schema:
+        if pa.types.is_integer(field.type):
+            rows.append((field.name, "NUMBER", 10, 0))
+        elif pa.types.is_floating(field.type):
+            rows.append((field.name, "NUMBER", None, None))
+        elif pa.types.is_timestamp(field.type):
+            rows.append((field.name, "DATE", None, None))
+        else:
+            rows.append((field.name, "VARCHAR2", None, None))
+    return rows
+
+
 class _Oracle:
-    """A connection the script reads through: dictionary rows by query, table rows as Arrow batches."""
+    """A connection the script reads through: dictionary rows by query, table rows as Arrow batches. `schemas` are
+    the driver's default types (decimals off), what a no-row fetch returns; `declared` the dictionary's declarations.
+    Given a `requested_schema`, it hands back batches only of that schema, as the driver converts to it or raises."""
 
     def __init__(self, batches: dict[str, list[pa.Table]], schemas: dict[str, pa.Schema] | None = None, *,
                  stats=None, table_comments=None, column_comments=None, keys=(), lobs=(), user="READER",
-                 fail_on: tuple[str, int] | None = None, database=("APPDB", "APPPDB")) -> None:
+                 fail_on: tuple[str, int] | None = None, database=("APPDB", "APPPDB"),
+                 declared: dict[str, list[tuple]] | None = None) -> None:
         self.batches = batches
         self.schemas = schemas or {t: b[0].schema for t, b in batches.items()}
+        self.declared = {t: _declared_like(s) for t, s in self.schemas.items()} | (declared or {})
         self.stats = stats if stats is not None else [(t, 10, 100) for t in self.schemas]
         self.table_comments = table_comments or {}
         self.column_comments = column_comments or {}
@@ -121,10 +163,16 @@ class _Oracle:
         table = self._table(statement)
         self.fetched.append(table)
         self.fetch_kwargs.append(kwargs)
+        requested = kwargs.get("requested_schema")
         for i, batch in enumerate(self.batches[table]):
             if self.fail_on == (table, i):
                 self.on_fail()
                 raise RuntimeError("the connection was lost")
+            if isinstance(batch, pa.Table):
+                if requested is not None:
+                    assert batch.schema == requested, f"a batch the driver would not return for {requested}"
+                else:  # unasked, the driver's own types
+                    batch = batch.cast(self.schemas[table])
             self.log.append(("batch", table, i))
             if self.on_batch is not None:
                 hook, self.on_batch = self.on_batch, None
@@ -269,8 +317,8 @@ def test_an_empty_table_is_copied_with_its_columns(tmp_path):
 
 
 def test_numbers_and_dates_land_as_the_duckdb_types_they_hold(tmp_path):
-    # The driver's own mapping, decimals off: NUMBER(p, 0) with p up to 18 as int64, any other NUMBER as double. An
-    # Oracle DATE (seconds) and a TIMESTAMP(3) (milliseconds) land as DuckDB's plain TIMESTAMP, widened without loss.
+    # NUMBER(10, 0) as int64 and a NUMBER with nothing declared as double, the driver's own mapping. An Oracle DATE
+    # (seconds) and a TIMESTAMP(3) (milliseconds) land as DuckDB's plain TIMESTAMP, widened without loss.
     schema = pa.schema([("N10", pa.int64()), ("N", pa.float64()), ("D", pa.timestamp("s")),
                         ("T3", pa.timestamp("ms")), ("T6", pa.timestamp("us"))])
     when = dt.datetime(2026, 1, 2, 3, 4, 5, 123000)
@@ -285,15 +333,79 @@ def test_numbers_and_dates_land_as_the_duckdb_types_they_hold(tmp_path):
     assert duck.execute('SELECT "D", "T3" FROM "T"').fetchone() == (when.replace(microsecond=0), when)
 
 
-def test_numbers_are_fetched_without_decimals(tmp_path):
-    # python-oracledb 4.0.2's decimal fetch returned a decimal128 column one value short in some later batches of a
-    # large table (measured, batches of 50,000 and 100,000; whole when one batch held every row). So the copy
-    # asks for the driver's default mapping, by name, whatever `oracledb.defaults.fetch_decimals` is set to.
+def test_numbers_are_fetched_without_the_drivers_decimal_mapping(tmp_path):
+    # Named, whatever `oracledb.defaults.fetch_decimals` is set to: with it on, python-oracledb 26.1 fails the whole
+    # fetch on a FLOAT or a negative-scale NUMBER (DPY-4042, measured). The exact types are requested column by column.
     fake = _Oracle({"ORDERS": [_batch(_ORDERS, range(2))], "EMPTY": []}, {"ORDERS": _ORDERS, "EMPTY": _ORDERS})
     duck = duckdb.connect(str(tmp_path / "c.duckdb"))
     copy_table(fake, duck, "APP", "ORDERS", 10)
     copy_table(fake, duck, "APP", "EMPTY", 10)
     assert fake.fetch_kwargs and all(kw.get("fetch_decimals") is False for kw in fake.fetch_kwargs)
+
+
+@pytest.mark.parametrize(("declared", "expected"), [
+    (("NUMBER", 10, 0), pa.int64()),
+    (("NUMBER", 18, 0), pa.int64()),
+    (("NUMBER", 19, 0), pa.decimal128(19, 0)),
+    (("NUMBER", 38, 0), pa.decimal128(38, 0)),
+    (("NUMBER", None, 0), pa.decimal128(38, 0)),  # NUMBER(*, 0) and INTEGER
+    (("NUMBER", 5, -2), pa.int64()),  # whole hundreds, up to 7 digits
+    (("NUMBER", 17, -2), pa.decimal128(19, 0)),
+    (("NUMBER", 38, -2), None),  # 40 digits: past DuckDB's widest decimal
+    (("NUMBER", 12, 2), pa.decimal128(12, 2)),
+    (("NUMBER", 3, 5), pa.decimal128(5, 5)),  # holds 0.00123
+    (("NUMBER", None, 2), pa.decimal128(38, 2)),
+    (("NUMBER", 10, 40), None),
+    (("NUMBER", None, None), None),  # nothing declared: any scale, no fixed type holds every value
+    (("FLOAT", 126, None), None),
+    (("BINARY_DOUBLE", None, None), None),
+    (("VARCHAR2", None, None), None),
+])
+def test_a_number_type_holds_every_value_its_declaration_allows(declared, expected):
+    assert copy.number_type(*declared) == expected
+
+
+def test_each_number_column_is_requested_as_its_exact_type_in_the_fetchs_column_order(tmp_path):
+    # The requested schema is matched by position (measured: a reversed one fails), so it follows the fetch's own
+    # columns, not the dictionary's listing; a column without an exact type keeps the driver's own.
+    default = pa.schema([("NAME", pa.large_string()), ("AMT", pa.float64()), ("BIG", pa.float64()),
+                         ("N", pa.float64()), ("F", pa.float64())])
+    declared = [("F", "FLOAT", 126, None), ("N", "NUMBER", None, None), ("BIG", "NUMBER", 19, 0),
+                ("AMT", "NUMBER", 12, 2), ("NAME", "VARCHAR2", None, None)]
+    fake = _Oracle({"T": []}, {"T": default}, declared={"T": declared})
+    copy_table(fake, duckdb.connect(str(tmp_path / "c.duckdb")), "APP", "T", 10)
+    requested = [kw for kw in fake.fetch_kwargs if "requested_schema" in kw]
+    assert requested and all(kw["requested_schema"] == pa.schema([
+        ("NAME", pa.large_string()), ("AMT", pa.decimal128(12, 2)), ("BIG", pa.decimal128(19, 0)),
+        ("N", pa.float64()), ("F", pa.float64())]) for kw in requested)
+
+
+def test_exact_numbers_land_as_duckdb_decimals_with_every_digit(tmp_path):
+    from decimal import Decimal
+
+    default = pa.schema([("AMT", pa.float64()), ("BIG", pa.float64()), ("I", pa.float64())])
+    exact = pa.schema([("AMT", pa.decimal128(12, 2)), ("BIG", pa.decimal128(19, 0)), ("I", pa.decimal128(38, 0))])
+    rows = {"AMT": [Decimal("1234567890.12"), None], "BIG": [Decimal("1234567890123456789"), Decimal("-1")],
+            "I": [Decimal("98765432109876543210123"), Decimal("0")]}
+    fake = _Oracle({"T": [pa.table(rows, schema=exact)]}, {"T": default},
+                   declared={"T": [("AMT", "NUMBER", 12, 2), ("BIG", "NUMBER", 19, 0), ("I", "NUMBER", None, 0)]})
+    duck = duckdb.connect(str(tmp_path / "c.duckdb"))
+    assert copy_table(fake, duck, "APP", "T", 10) == 2
+    types = dict(duck.execute("SELECT column_name, data_type FROM information_schema.columns "
+                              "WHERE table_name = 'T'").fetchall())
+    assert types == {"AMT": "DECIMAL(12,2)", "BIG": "DECIMAL(19,0)", "I": "DECIMAL(38,0)"}
+    assert duck.execute('SELECT "AMT", "BIG", "I" FROM "T" ORDER BY "BIG" DESC').fetchall() == [
+        (Decimal("1234567890.12"), Decimal("1234567890123456789"), Decimal("98765432109876543210123")),
+        (None, Decimal("-1"), Decimal("0"))]
+
+
+def test_an_empty_table_keeps_its_exact_number_types(tmp_path):
+    fake = _Oracle({"T": []}, {"T": pa.schema([("AMT", pa.float64())])},
+                   declared={"T": [("AMT", "NUMBER", 12, 2)]})
+    duck = duckdb.connect(str(tmp_path / "c.duckdb"))
+    assert copy_table(fake, duck, "APP", "T", 10) == 0
+    assert duck.execute("SELECT data_type FROM information_schema.columns WHERE table_name = 'T'").fetchall() == [
+        ("DECIMAL(12,2)",)]
 
 
 class _Malformed:
@@ -310,9 +422,9 @@ def test_a_batch_arrow_finds_malformed_stops_the_copy_with_nothing_landed(tmp_pa
     real = copy.pa.table
     seen: list[int] = []
 
-    def table(obj):
+    def table(obj):  # the first call is the no-row fetch, the next two the table's batches 1 and 2
         seen.append(1)
-        return _Malformed() if len(seen) == 2 else real(obj)
+        return _Malformed() if len(seen) == 3 else real(obj)
 
     monkeypatch.setattr(copy.pa, "table", table)
     duck = duckdb.connect(str(tmp_path / "c.duckdb"))
@@ -355,10 +467,13 @@ class Cursor:
     def __enter__(self): return self
     def __exit__(self, *exc): return False
     def execute(self, sql, *args, **kwargs): pass
+    def fetchall(self): return []
 
 class Killed:
     def cursor(self): return Cursor()
     def rollback(self): pass
+    def fetch_df_all(self, statement, **kwargs):
+        return pa.table({"ID": pa.array([], pa.int64()), "Status": pa.array([], pa.string())})
     def fetch_df_batches(self, statement, parameters=None, size=None, **kwargs):
         yield pa.table({"ID": list(range(3)), "Status": ["a", "b", "c"]})
         os.kill(os.getpid(), signal.SIGKILL)  # the process dies mid-table: no handler, no rollback, nothing tidied
@@ -410,8 +525,12 @@ def test_each_table_is_copied_in_its_own_read_only_transaction(deployment):
         batches = [i for i, entry in enumerate(log) if isinstance(entry, tuple) and entry[1] == table]
         first, last = batches[0], batches[-1]
         # Adjacent, not merely earlier and later: one transaction around both tables would put the other table's
-        # batches next to these, with no ROLLBACK and SET between them.
-        assert log[first - 2:first] == ["ROLLBACK", "SET TRANSACTION READ ONLY"], f"{table} starts its own"
+        # batches next to these, with no ROLLBACK and SET between them. Inside it, before the rows, the one read of
+        # this table's column declarations, so its types come from the snapshot its rows do.
+        start = max(i for i in range(first) if log[i] == "SET TRANSACTION READ ONLY")
+        assert log[start - 1] == "ROLLBACK", f"{table} starts its own"
+        before_rows = log[start + 1:first]
+        assert len(before_rows) == 1 and "data_precision" in before_rows[0], f"{table}: only its declarations first"
         assert log[last + 1] == "ROLLBACK", f"{table}'s transaction ends right after its last batch"
         between = log[first:last + 1]
         assert all(isinstance(e, tuple) and e[1] == table for e in between), "no other read inside it"

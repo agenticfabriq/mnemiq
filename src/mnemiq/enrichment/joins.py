@@ -9,15 +9,32 @@ from mnemiq.enrichment.profiling import ColumnStats, profile_column, unharvested
 logger = logging.getLogger(__name__)
 
 
-def _comparable(expr: str, dialect: str) -> str:
+# The first word of a declared type, before any "(", that holds a number on the sources compared as text below:
+# DuckDB's, Postgres's (`double precision`), MySQL's (`int unsigned`), SQLite's and the warehouses'.
+_NUMERIC_BASES = frozenset({
+    "TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER",
+    "UBIGINT", "UHUGEINT", "INT1", "INT2", "INT4", "INT8", "SERIAL", "SMALLSERIAL", "BIGSERIAL", "DECIMAL", "NUMERIC",
+    "NUMBER", "REAL", "FLOAT", "FLOAT4", "FLOAT8", "DOUBLE"})
+
+
+def _numeric(data_type: str | None) -> bool:
+    words = (data_type or "").split("(", 1)[0].upper().split()
+    return bool(words) and words[0] in _NUMERIC_BASES
+
+
+def _comparable(expr: str, dialect: str, *, numbers: bool = False) -> str:
     """`expr` as the orphan check compares it.
 
-    Elsewhere as text, because a catalog can mix typed and CSV-inferred all-text tables, where INTEGER 1 and TEXT '1'
-    must still match. Oracle natively, as the join the relationship describes will compare: it refuses
+    Natively where both sides are numbers (`numbers`), as the join the relationship describes will compare them: as
+    text one number is 1, 1.00 or 1.0 by its type, and a DuckDB copy of Oracle lands each NUMBER as BIGINT,
+    DECIMAL(p, s) or DOUBLE by its declaration. The fan-out check in `infer_relationships` asks the join itself,
+    natively, whether a child value meets two parents. Elsewhere as text, because a catalog
+    can mix typed and CSV-inferred all-text tables, where INTEGER 1 and TEXT '1' must still match. Oracle natively
+    always: it refuses
     `CAST(x AS VARCHAR)` with ORA-00906 (a VARCHAR2 needs a length, measured on 23.26), sqlglot's transpile gives
     `CAST(x AS CLOB)`, which it cannot compare with `=`, and `TO_CHAR` of a DATE follows the session's format, which
     can drop the time and make two different keys one. Types that do not compare raise, and the candidate is skipped."""
-    return expr if dialect == "oracle" else f"CAST({expr} AS VARCHAR)"
+    return expr if dialect == "oracle" or numbers else f"CAST({expr} AS VARCHAR)"
 
 
 def _stem(column: str) -> str:
@@ -103,14 +120,29 @@ def infer_relationships(adapter, catalog: list[TableInfo], *, harvest_values: bo
                 # inclusion dependency, compared as `_comparable` says. A NULL child value means "no
                 # parent", not a broken reference.
                 dialect = getattr(adapter, "dialect", "duckdb")
-                in_parent = _comparable(f'p."{col.name}"', dialect)
-                in_child = _comparable(f'c."{col.name}"', dialect)
+                numbers = _numeric(_declared_type(parent.name, col.name)) and _numeric(col.data_type)
+                in_parent = _comparable(f'p."{col.name}"', dialect, numbers=numbers)
+                in_child = _comparable(f'c."{col.name}"', dialect, numbers=numbers)
                 orphans = adapter.execute(
                     f'SELECT count(*) FROM "{child.name}" c '
                     f'WHERE c."{col.name}" IS NOT NULL AND NOT EXISTS ('
                     f'  SELECT 1 FROM "{parent.name}" p '
                     f'  WHERE {in_parent} = {in_child})'
                 )[0][0]
+                # The parent was counted unique in its own type and collation, and the join may compare in another
+                # that makes two parent keys one: a DOUBLE child against DECIMAL(38, 0) parents past 2^53, DuckDB's
+                # HUGEINT against UHUGEINT, a NOCASE collation's 'a' and 'A', text '1' and '01' against a number
+                # (Codex's second to fifth reviews). A relationship is stored as plain equality of its columns, so the
+                # source is asked, under that equality as the join will run it, whether a child value meets two;
+                # a join that raises on the keys (text it cannot read as a number) fails the check, said as above.
+                if orphans == 0:
+                    fanned = adapter.execute(
+                        f'SELECT count(*) FROM (SELECT d.v FROM (SELECT DISTINCT c."{col.name}" AS v '
+                        f'FROM "{child.name}" c WHERE c."{col.name}" IS NOT NULL) d '
+                        f'JOIN "{parent.name}" p ON p."{col.name}" = d.v GROUP BY d.v HAVING count(*) > 1) f'
+                    )[0][0]
+                    if fanned:
+                        continue  # a child value meets two parents: a join here would fan out
             except Exception as exc:  # noqa: BLE001 -- one candidate failing costs only itself
                 first = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
                 logger.warning("relationship %s.%s -> %s not inferred: its check failed: %s",

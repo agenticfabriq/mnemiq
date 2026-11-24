@@ -2089,42 +2089,41 @@ def _set_call_timeout(con, ms: int) -> None:
     con.call_timeout = ms
 
 
-# The codes a bounded call's end takes, by the driver's own error list (python-oracledb
-# 4.0.2, the locked version), each by its code so a reworded message changes nothing: DPY-4024,
-# the call timeout ("call timeout of 300 ms exceeded", measured on Oracle Free 23), which thin
-# mode raises after cancelling the call itself and to which the driver maps thick mode's
-# DPI-1067; and ORA-03156, the server's own statement timeout. Nothing else is a timeout, and no
-# clock makes one (Codex's reviews of #179). ORA-01013, the cancel, matched as one by M187 and
-# then once a deadline the adapter measured had passed, is always someone else's: the adapter
-# never cancels and the driver reports its own bound as DPY-4024 (`_is_cancel`). DPY-4011, a
-# closed connection, is the source's, an outage the runner reads through the adapter's
-# classifier (M188), with the one exception the driver names (`_BOUND_ENDED_CLOSING`). The code
-# is read off the driver's error
-# object (`full_code`) where the error carries one, so an application error whose message
-# quotes a timeout code (`ORA-20001: ... DPY-4024`) is not one (Codex's first review of
-# #176); an error with no code, a wrapped or a synthetic one, is read by its text, where the
-# word "timeout" alone counts too, the fallback the matcher has always had. A driver error
-# of another code whose message says "timeout" (ORA-12170, a connect timeout; ORA-12609, a
-# receive timeout) is not the query's timeout: the driver fills `full_code` from the code
-# its message leads with, so an error so led is read by its code, those being the
-# connection's and not a bounded call's end, and one whose message leads with no code goes
-# down the text branch (the gate on the second commit).
+# The codes a bounded call's end takes, by the driver's own error list (python-oracledb 4.0.2, read
+# again on 26.1.0, the locked version, unchanged), each by its code so a reworded message changes
+# nothing: DPY-4024, the call timeout ("call timeout of 300 ms exceeded", measured on Oracle Free
+# 23), which thin mode raises after cancelling the call itself and to which the driver maps thick
+# mode's DPI-1067; and ORA-03156, the server's own statement timeout. Nothing else is a timeout, and
+# no clock makes one (Codex's reviews of #179). ORA-01013, the cancel, matched as one by M187 and
+# then once a deadline the adapter measured had passed, is always someone else's: the adapter never
+# cancels and the driver reports its own bound as DPY-4024 (`_is_cancel`). DPY-4011, a closed
+# connection, is the source's, an outage the runner reads through the adapter's classifier (M188),
+# with the one exception the driver names (`_BOUND_ENDED_CLOSING`). The code is read off the
+# driver's error object (`full_code`) where the error carries one, so an application error whose
+# message quotes a timeout code (`ORA-20001: ... DPY-4024`) is not one (Codex's first review of
+# #176); an error with no code, a wrapped or a synthetic one, is read by its text, where the word
+# "timeout" alone counts too, the fallback the matcher has always had. A driver error of another
+# code whose message says "timeout" (ORA-12170, a connect timeout; ORA-12609, a receive timeout) is
+# not the query's timeout: the driver fills `full_code` from the code its message leads with, so an
+# error so led is read by its code, those being the connection's and not a bounded call's end, and
+# one whose message leads with no code goes down the text branch (the gate on the second commit).
 _TIMEOUT_CODES = frozenset({"DPY-4024", "ORA-03156"})
 _TIMEOUT_SPELLINGS = tuple(code.lower() for code in sorted(_TIMEOUT_CODES)) + ("timeout",)
 
 # The line thin mode puts under DPY-4011 when a call outlived `call_timeout` and the break it then
 # sent went unanswered within the same bound, so the driver closed the connection itself
-# (python-oracledb 4.0.2, `_process_message`). The bound's end in the driver's own words: measured
-# on Oracle Free 23 with a query that was only slow, 0.4 s a row under a 1 s bound, so a server that
-# answers ends this way, and is read as a timeout the model may answer with a cheaper query rather
-# than an outage that ends the turn. A source that drops off the network mid-query leaves the same
-# line, the residual this accepts: each repaired attempt reads as a timeout until one meets the
-# outage, at a pool acquire that opens a session, and the loop's attempt limit bounds how many (an
-# idle pooled session is pinged only past `ping_interval`). The driver's other line under DPY-4011,
-# "socket timed out while awaiting break response from server", is reached only with a break already
-# in progress, and the timeout path raises before that check, so it follows a break someone else's
-# `cancel()` began (`_break_external`), and stays the source's. Matched as a whole line of the
-# driver's own error, never inside another line.
+# (python-oracledb 4.0.2, `_process_message`; still so on 26.1.0, by the live test
+# `test_a_slow_query_the_driver_closes_at_its_bound_is_a_timeout`). The bound's end in the driver's
+# own words: measured on Oracle Free 23 with a query that was only slow, 0.4 s a row under a 1 s
+# bound, so a server that answers ends this way, and is read as a timeout the model may answer with
+# a cheaper query rather than an outage that ends the turn. A source that drops off the network
+# mid-query leaves the same line, the residual this accepts: each repaired attempt reads as a
+# timeout until one meets the outage, at a pool acquire that opens a session, and the loop's attempt
+# limit bounds how many (an idle pooled session is pinged only past `ping_interval`). The driver's
+# other line under DPY-4011, "socket timed out while awaiting break response from server", is
+# reached only with a break already in progress, and the timeout path raises before that check, so
+# it follows a break someone else's `cancel()` began (`_break_external`), and stays the source's.
+# Matched as a whole line of the driver's own error, never inside another line.
 _BOUND_ENDED_CLOSING = "socket timed out while recovering from previous socket timeout"
 
 
@@ -2153,7 +2152,7 @@ def _is_timeout(exc: Exception) -> bool:
 # The driver's own codes that say the connection, the pool, the connect handshake or the wire
 # protocol failed, so no session read the statement and answered. Read off the driver's error
 # table (`errors.ERR_MESSAGE_FORMATS`,
-# python-oracledb 4.0.2, the locked version) code by code rather than one code per incident,
+# python-oracledb 26.1.0, the locked version) code by code rather than one code per incident,
 # after two incidents (Codex's second and third reviews of #159: DPY-4005, then DPY-4033); the
 # taxonomy test classifies every code in that table, this set, the OperationalErrors or a
 # reviewed list of refusals, so a driver whose table differs fails it and sends a maintainer back
@@ -2207,6 +2206,14 @@ _UNAVAILABLE_DPY = frozenset({
     "DPY-2018", "DPY-2033", "DPY-2049", "DPY-2056", "DPY-2057", "DPY-3015",
     "DPY-4000", "DPY-4001", "DPY-4017", "DPY-4018", "DPY-4019", "DPY-4021", "DPY-4026",
     "DPY-4027", "DPY-4028", "DPY-4030", "DPY-4032", "DPY-4034",
+    # Added by 26.0 and 26.1 to the codes above: an ANO (native encryption or integrity) service's
+    # status failure, raised by impl/thin/messages/network_services.pyx as the connect handshake
+    # negotiates, an InternalError like 5004 there; and a transaction priority the database does not
+    # support, raised by impl/thin/messages/auth.pyx when a connect parameter asks for one (also by
+    # setting it on a live connection, which mnemiq never does). The other codes they added are the
+    # caller's or a value's (the taxonomy test lists them), or OperationalErrors (6008 server
+    # verification, 6009 EZTLS refused).
+    "DPY-3043", "DPY-5016",
 })
 # The ORA codes a session cannot be had under, which a growing pool meets on acquire and no
 # statement causes: the call timeout (03156); the credentials and the account (01017 logon
