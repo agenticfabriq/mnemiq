@@ -278,13 +278,15 @@ still to come. In short:
     columns, time grain, filters and row limit. The answer names each one left out and the chart that shows it
     (`left_out`). A goal the dashboard shows whole builds nothing and is answered as `shown`. A chart mnemiq cannot
     read the same way, a filter written in SQL among them, is never taken for a match, so the planned one is built.
-  - Onto a dashboard, the plan is also shown the measures the dashboard keeps: each one's name, label and kind, and its
-    expression only where its dataset is a table the builder can read. A dashboard keeps one definition for each
-    measure name, and a measure's dataset is part of its definition: the same formula on a dataset this build makes is
-    a measure of its own. So a planned measure that takes a kept name with another definition, or a kept label under
-    another name, goes back to the model once for a name and label of its own, and the plan is refused if it still
-    does. The measure the dashboard keeps, planned again as it is (its kind, dataset and expression), is that measure,
-    and the new charts join it.
+  - Onto a dashboard, the plan is also shown the measures the dashboard keeps that mnemiq would run for the builder: one
+    on a table's own dataset the builder can read, or one whose statement over its dataset, as Superset answers the
+    dataset to the builder, mnemiq's deciders approve for them. The others reach the model in no part. A dashboard keeps
+    one definition for each measure name, and a measure's dataset is part of its definition: the same formula on a
+    dataset this build makes is a measure of its own. So a planned measure that takes a kept name with another
+    definition, or a kept label under another name, goes back to the model once for a name and label of its own (in
+    words that say nothing of a measure the builder may not be told of), and the plan is refused if it still does. The
+    measure the dashboard keeps, planned again as it is (its kind, dataset and expression), is that measure, and the new
+    charts join it.
   - Before anything is planned, mnemiq asks Superset whether the person may build at all; one who may not is
     refused with a 403 as a non-builder, and nothing about a dashboard they named is read. Then, with a
     `dashboard_id`, it asks whether they edit that dashboard. One they cannot read, or one that does not exist, is a
