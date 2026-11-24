@@ -27,8 +27,8 @@ def _comparable(expr: str, dialect: str, *, numbers: bool = False) -> str:
 
     Natively where both sides are numbers (`numbers`), as the join the relationship describes will compare them: as
     text one number is 1, 1.00 or 1.0 by its type, and a DuckDB copy of Oracle lands each NUMBER as BIGINT,
-    DECIMAL(p, s) or DOUBLE by its declaration. A source may compare two keys in a wider type or a collation, so
-    `infer_relationships` also asks whether a child value meets two parents. Elsewhere as text, because a catalog
+    DECIMAL(p, s) or DOUBLE by its declaration. The fan-out check in `infer_relationships` asks the join itself,
+    natively, whether a child value meets two parents. Elsewhere as text, because a catalog
     can mix typed and CSV-inferred all-text tables, where INTEGER 1 and TEXT '1' must still match. Oracle natively
     always: it refuses
     `CAST(x AS VARCHAR)` with ORA-00906 (a VARCHAR2 needs a length, measured on 23.26), sqlglot's transpile gives
@@ -131,14 +131,15 @@ def infer_relationships(adapter, catalog: list[TableInfo], *, harvest_values: bo
                 )[0][0]
                 # The parent was counted unique in its own type and collation, and the join may compare in another
                 # that makes two parent keys one: a DOUBLE child against DECIMAL(38, 0) parents past 2^53, DuckDB's
-                # HUGEINT against UHUGEINT, a NOCASE collation's 'a' and 'A' (Codex's second to fourth reviews). So
-                # the source is asked, under the very predicate the join will use, whether a child value meets two.
+                # HUGEINT against UHUGEINT, a NOCASE collation's 'a' and 'A', text '1' and '01' against a number
+                # (Codex's second to fifth reviews). A relationship is stored as plain equality of its columns, so the
+                # source is asked, under that equality as the join will run it, whether a child value meets two;
+                # a join that raises on the keys (text it cannot read as a number) fails the check, said as above.
                 if orphans == 0:
-                    in_values = _comparable("d.v", dialect, numbers=numbers)
                     fanned = adapter.execute(
                         f'SELECT count(*) FROM (SELECT d.v FROM (SELECT DISTINCT c."{col.name}" AS v '
                         f'FROM "{child.name}" c WHERE c."{col.name}" IS NOT NULL) d '
-                        f'JOIN "{parent.name}" p ON {in_parent} = {in_values} GROUP BY d.v HAVING count(*) > 1) f'
+                        f'JOIN "{parent.name}" p ON p."{col.name}" = d.v GROUP BY d.v HAVING count(*) > 1) f'
                     )[0][0]
                     if fanned:
                         continue  # a child value meets two parents: a join here would fan out

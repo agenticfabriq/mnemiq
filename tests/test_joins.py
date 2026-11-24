@@ -134,19 +134,36 @@ def test_a_double_key_does_not_vouch_for_exact_keys_it_cannot_tell_apart():
     assert infer_relationships(_DuckAdapter(con), catalog) == []
 
 
-def test_a_text_parent_key_still_matches_a_numeric_child():
-    # The mirror of INTEGER against TEXT: the parent from an all-text CSV, the child typed. Either side text is text:
-    # natively, DuckDB would cast the parent's 'X1' to a number and raise, and the relationship would go unchecked.
+def _text_parent(values: str, child_type: str, failures: list | None = None):
     con = duckdb.connect()
     con.execute('CREATE TABLE parent ("parent_id" VARCHAR)')
-    con.execute("INSERT INTO parent VALUES ('1'), ('2'), ('X1')")
-    con.execute('CREATE TABLE child ("child_id" INTEGER, "parent_id" DECIMAL(19,0))')
+    con.execute(f"INSERT INTO parent VALUES {values}")
+    con.execute(f'CREATE TABLE child ("child_id" INTEGER, "parent_id" {child_type})')
     con.execute("INSERT INTO child VALUES (10, 1), (11, 2)")
     catalog = [
         TableInfo("parent", [ColumnInfo("parent_id", "VARCHAR")]),
-        TableInfo("child", [ColumnInfo("child_id", "INTEGER"), ColumnInfo("parent_id", "DECIMAL(19,0)")]),
+        TableInfo("child", [ColumnInfo("child_id", "INTEGER"), ColumnInfo("parent_id", child_type)]),
     ]
-    assert [(r.from_, r.to) for r in infer_relationships(_DuckAdapter(con), catalog)] == [("child", "parent")]
+    return [(r.from_, r.to) for r in infer_relationships(_DuckAdapter(con), catalog, failures=failures)]
+
+
+def test_a_text_parent_key_still_matches_a_numeric_child():
+    # The mirror of INTEGER against TEXT: the parent from an all-text CSV, the child typed.
+    assert _text_parent("('1'), ('2')", "DECIMAL(19,0)") == [("child", "parent")]
+
+
+def test_text_keys_one_number_in_the_join_do_not_vouch_for_it():
+    # Codex's fifth review: as text '1' and '01' are two parents and the child's 1 meets one, but the relationship is
+    # stored as plain equality, and the join compares natively, where 1 meets both. The fan-out is asked of that join.
+    assert _text_parent("('1'), ('01'), ('2')", "INTEGER") == []
+
+
+def test_a_text_key_the_join_cannot_read_as_a_number_is_not_inferred_and_is_said():
+    # The parent's 'X1' matches nothing as text, but the join reads the key as a number and raises on it: a relationship
+    # whose join raises is not one, so the candidate is skipped and recorded, as a check that could not run.
+    failures: list[str] = []
+    assert _text_parent("('1'), ('2'), ('X1')", "DECIMAL(19,0)", failures) == []
+    assert len(failures) == 1 and failures[0].startswith("child.parent_id -> parent:")
 
 
 def test_exact_keys_a_source_compares_in_floating_point_do_not_vouch_for_a_join_either():
