@@ -142,11 +142,16 @@ def deployment(tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
     def run(fake: _Oracle, *flags: str) -> int:
-        monkeypatch.setattr(copy, "connect", lambda spec, settings: fake)
+        def connected(spec, settings):
+            run.connects.append((spec.target, spec.schema, settings.oracle_user))
+            return fake
+
+        monkeypatch.setattr(copy, "connect", connected)
         return main(["--out", str(tmp_path / "copy.duckdb"), *flags])
 
     run.out = str(tmp_path / "copy.duckdb")
     run.manifest = manifest
+    run.connects = []
     return run
 
 
@@ -230,7 +235,9 @@ def test_a_table_is_copied_with_oracles_names_and_all_rows(tmp_path):
     assert [r[0] for r in duck.execute(
         "SELECT column_name FROM information_schema.columns WHERE table_name = 'ORDERS' "
         "ORDER BY ordinal_position").fetchall()] == ["ID", "Status"]
-    assert duck.execute("SELECT table_name FROM information_schema.tables").fetchall() == [("ORDERS",)]
+    assert duck.execute("SELECT table_schema, table_name FROM information_schema.tables ORDER BY 1, 2").fetchall() == [
+        ("main", "ORDERS"), ("mnemiq", "copied_tables")], "the table, and the record that it is complete"
+    assert duck.execute("SELECT table_name, row_count FROM mnemiq.copied_tables").fetchall() == [("ORDERS", 5)]
 
 
 def test_the_table_is_read_by_its_qualified_quoted_name(tmp_path):
@@ -261,7 +268,8 @@ def test_numbers_and_dates_land_as_the_duckdb_types_they_hold(tmp_path):
     duck = duckdb.connect(str(tmp_path / "c.duckdb"))
     fake = _Oracle({"T": [batch]})
     copy_table(fake, duck, "APP", "T", 10)
-    types = dict(duck.execute('SELECT column_name, data_type FROM information_schema.columns').fetchall())
+    types = dict(duck.execute("SELECT column_name, data_type FROM information_schema.columns "
+                              "WHERE table_name = 'T'").fetchall())
     assert types == {"N10": "BIGINT", "N": "DOUBLE", "D": "TIMESTAMP", "T3": "TIMESTAMP", "T6": "TIMESTAMP"}
     assert duck.execute('SELECT "D", "T3" FROM "T"').fetchone() == (when.replace(microsecond=0), when)
 
@@ -413,6 +421,79 @@ def test_a_copied_table_is_skipped_unless_replace(deployment, capsys):
     assert deployment(replaced, "--replace") == 0
     assert replaced.fetched == ["ORDERS", "CUSTOMER"]
     assert _tables(deployment.out) == {"ORDERS": 5, "CUSTOMER": 2}, "replaced, not appended"
+
+
+def _records(path: str) -> tuple[list[tuple], list[tuple]]:
+    con = duckdb.connect(path, read_only=True)
+    try:
+        return (con.execute("SELECT * FROM mnemiq.copy_source").fetchall(),
+                con.execute("SELECT table_name, row_count, completed_at IS NOT NULL FROM mnemiq.copied_tables "
+                            "ORDER BY table_name").fetchall())
+    finally:
+        con.close()
+
+
+def test_the_source_and_each_completed_table_are_recorded_in_the_file(deployment):
+    assert deployment(_shop()) == 0
+    assert _records(deployment.out) == ([("db.example:1521/APP", "APP", "READER")],
+                                        [("CUSTOMER", 2, True), ("ORDERS", 5, True)])
+    assert deployment(_shop(), "--replace") == 0
+    assert _records(deployment.out)[1] == [("CUSTOMER", 2, True), ("ORDERS", 5, True)], "replaced, not doubled"
+    with open(deployment.out, "rb") as fh:
+        assert b"not-a-real-password" not in fh.read(), "no password is recorded"
+    assert sorted(DuckDBAdapter.duckdb(deployment.out).introspect()) == ["CUSTOMER", "ORDERS"], "records are not tables"
+
+
+@pytest.mark.parametrize("changed", ["target", "schema", "user"])
+def test_a_file_holding_another_sources_copy_is_refused_before_any_read(deployment, monkeypatch, capsys, changed):
+    assert deployment(_shop()) == 0
+    entry = open(deployment.out + ".source.json").read()
+    if changed == "user":
+        monkeypatch.setenv("MNEMIQ_ORACLE_USER", "OTHER_READER")
+    else:
+        deployment.manifest.write_text(json.dumps([{**_SOURCE, changed: "OTHER" if changed == "schema" else
+                                                    "db.example:1521/OTHER"}]))
+    deployment.connects.clear()
+    other = _shop()
+    assert deployment(other, "--replace") == 2, "not even --replace mixes two sources in one file"
+    assert deployment.connects == [] and other.log == [], "refused before Oracle is reached"
+    assert "another source" in capsys.readouterr().err
+    assert _tables(deployment.out) == {"ORDERS": 5, "CUSTOMER": 2}
+    assert open(deployment.out + ".source.json").read() == entry, "nothing in the file or beside it changed"
+
+
+def test_a_file_holding_tables_but_no_recorded_source_is_refused(deployment, capsys):
+    con = duckdb.connect(deployment.out)
+    con.execute('CREATE TABLE main."ORDERS" AS SELECT 1 AS "ID"')
+    con.close()
+    fake = _shop()
+    assert deployment(fake) == 2
+    assert deployment.connects == [] and fake.log == []
+    assert "no record of the source" in capsys.readouterr().err
+
+
+def test_a_table_is_skipped_only_when_recorded_complete(deployment):
+    assert deployment(_shop()) == 0
+    con = duckdb.connect(deployment.out)
+    # ORDERS present but not recorded complete (as a table made outside the copy would be): copied again, whole.
+    con.execute("DELETE FROM mnemiq.copied_tables WHERE table_name = 'ORDERS'")
+    con.execute('DELETE FROM main."ORDERS" WHERE "ID" > 0')
+    con.close()
+    again = _shop()
+    assert deployment(again) == 0
+    assert again.fetched == ["ORDERS"], "CUSTOMER, recorded complete, is skipped"
+    assert _tables(deployment.out) == {"ORDERS": 5, "CUSTOMER": 2}
+
+
+def test_a_selected_name_equal_to_a_copied_one_without_case_is_refused(deployment, capsys):
+    # Patterns match without regard to case, so the two can only meet across runs: the schema changed in between
+    # (`ORDERS` dropped, `Orders` created), and DuckDB would take the new table for the copied one.
+    deployment.manifest.write_text(json.dumps([{**_SOURCE, "tables": ["orders"]}]))
+    assert deployment(_Oracle({"ORDERS": [_batch(_ORDERS, range(5))]})) == 0
+    later = _Oracle({"Orders": [_batch(_ORDERS, range(2))]})
+    assert deployment(later) == 2
+    assert later.fetched == [] and "'Orders'" in capsys.readouterr().err
+    assert _tables(deployment.out) == {"ORDERS": 5}
 
 
 def test_keys_with_both_ends_copied_are_written_to_the_keys_table(deployment):

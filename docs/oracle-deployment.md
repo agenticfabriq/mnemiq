@@ -399,8 +399,11 @@ copy would fail with ORA-01555). Rows arrive in batches (`--batch-rows`, 100,000
 checked with Arrow's own validation before it is stored. Each table is copied in one DuckDB
 transaction, committed after its last row, so a copy that stops part way, even by the process dying,
 leaves no trace of the table it was copying (and, with `--replace`, keeps the copy it was replacing):
-run it again and it copies what is missing, skipping the tables already there (`--replace` copies
-those again too).
+run it again and it copies what is missing, skipping the tables it recorded as copied whole
+(`--replace` copies those again too). The file records the one source it is a copy of
+(`mnemiq.copy_source`: the target, the owner and the user that read it, never a password) and each
+table copied whole (`mnemiq.copied_tables`), so a file holding another source's copy, or tables with
+no record of their source, is refused before Oracle is reached: copy into a new `--out` instead.
 
 **What it costs.**
 

@@ -19,9 +19,11 @@ What it does, in order:
   `ROLLBACK` after), `SELECT` only, streamed with python-oracledb's `fetch_df_batches` into the file's `main` schema
   under the exact names Oracle stores. One transaction per table, not one for the whole copy: a read-consistent view
   held for hours makes Oracle's undo reach back to the copy's start, and a long copy fails with ORA-01555.
-- **Resumes.** Each table is copied in one DuckDB transaction, committed after its last row, so a copy stopped
-  mid-table, even by the process dying, leaves no trace of that table. A table already in the file is skipped unless
-  `--replace`.
+- **Resumes.** Each table is copied in one DuckDB transaction, committed after its last row with its row in
+  `mnemiq.copied_tables`, so a copy stopped mid-table, even by the process dying, leaves no trace of that table. A rerun
+  skips a table recorded complete unless `--replace`. The file records the one source it copies (`mnemiq.copy_source`:
+  target, owner and read user, never a password), and a file recording another, or holding tables with no record of
+  their source, is refused before Oracle is reached.
 - **Comments and keys.** `ALL_TAB_COMMENTS` and `ALL_COL_COMMENTS` become DuckDB `COMMENT ON` statements, and the keys
   `ALL_CONSTRAINTS` declares between copied tables of the owner become rows of `mnemiq.declared_keys`. The DuckDB
   adapter reads both, so a store enriched on the copy keeps them. Nothing in DuckDB enforces a key, so an orphan row
@@ -49,11 +51,15 @@ from fnmatch import fnmatchcase
 
 import pyarrow as pa
 
-from mnemiq.adapters.duckdb import KEYS_SCHEMA, KEYS_TABLE
+from mnemiq.adapters.duckdb import KEYS_SCHEMA, KEYS_TABLE, attach_literal
 from mnemiq.config import Settings, SourceSpec
 from mnemiq.duckdb_extensions import connect_duckdb
 
 REFUSED = 2
+# What the copy records in the file, in mnemiq's own schema beside the declared keys (outside `main`, so no reader of the
+# source's tables sees them): the one source the file is a copy of, and each table copied whole from it.
+SOURCE_TABLE = "copy_source"
+COMPLETED_TABLE = "copied_tables"
 
 _TABLES = "SELECT table_name, num_rows, avg_row_len FROM all_tables WHERE owner = :owner ORDER BY table_name"
 _COLUMNS = ("SELECT table_name, column_name FROM all_tab_columns WHERE owner = :owner "
@@ -75,6 +81,27 @@ _USER = "SELECT user FROM dual"
 # LOB segments are sized only in USER_SEGMENTS (DBA_SEGMENTS needs a grant), so only the owner can see them.
 _LOBS = ("SELECT l.table_name, SUM(s.bytes) FROM user_lobs l JOIN user_segments s ON s.segment_name = l.segment_name "
          "GROUP BY l.table_name")
+
+
+@dataclass(frozen=True)
+class CopySource:
+    """The source a file is a copy of: the Oracle target, the schema owner whose tables it holds, and the user that read
+    them, whose grants (and any row policy) decide which rows it saw. Never a password."""
+
+    target: str
+    owner: str
+    read_user: str
+
+
+@dataclass(frozen=True)
+class _FileState:
+    """What a copy's file already records, read before anything is read or written: its source (`sources` rows of it),
+    the tables recorded complete, and every table in its `main`."""
+
+    source: CopySource | None
+    sources: int
+    completed: frozenset[str]
+    tables: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -213,8 +240,9 @@ def copy_table(conn, duck, owner: str, table: str, batch_rows: int) -> int:
     after the last. So no other name is ever used (a staging name could be a real table of the schema), and a copy that
     stops mid-table, by an error or by the process dying, leaves no trace of the table and keeps the one it was
     replacing: DuckDB 1.5.4 discards an uncommitted transaction on restart, measured with 231 MB already written to the
-    file when the process was killed. A table with no rows is created from `SELECT * ... WHERE 1 = 0`, so it keeps its
-    columns."""
+    file when the process was killed. The table's row in `mnemiq.copied_tables` is written in the same transaction,
+    so a resume skips a table only when it was copied whole. A table with no rows is created from `SELECT * ... WHERE
+    1 = 0`, so it keeps its columns."""
     select = f"SELECT * FROM {_quoted(owner)}.{_quoted(table)}"
     rows = 0
     created = False
@@ -231,6 +259,12 @@ def copy_table(conn, duck, owner: str, table: str, batch_rows: int) -> int:
             if not created:
                 empty = conn.fetch_df_all(f"{select} WHERE 1 = 0", fetch_decimals=False)
                 _append(duck, table, _for_duckdb(_whole(empty, table, 1)), create=True)
+        # Recorded in the same transaction, so a table is recorded complete exactly when it is in the file whole.
+        duck.execute(f"CREATE SCHEMA IF NOT EXISTS {KEYS_SCHEMA}")
+        duck.execute(f"CREATE TABLE IF NOT EXISTS {KEYS_SCHEMA}.{COMPLETED_TABLE} "
+                     "(table_name VARCHAR, row_count BIGINT, completed_at TIMESTAMPTZ)")
+        duck.execute(f"DELETE FROM {KEYS_SCHEMA}.{COMPLETED_TABLE} WHERE table_name = ?", [table])
+        duck.execute(f"INSERT INTO {KEYS_SCHEMA}.{COMPLETED_TABLE} VALUES (?, ?, now())", [table, rows])
         duck.execute("COMMIT")
     except BaseException:
         with contextlib.suppress(Exception):
@@ -305,6 +339,61 @@ def _print_estimate(est: Estimate, tables: list[str], lob_note: str | None) -> N
     sys.stdout.flush()  # before any refusal on stderr, so a log of both reads in the order they happened
 
 
+def _file_state(out: str, local_only: bool) -> _FileState:
+    """What `out` records, read through a read-only attachment, so a refused copy changes nothing; empty for no file."""
+    if not os.path.exists(out):
+        return _FileState(None, 0, frozenset(), frozenset())
+    con = connect_duckdb(":memory:", local_only=local_only)
+    try:
+        con.execute(f"ATTACH {attach_literal(out)} AS copy (READ_ONLY)")
+        held = {(schema, name) for schema, name in con.execute(
+            "SELECT table_schema, table_name FROM information_schema.tables WHERE table_catalog = 'copy'").fetchall()}
+        sources = (con.execute(f"SELECT target, owner, read_user FROM copy.{KEYS_SCHEMA}.{SOURCE_TABLE}").fetchall()
+                   if (KEYS_SCHEMA, SOURCE_TABLE) in held else [])
+        completed = ({r[0] for r in con.execute(
+            f"SELECT table_name FROM copy.{KEYS_SCHEMA}.{COMPLETED_TABLE}").fetchall()}
+            if (KEYS_SCHEMA, COMPLETED_TABLE) in held else set())
+    finally:
+        con.close()
+    return _FileState(CopySource(*sources[0]) if len(sources) == 1 else None, len(sources), frozenset(completed),
+                      frozenset(name for schema, name in held if schema == "main"))
+
+
+def _check_file(state: _FileState, source: CopySource, out: str) -> None:
+    """Refuse a file this copy cannot add to: one recording another source, which a resume would skip identically named
+    tables of and whose records it would overwrite, or one holding tables with no record of where they came from."""
+    if state.sources > 1:
+        raise _Refused(f"{out} records {state.sources} sources; copy into a new --out")
+    if state.source is None:
+        if state.tables:
+            raise _Refused(f"{out} holds {len(state.tables)} table(s) but no record of the source they were copied "
+                           "from, so they cannot be told apart from this source's; copy into a new --out")
+        return
+    differ = [name for name in ("target", "owner", "read_user")
+              if getattr(state.source, name) != getattr(source, name)]
+    if differ:
+        raise _Refused(f"{out} is a copy of another source: its {', '.join(differ)} differ(s) from this run's (it "
+                       f"records owner {state.source.owner!r}, read as {state.source.read_user!r}); a resume would "
+                       "skip tables that only share a name, so copy into a new --out")
+
+
+def _record_source(duck, source: CopySource) -> None:
+    duck.execute("BEGIN TRANSACTION")
+    duck.execute(f"CREATE SCHEMA IF NOT EXISTS {KEYS_SCHEMA}")
+    duck.execute(f"CREATE TABLE IF NOT EXISTS {KEYS_SCHEMA}.{SOURCE_TABLE} "
+                 "(target VARCHAR, owner VARCHAR, read_user VARCHAR)")
+    duck.execute(f"INSERT INTO {KEYS_SCHEMA}.{SOURCE_TABLE} VALUES (?, ?, ?)",
+                 [source.target, source.owner, source.read_user])
+    duck.execute("COMMIT")
+
+
+def _completed(duck) -> set[str]:
+    found = duck.execute("SELECT count(*) FROM information_schema.tables WHERE table_catalog = current_database() "
+                         "AND table_schema = ? AND table_name = ?", [KEYS_SCHEMA, COMPLETED_TABLE]).fetchone()[0]
+    return {r[0] for r in duck.execute(f"SELECT table_name FROM {KEYS_SCHEMA}.{COMPLETED_TABLE}").fetchall()} \
+        if found else set()
+
+
 def _duck_tables(duck) -> list[str]:
     return [r[0] for r in duck.execute(
         "SELECT table_name FROM information_schema.tables "
@@ -325,7 +414,7 @@ def _write_keys(duck, rows: list[KeyRow]) -> None:
         duck.executemany(f"INSERT INTO {KEYS_SCHEMA}.{KEYS_TABLE} VALUES (?, ?, ?, ?, ?)", rows)
 
 
-def _copy(conn, spec: SourceSpec, args, out: str, *, local_only: bool) -> int:
+def _copy(conn, spec: SourceSpec, args, out: str, *, local_only: bool, source: CopySource, state: _FileState) -> int:
     owner = spec.schema.upper()
     with _read_only(conn):
         stats = _rows(conn, _TABLES, owner=owner)
@@ -337,7 +426,10 @@ def _copy(conn, spec: SourceSpec, args, out: str, *, local_only: bool) -> int:
                            "(matched without regard to case; * and ? are patterns)")
         if not tables:
             raise _Refused(f"owner {owner!r} holds no table to copy")
-        clashes = _case_clashes(tables, _rows(conn, _COLUMNS, owner=owner))
+        # The tables this file already holds whole count too: a table selected now whose name equals one of theirs
+        # without regard to case would collide with it in DuckDB.
+        copied_before = sorted(state.completed & state.tables)
+        clashes = _case_clashes(sorted(set(tables) | set(copied_before)), _rows(conn, _COLUMNS, owner=owner))
         if clashes:
             raise _Refused("DuckDB matches names without regard to case, so it cannot keep these apart: "
                            + "; ".join(clashes))
@@ -362,18 +454,21 @@ def _copy(conn, spec: SourceSpec, args, out: str, *, local_only: bool) -> int:
     # mnemiq's own door: under MNEMIQ_LOCAL_ONLY, DuckDB installs and loads no extension by download here either.
     duck = connect_duckdb(out, local_only=local_only)
     try:
-        present = {t.casefold() for t in _duck_tables(duck)}
+        if state.source is None:
+            _record_source(duck, source)
+        # Skipped only when recorded complete and still there: a table present without the record is copied again.
+        done = _completed(duck) & set(_duck_tables(duck))
         started = time.monotonic()
         skipped = 0
         for table in tables:
-            if table.casefold() in present and not args.replace:
+            if table in done and not args.replace:
                 print(f"{table}: already in {out}, skipped (--replace copies it again)", flush=True)
                 skipped += 1
                 continue
             t0 = time.monotonic()
             rows = copy_table(conn, duck, owner, table, args.batch_rows)
             print(f"{table}: {rows} rows in {time.monotonic() - t0:.1f} s", flush=True)
-        in_file = set(_duck_tables(duck))
+        in_file = _completed(duck) & set(_duck_tables(duck))
         landed = [t for t in tables if t in in_file]
         columns = {t: _duck_columns(duck, t) for t in landed}
         statements = comment_statements(
@@ -431,9 +526,12 @@ def main(argv: list[str] | None = None) -> int:
             raise _Refused("MNEMIQ_ORACLE_WALLET_PASSWORD is set but MNEMIQ_ORACLE_CONFIG_DIR is not, so there is no "
                            "directory to find a wallet in")
         out = os.path.abspath(args.out)
+        source = CopySource(target=spec.target, owner=spec.schema.upper(), read_user=settings.oracle_user.upper())
+        state = _file_state(out, settings.local_only)
+        _check_file(state, source, out)
         conn = connect(spec, settings)
         try:
-            return _copy(conn, spec, args, out, local_only=settings.local_only)
+            return _copy(conn, spec, args, out, local_only=settings.local_only, source=source, state=state)
         finally:
             conn.close()
     except _Refused as refusal:
