@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 
 import duckdb
 import pyarrow as pa
@@ -39,6 +40,24 @@ def _batch(schema: pa.Schema, ids: range) -> pa.Table:
     return pa.table({schema.names[0]: list(ids), schema.names[1]: [f"v{i}" for i in ids]}, schema=schema)
 
 
+# The words Oracle refuses as a bind variable's name (ORA-01745), measured on Oracle Database 23.26
+# Free by binding each of the SQL Language Reference's reserved words: all but COLUMN_VALUE and
+# NESTED_TABLE_ID. The fake refuses them too, so a statement the server would refuse fails here.
+_REFUSED_BIND_NAMES = frozenset("""
+    ACCESS ADD ALL ALTER AND ANY AS ASC AUDIT BETWEEN BY CHAR CHECK CLUSTER COLUMN COMMENT COMPRESS
+    CONNECT CREATE CURRENT DATE DECIMAL DEFAULT DELETE DESC DISTINCT DROP ELSE EXCLUSIVE EXISTS FILE
+    FLOAT FOR FROM GRANT GROUP HAVING IDENTIFIED IMMEDIATE IN INCREMENT INDEX INITIAL INSERT INTEGER
+    INTERSECT INTO IS LEVEL LIKE LOCK LONG MAXEXTENTS MINUS MLSLABEL MODE MODIFY NOAUDIT NOCOMPRESS
+    NOT NOWAIT NULL NUMBER OF OFFLINE ON ONLINE OPTION OR ORDER PCTFREE PRIOR PUBLIC RAW RENAME
+    RESOURCE REVOKE ROW ROWID ROWNUM ROWS SELECT SESSION SET SHARE SIZE SMALLINT START SUCCESSFUL
+    SYNONYM SYSDATE TABLE THEN TO TRIGGER UID UNION UNIQUE UPDATE USER VALIDATE VALUES VARCHAR
+    VARCHAR2 VIEW WHENEVER WHERE WITH""".split())
+
+
+def _bind_names(sql: str) -> set[str]:
+    return {name.upper() for name in re.findall(r":([A-Za-z_][A-Za-z0-9_$#]*)", re.sub(r"'[^']*'", "", sql))}
+
+
 class _Cursor:
     def __init__(self, fake: "_Oracle") -> None:
         self._fake = fake
@@ -51,6 +70,8 @@ class _Cursor:
         return False
 
     def execute(self, sql: str, parameters=None, **binds):
+        refused = _bind_names(sql) & _REFUSED_BIND_NAMES
+        assert not refused, f"ORA-01745: invalid host/bind variable name {sorted(refused)} in {sql!r}"
         self._fake.log.append(sql)
         if self._fake.on_query is not None and "from all_tables" in sql.lower():
             hook, self._fake.on_query = self._fake.on_query, None
@@ -65,7 +86,7 @@ class _Cursor:
         elif "from all_tables" in low:
             self._rows = list(self._fake.stats)
         elif "data_precision" in low:
-            self._rows = list(self._fake.declared[parameters["table"]])
+            self._rows = list(self._fake.declared[parameters["table_name"]])
         elif "from all_tab_columns" in low:
             self._rows = [(t, c) for t, schema in self._fake.schemas.items() for c in schema.names]
         elif "from all_tab_comments" in low:

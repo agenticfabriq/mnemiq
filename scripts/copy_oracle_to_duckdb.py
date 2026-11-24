@@ -69,7 +69,7 @@ _TABLES = "SELECT table_name, num_rows, avg_row_len FROM all_tables WHERE owner 
 _COLUMNS = ("SELECT table_name, column_name FROM all_tab_columns WHERE owner = :owner "
             "ORDER BY table_name, column_id")
 _DECLARED = ("SELECT column_name, data_type, data_precision, data_scale FROM all_tab_columns "
-             "WHERE owner = :owner AND table_name = :table")
+             "WHERE owner = :owner AND table_name = :table_name")
 _TABLE_COMMENTS = "SELECT table_name, comments FROM all_tab_comments WHERE owner = :owner AND comments IS NOT NULL"
 _COLUMN_COMMENTS = ("SELECT table_name, column_name, comments FROM all_col_comments "
                     "WHERE owner = :owner AND comments IS NOT NULL")
@@ -317,7 +317,7 @@ def copy_table(conn, duck, owner: str, table: str, batch_rows: int) -> int:
         duck.execute(f"DROP TABLE IF EXISTS main.{_quoted(table)}")
         with _read_only(conn):
             declared = {name: (kind, precision, scale)
-                        for name, kind, precision, scale in _rows(conn, _DECLARED, owner=owner, table=table)}
+                        for name, kind, precision, scale in _rows(conn, _DECLARED, owner=owner, table_name=table)}
             # `fetch_decimals` named, whatever `oracledb.defaults` says: on, it fails the whole fetch on a FLOAT or a
             # negative scale (DPY-4042, measured), so exact types are requested column by column instead.
             fetched = _whole(conn.fetch_df_all(f"{select} WHERE 1 = 0", fetch_decimals=False), table, 0).schema
