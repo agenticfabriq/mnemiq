@@ -13,7 +13,7 @@ cd integrations/superset/frontend && pnpm install --frozen-lockfile && pnpm buil
 python scripts/build_superset_extension.py --out build/superset-extension --require-frontend
 ```
 
-That writes `build/superset-extension/dist/` (for `LOCAL_EXTENSIONS`) and `mnemiq-0.2.0.supx` (for `EXTENSIONS_PATH`).
+That writes `build/superset-extension/dist/` (for `LOCAL_EXTENSIONS`) and `mnemiq-<version>.supx` (for `EXTENSIONS_PATH`), its version the one `extension.json` names.
 No dependency is installed: the extension uses `pyjwt`, `cryptography` and `requests`, which Superset already ships.
 When the panel's frontend is built (`integrations/superset/frontend/dist`), it is packed too; `--require-frontend`
 refuses to pack without it. Every frontend file's name must carry a content hash, since Superset serves extension

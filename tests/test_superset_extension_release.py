@@ -43,6 +43,17 @@ def test_the_repositorys_own_manifest_is_read():
     assert _check().release_bundle(f"superset-extension-v{version}") == f"mnemiq-{version}.supx"
 
 
+def test_the_extension_s_three_version_pins_agree():
+    """A release names the manifest's version; the panel's package and the backend's project carry the same, so a
+    release cannot ship one part still at the version before."""
+    import tomllib
+    superset = ROOT / "integrations" / "superset"
+    manifest = json.loads((superset / "extension.json").read_text())["version"]
+    panel = json.loads((superset / "frontend" / "package.json").read_text())["version"]
+    backend = tomllib.loads((superset / "backend" / "pyproject.toml").read_text())["project"]["version"]
+    assert manifest == panel == backend, {"extension.json": manifest, "package.json": panel, "pyproject.toml": backend}
+
+
 def test_the_workflow_checks_the_tag_before_it_packs_the_frontend_and_publishes():
     """Read from the workflow's text, in order: a tag push publishes with write access to contents, the tag is checked
     first, the panel is built and tested, the bundle is packed only with its frontend, and the release carries it."""

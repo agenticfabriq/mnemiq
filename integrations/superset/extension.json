@@ -2,7 +2,7 @@
   "publisher": "agenticfabriq",
   "name": "mnemiq",
   "displayName": "mnemiq",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "license": "Apache-2.0",
   "description": "Lets mnemiq build and edit dashboards as the person asking: a token route, a forwarder for its panel, and MCP write tools.",
   "backend": {
