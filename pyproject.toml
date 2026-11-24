@@ -49,13 +49,14 @@ dependencies = [
 # tests guard the read-only controls, and behind an `importorskip` a missing driver turned them
 # into silent SKIPPED lines under a green build. In thin mode it needs no Oracle client
 # libraries, so the cost of installing it for every developer is a pure-python wheel.
-dev = ["pytest>=8", "ruff>=0.6", "fastapi>=0.115", "uvicorn>=0.30", "oracledb>=2,<5"]
+dev = ["pytest>=8", "ruff>=0.6", "fastapi>=0.115", "uvicorn>=0.30", "oracledb>=26.0.1,<27"]
 server = ["fastapi>=0.115", "uvicorn>=0.30"]
 # Oracle is a v1 target and an OPTIONAL extra, not a core dependency: only an Oracle
 # deployment needs the driver, and `oracledb` in thin mode needs no Oracle client libraries.
-# Capped below 5, the release after 4.0.2 being 26.0 (2026-11-03): on 26.1.0 the adapter's driver error
-# table misses a code (`test_source_unavailable_is_not_a_rejection`). Raise it with the canary.
-oracle = ["oracledb>=2,<5"]
+# The floor is 26.0.1, the first release whose Arrow data frame fetch keeps repeated NUMBER values whole
+# (4.0.2's crashed or came back a value short), which the copy script's exact decimal fetch needs.
+# Capped below the next year's major (versions are the two-digit year from 26.0).
+oracle = ["oracledb>=26.0.1,<27"]
 # The warehouse benchmark path: any script under `scripts/` that connects to Snowflake or
 # Databricks. Stated as a RULE rather than a list or a count, both of which this comment has
 # already got wrong -- it named five scripts when far more needed the drivers, because every
