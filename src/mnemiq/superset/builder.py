@@ -628,27 +628,19 @@ def _run_chart(run: _Run) -> _Outcome:
 def _held_to_the_dashboards_measures(run: _Run, specs: Sequence[ChartSpec], *, stops: str) -> None:
     """Before what `stops` names is made (every chart, at the first step; one chart, at its own): a measure the charts
     write that the dashboard already keeps under its name with another definition stops the step, since one name
-    would then mean two measures on one dashboard; so does one whose label another measure of the dashboard keeps,
-    since Superset keys a chart's values by label and the panel's Edit holds a dashboard's labels apart. At the first step a measure on a dataset the build has yet to make
-    carries the dataset's placeholder id, which is no kept measure's dataset; nor will the dataset's id be, once it is
-    made, since Superset gives a new dataset an id no dataset had before."""
+    would then mean two measures on one dashboard. The plan check (`planner.plan_build`'s `kept`) refuses such a
+    measure first, so this meets only a measure the dashboard came to keep after the plan. At the first step a measure
+    on a dataset the build has yet to make carries the dataset's placeholder id, which is no kept measure's dataset;
+    nor will the dataset's id be, once it is made, since Superset gives a new dataset an id no dataset had before."""
     build = run.build
-    rows = run.store.measures_for(build.tenant_id, build.dashboard_id)
-    kept = {row.measure.name: row for row in rows}
-    labelled = {row.measure.label.strip().casefold(): row for row in rows}
+    kept = {row.measure.name: row for row in run.store.measures_for(build.tenant_id, build.dashboard_id)}
     for spec in specs:
         for ref in spec.measures:
-            if not isinstance(ref, WrittenRef):
-                continue
-            if (before := kept.get(ref.measure.name)) is not None and not same_definition(before.measure, ref.measure):
+            if isinstance(ref, WrittenRef) and (before := kept.get(ref.measure.name)) is not None \
+                    and not same_definition(before.measure, ref.measure):
                 raise _Stop("measure_conflict", f"the dashboard keeps a measure {ref.measure.name!r} with another "
                                                 f"definition, so {stops}; give the planned measure another name, or "
                                                 "change the one the dashboard keeps")
-            other = labelled.get(ref.measure.label.strip().casefold())
-            if other is not None and other.measure.name != ref.measure.name:
-                raise _Stop("measure_conflict", f"the dashboard keeps the label {ref.measure.label!r} on its measure "
-                                                f"{other.measure.name!r}, so {stops}; give the planned measure "
-                                                "another label")
 
 
 def _saved_measure(ref: SavedRef, metric: SavedMetric, dataset_id: int, principal: str) -> Measure:

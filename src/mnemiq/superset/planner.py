@@ -382,9 +382,12 @@ def plan_prompt(goal: str, context: PlanContext) -> tuple[str, str]:
     }
     user = f"Goal: {goal}\n\nWhat this builder can see:\n{json.dumps(document, ensure_ascii=False)}"
     if context.kept:
+        # A measure's expression and table only where its dataset is a table this builder sees: a dashboard's editor
+        # may read fewer tables than its measures are on, and names and labels are all a plan needs to avoid them.
         tables = {table.dataset_id: table.name for table in context.tables if table.dataset_id is not None}
-        kept = [{"name": m.name, "label": m.label, "expression": m.expression, "kind": m.kind.value,
-                 **({"table": tables[m.dataset_id]} if m.dataset_id in tables else {})} for m in context.kept]
+        kept = [{"name": m.name, "label": m.label, "kind": m.kind.value,
+                 **({"expression": m.expression, "table": tables[m.dataset_id]} if m.dataset_id in tables else {})}
+                for m in context.kept]
         user += (f"\n\nThe dashboard this builds onto: this dashboard already keeps these measures, each on its own "
                  f"dataset:\n{json.dumps(kept, ensure_ascii=False)}\nA written measure's name and label are never one "
                  "of theirs, unless it is that measure: the same expression and kind, on its table.")
@@ -1326,8 +1329,8 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
         labels[measure.label.strip().casefold()] = measure.name
         held = kept_names.get(measure.name.casefold())
         if held is not None and not same_definition(held, measure):
-            where = f"the table {by_dataset[held.dataset_id]!r}" if held.dataset_id in by_dataset else "a dataset of its own"
-            refuse(part, f"this dashboard keeps a measure of this name, {held.expression} on {where}, and keeps one "
+            # Its definition is not said: its dataset may be no table this builder can read.
+            refuse(part, "this dashboard keeps a measure of this name with another definition, and keeps one "
                          "definition for each name: give this measure a name and a label this dashboard does not keep")
             continue
         other = kept_labels.get(measure.label.strip().casefold())

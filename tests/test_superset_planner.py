@@ -429,6 +429,8 @@ def test_a_measure_named_as_one_the_dashboard_keeps_elsewhere_goes_back_for_a_na
     [part] = planner.contexts[1].repair.refused
     assert part.part == "measure 'total_premium'" and part.repairable, part
     assert "this dashboard keeps" in part.reason and "name" in part.reason, part
+    # The kept measure's dataset is no table this builder can see: its definition is not said.
+    assert "SUM(premium)" not in part.reason and "premium" not in part.reason.replace("total_premium", ""), part
     refused = _plan(GOAL, FakePlanner(_one_bar(PREMIUM)), _tools(), kept=(kept,))
     assert isinstance(refused, PlanRefused) and "this dashboard keeps" in _parts(refused)["measure 'total_premium'"]
 
@@ -460,15 +462,17 @@ def test_a_kept_name_on_the_same_dataset_with_another_expression_is_refused():
 
 
 def test_the_planner_is_told_the_measures_the_dashboard_keeps_and_a_fresh_build_hears_nothing_of_them():
-    """The measures a dashboard keeps reach the model in the user prompt, each with its label, expression and kind,
-    and its table where its dataset is a table's; a build with none kept is sent the prompt it was sent before."""
+    """The measures a dashboard keeps reach the model in the user prompt, each with its name, label and kind; its
+    expression and table only where its dataset is a table this builder can see, since a dashboard's editor may read
+    fewer tables than its measures are on. A build with none kept is sent the prompt it was sent before."""
     kept = (dataclasses.replace(PREMIUM, dataset_id=ELSEWHERE), dataclasses.replace(CLAIMS, name="claims_kept"))
     told = FakePlanner(_one_bar(_measure("premium_on_policy", "Premium")))
     _plan(GOAL, told, _tools(), kept=kept)
     system, user = plan_prompt(GOAL, told.contexts[0])
     assert "this dashboard already keeps" in user and "never one of theirs" in user, user
     assert '"name": "total_premium"' in user and '"label": "Total premium"' in user, user
-    assert '"expression": "SUM(premium)"' in user and '"table": "claim"' in user, user
+    assert '"expression": "COUNT(claim_id)"' in user and '"table": "claim"' in user, user
+    assert "SUM(premium)" not in user, user
     fresh = FakePlanner(_one_bar(PREMIUM))
     _plan(GOAL, fresh, _tools())
     plain_system, plain_user = plan_prompt(GOAL, fresh.contexts[0])
