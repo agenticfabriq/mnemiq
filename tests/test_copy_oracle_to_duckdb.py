@@ -464,6 +464,20 @@ def test_missing_credentials_are_refused_before_connecting(deployment, monkeypat
     assert fake.log == [] and "MNEMIQ_ORACLE_PASSWORD" in capsys.readouterr().err
 
 
+def test_the_file_is_opened_through_mnemiqs_door_with_the_deployments_local_only(deployment, monkeypatch):
+    seen: list[bool] = []
+    real = copy.connect_duckdb
+
+    def door(database, *, local_only):
+        seen.append(local_only)
+        return real(database, local_only=local_only)
+
+    monkeypatch.setattr(copy, "connect_duckdb", door)
+    monkeypatch.setenv("MNEMIQ_LOCAL_ONLY", "1")
+    assert deployment(_shop()) == 0
+    assert seen == [True]
+
+
 def test_the_password_is_never_printed(deployment, capsys):
     deployment(_shop())
     out = capsys.readouterr()

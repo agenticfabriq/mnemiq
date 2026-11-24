@@ -46,11 +46,11 @@ import time
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 
-import duckdb
 import pyarrow as pa
 
 from mnemiq.adapters.duckdb import KEYS_SCHEMA, KEYS_TABLE
 from mnemiq.config import Settings, SourceSpec
+from mnemiq.duckdb_extensions import connect_duckdb
 
 # A table being copied lands under this suffix and is renamed when its last row is in.
 STAGING_SUFFIX = "__partial"
@@ -336,7 +336,7 @@ def _write_keys(duck, rows: list[KeyRow]) -> None:
         duck.executemany(f"INSERT INTO {KEYS_SCHEMA}.{KEYS_TABLE} VALUES (?, ?, ?, ?, ?)", rows)
 
 
-def _copy(conn, spec: SourceSpec, args, out: str) -> int:
+def _copy(conn, spec: SourceSpec, args, out: str, *, local_only: bool) -> int:
     owner = spec.schema.upper()
     with _read_only(conn):
         stats = _rows(conn, _TABLES, owner=owner)
@@ -370,7 +370,8 @@ def _copy(conn, spec: SourceSpec, args, out: str) -> int:
                            if t in selected}
         keys = _rows(conn, _KEYS, owner=owner)
 
-    duck = duckdb.connect(out)
+    # mnemiq's own door: under MNEMIQ_LOCAL_ONLY, DuckDB installs and loads no extension by download here either.
+    duck = connect_duckdb(out, local_only=local_only)
     try:
         present = {t.casefold() for t in _duck_tables(duck)}
         started = time.monotonic()
@@ -443,7 +444,7 @@ def main(argv: list[str] | None = None) -> int:
         out = os.path.abspath(args.out)
         conn = connect(spec, settings)
         try:
-            return _copy(conn, spec, args, out)
+            return _copy(conn, spec, args, out, local_only=settings.local_only)
         finally:
             conn.close()
     except _Refused as refusal:
