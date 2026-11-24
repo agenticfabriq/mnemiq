@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import json
 import os
 import sys
@@ -79,6 +80,8 @@ _KEYS = ("SELECT c.table_name, cc.column_name, rc.table_name, rcc.column_name, c
          "WHERE c.owner = :owner AND c.constraint_type = 'R' AND c.r_owner = c.owner "
          "ORDER BY c.table_name, c.constraint_name, cc.position")
 _USER = "SELECT user FROM dual"
+# The database's own names, which every user can read: which database a target reached, whatever the alias says.
+_DATABASE = "SELECT SYS_CONTEXT('USERENV', 'DB_UNIQUE_NAME'), SYS_CONTEXT('USERENV', 'CON_NAME') FROM dual"
 # LOB segments are sized only in USER_SEGMENTS (DBA_SEGMENTS needs a grant), so only the owner can see them.
 _LOBS = ("SELECT l.table_name, SUM(s.bytes) FROM user_lobs l JOIN user_segments s ON s.segment_name = l.segment_name "
          "GROUP BY l.table_name")
@@ -86,12 +89,17 @@ _LOBS = ("SELECT l.table_name, SUM(s.bytes) FROM user_lobs l JOIN user_segments 
 
 @dataclass(frozen=True)
 class CopySource:
-    """The source a file is a copy of: the Oracle target, the schema owner whose tables it holds, and the user that read
-    them, whose grants (and any row policy) decide which rows it saw. Never a password."""
+    """The source a file is a copy of: the Oracle target, the schema owner whose tables it holds, the user that read
+    them, whose grants (and any row policy) decide which rows it saw, and the database the target reached, by its own
+    names (`DB_UNIQUE_NAME`, `CON_NAME`): with a config directory one TNS alias can resolve to another database, so the
+    target string alone does not say which one it is. The two names are None until the copy has connected. Never a
+    password."""
 
     target: str
     owner: str
     read_user: str
+    db_unique_name: str | None = None
+    con_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -369,8 +377,17 @@ def _file_state(duck) -> _FileState:
     held = {(schema, name) for schema, name in duck.execute(
         "SELECT table_schema, table_name FROM information_schema.tables "
         "WHERE table_catalog = current_database()").fetchall()}
-    sources = (duck.execute(f"SELECT target, owner, read_user FROM {KEYS_SCHEMA}.{SOURCE_TABLE}").fetchall()
-               if (KEYS_SCHEMA, SOURCE_TABLE) in held else [])
+    sources = []
+    if (KEYS_SCHEMA, SOURCE_TABLE) in held:
+        columns = {c for (c,) in duck.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_catalog = current_database() "
+            "AND table_schema = ? AND table_name = ?", [KEYS_SCHEMA, SOURCE_TABLE]).fetchall()}
+        if "db_unique_name" not in columns:
+            raise _Refused(f"{KEYS_SCHEMA}.{SOURCE_TABLE} records its source without the database's names (an "
+                           "earlier version of this script), so which database it copied cannot be checked; copy "
+                           "into a new --out")
+        sources = duck.execute(f"SELECT target, owner, read_user, db_unique_name, con_name "
+                               f"FROM {KEYS_SCHEMA}.{SOURCE_TABLE}").fetchall()
     completed = ({r[0] for r in duck.execute(f"SELECT table_name FROM {KEYS_SCHEMA}.{COMPLETED_TABLE}").fetchall()}
                  if (KEYS_SCHEMA, COMPLETED_TABLE) in held else set())
     return _FileState(CopySource(*sources[0]) if len(sources) == 1 else None, len(sources), frozenset(completed),
@@ -393,15 +410,22 @@ def _check_file(state: _FileState, source: CopySource, out: str) -> None:
         raise _Refused(f"{out} is a copy of another source: its {', '.join(differ)} differ(s) from this run's (it "
                        f"records owner {state.source.owner!r}, read as {state.source.read_user!r}); a resume would "
                        "skip tables that only share a name, so copy into a new --out")
+    if source.db_unique_name is None:
+        return  # not connected yet: the database's names are checked once it is
+    database = [name for name in ("db_unique_name", "con_name") if getattr(state.source, name) != getattr(source, name)]
+    if database:
+        raise _Refused(f"{out} is a copy of another database: the target {source.target!r} now reaches "
+                       f"{source.db_unique_name}/{source.con_name}, and the file records "
+                       f"{state.source.db_unique_name}/{state.source.con_name}; copy into a new --out")
 
 
 def _record_source(duck, source: CopySource) -> None:
     duck.execute("BEGIN TRANSACTION")
     duck.execute(f"CREATE SCHEMA IF NOT EXISTS {KEYS_SCHEMA}")
     duck.execute(f"CREATE TABLE IF NOT EXISTS {KEYS_SCHEMA}.{SOURCE_TABLE} "
-                 "(target VARCHAR, owner VARCHAR, read_user VARCHAR)")
-    duck.execute(f"INSERT INTO {KEYS_SCHEMA}.{SOURCE_TABLE} VALUES (?, ?, ?)",
-                 [source.target, source.owner, source.read_user])
+                 "(target VARCHAR, owner VARCHAR, read_user VARCHAR, db_unique_name VARCHAR, con_name VARCHAR)")
+    duck.execute(f"INSERT INTO {KEYS_SCHEMA}.{SOURCE_TABLE} VALUES (?, ?, ?, ?, ?)",
+                 [source.target, source.owner, source.read_user, source.db_unique_name, source.con_name])
     duck.execute("COMMIT")
 
 
@@ -560,6 +584,11 @@ def _run(duck, created: bool, spec: SourceSpec, args, out: str, settings: Settin
         state = _file_state(duck)
         _check_file(state, source, out)
         conn = connect(spec, settings)
+        # Right after connecting, before the dictionary: which database the target reached.
+        with _read_only(conn):
+            db_unique_name, con_name = _rows(conn, _DATABASE)[0]
+        source = dataclasses.replace(source, db_unique_name=db_unique_name, con_name=con_name)
+        _check_file(state, source, out)
         plan = _plan(conn, spec, args, state)
     except BaseException:
         if conn is not None:

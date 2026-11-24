@@ -58,6 +58,8 @@ class _Cursor:
         low = " ".join(sql.lower().split())
         if low.startswith("set transaction"):
             self._rows = []
+        elif "sys_context" in low:
+            self._rows = [self._fake.database]
         elif "from dual" in low:
             self._rows = [(self._fake.user,)]
         elif "from all_tables" in low:
@@ -84,7 +86,7 @@ class _Oracle:
 
     def __init__(self, batches: dict[str, list[pa.Table]], schemas: dict[str, pa.Schema] | None = None, *,
                  stats=None, table_comments=None, column_comments=None, keys=(), lobs=(), user="READER",
-                 fail_on: tuple[str, int] | None = None) -> None:
+                 fail_on: tuple[str, int] | None = None, database=("APPDB", "APPPDB")) -> None:
         self.batches = batches
         self.schemas = schemas or {t: b[0].schema for t, b in batches.items()}
         self.stats = stats if stats is not None else [(t, 10, 100) for t in self.schemas]
@@ -93,6 +95,7 @@ class _Oracle:
         self.keys = list(keys)
         self.lobs = list(lobs)
         self.user = user
+        self.database = database  # (DB_UNIQUE_NAME, CON_NAME), as SYS_CONTEXT('USERENV', ...) gives them
         self.fail_on = fail_on
         self.on_fail = lambda: None  # what a test looks at the moment the copy stops, before anything cleans up
         self.on_query = None  # run once, at the first dictionary read
@@ -443,7 +446,7 @@ def _records(path: str) -> tuple[list[tuple], list[tuple]]:
 
 def test_the_source_and_each_completed_table_are_recorded_in_the_file(deployment):
     assert deployment(_shop()) == 0
-    assert _records(deployment.out) == ([("db.example:1521/APP", "APP", "READER")],
+    assert _records(deployment.out) == ([("db.example:1521/APP", "APP", "READER", "APPDB", "APPPDB")],
                                         [("CUSTOMER", 2, True), ("ORDERS", 5, True)])
     assert deployment(_shop(), "--replace") == 0
     assert _records(deployment.out)[1] == [("CUSTOMER", 2, True), ("ORDERS", 5, True)], "replaced, not doubled"
@@ -468,6 +471,32 @@ def test_a_file_holding_another_sources_copy_is_refused_before_any_read(deployme
     assert "another source" in capsys.readouterr().err
     assert _tables(deployment.out) == {"ORDERS": 5, "CUSTOMER": 2}
     assert open(deployment.out + ".source.json").read() == entry, "nothing in the file or beside it changed"
+
+
+@pytest.mark.parametrize("database", [("OTHERDB", "APPPDB"), ("APPDB", "OTHERPDB")], ids=["unique-name", "container"])
+def test_a_file_copied_from_another_database_behind_the_same_alias_is_refused(deployment, capsys, database):
+    # With MNEMIQ_ORACLE_CONFIG_DIR, one TNS alias can resolve to another database: the target string alone matched.
+    assert deployment(_shop()) == 0
+    before = (_records(deployment.out), _tables(deployment.out), open(deployment.out + ".source.json").read())
+    other = _shop(database=database)
+    assert deployment(other, "--replace") == 2
+    assert other.fetched == [], "no table read, skipped or written"
+    statements = [e for e in other.log if isinstance(e, str)
+                  and e not in ("ROLLBACK", "SET TRANSACTION READ ONLY", "CLOSE")]
+    assert len(statements) == 1 and "SYS_CONTEXT" in statements[0], "refused right after connecting, before the dictionary"
+    assert "another database" in capsys.readouterr().err
+    assert (_records(deployment.out), _tables(deployment.out), open(deployment.out + ".source.json").read()) == before
+
+
+def test_a_source_record_without_the_database_names_is_refused(deployment, capsys):
+    con = duckdb.connect(deployment.out)
+    con.execute("CREATE SCHEMA mnemiq")
+    con.execute("CREATE TABLE mnemiq.copy_source (target VARCHAR, owner VARCHAR, read_user VARCHAR)")
+    con.execute("INSERT INTO mnemiq.copy_source VALUES ('db.example:1521/APP', 'APP', 'READER')")
+    con.close()
+    fake = _shop()
+    assert deployment(fake) == 2
+    assert deployment.connects == [] and "without the database's names" in capsys.readouterr().err
 
 
 def test_a_file_holding_tables_but_no_recorded_source_is_refused(deployment, capsys):
@@ -534,7 +563,7 @@ def test_a_second_run_is_kept_out_while_the_first_holds_the_file(deployment, tmp
     assert deployment(first) == 0
     assert len(second) == 1 and second[0].returncode == 2, second[0].stderr[-600:]
     assert "held by another process" in second[0].stderr
-    assert _records(deployment.out)[0] == [("db.example:1521/APP", "APP", "READER")]
+    assert _records(deployment.out)[0] == [("db.example:1521/APP", "APP", "READER", "APPDB", "APPPDB")]
     assert _tables(deployment.out) == {"ORDERS": 5, "CUSTOMER": 2}
 
 
