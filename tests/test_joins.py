@@ -2,7 +2,7 @@ import duckdb
 import pytest
 
 from mnemiq.catalog import ColumnInfo, TableInfo
-from mnemiq.enrichment.joins import infer_relationships
+from mnemiq.enrichment.joins import _compares_as_numbers, infer_relationships
 
 
 class _DuckAdapter:
@@ -109,12 +109,30 @@ def _numeric_keys(parent_type: str, child_type: str, child_rows: str):
 
 
 @pytest.mark.parametrize(("parent_type", "child_type"), [
-    ("DECIMAL(19,0)", "DECIMAL(19,2)"), ("BIGINT", "DOUBLE"), ("DECIMAL(12,2)", "DOUBLE")])
+    ("DECIMAL(19,0)", "DECIMAL(19,2)"), ("BIGINT", "DECIMAL(19,2)"), ("DECIMAL(12,2)", "DOUBLE"),
+    ("INTEGER", "DOUBLE")])
 def test_numeric_join_keys_of_different_types_compare_as_numbers(parent_type, child_type):
     # A DuckDB copy of Oracle lands each NUMBER as BIGINT, DECIMAL(p, s) or DOUBLE by its declaration, where as text
     # one number is 1, 1.00 or 1.0; Oracle, and the join the relationship describes, compare them as numbers.
     rels = _numeric_keys(parent_type, child_type, "(10, 1), (11, 2)")
     assert [(r.from_, r.to) for r in rels] == [("child", "parent")]
+
+
+def test_a_double_key_does_not_vouch_for_exact_keys_it_cannot_tell_apart():
+    # Codex's second review of the exact-number copy: compared as a DOUBLE, two DECIMAL(38, 0) keys past 2^53 are one
+    # number, so one child row joins both parents. A double holds 15 significant digits exactly; past them the pair is
+    # compared as text, as before, and the child's 9007199254740992.0 matches neither parent.
+    con = duckdb.connect()
+    con.execute('CREATE TABLE parent ("parent_id" DECIMAL(38,0))')
+    con.execute("INSERT INTO parent VALUES (9007199254740992), (9007199254740993)")
+    con.execute('CREATE TABLE child ("child_id" INTEGER, "parent_id" DOUBLE)')
+    con.execute("INSERT INTO child VALUES (10, 9007199254740992)")
+    catalog = [
+        TableInfo("parent", [ColumnInfo("parent_id", "DECIMAL(38,0)")]),
+        TableInfo("child", [ColumnInfo("child_id", "INTEGER"), ColumnInfo("parent_id", "DOUBLE")]),
+    ]
+    assert con.execute('SELECT count(*) FROM child c JOIN parent p ON p."parent_id" = c."parent_id"').fetchone() == (2,)
+    assert infer_relationships(_DuckAdapter(con), catalog) == []
 
 
 def test_a_text_parent_key_still_matches_a_numeric_child():
@@ -130,6 +148,26 @@ def test_a_text_parent_key_still_matches_a_numeric_child():
         TableInfo("child", [ColumnInfo("child_id", "INTEGER"), ColumnInfo("parent_id", "DECIMAL(19,0)")]),
     ]
     assert [(r.from_, r.to) for r in infer_relationships(_DuckAdapter(con), catalog)] == [("child", "parent")]
+
+
+@pytest.mark.parametrize(("parent_type", "child_type", "natively"), [
+    ("DECIMAL(19,0)", "DECIMAL(19,2)", True),   # exact against exact compares exactly
+    ("BIGINT", "DECIMAL(38,0)", True),
+    ("DOUBLE", "FLOAT8", True),                 # floating against floating, as the source keeps them
+    ("DECIMAL(15,2)", "DOUBLE", True),          # an exact type within a double's 15 digits
+    ("DOUBLE", "INTEGER", True),
+    ("DECIMAL(16,0)", "DOUBLE", False),         # past them, two keys can become one
+    ("BIGINT", "DOUBLE", False),
+    ("NUMERIC", "DOUBLE", False),               # a precision not declared is not known to fit
+    ("INTEGER", "FLOAT", False),                # a single holds 6 digits
+    ("DECIMAL(6,2)", "REAL", True),
+    ("INTEGER", "VARCHAR", False),              # text on either side is text
+    ("BOOLEAN", "INTEGER", False),
+    (None, "INTEGER", False),
+])
+def test_keys_compare_as_numbers_only_where_no_two_keys_can_become_one(parent_type, child_type, natively):
+    assert _compares_as_numbers(parent_type, child_type) is natively
+    assert _compares_as_numbers(child_type, parent_type) is natively
 
 
 def test_numeric_join_keys_still_refuse_an_orphan():

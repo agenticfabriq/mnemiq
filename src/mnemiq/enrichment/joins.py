@@ -9,26 +9,59 @@ from mnemiq.enrichment.profiling import ColumnStats, profile_column, unharvested
 logger = logging.getLogger(__name__)
 
 
-# The first word of a declared type, before any "(", that holds a number on the sources compared as text below:
-# DuckDB's, Postgres's (`double precision`), MySQL's (`int unsigned`), SQLite's and the warehouses'.
-_NUMERIC_BASES = frozenset({
-    "TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER",
-    "UBIGINT", "UHUGEINT", "INT1", "INT2", "INT4", "INT8", "SERIAL", "SMALLSERIAL", "BIGSERIAL", "DECIMAL", "NUMERIC",
-    "NUMBER", "REAL", "FLOAT", "FLOAT4", "FLOAT8", "DOUBLE"})
+# By the first word of a declared type, before any "(", on the sources compared as text below: DuckDB's, Postgres's
+# (`double precision`), MySQL's (`int unsigned`), SQLite's and the warehouses'. Exact numbers, as integers of at most
+# 10 digits or as decimals of their declared precision; and floating point, as the significant digits it holds
+# exactly, 15 for a double and 6 for a single (MySQL's and DuckDB's FLOAT; Postgres's is a double, taken as a single).
+_SMALL_INTEGERS = frozenset({"TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "UTINYINT", "USMALLINT",
+                             "UINTEGER", "INT1", "INT2", "INT4", "SERIAL", "SMALLSERIAL"})
+_WIDE_INTEGERS = frozenset({"BIGINT", "HUGEINT", "UBIGINT", "UHUGEINT", "INT8", "BIGSERIAL"})
+_DECIMALS = frozenset({"DECIMAL", "NUMERIC", "NUMBER"})
+_FLOAT_DIGITS = {"DOUBLE": 15, "FLOAT8": 15, "REAL": 6, "FLOAT": 6, "FLOAT4": 6}
 
 
-def _numeric(data_type: str | None) -> bool:
+def _base(data_type: str | None) -> str:
     words = (data_type or "").split("(", 1)[0].upper().split()
-    return bool(words) and words[0] in _NUMERIC_BASES
+    return words[0] if words else ""
+
+
+def _exact_digits(data_type: str) -> int | None:
+    """The digits every value of an exact numeric type fits in, or None when unbounded or not known."""
+    base = _base(data_type)
+    if base in _SMALL_INTEGERS:
+        return 10
+    if base in _DECIMALS and "(" in data_type:
+        precision = data_type.split("(", 1)[1].split(",", 1)[0].strip(" )")
+        return int(precision) if precision.isdigit() else None
+    return None
+
+
+def _compares_as_numbers(parent_type: str | None, child_type: str | None) -> bool:
+    """Whether the keys compare natively without two different keys becoming one. Two exact types compare exactly,
+    and two floating ones as the source keeps them. An exact one against a floating one is compared in floating point,
+    where two exact keys past its digits can round to one number (Codex: DECIMAL(38, 0) 9007199254740992 and
+    9007199254740993 both equal a DOUBLE 9007199254740992, and one child row joins both parents), so only an exact type
+    known to fit in those digits compares natively with it."""
+    bases = (_base(parent_type), _base(child_type))
+    exact = [b in _SMALL_INTEGERS | _WIDE_INTEGERS | _DECIMALS for b in bases]
+    floating = [b in _FLOAT_DIGITS for b in bases]
+    if not all(e or f for e, f in zip(exact, floating)):
+        return False
+    if all(exact) or all(floating):
+        return True
+    exact_type, float_type = (parent_type, child_type) if exact[0] else (child_type, parent_type)
+    digits = _exact_digits(exact_type or "")
+    return digits is not None and digits <= _FLOAT_DIGITS[_base(float_type)]
 
 
 def _comparable(expr: str, dialect: str, *, numbers: bool = False) -> str:
     """`expr` as the orphan check compares it.
 
-    Natively where both sides are numbers (`numbers`), as the join the relationship describes will compare them: as
-    text one number is 1, 1.00 or 1.0 by its type, and a DuckDB copy of Oracle lands each NUMBER as BIGINT, DECIMAL(p, s)
-    or DOUBLE by its declaration. Elsewhere as text, because a catalog can mix typed and CSV-inferred all-text tables,
-    where INTEGER 1 and TEXT '1' must still match. Oracle natively always: it refuses
+    Natively where both sides are numbers that compare without loss (`numbers`, `_compares_as_numbers`), as the join
+    the relationship describes will compare them: as text one number is 1, 1.00 or 1.0 by its type, and a DuckDB copy
+    of Oracle lands each NUMBER as BIGINT, DECIMAL(p, s) or DOUBLE by its declaration. Elsewhere as text, because a
+    catalog can mix typed and CSV-inferred all-text tables, where INTEGER 1 and TEXT '1' must still match. Oracle
+    natively always: it refuses
     `CAST(x AS VARCHAR)` with ORA-00906 (a VARCHAR2 needs a length, measured on 23.26), sqlglot's transpile gives
     `CAST(x AS CLOB)`, which it cannot compare with `=`, and `TO_CHAR` of a DATE follows the session's format, which
     can drop the time and make two different keys one. Types that do not compare raise, and the candidate is skipped."""
@@ -118,7 +151,7 @@ def infer_relationships(adapter, catalog: list[TableInfo], *, harvest_values: bo
                 # inclusion dependency, compared as `_comparable` says. A NULL child value means "no
                 # parent", not a broken reference.
                 dialect = getattr(adapter, "dialect", "duckdb")
-                numbers = _numeric(_declared_type(parent.name, col.name)) and _numeric(col.data_type)
+                numbers = _compares_as_numbers(_declared_type(parent.name, col.name), col.data_type)
                 in_parent = _comparable(f'p."{col.name}"', dialect, numbers=numbers)
                 in_child = _comparable(f'c."{col.name}"', dialect, numbers=numbers)
                 orphans = adapter.execute(
