@@ -1,6 +1,6 @@
 {
   "name": "agenticfabriq-mnemiq-superset-panel",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "mnemiq's chat panel inside Superset 7.0",
   "license": "Apache-2.0",
   "private": true,
