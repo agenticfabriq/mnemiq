@@ -52,6 +52,9 @@ class _Cursor:
 
     def execute(self, sql: str, parameters=None, **binds):
         self._fake.log.append(sql)
+        if self._fake.on_query is not None and "from all_tables" in sql.lower():
+            hook, self._fake.on_query = self._fake.on_query, None
+            hook()
         low = " ".join(sql.lower().split())
         if low.startswith("set transaction"):
             self._rows = []
@@ -92,6 +95,8 @@ class _Oracle:
         self.user = user
         self.fail_on = fail_on
         self.on_fail = lambda: None  # what a test looks at the moment the copy stops, before anything cleans up
+        self.on_query = None  # run once, at the first dictionary read
+        self.on_batch = None  # run once, at the first batch
         self.log: list = []
         self.fetched: list[str] = []
         self.fetch_kwargs: list[dict] = []
@@ -118,6 +123,9 @@ class _Oracle:
                 self.on_fail()
                 raise RuntimeError("the connection was lost")
             self.log.append(("batch", table, i))
+            if self.on_batch is not None:
+                hook, self.on_batch = self.on_batch, None
+                hook()
             yield batch
 
     def fetch_df_all(self, statement, parameters=None, arraysize=None, **kwargs):
@@ -494,6 +502,40 @@ def test_a_selected_name_equal_to_a_copied_one_without_case_is_refused(deploymen
     assert deployment(later) == 2
     assert later.fetched == [] and "'Orders'" in capsys.readouterr().err
     assert _tables(deployment.out) == {"ORDERS": 5}
+
+
+_SECOND_RUN = """
+import sys
+sys.path[:0] = [sys.argv[2], sys.argv[2] + "/tests"]
+import scripts.copy_oracle_to_duckdb as copy
+import test_copy_oracle_to_duckdb as t
+copy.connect = lambda spec, settings: t._shop()
+sys.exit(copy.main(["--out", sys.argv[1]]))
+"""
+
+
+@pytest.mark.parametrize("moment", ["on_query", "on_batch"])
+def test_a_second_run_is_kept_out_while_the_first_holds_the_file(deployment, tmp_path, moment):
+    # Two runs that both found no file both went on, and the second could record another source in it for the first to
+    # skip tables of. The first now holds DuckDB's write lock from its check to its end; the second, another process
+    # with another source, starts while the first reads the dictionary (before it touched the file) or copies a table.
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    other = tmp_path / "other.json"
+    other.write_text(json.dumps([{**_SOURCE, "target": "db.example:1521/OTHER"}]))
+    root = str(Path(__file__).resolve().parents[1])
+    second: list = []
+    first = _shop()
+    setattr(first, moment, lambda: second.append(subprocess.run(
+        [sys.executable, "-c", _SECOND_RUN, deployment.out, root], capture_output=True, text=True,
+        env={**os.environ, "MNEMIQ_SOURCES_PATH": str(other)})))
+    assert deployment(first) == 0
+    assert len(second) == 1 and second[0].returncode == 2, second[0].stderr[-600:]
+    assert "held by another process" in second[0].stderr
+    assert _records(deployment.out)[0] == [("db.example:1521/APP", "APP", "READER")]
+    assert _tables(deployment.out) == {"ORDERS": 5, "CUSTOMER": 2}
 
 
 def test_keys_with_both_ends_copied_are_written_to_the_keys_table(deployment):

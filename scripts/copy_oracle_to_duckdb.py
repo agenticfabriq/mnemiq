@@ -49,9 +49,10 @@ import time
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 
+import duckdb
 import pyarrow as pa
 
-from mnemiq.adapters.duckdb import KEYS_SCHEMA, KEYS_TABLE, attach_literal
+from mnemiq.adapters.duckdb import KEYS_SCHEMA, KEYS_TABLE
 from mnemiq.config import Settings, SourceSpec
 from mnemiq.duckdb_extensions import connect_duckdb
 
@@ -341,22 +342,37 @@ def _print_estimate(est: Estimate, tables: list[str], lob_note: str | None) -> N
     sys.stdout.flush()  # before any refusal on stderr, so a log of both reads in the order they happened
 
 
-def _file_state(out: str, local_only: bool) -> _FileState:
-    """What `out` records, read through a read-only attachment, so a refused copy changes nothing; empty for no file."""
-    if not os.path.exists(out):
-        return _FileState(None, 0, frozenset(), frozenset())
-    con = connect_duckdb(":memory:", local_only=local_only)
+def _open_writer(out: str, local_only: bool):
+    """The one write connection to `out`, opened before anything is checked and held until the copy ends: DuckDB's file
+    lock then keeps every other process out, so what the checks read cannot change under them. Two runs that both
+    found no file used to both go on. Refused (exit 2) when another process holds the file."""
     try:
-        con.execute(f"ATTACH {attach_literal(out)} AS copy (READ_ONLY)")
-        held = {(schema, name) for schema, name in con.execute(
-            "SELECT table_schema, table_name FROM information_schema.tables WHERE table_catalog = 'copy'").fetchall()}
-        sources = (con.execute(f"SELECT target, owner, read_user FROM copy.{KEYS_SCHEMA}.{SOURCE_TABLE}").fetchall()
-                   if (KEYS_SCHEMA, SOURCE_TABLE) in held else [])
-        completed = ({r[0] for r in con.execute(
-            f"SELECT table_name FROM copy.{KEYS_SCHEMA}.{COMPLETED_TABLE}").fetchall()}
-            if (KEYS_SCHEMA, COMPLETED_TABLE) in held else set())
-    finally:
-        con.close()
+        # mnemiq's own door: under MNEMIQ_LOCAL_ONLY, DuckDB installs and loads no extension by download here either.
+        return connect_duckdb(out, local_only=local_only)
+    except duckdb.IOException as exc:
+        if "lock" not in str(exc).lower():
+            raise
+        raise _Refused(f"{out} is held by another process (another copy, or something reading it): wait for it to "
+                       "end, or copy into a new --out") from exc
+
+
+def _discard(out: str) -> None:
+    """Remove the file this run created, before its write connection closes: while the connection holds the lock no
+    other process can have opened it, and DuckDB leaves nothing behind for an unlinked file (measured)."""
+    for path in (out, out + ".wal"):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path)
+
+
+def _file_state(duck) -> _FileState:
+    """What the file records, read through the copy's own write connection."""
+    held = {(schema, name) for schema, name in duck.execute(
+        "SELECT table_schema, table_name FROM information_schema.tables "
+        "WHERE table_catalog = current_database()").fetchall()}
+    sources = (duck.execute(f"SELECT target, owner, read_user FROM {KEYS_SCHEMA}.{SOURCE_TABLE}").fetchall()
+               if (KEYS_SCHEMA, SOURCE_TABLE) in held else [])
+    completed = ({r[0] for r in duck.execute(f"SELECT table_name FROM {KEYS_SCHEMA}.{COMPLETED_TABLE}").fetchall()}
+                 if (KEYS_SCHEMA, COMPLETED_TABLE) in held else set())
     return _FileState(CopySource(*sources[0]) if len(sources) == 1 else None, len(sources), frozenset(completed),
                       frozenset(name for schema, name in held if schema == "main"))
 
@@ -426,7 +442,20 @@ def _write_keys(duck, rows: list[KeyRow]) -> None:
         raise
 
 
-def _copy(conn, spec: SourceSpec, args, out: str, *, local_only: bool, source: CopySource, state: _FileState) -> int:
+@dataclass(frozen=True)
+class _Plan:
+    """What the dictionary says the copy will do, read before anything is written."""
+
+    owner: str
+    owner_tables: list[str]
+    tables: list[str]
+    table_comments: dict[str, str]
+    column_comments: dict[tuple[str, str], str]
+    keys: list[tuple]
+
+
+def _plan(conn, spec: SourceSpec, args, state: _FileState) -> _Plan:
+    """Every dictionary read, the estimate and every refusal that rests on them, in one read-only transaction."""
     owner = spec.schema.upper()
     with _read_only(conn):
         stats = _rows(conn, _TABLES, owner=owner)
@@ -462,37 +491,38 @@ def _copy(conn, spec: SourceSpec, args, out: str, *, local_only: bool, source: C
         column_comments = {(t, c): text for t, c, text in _rows(conn, _COLUMN_COMMENTS, owner=owner)
                            if t in selected}
         keys = _rows(conn, _KEYS, owner=owner)
+    return _Plan(owner, owner_tables, tables, table_comments, column_comments, keys)
 
-    # mnemiq's own door: under MNEMIQ_LOCAL_ONLY, DuckDB installs and loads no extension by download here either.
-    duck = connect_duckdb(out, local_only=local_only)
-    try:
-        if state.source is None:
-            _record_source(duck, source)
-        # Skipped only when recorded complete and still there: a table present without the record is copied again.
-        done = _completed(duck) & set(_duck_tables(duck))
-        started = time.monotonic()
-        skipped = 0
-        for table in tables:
-            if table in done and not args.replace:
-                print(f"{table}: already in {out}, skipped (--replace copies it again)", flush=True)
-                skipped += 1
-                continue
-            t0 = time.monotonic()
-            rows = copy_table(conn, duck, owner, table, args.batch_rows)
-            print(f"{table}: {rows} rows in {time.monotonic() - t0:.1f} s", flush=True)
-        in_file = _completed(duck) & set(_duck_tables(duck))
-        landed = [t for t in tables if t in in_file]
-        columns = {t: _duck_columns(duck, t) for t in landed}
-        statements = comment_statements(
-            {t: c for t, c in table_comments.items() if t in in_file},
-            {(t, c): text for (t, c), text in column_comments.items() if t in in_file and c in columns[t]})
-        for statement in statements:
-            duck.execute(statement)
-        key_rows = declared_key_rows([tuple(r) for r in keys], in_file & set(owner_tables))
-        _write_keys(duck, key_rows)
-        duck.execute("CHECKPOINT")
-    finally:
-        duck.close()
+
+def _write(conn, duck, spec: SourceSpec, args, out: str, plan: _Plan, *, source: CopySource,
+           state: _FileState) -> int:
+    owner, owner_tables, tables = plan.owner, plan.owner_tables, plan.tables
+    table_comments, column_comments, keys = plan.table_comments, plan.column_comments, plan.keys
+    if state.source is None:
+        _record_source(duck, source)
+    # Skipped only when recorded complete and still there: a table present without the record is copied again.
+    done = _completed(duck) & set(_duck_tables(duck))
+    started = time.monotonic()
+    skipped = 0
+    for table in tables:
+        if table in done and not args.replace:
+            print(f"{table}: already in {out}, skipped (--replace copies it again)", flush=True)
+            skipped += 1
+            continue
+        t0 = time.monotonic()
+        rows = copy_table(conn, duck, owner, table, args.batch_rows)
+        print(f"{table}: {rows} rows in {time.monotonic() - t0:.1f} s", flush=True)
+    in_file = _completed(duck) & set(_duck_tables(duck))
+    landed = [t for t in tables if t in in_file]
+    columns = {t: _duck_columns(duck, t) for t in landed}
+    statements = comment_statements(
+        {t: c for t, c in table_comments.items() if t in in_file},
+        {(t, c): text for (t, c), text in column_comments.items() if t in in_file and c in columns[t]})
+    for statement in statements:
+        duck.execute(statement)
+    key_rows = declared_key_rows([tuple(r) for r in keys], in_file & set(owner_tables))
+    _write_keys(duck, key_rows)
+    duck.execute("CHECKPOINT")
     entry_path = out + ".source.json"
     with open(entry_path, "w") as fh:
         json.dump([source_entry(spec, out, tables)], fh, indent=1)
@@ -522,6 +552,27 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
+def _run(duck, created: bool, spec: SourceSpec, args, out: str, settings: Settings, source: CopySource) -> int:
+    """The copy through the held write connection: checks, plan, writes. A run that stops before its first write
+    removes a file it created, so a refused copy leaves nothing behind."""
+    conn = None
+    try:
+        state = _file_state(duck)
+        _check_file(state, source, out)
+        conn = connect(spec, settings)
+        plan = _plan(conn, spec, args, state)
+    except BaseException:
+        if conn is not None:
+            conn.close()
+        if created:
+            _discard(out)
+        raise
+    try:
+        return _write(conn, duck, spec, args, out, plan, source=source, state=state)
+    finally:
+        conn.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -539,13 +590,12 @@ def main(argv: list[str] | None = None) -> int:
                            "directory to find a wallet in")
         out = os.path.abspath(args.out)
         source = CopySource(target=spec.target, owner=spec.schema.upper(), read_user=settings.oracle_user.upper())
-        state = _file_state(out, settings.local_only)
-        _check_file(state, source, out)
-        conn = connect(spec, settings)
+        created = not os.path.exists(out)
+        duck = _open_writer(out, settings.local_only)
         try:
-            return _copy(conn, spec, args, out, local_only=settings.local_only, source=source, state=state)
+            return _run(duck, created, spec, args, out, settings, source)
         finally:
-            conn.close()
+            duck.close()
     except _Refused as refusal:
         print(f"copy_oracle_to_duckdb: {refusal}", file=sys.stderr)
         return REFUSED

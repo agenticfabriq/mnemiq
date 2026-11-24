@@ -405,7 +405,9 @@ run it again and it copies what is missing, skipping the tables it recorded as c
 (`--replace` copies those again too). The file records the one source it is a copy of
 (`mnemiq.copy_source`: the target, the owner and the user that read it, never a password) and each
 table copied whole (`mnemiq.copied_tables`), so a file holding another source's copy, or tables with
-no record of their source, is refused before Oracle is reached: copy into a new `--out` instead.
+no record of their source, is refused before Oracle is reached: copy into a new `--out` instead. The
+copy holds the file from that check to its end, so a second copy into it, or anything else opening
+it, is refused until the first is done.
 
 **What it costs.**
 
