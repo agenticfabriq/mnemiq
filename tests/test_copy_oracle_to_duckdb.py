@@ -635,6 +635,17 @@ def test_comments_reach_the_file_where_the_duckdb_adapter_reads_them(deployment)
         {"ORDERS": "One row per order"}, {("ORDERS", "Status"): "O open, C closed"})
 
 
+def test_a_comment_removed_in_oracle_is_removed_from_the_file_when_a_copy_resumes(deployment):
+    # Codex's third review: a resumed copy skips the tables it finished, and the dictionary reads return no row for a
+    # comment that is gone, so nothing cleared the old one, and the file said complete while it carried a comment the
+    # source no longer has.
+    commented = _shop(table_comments={"ORDERS": "One row per order"},
+                      column_comments={("ORDERS", "Status"): "O open, C closed"})
+    assert deployment(commented) == 0
+    assert deployment(_shop()) == 0  # the same source, its comments since removed; ORDERS is skipped as complete
+    assert DuckDBAdapter.duckdb(deployment.out).comments(["ORDERS"]) == ({}, {})
+
+
 def test_names_that_differ_only_in_case_are_refused_before_any_row(deployment, capsys):
     tables = _Oracle({"Orders": [_batch(_ORDERS, range(1))], "ORDERS": [_batch(_ORDERS, range(1))]})
     deployment.manifest.write_text(json.dumps([{**_SOURCE, "tables": ["orders"]}]))

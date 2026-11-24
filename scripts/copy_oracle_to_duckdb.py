@@ -166,6 +166,25 @@ def comment_statements(tables: dict[str, str], columns: dict[tuple[str, str], st
     return statements
 
 
+def stale_comment_clears(duck, tables: list[str], current_tables: dict[str, str],
+                         current_columns: dict[tuple[str, str], str]) -> list[str]:
+    """`COMMENT ON ... IS NULL` for every comment the file holds on one of `tables` that the source no longer has. A
+    resumed copy skips the tables it finished, and the dictionary reads return no row for a comment that is gone, so
+    without these the file would keep a comment the source dropped (Codex's third review)."""
+    wanted = set(tables)
+    held_tables = duck.execute(
+        "SELECT table_name FROM duckdb_tables() WHERE database_name = current_database() AND schema_name = 'main' "
+        "AND comment IS NOT NULL AND comment <> ''").fetchall()
+    held_columns = duck.execute(
+        "SELECT table_name, column_name FROM duckdb_columns() WHERE database_name = current_database() "
+        "AND schema_name = 'main' AND comment IS NOT NULL AND comment <> ''").fetchall()
+    clears = [f"COMMENT ON TABLE {_quoted(t)} IS NULL" for (t,) in held_tables
+              if t in wanted and t not in current_tables]
+    clears += [f"COMMENT ON COLUMN {_quoted(t)}.{_quoted(c)} IS NULL" for t, c in held_columns
+               if t in wanted and (t, c) not in current_columns]
+    return clears
+
+
 # (from_table, from_column, to_table, to_column, constraint_name, position): `position` keeps a composite key's pairs
 # in the order the key declares them, which the DuckDB adapter reads them by.
 KeyRow = tuple[str, str, str, str, str, int]
@@ -550,9 +569,11 @@ def _write(conn, duck, spec: SourceSpec, args, out: str, plan: _Plan, *, source:
     in_file = _completed(duck) & set(_duck_tables(duck))
     landed = [t for t in tables if t in in_file]
     columns = {t: _duck_columns(duck, t) for t in landed}
-    statements = comment_statements(
-        {t: c for t, c in table_comments.items() if t in in_file},
-        {(t, c): text for (t, c), text in column_comments.items() if t in in_file and c in columns[t]})
+    current_tables = {t: c for t, c in table_comments.items() if t in in_file}
+    current_columns = {(t, c): text for (t, c), text in column_comments.items() if t in in_file and c in columns[t]}
+    for clear in stale_comment_clears(duck, landed, current_tables, current_columns):
+        duck.execute(clear)
+    statements = comment_statements(current_tables, current_columns)
     for statement in statements:
         duck.execute(statement)
     key_rows = declared_key_rows([tuple(r) for r in keys], in_file & set(owner_tables))
