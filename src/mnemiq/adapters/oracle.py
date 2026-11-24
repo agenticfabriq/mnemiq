@@ -2153,7 +2153,7 @@ def _is_timeout(exc: Exception) -> bool:
 # The driver's own codes that say the connection, the pool, the connect handshake or the wire
 # protocol failed, so no session read the statement and answered. Read off the driver's error
 # table (`errors.ERR_MESSAGE_FORMATS`,
-# python-oracledb 4.0.2, the locked version) code by code rather than one code per incident,
+# python-oracledb 26.1.0, the locked version) code by code rather than one code per incident,
 # after two incidents (Codex's second and third reviews of #159: DPY-4005, then DPY-4033); the
 # taxonomy test classifies every code in that table, this set, the OperationalErrors or a
 # reviewed list of refusals, so a driver whose table differs fails it and sends a maintainer back
@@ -2207,6 +2207,14 @@ _UNAVAILABLE_DPY = frozenset({
     "DPY-2018", "DPY-2033", "DPY-2049", "DPY-2056", "DPY-2057", "DPY-3015",
     "DPY-4000", "DPY-4001", "DPY-4017", "DPY-4018", "DPY-4019", "DPY-4021", "DPY-4026",
     "DPY-4027", "DPY-4028", "DPY-4030", "DPY-4032", "DPY-4034",
+    # Added by 26.0 and 26.1 to the codes above: an ANO (native encryption or integrity) service's
+    # status failure, raised by impl/thin/messages/network_services.pyx as the connect handshake
+    # negotiates, an InternalError like 5004 there; and a transaction priority the database does not
+    # support, raised by impl/thin/messages/auth.pyx when a connect parameter asks for one (also by
+    # setting it on a live connection, which mnemiq never does). The other codes they added are the
+    # caller's or a value's (the taxonomy test lists them), or OperationalErrors (6008 server
+    # verification, 6009 EZTLS refused).
+    "DPY-3043", "DPY-5016",
 })
 # The ORA codes a session cannot be had under, which a growing pool meets on acquire and no
 # statement causes: the call timeout (03156); the credentials and the account (01017 logon

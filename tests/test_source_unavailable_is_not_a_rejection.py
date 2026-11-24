@@ -186,11 +186,11 @@ def test_oracle_tells_its_network_faults_and_call_timeout_from_a_parse_refusal()
     # so a code the driver adds, renumbers or removes fails the equality: re-read the table, then
     # move both lists.
     refused_codes = spans((1003, 1007), (2000, 2017), (2019, 2023), (2025, 2032), (2034, 2048),
-                          (2050, 2055), (2058, 2075), (3000, 3007), (3009, 3010), (3012, 3014),
-                          (3016, 3041),
-                          (4002, 4004), (4006, 4010), (4012, 4016), (4036, 4041), (5011, 5013),
-                          (8000, 8002)) | {4022, 4025, 4029, 4031, 5007, 5015, 7000}
-    operational_codes = spans((6000, 6007))
+                          (2050, 2055), (2058, 2077), (3000, 3007), (3009, 3010), (3012, 3014),
+                          (3016, 3042),
+                          (4002, 4004), (4006, 4010), (4012, 4016), (4036, 4042), (5011, 5013),
+                          (8000, 8002)) | {3044, 4022, 4025, 4029, 4031, 5007, 5015, 7000}
+    operational_codes = spans((6000, 6009))
     unavailable_codes = {int(code.removeprefix("DPY-")) for code in _UNAVAILABLE_DPY}
     assert unavailable_codes.isdisjoint(refused_codes)
     assert unavailable_codes | operational_codes | refused_codes == set(errors.ERR_MESSAGE_FORMATS), (
@@ -225,11 +225,12 @@ def test_oracle_tells_its_network_faults_and_call_timeout_from_a_parse_refusal()
     # typing (Codex's second and third reviews of #159); the response parser's unknown message
     # type and piggyback opcode (DPY-5000, 5009) are InternalErrors (its fourth); the unsupported
     # in-band notification the read buffer disconnects on (DPY-3008) a NotSupportedError (its
-    # fifth).
-    named = [_dpy(n) for n in (1001, 1002, 2018, 2033, 2049, 2056, 2057, 3008, 3015, 4000, 4001,
-                               4005, 4011, 4017, 4018, 4019, 4021, 4024, 4026, 4027, 4028, 4030,
-                               4032, 4033, 4034, 4035, 5000, 5001, 5002, 5003, 5004, 5005, 5006,
-                               5009, 5010, 5014)]
+    # fifth). From python-oracledb 26: the connect handshake's ANO status failure (DPY-5016, an
+    # InternalError) and a transaction priority the database refuses at logon (DPY-3043).
+    named = [_dpy(n) for n in (1001, 1002, 2018, 2033, 2049, 2056, 2057, 3008, 3015, 3043, 4000,
+                               4001, 4005, 4011, 4017, 4018, 4019, 4021, 4024, 4026, 4027, 4028,
+                               4030, 4032, 4033, 4034, 4035, 5000, 5001, 5002, 5003, 5004, 5005,
+                               5006, 5009, 5010, 5014, 5016)]
     assert {str(exc)[:8] for exc in named} == _UNAVAILABLE_DPY
     unanswered = [*named, _dpy(6005),
                   ora(3113, "ORA-03113: end-of-file on communication channel"),
