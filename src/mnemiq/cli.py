@@ -20,7 +20,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="mnemiq", description="Open-source data-agent engine.")
     sub = p.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("enrich", help="profile + describe the source; save a snapshot")
+    e = sub.add_parser("enrich", help="profile + describe the source; save a snapshot")
+    e.add_argument("--add", action="store_true",
+                   help="enrich the manifest's tables and keep every other table the latest snapshot holds, reading the "
+                        "joins between them again; needs an earlier snapshot of the source")
     sub.add_parser("build", help="index the current snapshot for retrieval")
     sub.add_parser(
         "refresh", help="re-crawl the source; re-enrich + publish if the catalog changed"
@@ -401,7 +404,37 @@ def _enrichment_source(settings: Settings):
     return spec, EnrichDeadline(adapter_for(spec, settings, statement_timeout_s=limit), settings.enrich_statement_timeout_s)
 
 
-def _cmd_enrich(settings: Settings) -> int:
+def _kept_for_add(settings: Settings, spec):
+    """The source's latest snapshot for `enrich --add`, or why --add cannot run. Read before any table is: refused after
+    the run, its model calls would be spent for nothing."""
+    import dataclasses
+
+    from mnemiq.adapters.resolve import adapter_for
+    from mnemiq.store.bootstrap import init_store
+    from mnemiq.store.snapshot_store import current_version, load_snapshot
+
+    if settings.superset_mode:
+        return None, ("--add is not available in Superset mode: it reads the source again for the joins between "
+                      "subsets, and Superset mode opens no source connection of its own")
+    con = init_store(settings.store_path, local_only=settings.local_only)
+    try:
+        version = current_version(con, spec.id)
+        kept = load_snapshot(con, version) if version else None
+    finally:
+        con.close()
+    if kept is None:
+        return None, (f"source {spec.id!r}: --add needs an earlier snapshot to add to, and the store has none for "
+                      "it: run `mnemiq enrich` without --add first")
+    # The union's adapter would stop on a kept table the source no longer reports (`TablesNotFound`), after the run.
+    reported = {t.casefold() for t in adapter_for(dataclasses.replace(spec, tables=()), settings).introspect()}
+    gone = sorted(b.object_id for b in kept.source_bindings if b.object_id.casefold() not in reported)
+    if gone:
+        return None, (f"source {spec.id!r}: --add keeps every table the earlier snapshot holds, and the source no "
+                      f"longer reports {', '.join(gone)}: run without --add to enrich from scratch")
+    return kept, None
+
+
+def _cmd_enrich(settings: Settings, add: bool = False) -> int:
     from mnemiq.adapters.resolve import SourceUnconfigured, UnknownSourceKind
     from mnemiq.enrichment.enricher import LLMEnricher
     from mnemiq.enrichment.examples import LLMExampleGenerator, enrich_examples
@@ -423,6 +456,12 @@ def _cmd_enrich(settings: Settings) -> int:
     if getattr(adapter, "unbounded", False):
         print(f"WARNING: source {spec.id!r}: its adapter takes no statement time limit, so enrich reads it without "
               "one", file=sys.stderr)
+    kept = None
+    if add:
+        kept, refusal = _kept_for_add(settings, spec)
+        if refusal:
+            print(refusal, file=sys.stderr)
+            return 1
     # Superset mode reads the source as the service user, whose view of it is no one asking
     # person's: so it reads the catalogue and the counts and harvests no values. No code set, no
     # grounding from the source's labels, no binding probe and no value index, each of which
@@ -520,6 +559,13 @@ def _cmd_enrich(settings: Settings) -> int:
         # store key is snap.version). code_scheme carries only the scheme id/label, so the columns
         # alone would not reflect it.
         snap = snap.model_copy(update={"ontology_version": _onto.version})
+    if kept is not None and kept.ontology_version != snap.ontology_version:
+        # Before grounding reads values and before any model call. The kept tables' code bindings were made under the
+        # earlier ontology, and a merged snapshot carries one ontology version for every table.
+        print(f"source {spec.id!r}: --add keeps the earlier tables' code bindings, made under ontology version "
+              f"{kept.ontology_version or '(none)'}, and this run's is {snap.ontology_version or '(none)'}: run "
+              "without --add so every table is bound under one", file=sys.stderr)
+        return 1
 
     # precedence: ontology < correlated < lookup < certified < dictionary
     if not superset:
@@ -563,10 +609,52 @@ def _cmd_enrich(settings: Settings) -> int:
             snap, LLMExampleGenerator(LLMClient(settings)), adapter, dialect=adapter.dialect,
             guard_fanout=settings.guard_fanout,
         )
-    from mnemiq.enrichment.deadline import time_limit_job, time_limit_warning
+    from mnemiq.enrichment.deadline import EnrichDeadline, time_limit_job, time_limit_warning
+
+    union = union_for_views = None
+    if kept is not None:
+        # --add: the run's tables replace their entries in the latest snapshot, every other table keeps its own. The
+        # joins are read again over all of them through an adapter scoped to the union, built as the run's is (its
+        # reads under the statement time limit): the run's own sees only its subset, and its scoped view keeps only
+        # keys with both ends in it. Views are discovered again the way the run discovers them.
+        from mnemiq.adapters.resolve import adapter_for
+        from mnemiq.enrichment.accumulate import (
+            ground_across_subsets, merge_run, reapply_overlays, union_relationships, union_spec, union_views,
+            views_spec,
+        )
+
+        snap, kept_failed = merge_run(kept, snap)
+        interim = {r.id for r in snap.relationships}  # the joins some single run already saw and grounded
+        for table in kept_failed:
+            print(f"WARNING: source {spec.id!r}: {table} is kept from the earlier run: its profile failed in this one",
+                  file=sys.stderr)
+        def scoped(view_of):
+            return EnrichDeadline(adapter_for(view_of, settings,
+                                              statement_timeout_s=settings.enrich_statement_timeout_s or None),
+                                  settings.enrich_statement_timeout_s)
+
+        union = scoped(union_spec(spec, snap))
+        relationships, join_job = union_relationships(union, snap, harvest_values=not superset)
+        # Views too: the view floor reads `discover:views`, and the run discovered views only within its subset.
+        union_for_views = scoped(views_spec(spec, kept, snap))
+        views, views_job = union_views(union_for_views, kept, snap)
+        snap = snap.model_copy(update={"relationships": relationships, "views": views,
+                                       "jobs": [*(j for j in snap.jobs if j.id not in (join_job.id, views_job.id)),
+                                                join_job, views_job]})
+        # Lookup grounding reads a code's meaning across a join, and no single run saw a join between subsets: those
+        # joins only are grounded, once, and key columns lose what a run harvested without seeing their key.
+        snap = ground_across_subsets(union, snap, [r for r in relationships if r.id not in interim])
+        # The certified set and the dictionary reached only the run's subset; laid again over every table, after the
+        # join pass so the certified joins it dropped come back.
+        snap = reapply_overlays(snap, _certified_set, _dict)
+        snap.version = content_version(snap)
 
     # What the statement time limit cut before the save, on the snapshot; the closing warning names the value index's too.
-    if (cut := time_limit_job(adapter, snap.source_id)) is not None:
+    # Under --add the union's reads are cut by the same limit, and one job names both.
+    cuts = [c for c in (time_limit_job(a, snap.source_id) for a in (adapter, union, union_for_views) if a is not None)
+            if c is not None]
+    if cuts:
+        cut = cuts[0].model_copy(update={"detail": "; ".join(c.detail for c in cuts if c.detail) or None})
         snap = snap.model_copy(update={"jobs": [*snap.jobs, cut]})
     con = init_store(settings.store_path, local_only=settings.local_only)
     save_snapshot(con, snap)
@@ -635,6 +723,9 @@ def _cmd_enrich(settings: Settings) -> int:
 
     if warning := partition_warning(snap):
         print(warning, file=sys.stderr)
+    for extra in (union, union_for_views):
+        if extra is not None and (extra_warning := time_limit_warning(extra, snap.source_id)):
+            print(extra_warning, file=sys.stderr)
     if warning := time_limit_warning(adapter, snap.source_id):
         print(warning, file=sys.stderr)
     return 0
@@ -937,7 +1028,7 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
     if args.command == "enrich":
-        return _cmd_enrich(settings)
+        return _cmd_enrich(settings, add=args.add)
     if args.command == "build":
         return _cmd_build(settings)
     if args.command == "refresh":
