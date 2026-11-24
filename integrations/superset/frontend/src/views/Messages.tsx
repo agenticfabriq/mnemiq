@@ -16,6 +16,8 @@ import { pageAppRoot } from "../page";
 import { DISPOSITION_LABEL, REASONS, type Cell, type DeferralReason, type Disposition, type Turn } from "../shared";
 import { confirmInPanel, declineInPanel } from "../talk";
 import { AnswerCard } from "./AnswerCard";
+import { reloadKeeping } from "../reload";
+import { getSnapshot } from "../store";
 
 const dashboardUrl = (id: number) => `${pageAppRoot()}/dashboard/${id}/`;
 
@@ -313,7 +315,7 @@ function Preview({ api, message, preview, onScreenId, muted, busy, pageNow }:
           {outcome?.removed?.length ? <span>Deleted: {outcome.removed.map(titled).join(", ")}.</span> : null}
           {(outcome?.left ?? []).map((left) => <span key={`l${left.chart_id}`}>{titled(left.chart_id)} left as it is: {left.reason}.</span>)}
           {(state === "done" || state === "partial") && here ? (
-            <Button size="small" style={{ alignSelf: "flex-start" }} onClick={() => window.location.reload()}>
+            <Button size="small" style={{ alignSelf: "flex-start" }} onClick={() => reloadKeeping(getSnapshot().conversationId)}>
               Reload to see the changes
             </Button>
           ) : null}

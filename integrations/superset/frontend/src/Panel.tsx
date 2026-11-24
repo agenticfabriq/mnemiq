@@ -6,8 +6,9 @@ import { driver } from "./build";
 import type { Choose, Page } from "./conversation";
 import { dashboardRefOf, pageAppRoot, resolveDashboard, usePageContext } from "./page";
 import { probe, type Readiness } from "./readiness";
+import { takeReloaded } from "./reload";
 import { getSnapshot, subscribe } from "./store";
-import { sendInPanel } from "./talk";
+import { reopenConversation, sendInPanel } from "./talk";
 import { BuildCard } from "./views/BuildCard";
 import { Composer } from "./views/Composer";
 import { Conversation } from "./views/Conversation";
@@ -103,6 +104,12 @@ function Ready({ api, starters }: { api: PanelApi; starters: string[] }) {
     useSyncExternalStore(subscribe, getSnapshot);
   const { token } = theme.useToken();
   useEffect(() => driver.attach(api), [api]);
+  // After the panel's own Reload: the conversation it was in, reopened from mnemiq. The fragment is read at the first
+  // opening after the reload, before anything can be on screen.
+  useEffect(() => {
+    const reopened = takeReloaded();
+    if (reopened !== null) void reopenConversation(api, reopened);
+  }, [api]);
   const onScreen = dashboard?.readable && dashboard.id !== null ? dashboard : null;
   // Accepted only when the screen is free, and held from that moment, before the page is looked up.
   const send = (text: string, choose?: Choose) => sendInPanel(api, text, pageNow, choose);

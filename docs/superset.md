@@ -514,6 +514,10 @@ mnemiq's address.
 - **What it keeps: nothing of its own.** mnemiq keeps the conversations; the panel holds what is on screen, and a
   running build, in the page's memory for its life. A reopened answer's rows and a measure's value live only in their
   open card or section. Nothing is written to browser storage.
+- **Reload to see the changes.** A finished build or change offers it, so Superset draws what was written. It carries
+  the conversation on screen to the reloaded page in the address's fragment (`#mnemiq-conversation=<id>`, which the
+  browser never sends to a server), and the panel reopens that conversation from mnemiq when it next opens, then
+  clears the fragment. A reload of the browser's own starts the panel empty, as before.
 
 The forwarder is configured in Superset's `superset_config.py`, beside the token settings the extension's README lists
 (it mints each request's token with them):

@@ -72,6 +72,8 @@ signed in.
   description of what it should show. A dashboard that already covers the goal is offered first.
 - **Change** the dashboard on screen: mnemiq shows each chart's edit, and writes nothing until Apply, which writes
   exactly what it showed. Build it and Apply are offered only on the dashboard they are for.
+- **Reload to see the changes**, once a build or a change is done, reloads the page and reopens the conversation it
+  was in.
 - **Finish** a build that stopped: closing the panel does not stop one, but leaving or reloading the page stops it
   after the step in flight, and the panel offers to finish it.
 - A person Superset will not let build sees only the sentence that says which roles building needs.
