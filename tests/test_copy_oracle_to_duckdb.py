@@ -525,6 +525,18 @@ def test_a_composite_keys_declared_order_survives_the_copy(deployment):
         [r.id for r in relationships_from_foreign_keys(oracle, catalog)] == ["LINES.ZONE+AREA->STORE"]
 
 
+def test_a_key_write_that_fails_part_way_leaves_the_previous_key_set_whole(tmp_path):
+    # Half of a composite key reads as a valid one-column join. DuckDB's executemany keeps the rows before a failing
+    # one (measured), so without one transaction a failure on the second pair published the first alone.
+    duck = duckdb.connect(str(tmp_path / "k.duckdb"))
+    before = [("LINES", "ZONE", "STORE", "ZONE", "FK_STORE", 1), ("LINES", "AREA", "STORE", "AREA", "FK_STORE", 2)]
+    copy._write_keys(duck, before)
+    after = [("LINES", "ZONE", "SITE", "ZONE", "FK_SITE", 1), ("LINES", "AREA", "SITE", "AREA", "FK_SITE", "second")]
+    with pytest.raises(duckdb.ConversionException):
+        copy._write_keys(duck, after)
+    assert duck.execute("SELECT * FROM mnemiq.declared_keys ORDER BY position").fetchall() == before
+
+
 def test_keys_are_read_with_their_position(deployment):
     fake = _shop()
     deployment(fake)

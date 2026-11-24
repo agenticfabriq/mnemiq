@@ -409,11 +409,21 @@ def _duck_columns(duck, table: str) -> set[str]:
 
 
 def _write_keys(duck, rows: list[KeyRow]) -> None:
-    duck.execute(f"CREATE SCHEMA IF NOT EXISTS {KEYS_SCHEMA}")
-    duck.execute(f"CREATE OR REPLACE TABLE {KEYS_SCHEMA}.{KEYS_TABLE} (from_table VARCHAR, from_column VARCHAR, "
-                 "to_table VARCHAR, to_column VARCHAR, constraint_name VARCHAR, position INTEGER)")
-    if rows:
-        duck.executemany(f"INSERT INTO {KEYS_SCHEMA}.{KEYS_TABLE} VALUES (?, ?, ?, ?, ?, ?)", rows)
+    """Replace the file's declared keys with `rows`, all or nothing: half of a composite key would read as a valid
+    one-column join, and DuckDB's `executemany` keeps the rows before a failing one, so the replace and every insert
+    are one transaction, and a failure leaves the previous key set as it was."""
+    duck.execute("BEGIN TRANSACTION")
+    try:
+        duck.execute(f"CREATE SCHEMA IF NOT EXISTS {KEYS_SCHEMA}")
+        duck.execute(f"CREATE OR REPLACE TABLE {KEYS_SCHEMA}.{KEYS_TABLE} (from_table VARCHAR, from_column VARCHAR, "
+                     "to_table VARCHAR, to_column VARCHAR, constraint_name VARCHAR, position INTEGER)")
+        if rows:
+            duck.executemany(f"INSERT INTO {KEYS_SCHEMA}.{KEYS_TABLE} VALUES (?, ?, ?, ?, ?, ?)", rows)
+        duck.execute("COMMIT")
+    except BaseException:
+        with contextlib.suppress(Exception):
+            duck.execute("ROLLBACK")
+        raise
 
 
 def _copy(conn, spec: SourceSpec, args, out: str, *, local_only: bool, source: CopySource, state: _FileState) -> int:
