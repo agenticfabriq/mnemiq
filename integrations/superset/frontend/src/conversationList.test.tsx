@@ -7,6 +7,7 @@ import { resetBuilds } from "./build";
 import type { Message } from "./conversation";
 import { REASONS } from "./shared";
 import { getSnapshot, resetStore } from "./store";
+import { page } from "./reload";
 import { resetTalk } from "./talk";
 import { resetDismissed } from "./views/Unfinished";
 
@@ -554,6 +555,56 @@ describe("conversations kept apart, and confirms sent from where the person is",
     const came = within(after).getByRole("region", { name: "What came of it" });
     expect(within(came).getByText("Changed: Sales.")).toBeTruthy();
     expect(within(came).getByText(/Pie left as it is: Superset stopped answering before this was done/)).toBeTruthy();
+  });
+
+  it("the panel's Reload keeps the conversation it was in, and the reloaded page reopens it", async () => {
+    // "Reload to see the changes" reloads the page to show what a build or a change wrote; the conversation it was in
+    // comes back with it, carried in the URL's fragment (never sent to the server, never browser storage) and read
+    // once: a reload of the browser's own starts empty, as before.
+    const { kept } = mnemiq(() => [], { 7: { title: "Sales", charts: ["a"] } });
+    kept[OTHER] = [{ index: 0, role: "person", kind: "change", text: "bookings as bars" },
+      { index: 1, role: "mnemiq", kind: "change", text: "To change: Bookings: line to bar.", replies_to: 0,
+        proposal: { dashboard_id: 7, dashboard_changed_on: "t", edits: [{ chart_id: 12, title: "Bookings",
+          changed_on: "t", said: "Bookings: line to bar", digest: "d" }], would_remove: [], add_chart: false, left: [],
+          dropped: [], not_editor: [], message: "m", reason: null }, outcome: { state: "done", changed: [12] } } as Message];
+    const reload = vi.spyOn(page, "reload").mockImplementation(() => {});
+    onDashboard(7);
+    await opened();
+    await openListed("bookings as bars");
+    const came = within(screen.getByRole("region", { name: "Preview" })).getByRole("region", { name: "What came of it" });
+    fireEvent.click(within(came).getByRole("button", { name: "Reload to see the changes" }));
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(window.location.hash).toBe(`#mnemiq-conversation=${OTHER}`);
+    expect(window.location.pathname).toBe("/dashboard/7/");
+    // The reload: the page's memory gone, the URL kept.
+    cleanup();
+    resetStore();
+    resetTalk();
+    await opened();
+    await screen.findByText("bookings as bars");
+    expect(getSnapshot().conversationId).toBe(OTHER);
+    expect(window.location.hash).toBe("");
+    expect(window.location.pathname).toBe("/dashboard/7/");
+    // Read once: the next opening of the panel starts as the page does.
+    cleanup();
+    resetStore();
+    resetTalk();
+    await opened();
+    expect(screen.queryByText("bookings as bars")).toBeNull();
+  });
+
+  it("a reloaded page's fragment that names no conversation of this person opens nothing and is cleared", async () => {
+    const { calls } = mnemiq(() => []);
+    history.replaceState(null, "", "/superset/welcome/#mnemiq-conversation=not%20an%20id");
+    await opened();
+    expect(window.location.hash).toBe("");
+    expect(getSnapshot().conversationId).toBeNull();
+    expect(getSnapshot().notice).toBeNull();
+    expect(calls.filter((c) => c.path.startsWith("/superset/conversations/"))).toEqual([]);
+    cleanup();
+    history.replaceState(null, "", "/superset/welcome/#CHART-abc");
+    await opened();
+    expect(window.location.hash).toBe("#CHART-abc");
   });
 
   it("a conversation is deleted from the list, and the screen cleared when it was on it", async () => {

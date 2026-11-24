@@ -5,6 +5,7 @@ import { host } from "./test/core";
 import { PanelApi } from "./api";
 import { BuildDriver, CHECK_WORDS, driver, resetBuilds, type BuildView, type PlanSummary } from "./build";
 import { BuildCard } from "./views/BuildCard";
+import { page } from "./reload";
 import { getSnapshot, resetStore, update } from "./store";
 import { resetTalk } from "./talk";
 import { resetDismissed } from "./views/Unfinished";
@@ -258,7 +259,13 @@ describe("finishing and the page", () => {
     fireEvent.click(within(banner).getByRole("button", { name: "Finish" }));
     await vi.waitFor(() => expect(getSnapshot().build?.view?.status).toBe("done"));
     expect(nexts(calls)).toHaveLength(3);
-    expect(await screen.findByRole("button", { name: "Reload to see the changes" })).toBeTruthy();
+    const reload = vi.spyOn(page, "reload").mockImplementation(() => {});
+    // The build's Reload keeps the conversation on screen for the reloaded page's panel (`reload.ts`).
+    update((state) => ({ ...state, conversationId: "1a2b3c4d-0000-4000-8000-000000000003" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Reload to see the changes" }));
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(window.location.hash).toBe("#mnemiq-conversation=1a2b3c4d-0000-4000-8000-000000000003");
+    expect(window.location.pathname).toBe("/dashboard/7/");
   });
 
   it("closing the panel does not stop a running build", async () => {

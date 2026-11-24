@@ -3,6 +3,7 @@ import { Alert, Button, Spin, Typography, theme } from "antd";
 import { CHECK_WORDS, driver, type BuildRecord, type BuildView, type StepView } from "../build";
 import { pageAppRoot } from "../page";
 import { getSnapshot, subscribe } from "../store";
+import { reloadKeeping } from "../reload";
 
 const STEP_WORDS: Record<string, string> = { pending: "to do", done: "done", failed: "stopped",
   uncertain: "not sure it was made" };
@@ -135,7 +136,7 @@ function Progress({ view, muted, onScreenId }: { view: BuildView; muted: CSSProp
       {view.message ? <span>{view.message}</span> : null}
       {view.status === "done" && view.dashboard_id !== null ? (
         view.dashboard_id === onScreenId ? (
-          <Button size="small" onClick={() => window.location.reload()}>Reload to see the changes</Button>
+          <Button size="small" onClick={() => reloadKeeping(getSnapshot().conversationId)}>Reload to see the changes</Button>
         ) : (
           <a href={dashboardUrl(view.dashboard_id)}>Open the dashboard</a>
         )
