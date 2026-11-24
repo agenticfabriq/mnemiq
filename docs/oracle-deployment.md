@@ -420,10 +420,11 @@ enriched with new tables beside old keys.
   database's grants, auditing and row policies. Keep it where you would keep an export.
 - **The store is as current as the copy,** and covers only the tables in it. Refreshing means
   copying again (`--replace`) and enriching again.
-- **Types are DuckDB's.** A `NUMBER(p, 0)` of at most 18 digits arrives as `BIGINT`; every other
-  `NUMBER` (with a scale, more digits, or no precision) as `DOUBLE`, so digits past about 15
-  significant ones are lost on the copy (python-oracledb 4.0.2's exact decimal fetch returned
-  malformed batches, so it is not used). `DATE` and `TIMESTAMP` arrive as `TIMESTAMP`, `CLOB` and
+- **Types are DuckDB's.** A `NUMBER` whose declaration bounds its values arrives exactly: with no
+  scale and at most 18 digits as `BIGINT`, otherwise as `DECIMAL(p, s)`, up to 38 digits. A
+  `NUMBER` declared with no precision or scale, a `FLOAT`, or one past 38 digits arrives as
+  `DOUBLE`, so digits past about 15 significant ones are lost on the copy: no fixed decimal type
+  holds every value such a column can. `DATE` and `TIMESTAMP` arrive as `TIMESTAMP`, `CLOB` and
   `BLOB` as `VARCHAR` and `BLOB`, each value under 1 GB. The cards show these types, and the profile
   reads values as the copy holds them, but answering on Oracle runs against Oracle's own.
 - **Names DuckDB cannot keep apart are refused.** DuckDB matches names without regard to case, so

@@ -31,12 +31,14 @@ What it does, in order:
 - **Writes the copy's source entry** to `<out>.source.json` (`kind: duckdb`, the Oracle source's `id` and `catalog`,
   `schema: main`, the tables) and prints the steps that follow.
 
-Types are python-oracledb's own mapping: a `NUMBER(p, 0)` with `p` at most 18 lands as BIGINT, exact; every other
-`NUMBER` (a scale, a precision past 18, or none declared) as DOUBLE, so digits past about 15 significant ones are lost.
-Its exact decimal fetch is not used: on python-oracledb 4.0.2 it returned a decimal column one value short in later
-batches of a large table (measured), and each batch is checked with Arrow's own validation, so a malformed one stops
-the copy rather than land. `DATE` and `TIMESTAMP` land as TIMESTAMP; CLOB and BLOB values as VARCHAR and BLOB (each
-under 1 GB: the DataFrame fetch reads a LOB's value whole, whatever `oracledb.defaults.fetch_lobs` says, measured).
+A `NUMBER` whose declaration bounds its values lands exactly (`number_type`): with no scale and at most 18 digits as
+BIGINT, otherwise as DECIMAL(p, s), up to DuckDB's widest, 38 digits. A `NUMBER` with no precision or scale declared,
+a `FLOAT`, or one past 38 digits keeps python-oracledb's own mapping, DOUBLE, so digits past about 15 significant ones
+are lost. Each column's type is read from `ALL_TAB_COLUMNS` and requested of the driver by name; its decimal mapping
+for the whole table is not used, as it fails the fetch on a `FLOAT` or a negative scale (measured on 26.1). Each batch
+is checked with Arrow's own validation, so a malformed one stops the copy rather than land. `DATE` and `TIMESTAMP` land
+as TIMESTAMP; CLOB and BLOB values as VARCHAR and BLOB (each under 1 GB: the DataFrame fetch reads a LOB's value whole,
+whatever `oracledb.defaults.fetch_lobs` says, measured).
 """
 from __future__ import annotations
 
@@ -66,6 +68,8 @@ COMPLETED_TABLE = "copied_tables"
 _TABLES = "SELECT table_name, num_rows, avg_row_len FROM all_tables WHERE owner = :owner ORDER BY table_name"
 _COLUMNS = ("SELECT table_name, column_name FROM all_tab_columns WHERE owner = :owner "
             "ORDER BY table_name, column_id")
+_DECLARED = ("SELECT column_name, data_type, data_precision, data_scale FROM all_tab_columns "
+             "WHERE owner = :owner AND table_name = :table")
 _TABLE_COMMENTS = "SELECT table_name, comments FROM all_tab_comments WHERE owner = :owner AND comments IS NOT NULL"
 _COLUMN_COMMENTS = ("SELECT table_name, column_name, comments FROM all_col_comments "
                     "WHERE owner = :owner AND comments IS NOT NULL")
@@ -225,10 +229,42 @@ def _read_only(conn):
         conn.rollback()
 
 
+def number_type(data_type: str, precision: int | None, scale: int | None) -> pa.DataType | None:
+    """The Arrow type that holds, exactly, every value an Oracle column of this declaration can; None where no fixed
+    type does and the driver's own mapping stands (a NUMBER with nothing declared, a FLOAT, past 38 digits).
+
+    A scale of 0 or less allows only integers, of up to `precision - scale` digits: int64 to 18, else a decimal of no
+    scale. A positive scale gets a decimal of that scale, as wide as the precision, or as the scale where that is wider
+    (NUMBER(3, 5) holds 0.00123). `NUMBER(*, s)`, listed with no precision, has 38. Never an integer type for a column
+    that can hold a fraction: the driver truncates one into it without a word (measured), where a decimal too narrow
+    for a value fails the fetch (DPY-4042)."""
+    if data_type != "NUMBER" or scale is None:
+        return None
+    digits = 38 if precision is None else precision
+    if scale <= 0:
+        width = digits - scale
+        if width <= 18:
+            return pa.int64()
+        return pa.decimal128(width, 0) if width <= 38 else None
+    width = max(digits, scale)
+    return pa.decimal128(width, scale) if width <= 38 else None
+
+
+def _requested(fetched: pa.Schema, declared: dict[str, tuple]) -> pa.Schema:
+    """The fetch's own schema with each column `number_type` gives a type for set to it: the driver matches a requested
+    schema by position (measured: a reversed one fails), so the order is the fetch's, never the dictionary's."""
+    fields = []
+    for field in fetched:
+        kind = number_type(*declared[field.name]) if field.name in declared else None
+        fields.append(field if kind is None else field.with_type(kind))
+    return pa.schema(fields)
+
+
 def _whole(batch, table: str, number: int) -> pa.Table:
     """The driver's batch as an Arrow table, refused unless Arrow's own validation passes. `pa.table` imports a
-    DataFrame through the C data interface without checking it, and python-oracledb 4.0.2 has handed over a batch with
-    one column a value short (its decimal fetch, measured): stored, it would be a table whose rows no longer line up."""
+    DataFrame through the C data interface without checking it, and python-oracledb before 26.0.1 handed over a batch
+    with one column a value short (its decimal fetch, measured): stored, it would be a table whose rows no longer line
+    up. The pin's floor is past that release; the check stays, so a driver that does it again stops the copy."""
     data = pa.table(batch)
     try:
         data.validate()
@@ -271,8 +307,8 @@ def copy_table(conn, duck, owner: str, table: str, batch_rows: int) -> int:
     stops mid-table, by an error or by the process dying, leaves no trace of the table and keeps the one it was
     replacing: DuckDB 1.5.4 discards an uncommitted transaction on restart, measured with 231 MB already written to the
     file when the process was killed. The table's row in `mnemiq.copied_tables` is written in the same transaction,
-    so a resume skips a table only when it was copied whole. A table with no rows is created from `SELECT * ... WHERE
-    1 = 0`, so it keeps its columns."""
+    so a resume skips a table only when it was copied whole. The columns and their order come from `SELECT * ... WHERE
+    1 = 0`, so a table with no rows keeps its columns, with the types its rows would have had."""
     select = f"SELECT * FROM {_quoted(owner)}.{_quoted(table)}"
     rows = 0
     created = False
@@ -280,15 +316,20 @@ def copy_table(conn, duck, owner: str, table: str, batch_rows: int) -> int:
     try:
         duck.execute(f"DROP TABLE IF EXISTS main.{_quoted(table)}")
         with _read_only(conn):
-            # `fetch_decimals` named, so a changed `oracledb.defaults` cannot turn the short-batch decimal fetch on.
-            for number, batch in enumerate(conn.fetch_df_batches(select, size=batch_rows, fetch_decimals=False), 1):
+            declared = {name: (kind, precision, scale)
+                        for name, kind, precision, scale in _rows(conn, _DECLARED, owner=owner, table=table)}
+            # `fetch_decimals` named, whatever `oracledb.defaults` says: on, it fails the whole fetch on a FLOAT or a
+            # negative scale (DPY-4042, measured), so exact types are requested column by column instead.
+            fetched = _whole(conn.fetch_df_all(f"{select} WHERE 1 = 0", fetch_decimals=False), table, 0).schema
+            requested = _requested(fetched, declared)
+            for number, batch in enumerate(conn.fetch_df_batches(select, size=batch_rows, fetch_decimals=False,
+                                                                 requested_schema=requested), 1):
                 data = _for_duckdb(_whole(batch, table, number))
                 _append(duck, table, data, create=not created)
                 created = True
                 rows += data.num_rows
             if not created:
-                empty = conn.fetch_df_all(f"{select} WHERE 1 = 0", fetch_decimals=False)
-                _append(duck, table, _for_duckdb(_whole(empty, table, 1)), create=True)
+                _append(duck, table, _for_duckdb(requested.empty_table()), create=True)
         # Recorded in the same transaction, so a table is recorded complete exactly when it is in the file whole.
         duck.execute(f"CREATE SCHEMA IF NOT EXISTS {KEYS_SCHEMA}")
         duck.execute(f"CREATE TABLE IF NOT EXISTS {KEYS_SCHEMA}.{COMPLETED_TABLE} "
