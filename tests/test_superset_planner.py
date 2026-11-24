@@ -25,6 +25,7 @@ from mnemiq.sql.fanout_check import PARTITIONS_JOB
 from mnemiq.superset import build_store
 from mnemiq.superset.adapter import SupersetSqlAdapter
 from mnemiq.superset.chart_form import _GRAINS
+from mnemiq.superset.client import SupersetToolError
 from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenRef
 from mnemiq.superset.extension import TOOL_PREFIX
 from mnemiq.superset.measures import Measure, MeasureKind, scales_by_100
@@ -141,7 +142,7 @@ def _value_answer(sql: str, held: dict | None) -> dict | None:
 
 
 def _tools(*, metrics=None, extension=None, dashboards=(), execute=None, datasets=None, held=None,
-           nulls=frozenset()) -> Tools:
+           nulls=frozenset(), infos=None) -> Tools:
     """policy is dataset 1 and claim dataset 2; agent has none, and a virtual dataset over policy is never a table's.
     `held` gives the values each `(table, column)` holds, for the plan check's probes of a filter's values; without
     it, every value probed is found. `nulls` holds each `(table, column)` that holds NULL; no other does."""
@@ -158,6 +159,11 @@ def _tools(*, metrics=None, extension=None, dashboards=(), execute=None, dataset
     def dataset_metrics(request):
         return {"datasets": [{"dataset_id": i, "metrics": extension.get(i, [])} for i in request["dataset_ids"]]}
 
+    def dataset_info(request):
+        # As Superset answers the builder: a dataset it reads, else an error.
+        found = (infos or {}).get(request["identifier"])
+        return dict(found) if found is not None else SupersetToolError("no dataset of that id for this user")
+
     def list_dashboards(request):
         word = request["search"].casefold()
         return {"dashboards": [dict(item) for item in dashboards if word in item["dashboard_title"].casefold()],
@@ -168,6 +174,7 @@ def _tools(*, metrics=None, extension=None, dashboards=(), execute=None, dataset
         "list_metrics": list_metrics,
         TOOL_PREFIX + "dataset_metrics": dataset_metrics,
         "list_dashboards": list_dashboards,
+        "get_dataset_info": dataset_info,
         "execute_sql": lambda request: (_null_answer(request["sql"], nulls) or _value_answer(request["sql"], held)
                                         or (execute or (lambda _: EMPTY))(request)),
     })
@@ -406,6 +413,126 @@ def test_two_written_measures_with_one_label_are_refused():
     assert "measure 'premium_avg'" in _parts(refused)
     assert "label" in _parts(refused)["measure 'premium_avg'"]
     assert "measure 'total_premium'" not in _parts(refused)
+
+
+# A dashboard keeps each measure on one dataset: a build onto it that makes a dataset of its own makes the same formula
+# a measure of its own, which needs a name and a label the dashboard does not keep.
+ELSEWHERE = 53  # a dataset mnemiq made for the dashboard, which is no table's of the catalogue
+
+
+# Superset's answer for dataset ELSEWHERE as a dataset mnemiq made over a join of two tables the builder reads.
+READABLE_JOIN = {"id": ELSEWHERE, "table_name": "dataset_1 b1", "schema": "public", "database_id": 7, "is_virtual": True,
+                 "sql": "SELECT p.premium, p.region FROM policy AS p JOIN claim AS c ON c.policy_id = p.policy_id",
+                 "metrics": []}
+
+
+def _one_bar(measure: Measure) -> BuildPlan:
+    return _valid_plan(measures=(measure,), charts=(_chart("by_region", Family.BAR, [WrittenRef(measure)],
+                                                           dims=["region"]),))
+
+
+def test_a_measure_named_as_one_the_dashboard_keeps_elsewhere_goes_back_for_a_name_of_its_own():
+    """The dashboard keeps `total_premium` (SUM(premium)) on a dataset of its own; the plan writes the same formula on
+    the policy table. The plan's measure is refused, repairable, in words that say the dashboard keeps that name; the
+    renamed plan passes. Before, the plan passed and its build stopped at its first step on `measure_conflict`."""
+    kept = dataclasses.replace(PREMIUM, dataset_id=ELSEWHERE)
+    renamed = _measure("premium_on_policy", "Premium")
+    planner = FakePlanner([_one_bar(PREMIUM), _one_bar(renamed)])
+    assert _plan(GOAL, planner, _tools(), kept=(kept,)) == _one_bar(renamed)
+    [part] = planner.contexts[1].repair.refused
+    assert part.part == "measure 'total_premium'" and part.repairable, part
+    assert "this dashboard keeps" in part.reason and "name" in part.reason, part
+    # The kept measure's dataset is no table this builder can see: its definition is not said.
+    assert "SUM(premium)" not in part.reason and "premium" not in part.reason.replace("total_premium", ""), part
+    refused = _plan(GOAL, FakePlanner(_one_bar(PREMIUM)), _tools(), kept=(kept,))
+    assert isinstance(refused, PlanRefused) and "this dashboard keeps" in _parts(refused)["measure 'total_premium'"]
+
+
+def test_a_measure_labelled_as_one_the_dashboard_keeps_is_refused():
+    """A label is a dashboard's too: Superset keys a chart's values by label, and the panel's Edit holds every label
+    of a dashboard's measures apart, so a new name with a kept label is refused as well, whatever its dataset."""
+    kept = dataclasses.replace(PREMIUM, name="premium_kept", dataset_id=ELSEWHERE)
+    refused = _plan(GOAL, FakePlanner(_one_bar(PREMIUM)), _tools(), kept=(kept,))
+    assert isinstance(refused, PlanRefused), refused
+    reason = _parts(refused)["measure 'total_premium'"]
+    assert "this dashboard keeps" in reason and "label" in reason, reason
+    on_policy = dataclasses.replace(kept, dataset_id=1)
+    refused = _plan(GOAL, FakePlanner(_one_bar(PREMIUM)), _tools(), kept=(on_policy,))
+    assert isinstance(refused, PlanRefused) and "label" in _parts(refused)["measure 'total_premium'"]
+
+
+def test_a_kept_measure_on_a_dataset_the_builder_cannot_read_reaches_the_model_in_no_part():
+    """The measures a dashboard keeps are the store's, read for the dashboard, not for the builder: one on a dataset
+    Superset does not answer the builder for, or over a table the builder's grants leave out, or on another database,
+    reaches the model in no part (name, label, kind or definition), and a planned measure that meets its name or label
+    is refused in words that repeat neither."""
+    secret = _measure("secret_margin", "Secret Margin", "SUM(salary)", dataset_id=ELSEWHERE)
+    # As Superset answers each to the builder: payroll is no table the builder's grants hold, read plainly, through a
+    # CTE of its own name, through an upper-case CTE that the unquoted name passes by, and inside a string a function
+    # runs as SQL; and a dataset on another database.
+    payroll = {54: "SELECT salary FROM payroll",
+               56: "WITH payroll AS (SELECT * FROM payroll) SELECT salary FROM payroll",
+               57: 'WITH "PAYROLL" AS (SELECT premium AS salary FROM policy) SELECT salary FROM PAYROLL',
+               58: "SELECT query_to_xml('SELECT * FROM payroll', true, false, '') AS salary FROM policy"}
+    infos = {i: dict(READABLE_JOIN, id=i, sql=sql) for i, sql in payroll.items()}
+    infos[55] = dict(READABLE_JOIN, id=55, database_id=8)  # read whole, were it on this database
+    hidden = (secret, *(dataclasses.replace(secret, dataset_id=i, name=f"secret_{i}", label=f"Secret {i}")
+                        for i in payroll),
+              dataclasses.replace(secret, dataset_id=55, name="secret_55", label="Secret 55", expression="SUM(premium)"),
+              # On policy's own dataset, which the builder reads, but reading payroll itself: made by a builder with
+              # wider grants.
+              dataclasses.replace(secret, dataset_id=1, name="secret_sub", label="Secret Sub",
+                                  expression="SUM((SELECT MAX(salary) FROM payroll))"))
+    tools = _tools(infos=infos)
+    told = FakePlanner(_one_bar(PREMIUM))
+    assert _plan(GOAL, told, tools, kept=hidden) == _one_bar(PREMIUM)
+    user = plan_prompt(GOAL, told.contexts[0])[1]
+    assert "keeps" not in user and all(word not in user for word in ("secret", "Secret", "salary")), user
+
+    by_name = dataclasses.replace(secret, name="total_premium")
+    refused = _plan(GOAL, FakePlanner(_one_bar(PREMIUM)), _tools(), kept=(by_name,))
+    reason = _parts(refused)["measure 'total_premium'"]
+    assert "this dashboard keeps" in reason and "Secret" not in reason and "salary" not in reason, reason
+    by_label = dataclasses.replace(secret, label="Total premium")
+    refused = _plan(GOAL, FakePlanner(_one_bar(PREMIUM)), _tools(), kept=(by_label,))
+    reason = _parts(refused)["measure 'total_premium'"]
+    assert "this dashboard keeps" in reason and "label" in reason and "secret" not in reason, reason
+
+
+def test_the_measure_the_dashboard_keeps_is_planned_again_as_it_is():
+    """The same measure (its name, its kind, its dataset, its expression once normalized) is the one the dashboard
+    keeps, which the build adds the new charts to: it passes, as its build merges it."""
+    kept = dataclasses.replace(PREMIUM, expression="sum( premium )")
+    assert _plan(GOAL, FakePlanner(_one_bar(PREMIUM)), _tools(), kept=(kept,)) == _one_bar(PREMIUM)
+
+
+def test_a_kept_name_on_the_same_dataset_with_another_expression_is_refused():
+    kept = dataclasses.replace(PREMIUM, expression="AVG(premium)")
+    refused = _plan(GOAL, FakePlanner(_one_bar(PREMIUM)), _tools(), kept=(kept,))
+    assert isinstance(refused, PlanRefused) and "this dashboard keeps" in _parts(refused)["measure 'total_premium'"]
+
+
+def test_the_planner_is_told_the_measures_the_dashboard_keeps_and_a_fresh_build_hears_nothing_of_them():
+    """The measures a dashboard keeps reach the model in the user prompt, each with its name, label and kind; its
+    expression and table only where its dataset is a table this builder can see, since a dashboard's editor may read
+    fewer tables than its measures are on. A build with none kept is sent the prompt it was sent before."""
+    # A second physical dataset over policy, which is no table's own dataset of the catalogue.
+    second = {"id": 60, "table_name": "policy", "schema": "public", "database_id": 7, "is_virtual": False, "sql": None,
+              "metrics": []}
+    kept = (dataclasses.replace(PREMIUM, dataset_id=ELSEWHERE), dataclasses.replace(CLAIMS, name="claims_kept"),
+            _measure("premium_avg", "Average premium", "AVG(premium)", dataset_id=60))
+    told = FakePlanner(_one_bar(_measure("premium_on_policy", "Premium")))
+    _plan(GOAL, told, _tools(infos={ELSEWHERE: READABLE_JOIN, 60: second}), kept=kept)
+    system, user = plan_prompt(GOAL, told.contexts[0])
+    assert "this dashboard already keeps" in user and "never one of theirs" in user, user
+    assert '"name": "total_premium"' in user and '"label": "Total premium"' in user, user
+    assert '"expression": "SUM(premium)"' in user and '"expression": "AVG(premium)"' in user, user
+    assert '"expression": "COUNT(claim_id)"' in user and '"table": "claim"' in user, user
+    fresh = FakePlanner(_one_bar(PREMIUM))
+    _plan(GOAL, fresh, _tools())
+    plain_system, plain_user = plan_prompt(GOAL, fresh.contexts[0])
+    assert plain_system == system and "keeps" not in plain_user
+    assert plain_user == plan_prompt(GOAL, dataclasses.replace(told.contexts[0], kept=()))[1]
 
 
 def test_saved_ref_named_like_a_dimension_is_refused():
@@ -2317,6 +2444,28 @@ def test_a_carried_label_another_measure_has_takes_its_table_and_is_refused_when
     assert _parts(refused) == {"measure 'open_paid_by_region'": (
         "its label 'Open claims paid' is another measure's, or a saved metric's on the join, and so is 'Open claims "
         "paid (claim)'; give the other measure a label of its own")}
+
+
+def test_a_carried_metric_holds_its_label_and_name_apart_from_the_measures_the_dashboard_keeps():
+    """A joined table's saved metric carried onto a build's join is a measure of the dashboard too: where its label is
+    one the dashboard keeps, its table is appended, as for another measure of the plan; where the plan's name for it
+    is one the dashboard keeps, it goes back for a name of its own (a carried measure is on a dataset the build makes,
+    so it is never the kept one)."""
+    def plan() -> BuildPlan:
+        return BuildPlan(charts=(_chart("carried", Family.BAR, [OPEN_PAID_REF], dataset_id=-1, dims=["region"]),),
+                         measures=(), reuse_candidates=(),
+                         datasets=(PlannedDataset(key="dataset_1", placeholder=-1, join=JOIN),))
+
+    tools = _tools(metrics=SAVED_ON_TABLES, extension=CERTIFIED)
+    labelled = _measure("kept_paid", "Open claims paid", "SUM(amount)", K.CURRENCY, dataset_id=ELSEWHERE)
+    checked = _plan(GOAL, FakePlanner(plan()), tools, snapshot=KEYED, settings=GUARDED, kept=(labelled,))
+    assert isinstance(checked, BuildPlan), checked
+    assert [m.label for m in checked.measures] == ["Open claims paid (claim)"]
+    named = _measure("open_paid_by_region", "Paid elsewhere", "SUM(amount)", K.CURRENCY, dataset_id=ELSEWHERE)
+    refused = _plan(GOAL, FakePlanner(plan()), tools, snapshot=KEYED, settings=GUARDED, kept=(named,))
+    assert isinstance(refused, PlanRefused), refused
+    reason = _parts(refused)["measure 'open_paid_by_region'"]
+    assert "this dashboard keeps" in reason and "name" in reason, reason
 
 
 def test_one_carried_metric_on_two_charts_is_one_measure_decided_against_both_charts_columns():

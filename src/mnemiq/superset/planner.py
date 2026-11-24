@@ -60,6 +60,8 @@ from mnemiq.sql.fanout_check import OffGrain, guard_on, key_facts, tables_off_th
 from mnemiq.sql.identifiers import resolve_identifier
 from mnemiq.sql.schema import column_types, visible_schema
 from mnemiq.superset.adapter import JINJA_DELIMITERS
+from mnemiq.superset.chart_check import read_dataset_facts
+from mnemiq.superset.chart_form import DatasetFacts, NotCheckable
 from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenRef, plan_refusal
 from mnemiq.superset.dashboard_charts import LeftOut, leave_out_shown, read_dashboard_charts
 from mnemiq.superset.grants import UnreadableAnswer, read_datasets, table_bindings
@@ -67,7 +69,7 @@ from mnemiq.superset.literals import NEGATED_OPERATORS, Absent, Probes, absent_l
 from mnemiq.superset.marker import format_marker
 from mnemiq.superset.measures import MAX_LABEL, Measure, MeasureKind, MeasureRefused, check_measure, scales_by_100, \
     superset_text_problem
-from mnemiq.superset.saved_metrics import Carried, SavedMetric, carry, read_saved_metrics, reusable
+from mnemiq.superset.saved_metrics import Carried, SavedMetric, carry, read_saved_metrics, reusable, same_definition
 from mnemiq.superset.settings import SUPERSET_DIALECT
 
 __all__ = ["COUNT_METRIC", "FILTER_OPERATORS", "GRAINS", "PLANNER_MAX_TOKENS", "PLAN_JSON_SHAPE", "SCALAR",
@@ -263,6 +265,9 @@ class PlanContext:
     dashboards: tuple[PlanDashboard, ...]
     families: tuple[Family, ...]
     repair: Repair | None = None
+    # Built onto a dashboard: the measures it keeps that this builder may be told of (`_readable_kept`), whose names
+    # and labels a written measure leaves to them.
+    kept: tuple[Measure, ...] = ()
 
 
 class Planner(Protocol):
@@ -379,6 +384,14 @@ def plan_prompt(goal: str, context: PlanContext) -> tuple[str, str]:
         "dashboards": [{"id": d.id, "title": d.title} for d in context.dashboards],
     }
     user = f"Goal: {goal}\n\nWhat this builder can see:\n{json.dumps(document, ensure_ascii=False)}"
+    if context.kept:
+        # Only measures on datasets this builder reads whole (`_readable_kept`); a table's own dataset is named.
+        tables = {table.dataset_id: table.name for table in context.tables if table.dataset_id is not None}
+        kept = [{"name": m.name, "label": m.label, "expression": m.expression, "kind": m.kind.value,
+                 **({"table": tables[m.dataset_id]} if m.dataset_id in tables else {})} for m in context.kept]
+        user += (f"\n\nThe dashboard this builds onto: this dashboard already keeps these measures, each on its own "
+                 f"dataset:\n{json.dumps(kept, ensure_ascii=False)}\nA written measure's name and label are never one "
+                 "of theirs, unless it is that measure: the same expression and kind, on its table.")
     if context.repair is not None:
         lines = "\n".join(f"- {part.part}: {part.reason}" for part in context.repair.refused)
         previous = f"Your plan was:\n{context.repair.previous}\n\n" if context.repair.previous else ""
@@ -1201,7 +1214,8 @@ def _null_refusals(chart: ChartSpec, on: _Rows, *, adapter, snapshot: Snapshot, 
 
 
 def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adapter, snapshot: Snapshot,
-           grants: GrantSet, settings, interactive_pivot_available: bool) -> BuildPlan | tuple[RefusedPart, ...]:
+           grants: GrantSet, settings, interactive_pivot_available: bool,
+           on_dashboard: Sequence[Measure] = ()) -> BuildPlan | tuple[RefusedPart, ...]:
     """The plan with its reusable measures replaced by the saved metrics that say the same, and each joined table's
     saved metric carried onto its join as a measure written from its expression, or every part refused, each with
     mnemiq's own reason."""
@@ -1290,6 +1304,11 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
     # its chart would show beside it.
     names: dict[str, str] = {}
     labels: dict[str, str] = {}
+    # The dashboard's own measures, when the plan builds onto one, every one of them, those the builder may not be
+    # told of among them: one definition for each name, one measure for each label (`same_definition`: a dataset is
+    # part of a measure). A refusal they cause says nothing of them.
+    kept_names = {m.name.casefold(): m for m in on_dashboard}
+    kept_labels = {m.label.strip().casefold(): m for m in on_dashboard}
     reused: dict[str, SavedRef] = {}
     kept: list[Measure] = []
     columns_of: dict[str, set[str]] = {}
@@ -1311,6 +1330,17 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
                          " give each measure a label of its own")
             continue
         labels[measure.label.strip().casefold()] = measure.name
+        held = kept_names.get(measure.name.casefold())
+        if held is not None and not same_definition(held, measure):
+            # Its definition is not said: its dataset may be no table this builder can read.
+            refuse(part, "this dashboard keeps a measure of this name with another definition, and keeps one "
+                         "definition for each name: give this measure a name and a label this dashboard does not keep")
+            continue
+        other = kept_labels.get(measure.label.strip().casefold())
+        if other is not None and other.name.casefold() != measure.name.casefold():
+            refuse(part, f"its label {measure.label!r} is one this dashboard keeps on another measure: give this "
+                         "measure a label this dashboard does not keep")
+            continue
         if len(measure.description) > MAX_DESCRIPTION:
             refuse(part, f"its description is at most {MAX_DESCRIPTION} characters")
             continue
@@ -1386,11 +1416,12 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
             refuse(part, found)
             continue
         metric, rendered = found
-        # Its label is its metric's own, so where that is another measure's label, a saved metric's name on the join,
-        # or a dimension of a chart that plots it, its table is appended; where that meets one too, it is refused.
+        # Its label is its metric's own, so where that is another measure's label (the plan's, or one the dashboard
+        # keeps), a saved metric's name on the join, or a dimension of a chart that plots it, its table is appended;
+        # where that meets one too, it is refused.
         base = _carried_label(metric)
         saved_names = {m.name.casefold() for m in on.saved}
-        taken = set(labels) | saved_names
+        taken = set(labels) | saved_names | set(kept_labels)
         dimensions = {column.casefold() for column in carried_columns[key]}
         label = base
         if base.casefold() in taken or base.casefold() in dimensions:
@@ -1410,6 +1441,10 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
         if name.casefold() in saved_names:
             refuse(part, f"its name {name!r} is also a saved metric's on its dataset (Superset gives every dataset it "
                          "makes one named count); Superset would show two metrics of one name, so name it differently")
+            continue
+        if name.casefold() in kept_names:  # on a dataset the build makes: never the kept measure
+            refuse(part, "this dashboard keeps a measure of this name, and keeps one definition for each name: give "
+                         "this measure a name this dashboard does not keep")
             continue
         names[name.casefold()], labels[label.casefold()] = name, name
         decided = Measure(name=name, label=label, expression=rendered.decided, kind=ref.kind, dataset_id=placeholder,
@@ -1548,7 +1583,7 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
 
 def plan_build(goal: str, *, planner: Planner, client, adapter, snapshot: Snapshot, grants: GrantSet, settings,
                interactive_pivot_available: bool = False, offer_reuse: bool = True, onto: int | None = None,
-               built_on: Mapping[int, int] | None = None) -> BuildPlan | PlanRefused:
+               built_on: Mapping[int, int] | None = None, kept: Sequence[Measure] = ()) -> BuildPlan | PlanRefused:
     """The checked plan for `goal`, or why there is none. `client` is the request's Superset client, the one its
     adapter (`superset_executor(settings, delegation)`) carries, and every call goes through it as the builder; nothing
     is written. A part refused goes back to `planner` once, with mnemiq's reason; refused again, the plan is refused,
@@ -1559,7 +1594,10 @@ def plan_build(goal: str, *, planner: Planner, client, adapter, snapshot: Snapsh
 
     `onto` names the dashboard the build adds to: once the plan is checked, its charts are read, once each, and each
     planned chart one of them already shows is left out (`BuildPlan.left_out`), with the measures and datasets only it
-    used. `built_on` gives the dataset of each chart mnemiq made there (`dashboard_charts.datasets_built_on`).
+    used. `built_on` gives the dataset of each chart mnemiq made there (`dashboard_charts.datasets_built_on`), and
+    `kept` the measures the dashboard keeps: the model is shown those on datasets the builder reads whole, and a
+    written measure that takes any kept name with another definition, or a kept label under another name, is refused
+    for repair, so the build does not stop on it (`measure_conflict`) once confirmed.
 
     A planning prompt the model's server refuses or cuts as longer than its window (`ContextTooLong`, `PromptCut`)
     refuses the plan in mnemiq's words, on the first plan or its repair: the goal and what the builder can see are too
@@ -1576,7 +1614,10 @@ def plan_build(goal: str, *, planner: Planner, client, adapter, snapshot: Snapsh
     if not catalogue.columns:
         return PlanRefused(NOTHING_VISIBLE)
     families = tuple(f for f in Family if f is not Family.INTERACTIVE_PIVOT or interactive_pivot_available)
-    context = _context(catalogue, _dashboards(client, goal) if offer_reuse else (), families)
+    kept = tuple(kept)
+    context = replace(_context(catalogue, _dashboards(client, goal) if offer_reuse else (), families),
+                      kept=_readable_kept(kept, catalogue, adapter, client, snapshot=snapshot, grants=grants,
+                                          settings=settings))
     parts: tuple[RefusedPart, ...] = ()
     for attempt in range(2):
         try:
@@ -1591,7 +1632,8 @@ def plan_build(goal: str, *, planner: Planner, client, adapter, snapshot: Snapsh
             parts, previous = answer.parts, answer.draft
         else:
             checked = _check(answer, catalogue, context, adapter=adapter, snapshot=snapshot, grants=grants,
-                             settings=settings, interactive_pivot_available=interactive_pivot_available)
+                             settings=settings, interactive_pivot_available=interactive_pivot_available,
+                             on_dashboard=kept)
             if (terminal := getattr(adapter, "terminal_refusal", None)) is not None:
                 # Superset refused the caller, or the caller's roles, while a measure was decided: every later call
                 # meets the same refusal, so the request ends here, as `superset_history` ends it.
@@ -1609,6 +1651,47 @@ def plan_build(goal: str, *, planner: Planner, client, adapter, snapshot: Snapsh
         if attempt == 0:
             context = replace(context, repair=Repair(previous=previous, refused=parts))
     return PlanRefused(_naming(parts), parts)
+
+
+def _readable_kept(kept: Sequence[Measure], catalogue: _Catalogue, adapter, client, *, snapshot: Snapshot,
+                   grants: GrantSet, settings) -> tuple[Measure, ...]:
+    """The kept measures this builder may be told of: each one mnemiq would run for them. Each measure's own statement
+    over its dataset is decided as any statement this builder asks is (`check_measure`), whose deciders read the
+    dataset's SQL and the measure's expression as the engine does, their tables, scopes, subqueries and functions:
+    a visible table's own dataset is its table; any other is the dataset as Superset answers it to the builder. A
+    readable dataset does not make every measure on it readable, since a measure written by a builder with wider grants
+    can read another table itself. The rest stay from the model; the plan check still holds their names and labels
+    apart. Fails closed: a dataset Superset does not answer, one on another database or schema, or a statement the
+    deciders refuse keeps its measure out."""
+    own = {dataset: _quoted(catalogue.stored[table]) for table, dataset in catalogue.datasets.items()}
+    stored = set(catalogue.stored.values())
+    facts: dict[int, DatasetFacts | NotCheckable] = {}
+    told = []
+    for measure in kept:
+        source = own.get(measure.dataset_id)
+        if source is None:
+            if measure.dataset_id not in facts:
+                facts[measure.dataset_id] = read_dataset_facts(client, measure.dataset_id)
+            source = _source_for_builder(facts[measure.dataset_id], adapter, stored)
+        if source is None:
+            continue
+        verdict = check_measure(measure, source=source, adapter=adapter, snapshot=snapshot, grants=grants,
+                                guard_fanout=settings.guard_fanout)
+        if not isinstance(verdict, MeasureRefused):
+            told.append(measure)
+    return tuple(told)
+
+
+def _source_for_builder(facts: DatasetFacts | NotCheckable, adapter, stored: set[str]) -> str | None:
+    """A dataset, as Superset answered it to the builder, as the FROM of a statement over it (as Superset reads it:
+    a table, or `(<its SQL>) AS "virtual_table"`), or None where it is not on the deployment's database and schema, or
+    is a physical one over a table the builder's catalogue does not hold."""
+    if not isinstance(facts, DatasetFacts) or facts.database_id != adapter.database_id \
+            or facts.schema != adapter.schema:
+        return None
+    if not facts.is_virtual:
+        return _quoted(facts.table) if facts.table in stored else None
+    return f'({facts.sql}) AS "virtual_table"' if facts.sql else None
 
 
 def _too_large(exc: ContextTooLong | PromptCut) -> PlanRefused:
