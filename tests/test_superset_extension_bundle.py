@@ -96,9 +96,14 @@ def test_require_frontend_refuses_a_missing_dist(tmp_path):
         raise AssertionError("a missing frontend was packed")
 
 
+def _version() -> str:
+    """The extension's version, as its manifest names it: the bundle's file name carries it."""
+    return json.loads((ROOT / "integrations" / "superset" / "extension.json").read_text())["version"]
+
+
 def test_bundle_has_only_allowed_entries(tmp_path):
     out = _build(tmp_path)
-    with zipfile.ZipFile(out / "mnemiq-0.2.0.supx") as bundle:
+    with zipfile.ZipFile(out / f"mnemiq-{_version()}.supx") as bundle:
         names = bundle.namelist()
     assert "manifest.json" in names
     assert "backend/src/agenticfabriq/mnemiq/entrypoint.py" in names
@@ -116,9 +121,9 @@ def test_manifest_entrypoint(tmp_path):
     out = _build(tmp_path)
     manifest = json.loads((out / "dist" / "manifest.json").read_text())
     assert manifest["publisher"] == "agenticfabriq" and manifest["name"] == "mnemiq"
-    assert manifest["id"] == "agenticfabriq.mnemiq" and manifest["version"] == "0.2.0"
+    assert manifest["id"] == "agenticfabriq.mnemiq" and manifest["version"] == _version()
     assert manifest["backend"] == {"entrypoint": "agenticfabriq.mnemiq.entrypoint"}
-    with zipfile.ZipFile(out / "mnemiq-0.2.0.supx") as bundle:
+    with zipfile.ZipFile(out / f"mnemiq-{_version()}.supx") as bundle:
         assert json.loads(bundle.read("manifest.json")) == manifest
     parts = manifest["backend"]["entrypoint"].split(".")
     assert (out / "dist" / "backend" / "src" / Path(*parts)).with_suffix(".py").is_file()
@@ -137,10 +142,14 @@ def test_the_packer_says_why_it_refuses_and_exits_1(tmp_path, capsys, monkeypatc
     assert packer.main(["--out", str(tmp_path / "out")]) == 0
 
 
-def test_the_extension_and_its_backend_carry_one_version():
-    """Superset's extension tooling compares the backend package's version with the extension's; they are one."""
+def test_the_extension_its_backend_and_its_panel_carry_one_version():
+    """Superset's extension tooling compares the backend package's version with the extension's, and a release names
+    the manifest's: the backend's project and the panel's package carry the same, so a release cannot ship one part
+    at the version before."""
     import tomllib
 
-    extension = json.loads((ROOT / "integrations" / "superset" / "extension.json").read_text())
-    backend = tomllib.loads((ROOT / "integrations" / "superset" / "backend" / "pyproject.toml").read_text())
-    assert extension["version"] == backend["project"]["version"] == "0.2.0"
+    superset = ROOT / "integrations" / "superset"
+    backend = tomllib.loads((superset / "backend" / "pyproject.toml").read_text())["project"]["version"]
+    panel = json.loads((superset / "frontend" / "package.json").read_text())["version"]
+    assert _version() == backend == panel, {"extension.json": _version(), "pyproject.toml": backend,
+                                            "package.json": panel}
