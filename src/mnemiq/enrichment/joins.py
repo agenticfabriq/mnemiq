@@ -22,16 +22,12 @@ def _numeric(data_type: str | None) -> bool:
     return bool(words) and words[0] in _NUMERIC_BASES
 
 
-def _same_type(a: str | None, b: str | None) -> bool:
-    return " ".join((a or "").upper().split()) == " ".join((b or "").upper().split())
-
-
 def _comparable(expr: str, dialect: str, *, numbers: bool = False) -> str:
     """`expr` as the orphan check compares it.
 
     Natively where both sides are numbers (`numbers`), as the join the relationship describes will compare them: as
     text one number is 1, 1.00 or 1.0 by its type, and a DuckDB copy of Oracle lands each NUMBER as BIGINT,
-    DECIMAL(p, s) or DOUBLE by its declaration. A source may compare two types in a wider one, so where they differ
+    DECIMAL(p, s) or DOUBLE by its declaration. A source may compare two keys in a wider type or a collation, so
     `infer_relationships` also asks whether a child value meets two parents. Elsewhere as text, because a catalog
     can mix typed and CSV-inferred all-text tables, where INTEGER 1 and TEXT '1' must still match. Oracle natively
     always: it refuses
@@ -124,8 +120,7 @@ def infer_relationships(adapter, catalog: list[TableInfo], *, harvest_values: bo
                 # inclusion dependency, compared as `_comparable` says. A NULL child value means "no
                 # parent", not a broken reference.
                 dialect = getattr(adapter, "dialect", "duckdb")
-                parent_type = _declared_type(parent.name, col.name)
-                numbers = _numeric(parent_type) and _numeric(col.data_type)
+                numbers = _numeric(_declared_type(parent.name, col.name)) and _numeric(col.data_type)
                 in_parent = _comparable(f'p."{col.name}"', dialect, numbers=numbers)
                 in_child = _comparable(f'c."{col.name}"', dialect, numbers=numbers)
                 orphans = adapter.execute(
@@ -134,11 +129,11 @@ def infer_relationships(adapter, catalog: list[TableInfo], *, harvest_values: bo
                     f'  SELECT 1 FROM "{parent.name}" p '
                     f'  WHERE {in_parent} = {in_child})'
                 )[0][0]
-                # Natively, two declared types can be compared in a wider one that makes two parent keys one: a DOUBLE
-                # child against DECIMAL(38, 0) parents past 2^53, or DuckDB's HUGEINT against UHUGEINT (Codex's second
-                # and third reviews). The parent was counted unique in its own type, so where the types differ the
-                # source is asked, under the very predicate the join will use, whether a child value meets two parents.
-                if orphans == 0 and (numbers or dialect == "oracle") and not _same_type(parent_type, col.data_type):
+                # The parent was counted unique in its own type and collation, and the join may compare in another
+                # that makes two parent keys one: a DOUBLE child against DECIMAL(38, 0) parents past 2^53, DuckDB's
+                # HUGEINT against UHUGEINT, a NOCASE collation's 'a' and 'A' (Codex's second to fourth reviews). So
+                # the source is asked, under the very predicate the join will use, whether a child value meets two.
+                if orphans == 0:
                     in_values = _comparable("d.v", dialect, numbers=numbers)
                     fanned = adapter.execute(
                         f'SELECT count(*) FROM (SELECT d.v FROM (SELECT DISTINCT c."{col.name}" AS v '

@@ -302,9 +302,10 @@ class _KeyRecorder:
     `count(*), count(DISTINCT), count()` gives 10, 10, 10 and the orphan count gives 0. `fail_on` names a column whose
     orphan query raises, as Oracle raised ORA-00906 on `CAST(... AS VARCHAR)` (measured on 23.26, 2026-11-19)."""
 
-    def __init__(self, dialect: str | None, fks=(), fail_on: str | None = None, catalog=()):
+    def __init__(self, dialect: str | None, fks=(), fail_on: str | None = None, catalog=(), fan_out: int = 0):
         if dialect is not None:
             self.dialect = dialect
+        self._fan_out = fan_out
         self.sql: list[str] = []
         self._fks = list(fks)
         self._fail_on = fail_on
@@ -321,6 +322,8 @@ class _KeyRecorder:
 
     def execute(self, sql):
         self.sql.append(sql)
+        if "HAVING count(*) > 1" in sql:  # child values that meet two parents
+            return [(self._fan_out,)]
         if "NOT EXISTS" in sql:
             if self._fail_on and f'"{self._fail_on}"' in sql:
                 raise RuntimeError("ORA-00942: table or view does not exist")
@@ -362,20 +365,31 @@ def test_orphan_query_on_duckdb_compares_as_text_unless_both_keys_are_numbers():
     assert orphan_check("VARCHAR") == head + '  WHERE CAST(p."customer_id" AS VARCHAR) = CAST(c."customer_id" AS VARCHAR))'
 
 
-def test_on_oracle_keys_of_different_declared_types_are_checked_for_a_fan_out():
-    """Oracle compares natively always, and a NUMBER against a BINARY_DOUBLE is compared in binary floating point; the
-    recorder answers every count with 10, so here the source says a child value meets two parents. Keys of one type
-    are not asked: the parent was counted unique in that type."""
-    mixed = _invoices()
-    mixed[1] = TableInfo("invoice", [ColumnInfo("invoice_id", "NUMBER"), ColumnInfo("customer_id", "BINARY_DOUBLE")])
-    recorder = _KeyRecorder("oracle")
-    rels = infer_relationships(recorder, mixed)
-    fan_out = [sql for sql in recorder.sql if "HAVING count(*) > 1" in sql]
-    assert ("invoice", "customer") not in {(r.from_, r.to) for r in rels}
-    assert len(fan_out) == 1 and 'ON p."customer_id" = d.v' in fan_out[0]
-    same = _KeyRecorder("oracle")
-    assert ("invoice", "customer") in {(r.from_, r.to) for r in infer_relationships(same, _invoices())}
-    assert not [sql for sql in same.sql if "HAVING" in sql]
+def test_every_candidate_is_checked_for_a_fan_out_under_the_join_predicate():
+    """The parent is counted unique in its own type and collation, which is not always how the join compares (a DOUBLE
+    against DECIMAL(38, 0) past 2^53, DuckDB's HUGEINT against UHUGEINT, a NOCASE collation), so the source is asked,
+    for every candidate, whether a child value meets two parents."""
+    fanned = _KeyRecorder("oracle", fan_out=1)
+    assert ("invoice", "customer") not in {(r.from_, r.to) for r in infer_relationships(fanned, _invoices())}
+    clean = _KeyRecorder("oracle")
+    assert ("invoice", "customer") in {(r.from_, r.to) for r in infer_relationships(clean, _invoices())}
+    checks = [sql for sql in clean.sql if "HAVING count(*) > 1" in sql and '"customer_id"' in sql]
+    assert len(checks) == 1 and 'ON p."customer_id" = d.v' in checks[0]
+
+
+def test_keys_one_collation_makes_equal_do_not_vouch_for_a_join():
+    # Codex's fourth review: under NOCASE 'a' and 'A' are two distinct parent values, and a child's 'a' meets both.
+    con = duckdb.connect()
+    con.execute('CREATE TABLE parent ("parent_id" VARCHAR COLLATE NOCASE)')
+    con.execute("INSERT INTO parent VALUES ('a'), ('A')")
+    con.execute('CREATE TABLE child ("child_id" INTEGER, "parent_id" VARCHAR COLLATE NOCASE)')
+    con.execute("INSERT INTO child VALUES (10, 'a')")
+    catalog = [
+        TableInfo("parent", [ColumnInfo("parent_id", "VARCHAR")]),
+        TableInfo("child", [ColumnInfo("child_id", "INTEGER"), ColumnInfo("parent_id", "VARCHAR")]),
+    ]
+    assert con.execute('SELECT count(*) FROM child c JOIN parent p ON p."parent_id" = c."parent_id"').fetchone() == (2,)
+    assert infer_relationships(_DuckAdapter(con), catalog) == []
 
 
 def test_a_candidate_that_cannot_be_checked_costs_only_itself(caplog):
