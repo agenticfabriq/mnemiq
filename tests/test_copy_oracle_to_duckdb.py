@@ -497,14 +497,39 @@ def test_a_selected_name_equal_to_a_copied_one_without_case_is_refused(deploymen
 
 
 def test_keys_with_both_ends_copied_are_written_to_the_keys_table(deployment):
-    keys = [("ORDERS", "CUSTOMER_ID", "CUSTOMER", "ID", "FK_ORD_CUST"),
-            ("ORDERS", "STORE_ID", "STORE", "ID", "FK_ORD_STORE")]
+    keys = [("ORDERS", "CUSTOMER_ID", "CUSTOMER", "ID", "FK_ORD_CUST", 1),
+            ("ORDERS", "STORE_ID", "STORE", "ID", "FK_ORD_STORE", 1)]
     assert deployment(_shop(keys=keys)) == 0
     con = duckdb.connect(deployment.out, read_only=True)
     assert con.execute("SELECT * FROM mnemiq.declared_keys").fetchall() == [keys[0]]
     con.close()
     # The DuckDB adapter reads what the copy wrote: the join between the two, not either end alone.
-    assert DuckDBAdapter.duckdb(deployment.out).foreign_keys() == [keys[0]]
+    assert DuckDBAdapter.duckdb(deployment.out).foreign_keys() == [keys[0][:5]]
+
+
+def test_a_composite_keys_declared_order_survives_the_copy(deployment):
+    from mnemiq.catalog import introspect
+    from mnemiq.enrichment.joins import relationships_from_foreign_keys
+
+    store = pa.schema([("ZONE", pa.large_string()), ("AREA", pa.large_string())])
+    lines = pa.schema([("ZONE", pa.large_string()), ("AREA", pa.large_string())])
+    fake = _Oracle({"LINES": [lines.empty_table()], "STORE": [store.empty_table()]},
+                   keys=[("LINES", "ZONE", "STORE", "ZONE", "FK_STORE", 1),
+                         ("LINES", "AREA", "STORE", "AREA", "FK_STORE", 2)])  # as Oracle orders them, by position
+    deployment.manifest.write_text(json.dumps([{**_SOURCE, "tables": ["LINES", "STORE"]}]))
+    assert deployment(fake) == 0
+    adapter = DuckDBAdapter.duckdb(deployment.out)
+    oracle = type("OracleOrder", (), {"foreign_keys": lambda self: [k[:5] for k in fake.keys]})()
+    catalog = introspect(adapter)
+    assert [r.id for r in relationships_from_foreign_keys(adapter, catalog)] == \
+        [r.id for r in relationships_from_foreign_keys(oracle, catalog)] == ["LINES.ZONE+AREA->STORE"]
+
+
+def test_keys_are_read_with_their_position(deployment):
+    fake = _shop()
+    deployment(fake)
+    statement = next(e for e in fake.log if isinstance(e, str) and "all_constraints" in e.lower())
+    assert "cc.column_name, rc.table_name, rcc.column_name, c.constraint_name, cc.position" in statement
 
 
 def test_declared_key_rows_keeps_keys_whose_both_ends_are_copied():

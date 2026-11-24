@@ -389,7 +389,8 @@ It reads the source's `"tables"` (every table the schema owner holds when there 
 
 **What the copy keeps.** Table and column comments (written as DuckDB comments, which enrich reads
 from the copy as it reads them from Oracle, under the same rules), and the foreign keys the schema
-declares between copied tables (written to a `mnemiq.declared_keys` table in the file, outside
+declares between copied tables (written, in each key's declared column order, to a
+`mnemiq.declared_keys` table in the file, outside
 `main`, which enrich reads as the copy's declared keys). A key into another schema, or to a table
 not copied, is left out. Nothing in DuckDB enforces a key, so an orphan row cannot stop the copy.
 

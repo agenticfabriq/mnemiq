@@ -420,7 +420,10 @@ class DuckDBAdapter:
         declared keys as rows in `mnemiq.declared_keys` (`KEYS_SCHEMA`, `KEYS_TABLE`). It lives outside `main` so that
         `introspect` and `list_columns`, which read only the configured schema, never enrich it as a table. Read only
         when `information_schema.tables` holds it in this file's catalog; a file without one reports no keys. Ordered by
-        `from_table, constraint_name, from_column`, so a composite key's pairs come out in one order on every call."""
+        `from_table, constraint_name, position`, `position` being the pair's place in its key
+        (`ALL_CONS_COLUMNS.position`), so a composite key's pairs come out in the order it declares them, the order
+        `OracleAdapter.foreign_keys` reads: sorted by column name instead, a key on (Z, A) became (A, Z), and the
+        relationship's id differed from a run on Oracle."""
         found = self._con.execute(
             "SELECT table_catalog FROM information_schema.tables "
             "WHERE lower(table_catalog) = lower(?) AND table_schema = ? AND table_name = ?",
@@ -431,7 +434,7 @@ class DuckDBAdapter:
             rows = self._con.execute(
                 "SELECT from_table, from_column, to_table, to_column, constraint_name "
                 f"FROM {_quoted(found[0][0])}.{KEYS_SCHEMA}.{KEYS_TABLE} "
-                "ORDER BY from_table, constraint_name, from_column").fetchall()
+                "ORDER BY from_table, constraint_name, position").fetchall()
         except Exception as exc:  # noqa: BLE001 -- a malformed table: enrichment falls back to inference
             logger.warning("the declared foreign keys in %s.%s could not be read (%s); relationships will be "
                            "inferred from the data instead", KEYS_SCHEMA, KEYS_TABLE, type(exc).__name__)

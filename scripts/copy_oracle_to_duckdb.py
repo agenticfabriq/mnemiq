@@ -69,7 +69,7 @@ _COLUMN_COMMENTS = ("SELECT table_name, column_name, comments FROM all_col_comme
                     "WHERE owner = :owner AND comments IS NOT NULL")
 # The statement `OracleAdapter.foreign_keys` reads, kept to keys whose target is the owner's too: a key into another
 # schema names a table this copy does not hold, or worse, one of the owner's own that happens to share its name.
-_KEYS = ("SELECT c.table_name, cc.column_name, rc.table_name, rcc.column_name, c.constraint_name "
+_KEYS = ("SELECT c.table_name, cc.column_name, rc.table_name, rcc.column_name, c.constraint_name, cc.position "
          "FROM all_constraints c "
          "JOIN all_cons_columns cc ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name "
          "JOIN all_constraints rc ON rc.owner = c.r_owner AND rc.constraint_name = c.r_constraint_name "
@@ -157,7 +157,9 @@ def comment_statements(tables: dict[str, str], columns: dict[tuple[str, str], st
     return statements
 
 
-KeyRow = tuple[str, str, str, str, str]
+# (from_table, from_column, to_table, to_column, constraint_name, position): `position` keeps a composite key's pairs
+# in the order the key declares them, which the DuckDB adapter reads them by.
+KeyRow = tuple[str, str, str, str, str, int]
 
 
 def declared_key_rows(rows: list[KeyRow], copied: set[str]) -> list[KeyRow]:
@@ -409,9 +411,9 @@ def _duck_columns(duck, table: str) -> set[str]:
 def _write_keys(duck, rows: list[KeyRow]) -> None:
     duck.execute(f"CREATE SCHEMA IF NOT EXISTS {KEYS_SCHEMA}")
     duck.execute(f"CREATE OR REPLACE TABLE {KEYS_SCHEMA}.{KEYS_TABLE} (from_table VARCHAR, from_column VARCHAR, "
-                 "to_table VARCHAR, to_column VARCHAR, constraint_name VARCHAR)")
+                 "to_table VARCHAR, to_column VARCHAR, constraint_name VARCHAR, position INTEGER)")
     if rows:
-        duck.executemany(f"INSERT INTO {KEYS_SCHEMA}.{KEYS_TABLE} VALUES (?, ?, ?, ?, ?)", rows)
+        duck.executemany(f"INSERT INTO {KEYS_SCHEMA}.{KEYS_TABLE} VALUES (?, ?, ?, ?, ?, ?)", rows)
 
 
 def _copy(conn, spec: SourceSpec, args, out: str, *, local_only: bool, source: CopySource, state: _FileState) -> int:
