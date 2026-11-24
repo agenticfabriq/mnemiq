@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import threading
+from collections.abc import Sequence
 
 import duckdb
 import pyarrow as pa
@@ -21,6 +22,23 @@ _DOLLAR_TAG = "$q$"
 # are ordered by them on DuckDB's side too, so the order of a composite key's columns, and of the
 # relationships made from them, does not rest on DuckDB keeping `postgres_query`'s row order.
 _DECLARED_KEYS_ORDER = "from_table, key_position, constraint_name"
+
+# Where a DuckDB file records the foreign keys its source declared: a schema of its own, outside `main`, so no reader
+# of the source's tables takes it for one. `scripts/copy_oracle_to_duckdb.py` writes it; `foreign_keys` reads it.
+KEYS_SCHEMA = "mnemiq"
+KEYS_TABLE = "declared_keys"
+# The copy's progress, one row: `copying` from its first write, `complete` once its tables, comments and keys are all in.
+COPY_STATE_TABLE = "copy_state"
+
+
+class ReservedSchema(ValueError):
+    """A DuckDB-file source names the schema mnemiq keeps its own records of a copy in, as if it held the tables."""
+
+
+def _quoted(identifier: str) -> str:
+    """`identifier` as a DuckDB quoted identifier, an embedded double quote doubled."""
+    return '"' + identifier.replace('"', '""') + '"'
+
 
 # Every schema name a Postgres database stores. The configured schema is matched against them on
 # DuckDB's side, without regard to case, as `introspect` and `list_columns` match it.
@@ -276,6 +294,12 @@ class DuckDBAdapter:
         local_only: bool = False,
         statement_timeout_s: float | None = None,
     ) -> None:
+        if attach_type.upper() == "DUCKDB" and table_schema.casefold() == KEYS_SCHEMA:
+            # Refused before the file is opened: every reader of the source's tables reads the configured schema, so
+            # naming this one would enrich the copy's declared keys, source and state as tables of the source.
+            raise ReservedSchema(
+                f"schema {table_schema!r} of a DuckDB file holds mnemiq's own records of a copy (its declared keys, "
+                "source and state), not tables to enrich; name the schema that holds the tables, usually main")
         self._catalog = catalog
         self._table_schema = table_schema
         self._fk_via_postgres = fk_via_postgres
@@ -343,6 +367,33 @@ class DuckDBAdapter:
         ).fetchall()
         return [(r[0], r[1], r[2]) for r in rows]
 
+    def comments(self, tables: Sequence[str]) -> tuple[dict[str, str], dict[tuple[str, str], str]]:
+        """The tables' comments and their columns', from DuckDB's own catalogue, for a DuckDB file: the shape
+        `OracleAdapter.comments` reads, so a store built on a DuckDB copy of an Oracle schema keeps the comments the copy
+        wrote as `COMMENT ON`. An empty comment is absent.
+
+        Only a DuckDB file is asked. Every other kind this class attaches answers `({}, {})`: DuckDB's scanner reports
+        no comment for an attached SQLite or Postgres table, so an empty answer is the truth there, not a failed read.
+        Catalog and schema are matched without regard to case and by parameter, as `introspect` matches them; the
+        tables exactly, since they are the names `introspect` reported."""
+        if self._attach_type != "DUCKDB":
+            return {}, {}
+        names = list(dict.fromkeys(tables))
+        if not names:
+            return {}, {}
+        scope = [self._catalog, self._table_schema, names]
+        table_comments = {table: text for table, text in self._con.execute(
+            "SELECT table_name, comment FROM duckdb_tables() "
+            "WHERE lower(database_name) = lower(?) AND lower(schema_name) = lower(?) "
+            "AND list_contains(?, table_name) AND comment IS NOT NULL AND comment <> '' "
+            "ORDER BY table_name", scope).fetchall()}
+        column_comments = {(table, column): text for table, column, text in self._con.execute(
+            "SELECT table_name, column_name, comment FROM duckdb_columns() "
+            "WHERE lower(database_name) = lower(?) AND lower(schema_name) = lower(?) "
+            "AND list_contains(?, table_name) AND comment IS NOT NULL AND comment <> '' "
+            "ORDER BY table_name, column_index", scope).fetchall()}
+        return table_comments, column_comments
+
     def foreign_keys(self) -> list[tuple[str, str, str, str, str]]:
         """Declared FKs: (from_table, from_col, to_table, to_col, constraint_id), one row for each
         column pair of a key, each source column with the target column at its own position.
@@ -350,14 +401,15 @@ class DuckDBAdapter:
         A Postgres source is read by the statement the Superset catalogue reads keys with
         (`DECLARED_KEYS`), run whole in Postgres through `postgres_query`, in this adapter's own
         schema, by the name Postgres stores it under (`_stored_schema`): only keys declared there
-        whose target is there too, never a partition's copy of one. Only a Postgres source is read
-        for keys: a SQLite source, whose keys DuckDB's scanner does not expose, and a DuckDB file
-        return []. A read that fails returns [] as well, and enrichment infers relationships from
-        the data instead; it logs a WARNING naming the exception's type, never its text, which can
-        carry the DSN, or saying why the schema could not be resolved.
+        whose target is there too, never a partition's copy of one. A DuckDB file is read from its
+        `mnemiq.declared_keys` table when it holds one (`_declared_keys_table`), and reports none
+        when it does not. A SQLite source, whose keys DuckDB's scanner does not expose, returns [].
+        A read that fails returns [] as well, and enrichment infers relationships from the data
+        instead; it logs a WARNING naming the exception's type, never its text, which can carry
+        the DSN, or saying why the schema could not be resolved.
         """
         if not self._fk_via_postgres:
-            return []
+            return self._declared_keys_table() if self._attach_type == "DUCKDB" else []
         try:
             schema = self._stored_schema()
             rows = self._con.execute(
@@ -370,6 +422,51 @@ class DuckDBAdapter:
             logger.warning("the declared foreign keys of Postgres schema %r could not be read (%s); "
                            "relationships will be inferred from the data instead",
                            self._table_schema, why)
+            return []
+        return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
+
+    def copy_state(self) -> str | None:
+        """What a DuckDB file made by `scripts/copy_oracle_to_duckdb.py` records of that copy: `complete`, or `copying`
+        when a copy stopped before its tables, comments and keys were all published (an interrupted `--replace` leaves
+        new tables beside old keys). None for a file with no such record, as any DuckDB file the copy did not make, and
+        for every other kind this class attaches."""
+        if self._attach_type != "DUCKDB":
+            return None
+        found = self._con.execute(
+            "SELECT table_catalog FROM information_schema.tables "
+            "WHERE lower(table_catalog) = lower(?) AND table_schema = ? AND table_name = ?",
+            [self._catalog, KEYS_SCHEMA, COPY_STATE_TABLE]).fetchall()
+        if not found:
+            return None
+        row = self._con.execute(
+            f"SELECT state FROM {_quoted(found[0][0])}.{KEYS_SCHEMA}.{COPY_STATE_TABLE}").fetchone()
+        return row[0] if row else None
+
+    def _declared_keys_table(self) -> list[tuple[str, str, str, str, str]]:
+        """A DuckDB file's declared keys, from the table `scripts/copy_oracle_to_duckdb.py` writes them to.
+
+        DuckDB enforces no key a copy could carry over without refusing an orphan row, so the copy records Oracle's
+        declared keys as rows in `mnemiq.declared_keys` (`KEYS_SCHEMA`, `KEYS_TABLE`). It lives outside `main` so that
+        `introspect` and `list_columns`, which read only the configured schema, never enrich it as a table. Read only
+        when `information_schema.tables` holds it in this file's catalog; a file without one reports no keys. Ordered by
+        `from_table, constraint_name, position`, `position` being the pair's place in its key
+        (`ALL_CONS_COLUMNS.position`), so a composite key's pairs come out in the order it declares them, the order
+        `OracleAdapter.foreign_keys` reads: sorted by column name instead, a key on (Z, A) became (A, Z), and the
+        relationship's id differed from a run on Oracle."""
+        found = self._con.execute(
+            "SELECT table_catalog FROM information_schema.tables "
+            "WHERE lower(table_catalog) = lower(?) AND table_schema = ? AND table_name = ?",
+            [self._catalog, KEYS_SCHEMA, KEYS_TABLE]).fetchall()
+        if not found:
+            return []
+        try:
+            rows = self._con.execute(
+                "SELECT from_table, from_column, to_table, to_column, constraint_name "
+                f"FROM {_quoted(found[0][0])}.{KEYS_SCHEMA}.{KEYS_TABLE} "
+                "ORDER BY from_table, constraint_name, position").fetchall()
+        except Exception as exc:  # noqa: BLE001 -- a malformed table: enrichment falls back to inference
+            logger.warning("the declared foreign keys in %s.%s could not be read (%s); relationships will be "
+                           "inferred from the data instead", KEYS_SCHEMA, KEYS_TABLE, type(exc).__name__)
             return []
         return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
 

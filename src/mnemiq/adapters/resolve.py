@@ -39,7 +39,7 @@ manifest-format change and not a v1 requirement.
 
 from __future__ import annotations
 
-from mnemiq.adapters.duckdb import DuckDBAdapter, UnparseableDSN
+from mnemiq.adapters.duckdb import DuckDBAdapter, ReservedSchema, UnparseableDSN
 from mnemiq.adapters.oracle import OracleAdapter
 from mnemiq.config import Settings, SourceSpec
 from mnemiq.duckdb_extensions import SOURCE_EXTENSIONS
@@ -160,7 +160,7 @@ def _adapter_for(spec: SourceSpec, settings: Settings | None = None, *, read_onl
     try:
         return _duckdb_adapter(spec, settings, read_only, statement_timeout_s, attach_type,
                                extension, default_schema, fk_via_postgres)
-    except UnparseableDSN as exc:  # a configuration error: one line on every door, no traceback
+    except (UnparseableDSN, ReservedSchema) as exc:  # a configuration error: one line on every door, no traceback
         raise SourceUnconfigured(f"source {spec.id!r}: {exc}") from exc
 
 

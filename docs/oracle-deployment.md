@@ -358,3 +358,74 @@ apart, never as a search miss.
 - **Nothing else reads an estimated table either.** Grounding skips joins to it, it has no value
   index, and the examples phase (`MNEMIQ_ENRICH_EXAMPLES`), which runs the queries it writes, is
   refused with `"statistics"`.
+
+### Enriching on a DuckDB copy
+
+The other way to profile a large schema exactly without loading production: copy its tables into
+one DuckDB file, enrich and build there, and serve the store on Oracle. Every count, code and join
+check then reads the copy, and Oracle is read once per table, by the copy.
+`scripts/copy_oracle_to_duckdb.py` makes the copy from the Oracle source in your manifest:
+
+```bash
+MNEMIQ_ORACLE_USER=... MNEMIQ_ORACLE_PASSWORD=... \
+  python scripts/copy_oracle_to_duckdb.py --sources sources.json --out copy.duckdb
+```
+
+It reads the source's `"tables"` (every table the schema owner holds when there are none), and then:
+
+1. **Copies the tables into the file's `main` schema,** under the names Oracle stores (upper case,
+   or as quoted). Before reading any row it prints a disk estimate (`NUM_ROWS × AVG_ROW_LEN`
+   summed, plus the LOB segments when the reader owns the tables, and the tables with no statistics
+   named), and stops past `--max-gb` (10 by default). DuckDB compresses by column, so the file is
+   usually smaller than the estimate. It writes the copy's source entry beside the file, as
+   `copy.duckdb.source.json`: the Oracle source's `id` and `catalog`, `"kind": "duckdb"`,
+   `"schema": "main"` and the same tables.
+2. **In a separate folder, point a deployment at the copy:** that entry as its manifest
+   (`MNEMIQ_SOURCES_PATH`), with the same definitions and access policy files you use on Oracle.
+   Run `mnemiq enrich`, then `mnemiq build`.
+3. **Copy the `store.duckdb` it writes into your Oracle deployment.** The Oracle source entry must
+   keep the same `id` and `catalog`, and list the same tables under `"tables"`, so the store's
+   tables name the source it serves.
+
+**What the copy keeps.** Table and column comments (written as DuckDB comments, which enrich reads
+from the copy as it reads them from Oracle, under the same rules), and the foreign keys the schema
+declares between copied tables (written, in each key's declared column order, to a
+`mnemiq.declared_keys` table in the file, outside
+`main`, which enrich reads as the copy's declared keys). Schema `mnemiq` holds only these records of
+the copy, so a DuckDB source naming it as its `"schema"`, in any case, is refused. A key into another schema, or to a table
+not copied, is left out. Nothing in DuckDB enforces a key, so an orphan row cannot stop the copy.
+
+**How it reads Oracle.** `SELECT` only, each table in its own read-only transaction (a single
+transaction held for the whole copy would need Oracle's undo to reach back to its start, and a long
+copy would fail with ORA-01555). Rows arrive in batches (`--batch-rows`, 100,000 by default), each
+checked with Arrow's own validation before it is stored. Each table is copied in one DuckDB
+transaction, committed after its last row, so a copy that stops part way, even by the process dying,
+leaves no trace of the table it was copying (and, with `--replace`, keeps the copy it was replacing):
+run it again and it copies what is missing, skipping the tables it recorded as copied whole
+(`--replace` copies those again too). The file records the one source it is a copy of
+(`mnemiq.copy_source`: the target, the database it reached by that database's own names, so a TNS
+alias that now resolves elsewhere is told apart, the owner and the user that read it, never a
+password) and each
+table copied whole (`mnemiq.copied_tables`), so a file holding another source's copy, or tables with
+no record of their source, is refused before Oracle is reached: copy into a new `--out` instead. The
+copy holds the file from that check to its end, so a second copy into it, or anything else opening
+it, is refused until the first is done. Until a run has published its tables, comments and keys,
+the file records the copy as unfinished (`mnemiq.copy_state`), and `mnemiq enrich` and `mnemiq
+refresh` refuse it, saying to rerun the copy: a `--replace` stopped part way would otherwise be
+enriched with new tables beside old keys.
+
+**What it costs.**
+
+- **No access rules on the copy.** It holds every row of every table it copied, outside the
+  database's grants, auditing and row policies. Keep it where you would keep an export.
+- **The store is as current as the copy,** and covers only the tables in it. Refreshing means
+  copying again (`--replace`) and enriching again.
+- **Types are DuckDB's.** A `NUMBER(p, 0)` of at most 18 digits arrives as `BIGINT`; every other
+  `NUMBER` (with a scale, more digits, or no precision) as `DOUBLE`, so digits past about 15
+  significant ones are lost on the copy (python-oracledb 4.0.2's exact decimal fetch returned
+  malformed batches, so it is not used). `DATE` and `TIMESTAMP` arrive as `TIMESTAMP`, `CLOB` and
+  `BLOB` as `VARCHAR` and `BLOB`, each value under 1 GB. The cards show these types, and the profile
+  reads values as the copy holds them, but answering on Oracle runs against Oracle's own.
+- **Names DuckDB cannot keep apart are refused.** DuckDB matches names without regard to case, so
+  two tables, or two columns of one table, whose names differ only in case stop the copy before any
+  row is read.
