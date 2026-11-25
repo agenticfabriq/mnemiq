@@ -825,6 +825,109 @@ def test_the_model_reads_its_own_plan_back_as_it_wrote_it():
     assert plan_from_draft(draft_of(plan, context), context) == plan
 
 
+def _with_paid(*, measure_rows: dict, chart_rows: dict | None = None) -> dict:
+    """`_draft`'s plan with a measure over JOIN and a chart that plots it, each naming its rows as given."""
+    draft = json.loads(_draft("SUM(premium)"))
+    draft["measures"].append({"name": "paid", "label": "Paid", "expression": "SUM(amount)", "kind": "currency",
+                              **measure_rows})
+    draft["charts"].append({"key": "paid_by_region", "family": "bar", "title": "Paid by region", "measures": ["paid"],
+                            "dimensions": ["region"], **(chart_rows or {})})
+    return draft
+
+
+def _context():
+    recorder = FakePlanner(_valid_plan())
+    _plan(GOAL, recorder, _tools())
+    return recorder.contexts[0]
+
+
+def test_a_join_written_where_a_table_goes_is_read_as_the_join():
+    """A model that writes a measure's join in `table` (Qwen3.8-27B did, in the panel's first build on her model) means
+    the join: the text names no table of the builder's and is one SQL join, so it is read as `join` would be. A name
+    that is no table and no join is still refused."""
+    context = _context()
+    as_join = plan_from_draft(_with_paid(measure_rows={"join": JOIN}), context)
+    assert isinstance(as_join, BuildPlan), as_join
+    assert plan_from_draft(_with_paid(measure_rows={"table": JOIN}), context) == as_join
+    assert plan_from_draft(_with_paid(measure_rows={"join": JOIN}, chart_rows={"table": JOIN}), context) == as_join
+    refused = plan_from_draft(_with_paid(measure_rows={"table": "payroll_view"}), context)
+    assert isinstance(refused, PlanRefused) and "'payroll_view' is not a table" in _parts(refused)["measure 'paid'"]
+
+
+def test_a_chart_on_one_table_of_its_measures_join_is_planned_on_the_join():
+    """A chart's rows are its measures' (one table or one join). A chart that names one of the tables its measures'
+    join joins (Qwen3.8-27B named `orders` for a measure over `order_items JOIN orders`) is planned on that join, as a
+    chart that names none is; a table the join does not hold is still refused."""
+    context = _context()
+    unnamed = plan_from_draft(_with_paid(measure_rows={"join": JOIN}), context)
+    assert isinstance(unnamed, BuildPlan), unnamed
+    # `region` is policy's alone, so it keeps its name on the join (a claim chart is in the next test).
+    moved = plan_from_draft(_with_paid(measure_rows={"join": JOIN}, chart_rows={"table": "policy"}), context)
+    assert moved == unnamed
+    for rows in ({"table": "agent"}, {"table": "agent", "dimensions": ["office"]}):  # office is agent's own
+        refused = plan_from_draft(_with_paid(measure_rows={"join": JOIN}, chart_rows=rows), context)
+        assert isinstance(refused, PlanRefused), rows
+        assert _parts(refused)["chart 'paid_by_region'"] == "its table or join is not its measures'", rows
+
+
+def test_a_chart_moved_onto_the_join_keeps_each_column_where_it_named_it():
+    """Moved onto its measures' join, a chart's columns are read as the join names them: a column the chart's table
+    alone has keeps its name, and one two joined tables share is `<table>_<column>` of the chart's own table. Codex's
+    case: `policy_policy_id` is a column of both tables, and the join shows `policy.policy_id` as `policy_policy_id`;
+    a chart that named `claim` and grouped by its `policy_policy_id` must group by `claim_policy_policy_id`, never by
+    `policy.policy_id`. A chart column its named table does not have keeps the chart refused."""
+    from mnemiq.superset.planner import PlanColumn
+    context = _context()
+    widened = tuple(dataclasses.replace(t, columns=(*t.columns, PlanColumn("policy_policy_id", "INTEGER")))
+                    if t.name in ("policy", "claim") else t for t in context.tables)
+    context = dataclasses.replace(context, tables=widened)
+
+    def chart_of(**chart_rows) -> ChartSpec | PlanRefused:
+        plan = plan_from_draft(_with_paid(measure_rows={"join": JOIN}, chart_rows={"table": "claim", **chart_rows}),
+                               context)
+        return plan if isinstance(plan, PlanRefused) else next(c for c in plan.charts if c.key == "paid_by_region")
+
+    chart = chart_of(dimensions=["policy_policy_id"])
+    assert chart.dimensions == ("claim_policy_policy_id",), chart
+    chart = chart_of(dimensions=["status", "policy_id"], time_column="created_at",
+                     filters=[{"column": "status", "op": "=", "operand": "open"},
+                              {"column": "created_at", "op": "IS NOT NULL"}])
+    assert chart.dimensions == ("status", "claim_policy_id") and chart.time_column == "claim_created_at", chart
+    assert [f.column for f in chart.filters] == ["status", "claim_created_at"], chart
+    refused = chart_of(dimensions=["region"])  # policy's column, not claim's
+    assert isinstance(refused, PlanRefused)
+    assert _parts(refused)["chart 'paid_by_region'"] == "its table or join is not its measures'"
+
+
+def test_a_join_written_as_a_table_meets_the_join_checks_a_join_meets():
+    """Read as a join, the text is held to every check a join is: one over a table the builder's grants leave out is
+    refused, through the repair, as `join` would be; text whose sources are not all tables (a subquery among them) is
+    no join, so it stays a table no builder can read."""
+    ungranted = "policy JOIN payroll ON payroll.salary = policy.premium"
+    reply = json.dumps(_with_paid(measure_rows={"table": ungranted}))
+    refused = _plan(GOAL, LLMPlanner(ScriptedModel([reply, reply])), _tools())
+    assert isinstance(refused, PlanRefused), refused
+    assert f"the join {ungranted!r}" in _parts(refused), _parts(refused)
+    context = _context()
+    for text in ("policy JOIN (SELECT * FROM payroll) AS p ON p.salary = policy.premium",
+                 "(SELECT * FROM payroll) AS p", "policy, LATERAL (SELECT * FROM payroll) AS p"):
+        refused = plan_from_draft(_with_paid(measure_rows={"table": text}), context)
+        assert isinstance(refused, PlanRefused), text
+        assert f"{text!r} is not a table this builder can read" in _parts(refused)["measure 'paid'"], text
+
+
+def test_a_reply_with_both_shapes_is_planned_with_no_repair():
+    reply = _with_paid(measure_rows={"table": JOIN}, chart_rows={"table": "policy"})
+    model = ScriptedModel([json.dumps(reply)])
+    plan = _plan(GOAL, LLMPlanner(model), _tools())
+    assert isinstance(plan, BuildPlan), plan
+    assert len(model.sent) == 1, "nothing went back for repair"
+    [paid] = [m for m in plan.measures if m.name == "paid"]
+    [chart] = [c for c in plan.charts if c.key == "paid_by_region"]
+    assert chart.dataset_id == paid.dataset_id < 0
+    assert [d.join for d in plan.datasets if d.placeholder == paid.dataset_id] == [JOIN]
+
+
 def test_a_draft_cannot_name_an_ungranted_table():
     draft = json.loads(_draft("SUM(salary)"))
     draft["measures"][0]["table"] = "payroll"
