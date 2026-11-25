@@ -16,11 +16,12 @@ from mnemiq.contract.values import JoinKey
 from mnemiq.superset.plan_rows import (Link, Refusal, Step, aggregated, base_of, chain, edges, far_side, join_text,
                                        links_of, qualified, rewrite)
 from mnemiq.superset.planner import joined_names
+from mnemiq.superset.saved_metrics import normalized
 from mnemiq.superset.settings import SUPERSET_DIALECT
 
 
-def _relationship(source: str, target: str, *keys: tuple[str, str]) -> Relationship:
-    return Relationship(id=f"{source}->{target}", from_=source, to=target, cardinality="many_to_one",
+def _relationship(source: str, target: str, *keys: tuple[str, str], name: str | None = None) -> Relationship:
+    return Relationship(id=name or f"{source}->{target}", from_=source, to=target, cardinality="many_to_one",
                         join_keys=[JoinKey(left=left, right=right) for left, right in keys])
 
 
@@ -39,10 +40,10 @@ UNIQUE = {("orders", "order_id"): True, ("order_items", "order_item_id"): True, 
           ("order_items", "order_id"): False, ("order_items", "product_id"): False,
           ("orders", "customer_id"): False}
 
-ITEM_ORDER = Link(("order_items", "order_id"), ("orders", "order_id"))
-ITEM_PRODUCT = Link(("order_items", "product_id"), ("products", "product_id"))
-ORDER_CUSTOMER = Link(("orders", "customer_id"), ("customers", "customer_id"))
-RETURN_ITEM = Link(("returns", "order_item_id"), ("order_items", "order_item_id"))
+ITEM_ORDER = Link(("order_items", "order_id"), ("orders", "order_id"), "order_items->orders")
+ITEM_PRODUCT = Link(("order_items", "product_id"), ("products", "product_id"), "order_items->products")
+ORDER_CUSTOMER = Link(("orders", "customer_id"), ("customers", "customer_id"), "orders->customers")
+RETURN_ITEM = Link(("returns", "order_item_id"), ("order_items", "order_item_id"), "returns->order_items")
 KNOWN = links_of(SHOP, NAMES)
 SHOP_EDGES = edges((), KNOWN)
 
@@ -61,8 +62,8 @@ def test_links_are_the_visible_relationships_by_table_name():
     by_id = [_relationship("obj-items", "obj-orders", ("order_id", "order_id"), ("region", "region")),
              _relationship("obj-orders", "obj-hidden", ("plan_id", "plan_id"))]
     assert links_of(by_id, {"obj-items": "Order Items", "obj-orders": "orders"}) == (
-        Link(("Order Items", "order_id"), ("orders", "order_id")),
-        Link(("Order Items", "region"), ("orders", "region")))
+        Link(("Order Items", "order_id"), ("orders", "order_id"), "obj-items->obj-orders"),
+        Link(("Order Items", "region"), ("orders", "region"), "obj-items->obj-orders"))
 
 
 def test_a_measures_base_is_the_table_inside_its_aggregate():
@@ -103,7 +104,8 @@ def test_a_chain_takes_the_shortest_path_over_unique_far_sides():
     assert chain("returns", {"customers"}, edges((direct,), KNOWN), UNIQUE) == (Step("customers", (direct,)),)
     # Walking a link from its far end joins the table it starts from: an item is returned at most once.
     assert chain("order_items", {"returns"}, SHOP_EDGES, UNIQUE) == (
-        Step("returns", (Link(("order_items", "order_item_id"), ("returns", "order_item_id")),)),)
+        Step("returns", (Link(("order_items", "order_item_id"), ("returns", "order_item_id"),
+                              "returns->order_items"),)),)
     assert chain("orders", {"orders"}, SHOP_EDGES, UNIQUE) == ()
 
 
@@ -150,6 +152,44 @@ def test_two_shortest_paths_or_two_links_to_a_table_are_ambiguous():
     _refused(chain("orders", {"customers"}, edges((), (*KNOWN, payer)), UNIQUE),
              "orders.customer_id = customers.customer_id", "orders.payer_id = customers.customer_id")
     _refused(chain("order_items", {"customers"}, edges((), (*KNOWN, payer)), UNIQUE), "orders.payer_id")
+    # Stated as one link from orders to customers, the two are still two: one link uses each column once.
+    both = (Link(("orders", "customer_id"), ("customers", "customer_id"), "orders->customers"),
+            Link(("orders", "payer_id"), ("customers", "customer_id"), "orders->customers"))
+    _refused(chain("orders", {"customers"}, edges(both, KNOWN), UNIQUE),
+             "orders.customer_id = customers.customer_id or orders.payer_id = customers.customer_id")
+
+
+def test_two_relationships_between_one_pair_are_two_links():
+    # An employee works in a department, and a department is managed by an employee.
+    staff = links_of([_relationship("employees", "departments", ("department_id", "department_id")),
+                      _relationship("departments", "employees", ("manager_id", "employee_id"))],
+                     {"employees": "employees", "departments": "departments"})
+    unique = {("departments", "department_id"): True, ("employees", "employee_id"): True,
+              ("employees", "department_id"): False}
+    _refused(chain("employees", {"departments"}, edges((), staff), unique),
+             "employees.department_id = departments.department_id or employees.employee_id = departments.manager_id")
+    # From a department only the manager's link is one to join by: a department has many employees.
+    managed = Link(("departments", "manager_id"), ("employees", "employee_id"), "departments->employees")
+    assert chain("departments", {"employees"}, edges((), staff), unique) == (Step("employees", (managed,)),)
+    # The same columns as one link join by both together.
+    one = (Link(("employees", "department_id"), ("departments", "department_id"), "employees->departments"),
+           Link(("departments", "manager_id"), ("employees", "employee_id"), "employees->departments"))
+    assert chain("employees", {"departments"}, edges(one, ()), unique) == (Step("departments", (
+        one[0], Link(("employees", "employee_id"), ("departments", "manager_id"), "employees->departments"))),)
+    # An order's customer and its payer's account: two relationships to one table, no column used twice.
+    paid = links_of([*SHOP, _relationship("orders", "customers", ("payer_id", "account_id"), name="payer")], NAMES)
+    _refused(chain("order_items", {"customers"}, edges((), paid), {**UNIQUE, ("customers", "account_id"): True}),
+             "orders.customer_id = customers.customer_id or orders.payer_id = customers.account_id")
+    # A relationship of the same column and one more is another link, each named with all its columns.
+    priced = links_of([*SHOP, _relationship("order_items", "products", ("product_id", "product_id"),
+                                            ("unit_price", "unit_price"), name="priced")], NAMES)
+    _refused(chain("order_items", {"products"}, edges((), priced), UNIQUE),
+             "order_items.product_id = products.product_id or order_items.product_id = products.product_id and "
+             "order_items.unit_price = products.unit_price")
+    # Two relationships of the same columns are one link.
+    twice = links_of([*SHOP, _relationship("orders", "customers", ("customer_id", "customer_id"), name="declared")],
+                     NAMES)
+    assert chain("orders", {"customers"}, edges((), twice), UNIQUE) == (Step("customers", (ORDER_CUSTOMER,)),)
 
 
 def test_an_unreachable_table_is_refused_by_name():
@@ -197,9 +237,13 @@ def test_quoted_and_mixed_case_names_resolve_by_dialect():
     assert qualified("SUM(Ärger.Wert)") == [("Ärger", "wert")]
     assert base_of('SUM("Order Items".revenue)', None) == "Order Items"
     assert aggregated('SUM("ORDERS".revenue)') == {"ORDERS"}
+    # A column the dataset keeps its name for keeps its spelling, quotes and all; a renamed one is quoted.
     assert rewrite('SUM("Order Items".revenue) / COUNT(Order_Items.Order_Id)',
                    {("Order Items", "revenue"): "revenue", ("order_items", "order_id"): "order_id"}) == (
-        'SUM("revenue") / COUNT("order_id")')
+        'SUM(revenue) / COUNT(Order_Id)')
+    assert rewrite('SUM("Order Items"."Revenue")', {("Order Items", "Revenue"): "Revenue"}) == 'SUM("Revenue")'
+    assert rewrite('SUM("Order Items"."Revenue")', {("Order Items", "Revenue"): "Order Items_Revenue"}) == (
+        'SUM("Order Items_Revenue")')
     mixed = Link(("Order Items", "Order Id"), ("orders", "order_id"))
     steps = chain("Order Items", {"orders"}, edges((mixed,), ()), {("orders", "order_id"): True})
     assert join_text("Order Items", steps) == (
@@ -208,10 +252,15 @@ def test_quoted_and_mixed_case_names_resolve_by_dialect():
 
 def test_rewrite_names_every_qualified_column_as_the_dataset_does():
     names = joined_names([(table, COLUMNS[table]) for table in ("order_items", "orders", "products")])
-    assert rewrite("SUM(order_items.revenue)", names) == 'SUM("revenue")'
+    assert rewrite("SUM(order_items.revenue)", names) == "SUM(revenue)"
     assert rewrite("AVG(CASE WHEN orders.channel = 'web' THEN order_items.unit_price END)", names) == (
-        """AVG(CASE WHEN "channel" = 'web' THEN "order_items_unit_price" END)""")
+        """AVG(CASE WHEN channel = 'web' THEN "order_items_unit_price" END)""")
     rewritten = rewrite("SUM(order_items.quantity * products.unit_price) / COUNT(DISTINCT orders.order_id)", names)
-    assert rewritten == 'SUM("quantity" * "products_unit_price") / COUNT(DISTINCT "orders_order_id")'
+    assert rewritten == 'SUM(quantity * "products_unit_price") / COUNT(DISTINCT "orders_order_id")'
+    # A measure over one table's columns reads as the same measure written on that table's own dataset, so a saved
+    # metric or a kept measure of that definition is still matched.
+    assert normalized(rewrite("SUM(order_items.revenue)", names)) == normalized("SUM(revenue)")
+    assert normalized(rewrite("SUM(order_items.revenue * order_items.quantity)", names)) == (
+        normalized("SUM(revenue * quantity)"))
     assert not [column for column in sqlglot.parse_one(f"SELECT {rewritten}", read=SUPERSET_DIALECT)
                 .find_all(exp.Column) if column.table]
