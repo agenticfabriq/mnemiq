@@ -372,10 +372,12 @@ to 1, which Superset shows as a percent: 0.25 shows as 25%; never multiply it by
 with a name of its own.
 A written measure adds up the rows of one table, the table of the columns its aggregate adds up: SUM(loans.renewals) \
 adds up loans. Its aggregate never adds up columns of two tables, though a condition on another table's column may say \
-which rows it covers. A count, sum or share of 1s counts the rows of the table its condition names. Give the measure \
-"table", the table whose rows it counts, for COUNT(*), where its condition names columns of more than one table, and \
-where it counts another table's rows, as the example's ebook_loans counts loans by their book's format. To count \
-rows, prefer COUNT(<table>.<key>), which names its table. Use a saved metric where one says what \
+which rows it covers. A measure that adds up no column, a count, sum or share of 1s, counts the rows of the table its \
+condition names. Give it "table", the table whose rows it counts, for COUNT(*), SUM(1) or COUNT(1), where its \
+condition names columns of more than one table, and where it counts another table's rows, as the example's \
+ebook_loans counts loans by their book's format. A count of 1s beside an aggregate that adds up a column counts that \
+column's table's rows, whatever its condition or "table" names: SUM(loans.renewals) / COUNT(CASE WHEN books.format \
+= 'ebook' THEN 1 END) adds up loans. To count rows, prefer COUNT(<table>.<key>), which names its table. Use a saved metric where one says what \
 a measure needs: never write your own measure for what a saved metric says. A saved metric that names no column, such \
 as count (COUNT(*)), is only for a table whose measures no chart shows with another table's column; write \
 COUNT(<table>.<key>) instead. A written measure's name and label are never a saved metric's name on its table, and no \

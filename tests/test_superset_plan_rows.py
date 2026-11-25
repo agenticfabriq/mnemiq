@@ -121,8 +121,9 @@ WIN_RATE = "AVG(CASE WHEN deals.stage IN ('won', 'lost') THEN CASE WHEN deals.st
     ("SUM(CASE WHEN orders.status = 'open' THEN 1 ELSE 0 END)::double precision / NULLIF(COUNT(*), 0)", "orders"),
     ("COUNT(*) FILTER (WHERE orders.status = 'open')", "orders"),
     ("SUM(CASE orders.status WHEN 'open' THEN 1 END)", "orders"),
+    ("COALESCE(SUM(CASE WHEN orders.status = 'open' THEN 1 END), 0)", "orders"),
 ], ids=["a sum of 1s", "a count of 1s", "a share of 1.0 and 0", "a share inside a condition", "a ratio of two sums",
-        "a share of all rows", "a filtered count", "a simple case"])
+        "a share of all rows", "a filtered count", "a simple case", "a sum of 1s inside a function"])
 def test_an_aggregate_of_no_column_counts_the_rows_of_the_table_its_condition_names(expression, base):
     """A count or sum of 1s, or a share of 1.0 and 0, adds up no column: it counts the rows of the table its condition
     names, every column of every condition inside its aggregates being of that one table, so it goes back for no
@@ -135,12 +136,15 @@ def test_an_aggregate_of_no_column_counts_the_rows_of_the_table_its_condition_na
 
 @pytest.mark.parametrize("expression", [
     "COUNT(*)", "SUM(1)", "COUNT(1)", "AVG(CASE WHEN 1 = 1 THEN 1.0 ELSE 0 END)",
-    # A window's partition chooses no aggregate's rows.
+    # A window's partition chooses no aggregate's rows, and a condition outside the aggregate none of its rows either.
     "SUM(COUNT(*)) OVER (PARTITION BY orders.channel)",
-], ids=["count star", "a sum of 1", "a count of 1", "a constant condition", "a window over a count"])
+    "CASE WHEN orders.status = 'open' THEN COUNT(*) END",
+], ids=["count star", "a sum of 1", "a count of 1", "a constant condition", "a window over a count",
+        "a condition outside its aggregate"])
 def test_an_aggregate_that_names_no_column_takes_its_table(expression):
-    """An aggregate naming no column, in what it adds up or in its condition, says nothing of whose rows it counts: its
-    `table` says that, and without one it goes back saying to give it."""
+    """An aggregate naming no column, in what it adds up or in its condition, says nothing of whose rows it counts,
+    whatever the expression names outside it: its `table` says that, and without one it goes back saying to give
+    it."""
     assert base_of(expression, "orders") == "orders"
     assert _refused(base_of(expression, None)) == NAMES_NO_COLUMN
 

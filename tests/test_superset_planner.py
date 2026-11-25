@@ -1005,14 +1005,19 @@ def test_the_prompt_asks_for_qualified_columns_and_links():
     assert ("State a link wherever a measure or a chart names a table, in a condition too, that the known links do not "
             "connect to the measure's table: with no links shown, state every link your plan needs.") in system
     assert "Where two ways connect the same tables, state the link the chart means." in system
-    # A measure whose aggregate adds up no column counts the rows of the table its condition names, and says its table
-    # where nothing names one, where its condition names two, or where it counts another table's rows; a count is
-    # better written over a key.
-    assert ('A count, sum or share of 1s counts the rows of the table its condition names. Give the measure "table", '
-            "the table whose rows it counts, for COUNT(*), where its condition names columns of more than one table, "
-            "and where it counts another table's rows, as the example's ebook_loans counts loans by their book's "
-            "format. To count rows, prefer COUNT(<table>.<key>)") in system
-    assert "names no table" not in system and "whatever its condition names" not in system
+    # A measure that adds up no column counts the rows of the table its condition names, and says its table where
+    # nothing names one, where its condition names two, or where it counts another table's rows. The rule is the
+    # measure's, not each aggregate's: a count of 1s beside an aggregate adding up a column counts that column's
+    # table's rows, as `base_of` reads it, and a "table" there changes nothing. A count is better written over a key.
+    assert ("A measure that adds up no column, a count, sum or share of 1s, counts the rows of the table its condition "
+            'names. Give it "table", the table whose rows it counts, for COUNT(*), SUM(1) or COUNT(1), where its '
+            "condition names columns of more than one table, and where it counts another table's rows, as the "
+            "example's ebook_loans counts loans by their book's format.") in system
+    assert ("A count of 1s beside an aggregate that adds up a column counts that column's table's rows, whatever its "
+            'condition or "table" names') in system
+    assert "To count rows, prefer COUNT(<table>.<key>)" in system
+    for unscoped in ("names no table", "whatever its condition names,", "A count, sum or share of 1s counts"):
+        assert unscoped not in system, unscoped
     # Nothing about rows, joins or a joined dataset's column names, which the model no longer decides.
     for unasked in ("JOIN", '"join"', "<table>_<column>", "the chart's rows", "on a join", "each column alone",
                     "one table or one join"):
