@@ -458,6 +458,21 @@ def _scalar(value: object) -> bool:
     return isinstance(value, (str, int, float, bool))
 
 
+def _join_tables(text: str) -> set[str] | None:
+    """The tables a FROM clause joins, each name as the dialect resolves it, when `text` is one SQL join (a FROM with at
+    least one JOIN); None when it is not (a bare table name among them)."""
+    try:
+        tree = sqlglot.parse_one(f"SELECT 1 FROM {text}", read=SUPERSET_DIALECT)
+    except SqlglotError:
+        return None
+    if not isinstance(tree, exp.Select) or tree.args.get("from_") is None or not tree.args.get("joins"):
+        return None
+    sources = [tree.args["from_"].this, *(join.this for join in tree.args["joins"])]
+    if not all(isinstance(source, exp.Table) for source in sources):
+        return None
+    return {resolve_identifier(source.this, SUPERSET_DIALECT) for source in sources}
+
+
 def _join_key(join: str) -> str | None:
     """The join as sqlglot writes it back, so two spellings of one join plan one dataset; None when it does not
     parse."""
@@ -483,6 +498,10 @@ def plan_from_draft(draft: Mapping[str, Any], context: PlanContext) -> BuildPlan
 
     def dataset_of(item: Mapping, part: str) -> int | None:
         table, join = item.get("table"), item.get("join")
+        # A join written where a table goes (Qwen3.8-27B wrote one): text that names no table and is one SQL join is
+        # read as the join it is.
+        if join is None and isinstance(table, str) and table not in tables and _join_tables(table) is not None:
+            table, join = None, table
         if (table is None) == (join is None):
             refuse(part, "name its rows with a table or a join, one of the two")
             return None
@@ -587,7 +606,17 @@ def plan_from_draft(draft: Mapping[str, Any], context: PlanContext) -> BuildPlan
                 of_refs.add(saved[name][1])
             else:
                 refuse(part, f"it plots {name!r}, which is no measure of the plan")
-        own = dataset_of(item, part) if item.get("table") is not None or item.get("join") is not None else None
+        # A chart's rows are its measures'. One that names a table its measures' join joins (Qwen3.8-27B named
+        # `orders` for a measure over `order_items JOIN orders`) is planned on that join, as one that names none is;
+        # the check reads its columns there.
+        theirs = next(iter(of_refs)) if len(of_refs) == 1 else None
+        joined = next((d for d in planned.values() if d.placeholder == theirs and d.join), None)
+        named = item.get("table")
+        if item.get("join") is None and isinstance(named, str) and named in tables and joined is not None \
+                and named in (_join_tables(joined.join) or set()):
+            own = theirs
+        else:
+            own = dataset_of(item, part) if item.get("table") is not None or item.get("join") is not None else None
         if len(of_refs) > 1:
             refuse(part, "its measures are on more than one table or join; a chart's measures are on one")
         elif own is not None and of_refs and of_refs != {own}:
