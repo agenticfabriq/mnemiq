@@ -366,23 +366,47 @@ still to come. In short:
   that already filters the column `IS NOT NULL` is not asked. One that filters it `IS NULL` beside the negation selects
   no row, since a chart's filters all apply, and is refused without asking. The probe runs as the builder and says
   only whether such a row exists: no value reaches the model.
-- **A joined table's saved metrics, on a join.** When a chart needs another table's columns, the plan may name a
-  joined table's saved metric on the join instead of writing its own measure, and mnemiq carries it as the table
+- **Columns named with their tables, and the rows a measure reads.** The planning model names every column as
+  `<table>.<column>`, in a measure's expression and in a chart's columns (`orders.order_date`,
+  `SUM(order_items.revenue)`), and never writes a `table` or a join. mnemiq reads the rest from those names.
+  - **A measure's base** is the table of the columns inside its aggregate. A measure that adds up no column (`COUNT(*)`,
+    a count or sum of 1s, a share written from 1.0 and 0) gives `table`, the one table whose rows it counts.
+  - **Links.** Where the known links (the snapshot's relationships, which the prompt shows) do not connect a table a
+    measure or chart needs, the model states one: `{"from": "order_items.order_id", "to": "orders.order_id"}`, from the
+    table whose rows reference to the table referenced. A stated link decides its pair of tables.
+  - **One dataset per base.** When a base needs nothing else, its measures and charts use the table's own dataset.
+    When a chart or measure needs another table, mnemiq makes a virtual dataset: the base `LEFT JOIN` each needed table,
+    along the shortest chain of links whose far side holds each value once. A `LEFT JOIN` from the base keeps every row
+    of the base, so a measure over it counts the base's rows as it would alone. Among equally short chains, the one
+    with the most stated links wins. Two chains with none preferred, two different links between one pair of tables,
+    or no chain at all go back to the model once for the repair, which is told to state the link.
+  - **A far side that repeats is never joined,** since it would repeat the base's rows. Enrichment's profile says
+    whether a key holds each value once. Where it does not say either way, mnemiq measures it as the builder, through
+    Superset: `COUNT(*)` against `COUNT(DISTINCT ...)` of the key's non-null values, and joins only if the table holds
+    each value once. A key column the builder's grants mask or deny, or a table a row rule filters, is not probed, so
+    a join over one is refused.
+  - **Column names on the made dataset** follow one rule, which the model never writes: a column only one included
+    table has keeps its name, and one that two share is `<table>_<column>` (`orders_region`, `customers_region`).
+  - **Measures are decided over the made dataset** exactly as Superset reads it, as `(<its SELECT>) AS virtual_table`,
+    under the builder's grants, as every measure is.
+  - Every measure on a base lives on that base's one dataset. A certified saved metric of a base whose charts need
+    another table is therefore carried onto the made dataset as a copy, with the same expression and so the same
+    numbers, and those charts do not show Superset's certification.
+  - Building onto a dashboard, the prompt shows the dashboard's kept measures by name and label only, and the model
+    gives a new measure a new name and label.
+- **A saved metric on a made dataset.** A plan may name a saved metric of a table instead of writing its own measure,
+  and where that table's charts need another table, mnemiq carries the metric onto the made dataset as its table
   defines it. It prints the metric's expression twice from one parse: once with each column named by its table's
   place in the join, which it decides under the builder's grants as it decides every measure, and once naming each
-  column as the joined dataset does (`<table>_<column>` for a column two joined tables share), which the chart sends
-  as its SQL metric, labelled with the metric's verbose name. Its values are its table's, so none is probed. It is
-  refused, and the repair told why, where it would not mean what its table defines:
+  column as the made dataset does (`<table>_<column>` for a column two tables share), which the chart sends as its SQL
+  metric, labelled with the metric's verbose name. Its values are its table's, so none is probed. It is refused, and
+  the repair told why, where it would not mean what its table defines:
   - its expression reads anything but its own table's columns, or names none of them, so `count` is never carried;
   - its table is on a side an outer join may fill with NULL: the right of a `LEFT JOIN`, every table before a
     `RIGHT JOIN`, any table of a `FULL JOIN`;
   - with the fan-out guard on (`MNEMIQ_GUARD_FANOUT`), the join repeats its table's rows, meets another table by a
     key not known to be unique there (one with no uniqueness profile, say), or joins it by no key to every other
     table, whatever the metric aggregates.
-
-  With `JOIN`, the rows of the metric's table that no other table matches are left out of it, as they are of every
-  chart over the join; on the side a `LEFT JOIN` or `RIGHT JOIN` keeps every row of (the left of a `LEFT JOIN`, the
-  right of a `RIGHT JOIN`), they are kept.
 
   Its chart, like every chart on a dataset a build makes over a join, is checked against mnemiq's own SQL over the
   dataset's SQL, read as Superset reads a virtual dataset, while that SQL is unchanged and no row rule applies to the
