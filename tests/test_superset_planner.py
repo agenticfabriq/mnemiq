@@ -861,10 +861,40 @@ def test_a_chart_on_one_table_of_its_measures_join_is_planned_on_the_join():
     context = _context()
     unnamed = plan_from_draft(_with_paid(measure_rows={"join": JOIN}), context)
     assert isinstance(unnamed, BuildPlan), unnamed
-    for table in ("policy", "claim"):
-        moved = plan_from_draft(_with_paid(measure_rows={"join": JOIN}, chart_rows={"table": table}), context)
-        assert moved == unnamed, table
-    refused = plan_from_draft(_with_paid(measure_rows={"join": JOIN}, chart_rows={"table": "agent"}), context)
+    # `region` is policy's alone, so it keeps its name on the join (a claim chart is in the next test).
+    moved = plan_from_draft(_with_paid(measure_rows={"join": JOIN}, chart_rows={"table": "policy"}), context)
+    assert moved == unnamed
+    for rows in ({"table": "agent"}, {"table": "agent", "dimensions": ["office"]}):  # office is agent's own
+        refused = plan_from_draft(_with_paid(measure_rows={"join": JOIN}, chart_rows=rows), context)
+        assert isinstance(refused, PlanRefused), rows
+        assert _parts(refused)["chart 'paid_by_region'"] == "its table or join is not its measures'", rows
+
+
+def test_a_chart_moved_onto_the_join_keeps_each_column_where_it_named_it():
+    """Moved onto its measures' join, a chart's columns are read as the join names them: a column the chart's table
+    alone has keeps its name, and one two joined tables share is `<table>_<column>` of the chart's own table. Codex's
+    case: `policy_policy_id` is a column of both tables, and the join shows `policy.policy_id` as `policy_policy_id`;
+    a chart that named `claim` and grouped by its `policy_policy_id` must group by `claim_policy_policy_id`, never by
+    `policy.policy_id`. A chart column its named table does not have keeps the chart refused."""
+    from mnemiq.superset.planner import PlanColumn
+    context = _context()
+    widened = tuple(dataclasses.replace(t, columns=(*t.columns, PlanColumn("policy_policy_id", "INTEGER")))
+                    if t.name in ("policy", "claim") else t for t in context.tables)
+    context = dataclasses.replace(context, tables=widened)
+
+    def chart_of(**chart_rows) -> ChartSpec | PlanRefused:
+        plan = plan_from_draft(_with_paid(measure_rows={"join": JOIN}, chart_rows={"table": "claim", **chart_rows}),
+                               context)
+        return plan if isinstance(plan, PlanRefused) else next(c for c in plan.charts if c.key == "paid_by_region")
+
+    chart = chart_of(dimensions=["policy_policy_id"])
+    assert chart.dimensions == ("claim_policy_policy_id",), chart
+    chart = chart_of(dimensions=["status", "policy_id"], time_column="created_at",
+                     filters=[{"column": "status", "op": "=", "operand": "open"},
+                              {"column": "created_at", "op": "IS NOT NULL"}])
+    assert chart.dimensions == ("status", "claim_policy_id") and chart.time_column == "claim_created_at", chart
+    assert [f.column for f in chart.filters] == ["status", "claim_created_at"], chart
+    refused = chart_of(dimensions=["region"])  # policy's column, not claim's
     assert isinstance(refused, PlanRefused)
     assert _parts(refused)["chart 'paid_by_region'"] == "its table or join is not its measures'"
 

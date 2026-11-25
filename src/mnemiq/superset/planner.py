@@ -473,6 +473,46 @@ def _join_tables(text: str) -> set[str] | None:
     return {resolve_identifier(source.this, SUPERSET_DIALECT) for source in sources}
 
 
+def _on_the_join(chart: Mapping[str, Any], table: str, joined: set[str],
+                 tables: Mapping[str, "PlanTable"]) -> dict | None:
+    """`chart`, which names `table`, moved onto a join of `joined` tables: its columns renamed as the join's dataset
+    names `table`'s columns (`_joined`: a column one joined table alone has keeps its name, one two share is
+    `<table>_<column>`), so each still reads the column of `table` the chart named. None, and the chart stays where it
+    was, when `table` is not one of the join's, a joined table is not one the builder can read, or a column the chart
+    names is not `table`'s."""
+    if table not in joined or not joined <= tables.keys():
+        return None
+    having: dict[str, int] = {}
+    for name in joined:
+        for column in tables[name].columns:
+            having[column.name] = having.get(column.name, 0) + 1
+    own = {column.name for column in tables[table].columns}
+
+    def shown(column: object) -> str | None:
+        if not isinstance(column, str) or column not in own:
+            return None
+        return column if having[column] == 1 else f"{table}_{column}"
+
+    moved = {key: value for key, value in chart.items() if key != "table"}
+    dimensions = chart.get("dimensions", [])
+    if isinstance(dimensions, list):
+        moved["dimensions"] = [shown(d) for d in dimensions]
+        if None in moved["dimensions"]:
+            return None
+    for key in ("time_column", "source", "target"):
+        if chart.get(key) is not None:
+            moved[key] = shown(chart[key])
+            if moved[key] is None:
+                return None
+    if isinstance(chart.get("filters"), list):
+        moved["filters"] = []
+        for each in chart["filters"]:
+            if not isinstance(each, dict) or shown(each.get("column")) is None:
+                return None
+            moved["filters"].append({**each, "column": shown(each["column"])})
+    return moved
+
+
 def _join_key(join: str) -> str | None:
     """The join as sqlglot writes it back, so two spellings of one join plan one dataset; None when it does not
     parse."""
@@ -612,9 +652,11 @@ def plan_from_draft(draft: Mapping[str, Any], context: PlanContext) -> BuildPlan
         theirs = next(iter(of_refs)) if len(of_refs) == 1 else None
         joined = next((d for d in planned.values() if d.placeholder == theirs and d.join), None)
         named = item.get("table")
-        if item.get("join") is None and isinstance(named, str) and named in tables and joined is not None \
-                and named in (_join_tables(joined.join) or set()):
-            own = theirs
+        moved = None
+        if item.get("join") is None and isinstance(named, str) and named in tables and joined is not None:
+            moved = _on_the_join(item, named, _join_tables(joined.join) or set(), tables)
+        if moved is not None:
+            own, item = theirs, moved
         else:
             own = dataset_of(item, part) if item.get("table") is not None or item.get("join") is not None else None
         if len(of_refs) > 1:
