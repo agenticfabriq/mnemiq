@@ -1166,6 +1166,23 @@ def test_null_on_an_optional_key_reads_as_the_key_left_out(place, key):
     assert plan_from_draft(nulled, context) == expected
 
 
+@pytest.mark.parametrize(("changes", "why"), [
+    ({"grain": ["month"]}, "its grain ['month'] is not one of second, minute, hour, day, week, month, quarter, year"),
+    ({"grain": {"month": 1}}, "its grain {'month': 1} is not one of second, minute, hour, day, week, month, quarter, "
+                              "year"),
+    ({"filters": 5}, "its filters are a list, each an object with a column and an op"),
+    ({"filters": {"column": "orders.channel", "op": "=", "operand": "web"}},
+     "its filters are a list, each an object with a column and an op"),
+], ids=["grain a list", "grain an object", "filters a number", "filters an object"])
+def test_a_grain_or_filters_of_the_wrong_shape_goes_back_never_raises(changes, why):
+    """A model's draft is JSON of any shape: a grain that is no text, or filters that are no list, go back for the
+    repair with a plain reason, and never raise."""
+    draft = _shop_draft({**_bar("by_month", time_column="orders.order_date"), **changes})
+    refused = plan_from_draft(draft, _shop_seen())
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused) == {"chart 'by_month'": why}
+
+
 def test_null_on_a_required_key_is_refused_as_written():
     """A key a draft must hold is never read as left out: null there is refused, as any value of the wrong shape."""
     draft = _shop_draft({**_bar("by_region", "customers.region"), "dimensions": None})

@@ -690,10 +690,14 @@ def plan_from_draft(draft: Mapping[str, Any], context: PlanContext) -> BuildPlan
             dimensions = []
         found: dict[str, Any] = {"dimensions": [column(text) for text in dimensions]}
         grain = item.get("grain")
-        if grain is not None and grain not in GRAINS and grain not in _GRAIN_WORD:
+        if grain is not None and (not isinstance(grain, str) or (grain not in GRAINS and grain not in _GRAIN_WORD)):
             refuse(part, f"its grain {grain!r} is not one of {', '.join(GRAINS)}")
         found["filters"] = []
-        for each in item.get("filters") or []:
+        filters = item.get("filters")
+        if filters is not None and not isinstance(filters, list):
+            refuse(part, "its filters are a list, each an object with a column and an op")
+            filters = []
+        for each in filters or []:
             if not isinstance(each, dict) or not isinstance(each.get("column"), str) \
                     or not isinstance(each.get("op"), str):
                 refuse(part, "a filter is an object with a column and an op")
