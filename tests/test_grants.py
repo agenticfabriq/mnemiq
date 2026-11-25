@@ -23,6 +23,21 @@ def test_grants_are_the_union_of_roles_and_groups(tmp_path):
     assert grants.allows("claim") and grants.allows("person")
 
 
+def test_both_readers_take_a_roles_row_filters_from_one_reading(tmp_path, monkeypatch):
+    """`grants_for` applies a role's row filters and `row_filtered_objects` lists their tables, so an advisory never
+    quotes a filtered table's values. Both read them through `_role_row_filters`, so a place one learns to read the
+    other reads too. Pinned by swapping that reading: a reader that goes around it does not see the swap. Comparing the
+    two readers' outputs cannot pin this: a place only one of them reads shows only in a fixture that already holds it."""
+    from mnemiq.authz import grants as module
+
+    provider = FileAuthzProvider(_policy(tmp_path, {
+        "west": {"read": ["claim"], "row_filters": {"claim": "region = 'w'"}}, "analyst": ["claim"]}))
+    monkeypatch.setattr(module, "_role_row_filters",
+                        lambda granted: {"swapped": "1 = 1"} if isinstance(granted, dict) else {})
+    assert provider.grants_for(_identity(roles=["west"])).row_filters == {"swapped": "1 = 1"}
+    assert provider.row_filtered_objects() == frozenset({"swapped"})
+
+
 def test_an_unlisted_object_is_denied(tmp_path):
     provider = FileAuthzProvider(_policy(tmp_path, {"analyst": ["claim"]}))
     grants = provider.grants_for(_identity(roles=["analyst"]))

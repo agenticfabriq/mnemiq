@@ -68,6 +68,22 @@ EMPTY = GrantSet(frozenset())
 UNAVAILABLE = GrantSet(frozenset(), available=False)
 
 
+def _role_row_filters(granted: object) -> dict:
+    """One role's row filters, table to predicate, as the policy writes them; {} for a role that has none.
+
+    The single reading of where a role's row filters live, for `grants_for`, which applies them, and
+    `row_filtered_objects`, which lists the tables they cover so an advisory never quotes those tables' values. Two
+    readings drift: a place one learns to read and the other does not is a filtered table whose values the advisory
+    shows. A list-form grant reads without filters. A `row_filters` that is not a mapping raises TypeError: neither
+    reader can say what it filters."""
+    if not isinstance(granted, dict):
+        return {}
+    filters = granted.get("row_filters") or {}
+    if not isinstance(filters, dict):
+        raise TypeError(f"row_filters is a {type(filters).__name__}, not a mapping of table to predicate")
+    return filters
+
+
 class AuthzProvider(Protocol):
     def grants_for(self, identity: IdentityContext) -> GrantSet: ...
 
@@ -113,14 +129,7 @@ class FileAuthzProvider:
         try:
             with open(self._path) as fh:
                 roles = json.load(fh)["roles"]
-            objects: set[str] = set()
-            for granted in roles.values():
-                if isinstance(granted, dict):
-                    filters = granted.get("row_filters") or {}
-                    if not isinstance(filters, dict):
-                        return None
-                    objects.update(str(table) for table in filters)
-            return frozenset(objects)
+            return frozenset(str(table) for granted in roles.values() for table in _role_row_filters(granted))
         except (OSError, json.JSONDecodeError, KeyError, TypeError, AttributeError):
             return None
 
@@ -152,7 +161,7 @@ class FileAuthzProvider:
                 writable.update(str(o) for o in granted.get("write", []))
                 clearance.update(str(x) for x in granted.get("pii_clearance", []))
                 mask.update(str(x) for x in granted.get("pii_mask", []))
-                for table, filt in (granted.get("row_filters") or {}).items():
+                for table, filt in _role_row_filters(granted).items():
                     # Matched case-INSENSITIVELY. Unquoted identifiers are case-insensitive in
                     # all three engines, so two roles naming one table in different cases are two
                     # grants on the SAME table and must OR-combine like any other pair -- which is
