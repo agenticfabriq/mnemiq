@@ -542,10 +542,11 @@ def test_a_kept_name_on_the_same_dataset_with_another_expression_is_refused():
     assert isinstance(refused, PlanRefused) and "this dashboard keeps" in _parts(refused)["measure 'total_premium'"]
 
 
-def test_the_planner_is_told_the_measures_the_dashboard_keeps_and_a_fresh_build_hears_nothing_of_them():
-    """The measures a dashboard keeps reach the model in the user prompt, each with its name, label and kind; its
-    expression and table only where its dataset is a table this builder can see, since a dashboard's editor may read
-    fewer tables than its measures are on. A build with none kept is sent the prompt it was sent before."""
+def test_kept_measures_are_shown_by_name_and_label_only():
+    """The measures a dashboard keeps reach the model in the user prompt by their names and labels, which its own
+    measures leave to them, and nothing else: a kept measure's stored expression names its dataset's columns, never a
+    column with its table as the model writes one, and its dataset may join tables the plan never names. A build with
+    none kept is sent the prompt it was sent before."""
     # A second physical dataset over policy, which is no table's own dataset of the catalogue.
     second = {"id": 60, "table_name": "policy", "schema": "public", "database_id": 7, "is_virtual": False, "sql": None,
               "metrics": []}
@@ -554,10 +555,13 @@ def test_the_planner_is_told_the_measures_the_dashboard_keeps_and_a_fresh_build_
     told = FakePlanner(_one_bar(_measure("premium_on_policy", "Premium")))
     _plan(GOAL, told, _tools(infos={ELSEWHERE: READABLE_JOIN, 60: second}), kept=kept)
     system, user = plan_prompt(GOAL, told.contexts[0])
-    assert "this dashboard already keeps" in user and "never one of theirs" in user, user
-    assert '"name": "total_premium"' in user and '"label": "Total premium"' in user, user
-    assert '"expression": "SUM(premium)"' in user and '"expression": "AVG(premium)"' in user, user
-    assert '"expression": "COUNT(claim_id)"' in user and '"table": "claim"' in user, user
+    lines = user.split("\n\nThe dashboard this builds onto already keeps these measures:\n", 1)[1].splitlines()
+    assert json.loads(lines[0]) == [{"name": "total_premium", "label": "Total premium"},
+                                    {"name": "claims_kept", "label": "Claims"},
+                                    {"name": "premium_avg", "label": "Average premium"}], user
+    assert lines[1:] == ["Give each measure of your plan a name and a label none of these has."], user
+    for unsaid in ("SUM(premium)", "AVG(premium)", "COUNT(claim_id)", '"expression"', '"kind"', '"table": "claim"'):
+        assert unsaid not in user.split("already keeps", 1)[1], unsaid
     fresh = FakePlanner(_one_bar(PREMIUM))
     _plan(GOAL, fresh, _tools())
     plain_system, plain_user = plan_prompt(GOAL, fresh.contexts[0])
@@ -972,6 +976,118 @@ def test_the_context_holds_the_visible_relationships_and_key_facts():
     assert [(link.left, link.right) for link in narrow.contexts[0].links] == [
         (("order_items", "order_id"), ("orders", "order_id"))]
     assert {table for table, _ in narrow.contexts[0].unique} == {"orders", "order_items"}
+
+
+def _seen_document(user: str) -> dict:
+    """What a first user prompt shows the model, as the JSON it holds."""
+    return json.loads(user.split("What this builder can see:\n", 1)[1])
+
+
+def test_the_prompt_asks_for_qualified_columns_and_links():
+    """The model says what to show: each column named with its table, each measure's expression, each chart's columns,
+    and a link only where the known ones do not connect a chart's tables. Which rows a chart reads, how its tables are
+    joined and what a joined dataset calls a column are mnemiq's, and the prompt asks the model for none of them."""
+    system, _ = plan_prompt(SHOP_GOAL, _shop_seen())
+    assert '{"measures": [...], "charts": [...], "links": [...], "reuse_dashboard": null}' in system
+    assert "Name every column with its table, as <table>.<column>" in system
+    assert ('Links: {"from": "<table>.<column>", "to": "<table>.<column>"}, a column of the table whose rows refer to '
+            "another table, equal to that table's key (order_lines.order_id to orders.order_id)") in system
+    assert "or where two ways connect the same tables, to say which the chart means" in system
+    # A measure whose aggregate adds up no column says its table; a count is better written over a key.
+    assert ('An aggregate that adds up no column, as COUNT(*) or a share of 1.0 and 0 does, names no table: give the '
+            'measure "table", the table whose rows it adds up. To count rows, prefer COUNT(<table>.<key>)') in system
+    # Nothing about rows, joins or a joined dataset's column names, which the model no longer decides.
+    for unasked in ("JOIN", '"join"', "<table>_<column>", "the chart's rows", "on a join", "each column alone",
+                    "one table or one join"):
+        assert unasked not in system, unasked
+
+
+def test_the_prompt_shows_the_known_links():
+    """The links the snapshot knows between the tables the builder sees are shown as the model writes one, so it can
+    copy one and state only what is missing. A table the grants leave out shows no link to it."""
+    _, user = plan_prompt(SHOP_GOAL, _shop_seen())
+    assert _seen_document(user)["links"] == [
+        {"from": "order_items.order_id", "to": "orders.order_id"},
+        {"from": "order_items.product_id", "to": "products.product_id"},
+        {"from": "orders.customer_id", "to": "customers.customer_id"},
+        {"from": "returns.order_item_id", "to": "order_items.order_item_id"}]
+    narrow = FakePlanner(_valid_plan())
+    _plan(SHOP_GOAL, narrow, _tools(datasets=[]), snapshot=SHOP, grants=GrantSet(frozenset({"orders", "order_items"})))
+    assert _seen_document(plan_prompt(SHOP_GOAL, narrow.contexts[0])[1])["links"] == [
+        {"from": "order_items.order_id", "to": "orders.order_id"}]
+    # Each side as the model names a column, quoted where the dialect would not read the name back as it is, and a key
+    # of two columns as two links.
+    from mnemiq.superset.plan_rows import Link, column_of
+    odd = dataclasses.replace(_shop_seen(), links=(Link(("Order Items", "order_id"), ("orders", "order_id"), "r1"),
+                                                   Link(("Order Items", "Line"), ("orders", "line"), "r1")))
+    shown = _seen_document(plan_prompt(SHOP_GOAL, odd)[1])["links"]
+    assert shown == [{"from": '"Order Items".order_id', "to": "orders.order_id"},
+                     {"from": '"Order Items"."Line"', "to": "orders.line"}]
+    assert [(column_of(link["from"]), column_of(link["to"])) for link in shown] == [
+        (link.left, link.right) for link in odd.links]
+
+
+# The tables the system prompt's example plans on: orders, their lines and their customers. The snapshot relates an
+# order to its customer and nothing to an order's lines, as the example says.
+_EXAMPLE_COLUMNS = {
+    "orders": (("order_id", "INTEGER", True), ("customer_id", "INTEGER", False), ("ordered_at", "DATE", None),
+               ("channel", "VARCHAR", None)),
+    "order_lines": (("order_line_id", "INTEGER", True), ("order_id", "INTEGER", False), ("quantity", "INTEGER", None)),
+    "customers": (("customer_id", "INTEGER", True), ("segment", "VARCHAR", None)),
+}
+EXAMPLE = Snapshot(version="v1", source_id="example", created_at="t",
+                   columns=[_shop_column(table, *column) for table, columns in _EXAMPLE_COLUMNS.items()
+                            for column in columns],
+                   relationships=[_shop_relationship("orders", "customer_id", "customers")])
+
+
+def test_the_prompts_example_is_a_plan_mnemiq_takes():
+    """The plan the system prompt shows as its example is one the reader and the check take as written, on tables
+    shaped as the example says, so the prompt never shows the model what mnemiq refuses. Its stated link is the one the
+    known links leave out: without it, the chart reaching a customer's segment from an order's lines is refused."""
+    system, _ = plan_prompt(SHOP_GOAL, _shop_seen())
+    (example,) = [json.loads(line) for line in system.splitlines() if line.startswith('{"measures": [{')]
+    goal = "Units sold by customer segment, and the share of web orders by quarter"
+    grants = GrantSet(frozenset(_EXAMPLE_COLUMNS))
+    model = ScriptedModel([json.dumps(example)])
+    plan = _plan(goal, LLMPlanner(model), _tools(datasets=[]), snapshot=EXAMPLE, grants=grants)
+    assert isinstance(plan, BuildPlan), plan
+    assert len(model.sent) == 1, "nothing went back for repair"
+    assert [(dataset.table, dataset.join) for dataset in plan.datasets] == [
+        (None, '"order_lines" LEFT JOIN "orders" ON "order_lines"."order_id" = "orders"."order_id" LEFT JOIN '
+               '"customers" ON "orders"."customer_id" = "customers"."customer_id"'),
+        ("orders", None)]
+    assert [measure.kind for measure in plan.measures] == [K.NUMBER, K.PERCENT]
+    unlinked = {key: value for key, value in example.items() if key != "links"}
+    recorder = FakePlanner(_valid_plan())
+    _plan(goal, recorder, _tools(datasets=[]), snapshot=EXAMPLE, grants=grants)
+    refused = plan_from_draft(unlinked, recorder.contexts[0])
+    assert isinstance(refused, PlanRefused) and list(_parts(refused)) == ["chart 'units_by_segment'"], refused
+
+
+@pytest.mark.parametrize(("place", "key"), [
+    ("plan", "links"),
+    *(("measure", key) for key in ("saved_metric", "description", "currency", "table")),
+    *(("chart", key) for key in ("time_column", "grain", "filters", "row_limit", "source", "target"))])
+def test_null_on_an_optional_key_reads_as_the_key_left_out(place, key):
+    """A model filling a JSON schema often writes null for a key it leaves out, and null on a key a draft may leave out
+    means nothing else: such a draft plans as the same draft without the key."""
+    context = _shop_seen()
+    plain = _shop_draft(_bar("by_region", "customers.region"),
+                        measures=({name: value for name, value in REVENUE.items() if name != "currency"},))
+    nulled = copy.deepcopy(plain)
+    {"plan": nulled, "measure": nulled["measures"][0], "chart": nulled["charts"][0]}[place][key] = None
+    expected = plan_from_draft(plain, context)
+    assert isinstance(expected, BuildPlan), expected
+    assert plan_from_draft(nulled, context) == expected
+
+
+def test_null_on_a_required_key_is_refused_as_written():
+    """A key a draft must hold is never read as left out: null there is refused, as any value of the wrong shape."""
+    draft = _shop_draft({**_bar("by_region", "customers.region"), "dimensions": None})
+    refused = plan_from_draft(draft, _shop_seen())
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused) == {"chart 'by_region'": "its dimensions are a list of columns, each named with its table"}
 
 
 ON_ITS_TABLE = _shop_draft({"key": "revenue", "family": "big_number", "title": "Total revenue",
@@ -3245,28 +3361,30 @@ def test_a_carried_metric_counts_toward_a_plans_measures(monkeypatch):
     assert _parts(refused)["the plan"] == "it writes 2 measures; a plan writes at most 1"
 
 
-CARRYING_PROMPT = (
+SAVED_METRIC_PROMPT = (
     '- a saved metric of a table\'s dataset: {"name": the plan\'s own name for it, "saved_metric": the saved metric\'s '
-    'name, "kind": ..., "table": ...}, or, on a join, {"name", "saved_metric", "kind", "table": the joined table whose '
-    'saved metric it is, "join": "a JOIN b ON ..."}. The same saved metric on two tables, or on two joins, is two '
-    "measures, each with a name of its own.\n"
-    "Use a saved metric where one says what a measure needs, on a join too: never write your own measure for what a "
-    "joined table's saved metric says. Write a join only where the charts need columns of more than one table. A join "
-    "is tables joined with JOIN, LEFT JOIN, RIGHT JOIN or FULL JOIN, each ON a condition on their columns, each table "
-    "named alone or with an alias. On a join, a written measure names each column alone (amount, not claim.amount), "
-    "and only a column one joined table alone has. A column two joined tables share is in the joined dataset as "
-    "<table>_<column> (claim_created_at), for dimensions, filters, time columns, source and target only. A saved "
-    "metric goes onto a join as its table defines it, mnemiq naming its columns as the join names them, and only where "
-    "the join repeats none of its table's rows: its table joined to tables with at most one row for each of its rows, "
-    "with JOIN (which leaves out its rows no other table matches) or on the side a LEFT or RIGHT JOIN keeps every row "
-    "of (the left of a LEFT JOIN, the right of a RIGHT JOIN), never in a FULL JOIN; and only a saved metric that names "
-    "a column of its own table, so never count (COUNT(*)). A written measure's name and label are never a saved "
-    "metric's name on its table, and no two measures share a label. A table with no dataset gets one, with Superset's "
-    "saved metric count (COUNT(*)).\n\nCharts: ")
+    'name, "kind": ..., "table": the table whose saved metric it is}. The same saved metric on two tables is two '
+    "measures, each with a name of its own.\n")
+COUNT_ON_ITS_TABLE_PROMPT = ("Use a saved metric where one says what a measure needs: never write your own measure "
+                             "for what a saved metric says. A saved metric that names no column, such as count "
+                             "(COUNT(*)), is only for a table whose measures no chart shows with another table's "
+                             "column; write COUNT(<table>.<key>) instead.")
 
 
-def test_the_prompt_offers_a_joined_tables_saved_metric_on_a_join():
+def test_the_prompt_offers_a_saved_metric_by_its_table():
+    """A saved metric is planned by its name and its table; mnemiq carries it onto a dataset that joins its table to
+    others, as its table defines it, except one that names no column (Superset's count). One dataset holds every
+    measure on a table, so that one is refused once any chart of a measure on its table names another table's column,
+    not only its own charts: the prompt says so, and the check bears it out."""
     system, _ = plan_prompt(GOAL, _seen(_tools()))
-    assert CARRYING_PROMPT in system
-    assert "The same saved metric on two tables is two measures" not in system
-    assert "On a join, a measure names each column alone" not in system
+    assert SAVED_METRIC_PROMPT in system and COUNT_ON_ITS_TABLE_PROMPT in system
+    assert "on a join" not in system and "joined table's saved metric" not in system
+    count = {"name": "orders_n", "saved_metric": "count", "kind": "count", "table": "orders"}
+    alone = _shop_draft(_bar("by_channel", "orders.channel", measures=("orders_n",)), measures=(count,))
+    assert isinstance(_shop(LLMPlanner(ScriptedModel([json.dumps(alone)]))), BuildPlan)
+    web = {"name": "web_n", "label": "Web orders", "kind": "count",
+           "expression": "COUNT(CASE WHEN orders.channel = 'web' THEN orders.order_id END)"}
+    beside = _shop_draft(_bar("by_channel", "orders.channel", measures=("orders_n",)),
+                         _bar("web_by_region", "customers.region", measures=("web_n",)), measures=(count, web))
+    refused = _shop(LLMPlanner(ScriptedModel([json.dumps(beside)] * 2)))
+    assert isinstance(refused, PlanRefused) and list(_parts(refused)) == ["measure 'orders_n'"], refused

@@ -5,12 +5,14 @@ dashboard the builder can see already covers the goal, the offer to reuse it. No
 to the build, which runs it one step per request.
 
 **What the model sees** (`PlanContext`) is what the builder may: the tables and columns the grants leave visible
-(`visible_schema`), the saved metrics of those tables' datasets by name and expression, and the dashboards whose titles
-share a word with the goal, by id and title. Never an editor's name (a saved metric's certifier, a dashboard's owners),
-never Superset's error text, and no value in the plan's first prompt: nothing a plan is made from is a number computed
-from the data. A filter's literal that no row the builder can read holds is refused, and only then does the model see
-values: those of the column its own plan filtered on, read as the builder. A part refused goes back to the model with
-mnemiq's own reason, which names what the model wrote and nothing Superset said, those values aside.
+(`visible_schema`), the snapshot's links between those tables, as the model writes one, the saved metrics of those
+tables' datasets by name and expression, the dashboards whose titles share a word with the goal, by id and title, and,
+built onto a dashboard, the names and labels of the measures it keeps. Never an editor's name (a saved metric's
+certifier, a dashboard's owners), never Superset's error text, and no value in the plan's first prompt: nothing a plan
+is made from is a number computed from the data. A filter's literal that no row the builder can read holds is
+refused, and only then does the model see values: those of the column its own plan filtered on, read as the builder. A
+part refused goes back to the model with mnemiq's own reason, which names what the model wrote and nothing Superset
+said, those values aside.
 
 **What is checked.** Each written measure meets `check_measure`, its statement decided under the builder's grants as
 every ask-path statement is, then the values it filters on (`absent_literals`), and then `reusable`: a saved metric on
@@ -331,40 +333,55 @@ PLAN_SCHEMA = {
 _RESPONSE_FORMAT = {"response_format": {"type": "json_schema",
                                         "json_schema": {"name": "dashboard_plan", "schema": PLAN_SCHEMA}}}
 
-_SYSTEM = """You plan a Superset dashboard for a builder's goal, from the tables, saved metrics and dashboards you are \
-shown. Answer with one JSON object and nothing else:
-{"measures": [...], "charts": [...], "reuse_dashboard": null}
+# The plan `_SYSTEM` shows the model, on tables of the example's own: a chart reaching a column two links from its
+# measure's table, one link known and one stated, and a share whose aggregate adds up no column, so names its table.
+_EXAMPLE = {
+    "measures": [
+        {"name": "units_sold", "label": "Units sold", "expression": "SUM(order_lines.quantity)", "kind": "number"},
+        {"name": "web_order_share", "label": "Web share of orders",
+         "expression": "AVG(CASE WHEN orders.channel = 'web' THEN 1.0 ELSE 0 END)", "kind": "percent",
+         "table": "orders"}],
+    "charts": [
+        {"key": "units_by_segment", "family": "bar", "title": "Units sold by customer segment",
+         "measures": ["units_sold"], "dimensions": ["customers.segment"]},
+        {"key": "web_share_by_quarter", "family": "line", "title": "Web share of orders by quarter",
+         "measures": ["web_order_share"], "dimensions": [], "time_column": "orders.ordered_at", "grain": "quarter"}],
+    "links": [{"from": "order_lines.order_id", "to": "orders.order_id"}],
+    "reuse_dashboard": None}
+
+_SYSTEM = """You plan a Superset dashboard for a builder's goal, from the tables, links, saved metrics and dashboards \
+you are shown. Answer with one JSON object and nothing else:
+{"measures": [...], "charts": [...], "links": [...], "reuse_dashboard": null}
+
+Name every column with its table, as <table>.<column> (orders.channel, customers.segment), wherever you name one: in \
+expressions, dimensions, filters, time columns, source and target. You say what to show, and mnemiq does the rest: it \
+reads each chart's rows from the tables its columns are of, joined by their links.
 
 Measures are the numbers the charts show. Each is either
 - written: {"name": lower case letters, digits and _, "label": the name shown on the chart, "expression": one SQL \
-aggregate expression in PostgreSQL over the measure's rows, "kind": one of currency, percent, count, number \
-(a percent is a fraction from 0 to 1, which Superset shows as a percent: 0.25 shows as 25%; never multiply it by \
-100), "table": a table's name, or "join": "a JOIN b ON ...", "description": optional, "currency": an ISO 4217 \
-code, optional}; or
+aggregate expression in PostgreSQL, "kind": one of currency, percent, count, number (a percent is a fraction from 0 \
+to 1, which Superset shows as a percent: 0.25 shows as 25%; never multiply it by 100), "description": optional, \
+"currency": an ISO 4217 code, optional, "table": only where its aggregate adds up no column}; or
 - a saved metric of a table's dataset: {"name": the plan's own name for it, "saved_metric": the saved metric's name, \
-"kind": ..., "table": ...}, or, on a join, {"name", "saved_metric", "kind", "table": the joined table whose saved \
-metric it is, "join": "a JOIN b ON ..."}. The same saved metric on two tables, or on two joins, is two measures, each \
+"kind": ..., "table": the table whose saved metric it is}. The same saved metric on two tables is two measures, each \
 with a name of its own.
-Use a saved metric where one says what a measure needs, on a join too: never write your own measure for what a joined \
-table's saved metric says. Write a join only where the charts need columns of more than one table. A join is tables \
-joined with JOIN, LEFT JOIN, RIGHT JOIN or FULL JOIN, each ON a condition on their columns, each table named alone or \
-with an alias. On a join, a written measure names each column alone (amount, not claim.amount), and only a column one \
-joined table alone has. A column two joined tables share is in the joined dataset as <table>_<column> \
-(claim_created_at), for dimensions, filters, time columns, source and target only. A saved metric goes onto a join as \
-its table defines it, mnemiq naming its columns as the join names them, and only where the join repeats none of its \
-table's rows: its table joined to tables with at most one row for each of its rows, with JOIN (which leaves out its \
-rows no other table matches) or on the side a LEFT or RIGHT JOIN keeps every row of (the left of a LEFT JOIN, the \
-right of a RIGHT JOIN), never in a FULL JOIN; and only a saved metric that names a column of its own table, so never \
-count (COUNT(*)). A written measure's name and label are never a saved metric's name on its table, and no two \
-measures share a label. A table with no dataset gets one, with Superset's saved metric count (COUNT(*)).
+A written measure adds up the rows of one table, the table of the columns its aggregate adds up: \
+SUM(order_lines.quantity) adds up order_lines. Its aggregate never adds up columns of two tables, though a condition \
+on another table's column may say which rows it covers. An aggregate that adds up no column, as COUNT(*) or a share \
+of 1.0 and 0 does, names no table: give the measure "table", the table whose rows it adds up. To count rows, prefer \
+COUNT(<table>.<key>), which names its table. Use a saved metric where one says what a measure needs: never write your \
+own measure for what a saved metric says. A saved metric that names no column, such as count (COUNT(*)), is only for \
+a table whose measures no chart shows with another table's column; write COUNT(<table>.<key>) instead. A written \
+measure's name and label are never a saved metric's name on its table, and no two measures share a label. A table \
+with no dataset gets one, with Superset's saved metric count (COUNT(*)).
 
 Charts: {"key": lower case letters, digits and _, at most 40, one per chart, "family": one of FAMILIES, "title", \
 "measures": [measure names], "dimensions": [columns], "time_column": a date or timestamp column, or omitted, \
 "grain": one of GRAINS or omitted, "filters": [{"column", "op": one of =, !=, >, <, >=, <=, LIKE, ILIKE, NOT LIKE, IN, \
 NOT IN, IS NULL, IS NOT NULL, "operand": one value, a list for IN and NOT IN, omitted for IS NULL and IS NOT NULL}], \
 "row_limit": optional, never on a chart with a time_column or a date or timestamp first dimension, "source" and \
-"target": a sankey's two columns, "table" or "join": the chart's rows, needed only when it has no measures}. \
-A chart's measures, dimensions and filters are all on one table or one join.
+"target": a sankey's two columns}. \
+A chart's measures all add up the rows of one table, and its columns are of that table or of tables linked to it.
 - pie, big_number, gauge, treemap, waterfall, funnel and sankey plot exactly one measure; mixed plots two or more on a \
 time column, the first on its primary axis;
 - pie, treemap, funnel, histogram, pivot and table need a dimension; waterfall and box_plot need a dimension or a time \
@@ -383,12 +400,26 @@ where its column is NULL: where those rows belong to the measure, keep them with
 should not show the groups a measure's condition leaves out (a closed stage, shown empty), filter them out on that \
 chart as well.
 
+Links: {"from": "<table>.<column>", "to": "<table>.<column>"}, a column of the table whose rows refer to another \
+table, equal to that table's key (order_lines.order_id to orders.order_id); a key of two columns is two links between \
+the same two tables. The links you are shown are known, and mnemiq joins tables by them. State a link only where a \
+chart names a table the known links do not connect to its measures' table, or where two ways connect the same \
+tables, to say which the chart means. Otherwise "links": [].
+
 reuse_dashboard: {"id": a dashboard's id, "reason": why it already covers the goal}, only for one of the dashboards \
-listed and only when it covers the goal; the builder is then asked whether to reuse it. Otherwise null."""
+listed and only when it covers the goal; the builder is then asked whether to reuse it. Otherwise null.
+
+For example, where the links shown include orders.customer_id to customers.customer_id and none connects \
+order_lines to orders, the goal "units sold by customer segment, and the share of web orders by quarter" is planned \
+as:
+""" + json.dumps(_EXAMPLE, ensure_ascii=False)
 
 
 def plan_prompt(goal: str, context: PlanContext) -> tuple[str, str]:
-    """The system and user prompts the model is sent for `goal`: everything it sees."""
+    """The system and user prompts the model is sent for `goal`: everything it sees. The links the snapshot knows
+    between the visible tables are shown as the model writes one (`column_text`), so it can copy one; a dashboard's
+    kept measures by name and label only, since a kept measure's expression names its dataset's columns, never a
+    column with its table as the model names one."""
     families = ", ".join(_family_name(family) for family in context.families)
     system = _SYSTEM.replace("FAMILIES", families).replace("GRAINS", ", ".join(GRAINS))
     document = {
@@ -397,17 +428,16 @@ def plan_prompt(goal: str, context: PlanContext) -> tuple[str, str]:
                     "has_dataset": table.dataset_id is not None,
                     "saved_metrics": [{"name": m.name, "expression": m.expression} for m in table.saved_metrics]}
                    for table in context.tables],
+        "links": [{"from": column_text(*link.left), "to": column_text(*link.right)} for link in context.links],
         "dashboards": [{"id": d.id, "title": d.title} for d in context.dashboards],
     }
     user = f"Goal: {goal}\n\nWhat this builder can see:\n{json.dumps(document, ensure_ascii=False)}"
     if context.kept:
-        # Only measures on datasets this builder reads whole (`_readable_kept`); a table's own dataset is named.
-        tables = {table.dataset_id: table.name for table in context.tables if table.dataset_id is not None}
-        kept = [{"name": m.name, "label": m.label, "expression": m.expression, "kind": m.kind.value,
-                 **({"table": tables[m.dataset_id]} if m.dataset_id in tables else {})} for m in context.kept]
-        user += (f"\n\nThe dashboard this builds onto: this dashboard already keeps these measures, each on its own "
-                 f"dataset:\n{json.dumps(kept, ensure_ascii=False)}\nA written measure's name and label are never one "
-                 "of theirs, unless it is that measure: the same expression and kind, on its table.")
+        # Only measures on datasets this builder reads whole (`_readable_kept`).
+        kept = [{"name": m.name, "label": m.label} for m in context.kept]
+        user += (f"\n\nThe dashboard this builds onto already keeps these measures:\n"
+                 f"{json.dumps(kept, ensure_ascii=False)}\nGive each measure of your plan a name and a label none of "
+                 "these has.")
     if context.repair is not None:
         lines = "\n".join(f"- {part.part}: {part.reason}" for part in context.repair.refused)
         previous = f"Your plan was:\n{context.repair.previous}\n\n" if context.repair.previous else ""
@@ -474,6 +504,19 @@ def _scalar(value: object) -> bool:
     return isinstance(value, (str, int, float, bool))
 
 
+def _nulls_left_out(value: Any, schema: Mapping[str, Any]) -> Any:
+    """`value` with each key whose value is null left out, at every depth `schema` describes, but for a key `schema`
+    requires there. A model filling a JSON schema often writes null for a key it leaves out, and null on a key a draft
+    may leave out means nothing else; a required key's null is read, and refused, as it is."""
+    if isinstance(value, list) and "items" in schema:
+        return [_nulls_left_out(each, schema["items"]) for each in value]
+    if isinstance(value, dict) and "properties" in schema:
+        required = set(schema.get("required", ()))
+        return {key: _nulls_left_out(each, schema["properties"].get(key, {})) for key, each in value.items()
+                if each is not None or key in required}
+    return value
+
+
 # The model names columns, never a part's rows: a chart's `table` or `join`, or a measure's `join`, goes back saying so.
 _ROWS_ARE_MNEMIQS = "name each column with its table; mnemiq chooses the rows"
 _LINK_SHAPE = 'a link is {"from": "<table>.<column>", "to": "<table>.<column>"}'
@@ -496,7 +539,9 @@ def plan_from_draft(draft: Mapping[str, Any], context: PlanContext) -> BuildPlan
     Each base is one dataset, which every part on it reads: its table's own where they name no other table (the
     table's dataset, or one the build makes), else one the build makes, the base LEFT JOIN each table they name
     (`chain`, over the links the model states and, for a pair it left unlinked, the snapshot's). Each column is then
-    named as its dataset names it. A part that cannot be read is refused, with the draft kept for the repair."""
+    named as its dataset names it. A part that cannot be read is refused, with the draft kept for the repair. A key
+    `PLAN_SCHEMA` does not require is read as left out where the model wrote null for it (`_nulls_left_out`)."""
+    draft = _nulls_left_out(draft, PLAN_SCHEMA)
     refused: list[RefusedPart] = []
     tables = {table.name: table for table in context.tables}
     columns = {table.name: tuple(column.name for column in table.columns) for table in context.tables}
