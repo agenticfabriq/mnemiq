@@ -369,8 +369,11 @@ still to come. In short:
 - **Columns named with their tables, and the rows a measure reads.** The planning model names every column as
   `<table>.<column>`, in a measure's expression and in a chart's columns (`orders.order_date`,
   `SUM(order_items.revenue)`), and never writes a `table` or a join. mnemiq reads the rest from those names.
-  - **A measure's base** is the table of the columns inside its aggregate. A measure that adds up no column (`COUNT(*)`,
-    a count or sum of 1s, a share written from 1.0 and 0) gives `table`, the one table whose rows it counts.
+  - **A measure's base** is the table of the columns inside its aggregate. A measure that adds up no column (a count or
+    sum of 1s, a share written from 1.0 and 0) counts the rows of the table its condition names. It gives `table`, the
+    one table whose rows it counts, where its aggregate names no column (`COUNT(*)`), where its conditions name columns
+    of two tables, or where the rows it counts are another table's (loans counted by their book's format). A `table`
+    given decides over the condition; a measure that adds up a column is that column's table's, whatever its `table`.
   - **Links.** Where the known links (the snapshot's relationships, which the prompt shows) do not connect a table a
     measure or chart needs, the model states one: `{"from": "order_items.order_id", "to": "orders.order_id"}`, from the
     table whose rows reference to the table referenced. A stated link decides its pair of tables.

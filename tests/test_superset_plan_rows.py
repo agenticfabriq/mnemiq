@@ -87,31 +87,79 @@ def test_a_measures_base_is_the_table_inside_its_aggregate():
     assert base_of("PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY order_items.revenue)", None) == "order_items"
     assert base_of("COUNT(DISTINCT order_items.order_id)", "orders") == "order_items"
     assert base_of("COUNT(*)", "orders") == "orders"
-    assert _refused(base_of("COUNT(*)", None)) == ADDS_UP_NO_COLUMN
+    assert _refused(base_of("COUNT(*)", None)) == NAMES_NO_COLUMN
     _refused(base_of("SUM(order_items.revenue) + SUM(returns.amount)", None), "order_items", "returns")
     _refused(base_of("SUM(revenue)", "order_items"), "'revenue'", "without its table")
 
 
-# Why a measure whose aggregate adds up no column is refused without its `table`: what to give, whatever its condition
-# names.
-ADDS_UP_NO_COLUMN = ('its aggregate adds up no column, whatever its condition names, so it does not say whose rows it '
-                     'counts: give the measure "table", the table whose rows it counts, or count one of that table\'s '
-                     "columns, as COUNT(<table>.<key>)")
+def test_what_an_aggregate_adds_up_decides_its_base_over_its_condition_and_its_table():
+    """Where an aggregate adds up a column, that column's table is the base, whatever table its condition names and
+    whatever `table` the measure gives: an item's revenue on web orders adds up items."""
+    for table in (None, "orders", "customers"):
+        assert base_of("SUM(CASE WHEN orders.channel = 'web' THEN order_items.revenue END)", table) == "order_items"
+        assert base_of("SUM(order_items.revenue) FILTER (WHERE orders.channel = 'web')", table) == "order_items"
+        # One aggregate adding up a column decides for the expression, beside one counting by a condition elsewhere.
+        assert base_of("SUM(order_items.revenue) / NULLIF(SUM(CASE WHEN orders.channel = 'web' THEN 1 ELSE 0 END), 0)",
+                       table) == "order_items"
+
+
+# Why a measure that names no column at all is refused without its `table`.
+NAMES_NO_COLUMN = ('it counts rows without saying whose: its aggregate names no column, so give the measure "table", '
+                   "the table whose rows it counts, or count one of that table's columns, as COUNT(<table>.<key>)")
+# A share among closed deals as a hosted model writes one: a CASE inside a CASE, adding up 1.0 and 0, every condition
+# on one table.
+WIN_RATE = "AVG(CASE WHEN deals.stage IN ('won', 'lost') THEN CASE WHEN deals.stage = 'won' THEN 1.0 ELSE 0 END END)"
+
+
+@pytest.mark.parametrize(("expression", "base"), [
+    ("SUM(CASE WHEN orders.status = 'open' THEN 1 ELSE 0 END)", "orders"),
+    ("COUNT(CASE WHEN orders.status = 'open' THEN 1 END)", "orders"),
+    ("AVG(CASE WHEN orders.channel = 'web' THEN 1.0 ELSE 0 END)", "orders"),
+    (WIN_RATE, "deals"),
+    ("SUM(CASE WHEN orders.status = 'won' THEN 1 ELSE 0 END)::double precision"
+     " / NULLIF(SUM(CASE WHEN orders.status IN ('won', 'lost') THEN 1 ELSE 0 END), 0)", "orders"),
+    ("SUM(CASE WHEN orders.status = 'open' THEN 1 ELSE 0 END)::double precision / NULLIF(COUNT(*), 0)", "orders"),
+    ("COUNT(*) FILTER (WHERE orders.status = 'open')", "orders"),
+    ("SUM(CASE orders.status WHEN 'open' THEN 1 END)", "orders"),
+], ids=["a sum of 1s", "a count of 1s", "a share of 1.0 and 0", "a share inside a condition", "a ratio of two sums",
+        "a share of all rows", "a filtered count", "a simple case"])
+def test_an_aggregate_of_no_column_counts_the_rows_of_the_table_its_condition_names(expression, base):
+    """A count or sum of 1s, or a share of 1.0 and 0, adds up no column: it counts the rows of the table its condition
+    names, every column of every condition inside its aggregates being of that one table, so it goes back for no
+    `table`. A `table` given says whose rows it counts instead, as the rows of one table counted by a condition on a
+    table it reaches."""
+    assert aggregated(expression) == set()
+    assert base_of(expression, None) == base
+    assert base_of(expression, "order_items") == "order_items"
 
 
 @pytest.mark.parametrize("expression", [
-    "COUNT(*)",
-    "SUM(CASE WHEN orders.status = 'open' THEN 1 ELSE 0 END)",
-    "COUNT(CASE WHEN orders.status = 'open' THEN 1 END)",
-    "AVG(CASE WHEN orders.channel = 'web' THEN 1.0 ELSE 0 END)",
+    "COUNT(*)", "SUM(1)", "COUNT(1)", "AVG(CASE WHEN 1 = 1 THEN 1.0 ELSE 0 END)",
+    # A window's partition chooses no aggregate's rows.
+    "SUM(COUNT(*)) OVER (PARTITION BY orders.channel)",
+], ids=["count star", "a sum of 1", "a count of 1", "a constant condition", "a window over a count"])
+def test_an_aggregate_that_names_no_column_takes_its_table(expression):
+    """An aggregate naming no column, in what it adds up or in its condition, says nothing of whose rows it counts: its
+    `table` says that, and without one it goes back saying to give it."""
+    assert base_of(expression, "orders") == "orders"
+    assert _refused(base_of(expression, None)) == NAMES_NO_COLUMN
+
+
+@pytest.mark.parametrize("expression", [
+    "SUM(CASE WHEN orders.status = 'open' AND customers.region = 'west' THEN 1 ELSE 0 END)",
+    "COUNT(*) FILTER (WHERE customers.region = 'west' AND orders.channel = 'web')",
     "SUM(CASE WHEN orders.status = 'won' THEN 1 ELSE 0 END)::double precision"
-    " / NULLIF(SUM(CASE WHEN orders.status IN ('won', 'lost') THEN 1 ELSE 0 END), 0)"])
-def test_an_aggregate_of_no_column_takes_its_table_whatever_its_condition_names(expression):
-    """A count or sum of 1s, or a share of 1.0 and 0, adds up no column: its condition says which rows it covers, never
-    whose rows they are. Its `table` says that, and without one it goes back saying to give it."""
+    " / NULLIF(SUM(CASE WHEN customers.region = 'west' THEN 1 ELSE 0 END), 0)",
+], ids=["one condition", "a filter", "two aggregates"])
+def test_an_aggregate_of_no_column_whose_conditions_name_two_tables_takes_its_table(expression):
+    """Conditions naming columns of two tables, in one aggregate or across a ratio's two, leave whose rows it counts
+    unsaid: it goes back naming both tables and asking for its `table`, and with one it counts that table's rows."""
     assert aggregated(expression) == set()
-    assert base_of(expression, "order_items") == "order_items"
-    assert _refused(base_of(expression, None)) == ADDS_UP_NO_COLUMN
+    assert _refused(base_of(expression, None)) == (
+        "it adds up no column, and its conditions name columns of 'customers' and 'orders', so it does not say whose "
+        'rows it counts: give the measure "table", the table whose rows it counts')
+    assert base_of(expression, "orders") == "orders"
+    assert base_of(expression, "customers") == "customers"
 
 
 NO_AGGREGATE = ("it is no aggregate: it gives one value per row, not one per group; write the measure with an "

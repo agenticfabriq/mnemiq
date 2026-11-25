@@ -1005,12 +1005,14 @@ def test_the_prompt_asks_for_qualified_columns_and_links():
     assert ("State a link wherever a measure or a chart names a table, in a condition too, that the known links do not "
             "connect to the measure's table: with no links shown, state every link your plan needs.") in system
     assert "Where two ways connect the same tables, state the link the chart means." in system
-    # A measure whose aggregate adds up no column says its table, whatever its condition names; a count is better
-    # written over a key.
-    assert ('An aggregate that adds up no column, as COUNT(*), a count or sum of 1s, or a share of 1.0 and 0 does, '
-            'whatever its condition names, does not say whose rows it counts: give the measure "table", the table '
-            'whose rows it counts. To count rows, prefer COUNT(<table>.<key>)') in system
-    assert "names no table" not in system
+    # A measure whose aggregate adds up no column counts the rows of the table its condition names, and says its table
+    # where nothing names one, where its condition names two, or where it counts another table's rows; a count is
+    # better written over a key.
+    assert ('A count, sum or share of 1s counts the rows of the table its condition names. Give the measure "table", '
+            "the table whose rows it counts, for COUNT(*), where its condition names columns of more than one table, "
+            "and where it counts another table's rows, as the example's ebook_loans counts loans by their book's "
+            "format. To count rows, prefer COUNT(<table>.<key>)") in system
+    assert "names no table" not in system and "whatever its condition names" not in system
     # Nothing about rows, joins or a joined dataset's column names, which the model no longer decides.
     for unasked in ("JOIN", '"join"', "<table>_<column>", "the chart's rows", "on a join", "each column alone",
                     "one table or one join"):
@@ -1126,9 +1128,10 @@ def test_a_table_a_measures_condition_names_needs_a_link_like_any_other():
     assert isinstance(plan_from_draft({**by_membership, "links": [BOOK_LINK, MEMBER_LINK]}, bare), BuildPlan)
 
 
-def test_a_sum_of_ones_plans_with_its_table_and_goes_back_without_it():
-    """A sum of 1s adds up no column, whatever its condition names: with `table` it counts that table's rows, joined
-    to the table a chart groups it by, and without one it goes back saying to give its table."""
+def test_a_sum_of_ones_counts_the_table_its_condition_names_or_the_table_it_gives():
+    """A sum of 1s adds up no column: without `table` it counts the rows of the table its condition names, and with
+    one, that table's rows, joined to the table its condition names as to the table a chart groups it by. A condition
+    naming two tables goes back naming both and asking for its table."""
     from mnemiq.superset.planner import PlanColumn
     context = _shop_seen()
     context = dataclasses.replace(context, tables=tuple(
@@ -1137,16 +1140,26 @@ def test_a_sum_of_ones_plans_with_its_table_and_goes_back_without_it():
     measure = {"name": "open_orders", "label": "Open orders", "kind": "count",
                "expression": "SUM(CASE WHEN orders.status = 'open' THEN 1 ELSE 0 END)"}
     chart = _bar("open_by_region", "customers.region", measures=("open_orders",))
-    plan = plan_from_draft(_shop_draft(chart, measures=({**measure, "table": "orders"},)), context)
+    for given in ({}, {"table": "orders"}):
+        plan = plan_from_draft(_shop_draft(chart, measures=({**measure, **given},)), context)
+        assert isinstance(plan, BuildPlan), (given, plan)
+        assert [dataset.join for dataset in plan.datasets] == [ORDERS_CUSTOMERS], given
+        assert [(m.expression, m.dataset_id) for m in plan.measures] == [
+            ("SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END)", -1)], given
+    # Items on open orders: the table given decides whose rows are counted.
+    plan = plan_from_draft(_shop_draft(chart, measures=({**measure, "table": "order_items"},)), context)
     assert isinstance(plan, BuildPlan), plan
-    assert [dataset.join for dataset in plan.datasets] == [ORDERS_CUSTOMERS]
-    assert [(m.expression, m.dataset_id) for m in plan.measures] == [
-        ("SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END)", -1)]
-    refused = plan_from_draft(_shop_draft(chart, measures=(measure,)), context)
+    assert [dataset.join for dataset in plan.datasets] == [
+        f'{ITEMS_ORDERS} LEFT JOIN "customers" ON "orders"."customer_id" = "customers"."customer_id"']
+    western = {**measure, "expression": "SUM(CASE WHEN orders.status = 'open' AND customers.region = 'west' THEN 1 "
+                                        "ELSE 0 END)"}
+    refused = plan_from_draft(_shop_draft(chart, measures=(western,)), context)
     assert isinstance(refused, PlanRefused), refused
     reason = _parts(refused)["measure 'open_orders'"]
-    assert 'whatever its condition names' in reason and 'give the measure "table", the table whose rows it counts' \
-        in reason, reason
+    assert "its conditions name columns of 'customers' and 'orders'" in reason and \
+        'give the measure "table", the table whose rows it counts' in reason, reason
+    assert isinstance(plan_from_draft(_shop_draft(chart, measures=({**western, "table": "orders"},)), context),
+                      BuildPlan)
 
 
 @pytest.mark.parametrize(("place", "key"), [
@@ -1275,7 +1288,7 @@ def test_count_star_names_its_base_with_table():
     plan = planned("customers.region")
     assert isinstance(plan, BuildPlan), plan
     assert [dataset.join for dataset in plan.datasets] == [ORDERS_CUSTOMERS]
-    for changes, why in (({"table": None}, "adds up no column"),
+    for changes, why in (({"table": None}, "it counts rows without saying whose"),
                          ({"table": "payroll_view"}, "'payroll_view' is not a table this builder can read")):
         refused = planned("orders.channel", **changes)
         assert isinstance(refused, PlanRefused), changes
@@ -1548,6 +1561,31 @@ def test_count_star_by_another_tables_column_passes_the_check():
     (made,) = plan.datasets
     assert made.join == ORDERS_CUSTOMERS
     assert any(f'COUNT(*) AS orders_n FROM ({made.sql}) AS "virtual_table"' in sql for sql in tools.statements())
+
+
+# The shop with each order's status, which a share of orders is counted by.
+SHOP_WITH_STATUS = SHOP.model_copy(update={"columns": [*SHOP.columns, _shop_column("orders", "status", "VARCHAR", None)]})
+
+
+def test_a_share_whose_condition_names_one_table_plans_on_it_with_no_repair():
+    """A share of 1.0 and 0 among the rows its condition chooses, written as a hosted model writes a win rate, with no
+    `table`: every column its conditions name is an order's, so it counts orders, joined to customers for a chart by
+    region, and the plan is taken as first written, with no round of repair."""
+    share = {"name": "shipped_share", "label": "Shipped share", "kind": "percent",
+             "expression": "AVG(CASE WHEN orders.status IN ('shipped', 'cancelled') THEN "
+                           "CASE WHEN orders.status = 'shipped' THEN 1.0 ELSE 0 END END)"}
+    model = ScriptedModel([json.dumps(_shop_draft(
+        _bar("shipped_by_region", "customers.region", measures=("shipped_share",)), measures=(share,)))])
+    tools = _tools(datasets=[])
+    plan = _shop(LLMPlanner(model), tools, snapshot=SHOP_WITH_STATUS)
+    assert isinstance(plan, BuildPlan), plan
+    assert len(model.sent) == 1, "nothing went back for repair"
+    (made,) = plan.datasets
+    assert made.join == ORDERS_CUSTOMERS
+    assert [(measure.expression, measure.kind, measure.dataset_id) for measure in plan.measures] == [
+        ("AVG(CASE WHEN status IN ('shipped', 'cancelled') THEN CASE WHEN status = 'shipped' THEN 1.0 ELSE 0 END END)",
+         K.PERCENT, -1)]
+    assert [(chart.dataset_id, chart.dimensions) for chart in plan.charts] == [(-1, ("region",))]
 
 
 def test_a_chart_with_no_measure_on_a_made_dataset_passes_the_check():

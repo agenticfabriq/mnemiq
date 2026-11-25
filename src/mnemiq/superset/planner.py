@@ -340,7 +340,7 @@ _RESPONSE_FORMAT = {"response_format": {"type": "json_schema",
 
 # The plan `_SYSTEM` shows the model, on a library's tables, which no measured schema has: a measure whose condition
 # names a table no known link reaches, so a link is stated for it; a chart reaching a column through a known link; and
-# a count of 1s, whose aggregate adds up no column, so it names its table.
+# a count of 1s whose condition names books while it counts loans, so it names its table.
 _EXAMPLE = {
     "measures": [
         {"name": "renewals", "label": "Renewals", "expression": "SUM(loans.renewals)", "kind": "number"},
@@ -372,9 +372,10 @@ to 1, which Superset shows as a percent: 0.25 shows as 25%; never multiply it by
 with a name of its own.
 A written measure adds up the rows of one table, the table of the columns its aggregate adds up: SUM(loans.renewals) \
 adds up loans. Its aggregate never adds up columns of two tables, though a condition on another table's column may say \
-which rows it covers. An aggregate that adds up no column, as COUNT(*), a count or sum of 1s, or a share of 1.0 and 0 \
-does, whatever its condition names, does not say whose rows it counts: give the measure "table", the table whose rows \
-it counts. To count rows, prefer COUNT(<table>.<key>), which names its table. Use a saved metric where one says what \
+which rows it covers. A count, sum or share of 1s counts the rows of the table its condition names. Give the measure \
+"table", the table whose rows it counts, for COUNT(*), where its condition names columns of more than one table, and \
+where it counts another table's rows, as the example's ebook_loans counts loans by their book's format. To count \
+rows, prefer COUNT(<table>.<key>), which names its table. Use a saved metric where one says what \
 a measure needs: never write your own measure for what a saved metric says. A saved metric that names no column, such \
 as count (COUNT(*)), is only for a table whose measures no chart shows with another table's column; write \
 COUNT(<table>.<key>) instead. A written measure's name and label are never a saved metric's name on its table, and no \

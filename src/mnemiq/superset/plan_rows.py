@@ -2,7 +2,8 @@
 each measure's base table, the chain of LEFT JOINs from that base to every other table a part needs, and the name the
 joined dataset gives each column. Nothing here reads a source or Superset; the planner reads a draft through it.
 
-A measure's base is the table whose rows it adds up: the table of the columns its aggregates add up (`base_of`). The
+A measure's base is the table whose rows it adds up: the table of the columns its aggregates add up, and for one that
+adds up no column (a count or a share of 1s), the table it gives, else the one table its conditions name (`base_of`). The
 other tables a part needs are joined to the base along links, each an equality of one column of each table: the links
 the model states, and for a pair of tables it left unlinked, the snapshot's relationships (`edges`). A table is joined
 by a link only where the link's columns on that table, its far side, hold each value once, so each of the base's rows
@@ -198,6 +199,25 @@ def aggregated(expression: str) -> set[str]:
     return tables
 
 
+def _named_in_aggregates(expression: str) -> set[str]:
+    """The tables of every column `expression`'s aggregates name: in what they add up and in what chooses their rows, a
+    CASE's condition, a FILTER's WHERE and the like; never a window's PARTITION BY or ORDER BY, which chooses no rows of
+    the aggregate it is over. Empty when `expression` is not one SQL expression (`qualified` says why)."""
+    tree = _one_expression(expression)
+    if tree is None:
+        return set()
+    tables: set[str] = set()
+    for aggregate in tree.find_all(exp.AggFunc):
+        # `COUNT(*) FILTER (WHERE x)` holds its condition, and `PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x)` its
+        # value, beside the function, not in it.
+        scope: exp.Expression = aggregate
+        while isinstance(scope.parent, (exp.Filter, exp.WithinGroup)) and scope.parent.this is scope:
+            scope = scope.parent
+        tables.update(resolve_identifier(column.args["table"], SUPERSET_DIALECT)
+                      for column in scope.find_all(exp.Column) if column.table)
+    return tables
+
+
 # Why an expression that gives one value per row is no measure, whatever its `table`: read as the plan check reads it
 # (`measures.aggregates`), so the draft goes back with the check's reason, never told to give a table.
 _NO_AGGREGATE = ("it is no aggregate: it gives one value per row, not one per group; write the measure with an "
@@ -206,15 +226,20 @@ _WINDOWED = ("its aggregate is computed over a window (OVER), which gives one va
              "is no measure either: write the aggregate without OVER")
 _UNMODELLED = ("mnemiq cannot tell whether it aggregates: it holds a function mnemiq does not model and no aggregate "
                "mnemiq does; write the measure with SQL's own aggregates, as SUM(<table>.<column>) or COUNT(*)")
+# Why a measure whose aggregates name no column, `COUNT(*)` or `SUM(1)`, needs its `table`.
+_NAMES_NO_COLUMN = ('it counts rows without saying whose: its aggregate names no column, so give the measure "table", '
+                    "the table whose rows it counts, or count one of that table's columns, as COUNT(<table>.<key>)")
 
 
 def base_of(expression: str, table: str | None) -> str | Refusal:
-    """The table whose rows a written measure adds up: the one table of the columns its aggregates add up; where they
-    add up no column (`COUNT(*)`), `table`, the table the measure names. `table` decides nothing for an expression whose
-    aggregates name a column. Refused when the expression cannot be read (`qualified`); when it holds no aggregate, or
-    only a window's, so it gives one value per row (`measures.aggregates`, as the plan check reads it), or holds no
-    aggregate but a function mnemiq does not model, whatever its `table`; when its aggregates add up columns of two
-    tables; and when they add up none and it names no table."""
+    """The table whose rows a written measure adds up: the one table of the columns its aggregates add up. Where they
+    add up no column, `table`, the table the measure names; without one, the one table of every column its aggregates
+    name (`_named_in_aggregates`), so a count, sum or share of 1s counts the rows of the table its condition names.
+    `table` decides nothing for an expression whose aggregates add up a column. Refused when the expression cannot be
+    read (`qualified`); when it holds no aggregate, or only a window's, so it gives one value per row
+    (`measures.aggregates`, as the plan check reads it), or holds no aggregate but a function mnemiq does not model,
+    whatever its `table`; when its aggregates add up columns of two tables; and, without `table`, when they add up
+    none and name columns of no table (`COUNT(*)`) or of two."""
     named = qualified(expression)
     if isinstance(named, str):
         return Refusal(named)
@@ -234,9 +259,13 @@ def base_of(expression: str, table: str | None) -> str | Refusal:
         return tables[0]
     if table is not None:
         return table
-    return Refusal('its aggregate adds up no column, whatever its condition names, so it does not say whose rows it '
-                   'counts: give the measure "table", the table whose rows it counts, or count one of that table\'s '
-                   "columns, as COUNT(<table>.<key>)")
+    chosen = sorted(_named_in_aggregates(expression))
+    if len(chosen) == 1:
+        return chosen[0]
+    if chosen:
+        return Refusal(f"it adds up no column, and its conditions name columns of {_listed(chosen)}, so it does not say "
+                       'whose rows it counts: give the measure "table", the table whose rows it counts')
+    return Refusal(_NAMES_NO_COLUMN)
 
 
 def far_side(table: str, columns: Sequence[str], unique: Unique) -> bool | None:
