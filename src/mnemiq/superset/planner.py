@@ -44,7 +44,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
@@ -948,6 +948,17 @@ def _temporal(data_type: str | None) -> bool:
     return built.is_type(*exp.DataType.TEMPORAL_TYPES) and not built.is_type(*_TIME_OF_DAY)
 
 
+def joined_names(tables: Sequence[tuple[str, Collection[str]]]) -> dict[tuple[str, str], str]:
+    """The name a joined dataset gives each (table, column), `tables` being each joined table and its columns in join
+    order: a column only one table has keeps its name, and a column two or more tables share is `<table>_<column>`."""
+    having: dict[str, int] = {}
+    for _, columns in tables:
+        for column in columns:
+            having[column] = having.get(column, 0) + 1
+    return {(table, column): column if having[column] == 1 else f"{table}_{column}"
+            for table, columns in tables for column in columns}
+
+
 def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
     """The rows of a planned join, with the SELECT its virtual dataset is made from, or why the join is refused.
 
@@ -1020,10 +1031,11 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
     origins: dict[str, tuple[str, str]] = {}
     shown_as: dict[tuple[str, str], str] = {}
     types: dict[str, str | None] = {}
+    named = joined_names([(name, catalogue.columns[name]) for name in names])
     for node, name in zip(nodes, names):
         qualifier = node.args["alias"].this if node.args.get("alias") else node.this
         for column in sorted(catalogue.columns[name]):
-            shown = column if len(having[column]) == 1 else f"{name}_{column}"
+            shown = named[(name, column)]
             if shown in owners:
                 return f"the joined dataset would have two columns named {shown!r}"
             if len(shown.encode()) > MAX_IDENTIFIER:

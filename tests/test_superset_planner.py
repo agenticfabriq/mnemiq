@@ -39,6 +39,7 @@ from mnemiq.superset.planner import (
     PlannedDataset,
     PlanRefused,
     draft_of,
+    joined_names,
     plan_build,
     plan_from_draft,
     plan_from_json,
@@ -691,6 +692,21 @@ def test_a_measure_that_needs_a_join_plans_a_virtual_dataset():
                         'claim."policy_id" AS "claim_policy_id", claim."status" AS "status" FROM ' + JOIN)
     assert made.name == "mnemiq_dataset_1:policy_claim"
     assert (made.key, made.placeholder, made.join, made.table, made.table_name) == ("dataset_1", -1, JOIN, None, None)
+
+
+def test_joined_names_is_the_rule_joined_applies():
+    from mnemiq.superset.planner import PlannedDataset, _Catalogue, _joined
+
+    columns = {table: frozenset(c.name for c in SNAPSHOT.columns if c.object_id == table)
+               for table in ("policy", "claim")}
+    catalogue = _Catalogue(columns=columns, stored={t: t for t in columns}, datasets={}, saved={},
+                           types={t: {} for t in columns})
+    rows = _joined(PlannedDataset(key="dataset_1", placeholder=-1, join=JOIN), catalogue)
+    names = joined_names([(table, columns[table]) for table in ("policy", "claim")])
+    assert names == rows.shown
+    assert names[("policy", "region")] == "region" and names[("claim", "amount")] == "amount"
+    assert names[("policy", "policy_id")] == "policy_policy_id" and names[("claim", "policy_id")] == "claim_policy_id"
+    assert names[("policy", "created_at")] == "policy_created_at" and names[("claim", "created_at")] == "claim_created_at"
 
 
 @pytest.mark.parametrize("expression, dims, why", [
