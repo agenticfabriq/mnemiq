@@ -1821,6 +1821,22 @@ def test_a_row_rule_mnemiq_cannot_tell_of_stops_the_probe(rules):
     assert _unique_probes(tools) == []
 
 
+def test_a_later_dataset_with_no_row_rule_does_not_answer_for_an_earlier_one_mnemiq_cannot_tell_of():
+    """The joined table has two datasets: of the first, mnemiq cannot tell whether a row rule applies to the builder,
+    and of the second, none does. A no for one dataset says nothing of another, so it is still not told that no rule
+    applies: nothing is probed, and the made dataset goes back saying mnemiq could not tell."""
+    def rules(request):
+        [dataset] = request["dataset_ids"]
+        return {"datasets": []} if dataset == 31 else {"datasets": [{"dataset_id": dataset, "applies": False}]}
+
+    tools = _tools(datasets=[_dataset(31, "customers"), _dataset(32, "Customers")], rules=rules)
+    refused = _shop(LLMPlanner(ScriptedModel([json.dumps(ORDERS_BY_REGION)] * 2)), tools,
+                    snapshot=CUSTOMER_KEY_UNPROFILED)
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused) == {ORDERS_AND_CUSTOMERS: RULES_UNKNOWN_ON_CUSTOMERS}
+    assert _rule_asks(tools) == [[31], [32]] * 2 and _unique_probes(tools) == []
+
+
 def test_a_key_the_grants_withhold_goes_back_saying_why():
     """A key column mnemiq's own grants mask, deny or hide, or a table they filter by row, is never probed, and the
     made dataset goes back saying so, not only that the key was not measured."""
