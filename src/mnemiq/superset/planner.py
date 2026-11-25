@@ -36,7 +36,8 @@ aggregate adds up, and each base is one dataset that every part on it reads: its
 other table (a planned dataset over the table where it has none), else a planned virtual dataset, the base LEFT JOIN
 each table its parts name. Each measure on a virtual dataset is decided by `check_measure` over the dataset's SELECT as
 Superset reads it, `(<its SQL>) AS "virtual_table"`, the text the build sends; and each table a LEFT JOIN brings in is
-joined only by columns that hold each value once, so the base's rows are each kept once: as enrichment's key facts
+joined only by equalities of two columns of one kind (`plan_rows.comparable`), whoever wrote the join, and only by
+columns that hold each value once, so the base's rows are each kept once: as enrichment's key facts
 say, or, where they say nothing, as the source answers the builder (`unique_live`), asked only where no row rule of
 Superset's applies to the builder on the table, since the answer would then be of their rows alone; a dataset whose
 far side is not shown to is refused, named by its rows, for the repair, saying why. The builder makes each with the
@@ -80,8 +81,8 @@ from mnemiq.superset.literals import NEGATED_OPERATORS, Absent, Probes, absent_l
 from mnemiq.superset.marker import format_marker
 from mnemiq.superset.measures import MAX_LABEL, Measure, MeasureKind, MeasureRefused, check_measure, scales_by_100, \
     superset_text_problem
-from mnemiq.superset.plan_rows import Link, Refusal, Unique, aggregated, base_among, base_of, chain, column_of, \
-    column_text, edges, far_side, join_text, links_of, qualified, qualify, read_join, rewrite
+from mnemiq.superset.plan_rows import Link, Refusal, Types, Unique, aggregated, base_among, base_of, chain, column_of, \
+    column_text, edges, far_side, join_text, links_of, mistyped, qualified, qualify, read_join, rewrite
 from mnemiq.superset.saved_metrics import Carried, SavedMetric, carry, read_saved_metrics, reusable, same_definition
 from mnemiq.superset.settings import SUPERSET_DIALECT
 
@@ -551,6 +552,7 @@ def plan_from_draft(draft: Mapping[str, Any], context: PlanContext) -> BuildPlan
     refused: list[RefusedPart] = []
     tables = {table.name: table for table in context.tables}
     columns = {table.name: tuple(column.name for column in table.columns) for table in context.tables}
+    types = {(table.name, column.name): column.type for table in context.tables for column in table.columns}
 
     def refuse(part: str, reason: str) -> None:
         refused.append(RefusedPart(part, reason))
@@ -586,6 +588,9 @@ def plan_from_draft(draft: Mapping[str, Any], context: PlanContext) -> BuildPlan
             refuse(part, problem)
         elif ends[0][0] == ends[1][0]:
             refuse(part, "a link joins a column of one table to a column of another")
+        elif (why := mistyped(Link(ends[0], ends[1]), types)) is not None:
+            # Refused here, and so never deciding its pair: the snapshot's link of the pair still may.
+            refuse(part, f"{why}; state a link between columns of one kind")
         else:
             # A stated link is named by its tables in the order written: two written from opposite ends are two.
             stated.append(Link(ends[0], ends[1], f"{ends[0][0]}->{ends[1][0]}"))
@@ -720,7 +725,7 @@ def plan_from_draft(draft: Mapping[str, Any], context: PlanContext) -> BuildPlan
                          "up the rows of one table: plan a chart for each")
             continue
         chart_tables = {table for table, _ in named_columns}
-        base = bases[0] if bases else base_among(chart_tables, joins, context.unique, stated)
+        base = bases[0] if bases else base_among(chart_tables, joins, context.unique, stated, types=types)
         if isinstance(base, Refusal):
             refuse(part, base.reason)
             continue
@@ -730,7 +735,7 @@ def plan_from_draft(draft: Mapping[str, Any], context: PlanContext) -> BuildPlan
 
     # Each part's tables joined to its base: a table no link reaches, or reached two ways, is that part's to repair.
     for each in parts:
-        if isinstance(joined := chain(each.base, each.tables, joins, context.unique, stated), Refusal):
+        if isinstance(joined := chain(each.base, each.tables, joins, context.unique, stated, types=types), Refusal):
             refuse(each.part, joined.reason)
 
     reuse, candidates, reason = draft.get("reuse_dashboard"), (), None
@@ -756,7 +761,7 @@ def plan_from_draft(draft: Mapping[str, Any], context: PlanContext) -> BuildPlan
     made: set[str] = set()
     planned: list[PlannedDataset] = []
     for base in dict.fromkeys([*(base for *_, base in read), *(base for _, base in written.values())]):
-        steps = chain(base, needs[base], joins, context.unique, stated)
+        steps = chain(base, needs[base], joins, context.unique, stated, types=types)
         if isinstance(steps, Refusal):
             raise AssertionError(f"the tables of the parts on {base!r} were each joined, and together were not")
         if steps or tables[base].dataset_id is None:
@@ -1022,8 +1027,9 @@ class _Rows:
     qualifier in the join (its alias, else its name, as written there, quoting and all), and `nullable` the joined
     tables an outer join may fill with NULL: in join order from the FROM's table, a LEFT JOIN's table, every table
     before a RIGHT JOIN, and every table up to a FULL JOIN's. `far` gives each table a LEFT JOIN brings in, in join
-    order, with its far side: its columns the join's ON condition sets equal to a column of a table before it, each
-    equality one every joined row meets. `base` is the table whose rows the dataset keeps, where its join is one the
+    order, with the equalities its far side is read from: each of its columns the join's ON condition sets equal to a
+    column of a table before it, as a link from that column, each equality one every joined row meets
+    (`_far_links`). `base` is the table whose rows the dataset keeps, where its join is one the
     plan's reader makes (`_made_from`); None for any other."""
 
     columns: frozenset[str]
@@ -1039,7 +1045,7 @@ class _Rows:
     shown: Mapping[tuple[str, str], str] = field(default_factory=dict)
     qualifiers: Mapping[str, exp.Identifier] = field(default_factory=dict)
     nullable: frozenset[str] = frozenset()
-    far: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    far: tuple[tuple[str, tuple[Link, ...]], ...] = ()
     base: str | None = None
 
 
@@ -1177,12 +1183,12 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
         return problem
     # `names[index]` is the table the join at `index` (from 1) brings in, and `names[:index]` every table before it.
     nullable: set[str] = set()
-    far: list[tuple[str, tuple[str, ...]]] = []
+    far: list[tuple[str, tuple[Link, ...]]] = []
     for index, join in enumerate(joins, 1):
         side = (join.args.get("side") or "").upper()
         if side == "LEFT":
             nullable.add(names[index])
-            far.append((names[index], _far_columns(join.args["on"], names[index], names[:index], qualifiers)))
+            far.append((names[index], _far_links(join.args["on"], names[index], names[:index], qualifiers)))
         elif side == "RIGHT":
             nullable.update(names[:index])
         elif side == "FULL":
@@ -1233,25 +1239,25 @@ def _conjuncts(condition: exp.Expression) -> list[exp.Expression]:
     return [condition]
 
 
-def _far_columns(condition: exp.Expression, table: str, before: Sequence[str],
-                 qualifiers: Mapping[str | None, str]) -> tuple[str, ...]:
-    """The columns of `table`, a LEFT JOIN's table, that its ON `condition` sets equal to a column of a table in
-    `before`, the tables joined before it, each named with its table's qualifier (`qualifiers`), in an equality every
-    joined row meets: one ANDed with the rest, never one under an OR or a NOT, which a row can meet without it."""
-    found: dict[str, None] = {}
+def _far_links(condition: exp.Expression, table: str, before: Sequence[str],
+               qualifiers: Mapping[str | None, str]) -> tuple[Link, ...]:
+    """The equalities of `table`, a LEFT JOIN's table, that its ON `condition` makes with a table in `before`, the
+    tables joined before it, each column named with its table's qualifier (`qualifiers`), in an equality every joined
+    row meets: one ANDed with the rest, never one under an OR or a NOT, which a row can meet without it. Each is a link
+    from the table before to `table`, so its right is a column of the far side, in the order written, once each."""
+    found: dict[Link, None] = {}
     for equal in _conjuncts(condition):
         if not isinstance(equal, exp.EQ):
             continue
         sides = [side.unnest() for side in (equal.this, equal.expression)]
         if not all(isinstance(side, exp.Column) and side.table for side in sides):
             continue
-        (left, left_column), (right, right_column) = (
-            (qualifiers.get(resolve_identifier(side.args["table"], SUPERSET_DIALECT)),
-             resolve_identifier(side.this, SUPERSET_DIALECT)) for side in sides)
-        if left == table and right in before:
-            found[left_column] = None
-        elif right == table and left in before:
-            found[right_column] = None
+        left, right = ((qualifiers.get(resolve_identifier(side.args["table"], SUPERSET_DIALECT)),
+                        resolve_identifier(side.this, SUPERSET_DIALECT)) for side in sides)
+        if left[0] == table and right[0] in before:
+            found[Link(right, left)] = None
+        elif right[0] == table and left[0] in before:
+            found[Link(left, right)] = None
     return tuple(found)
 
 
@@ -1505,14 +1511,17 @@ def _row_ruled(dataset_ids: Sequence[int] | None, client) -> bool | None:
     return None if unknown else False
 
 
-def _far_side_refusals(on: _Rows, unique: Unique, *, adapter, snapshot: Snapshot, grants: GrantSet, probes: Probes,
-                       row_ruled: Callable[[str], bool | None]) -> list[str]:
+def _far_side_refusals(on: _Rows, unique: Unique, types: Types, *, adapter, snapshot: Snapshot, grants: GrantSet,
+                       probes: Probes, row_ruled: Callable[[str], bool | None]) -> list[str]:
     """The reasons a planned join is refused for a table a LEFT JOIN brings in by a far side (`_Rows.far`) not shown
     to hold each value once: a far side that does meets each row it is joined to at most once, so the join keeps those
-    rows once each, and every measure's value with them; any other may repeat them. Enrichment's key facts (`unique`,
-    read over every row) decide wherever they say anything (`far_side`); only a far side they say nothing of is asked
-    of the source, as the builder, within the plan's probes (`unique_live`), and one the source does not answer for is
-    refused as one that repeats is: nothing is joined on a guess.
+    rows once each, and every measure's value with them; any other may repeat them. First, each equality the far side
+    is read from compares two columns of one kind (`mistyped`, each column's declared type in `types`), whoever wrote
+    the join: one that converts a side may read two of the far side's values as one, so no fact or count of the key
+    says it holds each value once there, and the table is refused before either is read. Then enrichment's key facts
+    (`unique`, read over every row) decide wherever they say anything (`far_side`); only a far side they say nothing of
+    is asked of the source, as the builder, within the plan's probes (`unique_live`), and one the source does not
+    answer for is refused as one that repeats is: nothing is joined on a guess.
 
     Superset applies its row rules to the probe, as to every statement the builder sends, so under one the probe
     counts the builder's rows only, and a key that holds each value once there may repeat among another viewer's. So
@@ -1520,12 +1529,16 @@ def _far_side_refusals(on: _Rows, unique: Unique, *, adapter, snapshot: Snapshot
     False, and not where mnemiq's own grants withhold it (`probe_withheld`); a key not probed for either is refused,
     saying why."""
     reasons: list[str] = []
-    for table, columns in on.far:
+    for table, links in on.far:
         advice = f"join {table} only by columns that hold each value once, or plan without its columns"
-        if not columns:
+        if not links:
             reasons.append(f"it joins {table} by no column of {table} equal to a column of a table before it, so a row "
                            f"may meet more than one of its rows; {advice}")
             continue
+        if (why := next((said for link in links if (said := mistyped(link, types)) is not None), None)) is not None:
+            reasons.append(f"{why}; join {table} only by columns of one kind, or plan without its columns")
+            continue
+        columns = tuple(dict.fromkeys(link.right[1] for link in links))
         known = far_side(table, columns, unique)
         measured, why = known, None
         if known is None:
@@ -1568,6 +1581,9 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
     probes = Probes()
     # Whether a row rule applies to the builder on a joined table, asked once per table in this check.
     rules: dict[str, bool | None] = {}
+    # Each visible column's declared type, which a joined table's every equality is held to, whoever wrote the join.
+    declared = {(table, column): data_type for table, typed in catalogue.types.items()
+                for column, data_type in typed.items()}
 
     def row_ruled(table: str) -> bool | None:
         if table not in rules:
@@ -1636,8 +1652,8 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
                              "that needs the join")
                 continue
             # Its parts are still checked on it, so a refusal of its far sides goes back with theirs in one repair.
-            for reason in _far_side_refusals(joined, context.unique, adapter=adapter, snapshot=snapshot, grants=grants,
-                                             probes=probes, row_ruled=row_ruled):
+            for reason in _far_side_refusals(joined, context.unique, declared, adapter=adapter, snapshot=snapshot,
+                                             grants=grants, probes=probes, row_ruled=row_ruled):
                 refuse(part, reason)
             rows[planned.placeholder] = joined
         elif planned.table not in catalogue.columns:

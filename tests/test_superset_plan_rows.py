@@ -15,8 +15,8 @@ from sqlglot import exp
 from mnemiq.contract import Relationship
 from mnemiq.contract.values import JoinKey
 from mnemiq.superset.plan_rows import (Link, Refusal, Step, aggregated, base_among, base_of, chain, column_of,
-                                       column_text, edges, far_side, join_text, links_of, qualified, qualify, read_join,
-                                       rewrite)
+                                       column_text, comparable, edges, far_side, join_text, links_of, qualified,
+                                       qualify, read_join, rewrite)
 from mnemiq.superset.planner import joined_names
 from mnemiq.superset.saved_metrics import normalized
 from mnemiq.superset.settings import SUPERSET_DIALECT
@@ -48,6 +48,16 @@ ORDER_CUSTOMER = Link(("orders", "customer_id"), ("customers", "customer_id"), "
 RETURN_ITEM = Link(("returns", "order_item_id"), ("order_items", "order_item_id"), "returns->order_items")
 KNOWN = links_of(SHOP, NAMES)
 SHOP_EDGES = edges((), KNOWN)
+# The declared type of each column a link here names, as the snapshot records one: every key an integer and a price an
+# exact numeric, so every link compares its columns exactly unless a test says otherwise.
+TYPES = {**{(table, column): "integer" for table, columns in {
+    "orders": ("order_id", "customer_id", "payer_id"),
+    "order_items": ("order_item_id", "order_id", "product_id", "shipment_id"),
+    "products": ("product_id",), "customers": ("customer_id", "account_id"),
+    "returns": ("order_item_id", "customer_id", "order_id", "product_id"),
+    "shipments": ("shipment_id", "customer_id"), "employees": ("employee_id", "department_id"),
+    "departments": ("department_id", "manager_id"), "Order Items": ("Order Id",)}.items() for column in columns},
+    ("order_items", "unit_price"): "numeric(10,2)", ("products", "unit_price"): "numeric(10,2)"}
 
 
 def _refused(result: object, *named: str) -> str:
@@ -149,33 +159,87 @@ def test_qualified_names_each_column_with_its_table_or_says_why_not():
 
 
 def test_a_chain_takes_the_shortest_path_over_unique_far_sides():
-    assert chain("order_items", {"customers", "products", "order_items"}, SHOP_EDGES, UNIQUE) == (
+    assert chain("order_items", {"customers", "products", "order_items"}, SHOP_EDGES, UNIQUE, types=TYPES) == (
         Step("orders", (ITEM_ORDER,)), Step("products", (ITEM_PRODUCT,)), Step("customers", (ORDER_CUSTOMER,)))
-    assert chain("returns", {"customers"}, SHOP_EDGES, UNIQUE) == (
+    assert chain("returns", {"customers"}, SHOP_EDGES, UNIQUE, types=TYPES) == (
         Step("order_items", (RETURN_ITEM,)), Step("orders", (ITEM_ORDER,)), Step("customers", (ORDER_CUSTOMER,)))
     # A link straight to customers is one join where the way through order_items and orders is three.
     direct = Link(("returns", "customer_id"), ("customers", "customer_id"))
-    assert chain("returns", {"customers"}, edges((direct,), KNOWN), UNIQUE) == (Step("customers", (direct,)),)
+    assert chain("returns", {"customers"}, edges((direct,), KNOWN), UNIQUE, types=TYPES) == (
+        Step("customers", (direct,)),)
     # Walking a link from its far end joins the table it starts from: an item is returned at most once.
-    assert chain("order_items", {"returns"}, SHOP_EDGES, UNIQUE) == (
+    assert chain("order_items", {"returns"}, SHOP_EDGES, UNIQUE, types=TYPES) == (
         Step("returns", (Link(("order_items", "order_item_id"), ("returns", "order_item_id"),
                               "returns->order_items"),)),)
-    assert chain("orders", {"orders"}, SHOP_EDGES, UNIQUE) == ()
+    assert chain("orders", {"orders"}, SHOP_EDGES, UNIQUE, types=TYPES) == ()
 
 
 def test_a_far_side_known_to_repeat_is_never_joined():
     assert far_side("orders", ["customer_id"], UNIQUE) is False
     # Each customer has many orders, so customers' rows cannot take an order's columns.
-    _refused(chain("customers", {"orders"}, SHOP_EDGES, UNIQUE), "orders", "customers.customer_id = orders.customer_id",
-             "orders.customer_id holds a value more than once")
+    _refused(chain("customers", {"orders"}, SHOP_EDGES, UNIQUE, types=TYPES), "orders",
+             "customers.customer_id = orders.customer_id", "orders.customer_id holds a value more than once")
     repeating = {**UNIQUE, ("orders", "order_id"): False}
-    _refused(chain("order_items", {"customers"}, SHOP_EDGES, repeating), "customers")
+    _refused(chain("order_items", {"customers"}, SHOP_EDGES, repeating, types=TYPES), "customers")
 
 
 def test_an_unknown_far_side_is_usable():
     unknown = {key: fact for key, fact in UNIQUE.items() if key != ("orders", "order_id")}
     assert far_side("orders", ["order_id"], unknown) is None
-    assert chain("order_items", {"orders"}, SHOP_EDGES, unknown) == (Step("orders", (ITEM_ORDER,)),)
+    assert chain("order_items", {"orders"}, SHOP_EDGES, unknown, types=TYPES) == (Step("orders", (ITEM_ORDER,)),)
+
+
+@pytest.mark.parametrize(("left", "right"), [
+    ("integer", "bigint"), ("numeric", "integer"), ("numeric(10,2)", "integer"), ("int8", "smallint"),
+    ("decimal(5)", "int4"), ("text", "varchar(20)"), ("character varying(10)", "character varying(20)"),
+    ("TEXT", "character varying"), ("double precision", "float8"), ("real", "real"), ("char(3)", "bpchar"),
+    ("date", "DATE"), ("timestamp(3) without time zone", "timestamp"), ("timestamp with time zone", "timestamptz"),
+    ("boolean", "bool"), ("uuid", "uuid"), ("citext", "citext"), ("integer[]", "int4[]"),
+])
+def test_columns_of_one_kind_compare_exactly(left, right):
+    """An integer with an exact numeric, text with varchar, and any other type with itself, its length and precision
+    aside: an equality of the two reads no two values of either as one."""
+    assert comparable(left, right) and comparable(right, left)
+
+
+@pytest.mark.parametrize(("left", "right"), [
+    ("double precision", "bigint"), ("double precision", "numeric"), ("real", "integer"), ("real", "double precision"),
+    ("char(3)", "varchar(3)"), ("character", "text"), ("timestamp", "timestamp with time zone"), ("date", "timestamp"),
+    ("text", "integer"), ("uuid", "text"), ("citext", "text"), ("integer[]", "text[]"),
+    ("bigint", None), (None, None), ("bigint", ""), ("unknown", "unknown"), ("USER-DEFINED", "USER-DEFINED"),
+    ("ARRAY", "ARRAY"),
+])
+def test_columns_of_two_kinds_or_of_no_known_type_do_not_compare_exactly(left, right):
+    """Equality across any other two types converts one side, and a conversion that rounds (a bigint read as a double
+    precision) reads two of its values as one; a column with no type recorded, or one that names none, could be
+    either."""
+    assert not comparable(left, right) and not comparable(right, left)
+
+
+def test_a_link_between_columns_of_two_kinds_is_never_walked():
+    """A double precision equal to a bigint compares both as double precision, which reads two ids past 2^53 as one: a
+    customer key that holds each value once may still meet one order twice, and LEFT JOIN would repeat the order. The
+    link is never joined by, whatever the key facts say, and the table it alone reaches is refused naming both columns
+    and both types."""
+    typed = {**TYPES, ("orders", "customer_id"): "double precision", ("customers", "customer_id"): "bigint"}
+    reason = _refused(chain("orders", {"customers"}, SHOP_EDGES, UNIQUE, types=typed), "'customers'")
+    assert ("orders.customer_id is double precision and customers.customer_id is bigint: a link joins columns whose "
+            "values compare exactly") in reason, reason
+    _refused(base_among({"orders", "customers"}, SHOP_EDGES, UNIQUE, types=typed), "'orders'", "'customers'")
+    # Where another way of one kind reaches the table, it is joined by: shipments' link to customers is an integer's.
+    assert chain("order_items", {"customers"}, edges((), SHIPPED), SHIPPED_UNIQUE, types=typed) == (
+        Step("shipments", (SHIPPED[-2],)), Step("customers", (SHIPPED[-1],)))
+    # A stated link of two kinds is no more joined by than a known one.
+    stated = Link(("orders", "customer_id"), ("customers", "customer_id"), "orders->customers")
+    _refused(chain("orders", {"customers"}, edges((stated,), KNOWN), UNIQUE, (stated,), types=typed),
+             "orders.customer_id is double precision and customers.customer_id is bigint")
+
+
+def test_a_link_with_a_column_of_no_recorded_type_is_never_walked():
+    untyped = {key: data_type for key, data_type in TYPES.items() if key != ("customers", "customer_id")}
+    reason = _refused(chain("orders", {"customers"}, SHOP_EDGES, UNIQUE, types=untyped), "'customers'")
+    assert ("orders.customer_id is integer and customers.customer_id has no recorded type: a link joins columns whose "
+            "values compare exactly, which mnemiq cannot tell without both columns' types") in reason, reason
 
 
 def test_a_two_column_far_side_is_unique_when_either_column_is():
@@ -186,7 +250,7 @@ def test_a_two_column_far_side_is_unique_when_either_column_is():
     assert far_side("order_items", ["order_id", "order_id"], UNIQUE) is False
     two = (Link(("returns", "order_id"), ("order_items", "order_id")),
            Link(("returns", "product_id"), ("order_items", "product_id")))
-    assert chain("returns", {"order_items"}, edges(two, KNOWN), UNIQUE) == (Step("order_items", two),)
+    assert chain("returns", {"order_items"}, edges(two, KNOWN), UNIQUE, types=TYPES) == (Step("order_items", two),)
 
 
 def test_two_shortest_paths_or_two_links_to_a_table_are_ambiguous():
@@ -194,23 +258,23 @@ def test_two_shortest_paths_or_two_links_to_a_table_are_ambiguous():
     shipped = KNOWN + (Link(("order_items", "shipment_id"), ("shipments", "shipment_id")),
                        Link(("shipments", "customer_id"), ("customers", "customer_id")))
     unique = {**UNIQUE, ("shipments", "shipment_id"): True}
-    _refused(chain("order_items", {"customers"}, edges((), shipped), unique), "customers",
+    _refused(chain("order_items", {"customers"}, edges((), shipped), unique, types=TYPES), "customers",
              "order_items.order_id = orders.order_id then orders.customer_id = customers.customer_id",
              "order_items.shipment_id = shipments.shipment_id then shipments.customer_id = customers.customer_id",
              "state the links of the way you mean")
-    _refused(chain("returns", {"customers"}, edges((), shipped), unique), "customers")
+    _refused(chain("returns", {"customers"}, edges((), shipped), unique, types=TYPES), "customers")
     # A table reached two ways that no part needs is never joined, so it is no ambiguity.
-    assert chain("order_items", {"orders", "shipments"}, edges((), shipped), unique) == (
+    assert chain("order_items", {"orders", "shipments"}, edges((), shipped), unique, types=TYPES) == (
         Step("orders", (ITEM_ORDER,)), Step("shipments", (shipped[-2],)))
     # An order's buyer and its payer are both customers: two links from orders to one table.
     payer = Link(("orders", "payer_id"), ("customers", "customer_id"))
-    _refused(chain("orders", {"customers"}, edges((), (*KNOWN, payer)), UNIQUE),
+    _refused(chain("orders", {"customers"}, edges((), (*KNOWN, payer)), UNIQUE, types=TYPES),
              "orders.customer_id = customers.customer_id", "orders.payer_id = customers.customer_id")
-    _refused(chain("order_items", {"customers"}, edges((), (*KNOWN, payer)), UNIQUE), "orders.payer_id")
+    _refused(chain("order_items", {"customers"}, edges((), (*KNOWN, payer)), UNIQUE, types=TYPES), "orders.payer_id")
     # Stated as one link from orders to customers, the two are still two: one link uses each column once.
     both = (Link(("orders", "customer_id"), ("customers", "customer_id"), "orders->customers"),
             Link(("orders", "payer_id"), ("customers", "customer_id"), "orders->customers"))
-    _refused(chain("orders", {"customers"}, edges(both, KNOWN), UNIQUE),
+    _refused(chain("orders", {"customers"}, edges(both, KNOWN), UNIQUE, types=TYPES),
              "orders.customer_id = customers.customer_id or orders.payer_id = customers.customer_id")
 
 
@@ -222,43 +286,44 @@ SHIPPED_UNIQUE = {**UNIQUE, ("shipments", "shipment_id"): True}
 def test_a_tie_between_shortest_ways_goes_to_the_one_with_the_most_stated_links():
     # Stating the link to shipments chooses the way through it: one stated link against none.
     ship = Link(("order_items", "shipment_id"), ("shipments", "shipment_id"), "order_items->shipments")
-    assert chain("order_items", {"customers"}, edges((ship,), SHIPPED), SHIPPED_UNIQUE, (ship,)) == (
+    assert chain("order_items", {"customers"}, edges((ship,), SHIPPED), SHIPPED_UNIQUE, (ship,), types=TYPES) == (
         Step("shipments", (ship,)), Step("customers", (SHIPPED[-1],)))
     # Stating a link the snapshot also knows chooses its way the same.
     buyer = Link(("orders", "customer_id"), ("customers", "customer_id"), "orders->customers")
-    assert chain("order_items", {"customers"}, edges((buyer,), SHIPPED), SHIPPED_UNIQUE, (buyer,)) == (
+    assert chain("order_items", {"customers"}, edges((buyer,), SHIPPED), SHIPPED_UNIQUE, (buyer,), types=TYPES) == (
         Step("orders", (ITEM_ORDER,)), Step("customers", (buyer,)))
     # Both links of a way against one of the other's.
     ships_to = Link(("shipments", "customer_id"), ("customers", "customer_id"), "shipments->customers")
     stated = (ship, ships_to, buyer)
-    assert chain("order_items", {"customers"}, edges(stated, SHIPPED), SHIPPED_UNIQUE, stated) == (
+    assert chain("order_items", {"customers"}, edges(stated, SHIPPED), SHIPPED_UNIQUE, stated, types=TYPES) == (
         Step("shipments", (ship,)), Step("customers", (ships_to,)))
     # A tie further from the base is broken as well: returns reach customers through order_items either way.
-    assert chain("returns", {"customers"}, edges((ship,), SHIPPED), SHIPPED_UNIQUE, (ship,)) == (
+    assert chain("returns", {"customers"}, edges((ship,), SHIPPED), SHIPPED_UNIQUE, (ship,), types=TYPES) == (
         Step("order_items", (RETURN_ITEM,)), Step("shipments", (ship,)), Step("customers", (SHIPPED[-1],)))
 
 
 def test_shortest_ways_with_as_many_stated_links_are_still_ambiguous():
     ship = Link(("order_items", "shipment_id"), ("shipments", "shipment_id"), "order_items->shipments")
     buyer = Link(("orders", "customer_id"), ("customers", "customer_id"), "orders->customers")
-    _refused(chain("order_items", {"customers"}, edges((ship, buyer), SHIPPED), SHIPPED_UNIQUE, (ship, buyer)),
+    _refused(chain("order_items", {"customers"}, edges((ship, buyer), SHIPPED), SHIPPED_UNIQUE, (ship, buyer),
+                   types=TYPES),
              "'customers' is reached from the rows of 'order_items' two ways of one length",
              "state the links of the way you mean")
     # A stated link on neither way breaks no tie.
     returned = Link(("returns", "order_item_id"), ("order_items", "order_item_id"), "returns->order_items")
-    _refused(chain("order_items", {"customers"}, edges((returned,), SHIPPED), SHIPPED_UNIQUE, (returned,)),
+    _refused(chain("order_items", {"customers"}, edges((returned,), SHIPPED), SHIPPED_UNIQUE, (returned,), types=TYPES),
              "two ways of one length")
 
 
 def test_a_part_with_no_measure_takes_as_its_base_the_one_table_reaching_the_others():
-    assert base_among({"orders", "customers"}, SHOP_EDGES, UNIQUE) == "orders"
-    assert base_among({"order_items", "customers", "products"}, SHOP_EDGES, UNIQUE) == "order_items"
-    assert base_among({"orders"}, SHOP_EDGES, UNIQUE) == "orders"
+    assert base_among({"orders", "customers"}, SHOP_EDGES, UNIQUE, types=TYPES) == "orders"
+    assert base_among({"order_items", "customers", "products"}, SHOP_EDGES, UNIQUE, types=TYPES) == "order_items"
+    assert base_among({"orders"}, SHOP_EDGES, UNIQUE, types=TYPES) == "orders"
     # Neither reaches the other: a customer has many orders, and an order is no product's.
-    _refused(base_among({"customers", "products"}, SHOP_EDGES, UNIQUE), "'customers'", "'products'")
+    _refused(base_among({"customers", "products"}, SHOP_EDGES, UNIQUE, types=TYPES), "'customers'", "'products'")
     # An item is returned at most once, so each reaches the other: which rows are meant is not said.
-    _refused(base_among({"order_items", "returns"}, SHOP_EDGES, UNIQUE), "'order_items'", "'returns'")
-    _refused(base_among(set(), SHOP_EDGES, UNIQUE), "no column")
+    _refused(base_among({"order_items", "returns"}, SHOP_EDGES, UNIQUE, types=TYPES), "'order_items'", "'returns'")
+    _refused(base_among(set(), SHOP_EDGES, UNIQUE, types=TYPES), "no column")
 
 
 def test_a_chart_column_is_one_column_named_with_its_table():
@@ -279,7 +344,7 @@ def test_column_text_reads_back_as_the_column_it_names():
 
 
 def test_a_join_text_reads_back_as_its_base_and_steps():
-    steps = chain("order_items", {"customers", "products"}, SHOP_EDGES, UNIQUE)
+    steps = chain("order_items", {"customers", "products"}, SHOP_EDGES, UNIQUE, types=TYPES)
     two = (Link(("returns", "order_id"), ("order_items", "order_id")),
            Link(("returns", "product_id"), ("order_items", "product_id")))
     for base, made in (("order_items", steps), ("returns", (Step("order_items", two),)), ("orders", ())):
@@ -317,40 +382,44 @@ def test_two_relationships_between_one_pair_are_two_links():
                      {"employees": "employees", "departments": "departments"})
     unique = {("departments", "department_id"): True, ("employees", "employee_id"): True,
               ("employees", "department_id"): False}
-    _refused(chain("employees", {"departments"}, edges((), staff), unique),
+    _refused(chain("employees", {"departments"}, edges((), staff), unique, types=TYPES),
              "employees.department_id = departments.department_id or employees.employee_id = departments.manager_id")
     # From a department only the manager's link is one to join by: a department has many employees.
     managed = Link(("departments", "manager_id"), ("employees", "employee_id"), "departments->employees")
-    assert chain("departments", {"employees"}, edges((), staff), unique) == (Step("employees", (managed,)),)
+    assert chain("departments", {"employees"}, edges((), staff), unique, types=TYPES) == (
+        Step("employees", (managed,)),)
     # The same columns as one link join by both together.
     one = (Link(("employees", "department_id"), ("departments", "department_id"), "employees->departments"),
            Link(("departments", "manager_id"), ("employees", "employee_id"), "employees->departments"))
-    assert chain("employees", {"departments"}, edges(one, ()), unique) == (Step("departments", (
+    assert chain("employees", {"departments"}, edges(one, ()), unique, types=TYPES) == (Step("departments", (
         one[0], Link(("employees", "employee_id"), ("departments", "manager_id"), "employees->departments"))),)
     # An order's customer and its payer's account: two relationships to one table, no column used twice.
     paid = links_of([*SHOP, _relationship("orders", "customers", ("payer_id", "account_id"), name="payer")], NAMES)
-    _refused(chain("order_items", {"customers"}, edges((), paid), {**UNIQUE, ("customers", "account_id"): True}),
+    _refused(chain("order_items", {"customers"}, edges((), paid), {**UNIQUE, ("customers", "account_id"): True},
+                   types=TYPES),
              "orders.customer_id = customers.customer_id or orders.payer_id = customers.account_id")
     # A relationship of the same column and one more is another link, each named with all its columns.
     priced = links_of([*SHOP, _relationship("order_items", "products", ("product_id", "product_id"),
                                             ("unit_price", "unit_price"), name="priced")], NAMES)
-    _refused(chain("order_items", {"products"}, edges((), priced), UNIQUE),
+    _refused(chain("order_items", {"products"}, edges((), priced), UNIQUE, types=TYPES),
              "order_items.product_id = products.product_id or order_items.product_id = products.product_id and "
              "order_items.unit_price = products.unit_price")
     # Two relationships of the same columns are one link.
     twice = links_of([*SHOP, _relationship("orders", "customers", ("customer_id", "customer_id"), name="declared")],
                      NAMES)
-    assert chain("orders", {"customers"}, edges((), twice), UNIQUE) == (Step("customers", (ORDER_CUSTOMER,)),)
+    assert chain("orders", {"customers"}, edges((), twice), UNIQUE, types=TYPES) == (
+        Step("customers", (ORDER_CUSTOMER,)),)
 
 
 def test_an_unreachable_table_is_refused_by_name():
-    reason = _refused(chain("order_items", {"customers", "suppliers", "orders"}, SHOP_EDGES, UNIQUE), "'suppliers'")
+    reason = _refused(chain("order_items", {"customers", "suppliers", "orders"}, SHOP_EDGES, UNIQUE, types=TYPES),
+                      "'suppliers'")
     assert "'customers'" not in reason and "'orders'" not in reason
-    _refused(chain("products", {"customers"}, SHOP_EDGES, UNIQUE), "'customers'", "'products'")
+    _refused(chain("products", {"customers"}, SHOP_EDGES, UNIQUE, types=TYPES), "'customers'", "'products'")
 
 
 def test_a_table_no_link_reaches_asks_the_model_to_state_the_link():
-    reason = _refused(chain("products", {"customers"}, SHOP_EDGES, UNIQUE), "'customers'")
+    reason = _refused(chain("products", {"customers"}, SHOP_EDGES, UNIQUE, types=TYPES), "'customers'")
     assert 'state it in "links"' in reason
     assert '{"from": "<table>.<column>", "to": "<table>.<column>"}' in reason
     assert "referencing table's column" in reason and "referenced table's key" in reason
@@ -366,13 +435,14 @@ def test_a_stated_link_decides_its_pair():
     reverse = Link(("customers", "customer_id"), ("orders", "payer_id"))
     assert edges((reverse, payer), KNOWN)[frozenset({"orders", "customers"})] == (reverse,)
     # Stating the payer's link chooses it over the buyer's the snapshot also knows.
-    assert chain("orders", {"customers"}, edges((payer,), (*KNOWN, payer)), UNIQUE) == (Step("customers", (payer,)),)
+    assert chain("orders", {"customers"}, edges((payer,), (*KNOWN, payer)), UNIQUE, types=TYPES) == (
+        Step("customers", (payer,)),)
     # A link a table states to itself joins nothing.
     assert edges((Link(("orders", "order_id"), ("orders", "order_id")),), ()) == {}
 
 
 def test_join_text_is_a_left_join_chain_from_the_base():
-    steps = chain("order_items", {"customers", "products"}, SHOP_EDGES, UNIQUE)
+    steps = chain("order_items", {"customers", "products"}, SHOP_EDGES, UNIQUE, types=TYPES)
     text = join_text("order_items", steps)
     assert text == ('"order_items" LEFT JOIN "orders" ON "order_items"."order_id" = "orders"."order_id" '
                     'LEFT JOIN "products" ON "order_items"."product_id" = "products"."product_id" '
@@ -403,7 +473,7 @@ def test_quoted_and_mixed_case_names_resolve_by_dialect():
     assert rewrite('SUM("Order Items"."Revenue")', {("Order Items", "Revenue"): "Order Items_Revenue"}) == (
         'SUM("Order Items_Revenue")')
     mixed = Link(("Order Items", "Order Id"), ("orders", "order_id"))
-    steps = chain("Order Items", {"orders"}, edges((mixed,), ()), {("orders", "order_id"): True})
+    steps = chain("Order Items", {"orders"}, edges((mixed,), ()), {("orders", "order_id"): True}, types=TYPES)
     assert join_text("Order Items", steps) == (
         '"Order Items" LEFT JOIN "orders" ON "Order Items"."Order Id" = "orders"."order_id"')
 

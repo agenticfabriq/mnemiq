@@ -1674,6 +1674,70 @@ def test_a_stated_link_onto_a_key_known_to_repeat_is_refused_naming_it_and_never
     assert _unique_probes(tools) == [] and _rule_asks(tools) == []
 
 
+def _customer_ref(customer_key: bool | None, *, order_key_type: str = "INTEGER") -> Snapshot:
+    """The shop with an order's `customer_ref`, a double precision, beside its customer_id, and a customer's id a
+    bigint, profiled as holding each value once (True), repeating (False) or never profiled (None)."""
+    columns = [_shop_column("customers", "customer_id", "bigint", customer_key) if column.id == "customers.customer_id"
+               else _shop_column("orders", "customer_id", order_key_type, False) if column.id == "orders.customer_id"
+               else column for column in SHOP.columns]
+    return SHOP.model_copy(update={"columns": [*columns, _shop_column("orders", "customer_ref", "double precision",
+                                                                      None)]})
+
+
+REF_OF_TWO_KINDS = ("orders.customer_ref is double precision and customers.customer_id is bigint: a link joins columns "
+                    "whose values compare exactly")
+
+
+def test_a_stated_link_between_columns_of_two_kinds_is_refused_naming_both_and_never_probed():
+    """A double precision equal to a bigint compares both as double precision, which reads two customer ids past 2^53
+    as one: a key that holds each value once, counted as the builder or profiled by enrichment, may meet one order
+    twice, and the LEFT JOIN would count that order twice. The stated link goes back for the repair naming both
+    columns and both types, refused again the plan is refused, and nothing is asked of the source or of the row
+    rules, since no count of the key could make the link safe."""
+    stated = {**copy.deepcopy(ORDERS_BY_REGION),
+              "links": [{"from": "orders.customer_ref", "to": "customers.customer_id"}]}
+    model = ScriptedModel([json.dumps(stated)] * 2)
+    tools = _tools(datasets=[_dataset(31, "customers")])
+    refused = _shop(LLMPlanner(model), tools, snapshot=_customer_ref(None))
+    assert isinstance(refused, PlanRefused), refused
+    assert len(model.sent) == 2, "it went back for the repair once"
+    reason = f"{REF_OF_TWO_KINDS}; state a link between columns of one kind"
+    assert _parts(refused) == {"the link 'orders.customer_ref = customers.customer_id'": reason}
+    assert f"- the link 'orders.customer_ref = customers.customer_id': {reason}\n" in model.sent[1]["user"]
+    assert _unique_probes(tools) == [] and _rule_asks(tools) == []
+
+
+def test_a_known_link_between_columns_of_two_kinds_is_not_joined_by():
+    """The snapshot's relationship of an order's customer to a customer's id is no more joined by when the two are of
+    two kinds: customers is reached by no link, and the chart goes back saying why, naming both columns and types."""
+    model = ScriptedModel([json.dumps(ORDERS_BY_REGION)] * 2)
+    tools = _tools(datasets=[_dataset(31, "customers")])
+    refused = _shop(LLMPlanner(model), tools, snapshot=_customer_ref(None, order_key_type="double precision"))
+    assert isinstance(refused, PlanRefused), refused
+    reason = _parts(refused)["chart 'orders_by_region'"]
+    assert "'customers' cannot be joined to the rows of 'orders'" in reason, reason
+    assert ("orders.customer_id is double precision and customers.customer_id is bigint: a link joins columns whose "
+            "values compare exactly") in reason, reason
+    assert _unique_probes(tools) == [] and _rule_asks(tools) == []
+
+
+@pytest.mark.parametrize("customer_key", [True, None], ids=["profiled unique", "never profiled"])
+def test_a_made_join_between_columns_of_two_kinds_is_refused_before_any_key_fact_or_probe(customer_key):
+    """A join handed to the check by a planner other than the model's channel, or kept from an earlier plan, is held
+    to the rule as well: each equality a LEFT JOIN's far side is read from compares two columns of one kind, before
+    enrichment's key fact is read or the source asked, since neither speaks to a key compared across two kinds."""
+    join = '"orders" LEFT JOIN "customers" ON "orders"."customer_ref" = "customers"."customer_id"'
+    tools = _tools(datasets=[_dataset(31, "customers")])
+    refused = _shop(FakePlanner(_orders_by_region(join)), tools, snapshot=_customer_ref(customer_key))
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused) == {ORDERS_AND_CUSTOMERS: (
+        f"{REF_OF_TWO_KINDS}; join customers only by columns of one kind, or plan without its columns")}
+    assert _unique_probes(tools) == [] and _rule_asks(tools) == []
+    # Joined by the customer_id of an order, an integer, the same join is checked as any other.
+    joined = _shop(FakePlanner(_orders_by_region()), _tools(datasets=[]), snapshot=_customer_ref(True))
+    assert isinstance(joined, BuildPlan), joined
+
+
 def _rule_asks(tools: Tools) -> list[list[int]]:
     """The datasets each call of the extension's `row_rules` asked about, in the order asked."""
     return [request["dataset_ids"] for tool, request in tools.calls if tool == ROW_RULES]

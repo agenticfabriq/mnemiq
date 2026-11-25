@@ -376,10 +376,20 @@ still to come. In short:
     table whose rows reference to the table referenced. A stated link decides its pair of tables.
   - **One dataset per base.** When a base needs nothing else, its measures and charts use the table's own dataset.
     When a chart or measure needs another table, mnemiq makes a virtual dataset: the base `LEFT JOIN` each needed table,
-    along the shortest chain of links whose far side holds each value once. A `LEFT JOIN` from the base keeps every row
-    of the base, so a measure over it counts the base's rows as it would alone. Among equally short chains, the one
+    along the shortest chain of links whose columns are of one kind and whose far side holds each value once. A
+    `LEFT JOIN` from the base keeps every row of the base, so a measure over it counts the base's rows as it would
+    alone. Among equally short chains, the one
     with the most stated links wins. Two chains with none preferred, two different links between one pair of tables,
     or no chain at all go back to the model once for the repair, which is told to state the link.
+  - **A link joins two columns of one kind.** An equality of two columns of different types converts one side, and a
+    conversion that rounds reads two values as one: a `double precision` equal to a `bigint` compares both as
+    `double precision`, which reads two ids past 2^53 as one, so a key that holds each value once can still meet a row
+    twice. mnemiq joins by a link only where both columns are integers or exact numerics (`smallint`, `integer`,
+    `bigint`, `numeric`), both `text` or `varchar`, or both of one other type (`char` with `char`, `date` with `date`,
+    a timestamp with a timestamp of the same time zone kind), lengths and precisions aside. A link of two other kinds,
+    or with a column whose type the snapshot does not record, is never joined by, whether the model stated it or the
+    snapshot knows it, and nothing is read of its key: the repair is told both columns and both types. Every equality
+    of a made dataset's `LEFT JOIN` is held to the same rule, whoever wrote the join.
   - **A far side that repeats is never joined,** since it would repeat the base's rows. Enrichment's profile says
     whether a key holds each value once. Where it does not say either way, mnemiq measures it as the builder, through
     Superset: `COUNT(*)` against `COUNT(DISTINCT ...)` of the key's non-null values, and joins only if the table holds

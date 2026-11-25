@@ -7,8 +7,12 @@ other tables a part needs are joined to the base along links, each an equality o
 the model states, and for a pair of tables it left unlinked, the snapshot's relationships (`edges`). A table is joined
 by a link only where the link's columns on that table, its far side, hold each value once, so each of the base's rows
 meets at most one of its rows, and LEFT JOIN keeps every base row: the measure's value is the same whichever tables a
-chart joins. A far side known to repeat is never joined; one not known either way may be (`far_side`), and the plan
-check measures it before the plan is accepted. Each needed table is reached by its shortest chain of such links
+chart joins. That holds only where the equality compares the two columns exactly: one that converts a side may read
+two of the far side's values as one (a bigint read as a double precision rounds two ids past 2^53 to one), and a key
+that holds each value once then meets a row twice. So a link joins two columns of one kind (`comparable`), whatever is
+known of its far side, and one of two kinds, or with a column of no recorded type, is never joined by (`mistyped`). A
+far side known to repeat is never joined; one not known either way may be (`far_side`), and the plan check measures it
+before the plan is accepted. Each needed table is reached by its shortest chain of such links
 (`chain`); two chains of one length, or two links between the same two tables, are refused as ambiguous, since each
 gives the measure different rows to read, unless the links the model stated tell the two chains apart. A part that adds
 nothing up takes as its rows the one of its tables that reaches the others (`base_among`).
@@ -40,6 +44,16 @@ from mnemiq.superset.settings import SUPERSET_DIALECT
 # Whether a table's column holds each value once, by (table, column): enrichment's key facts. A column absent is
 # unknown.
 Unique = Mapping[tuple[str, str], bool]
+# Each column's declared type, by (table, column), as the snapshot records it (`column_types`). A column absent has no
+# recorded type.
+Types = Mapping[tuple[str, str], str | None]
+
+_T = exp.DataType.Type
+# The types an equality compares exactly with another type, by the kind they share: Postgres compares an integer with an
+# exact numeric as numeric, which rounds neither, and text with varchar as text; `bpchar` is its own name for char. Any
+# other type compares exactly only with itself.
+_KINDS = {_T.SMALLINT: "exact number", _T.INT: "exact number", _T.BIGINT: "exact number", _T.DECIMAL: "exact number",
+          _T.TEXT: "text", _T.VARCHAR: "text", _T.CHAR: "blank-padded text", _T.BPCHAR: "blank-padded text"}
 
 
 @dataclass(frozen=True)
@@ -238,6 +252,54 @@ def far_side(table: str, columns: Sequence[str], unique: Unique) -> bool | None:
     return None
 
 
+def _kind(data_type: str | None) -> tuple[str, str] | None:
+    """The kind of a column of `data_type`, as the snapshot records it, read as `SUPERSET_DIALECT` reads a type, every
+    length and precision aside (`varchar(10)` is a varchar): its kind in `_KINDS`, else the type itself. None for no
+    type, or one that names none: unknown, a user-defined type of no name, or an array of elements of no type."""
+    if data_type is None or not data_type.strip():
+        return None
+    try:
+        built = exp.DataType.build(data_type, dialect=SUPERSET_DIALECT, udt=True)
+    except (SqlglotError, ValueError):
+        return None
+    for argument in list(built.find_all(exp.DataTypeParam)):
+        argument.pop()
+    if built.this == _T.UNKNOWN or (built.this == _T.USERDEFINED and not built.args.get("kind")) \
+            or (built.this in exp.DataType.NESTED_TYPES and not built.expressions):
+        return None
+    if built.this in _KINDS and not built.expressions:
+        return "kind", _KINDS[built.this]
+    return "type", built.sql(dialect=SUPERSET_DIALECT)
+
+
+def comparable(left_type: str | None, right_type: str | None) -> bool:
+    """Whether an equality of a column of `left_type` and one of `right_type` compares their values exactly, so it reads
+    no two values of either as one: both an integer or an exact numeric (smallint, integer, bigint, numeric), both text
+    or varchar, or both of one other type (char with char, a double precision with a double precision, a timestamp
+    with a timestamp of the same time zone kind), each read as `SUPERSET_DIALECT` reads a type, its length and
+    precision aside. False where either has no type, or one that names none."""
+    kind = _kind(left_type)
+    return kind is not None and kind == _kind(right_type)
+
+
+def _typed(column: tuple[str, str], data_type: str | None) -> str:
+    named = f"{column[0]}.{column[1]}"
+    return f"{named} is {data_type.strip()}" if data_type and data_type.strip() else f"{named} has no recorded type"
+
+
+def mistyped(link: Link, types: Types) -> str | None:
+    """Why `link` is never joined by, its columns' types (`types`) not comparing exactly (`comparable`): said with both
+    columns and both types, for the repair. None where they compare exactly."""
+    left, right = types.get(link.left), types.get(link.right)
+    if comparable(left, right):
+        return None
+    said = (f"{_typed(link.left, left)} and {_typed(link.right, right)}: a link joins columns whose values compare "
+            "exactly")
+    if _kind(left) is None or _kind(right) is None:
+        said += ", which mnemiq cannot tell without both columns' types"
+    return said
+
+
 def _oriented(links: Sequence[Link], near: str) -> tuple[Link, ...]:
     """`links` each written from `near`, the table already joined, to the table joined by them."""
     return tuple(link if link.left[0] == near else Link(link.right, link.left, link.via) for link in links)
@@ -261,23 +323,24 @@ def _listed(names: Sequence[str]) -> str:
 
 
 def chain(base: str, needed: Collection[str], edges: Mapping[frozenset[str], Sequence[Link]],
-          unique: Unique, stated: Collection[Link] = ()) -> tuple[Step, ...] | Refusal:
+          unique: Unique, stated: Collection[Link] = (), *, types: Types) -> tuple[Step, ...] | Refusal:
     """The LEFT JOINs that bring each of `needed` to `base`'s rows, in join order: for each needed table, the shortest
-    chain of links from `base` over which each joined table's far side is not known to repeat (`far_side`). Where two
-    shortest chains reach a table, the one with the most links the model stated (`stated`, as `edges` read them) is
-    joined, when it alone has the most. Refused, naming them, when a needed table is reached by no such chain; when
-    one is reached by two chains of one length that no stated link tells apart, or by a step whose two tables two such
-    links join (an employee's department and the department an employee manages), since either gives the base's rows
-    other rows to read."""
+    chain of links from `base` whose columns compare exactly (`mistyped`, read from `types` before anything is read of
+    a far side) and over which each joined table's far side is not known to repeat (`far_side`). Where two shortest
+    chains reach a table, the one with the most links the model stated (`stated`, as `edges` read them) is joined,
+    when it alone has the most. Refused, naming them, when a needed table is reached by no such chain; when one is
+    reached by two chains of one length that no stated link tells apart, or by a step whose two tables two such links
+    join (an employee's department and the department an employee manages), since either gives the base's rows other
+    rows to read."""
     adjacent: dict[str, list[tuple[str, frozenset[str]]]] = {}
     for pair in edges:
         for near, far in (sorted(pair), sorted(pair, reverse=True)):
             adjacent.setdefault(near, []).append((far, pair))
     # A breadth-first walk from the base: each table's depth, every table one shorter that reaches it, and the links
-    # each such step may join by.
+    # each such step may join by; and each link never joined by, with why.
     depth, parents, order = {base: 0}, {base: []}, [base]
     usable: dict[tuple[str, str], list[tuple[Link, ...]]] = {}
-    blocked: list[tuple[Link, ...]] = []
+    blocked: list[tuple[tuple[Link, ...], str]] = []
     frontier = [base]
     while frontier:
         reached: list[str] = []
@@ -285,10 +348,18 @@ def chain(base: str, needed: Collection[str], edges: Mapping[frozenset[str], Seq
             for far, pair in sorted(adjacent.get(near, ())):
                 if far in depth and depth[far] <= depth[near]:
                     continue
-                ways = _ways(edges[pair], near)
-                joinable = [on for on in ways if far_side(far, [link.right[1] for link in on], unique) is not False]
+                joinable: list[tuple[Link, ...]] = []
+                for on in _ways(edges[pair], near):
+                    why = next((said for link in on if (said := mistyped(link, types)) is not None), None)
+                    if why is None and far_side(far, [link.right[1] for link in on], unique) is False:
+                        columns = ", ".join(dict.fromkeys(f"{link.right[0]}.{link.right[1]}" for link in on))
+                        why = (f"the link {' and '.join(map(_link_text, on))} would repeat rows of {on[0].left[0]!r}, "
+                               f"since {columns} holds a value more than once")
+                    if why is None:
+                        joinable.append(on)
+                    else:
+                        blocked.append((on, why))
                 if not joinable:
-                    blocked.extend(ways)
                     continue
                 if far not in depth:
                     depth[far], parents[far] = depth[near] + 1, []
@@ -303,12 +374,10 @@ def chain(base: str, needed: Collection[str], edges: Mapping[frozenset[str], Seq
     if missing:
         reason = (f"{_listed(missing)} cannot be joined to the rows of {base!r}: no link reaches "
                   f"{'it' if len(missing) == 1 else 'them'} from {base!r}, directly or through other tables, whose "
-                  "columns on each table it joins hold each value once")
-        for on in blocked:
+                  "columns compare exactly and, on each table it joins, hold each value once")
+        for on, why in blocked:
             if on[0].right[0] in missing:
-                columns = ", ".join(dict.fromkeys(f"{link.right[0]}.{link.right[1]}" for link in on))
-                reason += (f"; the link {' and '.join(map(_link_text, on))} would repeat rows of {on[0].left[0]!r}, "
-                           f"since {columns} holds a value more than once")
+                reason += f"; {why}"
         reason += ('; if a link exists, state it in "links": from the referencing table\'s column to the referenced '
                    'table\'s key, as {"from": "<table>.<column>", "to": "<table>.<column>"}')
         return Refusal(reason)
@@ -362,20 +431,21 @@ def chain(base: str, needed: Collection[str], edges: Mapping[frozenset[str], Seq
 
 
 def base_among(tables: Collection[str], edges: Mapping[frozenset[str], Sequence[Link]], unique: Unique,
-               stated: Collection[Link] = ()) -> str | Refusal:
+               stated: Collection[Link] = (), *, types: Types) -> str | Refusal:
     """The rows of a part that adds nothing up (a chart with no measure): the one of `tables`, the tables its columns
     are of, from whose rows `chain` reaches every other. Refused, naming them, when none does, or when two do, since
     the part does not say whose rows it shows."""
     if not tables:
         return Refusal("it names no column, so it says no table for its rows")
     named = sorted(tables)
-    bases = [table for table in named if not isinstance(chain(table, tables, edges, unique, stated), Refusal)]
+    bases = [table for table in named
+             if not isinstance(chain(table, tables, edges, unique, stated, types=types), Refusal)]
     if len(bases) == 1:
         return bases[0]
     if not bases:
         return Refusal(f"its columns are of {_listed(named)}, and the rows of none of these reach the others by links "
-                       "whose columns on each table they join hold each value once: plot a measure on the table whose "
-                       "rows it shows, or state the link that joins them")
+                       "whose columns compare exactly and, on each table they join, hold each value once: plot a "
+                       "measure on the table whose rows it shows, or state the link that joins them")
     return Refusal(f"its columns are of {_listed(named)}, and the rows of each of {_listed(bases)} reach the others, so "
                    "which rows it shows is not said: plot a measure on the table whose rows it shows")
 
