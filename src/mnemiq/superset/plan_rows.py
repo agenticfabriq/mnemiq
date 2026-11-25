@@ -288,6 +288,8 @@ def chain(base: str, needed: Collection[str], edges: Mapping[frozenset[str], Seq
                 columns = ", ".join(dict.fromkeys(f"{link.right[0]}.{link.right[1]}" for link in on))
                 reason += (f"; the link {' and '.join(map(_link_text, on))} would repeat rows of {on[0].left[0]!r}, "
                            f"since {columns} holds a value more than once")
+        reason += ('; if a link exists, state it in "links": from the referencing table\'s column to the referenced '
+                   'table\'s key, as {"from": "<table>.<column>", "to": "<table>.<column>"}')
         return Refusal(reason)
 
     # Each table's parents on its shortest chains with the most stated links, walked in breadth-first order so each

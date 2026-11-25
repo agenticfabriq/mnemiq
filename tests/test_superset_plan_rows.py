@@ -319,6 +319,13 @@ def test_an_unreachable_table_is_refused_by_name():
     _refused(chain("products", {"customers"}, SHOP_EDGES, UNIQUE), "'customers'", "'products'")
 
 
+def test_a_table_no_link_reaches_asks_the_model_to_state_the_link():
+    reason = _refused(chain("products", {"customers"}, SHOP_EDGES, UNIQUE), "'customers'")
+    assert 'state it in "links"' in reason
+    assert '{"from": "<table>.<column>", "to": "<table>.<column>"}' in reason
+    assert "referencing table's column" in reason and "referenced table's key" in reason
+
+
 def test_a_stated_link_decides_its_pair():
     payer = Link(("orders", "payer_id"), ("customers", "customer_id"))
     decided = edges((payer,), KNOWN)
