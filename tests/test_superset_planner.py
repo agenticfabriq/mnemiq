@@ -869,6 +869,23 @@ def test_a_chart_on_one_table_of_its_measures_join_is_planned_on_the_join():
     assert _parts(refused)["chart 'paid_by_region'"] == "its table or join is not its measures'"
 
 
+def test_a_join_written_as_a_table_meets_the_join_checks_a_join_meets():
+    """Read as a join, the text is held to every check a join is: one over a table the builder's grants leave out is
+    refused, through the repair, as `join` would be; text whose sources are not all tables (a subquery among them) is
+    no join, so it stays a table no builder can read."""
+    ungranted = "policy JOIN payroll ON payroll.salary = policy.premium"
+    reply = json.dumps(_with_paid(measure_rows={"table": ungranted}))
+    refused = _plan(GOAL, LLMPlanner(ScriptedModel([reply, reply])), _tools())
+    assert isinstance(refused, PlanRefused), refused
+    assert f"the join {ungranted!r}" in _parts(refused), _parts(refused)
+    context = _context()
+    for text in ("policy JOIN (SELECT * FROM payroll) AS p ON p.salary = policy.premium",
+                 "(SELECT * FROM payroll) AS p", "policy, LATERAL (SELECT * FROM payroll) AS p"):
+        refused = plan_from_draft(_with_paid(measure_rows={"table": text}), context)
+        assert isinstance(refused, PlanRefused), text
+        assert f"{text!r} is not a table this builder can read" in _parts(refused)["measure 'paid'"], text
+
+
 def test_a_reply_with_both_shapes_is_planned_with_no_repair():
     reply = _with_paid(measure_rows={"table": JOIN}, chart_rows={"table": "policy"})
     model = ScriptedModel([json.dumps(reply)])
