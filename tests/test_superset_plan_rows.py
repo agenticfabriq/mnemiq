@@ -13,8 +13,9 @@ from sqlglot import exp
 
 from mnemiq.contract import Relationship
 from mnemiq.contract.values import JoinKey
-from mnemiq.superset.plan_rows import (Link, Refusal, Step, aggregated, base_of, chain, edges, far_side, join_text,
-                                       links_of, qualified, rewrite)
+from mnemiq.superset.plan_rows import (Link, Refusal, Step, aggregated, base_among, base_of, chain, column_of,
+                                       column_text, edges, far_side, join_text, links_of, qualified, qualify, read_join,
+                                       rewrite)
 from mnemiq.superset.planner import joined_names
 from mnemiq.superset.saved_metrics import normalized
 from mnemiq.superset.settings import SUPERSET_DIALECT
@@ -142,7 +143,8 @@ def test_two_shortest_paths_or_two_links_to_a_table_are_ambiguous():
     unique = {**UNIQUE, ("shipments", "shipment_id"): True}
     _refused(chain("order_items", {"customers"}, edges((), shipped), unique), "customers",
              "order_items.order_id = orders.order_id then orders.customer_id = customers.customer_id",
-             "order_items.shipment_id = shipments.shipment_id then shipments.customer_id = customers.customer_id")
+             "order_items.shipment_id = shipments.shipment_id then shipments.customer_id = customers.customer_id",
+             "state the links of the way you mean")
     _refused(chain("returns", {"customers"}, edges((), shipped), unique), "customers")
     # A table reached two ways that no part needs is never joined, so it is no ambiguity.
     assert chain("order_items", {"orders", "shipments"}, edges((), shipped), unique) == (
@@ -157,6 +159,102 @@ def test_two_shortest_paths_or_two_links_to_a_table_are_ambiguous():
             Link(("orders", "payer_id"), ("customers", "customer_id"), "orders->customers"))
     _refused(chain("orders", {"customers"}, edges(both, KNOWN), UNIQUE),
              "orders.customer_id = customers.customer_id or orders.payer_id = customers.customer_id")
+
+
+SHIPPED = KNOWN + (Link(("order_items", "shipment_id"), ("shipments", "shipment_id"), "shipped"),
+                   Link(("shipments", "customer_id"), ("customers", "customer_id"), "ships_to"))
+SHIPPED_UNIQUE = {**UNIQUE, ("shipments", "shipment_id"): True}
+
+
+def test_a_tie_between_shortest_ways_goes_to_the_one_with_the_most_stated_links():
+    # Stating the link to shipments chooses the way through it: one stated link against none.
+    ship = Link(("order_items", "shipment_id"), ("shipments", "shipment_id"), "order_items->shipments")
+    assert chain("order_items", {"customers"}, edges((ship,), SHIPPED), SHIPPED_UNIQUE, (ship,)) == (
+        Step("shipments", (ship,)), Step("customers", (SHIPPED[-1],)))
+    # Stating a link the snapshot also knows chooses its way the same.
+    buyer = Link(("orders", "customer_id"), ("customers", "customer_id"), "orders->customers")
+    assert chain("order_items", {"customers"}, edges((buyer,), SHIPPED), SHIPPED_UNIQUE, (buyer,)) == (
+        Step("orders", (ITEM_ORDER,)), Step("customers", (buyer,)))
+    # Both links of a way against one of the other's.
+    ships_to = Link(("shipments", "customer_id"), ("customers", "customer_id"), "shipments->customers")
+    stated = (ship, ships_to, buyer)
+    assert chain("order_items", {"customers"}, edges(stated, SHIPPED), SHIPPED_UNIQUE, stated) == (
+        Step("shipments", (ship,)), Step("customers", (ships_to,)))
+    # A tie further from the base is broken as well: returns reach customers through order_items either way.
+    assert chain("returns", {"customers"}, edges((ship,), SHIPPED), SHIPPED_UNIQUE, (ship,)) == (
+        Step("order_items", (RETURN_ITEM,)), Step("shipments", (ship,)), Step("customers", (SHIPPED[-1],)))
+
+
+def test_shortest_ways_with_as_many_stated_links_are_still_ambiguous():
+    ship = Link(("order_items", "shipment_id"), ("shipments", "shipment_id"), "order_items->shipments")
+    buyer = Link(("orders", "customer_id"), ("customers", "customer_id"), "orders->customers")
+    _refused(chain("order_items", {"customers"}, edges((ship, buyer), SHIPPED), SHIPPED_UNIQUE, (ship, buyer)),
+             "'customers' is reached from the rows of 'order_items' two ways of one length",
+             "state the links of the way you mean")
+    # A stated link on neither way breaks no tie.
+    returned = Link(("returns", "order_item_id"), ("order_items", "order_item_id"), "returns->order_items")
+    _refused(chain("order_items", {"customers"}, edges((returned,), SHIPPED), SHIPPED_UNIQUE, (returned,)),
+             "two ways of one length")
+
+
+def test_a_part_with_no_measure_takes_as_its_base_the_one_table_reaching_the_others():
+    assert base_among({"orders", "customers"}, SHOP_EDGES, UNIQUE) == "orders"
+    assert base_among({"order_items", "customers", "products"}, SHOP_EDGES, UNIQUE) == "order_items"
+    assert base_among({"orders"}, SHOP_EDGES, UNIQUE) == "orders"
+    # Neither reaches the other: a customer has many orders, and an order is no product's.
+    _refused(base_among({"customers", "products"}, SHOP_EDGES, UNIQUE), "'customers'", "'products'")
+    # An item is returned at most once, so each reaches the other: which rows are meant is not said.
+    _refused(base_among({"order_items", "returns"}, SHOP_EDGES, UNIQUE), "'order_items'", "'returns'")
+    _refused(base_among(set(), SHOP_EDGES, UNIQUE), "no column")
+
+
+def test_a_chart_column_is_one_column_named_with_its_table():
+    assert column_of("orders.order_date") == ("orders", "order_date")
+    assert column_of('"Order Items".Revenue') == ("Order Items", "revenue")
+    assert "without its table" in column_of("order_date")
+    for text in ("SUM(orders.order_id)", "orders.order_date AS day", "orders.channel || orders.channel"):
+        assert "not one column" in column_of(text), text
+    assert "not one SQL expression" in column_of("orders.")
+
+
+def test_column_text_reads_back_as_the_column_it_names():
+    for table, column in (("orders", "order_date"), ("Order Items", "Revenue"), ("ORDERS", "id"), ("order", "x"),
+                          ("Ärger", "wert"), ("select", "from")):
+        assert column_of(column_text(table, column)) == (table, column), (table, column)
+    assert column_text("orders", "order_date") == "orders.order_date"
+    assert column_text("Order Items", "Revenue") == '"Order Items"."Revenue"'
+
+
+def test_a_join_text_reads_back_as_its_base_and_steps():
+    steps = chain("order_items", {"customers", "products"}, SHOP_EDGES, UNIQUE)
+    two = (Link(("returns", "order_id"), ("order_items", "order_id")),
+           Link(("returns", "product_id"), ("order_items", "product_id")))
+    for base, made in (("order_items", steps), ("returns", (Step("order_items", two),)), ("orders", ())):
+        base_read, steps_read = read_join(join_text(base, made))
+        assert base_read == base
+        assert [(step.table, [(link.left, link.right) for link in step.on]) for step in steps_read] == [
+            (step.table, [(link.left, link.right) for link in step.on]) for step in made]
+    # A join written another way is read as far as its tables and its equalities go.
+    base, steps = read_join("policy p JOIN claim c ON c.policy_id = p.policy_id AND c.status = 'open'")
+    assert base == "policy" and [(step.table, [(link.left, link.right) for link in step.on]) for step in steps] == [
+        ("claim", [(("policy", "policy_id"), ("claim", "policy_id"))])]
+    for text in ("policy JOIN", "(SELECT 1) AS t", "policy, LATERAL (SELECT 1) AS t"):
+        assert read_join(text) is None, text
+
+
+def test_qualify_names_each_dataset_column_with_its_table_again():
+    names = joined_names([(table, COLUMNS[table]) for table in ("order_items", "orders", "products")])
+    owners = {name: key for key, name in names.items()}
+    for written in ("SUM(order_items.revenue)", "AVG(CASE WHEN orders.channel = 'web' THEN order_items.unit_price END)",
+                    "SUM(order_items.quantity * products.unit_price) / COUNT(DISTINCT orders.order_id)"):
+        shown = rewrite(written, names)
+        assert qualify(shown, owners) == written
+        assert rewrite(qualify(shown, owners), names) == shown
+    # The model's own spelling of a column whose name the dataset keeps is kept.
+    assert qualify("SUM(Revenue)", owners) == "SUM(order_items.Revenue)"
+    # What the dataset does not name is left as written; text that does not parse is returned as it is.
+    assert qualify("SUM(bogus) + SUM(t.revenue)", owners) == "SUM(bogus) + SUM(t.revenue)"
+    assert qualify("SUM(", owners) == "SUM("
 
 
 def test_two_relationships_between_one_pair_are_two_links():

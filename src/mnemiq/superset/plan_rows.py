@@ -10,7 +10,12 @@ meets at most one of its rows, and LEFT JOIN keeps every base row: the measure's
 chart joins. A far side known to repeat is never joined; one not known either way may be (`far_side`), and the plan
 check measures it before the plan is accepted. Each needed table is reached by its shortest chain of such links
 (`chain`); two chains of one length, or two links between the same two tables, are refused as ambiguous, since each
-gives the measure different rows to read.
+gives the measure different rows to read, unless the links the model stated tell the two chains apart. A part that adds
+nothing up takes as its rows the one of its tables that reaches the others (`base_among`).
+
+The repair shows the model its plan in the form it wrote it: `read_join` reads back a join `join_text` wrote, `qualify`
+names each of a dataset's columns with its table again, as `rewrite` named it the other way, and `column_text` writes
+one column as `column_of` reads it.
 
 Every identifier is read as `SUPERSET_DIALECT` reads it (`resolve_identifier`): an unquoted name folds as the dialect
 folds it, and a quoted one is the name as written. Every identifier built here is quoted, so it reads back as the
@@ -132,6 +137,34 @@ def qualified(expression: str) -> list[tuple[str, str]] | str:
     return list(named)
 
 
+def column_of(text: str) -> tuple[str, str] | str:
+    """The (table, column) `text` names when it is one column named with its table, `<table>.<column>`, as a chart's
+    dimension, time column, filter or a link's side is; or why it is not."""
+    named = qualified(text)
+    if isinstance(named, str):
+        return named
+    tree = _one_expression(text)
+    if tree is None or not isinstance(tree.expressions[0], exp.Column):
+        return f"{text!r} is not one column: name one column with its table, as <table>.<column>"
+    return named[0]
+
+
+def _written(name: str) -> exp.Identifier:
+    """`name` as an identifier `SUPERSET_DIALECT` reads back as `name`: unquoted where it reads so, else quoted."""
+    plain = exp.to_identifier(name, quoted=False)
+    tree = _one_expression(plain.sql(dialect=SUPERSET_DIALECT))
+    read = tree.expressions[0] if tree is not None else None
+    if isinstance(read, exp.Column) and not read.table and resolve_identifier(read.this, SUPERSET_DIALECT) == name:
+        return plain
+    return exp.to_identifier(name, quoted=True)
+
+
+def column_text(table: str, column: str) -> str:
+    """`<table>.<column>` as the model writes a column, each name unquoted where the dialect reads it back so: the text
+    `column_of` reads as (table, column)."""
+    return exp.Column(this=_written(column), table=_written(table)).sql(dialect=SUPERSET_DIALECT)
+
+
 def aggregated(expression: str) -> set[str]:
     """The tables of the columns `expression`'s aggregates add up: each aggregate's value columns (`value_terms`), so a
     CASE's condition, which only chooses rows, is not among them, and an ordered-set aggregate's are those it orders
@@ -205,12 +238,14 @@ def _listed(names: Sequence[str]) -> str:
 
 
 def chain(base: str, needed: Collection[str], edges: Mapping[frozenset[str], Sequence[Link]],
-          unique: Unique) -> tuple[Step, ...] | Refusal:
+          unique: Unique, stated: Collection[Link] = ()) -> tuple[Step, ...] | Refusal:
     """The LEFT JOINs that bring each of `needed` to `base`'s rows, in join order: for each needed table, the shortest
-    chain of links from `base` over which each joined table's far side is not known to repeat (`far_side`). Refused,
-    naming them, when a needed table is reached by no such chain; when one is reached by two chains of one length, or
-    by a step whose two tables two such links join (an employee's department and the department an employee manages),
-    since either gives the base's rows other rows to read."""
+    chain of links from `base` over which each joined table's far side is not known to repeat (`far_side`). Where two
+    shortest chains reach a table, the one with the most links the model stated (`stated`, as `edges` read them) is
+    joined, when it alone has the most. Refused, naming them, when a needed table is reached by no such chain; when
+    one is reached by two chains of one length that no stated link tells apart, or by a step whose two tables two such
+    links join (an employee's department and the department an employee manages), since either gives the base's rows
+    other rows to read."""
     adjacent: dict[str, list[tuple[str, frozenset[str]]]] = {}
     for pair in edges:
         for near, far in (sorted(pair), sorted(pair, reverse=True)):
@@ -253,11 +288,21 @@ def chain(base: str, needed: Collection[str], edges: Mapping[frozenset[str], Seq
                            f"since {columns} holds a value more than once")
         return Refusal(reason)
 
+    # Each table's parents on its shortest chains with the most stated links, walked in breadth-first order so each
+    # parent's count is known first: a step is stated when the model stated a link between its two tables.
+    pairs = {frozenset((link.left[0], link.right[0])) for link in stated}
+    most: dict[str, int] = {base: 0}
+    chosen: dict[str, list[str]] = {base: []}
+    for table in order[1:]:
+        counts = {parent: most[parent] + (frozenset((parent, table)) in pairs) for parent in parents[table]}
+        most[table] = max(counts.values())
+        chosen[table] = [parent for parent in parents[table] if counts[parent] == most[table]]
+
     def path_to(table: str) -> list[str]:
-        """`table`'s chain from the base, through each table's first parent."""
+        """`table`'s chain from the base, through each table's first chosen parent."""
         path = [table]
-        while parents[path[-1]]:
-            path.append(parents[path[-1]][0])
+        while chosen[path[-1]]:
+            path.append(chosen[path[-1]][0])
         return path[::-1]
 
     def path_text(path: Sequence[str]) -> str:
@@ -266,14 +311,15 @@ def chain(base: str, needed: Collection[str], edges: Mapping[frozenset[str], Seq
     joined: set[str] = set()
     for table in wanted:
         walked = [table]
-        while parents[walked[-1]]:
+        while chosen[walked[-1]]:
             node = walked[-1]
-            if len(parents[node]) > 1:
+            if len(chosen[node]) > 1:
                 rest = walked[::-1][1:]
-                first, second = (path_to(parent) + [node] + rest for parent in parents[node][:2])
+                first, second = (path_to(parent) + [node] + rest for parent in chosen[node][:2])
                 return Refusal(f"{table!r} is reached from the rows of {base!r} two ways of one length, by "
-                               f"{path_text(first)}, and by {path_text(second)}; mnemiq joins a table one way only")
-            near = parents[node][0]
+                               f"{path_text(first)}, and by {path_text(second)}; mnemiq joins a table one way only: "
+                               "state the links of the way you mean")
+            near = chosen[node][0]
             ways = usable[(near, node)]
             # One link uses each of its columns once: one that uses a column twice is two links, as a buyer's and a
             # payer's both equal to one customer's key.
@@ -286,8 +332,27 @@ def chain(base: str, needed: Collection[str], edges: Mapping[frozenset[str], Seq
                                "by as a link")
             walked.append(near)
         joined.update(walked)
-    return tuple(Step(table, usable[(parents[table][0], table)][0])
+    return tuple(Step(table, usable[(chosen[table][0], table)][0])
                  for table in order if table in joined and table != base)
+
+
+def base_among(tables: Collection[str], edges: Mapping[frozenset[str], Sequence[Link]], unique: Unique,
+               stated: Collection[Link] = ()) -> str | Refusal:
+    """The rows of a part that adds nothing up (a chart with no measure): the one of `tables`, the tables its columns
+    are of, from whose rows `chain` reaches every other. Refused, naming them, when none does, or when two do, since
+    the part does not say whose rows it shows."""
+    if not tables:
+        return Refusal("it names no column, so it says no table for its rows")
+    named = sorted(tables)
+    bases = [table for table in named if not isinstance(chain(table, tables, edges, unique, stated), Refusal)]
+    if len(bases) == 1:
+        return bases[0]
+    if not bases:
+        return Refusal(f"its columns are of {_listed(named)}, and the rows of none of these reach the others by links "
+                       "whose columns on each table they join hold each value once: plot a measure on the table whose "
+                       "rows it shows, or state the link that joins them")
+    return Refusal(f"its columns are of {_listed(named)}, and the rows of each of {_listed(bases)} reach the others, so "
+                   "which rows it shows is not said: plot a measure on the table whose rows it shows")
 
 
 def _identifier(name: str) -> exp.Identifier:
@@ -307,6 +372,63 @@ def join_text(base: str, steps: Sequence[Step]) -> str:
         text += " " + exp.Join(this=exp.Table(this=_identifier(step.table)), on=on, side="LEFT").sql(
             dialect=SUPERSET_DIALECT)
     return text
+
+
+def read_join(text: str) -> tuple[str, tuple[Step, ...]] | None:
+    """The base and the steps of a FROM clause, as `join_text` writes one: its first table, and each table joined
+    after it with the equalities of its ON condition between a column of that table and one of a table before it, each
+    link written from the table before. A join written another way is read as far as its tables and such equalities go;
+    None when `text` is not tables joined, each named alone or with an alias."""
+    try:
+        tree = sqlglot.parse_one(f"SELECT 1 FROM {text}", read=SUPERSET_DIALECT)
+    except SqlglotError:
+        return None
+    if not isinstance(tree, exp.Select) or tree.args.get("from_") is None:
+        return None
+    sources = [tree.args["from_"].this, *(join.this for join in tree.args.get("joins") or [])]
+    if not all(isinstance(source, exp.Table) for source in sources):
+        return None
+    tables = [resolve_identifier(source.this, SUPERSET_DIALECT) for source in sources]
+    by_qualifier = {resolve_identifier(source.args["alias"].this if source.args.get("alias") else source.this,
+                                       SUPERSET_DIALECT): table for source, table in zip(sources, tables)}
+
+    def side(column: exp.Expression) -> tuple[str, str] | None:
+        if not isinstance(column, exp.Column) or not column.table:
+            return None
+        table = by_qualifier.get(resolve_identifier(column.args["table"], SUPERSET_DIALECT))
+        return None if table is None else (table, resolve_identifier(column.this, SUPERSET_DIALECT))
+
+    steps: list[Step] = []
+    for index, join in enumerate(tree.args.get("joins") or [], 1):
+        on: list[Link] = []
+        condition = join.args.get("on")
+        for equal in condition.find_all(exp.EQ) if condition is not None else ():
+            left, right = side(equal.this), side(equal.expression)
+            if left is None or right is None or tables[index] not in (left[0], right[0]) or left[0] == right[0]:
+                continue
+            on.append(Link(left, right) if right[0] == tables[index] else Link(right, left))
+        steps.append(Step(tables[index], tuple(on)))
+    return tables[0], tuple(steps)
+
+
+def qualify(expression: str, owners: Mapping[str, tuple[str, str]]) -> str:
+    """`expression`, written over a dataset's columns, with each column it names written as the model writes it, with
+    its table: `owners` gives the (table, column) each of the dataset's column names reads (`rewrite`'s map, turned
+    round). A column whose name is its own keeps the identifier written; a column named with a table, or one `owners`
+    does not hold, is left as it is, and so is `expression` when it is not one SQL expression."""
+    tree = _one_expression(expression)
+    if tree is None:
+        return expression
+    for column in list(tree.find_all(exp.Column)):
+        if column.table or not isinstance(column.this, exp.Identifier):
+            continue
+        owner = owners.get(resolve_identifier(column.this, SUPERSET_DIALECT))
+        if owner is None:
+            continue
+        table, name = owner
+        kept = resolve_identifier(column.this, SUPERSET_DIALECT) == name
+        column.replace(exp.Column(this=column.this.copy() if kept else _written(name), table=_written(table)))
+    return tree.expressions[0].sql(dialect=SUPERSET_DIALECT)
 
 
 def rewrite(expression: str, names: Mapping[tuple[str, str], str]) -> str:
