@@ -383,8 +383,12 @@ still to come. In short:
   - **A far side that repeats is never joined,** since it would repeat the base's rows. Enrichment's profile says
     whether a key holds each value once. Where it does not say either way, mnemiq measures it as the builder, through
     Superset: `COUNT(*)` against `COUNT(DISTINCT ...)` of the key's non-null values, and joins only if the table holds
-    each value once. A key column the builder's grants mask or deny, or a table a row rule filters, is not probed, so
-    a join over one is refused.
+    each value once. Superset applies its row rules to that count, so under a rule it would count only the builder's
+    rows, and a key unique there may repeat in rows another person reads. So before it counts, mnemiq asks the
+    extension's `row_rules`, as the builder, about every dataset Superset lists under the table's name on the
+    deployment's database and schema (letter case aside, physical or virtual, as Superset finds the rules a statement
+    on a table meets). Where a rule applies to the builder, or mnemiq cannot tell, it does not count, and the join is
+    refused. So is a join on a key column the builder's grants mask or deny. The repair is told why.
   - **Column names on the made dataset** follow one rule, which the model never writes: a column only one included
     table has keeps its name, and one that two share is `<table>_<column>` (`orders_region`, `customers_region`).
   - **Measures are decided over the made dataset** exactly as Superset reads it, as `(<its SELECT>) AS virtual_table`,
@@ -402,8 +406,8 @@ still to come. In short:
   metric, labelled with the metric's verbose name. Its values are its table's, so none is probed. It is refused, and
   the repair told why, where it would not mean what its table defines:
   - its expression reads anything but its own table's columns, or names none of them, so `count` is never carried;
-  - its table is on a side an outer join may fill with NULL: the right of a `LEFT JOIN`, every table before a
-    `RIGHT JOIN`, any table of a `FULL JOIN`;
+  - its table is on a side an outer join may fill with NULL: the right of a `LEFT JOIN`, and, in a join mnemiq did not
+    make (it makes only `LEFT JOIN`s), every table before a `RIGHT JOIN` and any table of a `FULL JOIN`;
   - with the fan-out guard on (`MNEMIQ_GUARD_FANOUT`), the join repeats its table's rows, meets another table by a
     key not known to be unique there (one with no uniqueness profile, say), or joins it by no key to every other
     table, whatever the metric aggregates.

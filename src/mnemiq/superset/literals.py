@@ -36,7 +36,9 @@ nothing, and refuses nothing.
 makes that LEFT JOINs a table by columns enrichment's profile says nothing of: the rows holding a key against their
 distinct keys, two counts, never a value. It shares the plan's `Probes`, once per key, and is asked of no column or
 table `holds_null` would not ask of. Unlike the probes above, a probe that fails or is not sent says nothing, and the
-plan check then joins nothing on it: a key is joined only where it is shown to hold each value once.
+plan check then joins nothing on it: a key is joined only where it is shown to hold each value once. Superset applies
+its row rules to the probe as to every statement the builder sends, so the counts are of the builder's rows; the plan
+check sends it only where no row rule applies to the builder on the table, as the extension's `row_rules` answers.
 """
 
 from __future__ import annotations
@@ -66,7 +68,7 @@ from mnemiq.sql.values_check import (
 )
 
 __all__ = ["HELD_NAMED", "NEGATED_OPERATORS", "Absent", "Probes", "absent_literals", "filter_statement", "holds_null",
-           "null_statement", "unique_live", "unique_statement"]
+           "null_statement", "probe_withheld", "unique_live", "unique_statement"]
 
 logger = logging.getLogger(__name__)
 
@@ -249,7 +251,7 @@ def holds_null(table: str, column: str, *, adapter, snapshot: Snapshot, grants: 
     words can quote a value."""
     if getattr(adapter, "terminal_refusal", None) is not None:
         return None  # Superset refused this request for good: every later call meets the same refusal
-    if _withheld(table, (column,), snapshot=snapshot, grants=grants):
+    if probe_withheld(table, (column,), snapshot=snapshot, grants=grants):
         return None
     key = (table, column)
     if key in probes.nulls:
@@ -273,10 +275,11 @@ def holds_null(table: str, column: str, *, adapter, snapshot: Snapshot, grants: 
     return probes.nulls[key]
 
 
-def _withheld(table: str, columns: Sequence[str], *, snapshot: Snapshot, grants: GrantSet) -> bool:
-    """Whether a probe of `columns` of `table` is not the builder's to send: a column the grants hide, mask or deny, a
-    table they filter by row (a probe runs outside mnemiq's own row filter), or any table while a row filter names one
-    the snapshot does not hold, which may be this one misspelled."""
+def probe_withheld(table: str, columns: Sequence[str], *, snapshot: Snapshot, grants: GrantSet) -> bool:
+    """Whether a probe of `columns` of `table` is not the builder's to send under mnemiq's own grants: a column the
+    grants hide, mask or deny, a table they filter by row (a probe runs outside mnemiq's own row filter), or any table
+    while a row filter names one the snapshot does not hold, which may be this one misspelled. Superset's row rules are
+    not mnemiq's grants, and are not read here: whoever needs a probe's rows to be every viewer's asks Superset."""
     policy = build_access_policy(snapshot, grants)
     visible = visible_schema(snapshot, grants).get(table, ())
     return policy.row_filter_for(table) is not None or bool(policy.unknown_filter_targets) or any(
@@ -311,7 +314,7 @@ def unique_live(table: str, columns: Sequence[str], *, adapter, snapshot: Snapsh
     its kind alone: a source's words can quote a value."""
     named = tuple(sorted(set(columns)))
     if not named or getattr(adapter, "terminal_refusal", None) is not None \
-            or _withheld(table, named, snapshot=snapshot, grants=grants):
+            or probe_withheld(table, named, snapshot=snapshot, grants=grants):
         return None
     key = (table, named)
     if key in probes.unique:

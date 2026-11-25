@@ -37,8 +37,9 @@ other table (a planned dataset over the table where it has none), else a planned
 each table its parts name. Each measure on a virtual dataset is decided by `check_measure` over the dataset's SELECT as
 Superset reads it, `(<its SQL>) AS "virtual_table"`, the text the build sends; and each table a LEFT JOIN brings in is
 joined only by columns that hold each value once, so the base's rows are each kept once: as enrichment's key facts
-say, or, where they say nothing, as the source answers the builder (`unique_live`); a dataset whose far side is not
-shown to is refused, named by its rows, for the repair. The builder makes each with the
+say, or, where they say nothing, as the source answers the builder (`unique_live`), asked only where no row rule of
+Superset's applies to the builder on the table, since the answer would then be of their rows alone; a dataset whose
+far side is not shown to is refused, named by its rows, for the repair, saying why. The builder makes each with the
 extension's `create_dataset`, a virtual one with its `sql`. A planned dataset has no id
 until it is made, so the plan's charts and measures carry its negative `placeholder` until `with_made_datasets` puts
 the made id in its place. Every dataset Superset makes carries a saved metric `count` (`COUNT_METRIC`), which is
@@ -51,7 +52,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Protocol
@@ -72,9 +73,10 @@ from mnemiq.superset.chart_check import read_dataset_facts
 from mnemiq.superset.chart_form import DatasetFacts, NotCheckable
 from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenRef, plan_refusal
 from mnemiq.superset.dashboard_charts import LeftOut, leave_out_shown, read_dashboard_charts
-from mnemiq.superset.grants import UnreadableAnswer, read_datasets, table_bindings
+from mnemiq.superset.extension import row_rule_applies
+from mnemiq.superset.grants import ListedDataset, UnreadableAnswer, read_datasets, table_bindings
 from mnemiq.superset.literals import NEGATED_OPERATORS, Absent, Probes, absent_literals, filter_statement, holds_null, \
-    unique_live
+    probe_withheld, unique_live
 from mnemiq.superset.marker import format_marker
 from mnemiq.superset.measures import MAX_LABEL, Measure, MeasureKind, MeasureRefused, check_measure, scales_by_100, \
     superset_text_problem
@@ -880,27 +882,45 @@ def _naming(parts: Sequence[RefusedPart]) -> str:
 @dataclass(frozen=True)
 class _Catalogue:
     """What a plan is checked against: the visible tables' columns, each table's name as stored, its existing
-    dataset, and that dataset's saved metrics as the builder reads them."""
+    dataset, and that dataset's saved metrics as the builder reads them. `ruled_by` gives each visible table the
+    datasets whose row rules Superset applies to a statement reading it (`_rule_datasets`); a table it does not hold
+    is one mnemiq cannot tell of."""
 
     columns: dict[str, frozenset[str]]
     stored: dict[str, str]
     datasets: dict[str, int]
     saved: dict[int, tuple[SavedMetric, ...]]
     types: dict[str, dict[str, str]] = field(default_factory=dict)
+    ruled_by: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
 
 
-def _datasets_by_table(adapter, stored: dict[str, str]) -> dict[str, int]:
-    """Each visible table's physical dataset on the configured database and schema (`read_datasets`): the first by id
-    of those named exactly as the table is stored. rc2 reads a physical dataset FROM `table(self.table_name,
-    schema=self.schema)` (`SqlaTable.get_sqla_table` in `superset/connectors/sqla/models.py`), which SQLAlchemy quotes
-    when the name is not all lower case, so a dataset `Party` reads `"Party"`, never a stored `party`."""
-    physical = [d for d in read_datasets(adapter)
-                if d.database_id == adapter.database_id and d.schema == adapter.schema and not d.sql]
+def _datasets_by_table(listed: Sequence[ListedDataset], adapter, stored: dict[str, str]) -> dict[str, int]:
+    """Each visible table's physical dataset on the configured database and schema, of those `read_datasets` listed:
+    the first by id of those named exactly as the table is stored. rc2 reads a physical dataset FROM
+    `table(self.table_name, schema=self.schema)` (`SqlaTable.get_sqla_table` in `superset/connectors/sqla/models.py`),
+    which SQLAlchemy quotes when the name is not all lower case, so a dataset `Party` reads `"Party"`, never a stored
+    `party`."""
+    physical = [d for d in listed if d.database_id == adapter.database_id and d.schema == adapter.schema and not d.sql]
     found: dict[str, int] = {}
     for table, name in stored.items():
         named = [d.id for d in physical if d.table_name == name]
         if named:
             found[table] = min(named)
+    return found
+
+
+def _rule_datasets(listed: Sequence[ListedDataset], adapter, stored: dict[str, str]) -> dict[str, tuple[int, ...]]:
+    """Each visible table's datasets whose row rules Superset applies to a statement that reads the table, of those
+    `read_datasets` listed, in id order: every dataset on the configured database and schema named as the table is
+    stored, letter case aside, physical or virtual. That is how rc2 finds them (`get_predicates_for_table` and
+    `_find_datasets` in `superset/utils/rls.py`): by the table's name and schema, folded on an engine that folds
+    unquoted names, as Postgres does, and with no regard to a dataset's SQL; and it applies every one's rules. Wider
+    than the datasets that name a table for access (`grants._candidates`), which only asks more. A table none names has
+    no rule to apply."""
+    found: dict[str, tuple[int, ...]] = {}
+    for table, name in stored.items():
+        found[table] = tuple(sorted(d.id for d in listed if d.database_id == adapter.database_id
+                                    and d.schema == adapter.schema and d.table_name.lower() == name.lower()))
     return found
 
 
@@ -912,16 +932,18 @@ def _catalogue(client, adapter, snapshot: Snapshot, grants: GrantSet) -> _Catalo
             if table in visible:
                 stored[table] = name
     try:
-        datasets = _datasets_by_table(adapter, stored)
+        listed = read_datasets(adapter)
     except UnreadableAnswer:  # logged where it was found
         return PlanRefused(DATASETS_UNREADABLE)
+    datasets = _datasets_by_table(listed, adapter, stored)
     saved: dict[int, list[SavedMetric]] = {dataset: [] for dataset in datasets.values()}
     for metric in read_saved_metrics(client, dataset_ids=tuple(sorted(set(datasets.values())))):
         saved.setdefault(metric.dataset_id, []).append(metric)
     types = column_types(snapshot)
     return _Catalogue(columns={table: frozenset(columns) for table, columns in visible.items()}, stored=stored,
                       datasets=datasets, saved={d: tuple(sorted(ms, key=lambda m: m.name)) for d, ms in saved.items()},
-                      types={table: types.get(table, {}) for table in visible})
+                      types={table: types.get(table, {}) for table in visible},
+                      ruled_by=_rule_datasets(listed, adapter, stored))
 
 
 def _words(text: str) -> list[str]:
@@ -1454,14 +1476,36 @@ def _null_refusals(chart: ChartSpec, on: _Rows, *, adapter, snapshot: Snapshot, 
     return list(reasons)
 
 
-def _far_side_refusals(on: _Rows, unique: Unique, *, adapter, snapshot: Snapshot, grants: GrantSet,
-                       probes: Probes) -> list[str]:
+def _row_ruled(dataset_ids: Sequence[int] | None, client) -> bool | None:
+    """Whether a row rule applies to the builder on any of `dataset_ids`, a table's datasets (`_Catalogue.ruled_by`),
+    as the extension's `row_rules` answers for each (`row_rule_applies`), asked in order until one has a rule: True
+    where one does; None where mnemiq cannot tell of one and none is known to (or the datasets are not known,
+    `dataset_ids` None); False where none does, and for a table with no dataset."""
+    if dataset_ids is None:
+        return None
+    unknown = False
+    for dataset_id in dataset_ids:
+        applies = row_rule_applies(client, dataset_id)
+        if applies:
+            return True
+        unknown = unknown or applies is None
+    return None if unknown else False
+
+
+def _far_side_refusals(on: _Rows, unique: Unique, *, adapter, snapshot: Snapshot, grants: GrantSet, probes: Probes,
+                       row_ruled: Callable[[str], bool | None]) -> list[str]:
     """The reasons a planned join is refused for a table a LEFT JOIN brings in by a far side (`_Rows.far`) not shown
     to hold each value once: a far side that does meets each row it is joined to at most once, so the join keeps those
     rows once each, and every measure's value with them; any other may repeat them. Enrichment's key facts (`unique`,
     read over every row) decide wherever they say anything (`far_side`); only a far side they say nothing of is asked
     of the source, as the builder, within the plan's probes (`unique_live`), and one the source does not answer for is
-    refused as one that repeats is: nothing is joined on a guess."""
+    refused as one that repeats is: nothing is joined on a guess.
+
+    Superset applies its row rules to the probe, as to every statement the builder sends, so under one the probe
+    counts the builder's rows only, and a key that holds each value once there may repeat among another viewer's. So
+    the probe is sent only where `row_ruled(table)` (whether a row rule applies to the builder on the table) answers
+    False, and not where mnemiq's own grants withhold it (`probe_withheld`); a key not probed for either is refused,
+    saying why."""
     reasons: list[str] = []
     for table, columns in on.far:
         advice = f"join {table} only by columns that hold each value once, or plan without its columns"
@@ -1470,17 +1514,29 @@ def _far_side_refusals(on: _Rows, unique: Unique, *, adapter, snapshot: Snapshot
                            f"may meet more than one of its rows; {advice}")
             continue
         known = far_side(table, columns, unique)
-        measured = known if known is not None else unique_live(
-            table, columns, adapter=adapter, snapshot=snapshot, grants=grants, probes=probes,
-            timeout_s=DEFAULT_TIMEOUT_S)
+        measured, why = known, None
+        if known is None:
+            if probe_withheld(table, columns, snapshot=snapshot, grants=grants):
+                why = f"the builder's grants mask, deny or hide a column of it, or filter {table} by row"
+            elif getattr(adapter, "terminal_refusal", None) is not None:
+                pass  # Superset refused this request for good: nothing more is asked
+            elif (ruled := row_ruled(table)) is not False:
+                why = (f"a row rule applies to the builder on {table} and a count would read only the rows it leaves "
+                       "them" if ruled else
+                       f"it could not tell whether a row rule applies to the builder on {table}, and a count would "
+                       "read only the rows such a rule leaves them")
+            else:
+                measured = unique_live(table, columns, adapter=adapter, snapshot=snapshot, grants=grants,
+                                       probes=probes, timeout_s=DEFAULT_TIMEOUT_S)
         if measured:
             continue
         named = [f"{table}.{column}" for column in columns]
         key = named[0] if len(named) == 1 else f"{', '.join(named[:-1])} and {named[-1]}"
         verb, together = ("holds", "") if len(named) == 1 else ("hold", " together")
         if measured is None:
-            reasons.append(f"mnemiq could not measure whether {key} {verb} each value once{together}, and joins a table "
-                           f"only by columns that do; {advice}")
+            since = f", since {why}" if why is not None else ""
+            reasons.append(f"mnemiq could not measure whether {key} {verb} each value once{together}{since}, and joins "
+                           f"a table only by columns that do; {advice}")
         else:
             where = "" if known is False else " in the rows the builder can read"
             reasons.append(f"{key} {verb} a value more than once{together}{where}, so joining {table} would repeat the "
@@ -1497,6 +1553,13 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
     refused: list[RefusedPart] = []
     # Every probe of a filter's value this check makes, the measures' and the charts', shares one budget and one memo.
     probes = Probes()
+    # Whether a row rule applies to the builder on a joined table, asked once per table in this check.
+    rules: dict[str, bool | None] = {}
+
+    def row_ruled(table: str) -> bool | None:
+        if table not in rules:
+            rules[table] = _row_ruled(catalogue.ruled_by.get(table), adapter.client)
+        return rules[table]
 
     def refuse(part: str, reason: str, *, repairable: bool = True) -> None:
         refused.append(RefusedPart(part, reason, repairable))
@@ -1561,7 +1624,7 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
                 continue
             # Its parts are still checked on it, so a refusal of its far sides goes back with theirs in one repair.
             for reason in _far_side_refusals(joined, context.unique, adapter=adapter, snapshot=snapshot, grants=grants,
-                                             probes=probes):
+                                             probes=probes, row_ruled=row_ruled):
                 refuse(part, reason)
             rows[planned.placeholder] = joined
         elif planned.table not in catalogue.columns:

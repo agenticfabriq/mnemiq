@@ -72,6 +72,7 @@ GOAL = "Premium by region and month"
 WRITES = ("generate_chart", "create_dataset", "create_virtual_dataset", "delete_chart", "remove_chart_from_dashboard",
           *(TOOL_PREFIX + name for name in ("create_dashboard", "create_dataset", "create_chart", "patch_chart",
                                             "add_saved_metric", "delete_dataset", "set_layout")))
+ROW_RULES = TOOL_PREFIX + "row_rules"
 
 
 class Tools:
@@ -166,12 +167,13 @@ def _value_answer(sql: str, held: dict | None) -> dict | None:
 
 
 def _tools(*, metrics=None, extension=None, dashboards=(), execute=None, datasets=None, held=None,
-           nulls=frozenset(), infos=None, repeats=frozenset()) -> Tools:
+           nulls=frozenset(), infos=None, repeats=frozenset(), ruled=frozenset(), rules=None) -> Tools:
     """policy is dataset 1 and claim dataset 2; agent has none, and a virtual dataset over policy is never a table's.
     `held` gives the values each `(table, column)` holds, for the plan check's probes of a filter's values; without
     it, every value probed is found. `nulls` holds each `(table, column)` that holds NULL; no other does. `repeats`
     holds each `(table, columns)` key whose values repeat; every other key the plan check measures holds each value
-    once."""
+    once. `ruled` holds each dataset on which a row rule applies to the builder, as the extension's `row_rules`
+    answers; `rules`, when given, answers it instead: a function of the request, or an answer or exception for any."""
     metrics = metrics or {}
     extension = extension or {}
     datasets = datasets if datasets is not None else [_dataset(1, "policy"), _dataset(2, "claim"),
@@ -195,10 +197,16 @@ def _tools(*, metrics=None, extension=None, dashboards=(), execute=None, dataset
         return {"dashboards": [dict(item) for item in dashboards if word in item["dashboard_title"].casefold()],
                 "count": 0, "total_pages": 1}
 
+    def row_rules(request):
+        if rules is not None:
+            return rules(request) if callable(rules) else copy.deepcopy(rules)
+        return {"datasets": [{"dataset_id": i, "applies": i in ruled} for i in request["dataset_ids"]]}
+
     return Tools({
         "list_datasets": lambda request: {"datasets": datasets, "count": len(datasets)},
         "list_metrics": list_metrics,
         TOOL_PREFIX + "dataset_metrics": dataset_metrics,
+        ROW_RULES: row_rules,
         "list_dashboards": list_dashboards,
         "get_dataset_info": dataset_info,
         "execute_sql": lambda request: (_null_answer(request["sql"], nulls) or _unique_answer(request["sql"], repeats)
@@ -1590,6 +1598,104 @@ def test_unknown_keys_not_measured_are_refused(monkeypatch):
     assert isinstance(refused, PlanRefused), refused
     assert _parts(refused) == {ORDERS_AND_CUSTOMERS: reason}
     assert _unique_probes(spent) == []
+
+
+def _rule_asks(tools: Tools) -> list[list[int]]:
+    """The datasets each call of the extension's `row_rules` asked about, in the order asked."""
+    return [request["dataset_ids"] for tool, request in tools.calls if tool == ROW_RULES]
+
+
+RULE_APPLIES_TO_CUSTOMERS = (
+    "mnemiq could not measure whether customers.customer_id holds each value once, since a row rule applies to the "
+    "builder on customers and a count would read only the rows it leaves them, and joins a table only by columns that "
+    f"do; {JOIN_BY_UNIQUE}")
+RULES_UNKNOWN_ON_CUSTOMERS = (
+    "mnemiq could not measure whether customers.customer_id holds each value once, since it could not tell whether a "
+    "row rule applies to the builder on customers, and a count would read only the rows such a rule leaves them, and "
+    f"joins a table only by columns that do; {JOIN_BY_UNIQUE}")
+
+
+def test_a_row_rule_on_the_joined_tables_dataset_stops_the_probe():
+    """Superset applies its row rules to every statement the builder sends through it, a probe of a key among them, so
+    under a rule the probe counts only the builder's rows: a key that holds each value once there may repeat among the
+    rows another viewer reads, and a join on it would repeat their rows. Where a row rule applies to the builder on
+    the far table's dataset, asked of the extension's `row_rules` as the builder, nothing is probed: the made dataset
+    goes back for the repair saying why, and refused again, the plan is refused. mnemiq's own grants carry no row
+    filter in Superset mode, so they cannot stop the probe here."""
+    tools = _tools(datasets=[_dataset(31, "customers")], ruled={31})
+    model = ScriptedModel([json.dumps(ORDERS_BY_REGION)] * 2)
+    refused = _shop(LLMPlanner(model), tools, snapshot=CUSTOMER_KEY_UNPROFILED)
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused) == {ORDERS_AND_CUSTOMERS: RULE_APPLIES_TO_CUSTOMERS}
+    assert f"- {ORDERS_AND_CUSTOMERS}: {RULE_APPLIES_TO_CUSTOMERS}\n" in model.sent[1]["user"]
+    assert _unique_probes(tools) == []
+    assert _rule_asks(tools) == [[31], [31]], "asked once in each check, the plan's and its repair's"
+
+
+def test_with_no_row_rule_on_the_joined_tables_dataset_the_key_is_measured():
+    """No row rule applies to the builder on the far table's dataset: the key is measured, and held once, joined. A
+    table with no dataset has no rule to apply, and nothing is asked of the extension for it."""
+    tools = _tools(datasets=[_dataset(31, "customers")])
+    plan = _shop(LLMPlanner(ScriptedModel([json.dumps(ORDERS_BY_REGION)])), tools, snapshot=CUSTOMER_KEY_UNPROFILED)
+    assert isinstance(plan, BuildPlan), plan
+    assert _unique_probes(tools) == [("customers", ("customer_id",))]
+    assert _rule_asks(tools) == [[31]]
+    tools = _tools(datasets=[])
+    plan = _shop(LLMPlanner(ScriptedModel([json.dumps(ORDERS_BY_REGION)])), tools, snapshot=CUSTOMER_KEY_UNPROFILED)
+    assert isinstance(plan, BuildPlan), plan
+    assert _unique_probes(tools) == [("customers", ("customer_id",))]
+    assert _rule_asks(tools) == []
+
+
+def test_every_dataset_superset_finds_for_the_joined_table_is_asked_about():
+    """Superset finds the row rules of a statement's table by the datasets of that name on its database and schema,
+    letter case aside on Postgres, physical or virtual, and applies every one's: each is asked about, until one has a
+    rule, and none of another name, schema or database."""
+    datasets = [_dataset(31, "customers"), _dataset(32, "Customers"), _dataset(33, "customers", "SELECT 1"),
+                _dataset(34, "customers", schema="sales"), _dataset(35, "customers", database_id=8),
+                _dataset(36, "customers_by_region")]
+    tools = _tools(datasets=datasets)
+    plan = _shop(LLMPlanner(ScriptedModel([json.dumps(ORDERS_BY_REGION)])), tools, snapshot=CUSTOMER_KEY_UNPROFILED)
+    assert isinstance(plan, BuildPlan), plan
+    assert _rule_asks(tools) == [[31], [32], [33]]
+    tools = _tools(datasets=datasets, ruled={32})
+    refused = _shop(LLMPlanner(ScriptedModel([json.dumps(ORDERS_BY_REGION)] * 2)), tools,
+                    snapshot=CUSTOMER_KEY_UNPROFILED)
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused) == {ORDERS_AND_CUSTOMERS: RULE_APPLIES_TO_CUSTOMERS}
+    assert _rule_asks(tools) == [[31], [32]] * 2 and _unique_probes(tools) == []
+
+
+@pytest.mark.parametrize("rules", [
+    SupersetToolError("Internal error in row_rules: An unexpected error occurred."),
+    {"datasets": []},
+    {"datasets": [{"dataset_id": 31, "applies": "no"}]},
+    {"refused": "request", "field": "dataset_ids"},
+], ids=["failed", "left out", "not a boolean", "refused"])
+def test_a_row_rule_mnemiq_cannot_tell_of_stops_the_probe(rules):
+    """Where mnemiq cannot tell whether a row rule applies to the builder on the far table's dataset (the call fails,
+    or its answer does not say), it does not probe: the made dataset goes back for the repair saying why."""
+    tools = _tools(datasets=[_dataset(31, "customers")], rules=rules)
+    refused = _shop(LLMPlanner(ScriptedModel([json.dumps(ORDERS_BY_REGION)] * 2)), tools,
+                    snapshot=CUSTOMER_KEY_UNPROFILED)
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused) == {ORDERS_AND_CUSTOMERS: RULES_UNKNOWN_ON_CUSTOMERS}
+    assert _unique_probes(tools) == []
+
+
+def test_a_key_the_grants_withhold_goes_back_saying_why():
+    """A key column mnemiq's own grants mask, deny or hide, or a table they filter by row, is never probed, and the
+    made dataset goes back saying so, not only that the key was not measured."""
+    grants = GrantSet(frozenset(_SHOP_COLUMNS), row_filters={"customers": "region = 'west'"})
+    tools = _tools(datasets=[])
+    refused = _plan(SHOP_GOAL, LLMPlanner(ScriptedModel([json.dumps(ORDERS_BY_REGION)] * 2)), tools,
+                    snapshot=CUSTOMER_KEY_UNPROFILED, grants=grants)
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused) == {ORDERS_AND_CUSTOMERS: (
+        "mnemiq could not measure whether customers.customer_id holds each value once, since the builder's grants "
+        "mask, deny or hide a column of it, or filter customers by row, and joins a table only by columns that do; "
+        f"{JOIN_BY_UNIQUE}")}
+    assert _unique_probes(tools) == []
 
 
 def test_a_carried_certified_metric_is_decided_over_the_made_dataset():

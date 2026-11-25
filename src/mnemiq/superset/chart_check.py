@@ -77,7 +77,7 @@ from mnemiq.superset.chart_form import (
 )
 from mnemiq.superset.charts import Filter
 from mnemiq.superset.client import SupersetToolError, SupersetUnavailable
-from mnemiq.superset.extension import TOOL_PREFIX
+from mnemiq.superset.extension import row_rule_applies
 from mnemiq.superset.display_format import CANNOT_TELL, Displayed, displayed, fits, metric_label, shows_currency
 from mnemiq.superset.measures import Measure, MeasureKind, measure_statement, run_decided
 from mnemiq.superset.saved_metrics import SavedMetric
@@ -816,28 +816,6 @@ _RULES_UNKNOWN = ("mnemiq could not tell whether a row rule applies to you on th
                   "check it with its own SQL")
 
 
-def _row_rule_applies(client, dataset_id: int) -> bool | NotCheckable:
-    """Whether a row rule applies to the caller on the dataset, as the extension's `row_rules` answers it, read
-    strictly: the answer must be exactly `{"datasets": [...]}` holding at most this one entry, exactly
-    `{"dataset_id": <this id>, "applies": <a boolean>}`. Anything else (a refusal or a size cut beside it, a malformed
-    or repeated entry, an entry for another dataset, an entry saying more), a dataset left out, or a failure of the call
-    is that mnemiq cannot tell. A refusal of the caller is raised, as for every other call of the check."""
-    try:
-        answer = client.call(TOOL_PREFIX + "row_rules", {"dataset_ids": [dataset_id]})
-    except (SupersetUnavailable, SupersetToolError) as failure:
-        logger.warning("the value check: the extension's row_rules for dataset %s failed: %s", dataset_id, failure)
-        return NotCheckable(_RULES_UNKNOWN)
-    entries = answer.get("datasets") if isinstance(answer, dict) and set(answer) == {"datasets"} else None
-    if not isinstance(entries, list) or len(entries) != 1:
-        return NotCheckable(_RULES_UNKNOWN)
-    [entry] = entries
-    if not isinstance(entry, dict) or set(entry) != {"dataset_id", "applies"} \
-            or type(entry["dataset_id"]) is not int or entry["dataset_id"] != dataset_id \
-            or not isinstance(entry["applies"], bool):
-        return NotCheckable(_RULES_UNKNOWN)
-    return entry["applies"]
-
-
 def _time_axis(client, form: dict, expectation: Expectation,
                dataset: DatasetFacts) -> Callable[[], bool | NotCheckable] | None:
     """For a chart drawn on an x-axis (a time series or a mixed chart; a waterfall's query does not rank by its
@@ -887,9 +865,9 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
             return not_checked(_SQL_UNSHOWN)
         if dataset.sql != made[dataset.dataset_id]:
             return not_checked(_SQL_CHANGED)
-        applies = _row_rule_applies(client, dataset.dataset_id)
-        if isinstance(applies, NotCheckable):
-            return not_checked(applies.reason)
+        applies = row_rule_applies(client, dataset.dataset_id)
+        if applies is None:
+            return not_checked(_RULES_UNKNOWN)
         if applies:
             return not_checked(_RULE_APPLIES)
         source = f'({dataset.sql}) AS "virtual_table"'

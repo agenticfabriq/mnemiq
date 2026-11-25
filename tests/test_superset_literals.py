@@ -514,7 +514,11 @@ def test_unique_live_asks_nothing_for_a_withheld_column_or_a_row_filtered_table_
     """How often a column's values repeat is what a mask withholds, a denied column and a table the grants hide are not
     the builder's to ask about, and a probe runs outside mnemiq's own row filter, so a table under one is never asked:
     as for whether a column holds NULL (`holds_null`). Nor is anything once Superset refused the request for good, or
-    a key of no column. Each is None, not measured, not asked and not remembered."""
+    a key of no column. Each is None, not measured, not asked and not remembered.
+
+    These are mnemiq's own grants. In Superset mode they carry no row filter: Superset applies its row rules itself,
+    and the plan check asks whether one applies to the builder before it calls `unique_live` at all
+    (`test_a_row_rule_on_the_joined_tables_dataset_stops_the_probe` in the planner's tests)."""
     source = Source(lambda sql: _counts(10, 10))
     if refused:
         source.terminal_refusal = RuntimeError("Superset refused this caller")
