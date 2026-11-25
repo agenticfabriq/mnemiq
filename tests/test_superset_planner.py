@@ -19,8 +19,9 @@ from sqlglot import exp
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.config import Settings
-from mnemiq.contract import Column, Snapshot
+from mnemiq.contract import Column, Relationship, Snapshot
 from mnemiq.contract.semantic import Job
+from mnemiq.contract.values import JoinKey
 from mnemiq.sql.fanout_check import PARTITIONS_JOB
 from mnemiq.superset import build_store
 from mnemiq.superset.adapter import SupersetSqlAdapter
@@ -261,7 +262,7 @@ def test_refused_measure_is_repaired_once():
     repair = planner.contexts[1].repair
     assert [part.part for part in repair.refused] == ["measure 'total_premium'"]
     assert "does not aggregate" in repair.refused[0].reason
-    assert "SUM(premium) OVER ()" in repair.previous
+    assert "SUM(policy.premium) OVER ()" in repair.previous
     # The repair goes back with the same view of the data: only the repair is new.
     assert dataclasses.replace(planner.contexts[1], repair=None) == planner.contexts[0]
 
@@ -322,13 +323,15 @@ class ScriptedModel:
 
 
 def _draft(expression: str) -> str:
+    """A model's reply: `expression` as the premium measure, by month and by region, each column with its table."""
     return json.dumps({
         "measures": [{"name": "total_premium", "label": "Total premium", "expression": expression,
-                      "kind": "currency", "table": "policy"}],
+                      "kind": "currency"}],
         "charts": [{"key": "premium_by_month", "family": "line", "title": "Premium by month",
-                    "measures": ["total_premium"], "dimensions": [], "time_column": "start_date", "grain": "month"},
+                    "measures": ["total_premium"], "dimensions": [], "time_column": "policy.start_date",
+                    "grain": "month"},
                    {"key": "premium_by_region", "family": "bar", "title": "Premium by region",
-                    "measures": ["total_premium"], "dimensions": ["region"]}],
+                    "measures": ["total_premium"], "dimensions": ["policy.region"]}],
         "reuse_dashboard": None})
 
 
@@ -359,7 +362,7 @@ def test_prompt_holds_no_editor_names_or_values():
                      "owners": [{"first_name": "Avery", "last_name": "Quillfeather"}],
                      "changed_by_name": "Rowan Pikeworth"}],
         execute=execute)
-    model = ScriptedModel([_draft("SUM(premium * 2)"), _draft("SUM(premium)")])
+    model = ScriptedModel([_draft("SUM(policy.premium * 2)"), _draft("SUM(policy.premium)")])
     planner = LLMPlanner(model)
     plan = _plan(GOAL, planner, tools)
     assert isinstance(plan, BuildPlan), plan
@@ -387,10 +390,11 @@ def test_prompt_holds_no_editor_names_or_values():
 
 
 def planner_contexts(tools: Tools) -> str:
-    """Every context a plan made on `tools` hands its planner, serialized whole."""
+    """Every context a plan made on `tools` hands its planner, serialized whole: its repr holds every field, the
+    read-only map of key facts among them, which `dataclasses.asdict` cannot copy."""
     recorder = FakePlanner(_valid_plan())
     _plan(GOAL, recorder, tools)
-    return json.dumps([dataclasses.asdict(context) for context in recorder.contexts], default=str)
+    return repr(recorder.contexts)
 
 
 # ---------------------------------------------------------------- the checks a plan's parts meet
@@ -746,7 +750,7 @@ def test_a_join_on_an_ungranted_table_is_refused():
 # ---------------------------------------------------------------- the model's channel
 
 def test_llm_planner_asks_for_a_json_schema_reply():
-    model = ScriptedModel([_draft("SUM(premium)")])
+    model = ScriptedModel([_draft("SUM(policy.premium)")])
     plan = _plan(GOAL, LLMPlanner(model), _tools())
     assert isinstance(plan, BuildPlan)
     body = model.sent[0]["extra_body"]
@@ -767,39 +771,45 @@ def test_an_unreadable_reply_is_a_refusal_never_an_exception(reply):
 
 
 def test_a_fenced_reply_is_read():
-    model = ScriptedModel(["Here is the plan:\n```json\n" + _draft("SUM(premium)") + "\n```"])
+    model = ScriptedModel(["Here is the plan:\n```json\n" + _draft("SUM(policy.premium)") + "\n```"])
     assert isinstance(_plan(GOAL, LLMPlanner(model), _tools()), BuildPlan)
 
 
 def test_a_malformed_part_goes_back_once():
-    broken = json.loads(_draft("SUM(premium)"))
+    broken = json.loads(_draft("SUM(policy.premium)"))
     broken["measures"][0]["kind"] = "money"
-    model = ScriptedModel([json.dumps(broken), _draft("SUM(premium)")])
+    model = ScriptedModel([json.dumps(broken), _draft("SUM(policy.premium)")])
     plan = _plan(GOAL, LLMPlanner(model), _tools())
     assert isinstance(plan, BuildPlan)
     assert "measure 'total_premium'" in model.sent[1]["user"] and '"money"' in model.sent[1]["user"]
 
 
+# claim's rows joined to their policy's, as the draft reader builds the join from the link `claim.policy_id =
+# policy.policy_id`, which the snapshot does not hold, so a draft states it.
+CLAIM_POLICY = '"claim" LEFT JOIN "policy" ON "claim"."policy_id" = "policy"."policy_id"'
+CLAIM_POLICY_LINK = {"from": "claim.policy_id", "to": "policy.policy_id"}
+
+
 def test_a_draft_table_with_no_dataset_is_planned():
-    draft = {"measures": [{"name": "agents", "label": "Agents", "expression": "COUNT(DISTINCT agent_id)",
-                           "kind": "count", "table": "agent"},
-                          {"name": "paid", "label": "Paid", "expression": "SUM(amount)", "kind": "currency",
-                           "join": JOIN}],
+    draft = {"measures": [{"name": "agents", "label": "Agents", "expression": "COUNT(DISTINCT agent.agent_id)",
+                           "kind": "count"},
+                          {"name": "paid", "label": "Paid", "expression": "SUM(claim.amount)", "kind": "currency"}],
              "charts": [{"key": "agents", "family": "bar", "title": "Agents", "measures": ["agents"],
-                         "dimensions": ["office"]},
+                         "dimensions": ["agent.office"]},
                         {"key": "paid", "family": "bar", "title": "Paid", "measures": ["paid"],
-                         "dimensions": ["region"],
-                         "filters": [{"column": "status", "op": "IN", "operand": ["open"]}]}]}
+                         "dimensions": ["policy.region"],
+                         "filters": [{"column": "claim.status", "op": "IN", "operand": ["open"]}]}],
+             "links": [CLAIM_POLICY_LINK]}
     plan = _plan(GOAL, LLMPlanner(ScriptedModel([json.dumps(draft)])), _tools())
     assert isinstance(plan, BuildPlan), plan
     assert [(d.key, d.placeholder, d.table, d.join) for d in plan.datasets] == [
-        ("dataset_1", -1, "agent", None), ("dataset_2", -2, None, JOIN)]
+        ("dataset_1", -1, "agent", None), ("dataset_2", -2, None, CLAIM_POLICY)]
     assert [m.dataset_id for m in plan.measures] == [-1, -2]
     assert plan.charts[1].filters == (Filter("status", "IN", ["open"]),)
 
 
 def test_an_unreadable_repair_still_names_the_refused_part():
-    model = ScriptedModel([_draft("SUM(premium) OVER ()"), "no plan this time"])
+    model = ScriptedModel([_draft("SUM(policy.premium) OVER ()"), "no plan this time"])
     refused = _plan(GOAL, LLMPlanner(model), _tools())
     assert isinstance(refused, PlanRefused) and len(model.sent) == 2
     assert "measure 'total_premium'" in refused.reason and "could not be read" in refused.reason
@@ -819,36 +829,372 @@ def test_a_join_holding_a_template_marker_is_refused():
 
 
 def test_the_model_reads_its_own_plan_back_as_it_wrote_it():
-    """`draft_of` is what a repair shows the model of its plan, so `plan_from_draft` reads it back to the same plan."""
-    from mnemiq.superset.planner import draft_of, plan_from_draft
-
-    draft = json.loads(_draft("SUM(premium)"))
-    draft["measures"].append({"name": "paid", "label": "Paid", "expression": "SUM(amount)", "kind": "currency",
-                              "join": JOIN, "currency": "EUR", "description": "claims paid"})
-    draft["measures"].append({"name": "agents_n", "saved_metric": "count", "kind": "count", "table": "agent"})
+    """`draft_of` is what a repair shows the model of its plan: the format the model writes, each column named with its
+    table again (a column the joined dataset renames, claim's created_at, as claim.created_at), a measure whose
+    aggregate names no column with its table, and the links its joined datasets join by. `plan_from_draft` reads it
+    back to the same plan."""
+    draft = json.loads(_draft("SUM(policy.premium)"))
+    draft["measures"] += [{"name": "paid", "label": "Paid", "expression": "SUM(claim.amount)", "kind": "currency",
+                           "currency": "EUR", "description": "claims paid"},
+                          {"name": "claims_n", "label": "Claims", "expression": "COUNT(*)", "kind": "count",
+                           "table": "claim"},
+                          {"name": "count", "saved_metric": "count", "kind": "count", "table": "agent"}]
     draft["charts"] += [{"key": "paid", "family": "pie", "title": "Paid", "measures": ["paid"],
-                         "dimensions": ["status"], "filters": [{"column": "status", "op": "IS NOT NULL"}]},
-                        {"key": "agents", "family": "big_number", "title": "Agents", "measures": ["agents_n"],
+                         "dimensions": ["policy.region"], "filters": [{"column": "claim.status", "op": "IS NOT NULL"}]},
+                        {"key": "paid_by_month", "family": "line", "title": "Paid by month", "measures": ["paid"],
+                         "dimensions": [], "time_column": "claim.created_at", "grain": "month"},
+                        {"key": "claims", "family": "big_number", "title": "Claims", "measures": ["claims_n"],
+                         "dimensions": []},
+                        {"key": "agents", "family": "big_number", "title": "Agents", "measures": ["count"],
                          "dimensions": []},
                         {"key": "spread", "family": "histogram", "title": "Spread", "measures": [],
-                         "dimensions": ["premium"], "table": "policy", "row_limit": 500}]
+                         "dimensions": ["policy.premium"], "row_limit": 500}]
+    draft["links"] = [{"from": "claim.policy_id", "to": "policy.policy_id"}]
     draft["reuse_dashboard"] = {"id": 12, "reason": "it covers it"}
-    recorder = FakePlanner(_valid_plan())
-    _plan(GOAL, recorder, _tools())
-    context = recorder.contexts[0]
+    context = _context()
     plan = plan_from_draft(draft, context)
     assert isinstance(plan, BuildPlan), plan
+    assert [chart.time_column for chart in plan.charts if chart.key == "paid_by_month"] == ["claim_created_at"]
+    assert draft_of(plan, context) == draft
     assert plan_from_draft(draft_of(plan, context), context) == plan
 
 
-def _with_paid(*, measure_rows: dict, chart_rows: dict | None = None) -> dict:
-    """`_draft`'s plan with a measure over JOIN and a chart that plots it, each naming its rows as given."""
-    draft = json.loads(_draft("SUM(premium)"))
-    draft["measures"].append({"name": "paid", "label": "Paid", "expression": "SUM(amount)", "kind": "currency",
-                              **measure_rows})
+# ---------------------------------------------------------------- the draft: each column named with its table
+
+# The demo shop: an item is of one order and one product, an order of one customer, and a return of one item. Each
+# table's own key holds each value once, as enrichment's profile reads it; a key pointing at another table repeats,
+# except a return's item.
+_SHOP_COLUMNS = {
+    "orders": (("order_id", "INTEGER", True), ("customer_id", "INTEGER", False), ("order_date", "DATE", None),
+               ("channel", "VARCHAR", None)),
+    "order_items": (("order_item_id", "INTEGER", True), ("order_id", "INTEGER", False),
+                    ("product_id", "INTEGER", False), ("revenue", "NUMERIC", None), ("unit_price", "NUMERIC", None)),
+    "products": (("product_id", "INTEGER", True), ("unit_price", "NUMERIC", None), ("category", "VARCHAR", None)),
+    "customers": (("customer_id", "INTEGER", True), ("region", "VARCHAR", None)),
+    "returns": (("return_id", "INTEGER", True), ("order_item_id", "INTEGER", True)),
+}
+
+
+def _shop_column(table: str, name: str, data_type: str, unique: bool | None) -> Column:
+    counts = {} if unique is None else {"row_count": 100, "distinct_count": 100 if unique else 40, "null_count": 0}
+    return Column(id=f"{table}.{name}", object_id=table, name=name, data_type=data_type, **counts)
+
+
+def _shop_relationship(source: str, column: str, target: str) -> Relationship:
+    return Relationship(id=f"{source}.{column}", from_=source, to=target, cardinality="many_to_one",
+                        join_keys=[JoinKey(left=column, right=column)])
+
+
+SHOP = Snapshot(version="v1", source_id="shop", created_at="t",
+                columns=[_shop_column(table, *column) for table, columns in _SHOP_COLUMNS.items()
+                         for column in columns],
+                relationships=[_shop_relationship("order_items", "order_id", "orders"),
+                               _shop_relationship("order_items", "product_id", "products"),
+                               _shop_relationship("orders", "customer_id", "customers"),
+                               _shop_relationship("returns", "order_item_id", "order_items")])
+SHOP_GRANTS = GrantSet(frozenset(_SHOP_COLUMNS))
+SHOP_GOAL = "Revenue by month and orders by region"
+ITEMS_ORDERS = '"order_items" LEFT JOIN "orders" ON "order_items"."order_id" = "orders"."order_id"'
+ORDERS_CUSTOMERS = '"orders" LEFT JOIN "customers" ON "orders"."customer_id" = "customers"."customer_id"'
+ROWS_ARE_MNEMIQS = "name each column with its table; mnemiq chooses the rows"
+REVENUE = {"name": "total_revenue", "label": "Total revenue", "expression": "SUM(order_items.revenue)",
+           "kind": "currency", "currency": "USD"}
+
+
+def _shop(planner, tools: Tools | None = None, **more):
+    """A plan on the shop, whose tables have no dataset yet."""
+    return _plan(SHOP_GOAL, planner, tools or _tools(datasets=[]), snapshot=SHOP, grants=SHOP_GRANTS, **more)
+
+
+def _shop_seen():
+    """The context a plan on the shop hands its planner."""
+    recorder = FakePlanner(_valid_plan())
+    _shop(recorder)
+    return recorder.contexts[0]
+
+
+def _shop_draft(*charts: dict, measures: tuple[dict, ...] = (REVENUE,), **more) -> dict:
+    return {"measures": list(measures), "charts": list(charts), "reuse_dashboard": None, **more}
+
+
+def _bar(key: str, *dimensions: str, measures: tuple[str, ...] = ("total_revenue",), **more) -> dict:
+    return {"key": key, "family": "bar", "title": key.replace("_", " ").capitalize(), "measures": list(measures),
+            "dimensions": list(dimensions), **more}
+
+
+def test_the_context_holds_the_visible_relationships_and_key_facts():
+    context = _shop_seen()
+    assert {(link.left, link.right) for link in context.links} == {
+        (("order_items", "order_id"), ("orders", "order_id")),
+        (("order_items", "product_id"), ("products", "product_id")),
+        (("orders", "customer_id"), ("customers", "customer_id")),
+        (("returns", "order_item_id"), ("order_items", "order_item_id"))}
+    assert context.unique[("orders", "order_id")] is True and context.unique[("orders", "customer_id")] is False
+    assert ("orders", "channel") not in context.unique
+    # A table the builder's grants leave out is in neither.
+    narrow = FakePlanner(_valid_plan())
+    _plan(SHOP_GOAL, narrow, _tools(datasets=[]), snapshot=SHOP, grants=GrantSet(frozenset({"orders", "order_items"})))
+    assert [(link.left, link.right) for link in narrow.contexts[0].links] == [
+        (("order_items", "order_id"), ("orders", "order_id"))]
+    assert {table for table, _ in narrow.contexts[0].unique} == {"orders", "order_items"}
+
+
+ON_ITS_TABLE = _shop_draft({"key": "revenue", "family": "big_number", "title": "Total revenue",
+                        "measures": ["total_revenue"], "dimensions": []},
+                       {"key": "revenue_by_month", "family": "line", "title": "Revenue by month",
+                        "measures": ["total_revenue"], "dimensions": [], "time_column": "orders.order_date",
+                        "grain": "month"})
+
+
+def test_a_measure_on_its_table_and_a_chart_reaching_a_dimension_elsewhere_plan_one_dataset():
+    """The shape a model writes when each measure goes on the table its column is in and a chart groups it by another
+    table's column: mnemiq joins that table to the measure's, the measure's table LEFT JOIN the other, and every chart
+    plotting the measure reads that one dataset, so the measure means the same on each. The model writes no rows and
+    no dataset column name, and nothing goes back for repair."""
+    model = ScriptedModel([json.dumps(ON_ITS_TABLE)])
+    tools = _tools(datasets=[])
+    plan = _shop(LLMPlanner(model), tools)
+    assert isinstance(plan, BuildPlan), plan
+    assert len(model.sent) == 1, "nothing went back for repair"
+    (made,) = plan.datasets
+    assert (made.key, made.placeholder, made.table, made.join) == ("dataset_1", -1, None, ITEMS_ORDERS)
+    assert plan.measures == (Measure(name="total_revenue", label="Total revenue", expression="SUM(revenue)",
+                                     kind=K.CURRENCY, dataset_id=-1, description="", asked_by="", currency="USD"),)
+    assert [(chart.dataset_id, chart.time_column) for chart in plan.charts] == [(-1, None), (-1, "order_date")]
+    assert any(f"SUM(revenue) AS total_revenue FROM {ITEMS_ORDERS}" in sql for sql in tools.statements())
+
+
+def test_one_measure_on_two_charts_needing_different_tables_reads_one_dataset():
+    """One dataset per base table, over every table its measures and their charts name: a measure grouped by an
+    order's channel on one chart and a product's category on another is on one dataset that joins both."""
+    draft = _shop_draft(_bar("by_channel", "orders.channel"), _bar("by_category", "products.category"))
+    plan = _shop(LLMPlanner(ScriptedModel([json.dumps(draft)])))
+    assert isinstance(plan, BuildPlan), plan
+    (made,) = plan.datasets
+    assert made.join == (f'{ITEMS_ORDERS} LEFT JOIN "products" ON "order_items"."product_id" = '
+                         '"products"."product_id"')
+    assert [(chart.dataset_id, chart.dimensions) for chart in plan.charts] == [(-1, ("channel",)), (-1, ("category",))]
+    assert [(measure.expression, measure.dataset_id) for measure in plan.measures] == [("SUM(revenue)", -1)]
+
+
+def test_a_filter_column_joins_its_table():
+    """A table a chart names only in a filter is a table it needs: joined, and the filter's value asked of it."""
+    draft = _shop_draft({"key": "web_revenue", "family": "big_number", "title": "Web revenue",
+                         "measures": ["total_revenue"], "dimensions": [],
+                         "filters": [{"column": "orders.channel", "op": "=", "operand": "web"}]})
+    tools = _tools(datasets=[])
+    plan = _shop(LLMPlanner(ScriptedModel([json.dumps(draft)])), tools)
+    assert isinstance(plan, BuildPlan), plan
+    assert [dataset.join for dataset in plan.datasets] == [ITEMS_ORDERS]
+    assert plan.charts[0].filters == (Filter("channel", "=", "web"),)
+    assert [(probe["table"], probe["column"]) for sql in tools.statements() if (probe := _PROBE.fullmatch(sql))] == [
+        ("orders", "channel")]
+
+
+def test_a_base_that_needs_only_itself_is_its_tables_own_dataset():
+    draft = _shop_draft(_bar("by_product", "order_items.product_id"))
+    plan = _shop(LLMPlanner(ScriptedModel([json.dumps(draft)])))
+    assert isinstance(plan, BuildPlan), plan
+    assert plan.datasets == (PlannedDataset(key="dataset_1", placeholder=-1, table="order_items",
+                                            table_name="order_items"),)
+    assert [(m.expression, m.dataset_id) for m in plan.measures] == [("SUM(revenue)", -1)]
+    assert plan.charts[0].dimensions == ("product_id",)
+    # A table with a dataset of its own reads that dataset.
+    plan = plan_from_draft(json.loads(_draft("SUM(policy.premium)")), _context())
+    assert isinstance(plan, BuildPlan), plan
+    assert plan.datasets == () and {m.dataset_id for m in plan.measures} == {c.dataset_id for c in plan.charts} == {1}
+
+
+def test_count_star_names_its_base_with_table():
+    """An aggregate that names no column says no table: the measure's `table` does, and joins as any base does."""
+    context = _shop_seen()
+
+    def planned(dimension: str, **changes) -> BuildPlan | PlanRefused:
+        measure = {"name": "orders_n", "label": "Orders", "expression": "COUNT(*)", "kind": "count",
+                   "table": "orders", **changes}
+        return plan_from_draft(_shop_draft(_bar("orders", dimension, measures=("orders_n",)), measures=(measure,)),
+                               context)
+
+    plan = planned("orders.channel")
+    assert isinstance(plan, BuildPlan), plan
+    assert plan.datasets == (PlannedDataset(key="dataset_1", placeholder=-1, table="orders"),)
+    assert [(m.expression, m.dataset_id) for m in plan.measures] == [("COUNT(*)", -1)]
+    plan = planned("customers.region")
+    assert isinstance(plan, BuildPlan), plan
+    assert [dataset.join for dataset in plan.datasets] == [ORDERS_CUSTOMERS]
+    for changes, why in (({"table": None}, "names no column"),
+                         ({"table": "payroll_view"}, "'payroll_view' is not a table this builder can read")):
+        refused = planned("orders.channel", **changes)
+        assert isinstance(refused, PlanRefused), changes
+        assert why in _parts(refused)["measure 'orders_n'"], changes
+
+
+def test_a_chart_with_no_measure_takes_its_base_from_its_columns():
+    """A table or a histogram plots no measure: its rows are those of the one table of its columns that reaches the
+    others, an order's with its customer's region here."""
+    context = _shop_seen()
+    listed = {"key": "orders_list", "family": "table", "title": "Orders", "measures": [],
+              "dimensions": ["orders.order_id", "customers.region"]}
+    plan = plan_from_draft(_shop_draft(listed, measures=()), context)
+    assert isinstance(plan, BuildPlan), plan
+    assert [dataset.join for dataset in plan.datasets] == [ORDERS_CUSTOMERS]
+    assert [(chart.dataset_id, chart.dimensions) for chart in plan.charts] == [(-1, ("order_id", "region"))]
+    # A customer has many orders and an order no product: neither table's rows reach the other's.
+    refused = plan_from_draft(_shop_draft({**listed, "dimensions": ["customers.region", "products.category"]},
+                                          measures=()), context)
+    assert isinstance(refused, PlanRefused), refused
+    reason = _parts(refused)["chart 'orders_list'"]
+    assert "'customers'" in reason and "'products'" in reason, reason
+
+
+def test_a_chart_whose_measures_have_different_bases_is_refused():
+    returns = {"name": "returns_n", "label": "Returns", "expression": "COUNT(returns.return_id)", "kind": "count"}
+    draft = _shop_draft(_bar("both", "orders.channel", measures=("total_revenue", "returns_n")),
+                        measures=(REVENUE, returns))
+    refused = plan_from_draft(draft, _shop_seen())
+    assert isinstance(refused, PlanRefused), refused
+    assert list(_parts(refused)) == ["chart 'both'"]
+    reason = _parts(refused)["chart 'both'"]
+    assert "'order_items'" in reason and "'returns'" in reason, reason
+
+
+def test_a_chart_table_or_join_goes_back_for_the_repair():
+    """The model names columns; mnemiq chooses each part's rows. A chart's `table` or `join`, or a measure's `join`,
+    goes back for the repair saying so, and the plan without it passes."""
+    for rows in ({"table": "order_items"}, {"join": "order_items JOIN orders ON order_items.order_id = orders.order_id"}):
+        bad = copy.deepcopy(ON_ITS_TABLE)
+        bad["charts"][1].update(rows)
+        model = ScriptedModel([json.dumps(bad), json.dumps(ON_ITS_TABLE)])
+        plan = _shop(LLMPlanner(model))
+        assert isinstance(plan, BuildPlan), plan
+        assert len(model.sent) == 2, rows
+        assert f"- chart 'revenue_by_month': {ROWS_ARE_MNEMIQS}\n" in model.sent[1]["user"], rows
+    bad = copy.deepcopy(ON_ITS_TABLE)
+    bad["measures"][0]["join"] = "order_items JOIN orders ON order_items.order_id = orders.order_id"
+    refused = plan_from_draft(bad, _shop_seen())
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused)["measure 'total_revenue'"] == ROWS_ARE_MNEMIQS
+
+
+def test_every_column_and_link_names_what_the_builder_reads():
+    """A column, in a measure, a chart or a link, is a column of a table the builder's grants leave visible, named with
+    its table; anything else goes back naming it, before any join is derived."""
+    context = _shop_seen()
+    cases = [
+        (_shop_draft(_bar("by_channel", "orders.channel"),
+                     measures=({**REVENUE, "expression": "SUM(order_items.revnue)"},)),
+         "measure 'total_revenue'", "'order_items' has no column 'revnue'"),
+        (_shop_draft(_bar("by_channel", "orders.region")), "chart 'by_channel'", "'orders' has no column 'region'"),
+        (_shop_draft(_bar("by_channel", "channel")), "chart 'by_channel'", "'channel' is named without its table"),
+        (_shop_draft(_bar("by_channel", "orders.channel", time_column="payroll.paid_on")), "chart 'by_channel'",
+         "'payroll' is not a table this builder can read"),
+        (_shop_draft(_bar("by_channel", "orders.channel"),
+                     links=[{"from": "orders.customer_id", "to": "payroll.customer_id"}]),
+         "the link 'orders.customer_id = payroll.customer_id'", "'payroll' is not a table this builder can read"),
+        (_shop_draft(_bar("by_channel", "orders.channel"), links=[{"from": "orders.order_id", "to": "orders.order_id"}]),
+         "the link 'orders.order_id = orders.order_id'", "a link joins a column of one table to a column of another"),
+        (_shop_draft(_bar("by_channel", "orders.channel"), links=[{"from": "orders.channel"}]), "link 1",
+         'a link is {"from": "<table>.<column>", "to": "<table>.<column>"}'),
+        (_shop_draft(_bar("by_channel", "orders.channel"), links={"from": "orders.channel"}), "the plan",
+         "its links are a list"),
+    ]
+    for draft, part, why in cases:
+        refused = plan_from_draft(draft, context)
+        assert isinstance(refused, PlanRefused), (part, why)
+        assert why in _parts(refused).get(part, ""), (part, why, _parts(refused))
+
+
+def test_a_stated_link_joins_tables_the_snapshot_does_not_relate():
+    """policy and claim have no relationship in the snapshot: a link the model states joins them, from the measure's
+    table, LEFT JOIN, and a column both tables have is named for its table on the dataset."""
+    draft = json.loads(_draft("SUM(policy.premium)"))
+    draft["measures"].append({"name": "paid", "label": "Paid", "expression": "SUM(claim.amount)", "kind": "currency"})
     draft["charts"].append({"key": "paid_by_region", "family": "bar", "title": "Paid by region", "measures": ["paid"],
-                            "dimensions": ["region"], **(chart_rows or {})})
-    return draft
+                            "dimensions": ["policy.region", "claim.policy_id"], "time_column": "claim.created_at",
+                            "filters": [{"column": "claim.status", "op": "=", "operand": "open"},
+                                        {"column": "policy.created_at", "op": "IS NOT NULL"}]})
+    context = _context()
+    refused = plan_from_draft(draft, context)
+    assert isinstance(refused, PlanRefused), refused
+    assert "'policy' cannot be joined to the rows of 'claim'" in _parts(refused)["chart 'paid_by_region'"]
+    draft["links"] = [{"from": "policy.policy_id", "to": "claim.policy_id"}]
+    plan = plan_from_draft(draft, context)
+    assert isinstance(plan, BuildPlan), plan
+    (made,) = plan.datasets
+    assert made.join == '"claim" LEFT JOIN "policy" ON "claim"."policy_id" = "policy"."policy_id"'
+    chart = next(chart for chart in plan.charts if chart.key == "paid_by_region")
+    assert (chart.dimensions, chart.time_column) == (("region", "claim_policy_id"), "claim_created_at")
+    assert chart.filters == (Filter("status", "=", "open"), Filter("policy_created_at", "IS NOT NULL"))
+
+
+def test_a_stated_link_chooses_between_two_ways_of_one_length():
+    """Stated, a link from returns to customers makes a second way from an item to its customer as short as the
+    snapshot's way through its order. Two ways of one length are refused, saying to state the way meant; a way with
+    more stated links than the other is the one joined."""
+    by_region = _shop_draft(_bar("by_region", "customers.region"),
+                            links=[{"from": "returns.return_id", "to": "customers.customer_id"}])
+    plan = plan_from_draft(by_region, _shop_seen())
+    assert isinstance(plan, BuildPlan), plan
+    assert [dataset.join for dataset in plan.datasets] == [
+        '"order_items" LEFT JOIN "returns" ON "order_items"."order_item_id" = "returns"."order_item_id" '
+        'LEFT JOIN "customers" ON "returns"."return_id" = "customers"."customer_id"']
+    both = copy.deepcopy(by_region)
+    both["links"].append({"from": "orders.customer_id", "to": "customers.customer_id"})
+    refused = plan_from_draft(both, _shop_seen())
+    assert isinstance(refused, PlanRefused), refused
+    reason = _parts(refused)["chart 'by_region'"]
+    assert "two ways of one length" in reason and "state the links of the way you mean" in reason, reason
+
+
+def test_two_links_stated_from_opposite_ends_are_two_links():
+    """A link is the columns stated from one table to another: links between one pair stated from each end are two
+    links, refused as more than one, not one link of both columns."""
+    draft = _shop_draft(_bar("orders_by_region", "customers.region", measures=("orders_n",)),
+                        measures=({"name": "orders_n", "label": "Orders", "expression": "COUNT(orders.order_id)",
+                                   "kind": "count"},),
+                        links=[{"from": "orders.customer_id", "to": "customers.customer_id"},
+                               {"from": "customers.region", "to": "orders.channel"}])
+    refused = plan_from_draft(draft, _shop_seen())
+    assert isinstance(refused, PlanRefused), refused
+    assert "'orders' reaches 'customers' by more than one link" in _parts(refused)["chart 'orders_by_region'"]
+    draft["links"].pop()
+    assert [dataset.join for dataset in plan_from_draft(draft, _shop_seen()).datasets] == [ORDERS_CUSTOMERS]
+
+
+def test_kept_names_and_labels_still_go_back_for_the_repair():
+    """Built onto a dashboard, a measure whose name or label the dashboard keeps with another definition goes back for
+    the repair, the repair showing the model its plan as it wrote it; renamed, it passes. A measure on a dataset the
+    build makes is never the kept one, while the same measure on its table's own dataset still is."""
+    first = _draft("SUM(policy.premium)")
+    renamed = json.loads(first)
+    renamed["measures"][0].update(name="premium_on_policy", label="Premium")
+    for chart in renamed["charts"]:
+        chart["measures"] = ["premium_on_policy"]
+    model = ScriptedModel([first, json.dumps(renamed)])
+    plan = _plan(GOAL, LLMPlanner(model), _tools(), kept=(dataclasses.replace(PREMIUM, dataset_id=ELSEWHERE),))
+    assert isinstance(plan, BuildPlan), plan
+    assert len(model.sent) == 2 and [m.name for m in plan.measures] == ["premium_on_policy"]
+    repair = model.sent[1]["user"]
+    assert "- measure 'total_premium': this dashboard keeps a measure of this name" in repair, repair
+    assert '"expression": "SUM(policy.premium)"' in repair and '"policy.region"' in repair, repair
+    labelled = dataclasses.replace(PREMIUM, name="premium_kept", dataset_id=ELSEWHERE)
+    refused = _plan(GOAL, LLMPlanner(ScriptedModel([first, first])), _tools(), kept=(labelled,))
+    assert isinstance(refused, PlanRefused), refused
+    assert "label" in _parts(refused)["measure 'total_premium'"]
+    # claim's own measure, kept on claim's dataset: planned again there it is that measure; planned by policy's region,
+    # on the dataset the build makes, it is another.
+    kept = _measure("paid", "Paid", "SUM(amount)", K.CURRENCY, dataset_id=2)
+    paid = {"name": "paid", "label": "Paid", "expression": "SUM(claim.amount)", "kind": "currency"}
+    by_status = {"measures": [paid], "charts": [{"key": "paid", "family": "bar", "title": "Paid",
+                                                 "measures": ["paid"], "dimensions": ["claim.status"]}]}
+    plan = _plan(GOAL, LLMPlanner(ScriptedModel([json.dumps(by_status)])), _tools(), kept=(kept,))
+    assert isinstance(plan, BuildPlan) and plan.measures == (kept,), plan
+    by_region = copy.deepcopy(by_status)
+    by_region["charts"][0]["dimensions"] = ["policy.region"]
+    by_region["links"] = [{"from": "claim.policy_id", "to": "policy.policy_id"}]
+    refused = _plan(GOAL, LLMPlanner(ScriptedModel([json.dumps(by_region)] * 2)), _tools(), kept=(kept,))
+    assert isinstance(refused, PlanRefused), refused
+    assert "this dashboard keeps a measure of this name" in _parts(refused)["measure 'paid'"]
 
 
 def _context():
@@ -857,96 +1203,37 @@ def _context():
     return recorder.contexts[0]
 
 
-def test_a_join_written_where_a_table_goes_is_read_as_the_join():
-    """A model that writes a measure's join in `table` (Qwen3.8-27B did, in the panel's first build on her model) means
-    the join: the text names no table of the builder's and is one SQL join, so it is read as `join` would be. A name
-    that is no table and no join is still refused."""
-    context = _context()
-    as_join = plan_from_draft(_with_paid(measure_rows={"join": JOIN}), context)
-    assert isinstance(as_join, BuildPlan), as_join
-    assert plan_from_draft(_with_paid(measure_rows={"table": JOIN}), context) == as_join
-    assert plan_from_draft(_with_paid(measure_rows={"join": JOIN}, chart_rows={"table": JOIN}), context) == as_join
-    refused = plan_from_draft(_with_paid(measure_rows={"table": "payroll_view"}), context)
-    assert isinstance(refused, PlanRefused) and "'payroll_view' is not a table" in _parts(refused)["measure 'paid'"]
-
-
-def test_a_chart_on_one_table_of_its_measures_join_is_planned_on_the_join():
-    """A chart's rows are its measures' (one table or one join). A chart that names one of the tables its measures'
-    join joins (Qwen3.8-27B named `orders` for a measure over `order_items JOIN orders`) is planned on that join, as a
-    chart that names none is; a table the join does not hold is still refused."""
-    context = _context()
-    unnamed = plan_from_draft(_with_paid(measure_rows={"join": JOIN}), context)
-    assert isinstance(unnamed, BuildPlan), unnamed
-    # `region` is policy's alone, so it keeps its name on the join (a claim chart is in the next test).
-    moved = plan_from_draft(_with_paid(measure_rows={"join": JOIN}, chart_rows={"table": "policy"}), context)
-    assert moved == unnamed
-    for rows in ({"table": "agent"}, {"table": "agent", "dimensions": ["office"]}):  # office is agent's own
-        refused = plan_from_draft(_with_paid(measure_rows={"join": JOIN}, chart_rows=rows), context)
-        assert isinstance(refused, PlanRefused), rows
-        assert _parts(refused)["chart 'paid_by_region'"] == "its table or join is not its measures'", rows
-
-
-def test_a_chart_moved_onto_the_join_keeps_each_column_where_it_named_it():
-    """Moved onto its measures' join, a chart's columns are read as the join names them: a column the chart's table
-    alone has keeps its name, and one two joined tables share is `<table>_<column>` of the chart's own table. Codex's
-    case: `policy_policy_id` is a column of both tables, and the join shows `policy.policy_id` as `policy_policy_id`;
-    a chart that named `claim` and grouped by its `policy_policy_id` must group by `claim_policy_policy_id`, never by
-    `policy.policy_id`. A chart column its named table does not have keeps the chart refused."""
+def test_a_chart_column_reads_the_column_of_the_table_it_names():
+    """A chart's column is named on its dataset as the dataset names that table's column: alone where no other joined
+    table has it, `<table>_<column>` where two do. Where both tables hold a column `policy_policy_id`, claim's is
+    `claim_policy_policy_id`, never `policy_policy_id`, which is what the dataset calls policy's `policy_id`."""
     from mnemiq.superset.planner import PlanColumn
     context = _context()
     widened = tuple(dataclasses.replace(t, columns=(*t.columns, PlanColumn("policy_policy_id", "INTEGER")))
                     if t.name in ("policy", "claim") else t for t in context.tables)
     context = dataclasses.replace(context, tables=widened)
-
-    def chart_of(**chart_rows) -> ChartSpec | PlanRefused:
-        plan = plan_from_draft(_with_paid(measure_rows={"join": JOIN}, chart_rows={"table": "claim", **chart_rows}),
-                               context)
-        return plan if isinstance(plan, PlanRefused) else next(c for c in plan.charts if c.key == "paid_by_region")
-
-    chart = chart_of(dimensions=["policy_policy_id"])
-    assert chart.dimensions == ("claim_policy_policy_id",), chart
-    chart = chart_of(dimensions=["status", "policy_id"], time_column="created_at",
-                     filters=[{"column": "status", "op": "=", "operand": "open"},
-                              {"column": "created_at", "op": "IS NOT NULL"}])
-    assert chart.dimensions == ("status", "claim_policy_id") and chart.time_column == "claim_created_at", chart
-    assert [f.column for f in chart.filters] == ["status", "claim_created_at"], chart
-    refused = chart_of(dimensions=["region"])  # policy's column, not claim's
-    assert isinstance(refused, PlanRefused)
-    assert _parts(refused)["chart 'paid_by_region'"] == "its table or join is not its measures'"
-
-
-def test_a_join_written_as_a_table_meets_the_join_checks_a_join_meets():
-    """Read as a join, the text is held to every check a join is: one over a table the builder's grants leave out is
-    refused, through the repair, as `join` would be; text whose sources are not all tables (a subquery among them) is
-    no join, so it stays a table no builder can read."""
-    ungranted = "policy JOIN payroll ON payroll.salary = policy.premium"
-    reply = json.dumps(_with_paid(measure_rows={"table": ungranted}))
-    refused = _plan(GOAL, LLMPlanner(ScriptedModel([reply, reply])), _tools())
-    assert isinstance(refused, PlanRefused), refused
-    assert f"the join {ungranted!r}" in _parts(refused), _parts(refused)
-    context = _context()
-    for text in ("policy JOIN (SELECT * FROM payroll) AS p ON p.salary = policy.premium",
-                 "(SELECT * FROM payroll) AS p", "policy, LATERAL (SELECT * FROM payroll) AS p"):
-        refused = plan_from_draft(_with_paid(measure_rows={"table": text}), context)
-        assert isinstance(refused, PlanRefused), text
-        assert f"{text!r} is not a table this builder can read" in _parts(refused)["measure 'paid'"], text
-
-
-def test_a_reply_with_both_shapes_is_planned_with_no_repair():
-    reply = _with_paid(measure_rows={"table": JOIN}, chart_rows={"table": "policy"})
-    model = ScriptedModel([json.dumps(reply)])
-    plan = _plan(GOAL, LLMPlanner(model), _tools())
+    draft = {"measures": [{"name": "paid", "label": "Paid", "expression": "SUM(claim.amount)", "kind": "currency"}],
+             "charts": [{"key": "paid", "family": "bar", "title": "Paid", "measures": ["paid"],
+                         "dimensions": ["claim.policy_policy_id", "policy.policy_id", "policy.region"],
+                         "time_column": "claim.created_at",
+                         "filters": [{"column": "claim.status", "op": "=", "operand": "open"},
+                                     {"column": "claim.created_at", "op": "IS NOT NULL"}]}],
+             "links": [CLAIM_POLICY_LINK]}
+    plan = plan_from_draft(draft, context)
     assert isinstance(plan, BuildPlan), plan
-    assert len(model.sent) == 1, "nothing went back for repair"
-    [paid] = [m for m in plan.measures if m.name == "paid"]
-    [chart] = [c for c in plan.charts if c.key == "paid_by_region"]
-    assert chart.dataset_id == paid.dataset_id < 0
-    assert [d.join for d in plan.datasets if d.placeholder == paid.dataset_id] == [JOIN]
+    (chart,) = plan.charts
+    assert chart.dimensions == ("claim_policy_policy_id", "policy_policy_id", "region"), chart
+    assert chart.time_column == "claim_created_at", chart
+    assert [f.column for f in chart.filters] == ["status", "claim_created_at"], chart
+    # A column the named table does not have is refused, naming it.
+    draft["charts"][0]["dimensions"] = ["claim.region"]
+    refused = plan_from_draft(draft, context)
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused)["chart 'paid'"] == "'claim' has no column 'region'"
 
 
 def test_a_draft_cannot_name_an_ungranted_table():
-    draft = json.loads(_draft("SUM(salary)"))
-    draft["measures"][0]["table"] = "payroll"
+    draft = json.loads(_draft("SUM(payroll.salary)"))
     model = ScriptedModel([json.dumps(draft), json.dumps(draft)])
     refused = _plan(GOAL, LLMPlanner(model), _tools())
     assert isinstance(refused, PlanRefused) and "measure 'total_premium'" in _parts(refused)
@@ -1610,14 +1897,14 @@ def test_a_row_limit_on_a_categorical_chart_still_plans():
 
 
 def test_the_prompt_says_a_time_axis_takes_no_row_limit():
-    model = ScriptedModel([_draft("SUM(premium)")])
+    model = ScriptedModel([_draft("SUM(policy.premium)")])
     _plan(GOAL, LLMPlanner(model), _tools())
     assert '"row_limit": optional, never on a chart with a time_column or a date or timestamp first dimension,' \
         in model.sent[0]["system"]
 
 
 def test_the_prompt_says_a_percent_is_a_fraction():
-    model = ScriptedModel([_draft("SUM(premium)")])
+    model = ScriptedModel([_draft("SUM(policy.premium)")])
     _plan(GOAL, LLMPlanner(model), _tools())
     system = model.sent[0]["system"]
     assert "a percent is a fraction from 0 to 1" in system and "never multiply it by 100" in system
@@ -1626,7 +1913,7 @@ def test_the_prompt_says_a_percent_is_a_fraction():
 def test_the_prompt_keeps_a_measures_condition_in_its_expression():
     """A condition that defines a measure (open, won) belongs in its expression, so the measure means its name on every
     chart, in the measures section and in a saved metric; a chart's filters only narrow that chart."""
-    model = ScriptedModel([_draft("SUM(premium)")])
+    model = ScriptedModel([_draft("SUM(policy.premium)")])
     _plan(GOAL, LLMPlanner(model), _tools())
     system = model.sent[0]["system"]
     assert "goes inside its expression" in system
@@ -2273,15 +2560,17 @@ def test_a_joined_tables_saved_metric_is_carried_onto_the_join():
 
 
 CARRIED_DRAFT = {"measures": [{"name": "open_paid_by_region", "saved_metric": "open_paid", "kind": "currency",
-                               "table": "claim", "join": JOIN}],
+                               "table": "claim"}],
                  "charts": [{"key": "carried", "family": "bar", "title": "Carried",
-                             "measures": ["open_paid_by_region"], "dimensions": ["region"]}],
+                             "measures": ["open_paid_by_region"], "dimensions": ["policy.region"]}],
+                 "links": [CLAIM_POLICY_LINK],
                  "reuse_dashboard": None}
 
 
-def test_the_model_carries_a_joined_tables_saved_metric_by_its_table_and_join():
-    """On the JSON channel a carried metric is a saved metric named with its table and the join: read as that
-    reference under the model's name for it, and written back for the repair as the model wrote it."""
+def test_the_model_carries_a_joined_tables_saved_metric_by_its_table():
+    """On the JSON channel a saved metric is named with its table. Plotted by a column of another table, it is on the
+    dataset the build joins for its table, carried onto it under the model's name for it, and written back for the
+    repair as the model wrote it."""
     model = ScriptedModel([json.dumps(CARRIED_DRAFT)])
     checked = _plan(GOAL, LLMPlanner(model), _tools(metrics=SAVED_ON_TABLES, extension=CERTIFIED), snapshot=KEYED,
                     settings=GUARDED)
@@ -2289,23 +2578,26 @@ def test_the_model_carries_a_joined_tables_saved_metric_by_its_table_and_join():
     assert len(model.sent) == 1 and [m.expression for m in checked.measures] == [OPEN_PAID_SHOWN]
     context = _seen(_tools(metrics=SAVED_ON_TABLES))
     plan = plan_from_draft(CARRIED_DRAFT, context)
-    assert plan == _carried_plan(OPEN_PAID_REF)
+    assert plan == _carried_plan(OPEN_PAID_REF, join=CLAIM_POLICY)
     assert draft_of(plan, context) == CARRIED_DRAFT
     assert plan_from_draft(draft_of(plan, context), context) == plan
+    # Plotted by its own table's columns alone, it is its table's saved metric, on its table's dataset.
+    own = copy.deepcopy(CARRIED_DRAFT)
+    own["charts"][0]["dimensions"] = ["claim.status"]
+    plan = plan_from_draft(own, context)
+    assert isinstance(plan, BuildPlan), plan
+    assert plan.datasets == () and [(c.dataset_id, c.measures) for c in plan.charts] == [
+        (2, (SavedRef("open_paid", K.CURRENCY),))]
 
 
 @pytest.mark.parametrize("change, why", [
     ({"table": "payroll"}, "'payroll' is not a table this builder can read"),
-    ({"join": "policy JOIN"}, "the join 'policy JOIN' is not one SQL join"),
-    # A written measure still names its rows with one of the two.
-    ({"saved_metric": None, "label": "Paid", "expression": "SUM(amount)"},
-     "name its rows with a table or a join, one of the two"),
+    ({"table": None}, "a saved metric is named with its table"),
+    ({"join": JOIN}, ROWS_ARE_MNEMIQS),
 ])
-def test_a_carried_metric_names_a_table_the_builder_reads_and_one_join(change, why):
+def test_a_saved_metric_names_a_table_the_builder_reads_and_no_join(change, why):
     draft = copy.deepcopy(CARRIED_DRAFT)
     draft["measures"][0].update(change)
-    if change.get("saved_metric", "") is None:
-        del draft["measures"][0]["saved_metric"]
     refused = plan_from_draft(draft, _seen(_tools(metrics=SAVED_ON_TABLES)))
     assert isinstance(refused, PlanRefused), refused
     assert why in _parts(refused)["measure 'open_paid_by_region'"]
