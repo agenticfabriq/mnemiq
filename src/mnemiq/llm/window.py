@@ -322,9 +322,9 @@ def count_on_server(base_url: str, model: str, system: str, user: str,
     started = time.monotonic()
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
-    def call(method: str, path: str, body: dict | None = None):
+    def call(method: str, path: str, body: dict | None = None, params: dict | None = None):
         """The reply's JSON, or None: not 200, past the deadline or the cap, or not JSON."""
-        with client.stream(method, f"{root}{path}", json=body, headers=headers) as resp:
+        with client.stream(method, f"{root}{path}", json=body, headers=headers, params=params) as resp:
             if resp.status_code != 200:
                 return None
             chunks, size = [], 0
@@ -341,7 +341,7 @@ def count_on_server(base_url: str, model: str, system: str, user: str,
             count, window = data.get("count"), data.get("max_model_len")
             if isinstance(count, int) and isinstance(window, int):
                 return count, window
-        return _count_on_llama_cpp(call, messages)
+        return _count_on_llama_cpp(call, model, messages)
     except (httpx.HTTPError, ValueError):
         # Down, slow, or answering with something other than JSON (a proxy's catch-all page):
         # none of it is a count, and a declared window can still be checked without one -- an
@@ -357,14 +357,16 @@ def _positive(value) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
-def _count_on_llama_cpp(call, messages: list[dict]) -> tuple[int, int] | None:
-    rendered = call("POST", "/apply-template", {"messages": messages})
+def _count_on_llama_cpp(call, model: str, messages: list[dict]) -> tuple[int, int] | None:
+    # Every call names the model: a single-model server ignores it, and the router (`--models-dir`) refuses a POST
+    # without one and answers `/props` without `?model=` for itself, a window of 0 (Codex review, observed on b12359).
+    rendered = call("POST", "/apply-template", {"model": model, "messages": messages})
     prompt = rendered.get("prompt") if isinstance(rendered, dict) else None
     if not isinstance(prompt, str) or not prompt:
         return None
-    counted = call("POST", "/tokenize", {"content": prompt, "add_special": True, "parse_special": True})
+    counted = call("POST", "/tokenize", {"model": model, "content": prompt, "add_special": True, "parse_special": True})
     tokens = counted.get("tokens") if isinstance(counted, dict) else None
-    props = call("GET", "/props") if isinstance(tokens, list) else None
+    props = call("GET", "/props", params={"model": model}) if isinstance(tokens, list) else None
     settings = props.get("default_generation_settings") if isinstance(props, dict) else None
     window = _positive(settings.get("n_ctx")) if isinstance(settings, dict) else None
     # A templated chat is never empty: no tokens means the server did not count it.

@@ -440,6 +440,29 @@ def test_llama_cpp_is_counted_on_its_own_template_and_tokenizer():
     assert ("GET", "/props", None) in seen
 
 
+def _llama_cpp_router(model: str = "m") -> httpx.Client:
+    """llama.cpp's router (`--models-dir`), as observed on build b12359: a POST without the model is 400, and `/props`
+    without `?model=` describes the router itself, `n_ctx` 0."""
+    single = _llama_cpp()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        if request.method == "POST" and request.url.path != "/tokenize" or (
+                request.url.path == "/tokenize" and body is not None and "content" in body):
+            if body.get("model") != model:
+                return httpx.Response(400, json={"error": {"code": 400, "message": "model name is missing"}})
+        if request.url.path == "/props" and request.url.params.get("model") != model:
+            return httpx.Response(200, json={"default_generation_settings": {"n_ctx": 0}, "role": "router"})
+        return single._transport.handle_request(request)
+    return httpx.Client(transport=httpx.MockTransport(handle))
+
+
+def test_llama_cpps_router_is_asked_for_the_configured_model():
+    """Codex review: the router needs the model on every call, and `/props` without one reads as a window of 0."""
+    assert count_on_server("http://h/v1", "qwen small/7b", "SYS", "USER",
+                           http=_llama_cpp_router("qwen small/7b")) == (39, 4096)
+
+
 def test_an_empty_token_list_is_never_a_count_of_zero():
     """vLLM's body on llama.cpp's /tokenize comes back 200 with no tokens: read as a length, every prompt would be 0
     tokens and always fit."""
