@@ -8,6 +8,7 @@ a key pointing at another table repeats, except a return's item: an item is retu
 
 from __future__ import annotations
 
+import pytest
 import sqlglot
 from sqlglot import exp
 
@@ -76,9 +77,31 @@ def test_a_measures_base_is_the_table_inside_its_aggregate():
     assert base_of("PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY order_items.revenue)", None) == "order_items"
     assert base_of("COUNT(DISTINCT order_items.order_id)", "orders") == "order_items"
     assert base_of("COUNT(*)", "orders") == "orders"
-    _refused(base_of("COUNT(*)", None), "names no column")
+    assert _refused(base_of("COUNT(*)", None)) == ADDS_UP_NO_COLUMN
     _refused(base_of("SUM(order_items.revenue) + SUM(returns.amount)", None), "order_items", "returns")
     _refused(base_of("SUM(revenue)", "order_items"), "'revenue'", "without its table")
+
+
+# Why a measure whose aggregate adds up no column is refused without its `table`: what to give, whatever its condition
+# names.
+ADDS_UP_NO_COLUMN = ('its aggregate adds up no column, whatever its condition names, so it does not say whose rows it '
+                     'counts: give the measure "table", the table whose rows it counts, or count one of that table\'s '
+                     "columns, as COUNT(<table>.<key>)")
+
+
+@pytest.mark.parametrize("expression", [
+    "COUNT(*)",
+    "SUM(CASE WHEN orders.status = 'open' THEN 1 ELSE 0 END)",
+    "COUNT(CASE WHEN orders.status = 'open' THEN 1 END)",
+    "AVG(CASE WHEN orders.channel = 'web' THEN 1.0 ELSE 0 END)",
+    "SUM(CASE WHEN orders.status = 'won' THEN 1 ELSE 0 END)::double precision"
+    " / NULLIF(SUM(CASE WHEN orders.status IN ('won', 'lost') THEN 1 ELSE 0 END), 0)"])
+def test_an_aggregate_of_no_column_takes_its_table_whatever_its_condition_names(expression):
+    """A count or sum of 1s, or a share of 1.0 and 0, adds up no column: its condition says which rows it covers, never
+    whose rows they are. Its `table` says that, and without one it goes back saying to give it."""
+    assert aggregated(expression) == set()
+    assert base_of(expression, "order_items") == "order_items"
+    assert _refused(base_of(expression, None)) == ADDS_UP_NO_COLUMN
 
 
 def test_qualified_names_each_column_with_its_table_or_says_why_not():

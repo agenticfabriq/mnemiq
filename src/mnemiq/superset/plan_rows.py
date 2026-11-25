@@ -199,8 +199,9 @@ def base_of(expression: str, table: str | None) -> str | Refusal:
         return tables[0]
     if table is not None:
         return table
-    return Refusal("its aggregate names no column, so it does not say whose rows it adds up: give the measure its "
-                   "table, or aggregate one of that table's columns, as COUNT(<table>.<column>)")
+    return Refusal('its aggregate adds up no column, whatever its condition names, so it does not say whose rows it '
+                   'counts: give the measure "table", the table whose rows it counts, or count one of that table\'s '
+                   "columns, as COUNT(<table>.<key>)")
 
 
 def far_side(table: str, columns: Sequence[str], unique: Unique) -> bool | None:

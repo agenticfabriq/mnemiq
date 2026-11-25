@@ -333,29 +333,29 @@ PLAN_SCHEMA = {
 _RESPONSE_FORMAT = {"response_format": {"type": "json_schema",
                                         "json_schema": {"name": "dashboard_plan", "schema": PLAN_SCHEMA}}}
 
-# The plan `_SYSTEM` shows the model, on tables of the example's own: a chart reaching a column two links from its
-# measure's table, one link known and one stated, and a share whose aggregate adds up no column, so names its table.
+# The plan `_SYSTEM` shows the model, on a library's tables, which no measured schema has: a measure whose condition
+# names a table no known link reaches, so a link is stated for it; a chart reaching a column through a known link; and
+# a count of 1s, whose aggregate adds up no column, so it names its table.
 _EXAMPLE = {
     "measures": [
-        {"name": "units_sold", "label": "Units sold", "expression": "SUM(order_lines.quantity)", "kind": "number"},
-        {"name": "web_order_share", "label": "Web share of orders",
-         "expression": "AVG(CASE WHEN orders.channel = 'web' THEN 1.0 ELSE 0 END)", "kind": "percent",
-         "table": "orders"}],
+        {"name": "renewals", "label": "Renewals", "expression": "SUM(loans.renewals)", "kind": "number"},
+        {"name": "ebook_loans", "label": "Ebook loans",
+         "expression": "COUNT(CASE WHEN books.format = 'ebook' THEN 1 END)", "kind": "count", "table": "loans"}],
     "charts": [
-        {"key": "units_by_segment", "family": "bar", "title": "Units sold by customer segment",
-         "measures": ["units_sold"], "dimensions": ["customers.segment"]},
-        {"key": "web_share_by_quarter", "family": "line", "title": "Web share of orders by quarter",
-         "measures": ["web_order_share"], "dimensions": [], "time_column": "orders.ordered_at", "grain": "quarter"}],
-    "links": [{"from": "order_lines.order_id", "to": "orders.order_id"}],
+        {"key": "renewals_by_membership", "family": "bar", "title": "Renewals by membership",
+         "measures": ["renewals"], "dimensions": ["members.membership"]},
+        {"key": "ebook_loans_by_month", "family": "line", "title": "Ebook loans by month",
+         "measures": ["ebook_loans"], "dimensions": [], "time_column": "loans.loaned_on", "grain": "month"}],
+    "links": [{"from": "loans.book_id", "to": "books.book_id"}],
     "reuse_dashboard": None}
 
 _SYSTEM = """You plan a Superset dashboard for a builder's goal, from the tables, links, saved metrics and dashboards \
 you are shown. Answer with one JSON object and nothing else:
 {"measures": [...], "charts": [...], "links": [...], "reuse_dashboard": null}
 
-Name every column with its table, as <table>.<column> (orders.channel, customers.segment), wherever you name one: in \
-expressions, dimensions, filters, time columns, source and target. You say what to show, and mnemiq does the rest: it \
-reads each chart's rows from the tables its columns are of, joined by their links.
+Name every column with its table, as <table>.<column> (loans.renewals, members.membership), wherever you name one: \
+in expressions, dimensions, filters, time columns, source and target. You say what to show, and mnemiq does the rest: \
+it reads each chart's rows from the tables its columns are of, joined by their links.
 
 Measures are the numbers the charts show. Each is either
 - written: {"name": lower case letters, digits and _, "label": the name shown on the chart, "expression": one SQL \
@@ -365,15 +365,15 @@ to 1, which Superset shows as a percent: 0.25 shows as 25%; never multiply it by
 - a saved metric of a table's dataset: {"name": the plan's own name for it, "saved_metric": the saved metric's name, \
 "kind": ..., "table": the table whose saved metric it is}. The same saved metric on two tables is two measures, each \
 with a name of its own.
-A written measure adds up the rows of one table, the table of the columns its aggregate adds up: \
-SUM(order_lines.quantity) adds up order_lines. Its aggregate never adds up columns of two tables, though a condition \
-on another table's column may say which rows it covers. An aggregate that adds up no column, as COUNT(*) or a share \
-of 1.0 and 0 does, names no table: give the measure "table", the table whose rows it adds up. To count rows, prefer \
-COUNT(<table>.<key>), which names its table. Use a saved metric where one says what a measure needs: never write your \
-own measure for what a saved metric says. A saved metric that names no column, such as count (COUNT(*)), is only for \
-a table whose measures no chart shows with another table's column; write COUNT(<table>.<key>) instead. A written \
-measure's name and label are never a saved metric's name on its table, and no two measures share a label. A table \
-with no dataset gets one, with Superset's saved metric count (COUNT(*)).
+A written measure adds up the rows of one table, the table of the columns its aggregate adds up: SUM(loans.renewals) \
+adds up loans. Its aggregate never adds up columns of two tables, though a condition on another table's column may say \
+which rows it covers. An aggregate that adds up no column, as COUNT(*), a count or sum of 1s, or a share of 1.0 and 0 \
+does, whatever its condition names, does not say whose rows it counts: give the measure "table", the table whose rows \
+it counts. To count rows, prefer COUNT(<table>.<key>), which names its table. Use a saved metric where one says what \
+a measure needs: never write your own measure for what a saved metric says. A saved metric that names no column, such \
+as count (COUNT(*)), is only for a table whose measures no chart shows with another table's column; write \
+COUNT(<table>.<key>) instead. A written measure's name and label are never a saved metric's name on its table, and no \
+two measures share a label. A table with no dataset gets one, with Superset's saved metric count (COUNT(*)).
 
 Charts: {"key": lower case letters, digits and _, at most 40, one per chart, "family": one of FAMILIES, "title", \
 "measures": [measure names], "dimensions": [columns], "time_column": a date or timestamp column, or omitted, \
@@ -401,17 +401,17 @@ should not show the groups a measure's condition leaves out (a closed stage, sho
 chart as well.
 
 Links: {"from": "<table>.<column>", "to": "<table>.<column>"}, a column of the table whose rows refer to another \
-table, equal to that table's key (order_lines.order_id to orders.order_id); a key of two columns is two links between \
-the same two tables. The links you are shown are known, and mnemiq joins tables by them. State a link only where a \
-chart names a table the known links do not connect to its measures' table, or where two ways connect the same \
-tables, to say which the chart means. Otherwise "links": [].
+table, equal to that table's key (loans.book_id to books.book_id); a key of two columns is two links between the same \
+two tables. The links you are shown are known, and mnemiq joins tables by them. State a link wherever a measure or a \
+chart names a table, in a condition too, that the known links do not connect to the measure's table: with no links \
+shown, state every link your plan needs. Where two ways connect the same tables, state the link the chart means. With \
+nothing to state, "links": [].
 
 reuse_dashboard: {"id": a dashboard's id, "reason": why it already covers the goal}, only for one of the dashboards \
 listed and only when it covers the goal; the builder is then asked whether to reuse it. Otherwise null.
 
-For example, where the links shown include orders.customer_id to customers.customer_id and none connects \
-order_lines to orders, the goal "units sold by customer segment, and the share of web orders by quarter" is planned \
-as:
+For example, where the links shown include loans.member_id to members.member_id and none connects loans to books, \
+the goal "renewals by membership, and ebook loans by month" is planned as:
 """ + json.dumps(_EXAMPLE, ensure_ascii=False)
 
 
@@ -783,7 +783,7 @@ def plan_from_draft(draft: Mapping[str, Any], context: PlanContext) -> BuildPlan
 
 def draft_of(plan: BuildPlan, context: PlanContext) -> dict:
     """`plan` as the model writes one (`plan_from_draft` reads it back): each column named with its table again, as its
-    dataset reads it (`qualify`), a written measure whose aggregate names no column with its table, and the links the
+    dataset reads it (`qualify`), a written measure whose aggregate adds up no column with its table, and the links the
     datasets the build makes join by. What the model is shown of its own plan when a part goes back for repair. A
     dataset that is neither a visible table's nor one the plan makes is named as `dataset <id>`."""
     columns = {table.name: tuple(column.name for column in table.columns) for table in context.tables}

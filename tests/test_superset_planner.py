@@ -862,7 +862,7 @@ def test_a_join_holding_a_template_marker_is_refused():
 def test_the_model_reads_its_own_plan_back_as_it_wrote_it():
     """`draft_of` is what a repair shows the model of its plan: the format the model writes, each column named with its
     table again (a column the joined dataset renames, claim's created_at, as claim.created_at), a measure whose
-    aggregate names no column with its table, and the links its joined datasets join by. `plan_from_draft` reads it
+    aggregate adds up no column with its table, and the links its joined datasets join by. `plan_from_draft` reads it
     back to the same plan."""
     draft = json.loads(_draft("SUM(policy.premium)"))
     draft["measures"] += [{"name": "paid", "label": "Paid", "expression": "SUM(claim.amount)", "kind": "currency",
@@ -991,11 +991,18 @@ def test_the_prompt_asks_for_qualified_columns_and_links():
     assert '{"measures": [...], "charts": [...], "links": [...], "reuse_dashboard": null}' in system
     assert "Name every column with its table, as <table>.<column>" in system
     assert ('Links: {"from": "<table>.<column>", "to": "<table>.<column>"}, a column of the table whose rows refer to '
-            "another table, equal to that table's key (order_lines.order_id to orders.order_id)") in system
-    assert "or where two ways connect the same tables, to say which the chart means" in system
-    # A measure whose aggregate adds up no column says its table; a count is better written over a key.
-    assert ('An aggregate that adds up no column, as COUNT(*) or a share of 1.0 and 0 does, names no table: give the '
-            'measure "table", the table whose rows it adds up. To count rows, prefer COUNT(<table>.<key>)') in system
+            "another table, equal to that table's key (loans.book_id to books.book_id)") in system
+    # A link wherever a measure or a chart names a table the known links leave unconnected, a condition's table too,
+    # and every one where none is known.
+    assert ("State a link wherever a measure or a chart names a table, in a condition too, that the known links do not "
+            "connect to the measure's table: with no links shown, state every link your plan needs.") in system
+    assert "Where two ways connect the same tables, state the link the chart means." in system
+    # A measure whose aggregate adds up no column says its table, whatever its condition names; a count is better
+    # written over a key.
+    assert ('An aggregate that adds up no column, as COUNT(*), a count or sum of 1s, or a share of 1.0 and 0 does, '
+            'whatever its condition names, does not say whose rows it counts: give the measure "table", the table '
+            'whose rows it counts. To count rows, prefer COUNT(<table>.<key>)') in system
+    assert "names no table" not in system
     # Nothing about rows, joins or a joined dataset's column names, which the model no longer decides.
     for unasked in ("JOIN", '"join"', "<table>_<column>", "the chart's rows", "on a join", "each column alone",
                     "one table or one join"):
@@ -1027,42 +1034,111 @@ def test_the_prompt_shows_the_known_links():
         (link.left, link.right) for link in odd.links]
 
 
-# The tables the system prompt's example plans on: orders, their lines and their customers. The snapshot relates an
-# order to its customer and nothing to an order's lines, as the example says.
-_EXAMPLE_COLUMNS = {
-    "orders": (("order_id", "INTEGER", True), ("customer_id", "INTEGER", False), ("ordered_at", "DATE", None),
-               ("channel", "VARCHAR", None)),
-    "order_lines": (("order_line_id", "INTEGER", True), ("order_id", "INTEGER", False), ("quantity", "INTEGER", None)),
-    "customers": (("customer_id", "INTEGER", True), ("segment", "VARCHAR", None)),
+# The tables the system prompt's example plans on: a library's loans, their books and their members, none of them a
+# table or a column of the shop. The snapshot relates a loan to its member and nothing to a loan's book, as the example
+# says.
+_LIBRARY_COLUMNS = {
+    "loans": (("loan_id", "INTEGER", True), ("book_id", "INTEGER", False), ("member_id", "INTEGER", False),
+              ("loaned_on", "DATE", None), ("renewals", "INTEGER", None)),
+    "books": (("book_id", "INTEGER", True), ("format", "VARCHAR", None)),
+    "members": (("member_id", "INTEGER", True), ("membership", "VARCHAR", None)),
 }
-EXAMPLE = Snapshot(version="v1", source_id="example", created_at="t",
-                   columns=[_shop_column(table, *column) for table, columns in _EXAMPLE_COLUMNS.items()
+LIBRARY = Snapshot(version="v1", source_id="library", created_at="t",
+                   columns=[_shop_column(table, *column) for table, columns in _LIBRARY_COLUMNS.items()
                             for column in columns],
-                   relationships=[_shop_relationship("orders", "customer_id", "customers")])
+                   relationships=[_shop_relationship("loans", "member_id", "members")])
+LIBRARY_GRANTS = GrantSet(frozenset(_LIBRARY_COLUMNS))
+LIBRARY_GOAL = "Renewals by membership, and ebook loans by month"
+BOOK_LINK = {"from": "loans.book_id", "to": "books.book_id"}
+MEMBER_LINK = {"from": "loans.member_id", "to": "members.member_id"}
+
+
+def _library_seen(snapshot: Snapshot = LIBRARY):
+    """The context a plan on the library hands its planner."""
+    recorder = FakePlanner(_valid_plan())
+    _plan(LIBRARY_GOAL, recorder, _tools(datasets=[]), snapshot=snapshot, grants=LIBRARY_GRANTS)
+    return recorder.contexts[0]
 
 
 def test_the_prompts_example_is_a_plan_mnemiq_takes():
     """The plan the system prompt shows as its example is one the reader and the check take as written, on tables
     shaped as the example says, so the prompt never shows the model what mnemiq refuses. Its stated link is the one the
-    known links leave out: without it, the chart reaching a customer's segment from an order's lines is refused."""
+    known links leave out, needed by a measure's condition alone: without it, that measure is refused. Its tables and
+    columns are none of the shop's, and the prompt names no table of the shop, so a model measured on a shop is shown
+    no answer of it."""
     system, _ = plan_prompt(SHOP_GOAL, _shop_seen())
     (example,) = [json.loads(line) for line in system.splitlines() if line.startswith('{"measures": [{')]
-    goal = "Units sold by customer segment, and the share of web orders by quarter"
-    grants = GrantSet(frozenset(_EXAMPLE_COLUMNS))
     model = ScriptedModel([json.dumps(example)])
-    plan = _plan(goal, LLMPlanner(model), _tools(datasets=[]), snapshot=EXAMPLE, grants=grants)
+    plan = _plan(LIBRARY_GOAL, LLMPlanner(model), _tools(datasets=[]), snapshot=LIBRARY, grants=LIBRARY_GRANTS)
     assert isinstance(plan, BuildPlan), plan
     assert len(model.sent) == 1, "nothing went back for repair"
     assert [(dataset.table, dataset.join) for dataset in plan.datasets] == [
-        (None, '"order_lines" LEFT JOIN "orders" ON "order_lines"."order_id" = "orders"."order_id" LEFT JOIN '
-               '"customers" ON "orders"."customer_id" = "customers"."customer_id"'),
-        ("orders", None)]
-    assert [measure.kind for measure in plan.measures] == [K.NUMBER, K.PERCENT]
+        (None, '"loans" LEFT JOIN "books" ON "loans"."book_id" = "books"."book_id" LEFT JOIN "members" ON '
+               '"loans"."member_id" = "members"."member_id"')]
+    assert [(measure.name, measure.kind, measure.dataset_id) for measure in plan.measures] == [
+        ("renewals", K.NUMBER, -1), ("ebook_loans", K.COUNT, -1)]
+    assert [(chart.dimensions, chart.time_column) for chart in plan.charts] == [(("membership",), None),
+                                                                               ((), "loaned_on")]
     unlinked = {key: value for key, value in example.items() if key != "links"}
-    recorder = FakePlanner(_valid_plan())
-    _plan(goal, recorder, _tools(datasets=[]), snapshot=EXAMPLE, grants=grants)
-    refused = plan_from_draft(unlinked, recorder.contexts[0])
-    assert isinstance(refused, PlanRefused) and list(_parts(refused)) == ["chart 'units_by_segment'"], refused
+    refused = plan_from_draft(unlinked, _library_seen())
+    assert isinstance(refused, PlanRefused) and list(_parts(refused)) == ["measure 'ebook_loans'"], refused
+    shop_columns = {column for columns in _SHOP_COLUMNS.values() for column, *_ in columns}
+    library_columns = {column for columns in _LIBRARY_COLUMNS.values() for column, *_ in columns}
+    assert not set(_LIBRARY_COLUMNS) & set(_SHOP_COLUMNS) and not library_columns & shop_columns
+    assert re.search(rf"\b({'|'.join(_SHOP_COLUMNS)})\b", system) is None, system
+
+
+def test_a_table_a_measures_condition_names_needs_a_link_like_any_other():
+    """A table a measure names only in its condition is joined to the measure's rows as surely as one a chart names in
+    a dimension, so a link must reach it, known or stated: with "links": [] and no known link, the measure is refused,
+    and stated, it plans. With no known link at all, every table but the measure's own needs one stated, the prompt
+    shows none and says so, and a chart reaching a member's membership without one is refused."""
+    measure = {"name": "print_renewals", "label": "Renewals of print books", "kind": "number",
+               "expression": "SUM(CASE WHEN books.format = 'print' THEN loans.renewals END)"}
+    chart = {"key": "print_renewals", "family": "big_number", "title": "Renewals of print books",
+             "measures": ["print_renewals"], "dimensions": []}
+    draft = {"measures": [measure], "charts": [chart], "links": [], "reuse_dashboard": None}
+    refused = plan_from_draft(draft, _library_seen())
+    assert isinstance(refused, PlanRefused), refused
+    assert list(_parts(refused)) == ["measure 'print_renewals'"], refused
+    assert _parts(refused)["measure 'print_renewals'"].startswith(
+        "'books' cannot be joined to the rows of 'loans': no link reaches it")
+    stated = {**draft, "links": [BOOK_LINK]}
+    plan = _plan(LIBRARY_GOAL, LLMPlanner(ScriptedModel([json.dumps(stated)])), _tools(datasets=[]), snapshot=LIBRARY,
+                 grants=LIBRARY_GRANTS)
+    assert isinstance(plan, BuildPlan), plan
+
+    bare = _library_seen(LIBRARY.model_copy(update={"relationships": []}))
+    system, user = plan_prompt(LIBRARY_GOAL, bare)
+    assert _seen_document(user)["links"] == []
+    assert "with no links shown, state every link your plan needs" in system
+    by_membership = {**stated, "charts": [{**chart, "family": "bar", "dimensions": ["members.membership"]}]}
+    refused = plan_from_draft(by_membership, bare)
+    assert isinstance(refused, PlanRefused) and list(_parts(refused)) == ["chart 'print_renewals'"], refused
+    assert isinstance(plan_from_draft({**by_membership, "links": [BOOK_LINK, MEMBER_LINK]}, bare), BuildPlan)
+
+
+def test_a_sum_of_ones_plans_with_its_table_and_goes_back_without_it():
+    """A sum of 1s adds up no column, whatever its condition names: with `table` it counts that table's rows, joined
+    to the table a chart groups it by, and without one it goes back saying to give its table."""
+    from mnemiq.superset.planner import PlanColumn
+    context = _shop_seen()
+    context = dataclasses.replace(context, tables=tuple(
+        dataclasses.replace(table, columns=(*table.columns, PlanColumn("status", "VARCHAR")))
+        if table.name == "orders" else table for table in context.tables))
+    measure = {"name": "open_orders", "label": "Open orders", "kind": "count",
+               "expression": "SUM(CASE WHEN orders.status = 'open' THEN 1 ELSE 0 END)"}
+    chart = _bar("open_by_region", "customers.region", measures=("open_orders",))
+    plan = plan_from_draft(_shop_draft(chart, measures=({**measure, "table": "orders"},)), context)
+    assert isinstance(plan, BuildPlan), plan
+    assert [dataset.join for dataset in plan.datasets] == [ORDERS_CUSTOMERS]
+    assert [(m.expression, m.dataset_id) for m in plan.measures] == [
+        ("SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END)", -1)]
+    refused = plan_from_draft(_shop_draft(chart, measures=(measure,)), context)
+    assert isinstance(refused, PlanRefused), refused
+    reason = _parts(refused)["measure 'open_orders'"]
+    assert 'whatever its condition names' in reason and 'give the measure "table", the table whose rows it counts' \
+        in reason, reason
 
 
 @pytest.mark.parametrize(("place", "key"), [
@@ -1174,7 +1250,7 @@ def test_count_star_names_its_base_with_table():
     plan = planned("customers.region")
     assert isinstance(plan, BuildPlan), plan
     assert [dataset.join for dataset in plan.datasets] == [ORDERS_CUSTOMERS]
-    for changes, why in (({"table": None}, "names no column"),
+    for changes, why in (({"table": None}, "adds up no column"),
                          ({"table": "payroll_view"}, "'payroll_view' is not a table this builder can read")):
         refused = planned("orders.channel", **changes)
         assert isinstance(refused, PlanRefused), changes
