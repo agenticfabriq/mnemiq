@@ -37,13 +37,15 @@ other table (a planned dataset over the table where it has none), else a planned
 each table its parts name. Each measure on a virtual dataset is decided by `check_measure` over the dataset's SELECT as
 Superset reads it, `(<its SQL>) AS "virtual_table"`, the text the build sends; and each table a LEFT JOIN brings in is
 joined only by equalities of two columns of one kind (`plan_rows.comparable`), whoever wrote the join, and only by
-columns that hold each value once, so the base's rows are each kept once: as enrichment's key facts
-say, or, where they say nothing, as the source answers the builder (`unique_live`), asked only where no row rule of
-Superset's applies to the builder on the table, since the answer would then be of their rows alone; a dataset whose
-far side is not shown to is refused, named by its rows, for the repair, saying why. The builder makes each with the
-extension's `create_dataset`, a virtual one with its `sql`. A planned dataset has no id
-until it is made, so the plan's charts and measures carry its negative `placeholder` until `with_made_datasets` puts
-the made id in its place. Every dataset Superset makes carries a saved metric `count` (`COUNT_METRIC`), which is
+columns that hold each value once, so the base's rows are each kept once: as enrichment's key facts say, or, where
+they say nothing, as the source answers the builder (`unique_live`). Before it asks the source, mnemiq asks Superset's
+row rules, as the builder, about each dataset Superset lists to the builder with the table's name on the configured
+database and schema (`_rule_datasets`, `_row_ruled`), and does not ask the source where a rule applies to the builder
+on one of them or an answer cannot be read: under a rule, the source's answer would be of the builder's rows alone. A
+dataset whose far side is not shown to hold each value once is refused, named by its rows, for the repair, saying
+why. The builder makes each with the extension's `create_dataset`, a virtual one with its `sql`. A planned dataset has
+no id until it is made, so the plan's charts and measures carry its negative `placeholder` until `with_made_datasets`
+puts the made id in its place. Every dataset Superset makes carries a saved metric `count` (`COUNT_METRIC`), which is
 Superset's, never one of mnemiq's measures.
 """
 
@@ -901,8 +903,8 @@ def _naming(parts: Sequence[RefusedPart]) -> str:
 class _Catalogue:
     """What a plan is checked against: the visible tables' columns, each table's name as stored, its existing
     dataset, and that dataset's saved metrics as the builder reads them. `ruled_by` gives each visible table the
-    datasets whose row rules Superset applies to a statement reading it (`_rule_datasets`); a table it does not hold
-    is one mnemiq cannot tell of."""
+    datasets mnemiq asks Superset's row rules about before it measures the table's key (`_rule_datasets`); a table it
+    does not hold is one mnemiq cannot tell of."""
 
     columns: dict[str, frozenset[str]]
     stored: dict[str, str]
@@ -928,13 +930,10 @@ def _datasets_by_table(listed: Sequence[ListedDataset], adapter, stored: dict[st
 
 
 def _rule_datasets(listed: Sequence[ListedDataset], adapter, stored: dict[str, str]) -> dict[str, tuple[int, ...]]:
-    """Each visible table's datasets whose row rules Superset applies to a statement that reads the table, of those
-    `read_datasets` listed, in id order: every dataset on the configured database and schema named as the table is
-    stored, letter case aside, physical or virtual. That is how rc2 finds them (`get_predicates_for_table` and
-    `_find_datasets` in `superset/utils/rls.py`): by the table's name and schema, folded on an engine that folds
-    unquoted names, as Postgres does, and with no regard to a dataset's SQL; and it applies every one's rules. Wider
-    than the datasets that name a table for access (`grants._candidates`), which only asks more. A table none names has
-    no rule to apply."""
+    """Each visible table's datasets that mnemiq asks Superset's row rules about, as the builder, before it measures
+    the table's key (`_row_ruled`), in id order: of the datasets Superset lists to the builder (`read_datasets`), every
+    one on the configured database and schema whose name is the table's stored name, letter case aside, physical or
+    virtual. Wider than the datasets that name a table for access (`grants._candidates`), which only asks more."""
     found: dict[str, tuple[int, ...]] = {}
     for table, name in stored.items():
         found[table] = tuple(sorted(d.id for d in listed if d.database_id == adapter.database_id
@@ -1499,7 +1498,7 @@ def _row_ruled(dataset_ids: Sequence[int] | None, client) -> bool | None:
     """Whether a row rule applies to the builder on any of `dataset_ids`, a table's datasets (`_Catalogue.ruled_by`),
     as the extension's `row_rules` answers for each (`row_rule_applies`), asked in order until one has a rule: True
     where one does; None where mnemiq cannot tell of one and none is known to (or the datasets are not known,
-    `dataset_ids` None); False where none does, and for a table with no dataset."""
+    `dataset_ids` None); False where none of them does, `dataset_ids` empty among them."""
     if dataset_ids is None:
         return None
     unknown = False
@@ -1525,9 +1524,9 @@ def _far_side_refusals(on: _Rows, unique: Unique, types: Types, *, adapter, snap
 
     Superset applies its row rules to the probe, as to every statement the builder sends, so under one the probe
     counts the builder's rows only, and a key that holds each value once there may repeat among another viewer's. So
-    the probe is sent only where `row_ruled(table)` (whether a row rule applies to the builder on the table) answers
-    False, and not where mnemiq's own grants withhold it (`probe_withheld`); a key not probed for either is refused,
-    saying why."""
+    the probe is sent only where `row_ruled(table)` (whether a row rule applies to the builder on the table's datasets
+    mnemiq asks about, `_row_ruled`) answers False, and not where mnemiq's own grants withhold it (`probe_withheld`); a
+    key not probed for either is refused, saying why."""
     reasons: list[str] = []
     for table, links in on.far:
         advice = f"join {table} only by columns that hold each value once, or plan without its columns"

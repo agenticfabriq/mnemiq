@@ -1771,8 +1771,8 @@ def test_a_row_rule_on_the_joined_tables_dataset_stops_the_probe():
 
 
 def test_with_no_row_rule_on_the_joined_tables_dataset_the_key_is_measured():
-    """No row rule applies to the builder on the far table's dataset: the key is measured, and held once, joined. A
-    table with no dataset has no rule to apply, and nothing is asked of the extension for it."""
+    """No row rule applies to the builder on the far table's dataset: the key is measured, and held once, joined. The
+    extension is asked only about the datasets Superset lists to the builder with the table's name."""
     tools = _tools(datasets=[_dataset(31, "customers")])
     plan = _shop(LLMPlanner(ScriptedModel([json.dumps(ORDERS_BY_REGION)])), tools, snapshot=CUSTOMER_KEY_UNPROFILED)
     assert isinstance(plan, BuildPlan), plan
@@ -1785,10 +1785,10 @@ def test_with_no_row_rule_on_the_joined_tables_dataset_the_key_is_measured():
     assert _rule_asks(tools) == []
 
 
-def test_every_dataset_superset_finds_for_the_joined_table_is_asked_about():
-    """Superset finds the row rules of a statement's table by the datasets of that name on its database and schema,
-    letter case aside on Postgres, physical or virtual, and applies every one's: each is asked about, until one has a
-    rule, and none of another name, schema or database."""
+def test_every_dataset_listed_with_the_joined_tables_name_is_asked_about():
+    """mnemiq asks about each dataset Superset lists to the builder with the joined table's name on the configured
+    database and schema, letter case aside, physical or virtual, in id order until one has a rule, and about none of
+    another name, schema or database."""
     datasets = [_dataset(31, "customers"), _dataset(32, "Customers"), _dataset(33, "customers", "SELECT 1"),
                 _dataset(34, "customers", schema="sales"), _dataset(35, "customers", database_id=8),
                 _dataset(36, "customers_by_region")]

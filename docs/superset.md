@@ -395,10 +395,10 @@ still to come. In short:
     Superset: `COUNT(*)` against `COUNT(DISTINCT ...)` of the key's non-null values, and joins only if the table holds
     each value once. Superset applies its row rules to that count, so under a rule it would count only the builder's
     rows, and a key unique there may repeat in rows another person reads. So before it counts, mnemiq asks the
-    extension's `row_rules`, as the builder, about every dataset Superset lists under the table's name on the
-    deployment's database and schema (letter case aside, physical or virtual, as Superset finds the rules a statement
-    on a table meets). Where a rule applies to the builder, or mnemiq cannot tell, it does not count, and the join is
-    refused. So is a join on a key column the builder's grants mask or deny. The repair is told why.
+    extension's `row_rules`, as the builder, about each dataset Superset lists to the builder with the table's name
+    (letter case aside, physical or virtual) on the deployment's database and schema. Where a rule applies to the
+    builder on one of them, or an answer cannot be read, it does not count, and the join is refused. So is a join on a
+    key column the builder's grants mask or deny. The repair is told why.
   - **Column names on the made dataset** follow one rule, which the model never writes: a column only one included
     table has keeps its name, and one that two share is `<table>_<column>` (`orders_region`, `customers_region`).
   - **Measures are decided over the made dataset** exactly as Superset reads it, as `(<its SELECT>) AS virtual_table`,
