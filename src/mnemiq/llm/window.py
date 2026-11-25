@@ -31,7 +31,9 @@ table at boot. So a warning means the measured parts do not fit, and a
 "fits" close to the window is not a promise: leave headroom.
 
 Counted by the server where it can count: vLLM's `/tokenize` returns the count, chat template
-included, and `max_model_len` in one call. Otherwise the window is `MNEMIQ_LLM_CONTEXT_WINDOW`, as
+included, and `max_model_len` in one call; llama.cpp's server renders the chat with
+`/apply-template`, counts it with `/tokenize` and reports one request's window in `/props`
+(`count_on_server`). Otherwise the window is `MNEMIQ_LLM_CONTEXT_WINDOW`, as
 declared, and the count a bound: the prompt's UTF-8 bytes plus room for the chat template
 (`byte_bound`), since a byte-level tokenizer spends at most a token a byte. It errs long -- at least
 2.5 times for English prose (the fewest characters a token measured was 2.56; typical prose is near
@@ -142,7 +144,7 @@ class WindowReport:
         if self.real_tokens is not None and self.real_tokens != self.prompt_tokens:
             count += (f" (an upper bound; a real packet of those tables, each shared definition "
                       f"once, is {self.real_tokens:,})")
-        window = ("unknown: the server gave no count (it has no /tokenize, or it did not answer) "
+        window = ("unknown: the server gave no count (it is neither vLLM nor llama.cpp's server, or it did not answer) "
                   "and MNEMIQ_LLM_CONTEXT_WINDOW is unset"
                   if self.window is None else
                   f"{self.window:,} tokens ({'reported by the server' if self.counted_by_server else 'MNEMIQ_LLM_CONTEXT_WINDOW'})")
@@ -292,28 +294,37 @@ def _largest_examples(con, k: int, allowed) -> list:
 def count_on_server(base_url: str, model: str, system: str, user: str,
                     http: httpx.Client | None = None,
                     api_key: str | None = None) -> tuple[int, int] | None:
-    """(prompt tokens, window) from vLLM's `/tokenize`, or None where the server has no such door.
+    """(prompt tokens, window) from the server, or None where it cannot count.
 
-    `/tokenize` sits at the server root, beside `/v1`, and takes the chat messages, so the count
-    includes the template the server wraps them in. It carries the chat calls' own key, to the host
-    they already send it to (redirects stay off): a server behind an authenticating proxy answers
-    a keyless call with 401, which would read as no count.
+    vLLM first: its `/tokenize` sits at the server root, beside `/v1`, takes the chat messages, so
+    the count includes the template the server wraps them in, and returns the count and
+    `max_model_len` in one call. Then llama.cpp's server, which answers that body with 200 and an
+    empty list (never read as a count of 0): its `/apply-template` renders the chat with the model's
+    own template, its `/tokenize` counts that text as a chat is charged (`add_special`: a leading
+    BOS the template already wrote is counted twice, so this can be one over, never under), and
+    `/props` gives one request's window, a slot's `n_ctx` -- the server's `-c` split across its
+    `--parallel` slots. Measured on build b12359: equal to the `prompt_tokens` its chat endpoint
+    charged. Each call carries the chat calls' own key, to the host they already send it to
+    (redirects stay off): a server behind an authenticating proxy answers a keyless call with 401,
+    which would read as no count.
 
     Bounded overall, not only per phase: httpx's timeout limits each silence, so a proxy dripping a
     byte every few seconds would hold the boot -- or the ask that saw a snapshot swap -- for as long
-    as it liked. The reply is read in chunks against a deadline and a size cap, and either one
-    reached is no count. What comes before the body -- the DNS lookup, which has no timeout, each
-    address tried, the headers -- is bounded by `check_window`, which stops waiting at the deadline.
+    as it liked. Every reply is read in chunks against one deadline for all the calls and a size
+    cap, and either one reached is no count. What comes before a body -- the DNS lookup, which has
+    no timeout, each address tried, the headers -- is bounded by `check_window`, which stops waiting
+    at the deadline.
     """
     root = base_url.rstrip("/")
     root = root[:-3] if root.endswith("/v1") else root
-    body = {"model": model, "messages": [{"role": "system", "content": system},
-                                         {"role": "user", "content": user}]}
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     client = http or httpx.Client(follow_redirects=False, timeout=_PHASE_TIMEOUT_S)
     started = time.monotonic()
-    try:
-        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        with client.stream("POST", f"{root}/tokenize", json=body, headers=headers) as resp:
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+    def call(method: str, path: str, body: dict | None = None, params: dict | None = None):
+        """The reply's JSON, or None: not 200, past the deadline or the cap, or not JSON."""
+        with client.stream(method, f"{root}{path}", json=body, headers=headers, params=params) as resp:
             if resp.status_code != 200:
                 return None
             chunks, size = [], 0
@@ -322,7 +333,15 @@ def count_on_server(base_url: str, model: str, system: str, user: str,
                 if size > MAX_REPLY_BYTES or time.monotonic() - started > DEADLINE_S:
                     return None
                 chunks.append(chunk)
-        data = json.loads(b"".join(chunks))
+        return json.loads(b"".join(chunks))
+
+    try:
+        data = call("POST", "/tokenize", {"model": model, "messages": messages})
+        if isinstance(data, dict):
+            count, window = data.get("count"), data.get("max_model_len")
+            if isinstance(count, int) and isinstance(window, int):
+                return count, window
+        return _count_on_llama_cpp(call, model, messages)
     except (httpx.HTTPError, ValueError):
         # Down, slow, or answering with something other than JSON (a proxy's catch-all page):
         # none of it is a count, and a declared window can still be checked without one -- an
@@ -331,12 +350,29 @@ def count_on_server(base_url: str, model: str, system: str, user: str,
     finally:
         if http is None:
             client.close()
-    if not isinstance(data, dict):
+
+
+def _positive(value) -> int | None:
+    """A positive whole number, or None (JSON's `true` is a Python int, and is not one)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _count_on_llama_cpp(call, model: str, messages: list[dict]) -> tuple[int, int] | None:
+    # Every call names the model: a single-model server ignores it, and the router (`--models-dir`) refuses a POST
+    # without one and answers `/props` without `?model=` for itself, a window of 0 (Codex review, observed on b12359).
+    rendered = call("POST", "/apply-template", {"model": model, "messages": messages})
+    prompt = rendered.get("prompt") if isinstance(rendered, dict) else None
+    if not isinstance(prompt, str) or not prompt:
         return None
-    count, window = data.get("count"), data.get("max_model_len")
-    if isinstance(count, int) and isinstance(window, int):
-        return count, window
-    return None
+    counted = call("POST", "/tokenize", {"model": model, "content": prompt, "add_special": True, "parse_special": True})
+    tokens = counted.get("tokens") if isinstance(counted, dict) else None
+    props = call("GET", "/props", params={"model": model}) if isinstance(tokens, list) else None
+    settings = props.get("default_generation_settings") if isinstance(props, dict) else None
+    window = _positive(settings.get("n_ctx")) if isinstance(settings, dict) else None
+    # A templated chat is never empty: no tokens means the server did not count it.
+    if not tokens or window is None:
+        return None
+    return len(tokens), window
 
 
 def _within_deadline(fn, *args, deadline: float | None = None, **kwargs):

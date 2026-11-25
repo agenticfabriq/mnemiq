@@ -218,8 +218,11 @@ than send a prompt the server refuses.** On that 1,500-column schema, a descript
 largest prompt from about 23,000 tokens to about 40,000. When a question's prompt would not fit with the
 reply, every column keeps its name and type, and descriptions go first to the columns the question, a
 definition or a measure names, then to join keys, then to columns sharing the question's words, as many as
-fit. A prompt that fits is sent exactly as before. This needs the window: vLLM reports it, and for another
-server set `MNEMIQ_LLM_CONTEXT_WINDOW`; without either, prompts go whole. The startup check says when the
+fit. A prompt that fits is sent exactly as before. This needs the window and, to keep every description
+that fits, a count of the prompt's tokens: vLLM and llama.cpp's server give both (llama.cpp's window is one
+slot's share of `-c`, so `--parallel 4` gives each request a quarter). For another server set
+`MNEMIQ_LLM_CONTEXT_WINDOW`: without a count mnemiq sizes prompts by their bytes, which errs long and
+withholds descriptions there was room for. Without a window, prompts go whole. The startup check says when the
 window fits only by withholding descriptions (`window:trims`); raise the window to send them all.
 
 Set `MNEMIQ_LOCAL_ONLY=1` to make that verification the `mnemiq` command's job instead of yours
