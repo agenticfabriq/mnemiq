@@ -24,16 +24,19 @@ and the reason names it.
 metric, kind, table and join. It is refused where its table is on a side an outer join may fill with NULL, where the
 fan-out guard is on and the join does not leave its table's rows at their own grain (`tables_off_their_grain`),
 whatever it aggregates, and where its expression reads anything but its own table's columns. Otherwise its expression
-is printed twice from one parse: each column qualified as the join names its table, decided by `check_measure` over
-the join, and each column named as the joined dataset names it, which the chart sends. It is then a written measure
-of the plan, under the plan's name for it and its metric's verbose name, but for its values, which are its table's
-and never probed.
+is printed with each column named as the joined dataset names it, which the chart sends, and decided by
+`check_measure` over the dataset as Superset reads it. It is then a written measure of the plan, under the plan's name
+for it and its metric's verbose name, but for its values, which are its table's and never probed.
 
 **Datasets.** The model names every column with its table, and states the links between tables the snapshot does not
 relate; mnemiq chooses each part's rows (`plan_from_draft`, through `plan_rows`). A measure's base is the table its
 aggregate adds up, and each base is one dataset that every part on it reads: its table's own where its parts name no
 other table (a planned dataset over the table where it has none), else a planned virtual dataset, the base LEFT JOIN
-each table its parts name, decided with each measure on it by `check_measure`. The builder makes each with the
+each table its parts name. Each measure on a virtual dataset is decided by `check_measure` over the dataset's SELECT as
+Superset reads it, `(<its SQL>) AS "virtual_table"`, the text the build sends; and each table a LEFT JOIN brings in is
+joined only by columns that hold each value once, so the base's rows are each kept once: as enrichment's key facts
+say, or, where they say nothing, as the source answers the builder (`unique_live`); a dataset whose far side is not
+shown to is refused, named by its rows, for the repair. The builder makes each with the
 extension's `create_dataset`, a virtual one with its `sql`. A planned dataset has no id
 until it is made, so the plan's charts and measures carry its negative `placeholder` until `with_made_datasets` puts
 the made id in its place. Every dataset Superset makes carries a saved metric `count` (`COUNT_METRIC`), which is
@@ -68,12 +71,13 @@ from mnemiq.superset.chart_form import DatasetFacts, NotCheckable
 from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenRef, plan_refusal
 from mnemiq.superset.dashboard_charts import LeftOut, leave_out_shown, read_dashboard_charts
 from mnemiq.superset.grants import UnreadableAnswer, read_datasets, table_bindings
-from mnemiq.superset.literals import NEGATED_OPERATORS, Absent, Probes, absent_literals, filter_statement, holds_null
+from mnemiq.superset.literals import NEGATED_OPERATORS, Absent, Probes, absent_literals, filter_statement, holds_null, \
+    unique_live
 from mnemiq.superset.marker import format_marker
 from mnemiq.superset.measures import MAX_LABEL, Measure, MeasureKind, MeasureRefused, check_measure, scales_by_100, \
     superset_text_problem
 from mnemiq.superset.plan_rows import Link, Refusal, Unique, aggregated, base_among, base_of, chain, column_of, \
-    column_text, edges, join_text, links_of, qualified, qualify, read_join, rewrite
+    column_text, edges, far_side, join_text, links_of, qualified, qualify, read_join, rewrite
 from mnemiq.superset.saved_metrics import Carried, SavedMetric, carry, read_saved_metrics, reusable, same_definition
 from mnemiq.superset.settings import SUPERSET_DIALECT
 
@@ -205,7 +209,8 @@ class BuildPlan:
 @dataclass(frozen=True)
 class RefusedPart:
     """A part of a plan mnemiq refused, as the model named it (`measure 'x'`, `chart 'y'`, `the link '...'`), or as
-    mnemiq did (`the join '...'`, a dataset it made), with mnemiq's own reason."""
+    mnemiq did (`the rows of x, joined to y`, a dataset it made; `the join '...'`, one a planner other than the model's
+    channel wrote), with mnemiq's own reason."""
 
     part: str
     reason: str
@@ -928,14 +933,18 @@ def _context(catalogue: _Catalogue, dashboards, families, snapshot: Snapshot) ->
 @dataclass(frozen=True)
 class _Rows:
     """A dataset a part of the plan is on: the columns a chart may name and their types, the source its measures are
-    decided over, its saved metrics, how the model named it, and the planned dataset when the build makes it. On a
-    join, `measured` holds the columns a measure may name, `owners` each column's table, and `shared` the names the
-    dataset gives each column two joined tables share. `origins` gives each column a chart may name the snapshot's table
-    and column it reads, as a chart filter's value is asked of the source (`absent_literals`), and `shown` the other way:
-    each joined table's column, by table and column, to the name the dataset gives it. `qualifiers` gives each joined
-    table its qualifier in the join (its alias, else its name, as written there, quoting and all), and `nullable` the
-    joined tables an outer join may fill with NULL: in join order from the FROM's table, a LEFT JOIN's table, every
-    table before a RIGHT JOIN, and every table up to a FULL JOIN's."""
+    decided over, its saved metrics, how a refusal names it, and the planned dataset when the build makes it. On a
+    join, the source is the dataset's SELECT as Superset reads a virtual dataset, `measured` holds the columns a measure
+    may name (every column of the dataset), `owners` each column's table, and `shared` the names the dataset gives each
+    column two joined tables share. `origins` gives each column a chart may name the snapshot's table and column it
+    reads, as a chart filter's value is asked of the source (`absent_literals`), and `shown` the other way: each joined
+    table's column, by table and column, to the name the dataset gives it. `qualifiers` gives each joined table its
+    qualifier in the join (its alias, else its name, as written there, quoting and all), and `nullable` the joined
+    tables an outer join may fill with NULL: in join order from the FROM's table, a LEFT JOIN's table, every table
+    before a RIGHT JOIN, and every table up to a FULL JOIN's. `far` gives each table a LEFT JOIN brings in, in join
+    order, with its far side: its columns the join's ON condition sets equal to a column of a table before it, each
+    equality one every joined row meets. `base` is the table whose rows the dataset keeps, where its join is one the
+    plan's reader makes (`_made_from`); None for any other."""
 
     columns: frozenset[str]
     source: str
@@ -950,6 +959,32 @@ class _Rows:
     shown: Mapping[tuple[str, str], str] = field(default_factory=dict)
     qualifiers: Mapping[str, exp.Identifier] = field(default_factory=dict)
     nullable: frozenset[str] = frozenset()
+    far: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    base: str | None = None
+
+
+def _made_from(join: str) -> tuple[str, tuple[str, ...]] | None:
+    """The base and the joined tables, in join order, of a join exactly as the plan's reader writes one (`join_text`):
+    a base LEFT JOIN each table on equal columns. None for a join written any other way."""
+    read = read_join(join)
+    if read is None or not read[1] or not all(step.on for step in read[1]) or join_text(*read) != join:
+        return None
+    base, steps = read
+    return base, tuple(step.table for step in steps)
+
+
+def _dataset_part(planned: PlannedDataset) -> str:
+    """How a refusal names a planned dataset: a table's by its table; a join the plan's reader made, which the model
+    never wrote, by the rows it keeps and the tables joined to them ("the rows of order_items, joined to orders and
+    customers"); any other join as written."""
+    if not planned.virtual:
+        return f"the table {planned.table!r}"
+    made = _made_from(planned.join)
+    if made is None:
+        return f"the join {planned.join!r}"
+    base, tables = made
+    joined = tables[0] if len(tables) == 1 else f"{', '.join(tables[:-1])} and {tables[-1]}"
+    return f"the rows of {base}, joined to {joined}"
 
 
 def _own_columns(table: str, columns: frozenset[str]) -> dict[str, tuple[str, str]]:
@@ -1013,11 +1048,12 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
     JOIN's, so nothing in an ON condition (an EXISTS, an IN or a scalar subquery, a CTE) reads another table. Each table
     is named alone or with an alias (`_table_problem`), each join is a plain, LEFT, RIGHT or FULL JOIN ON a condition,
     and the conditions name only the joined tables' columns (`_condition_problem`). The dataset runs the join as sqlglot
-    prints it, the text each measure over it was decided on.
+    prints it.
 
-    The dataset names a column one joined table alone has without its table, so a measure decided over the join names
-    the same column on the dataset; a measure names only those. A column two joined tables share is in the dataset once
-    for each, as `<table>_<column>`, for a chart's dimensions, filters, time column, source and target."""
+    The dataset names its columns by `joined_names`: a column one joined table alone has keeps its name, and one two
+    joined tables share is in the dataset once for each, as `<table>_<column>`. A measure on it is decided over the
+    dataset as Superset reads it, `(<its SELECT>) AS "virtual_table"`, so the text decided is the text the dataset
+    sends, and it may name any of the dataset's columns, as a chart may."""
     # The join is the virtual dataset's SQL, which Superset renders as a template.
     if (marker := next((d for d in JINJA_DELIMITERS if d in planned.join), None)) is not None:
         return f"it holds {marker}, which Superset reads as a template marker; write it without {marker}"
@@ -1061,10 +1097,12 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
         return problem
     # `names[index]` is the table the join at `index` (from 1) brings in, and `names[:index]` every table before it.
     nullable: set[str] = set()
+    far: list[tuple[str, tuple[str, ...]]] = []
     for index, join in enumerate(joins, 1):
         side = (join.args.get("side") or "").upper()
         if side == "LEFT":
             nullable.add(names[index])
+            far.append((names[index], _far_columns(join.args["on"], names[index], names[:index], qualifiers)))
         elif side == "RIGHT":
             nullable.update(names[:index])
         elif side == "FULL":
@@ -1092,18 +1130,49 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
             shown_as[(name, column)] = shown
             picked.append(exp.alias_(exp.Column(this=exp.to_identifier(column, quoted=True), table=qualifier.copy()),
                                      exp.to_identifier(shown, quoted=True)))
-    shared = {column: tuple(f"{table}_{column}" for table in tables) for column, tables in having.items()
+    shared = {column: tuple(named[(table, column)] for table in tables) for column, tables in having.items()
               if len(tables) > 1}
-    # The dataset's SELECT is the parsed join's own tree with these columns, printed as the deciders print each
-    # measure's statement over the same join text: the dataset runs the FROM that was decided, never the raw text.
+    # The dataset's SELECT is the parsed join's own tree with these columns: the dataset runs the FROM that was read
+    # here, never the raw text, and each measure on it is decided over that SELECT, the text the build sends.
     select = tree.copy()
     select.set("expressions", picked)
     made = PlannedDataset(key=planned.key, placeholder=planned.placeholder, join=planned.join,
                           sql=select.sql(dialect=SUPERSET_DIALECT), name=_virtual_name(planned.key, names))
-    return _Rows(frozenset(owners), planned.join, (_made_count(planned.placeholder),), f"the join {planned.join!r}",
-                 types, made, measured=frozenset(c for c, tables in having.items() if len(tables) == 1),
-                 owners=owners, shared=shared, origins=origins, shown=shown_as, qualifiers=qualifier_of,
-                 nullable=frozenset(nullable))
+    reader = _made_from(planned.join)
+    return _Rows(frozenset(owners), f'({made.sql}) AS "virtual_table"', (_made_count(planned.placeholder),),
+                 _dataset_part(planned), types, made, measured=frozenset(owners), owners=owners, shared=shared,
+                 origins=origins, shown=shown_as, qualifiers=qualifier_of, nullable=frozenset(nullable),
+                 far=tuple(far), base=reader[0] if reader is not None else None)
+
+
+def _conjuncts(condition: exp.Expression) -> list[exp.Expression]:
+    """The conditions `condition` ANDs together, each of which every row it keeps meets, parentheses read through."""
+    condition = condition.unnest()
+    if isinstance(condition, exp.And):
+        return [*_conjuncts(condition.this), *_conjuncts(condition.expression)]
+    return [condition]
+
+
+def _far_columns(condition: exp.Expression, table: str, before: Sequence[str],
+                 qualifiers: Mapping[str | None, str]) -> tuple[str, ...]:
+    """The columns of `table`, a LEFT JOIN's table, that its ON `condition` sets equal to a column of a table in
+    `before`, the tables joined before it, each named with its table's qualifier (`qualifiers`), in an equality every
+    joined row meets: one ANDed with the rest, never one under an OR or a NOT, which a row can meet without it."""
+    found: dict[str, None] = {}
+    for equal in _conjuncts(condition):
+        if not isinstance(equal, exp.EQ):
+            continue
+        sides = [side.unnest() for side in (equal.this, equal.expression)]
+        if not all(isinstance(side, exp.Column) and side.table for side in sides):
+            continue
+        (left, left_column), (right, right_column) = (
+            (qualifiers.get(resolve_identifier(side.args["table"], SUPERSET_DIALECT)),
+             resolve_identifier(side.this, SUPERSET_DIALECT)) for side in sides)
+        if left == table and right in before:
+            found[left_column] = None
+        elif right == table and left in before:
+            found[right_column] = None
+    return tuple(found)
 
 
 def _table_problem(node: exp.Table) -> str | None:
@@ -1156,19 +1225,15 @@ def _expression_columns(expression: str) -> list[exp.Column] | None:
 
 
 def _column_problem(columns: list[exp.Column], rows: _Rows) -> str | None:
-    """Why a measure's expression cannot run on a joined dataset as it was decided over the join: a column named with
-    its table, or one the dataset does not name as the join does."""
+    """Why a measure's expression cannot run on a joined dataset: a column named with its table, or one the dataset
+    does not hold (a column two joined tables share is the dataset's only as `<table>_<column>`)."""
     for column in columns:
         if column.table:
             return (f"name {column.sql(dialect=SUPERSET_DIALECT)} alone, as {column.name}: the joined dataset names "
                     "its columns without their tables")
         name = resolve_identifier(column.this, SUPERSET_DIALECT)
-        if name in rows.shared:
-            return (f"{column.name!r} is in more than one of the joined tables, so a measure cannot name it; a measure "
-                    "names only a column one joined table alone has")
         if name not in rows.measured:
-            return (f"{column.name!r} is not a column a measure on the join may name: only a column one joined table "
-                    "alone has, named alone")
+            return _column_refusal(name, rows)
     return None
 
 
@@ -1229,6 +1294,7 @@ def _carried_currency(metric: SavedMetric) -> str | None:
 
 
 def _column_refusal(column: str, rows: _Rows) -> str:
+    """Why `column` is not one of `rows`' columns, naming the dataset's names for it where two joined tables have it."""
     if column in rows.shared:
         return (f"{column!r} is in more than one of the joined tables; the joined dataset names it "
                 f"{' or '.join(rows.shared[column])}")
@@ -1343,6 +1409,40 @@ def _null_refusals(chart: ChartSpec, on: _Rows, *, adapter, snapshot: Snapshot, 
     return list(reasons)
 
 
+def _far_side_refusals(on: _Rows, unique: Unique, *, adapter, snapshot: Snapshot, grants: GrantSet,
+                       probes: Probes) -> list[str]:
+    """The reasons a planned join is refused for a table a LEFT JOIN brings in by a far side (`_Rows.far`) not shown
+    to hold each value once: a far side that does meets each row it is joined to at most once, so the join keeps those
+    rows once each, and every measure's value with them; any other may repeat them. Enrichment's key facts (`unique`,
+    read over every row) decide wherever they say anything (`far_side`); only a far side they say nothing of is asked
+    of the source, as the builder, within the plan's probes (`unique_live`), and one the source does not answer for is
+    refused as one that repeats is: nothing is joined on a guess."""
+    reasons: list[str] = []
+    for table, columns in on.far:
+        advice = f"join {table} only by columns that hold each value once, or plan without its columns"
+        if not columns:
+            reasons.append(f"it joins {table} by no column of {table} equal to a column of a table before it, so a row "
+                           f"may meet more than one of its rows; {advice}")
+            continue
+        known = far_side(table, columns, unique)
+        measured = known if known is not None else unique_live(
+            table, columns, adapter=adapter, snapshot=snapshot, grants=grants, probes=probes,
+            timeout_s=DEFAULT_TIMEOUT_S)
+        if measured:
+            continue
+        named = [f"{table}.{column}" for column in columns]
+        key = named[0] if len(named) == 1 else f"{', '.join(named[:-1])} and {named[-1]}"
+        verb, together = ("holds", "") if len(named) == 1 else ("hold", " together")
+        if measured is None:
+            reasons.append(f"mnemiq could not measure whether {key} {verb} each value once{together}, and joins a table "
+                           f"only by columns that do; {advice}")
+        else:
+            where = "" if known is False else " in the rows the builder can read"
+            reasons.append(f"{key} {verb} a value more than once{together}{where}, so joining {table} would repeat the "
+                           f"rows it is joined to; {advice}")
+    return reasons
+
+
 def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adapter, snapshot: Snapshot,
            grants: GrantSet, settings, interactive_pivot_available: bool,
            on_dashboard: Sequence[Measure] = ()) -> BuildPlan | tuple[RefusedPart, ...]:
@@ -1391,7 +1491,7 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
     for planned in plan.datasets:
         if planned.placeholder not in used:
             continue
-        part = f"the join {planned.join!r}" if planned.virtual else f"the table {planned.table!r}"
+        part = _dataset_part(planned)
         try:
             format_marker(_ANY_BUILD, planned.key, None)
             good_key = planned.key not in keys and planned.key not in _RESERVED_KEYS
@@ -1407,11 +1507,17 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
             if isinstance(joined, str):
                 refuse(part, joined)
                 continue
-            if not any(m.dataset_id == planned.placeholder for m in measures) \
+            # A join the plan's reader made keeps its base's rows for every part on it, a chart that plots no measure
+            # among them; one written otherwise is made only for what needs it.
+            if joined.base is None and not any(m.dataset_id == planned.placeholder for m in measures) \
                     and not any(key[3] == planned.placeholder for key in to_carry):
                 refuse(part, "a joined dataset is made only for a written measure, or a joined table's saved metric, "
                              "that needs the join")
                 continue
+            # Its parts are still checked on it, so a refusal of its far sides goes back with theirs in one repair.
+            for reason in _far_side_refusals(joined, context.unique, adapter=adapter, snapshot=snapshot, grants=grants,
+                                             probes=probes):
+                refuse(part, reason)
             rows[planned.placeholder] = joined
         elif planned.table not in catalogue.columns:
             refuse(part, "it is not a table this builder can read")
@@ -1539,7 +1645,7 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
         reads.setdefault(placeholder, set()).add(ref.table)
         if guarded and placeholder not in grains:
             grains[placeholder] = tables_off_their_grain(
-                sqlglot.parse_one(f"{_JOIN_PREFIX}{on.source}", read=SUPERSET_DIALECT),
+                sqlglot.parse_one(f"{_JOIN_PREFIX}{on.planned.join}", read=SUPERSET_DIALECT),
                 visible_schema(snapshot, grants), key_facts(snapshot), SUPERSET_DIALECT)
         found = _carried(ref, on, catalogue, grains.get(placeholder))
         if isinstance(found, str):
@@ -1577,15 +1683,15 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
                          "this measure a name this dashboard does not keep")
             continue
         names[name.casefold()], labels[label.casefold()] = name, name
-        decided = Measure(name=name, label=label, expression=rendered.decided, kind=ref.kind, dataset_id=placeholder,
+        # Decided as the chart sends it: each column named as the dataset names it, over the dataset's SELECT.
+        measure = Measure(name=name, label=label, expression=rendered.superset, kind=ref.kind, dataset_id=placeholder,
                           description=f"The saved metric {metric.name!r} of {ref.table!r}, carried onto the join.",
                           asked_by="", currency=_carried_currency(metric))
-        verdict = check_measure(decided, source=on.source, dimension_names=tuple(sorted(carried_columns[key])),
+        verdict = check_measure(measure, source=on.source, dimension_names=tuple(sorted(carried_columns[key])),
                                 adapter=adapter, snapshot=snapshot, grants=grants, guard_fanout=settings.guard_fanout)
         if isinstance(verdict, MeasureRefused):
             refuse(part, verdict.reason, repairable=verdict.repairable)
             continue
-        measure = replace(decided, expression=rendered.superset)
         kept.append(measure)
         carried[key] = WrittenRef(measure)
 
@@ -1687,8 +1793,9 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
                 refuse(part, reason)
         charts.append(spec)
 
+    # A join the plan's reader made reads its base's rows whatever its measures name: COUNT(*) on orders counts them.
     for placeholder, on in rows.items():
-        if on.measured is not None and len(read := reads.get(placeholder, set())) < 2:
+        if on.measured is not None and len(read := reads.get(placeholder, set()) | ({on.base} - {None})) < 2:
             what = f"only {', '.join(sorted(read))}" if read else "none of the joined tables' columns"
             refuse(on.part, f"its measures and charts read {what}: a joined dataset is made only where they read more "
                             "than one table, so plan them on that table")

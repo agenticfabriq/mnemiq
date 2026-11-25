@@ -1711,11 +1711,13 @@ def test_a_joined_tables_saved_metric_is_carried_onto_the_join_and_adds_up(live,
     unique there, so the join meets each policy row once; and the region table's own `status` would give another
     total than policy's. Expected:
     - the build runs to `done`: dashboard, the joined dataset, the chart, layout, check;
-    - the start decided the metric over the join with policy's columns qualified by its alias (`p."status"`), and sent
-      no statement asking whether a column holds 'active': the metric's values are the data team's;
+    - the start decided the metric as the chart sends it, naming the joined dataset's `"policy_status"`, over the
+      dataset's SELECT as Superset reads a virtual dataset, and sent no statement asking whether a column holds
+      'active': the metric's values are the data team's;
     - the plan kept holds it as a measure of the join, labelled with the metric's verbose name, its expression naming
       the joined dataset's `"policy_status"`, and no saved-metric reference; the chart's create sent that expression,
-      and Superset saved it; read back through the joined dataset's SQL as Superset stores it, it is the decided one;
+      and Superset saved it; read back through the joined dataset's SQL as Superset stores it, it reads policy's
+      columns by its alias (`p."status"`);
     - the chart's three bars, read as the builder through `get_chart_data`, add up to `active_premium` read as the
       builder on policy's own dataset through `query_dataset` (the source's own total), and each bar is its region's
       `active_premium`, read the same way by region, the region named by the bar's manager (`REGION_ROWS`);
@@ -1748,11 +1750,12 @@ def test_a_joined_tables_saved_metric_is_carried_onto_the_join_and_adds_up(live,
     assert [step["key"] for step in run.final["steps"]] == ["dashboard", "dataset_1", chart.key, "layout", "check"]
     dataset_id, chart_id = raw["dataset_1"]["object_id"], raw[chart.key]["object_id"]
 
-    # Decided over the join, qualified by policy's alias; its value never probed.
+    # Decided as the chart sends it, over the joined dataset's SELECT as Superset reads it; its value never probed.
     start = run.requests[0]
     statements = [call.sql for call in start.calls if call.tool == "execute_sql"]
-    assert any(f"{CARRIED_DECIDED} AS active_premium FROM " in sql for sql in statements), statements
-    assert [sql for sql in statements if "'active'" in sql and CARRIED_DECIDED not in sql] == []
+    assert any(f"{CARRIED_SHOWN} AS active_premium FROM (SELECT " in sql and ') AS "virtual_table"' in sql
+               for sql in statements), statements
+    assert [sql for sql in statements if "'active'" in sql and CARRIED_SHOWN not in sql] == []
 
     # Kept, sent and saved as a measure of the joined dataset.
     kept = served.raw_plan(run.build_id)

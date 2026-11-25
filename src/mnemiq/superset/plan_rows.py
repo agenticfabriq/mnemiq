@@ -103,10 +103,11 @@ def _by_pair(links: Sequence[Link]) -> dict[frozenset[str], tuple[Link, ...]]:
 
 
 def _one_expression(expression: str) -> exp.Select | None:
-    """`expression` parsed as the one column of a SELECT, or None when it is not one SQL expression."""
+    """`expression` parsed as the one column of a SELECT, or None when it is not one SQL expression: one the parser
+    refuses, or one nested deeper than it reads (a RecursionError), which a model's text can be."""
     try:
         tree = sqlglot.parse_one(f"SELECT {expression}", read=SUPERSET_DIALECT)
-    except SqlglotError:
+    except (SqlglotError, RecursionError):
         return None
     if not isinstance(tree, exp.Select) or len(tree.expressions) != 1 \
             or {key for key, value in tree.args.items() if value} - {"expressions"}:
