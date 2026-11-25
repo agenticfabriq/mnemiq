@@ -1,0 +1,217 @@
+"""How a plan whose columns are named with their tables becomes rows (`plan_rows`): each measure's base table, the LEFT
+JOIN chain from that base to every other table a part needs, and the name the joined dataset gives each column.
+
+The tables are the demo shop's, every relationship many to one: order_items to orders to customers, order_items to
+products, and returns to order_items. Each table's own key holds each value once, as enrichment's profile reads it, and
+a key pointing at another table repeats, except a return's item: an item is returned at most once.
+"""
+
+from __future__ import annotations
+
+import sqlglot
+from sqlglot import exp
+
+from mnemiq.contract import Relationship
+from mnemiq.contract.values import JoinKey
+from mnemiq.superset.plan_rows import (Link, Refusal, Step, aggregated, base_of, chain, edges, far_side, join_text,
+                                       links_of, qualified, rewrite)
+from mnemiq.superset.planner import joined_names
+from mnemiq.superset.settings import SUPERSET_DIALECT
+
+
+def _relationship(source: str, target: str, *keys: tuple[str, str]) -> Relationship:
+    return Relationship(id=f"{source}->{target}", from_=source, to=target, cardinality="many_to_one",
+                        join_keys=[JoinKey(left=left, right=right) for left, right in keys])
+
+
+SHOP = [_relationship("order_items", "orders", ("order_id", "order_id")),
+        _relationship("order_items", "products", ("product_id", "product_id")),
+        _relationship("orders", "customers", ("customer_id", "customer_id")),
+        _relationship("returns", "order_items", ("order_item_id", "order_item_id"))]
+TABLES = ("orders", "order_items", "products", "customers", "returns")
+NAMES = {table: table for table in TABLES}
+COLUMNS = {"orders": ("order_id", "customer_id", "order_date", "channel"),
+           "order_items": ("order_item_id", "order_id", "product_id", "revenue", "unit_price", "quantity"),
+           "products": ("product_id", "unit_price", "category"),
+           "customers": ("customer_id", "region")}
+UNIQUE = {("orders", "order_id"): True, ("order_items", "order_item_id"): True, ("products", "product_id"): True,
+          ("customers", "customer_id"): True, ("returns", "return_id"): True, ("returns", "order_item_id"): True,
+          ("order_items", "order_id"): False, ("order_items", "product_id"): False,
+          ("orders", "customer_id"): False}
+
+ITEM_ORDER = Link(("order_items", "order_id"), ("orders", "order_id"))
+ITEM_PRODUCT = Link(("order_items", "product_id"), ("products", "product_id"))
+ORDER_CUSTOMER = Link(("orders", "customer_id"), ("customers", "customer_id"))
+RETURN_ITEM = Link(("returns", "order_item_id"), ("order_items", "order_item_id"))
+KNOWN = links_of(SHOP, NAMES)
+SHOP_EDGES = edges((), KNOWN)
+
+
+def _refused(result: object, *named: str) -> str:
+    assert isinstance(result, Refusal), result
+    for text in named:
+        assert text in result.reason, (text, result.reason)
+    return result.reason
+
+
+def test_links_are_the_visible_relationships_by_table_name():
+    assert KNOWN == (ITEM_ORDER, ITEM_PRODUCT, ORDER_CUSTOMER, RETURN_ITEM)
+    # A relationship names its tables by the snapshot's object ids; a link names them as the planner does, and a
+    # relationship touching a table the builder cannot see is no link. One of two key columns is one link each.
+    by_id = [_relationship("obj-items", "obj-orders", ("order_id", "order_id"), ("region", "region")),
+             _relationship("obj-orders", "obj-hidden", ("plan_id", "plan_id"))]
+    assert links_of(by_id, {"obj-items": "Order Items", "obj-orders": "orders"}) == (
+        Link(("Order Items", "order_id"), ("orders", "order_id")),
+        Link(("Order Items", "region"), ("orders", "region")))
+
+
+def test_a_measures_base_is_the_table_inside_its_aggregate():
+    assert base_of("SUM(order_items.revenue)", None) == "order_items"
+    # A CASE's condition chooses the rows; its value is what is added up.
+    assert aggregated("AVG(CASE WHEN orders.channel = 'web' THEN order_items.revenue END)") == {"order_items"}
+    assert base_of("AVG(CASE WHEN orders.channel = 'web' THEN order_items.revenue END)", None) == "order_items"
+    assert base_of("SUM(order_items.revenue) FILTER (WHERE orders.channel = 'web')", None) == "order_items"
+    assert base_of("PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY order_items.revenue)", None) == "order_items"
+    assert base_of("COUNT(DISTINCT order_items.order_id)", "orders") == "order_items"
+    assert base_of("COUNT(*)", "orders") == "orders"
+    _refused(base_of("COUNT(*)", None), "names no column")
+    _refused(base_of("SUM(order_items.revenue) + SUM(returns.amount)", None), "order_items", "returns")
+    _refused(base_of("SUM(revenue)", "order_items"), "'revenue'", "without its table")
+
+
+def test_qualified_names_each_column_with_its_table_or_says_why_not():
+    assert qualified("AVG(CASE WHEN orders.channel = 'web' THEN order_items.revenue END)") == [
+        ("orders", "channel"), ("order_items", "revenue")]
+    assert qualified("customers.region") == [("customers", "region")]
+    assert qualified("SUM(order_items.revenue) - SUM(order_items.revenue)") == [("order_items", "revenue")]
+    assert "'region'" in qualified("region")
+    assert "public.orders.channel" in qualified("public.orders.channel")
+    assert "orders.*" in qualified("COUNT(orders.*)")
+    assert "subquery" in qualified("(SELECT MAX(orders.order_date) FROM orders)")
+    for text in ("SUM(", "SUM(orders.x) FROM orders", "orders.order_id, orders.channel", "DISTINCT orders.channel",
+                 ""):
+        assert "not one SQL expression" in qualified(text), text
+
+
+def test_a_chain_takes_the_shortest_path_over_unique_far_sides():
+    assert chain("order_items", {"customers", "products", "order_items"}, SHOP_EDGES, UNIQUE) == (
+        Step("orders", (ITEM_ORDER,)), Step("products", (ITEM_PRODUCT,)), Step("customers", (ORDER_CUSTOMER,)))
+    assert chain("returns", {"customers"}, SHOP_EDGES, UNIQUE) == (
+        Step("order_items", (RETURN_ITEM,)), Step("orders", (ITEM_ORDER,)), Step("customers", (ORDER_CUSTOMER,)))
+    # A link straight to customers is one join where the way through order_items and orders is three.
+    direct = Link(("returns", "customer_id"), ("customers", "customer_id"))
+    assert chain("returns", {"customers"}, edges((direct,), KNOWN), UNIQUE) == (Step("customers", (direct,)),)
+    # Walking a link from its far end joins the table it starts from: an item is returned at most once.
+    assert chain("order_items", {"returns"}, SHOP_EDGES, UNIQUE) == (
+        Step("returns", (Link(("order_items", "order_item_id"), ("returns", "order_item_id")),)),)
+    assert chain("orders", {"orders"}, SHOP_EDGES, UNIQUE) == ()
+
+
+def test_a_far_side_known_to_repeat_is_never_joined():
+    assert far_side("orders", ["customer_id"], UNIQUE) is False
+    # Each customer has many orders, so customers' rows cannot take an order's columns.
+    _refused(chain("customers", {"orders"}, SHOP_EDGES, UNIQUE), "orders", "customers.customer_id = orders.customer_id",
+             "orders.customer_id holds a value more than once")
+    repeating = {**UNIQUE, ("orders", "order_id"): False}
+    _refused(chain("order_items", {"customers"}, SHOP_EDGES, repeating), "customers")
+
+
+def test_an_unknown_far_side_is_usable():
+    unknown = {key: fact for key, fact in UNIQUE.items() if key != ("orders", "order_id")}
+    assert far_side("orders", ["order_id"], unknown) is None
+    assert chain("order_items", {"orders"}, SHOP_EDGES, unknown) == (Step("orders", (ITEM_ORDER,)),)
+
+
+def test_a_two_column_far_side_is_unique_when_either_column_is():
+    assert far_side("order_items", ["order_id", "order_item_id"], UNIQUE) is True
+    assert far_side("order_items", ["order_item_id", "order_id"], UNIQUE) is True
+    # Each column repeats, and the two together may still hold each value once: unknown, never a repeat.
+    assert far_side("order_items", ["order_id", "product_id"], UNIQUE) is None
+    assert far_side("order_items", ["order_id", "order_id"], UNIQUE) is False
+    two = (Link(("returns", "order_id"), ("order_items", "order_id")),
+           Link(("returns", "product_id"), ("order_items", "product_id")))
+    assert chain("returns", {"order_items"}, edges(two, KNOWN), UNIQUE) == (Step("order_items", two),)
+
+
+def test_two_shortest_paths_or_two_links_to_a_table_are_ambiguous():
+    # Items ship in shipments, each to a customer: customers is two links from order_items both ways.
+    shipped = KNOWN + (Link(("order_items", "shipment_id"), ("shipments", "shipment_id")),
+                       Link(("shipments", "customer_id"), ("customers", "customer_id")))
+    unique = {**UNIQUE, ("shipments", "shipment_id"): True}
+    _refused(chain("order_items", {"customers"}, edges((), shipped), unique), "customers",
+             "order_items.order_id = orders.order_id then orders.customer_id = customers.customer_id",
+             "order_items.shipment_id = shipments.shipment_id then shipments.customer_id = customers.customer_id")
+    _refused(chain("returns", {"customers"}, edges((), shipped), unique), "customers")
+    # A table reached two ways that no part needs is never joined, so it is no ambiguity.
+    assert chain("order_items", {"orders", "shipments"}, edges((), shipped), unique) == (
+        Step("orders", (ITEM_ORDER,)), Step("shipments", (shipped[-2],)))
+    # An order's buyer and its payer are both customers: two links from orders to one table.
+    payer = Link(("orders", "payer_id"), ("customers", "customer_id"))
+    _refused(chain("orders", {"customers"}, edges((), (*KNOWN, payer)), UNIQUE),
+             "orders.customer_id = customers.customer_id", "orders.payer_id = customers.customer_id")
+    _refused(chain("order_items", {"customers"}, edges((), (*KNOWN, payer)), UNIQUE), "orders.payer_id")
+
+
+def test_an_unreachable_table_is_refused_by_name():
+    reason = _refused(chain("order_items", {"customers", "suppliers", "orders"}, SHOP_EDGES, UNIQUE), "'suppliers'")
+    assert "'customers'" not in reason and "'orders'" not in reason
+    _refused(chain("products", {"customers"}, SHOP_EDGES, UNIQUE), "'customers'", "'products'")
+
+
+def test_a_stated_link_decides_its_pair():
+    payer = Link(("orders", "payer_id"), ("customers", "customer_id"))
+    decided = edges((payer,), KNOWN)
+    assert decided[frozenset({"orders", "customers"})] == (payer,)
+    assert decided[frozenset({"order_items", "orders"})] == (ITEM_ORDER,)
+    assert len(decided) == len(SHOP_EDGES)
+    # Stated from either end, and more than once, it is one link.
+    reverse = Link(("customers", "customer_id"), ("orders", "payer_id"))
+    assert edges((reverse, payer), KNOWN)[frozenset({"orders", "customers"})] == (reverse,)
+    # Stating the payer's link chooses it over the buyer's the snapshot also knows.
+    assert chain("orders", {"customers"}, edges((payer,), (*KNOWN, payer)), UNIQUE) == (Step("customers", (payer,)),)
+    # A link a table states to itself joins nothing.
+    assert edges((Link(("orders", "order_id"), ("orders", "order_id")),), ()) == {}
+
+
+def test_join_text_is_a_left_join_chain_from_the_base():
+    steps = chain("order_items", {"customers", "products"}, SHOP_EDGES, UNIQUE)
+    text = join_text("order_items", steps)
+    assert text == ('"order_items" LEFT JOIN "orders" ON "order_items"."order_id" = "orders"."order_id" '
+                    'LEFT JOIN "products" ON "order_items"."product_id" = "products"."product_id" '
+                    'LEFT JOIN "customers" ON "orders"."customer_id" = "customers"."customer_id"')
+    tree = sqlglot.parse_one(f"SELECT 1 FROM {text}", read=SUPERSET_DIALECT)
+    assert [join.side for join in tree.args["joins"]] == ["LEFT", "LEFT", "LEFT"]
+    two = (Link(("returns", "order_id"), ("order_items", "order_id")),
+           Link(("returns", "product_id"), ("order_items", "product_id")))
+    assert join_text("returns", (Step("order_items", two),)) == (
+        '"returns" LEFT JOIN "order_items" ON "returns"."order_id" = "order_items"."order_id" '
+        'AND "returns"."product_id" = "order_items"."product_id"')
+    assert join_text("orders", ()) == '"orders"'
+
+
+def test_quoted_and_mixed_case_names_resolve_by_dialect():
+    # Unquoted names fold as the dialect folds them, and only so far; a quoted name is the name as written.
+    assert qualified('SUM("Order Items".revenue)') == [("Order Items", "revenue")]
+    assert qualified("SUM(Order_Items.Revenue)") == [("order_items", "revenue")]
+    assert qualified('SUM("Order_Items"."Revenue")') == [("Order_Items", "Revenue")]
+    assert qualified("SUM(Ärger.Wert)") == [("Ärger", "wert")]
+    assert base_of('SUM("Order Items".revenue)', None) == "Order Items"
+    assert aggregated('SUM("ORDERS".revenue)') == {"ORDERS"}
+    assert rewrite('SUM("Order Items".revenue) / COUNT(Order_Items.Order_Id)',
+                   {("Order Items", "revenue"): "revenue", ("order_items", "order_id"): "order_id"}) == (
+        'SUM("revenue") / COUNT("order_id")')
+    mixed = Link(("Order Items", "Order Id"), ("orders", "order_id"))
+    steps = chain("Order Items", {"orders"}, edges((mixed,), ()), {("orders", "order_id"): True})
+    assert join_text("Order Items", steps) == (
+        '"Order Items" LEFT JOIN "orders" ON "Order Items"."Order Id" = "orders"."order_id"')
+
+
+def test_rewrite_names_every_qualified_column_as_the_dataset_does():
+    names = joined_names([(table, COLUMNS[table]) for table in ("order_items", "orders", "products")])
+    assert rewrite("SUM(order_items.revenue)", names) == 'SUM("revenue")'
+    assert rewrite("AVG(CASE WHEN orders.channel = 'web' THEN order_items.unit_price END)", names) == (
+        """AVG(CASE WHEN "channel" = 'web' THEN "order_items_unit_price" END)""")
+    rewritten = rewrite("SUM(order_items.quantity * products.unit_price) / COUNT(DISTINCT orders.order_id)", names)
+    assert rewritten == 'SUM("quantity" * "products_unit_price") / COUNT(DISTINCT "orders_order_id")'
+    assert not [column for column in sqlglot.parse_one(f"SELECT {rewritten}", read=SUPERSET_DIALECT)
+                .find_all(exp.Column) if column.table]
