@@ -3744,26 +3744,129 @@ SAVED_METRIC_PROMPT = (
     '- a saved metric of a table\'s dataset: {"name": the plan\'s own name for it, "saved_metric": the saved metric\'s '
     'name, "kind": ..., "table": the table whose saved metric it is}. The same saved metric on two tables is two '
     "measures, each with a name of its own.\n")
-COUNT_ON_ITS_TABLE_PROMPT = ("Use a saved metric where one says what a measure needs: never write your own measure "
-                             "for what a saved metric says. A saved metric that names no column, such as count "
-                             "(COUNT(*)), is only for a table whose measures no chart shows with another table's "
-                             "column; write COUNT(<table>.<key>) instead.")
+USE_A_SAVED_METRIC_PROMPT = ("Use a saved metric where one says what a measure needs: never write your own measure "
+                             "for what a saved metric says. A written measure's name and label are never a saved "
+                             "metric's name on its table")
 
 
 def test_the_prompt_offers_a_saved_metric_by_its_table():
     """A saved metric is planned by its name and its table; mnemiq carries it onto a dataset that joins its table to
-    others, as its table defines it, except one that names no column (Superset's count). One dataset holds every
-    measure on a table, so that one is refused once any chart of a measure on its table names another table's column,
-    not only its own charts: the prompt says so, and the check bears it out."""
+    others, as its table defines it, Superset's count among them where the dataset's rows are its table's. So the
+    prompt keeps no saved metric from a table whose charts name another table's column."""
     system, _ = plan_prompt(GOAL, _seen(_tools()))
-    assert SAVED_METRIC_PROMPT in system and COUNT_ON_ITS_TABLE_PROMPT in system
+    assert SAVED_METRIC_PROMPT in system and USE_A_SAVED_METRIC_PROMPT in system
+    assert "saved metric that names no column" not in system
     assert "on a join" not in system and "joined table's saved metric" not in system
     count = {"name": "orders_n", "saved_metric": "count", "kind": "count", "table": "orders"}
     alone = _shop_draft(_bar("by_channel", "orders.channel", measures=("orders_n",)), measures=(count,))
     assert isinstance(_shop(LLMPlanner(ScriptedModel([json.dumps(alone)]))), BuildPlan)
-    web = {"name": "web_n", "label": "Web orders", "kind": "count",
-           "expression": "COUNT(CASE WHEN orders.channel = 'web' THEN orders.order_id END)"}
-    beside = _shop_draft(_bar("by_channel", "orders.channel", measures=("orders_n",)),
-                         _bar("web_by_region", "customers.region", measures=("web_n",)), measures=(count, web))
-    refused = _shop(LLMPlanner(ScriptedModel([json.dumps(beside)] * 2)))
-    assert isinstance(refused, PlanRefused) and list(_parts(refused)) == ["measure 'orders_n'"], refused
+
+
+# ---------------------------------------------------------------- a saved count of a base, on its made dataset
+
+# Invoices, each of one customer: a customer's key holds each value once, as enrichment's profile reads it, and an
+# invoice's customer repeats. Each table has a dataset, with Superset's saved metric count.
+_BILLING_COLUMNS = {
+    "invoices": (("invoice_id", "INTEGER", True), ("customer_id", "INTEGER", False), ("status", "VARCHAR", None)),
+    "customers": (("customer_id", "INTEGER", True), ("segment", "VARCHAR", None)),
+}
+BILLING = Snapshot(version="v1", source_id="billing", created_at="t",
+                   columns=[_shop_column(table, *column) for table, columns in _BILLING_COLUMNS.items()
+                            for column in columns],
+                   relationships=[_shop_relationship("invoices", "customer_id", "customers")])
+BILLING_GRANTS = GrantSet(frozenset(_BILLING_COLUMNS))
+INVOICES_CUSTOMERS = '"invoices" LEFT JOIN "customers" ON "invoices"."customer_id" = "customers"."customer_id"'
+INVOICES_N = SavedRef("count", K.COUNT, table="invoices", handle="invoices_n")
+NO_INVOICE_COLUMN = "it names no column of invoices, so on a join it would count the join's rows"
+# The plan a hosted model writes for overdue invoices by their customer's segment: Superset's count of invoices.
+OVERDUE_BY_SEGMENT = {
+    "measures": [{"name": "invoices_n", "saved_metric": "count", "kind": "count", "table": "invoices"}],
+    "charts": [{"key": "overdue_by_segment", "family": "bar", "title": "Overdue invoices by segment",
+                "measures": ["invoices_n"], "dimensions": ["customers.segment"],
+                "filters": [{"column": "invoices.status", "op": "=", "operand": "overdue"}]}],
+    "links": [], "reuse_dashboard": None}
+
+
+def _billing_key(unique: bool | None) -> Snapshot:
+    """The invoices with a customer's key profiled as holding each value once (True), as repeating one (False), or
+    never profiled (None)."""
+    return BILLING.model_copy(update={"columns": [
+        _shop_column("customers", "customer_id", "INTEGER", unique) if column.id == "customers.customer_id"
+        else column for column in BILLING.columns]})
+
+
+def _billing_tools(**more) -> Tools:
+    return _tools(datasets=[_dataset(1, "invoices"), _dataset(2, "customers")],
+                  metrics={1: [_metric(1, "count", "COUNT(*)")], 2: [_metric(2, "count", "COUNT(*)")]}, **more)
+
+
+def _billing_carried(*refs, join: str = INVOICES_CUSTOMERS, snapshot: Snapshot = BILLING,
+                     tools: Tools | None = None):
+    """One bar of `refs` by customers' segment on the dataset `join`, as a planner other than the model's channel
+    hands one to the check."""
+    plan = BuildPlan(charts=(_chart("carried", Family.BAR, refs, dataset_id=-1, dims=["segment"]),), measures=(),
+                     reuse_candidates=(), datasets=(PlannedDataset(key="dataset_1", placeholder=-1, join=join),))
+    return _plan(GOAL, FakePlanner(plan), tools or _billing_tools(), snapshot=snapshot, grants=BILLING_GRANTS)
+
+
+@pytest.mark.parametrize("snapshot, settings", [
+    (BILLING, None),
+    (BILLING, GUARDED),
+    # No profile says whether a customer's key holds each value once: the source is asked, and answers that it does.
+    (_billing_key(None), None),
+], ids=["key-fact", "key-fact-guarded", "probed"])
+def test_a_saved_count_of_a_base_is_carried_onto_its_made_dataset(snapshot, settings):
+    """Superset's count of invoices, on a chart of overdue invoices by their customer's segment: one dataset per base
+    puts it on invoices' made dataset, invoices LEFT JOIN customers, whose far side holds each value once. That
+    dataset's rows are invoices', each once, so COUNT(*) on it counts invoices, as on invoices alone: it is carried as
+    written, decided over the dataset, and the plan is taken with no round of repair."""
+    model = ScriptedModel([json.dumps(OVERDUE_BY_SEGMENT)])
+    tools = _billing_tools()
+    plan = _plan(GOAL, LLMPlanner(model), tools, snapshot=snapshot, grants=BILLING_GRANTS, settings=settings)
+    assert isinstance(plan, BuildPlan), plan
+    assert len(model.sent) == 1, "nothing went back for repair"
+    (made,) = plan.datasets
+    assert made.join == INVOICES_CUSTOMERS
+    (measure,) = plan.measures
+    assert (measure.name, measure.expression, measure.kind, measure.dataset_id) == ("invoices_n", "COUNT(*)",
+                                                                                    K.COUNT, -1)
+    assert [chart.measures for chart in plan.charts] == [(WrittenRef(measure),)]
+    assert any(f'COUNT(*) AS invoices_n FROM ({made.sql}) AS "virtual_table"' in sql for sql in tools.statements())
+    assert _unique_probes(tools) == ([] if snapshot is BILLING else [("customers", ("customer_id",))])
+
+
+def test_a_saved_count_of_a_far_side_is_refused_on_the_made_dataset():
+    """customers' count on invoices' made dataset: the dataset's rows are invoices', and customers is the side its
+    LEFT JOIN fills with NULL for an invoice with no customer. Refused."""
+    refused = _billing_carried(SavedRef("count", K.COUNT, table="customers", handle="customers_n"))
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused) == {"measure 'customers_n'": (
+        "customers is on a side the join may fill with NULL, where its saved metric 'count' is not defined: put "
+        "customers on the side the join keeps every row of, or join with JOIN")}
+
+
+@pytest.mark.parametrize("join", [
+    # A JOIN keeps only the invoices that meet a customer, and the check reads no far side of it.
+    '"invoices" JOIN "customers" ON "invoices"."customer_id" = "customers"."customer_id"',
+    # A LEFT JOIN written another way than the plan's reader writes one: a join mnemiq did not make.
+    "invoices i LEFT JOIN customers c ON c.customer_id = i.customer_id",
+], ids=["inner", "written"])
+def test_a_saved_count_onto_a_join_mnemiq_did_not_make_is_refused(join):
+    refused = _billing_carried(INVOICES_N, join=join)
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused) == {"measure 'invoices_n'": NO_INVOICE_COLUMN}
+
+
+@pytest.mark.parametrize("snapshot, tools", [
+    (_billing_key(False), None),
+    (_billing_key(None), _billing_tools(repeats={("customers", ("customer_id",))})),
+], ids=["key-fact", "probed"])
+def test_a_saved_count_is_refused_on_a_made_dataset_whose_far_side_repeats(snapshot, tools):
+    """invoices' made dataset, joined to customers by a key that repeats: the join may repeat invoices' rows, so its
+    rows are never read as invoices', and the count is refused beside the dataset's own refusal, in one repair."""
+    refused = _billing_carried(INVOICES_N, snapshot=snapshot, tools=tools)
+    assert isinstance(refused, PlanRefused), refused
+    parts = _parts(refused)
+    assert set(parts) == {"the rows of invoices, joined to customers", "measure 'invoices_n'"}, parts
+    assert parts["measure 'invoices_n'"] == NO_INVOICE_COLUMN
+    assert "customers.customer_id holds a value more than once" in parts["the rows of invoices, joined to customers"]

@@ -25,10 +25,11 @@ and the reason names it.
 **A joined table's saved metric on a join** is carried onto it as its table defines it (`carry`), once for each
 metric, kind, table and join. It is refused where its table is on a side an outer join may fill with NULL, where the
 fan-out guard is on and the join does not leave its table's rows at their own grain (`tables_off_their_grain`),
-whatever it aggregates, and where its expression reads anything but its own table's columns. Otherwise its expression
-is printed with each column named as the joined dataset names it, which the chart sends, and decided by
-`check_measure` over the dataset as Superset reads it. It is then a written measure of the plan, under the plan's name
-for it and its metric's verbose name, but for its values, which are its table's and never probed.
+whatever it aggregates, and where its expression reads anything but its own table's columns, or names none of them
+(a count of rows) on a join whose rows are not its table's. Otherwise its expression is printed with each column named
+as the joined dataset names it, which the chart sends, and decided by `check_measure` over the dataset as Superset reads
+it. It is then a written measure of the plan, under the plan's name for it and its metric's verbose name, but for its
+values, which are its table's and never probed.
 
 **Datasets.** The model names every column with its table, and states the links between tables the snapshot does not
 relate; mnemiq chooses each part's rows (`plan_from_draft`, through `plan_rows`). A measure's base is the table its
@@ -378,10 +379,9 @@ condition names columns of more than one table, and where it counts another tabl
 ebook_loans counts loans by their book's format. A count of 1s beside an aggregate that adds up a column counts that \
 column's table's rows, whatever its condition or "table" names: SUM(loans.renewals) / COUNT(CASE WHEN books.format \
 = 'ebook' THEN 1 END) adds up loans. To count rows, prefer COUNT(<table>.<key>), which names its table. Use a saved metric where one says what \
-a measure needs: never write your own measure for what a saved metric says. A saved metric that names no column, such \
-as count (COUNT(*)), is only for a table whose measures no chart shows with another table's column; write \
-COUNT(<table>.<key>) instead. A written measure's name and label are never a saved metric's name on its table, and no \
-two measures share a label. A table with no dataset gets one, with Superset's saved metric count (COUNT(*)).
+a measure needs: never write your own measure for what a saved metric says. A written measure's name and label are \
+never a saved metric's name on its table, and no two measures share a label. A table with no dataset gets one, with \
+Superset's saved metric count (COUNT(*)).
 
 Charts: {"key": lower case letters, digits and _, at most 40, one per chart, "family": one of FAMILIES, "title", \
 "measures": [measure names], "dimensions": [columns], "time_column": a date or timestamp column, or omitted, \
@@ -1032,7 +1032,9 @@ class _Rows:
     order, with the equalities its far side is read from: each of its columns the join's ON condition sets equal to a
     column of a table before it, as a link from that column, each equality one every joined row meets
     (`_far_links`). `base` is the table whose rows the dataset keeps, where its join is one the
-    plan's reader makes (`_made_from`); None for any other."""
+    plan's reader makes (`_made_from`); None for any other. `rows_of` is the table whose rows the dataset's rows are,
+    each once: such a join's base, set by the plan check only once it has shown each far side to hold each value once
+    (`_far_side_refusals` gave no reason); None until then, and for any other dataset."""
 
     columns: frozenset[str]
     source: str
@@ -1049,6 +1051,7 @@ class _Rows:
     nullable: frozenset[str] = frozenset()
     far: tuple[tuple[str, tuple[Link, ...]], ...] = ()
     base: str | None = None
+    rows_of: str | None = None
 
 
 def _made_from(join: str) -> tuple[str, tuple[str, ...]] | None:
@@ -1342,7 +1345,8 @@ def _carried(ref: SavedRef, on: _Rows, catalogue: _Catalogue,
     it (`carry`), or why it cannot be: the table has no such metric the builder can reach; it is on a side an outer
     join may fill with NULL, where the metric is not defined; the join does not leave its rows at their own grain
     (`off_grain`, the tables `tables_off_their_grain` names, given only when the fan-out guard is on); the metric is
-    on a 0 to 100 scale and planned as a percent; or `carry` refuses its expression."""
+    on a 0 to 100 scale and planned as a percent; or `carry` refuses its expression, which names no column only where
+    the join's rows are its table's (`_Rows.rows_of`)."""
     table = ref.table
     metric = next((m for m in catalogue.saved.get(catalogue.datasets.get(table), ()) if m.name == ref.name), None)
     if metric is None:
@@ -1362,7 +1366,8 @@ def _carried(ref: SavedRef, on: _Rows, catalogue: _Catalogue,
         return _scaled_saved(ref.name)
     carried = carry(metric, table=table, stored=catalogue.stored[table], columns=catalogue.columns[table],
                     qualifier=on.qualifiers[table],
-                    shown={column: on.shown[(table, column)] for column in catalogue.columns[table]})
+                    shown={column: on.shown[(table, column)] for column in catalogue.columns[table]},
+                    rows_are_base=on.rows_of == table)
     return carried if isinstance(carried, str) else (metric, carried)
 
 
@@ -1654,10 +1659,13 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
                              "that needs the join")
                 continue
             # Its parts are still checked on it, so a refusal of its far sides goes back with theirs in one repair.
-            for reason in _far_side_refusals(joined, context.unique, declared, adapter=adapter, snapshot=snapshot,
-                                             grants=grants, probes=probes, row_ruled=row_ruled):
+            far_refused = _far_side_refusals(joined, context.unique, declared, adapter=adapter, snapshot=snapshot,
+                                             grants=grants, probes=probes, row_ruled=row_ruled)
+            for reason in far_refused:
                 refuse(part, reason)
-            rows[planned.placeholder] = joined
+            # A join the plan's reader made is its base LEFT JOIN each far side, so once every far side is shown to
+            # hold each value once, its rows are its base's, each once. Until then they may repeat the base's.
+            rows[planned.placeholder] = joined if far_refused else replace(joined, rows_of=joined.base)
         elif planned.table not in catalogue.columns:
             refuse(part, "it is not a table this builder can read")
         elif planned.table in catalogue.datasets:
