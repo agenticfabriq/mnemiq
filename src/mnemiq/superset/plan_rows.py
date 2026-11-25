@@ -34,6 +34,7 @@ from sqlglot.errors import SqlglotError
 from mnemiq.contract.semantic import Relationship
 from mnemiq.sql.fanout_check import value_terms
 from mnemiq.sql.identifiers import resolve_identifier
+from mnemiq.superset.measures import Aggregation, aggregates
 from mnemiq.superset.settings import SUPERSET_DIALECT
 
 # Whether a table's column holds each value once, by (table, column): enrichment's key facts. A column absent is
@@ -183,14 +184,34 @@ def aggregated(expression: str) -> set[str]:
     return tables
 
 
+# Why an expression that gives one value per row is no measure, whatever its `table`: read as the plan check reads it
+# (`measures.aggregates`), so the draft goes back with the check's reason, never told to give a table.
+_NO_AGGREGATE = ("it is no aggregate: it gives one value per row, not one per group; write the measure with an "
+                 "aggregate, as SUM(<table>.<column>) or COUNT(*)")
+_WINDOWED = ("its aggregate is computed over a window (OVER), which gives one value per row, not one per group, so it "
+             "is no measure either: write the aggregate without OVER")
+_UNMODELLED = ("mnemiq cannot tell whether it aggregates: it holds a function mnemiq does not model and no aggregate "
+               "mnemiq does; write the measure with SQL's own aggregates, as SUM(<table>.<column>) or COUNT(*)")
+
+
 def base_of(expression: str, table: str | None) -> str | Refusal:
     """The table whose rows a written measure adds up: the one table of the columns its aggregates add up; where they
     add up no column (`COUNT(*)`), `table`, the table the measure names. `table` decides nothing for an expression whose
-    aggregates name a column. Refused when the expression cannot be read (`qualified`), when its aggregates add up
-    columns of two tables, or when they add up none and it names no table."""
+    aggregates name a column. Refused when the expression cannot be read (`qualified`); when it holds no aggregate, or
+    only a window's, so it gives one value per row (`measures.aggregates`, as the plan check reads it), or holds no
+    aggregate but a function mnemiq does not model, whatever its `table`; when its aggregates add up columns of two
+    tables; and when they add up none and it names no table."""
     named = qualified(expression)
     if isinstance(named, str):
         return Refusal(named)
+    shape = aggregates(expression)
+    if shape is not Aggregation.AGGREGATES:
+        tree = _one_expression(expression)
+        held = tree is not None and tree.find(exp.AggFunc) is not None
+        if shape is Aggregation.ROW_LEVEL:
+            return Refusal(_WINDOWED if held else _NO_AGGREGATE)
+        if not held:
+            return Refusal(_UNMODELLED)
     tables = sorted(aggregated(expression))
     if len(tables) > 1:
         return Refusal(f"it adds up columns of {_listed(tables)}, and a measure adds up the rows of one table: plan "

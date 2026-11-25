@@ -104,6 +104,36 @@ def test_an_aggregate_of_no_column_takes_its_table_whatever_its_condition_names(
     assert _refused(base_of(expression, None)) == ADDS_UP_NO_COLUMN
 
 
+NO_AGGREGATE = ("it is no aggregate: it gives one value per row, not one per group; write the measure with an "
+                "aggregate, as SUM(<table>.<column>) or COUNT(*)")
+WINDOWED = ("its aggregate is computed over a window (OVER), which gives one value per row, not one per group, so it "
+            "is no measure either: write the aggregate without OVER")
+UNMODELLED = ("mnemiq cannot tell whether it aggregates: it holds a function mnemiq does not model and no aggregate "
+              "mnemiq does; write the measure with SQL's own aggregates, as SUM(<table>.<column>) or COUNT(*)")
+
+
+@pytest.mark.parametrize(("expression", "why"), [
+    ("order_items.revenue", NO_AGGREGATE),
+    ("order_items.revenue * order_items.quantity", NO_AGGREGATE),
+    ("CASE WHEN orders.channel = 'web' THEN 1 ELSE 0 END", NO_AGGREGATE),
+    ("1", NO_AGGREGATE),
+    ("SUM(order_items.revenue) OVER ()", WINDOWED),
+    ("COUNT(*) OVER (PARTITION BY orders.channel)", WINDOWED),
+    ("SUM(order_items.revenue) FILTER (WHERE orders.channel = 'web') OVER ()", WINDOWED),
+    ("MY_TOTAL(order_items.revenue)", UNMODELLED),
+], ids=["a column", "a product", "a case", "a constant", "a window's sum", "a window's count", "a filtered window",
+        "an unmodelled function"])
+@pytest.mark.parametrize("table", [None, "order_items"], ids=["no table", "a table"])
+def test_an_expression_that_does_not_aggregate_is_no_measure_whatever_its_table(expression, why, table):
+    """A measure gives one value per group. An expression with no aggregate, or whose every aggregate is a window's,
+    gives one per row: it is refused saying so, with or without a `table`, never told to give one, which would pass
+    it here only for the plan check to refuse it, spending the one repair. One whose only function mnemiq does not
+    model is refused as the check refuses it: mnemiq cannot tell whether it aggregates."""
+    assert _refused(base_of(expression, table)) == why
+    # A window over an aggregate aggregates.
+    assert base_of("SUM(SUM(order_items.revenue)) OVER ()", table) == "order_items"
+
+
 def test_qualified_names_each_column_with_its_table_or_says_why_not():
     assert qualified("AVG(CASE WHEN orders.channel = 'web' THEN order_items.revenue END)") == [
         ("orders", "channel"), ("order_items", "revenue")]

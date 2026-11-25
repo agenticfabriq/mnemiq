@@ -1282,6 +1282,21 @@ def test_count_star_names_its_base_with_table():
         assert why in _parts(refused)["measure 'orders_n'"], changes
 
 
+@pytest.mark.parametrize(("expression", "why"), [
+    ("order_items.revenue", "it is no aggregate"),
+    ("SUM(order_items.revenue) OVER ()", "is no measure either: write the aggregate without OVER")])
+@pytest.mark.parametrize("table", [None, "order_items"])
+def test_a_measure_that_does_not_aggregate_goes_back_saying_so(expression, why, table):
+    """An expression that gives one value per row goes back saying it is no measure, with or without a `table`, and is
+    never told to give one: given one, it would read here and fail the plan check, which spends the one repair."""
+    measure = {**REVENUE, "expression": expression, **({"table": table} if table is not None else {})}
+    refused = plan_from_draft(_shop_draft(_bar("by_product", "order_items.product_id"), measures=(measure,)),
+                              _shop_seen())
+    assert isinstance(refused, PlanRefused), refused
+    reason = _parts(refused)["measure 'total_revenue'"]
+    assert why in reason and '"table"' not in reason, reason
+
+
 def test_a_chart_with_no_measure_takes_its_base_from_its_columns():
     """A table or a histogram plots no measure: its rows are those of the one table of its columns that reaches the
     others, an order's with its customer's region here."""
