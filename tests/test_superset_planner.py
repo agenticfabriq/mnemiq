@@ -3870,3 +3870,73 @@ def test_a_saved_count_is_refused_on_a_made_dataset_whose_far_side_repeats(snaps
     assert set(parts) == {"the rows of invoices, joined to customers", "measure 'invoices_n'"}, parts
     assert parts["measure 'invoices_n'"] == NO_INVOICE_COLUMN
     assert "customers.customer_id holds a value more than once" in parts["the rows of invoices, joined to customers"]
+
+
+# ---------------------------------------------------------------- the count a base with no dataset is offered
+
+# The shop's tables have no dataset, so the plan is shown the count Superset gives the dataset it makes for each.
+ORDER_COUNT = {"name": "order_count", "saved_metric": "count", "table": "orders", "kind": "count"}
+
+
+def _shop_saved(ref: SavedRef, *, join: str = ORDERS_CUSTOMERS, snapshot: Snapshot = SHOP, tools: Tools | None = None):
+    """One bar of `ref` by customers' region on the dataset `join`, as a planner other than the model's channel hands
+    one to the check."""
+    plan = BuildPlan(charts=(_chart("orders_by_region", Family.BAR, [ref], dataset_id=-1, dims=["region"]),),
+                     measures=(), reuse_candidates=(),
+                     datasets=(PlannedDataset(key="dataset_1", placeholder=-1, join=join),))
+    return _shop(FakePlanner(plan), tools, snapshot=snapshot)
+
+
+@pytest.mark.parametrize("snapshot", [SHOP, CUSTOMER_KEY_UNPROFILED], ids=["key-fact", "probed"])
+def test_the_count_a_base_without_a_dataset_is_offered_is_its_made_datasets_count(snapshot):
+    """orders has no dataset, so the plan is offered the count Superset gives the dataset it makes for orders. A chart
+    of it by customers' region puts it on orders' made dataset, orders LEFT JOIN customers, whose far side holds each
+    value once (as the profile says, or as the source answers): that dataset's rows are orders', each once, and its
+    own count, which Superset gives it too, is the count of orders. The chart plots that, and nothing is carried."""
+    model = ScriptedModel([json.dumps(_shop_draft(_bar("orders_by_region", "customers.region",
+                                                       measures=("order_count",)), measures=(ORDER_COUNT,)))])
+    plan = _shop(LLMPlanner(model), snapshot=snapshot)
+    assert isinstance(plan, BuildPlan), plan
+    assert len(model.sent) == 1, "nothing went back for repair"
+    (made,) = plan.datasets
+    assert made.join == ORDERS_CUSTOMERS
+    assert plan.measures == ()
+    assert [(chart.dataset_id, chart.measures) for chart in plan.charts] == [(-1, (SavedRef("count", K.COUNT),))]
+
+
+def test_a_far_sides_offered_count_is_refused_on_the_made_dataset():
+    """customers has no dataset either, and its count on orders' made dataset would count orders: refused, as the
+    reader refuses a draft that makes customers a chart's rows by orders' channel (orders' key to it repeats)."""
+    refused = _shop_saved(SavedRef("count", K.COUNT, table="customers", handle="customer_count"))
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused) == {
+        "measure 'customer_count'": "customers has no saved metric named 'count' this builder can reach"}
+    customers = {"name": "customer_count", "saved_metric": "count", "table": "customers", "kind": "count"}
+    drafted = _shop(LLMPlanner(ScriptedModel([json.dumps(_shop_draft(
+        _bar("customers_by_channel", "orders.channel", measures=("customer_count",)), measures=(customers,)))] * 2)))
+    assert isinstance(drafted, PlanRefused), drafted
+    assert "cannot be joined to the rows of 'customers'" in _parts(drafted)["chart 'customers_by_channel'"]
+
+
+@pytest.mark.parametrize("join, snapshot, tools", [
+    # The far side repeats, by the profile or by the source's answer: the join may repeat orders' rows.
+    (ORDERS_CUSTOMERS, CUSTOMER_KEY_REPEATS, None),
+    (ORDERS_CUSTOMERS, CUSTOMER_KEY_UNPROFILED, _tools(datasets=[], repeats={("customers", ("customer_id",))})),
+    # A JOIN keeps only the orders that meet a customer: a join mnemiq did not make.
+    ('"orders" JOIN "customers" ON "orders"."customer_id" = "customers"."customer_id"', SHOP, None),
+], ids=["repeats", "probed-repeats", "inner"])
+def test_the_offered_count_is_refused_on_a_join_whose_rows_are_not_its_bases(join, snapshot, tools):
+    refused = _shop_saved(SavedRef("count", K.COUNT, table="orders", handle="order_count"), join=join,
+                          snapshot=snapshot, tools=tools)
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused)["measure 'order_count'"] == "orders has no saved metric named 'count' this builder can reach"
+
+
+def test_only_the_count_is_offered_to_a_base_without_a_dataset():
+    """A saved metric of any other name, on orders, which has no dataset and so no saved metric but the count its
+    dataset would get: refused, even on a dataset whose rows are orders'."""
+    total = {"name": "order_total", "saved_metric": "total", "table": "orders", "kind": "number"}
+    refused = _shop(LLMPlanner(ScriptedModel([json.dumps(_shop_draft(
+        _bar("totals_by_region", "customers.region", measures=("order_total",)), measures=(total,)))] * 2)))
+    assert isinstance(refused, PlanRefused), refused
+    assert _parts(refused) == {"measure 'order_total'": "orders has no saved metric named 'total' this builder can reach"}

@@ -422,7 +422,8 @@ still to come. In short:
   - its expression names none of its table's columns (`count`, `COUNT(*)`), so it counts the rows it is given, and the
     join's rows are not its table's. A dataset mnemiq makes has exactly its base's rows, each once, when every far
     side is shown to hold each value once, so the base's `count` is carried onto it as written; on any other join it
-    would count the join's rows;
+    would count the join's rows. A base with no dataset is offered the `count` Superset gives the dataset mnemiq makes
+    for it; on such a made dataset its chart plots the made dataset's own `count`, the same count;
   - its table is on a side an outer join may fill with NULL: the right of a `LEFT JOIN`, and, in a join mnemiq did not
     make (it makes only `LEFT JOIN`s), every table before a `RIGHT JOIN` and any table of a `FULL JOIN`;
   - with the fan-out guard on (`MNEMIQ_GUARD_FANOUT`), the join repeats its table's rows, meets another table by a

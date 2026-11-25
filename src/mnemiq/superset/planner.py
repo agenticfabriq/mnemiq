@@ -29,7 +29,9 @@ whatever it aggregates, and where its expression reads anything but its own tabl
 (a count of rows) on a join whose rows are not its table's. Otherwise its expression is printed with each column named
 as the joined dataset names it, which the chart sends, and decided by `check_measure` over the dataset as Superset reads
 it. It is then a written measure of the plan, under the plan's name for it and its metric's verbose name, but for its
-values, which are its table's and never probed.
+values, which are its table's and never probed. A table with no dataset has no saved metric but the count Superset
+gives the dataset the build makes for it (`COUNT_METRIC`): on a join whose rows are that table's, the chart plots the
+join's own count, which is that one, and nothing is carried.
 
 **Datasets.** The model names every column with its table, and states the links between tables the snapshot does not
 relate; mnemiq chooses each part's rows (`plan_from_draft`, through `plan_rows`). A measure's base is the table its
@@ -1581,8 +1583,9 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
            grants: GrantSet, settings, interactive_pivot_available: bool,
            on_dashboard: Sequence[Measure] = ()) -> BuildPlan | tuple[RefusedPart, ...]:
     """The plan with its reusable measures replaced by the saved metrics that say the same, and each joined table's
-    saved metric carried onto its join as a measure written from its expression, or every part refused, each with
-    mnemiq's own reason."""
+    saved metric carried onto its join as a measure written from its expression (the count a table with no dataset is
+    offered, the join's own count, where the join's rows are that table's), or every part refused, each with mnemiq's
+    own reason."""
     refused: list[RefusedPart] = []
     # Every probe of a filter's value this check makes, the measures' and the charts', shares one budget and one memo.
     probes = Probes()
@@ -1773,6 +1776,10 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
     # name and label of the plan, decided over the join as a written measure is (its values are its table's, so none is
     # probed), and kept as the measure its charts write, its expression naming the joined dataset's columns.
     carried: dict[tuple[str, MeasureKind, str, int], WrittenRef] = {}
+    # A table with no dataset is offered the count Superset gives the dataset the build makes for it (`COUNT_METRIC`).
+    # On a join whose rows are that table's, each once (`_Rows.rows_of`), the join's own count is that count: the chart
+    # plots it as the join's saved metric, and nothing is carried.
+    own_counts: dict[tuple[str, MeasureKind, str, int], SavedRef] = {}
     guarded = bool(to_carry) and guard_on(settings.guard_fanout, snapshot)
     grains: dict[int, Mapping[str, str]] = {}
     for key, ref in to_carry.items():
@@ -1790,6 +1797,9 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
             refuse(part, f"{ref.table} is not one of the tables of {on.part}")
             continue
         reads.setdefault(placeholder, set()).add(ref.table)
+        if ref.name == COUNT_METRIC[0] and ref.table not in catalogue.datasets and on.rows_of == ref.table:
+            own_counts[key] = SavedRef(ref.name, ref.kind)
+            continue
         if guarded and placeholder not in grains:
             grains[placeholder] = tables_off_their_grain(
                 sqlglot.parse_one(f"{_JOIN_PREFIX}{on.planned.join}", read=SUPERSET_DIALECT),
@@ -1877,9 +1887,10 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
                 else:
                     refs.append(reused.get(measure.name, WrittenRef(measure)))
             elif ref.table is not None:
-                # The measure the carried pass wrote for it; refused there, the reference as planned, with the reason
-                # the measure was given, so the chart's own checks still run.
-                refs.append(carried.get((ref.name, ref.kind, ref.table, chart.dataset_id), ref))
+                # The measure the carried pass wrote for it, or the join's own count; refused there, the reference as
+                # planned, with the reason the measure was given, so the chart's own checks still run.
+                key = (ref.name, ref.kind, ref.table, chart.dataset_id)
+                refs.append(carried.get(key, own_counts.get(key, ref)))
             else:
                 refs.append(ref)
         spec = replace(chart, measures=tuple(refs))
