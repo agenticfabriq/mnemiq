@@ -1656,6 +1656,24 @@ def test_unknown_keys_not_measured_are_refused(monkeypatch):
     assert _unique_probes(spent) == []
 
 
+def test_a_stated_link_onto_a_key_known_to_repeat_is_refused_naming_it_and_never_probed():
+    """A link the model states decides its pair of tables, but never joins a table by a key enrichment's profile says
+    repeats: through the reader and the check, the plan goes back for the repair naming the key, refused again it is
+    refused, and nothing asks the source whether the key holds each value once, since the profile, read over every
+    row, already said."""
+    stated = {**copy.deepcopy(ORDERS_BY_REGION),
+              "links": [{"from": "orders.customer_id", "to": "customers.customer_id"}]}
+    model = ScriptedModel([json.dumps(stated)] * 2)
+    tools = _tools(datasets=[_dataset(31, "customers")])
+    refused = _shop(LLMPlanner(model), tools, snapshot=CUSTOMER_KEY_REPEATS)
+    assert isinstance(refused, PlanRefused), refused
+    assert len(model.sent) == 2, "it went back for the repair once"
+    [(part, reason)] = _parts(refused).items()
+    assert "customers.customer_id holds a value more than once" in reason, reason
+    assert f"- {part}: {reason}\n" in model.sent[1]["user"]
+    assert _unique_probes(tools) == [] and _rule_asks(tools) == []
+
+
 def _rule_asks(tools: Tools) -> list[list[int]]:
     """The datasets each call of the extension's `row_rules` asked about, in the order asked."""
     return [request["dataset_ids"] for tool, request in tools.calls if tool == ROW_RULES]
