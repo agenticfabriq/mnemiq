@@ -542,7 +542,11 @@ def plan_from_draft(draft: Mapping[str, Any], context: PlanContext) -> BuildPlan
     table's dataset, or one the build makes), else one the build makes, the base LEFT JOIN each table they name
     (`chain`, over the links the model states and, for a pair it left unlinked, the snapshot's). Each column is then
     named as its dataset names it. A part that cannot be read is refused, with the draft kept for the repair. A key
-    `PLAN_SCHEMA` does not require is read as left out where the model wrote null for it (`_nulls_left_out`)."""
+    `PLAN_SCHEMA` does not require is read as left out where the model wrote null for it (`_nulls_left_out`).
+
+    Only what a chart plots is built, as the plan check builds it, so a measure no chart plots is left out before any
+    part's rows are read: the tables it names join nothing to the rows of the measures a chart plots, and nothing it
+    names is refused, since it would never be built."""
     draft = _nulls_left_out(draft, PLAN_SCHEMA)
     refused: list[RefusedPart] = []
     tables = {table.name: table for table in context.tables}
@@ -590,6 +594,9 @@ def plan_from_draft(draft: Mapping[str, Any], context: PlanContext) -> BuildPlan
     parts: list[_Part] = []
     written: dict[str, tuple[Measure, str]] = {}
     saved: dict[str, tuple[str, MeasureKind, str]] = {}
+    drafted = draft.get("charts")
+    plotted = {name for item in (drafted if isinstance(drafted, list) else []) if isinstance(item, dict)
+               and isinstance(item.get("measures"), list) for name in item["measures"] if isinstance(name, str)}
     measures = draft.get("measures")
     if not isinstance(measures, list):
         refuse("the plan", "its measures are a list")
@@ -603,6 +610,8 @@ def plan_from_draft(draft: Mapping[str, Any], context: PlanContext) -> BuildPlan
         if name in written or name in saved:
             refuse(part, "two measures have this name")
             continue
+        if name not in plotted:
+            continue  # no chart plots it, so it is never built
         if item.get("join") is not None:
             refuse(part, _ROWS_ARE_MNEMIQS)
             continue

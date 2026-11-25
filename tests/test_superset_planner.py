@@ -1294,6 +1294,30 @@ def test_a_chart_whose_measures_have_different_bases_is_refused():
     assert "'order_items'" in reason and "'returns'" in reason, reason
 
 
+def test_a_measure_no_chart_plots_is_left_out_before_any_rows_are_read():
+    """Only what a chart plots is built, so a written measure no chart plots is left out as the draft is read, before
+    any part's rows are: the tables it names join nothing to the rows of the measures a chart plots, and a table no
+    link reaches from its own sends nothing back for repair. Revenue by product plans on the items' own rows, though
+    a measure beside it names an order's channel, and another an unlinked customer's region."""
+    web = {"name": "web_revenue", "label": "Web revenue", "kind": "currency", "currency": "USD",
+           "expression": "SUM(CASE WHEN orders.channel = 'web' THEN order_items.revenue END)"}
+    # From products, no link reaches customers: an item's product id repeats, so items are never joined to products.
+    west = {"name": "west_price", "label": "West price", "kind": "currency", "currency": "USD",
+            "expression": "AVG(CASE WHEN customers.region = 'west' THEN products.unit_price END)"}
+    draft = _shop_draft(_bar("by_product", "order_items.product_id"), measures=(REVENUE, web, west))
+    model = ScriptedModel([json.dumps(draft)] * 2)
+    plan = _shop(LLMPlanner(model))
+    assert isinstance(plan, BuildPlan), plan
+    assert len(model.sent) == 1, "nothing went back for repair"
+    assert plan.datasets == (PlannedDataset(key="dataset_1", placeholder=-1, table="order_items",
+                                            table_name="order_items"),)
+    assert [(m.name, m.expression, m.dataset_id) for m in plan.measures] == [("total_revenue", "SUM(revenue)", -1)]
+    read = plan_from_draft(draft, _shop_seen())
+    assert isinstance(read, BuildPlan), read
+    assert [m.name for m in read.measures] == ["total_revenue"]
+    assert read.datasets == (PlannedDataset(key="dataset_1", placeholder=-1, table="order_items"),)
+
+
 def test_a_chart_table_or_join_goes_back_for_the_repair():
     """The model names columns; mnemiq chooses each part's rows. A chart's `table` or `join`, or a measure's `join`,
     goes back for the repair saying so, and the plan without it passes."""
