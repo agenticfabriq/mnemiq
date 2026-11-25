@@ -396,6 +396,98 @@ def test_vllm_counts_at_its_root_tokenize_with_the_chat_messages():
                                 {"role": "user", "content": "USER"}]
 
 
+# llama.cpp's server as observed on build b12359: `/tokenize` reads `content`, and answers vLLM's chat-messages body with
+# 200 and an empty list; `/apply-template` renders the chat with the model's own template; `/props` gives one request's
+# window (a slot's `n_ctx`, not the server's whole `-c`).
+_RENDERED = "<|im_start|>system\nSYS<|im_end|>\n<|im_start|>user\nUSER<|im_end|>\n<|im_start|>assistant\n"
+
+
+def _llama_cpp(tokens: int = 39, n_ctx=4096, seen: list | None = None, key: str | None = None,
+               delay: float = 0.0) -> httpx.Client:
+    def handle(request: httpx.Request) -> httpx.Response:
+        if delay:
+            import time
+            time.sleep(delay)
+        if key is not None and request.headers.get("Authorization") != f"Bearer {key}":
+            return httpx.Response(401)
+        body = json.loads(request.content) if request.content else None
+        if seen is not None:
+            seen.append((request.method, request.url.path, body))
+        if request.url.path == "/tokenize":
+            if "content" not in body:
+                return httpx.Response(200, json={"tokens": []})
+            return httpx.Response(200, json={"tokens": list(range(tokens)) if body["content"] == _RENDERED else [7]})
+        if request.url.path == "/apply-template":
+            return httpx.Response(200, json={"prompt": _RENDERED})
+        if request.url.path == "/props":
+            return httpx.Response(200, json={"default_generation_settings": {"n_ctx": n_ctx}, "total_slots": 2})
+        return httpx.Response(404)
+    return httpx.Client(transport=httpx.MockTransport(handle))
+
+
+def test_llama_cpp_is_counted_on_its_own_template_and_tokenizer():
+    """A design partner's run on llama.cpp got no count (only vLLM's /tokenize body was sent), so the byte bound sized
+    every prompt and the fit withheld every column description."""
+    seen: list = []
+    got = count_on_server("http://h:8080/v1", "m", "SYS", "USER", http=_llama_cpp(seen=seen))
+    assert got == (39, 4096)
+    rendered = [body for method, path, body in seen if path == "/apply-template"]
+    assert rendered and rendered[0]["messages"] == [{"role": "system", "content": "SYS"},
+                                                    {"role": "user", "content": "USER"}]
+    counted = [body for method, path, body in seen if path == "/tokenize" and "content" in body]
+    assert len(counted) == 1 and counted[0]["content"] == _RENDERED
+    assert counted[0]["add_special"] is True, "counted as the server charges a chat: never under"
+    assert ("GET", "/props", None) in seen
+
+
+def test_an_empty_token_list_is_never_a_count_of_zero():
+    """vLLM's body on llama.cpp's /tokenize comes back 200 with no tokens: read as a length, every prompt would be 0
+    tokens and always fit."""
+    assert count_on_server("http://h/v1", "m", "SYS", "USER", http=_llama_cpp(tokens=0)) is None
+
+
+@pytest.mark.parametrize("n_ctx", [None, 0, -1, "4096", True, 4096.0])
+def test_llama_cpp_without_a_usable_window_is_no_count(n_ctx):
+    assert count_on_server("http://h/v1", "m", "SYS", "USER", http=_llama_cpp(n_ctx=n_ctx)) is None
+
+
+def test_llama_cpps_calls_carry_the_chat_calls_key():
+    assert count_on_server("http://h/v1", "m", "SYS", "USER", http=_llama_cpp(key="k"), api_key="k") == (39, 4096)
+    assert count_on_server("http://h/v1", "m", "SYS", "USER", http=_llama_cpp(key="k")) is None
+
+
+def test_llama_cpps_calls_share_one_deadline(monkeypatch):
+    """Four calls where vLLM takes one: each alone inside the deadline, together past it."""
+    import time
+
+    monkeypatch.setattr(window, "DEADLINE_S", 0.3)
+    started = time.monotonic()
+    assert count_on_server("http://h/v1", "m", "SYS", "USER", http=_llama_cpp(delay=0.12)) is None
+    assert time.monotonic() - started < 1.0
+
+
+def test_the_boot_check_counts_on_llama_cpp():
+    report = check_window(duckdb.connect(), _snapshot(), _settings(llm_context_window=999_999), "duckdb",
+                          http=_llama_cpp())
+    assert report.counted_by_server and report.window == 4096, "the server outranks a declaration"
+
+
+def test_the_fit_counts_on_llama_cpp(monkeypatch):
+    """The join: `fitter_for` builds its own client, so llama.cpp stands behind that client here."""
+    from mnemiq.semantic.fit import fitter_for
+    from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
+
+    real_client = httpx.Client
+    behind = _llama_cpp(n_ctx=32_768)
+    monkeypatch.setattr(httpx, "Client", lambda *a, **kw: real_client(transport=behind._transport))
+    snap = _snapshot()
+    packet = ContextPacket(question="q", cards=[RetrievedCard(object_id="main.a", card="table a", score=1.0)],
+                           grant_fingerprint="", enrichment_version=None)
+    fit = fitter_for(_settings(), "duckdb").measure(packet, snap, window.everything(snap))
+    assert fit.counted_by == "server" and fit.tokens == 39  # the mock's count of the chat it rendered
+    assert fit.budget == 32_768 - fit.reserve and fit.fits is True
+
+
 def test_the_count_carries_the_chat_calls_key():
     """Codex review of #73: behind an authenticating proxy a keyless /tokenize got 401, and the
     advisory reported no check at all against a server that would have counted."""

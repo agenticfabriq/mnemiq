@@ -14,9 +14,10 @@ the corrector's feedback.
 **With a server count, nothing that fits is changed.** The packet comes back as the same object,
 cards byte for byte as retrieval rendered them: without a request when the prompt's UTF-8 bytes
 already fit (`mnemiq.llm.window.byte_bound`: at most a token a byte, plus room for the chat
-template), and on the server's /tokenize count otherwise -- one round trip for each question whose
+template), and on the server's count otherwise (vLLM's /tokenize, or llama.cpp's server: see
+`count_on_server`) -- one round trip for each question whose
 bytes do not fit, and one a minute however small the prompt, to keep the server's window current
-(milliseconds on vLLM). **Without a count** (a server with no /tokenize and a
+(milliseconds on vLLM). **Without a count** (a server that cannot count, such as Ollama, and a
 declared MNEMIQ_LLM_CONTEXT_WINDOW) the byte bound decides alone, and it errs long, about 2.5
 times for English: such a deployment trims descriptions it has room for. That is the trade --
 never too little, often too much -- and the boot check, which uses the same bound, says so.
