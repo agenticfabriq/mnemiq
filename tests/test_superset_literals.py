@@ -19,7 +19,16 @@ from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Column, Snapshot
 from mnemiq.contract.semantic import SourceBinding
 from mnemiq.sql.values_check import PROBE_LIMIT
-from mnemiq.superset.literals import Absent, Probes, absent_literals, filter_statement, holds_null, null_statement
+from mnemiq.superset.literals import (
+    Absent,
+    Probes,
+    absent_literals,
+    filter_statement,
+    holds_null,
+    null_statement,
+    unique_live,
+    unique_statement,
+)
 
 SNAPSHOT = Snapshot(version="v1", source_id="only", created_at="t", columns=[
     Column(id="t.status", object_id="t", name="status", data_type="VARCHAR"),
@@ -435,3 +444,118 @@ def test_a_failed_null_probe_is_none_and_logs_no_value(caplog):
     assert _holds_null("status", source, probes=probes) is None and len(source.sent) == 1
     [line] = [r.getMessage() for r in caplog.records if r.name == "mnemiq.superset.literals"]
     assert "t.status" in line and "RuntimeError" in line and "Ann" not in line and "invalid" not in line
+
+
+# ---------------------------------------------------------------- whether a table's columns hold each value once
+
+
+def _counts(keyed, distinct) -> pa.Table:
+    """The two counts of `unique_statement`, as one row."""
+    return pa.table({"keyed_rows": pa.array([keyed], pa.int64()), "distinct_keys": pa.array([distinct], pa.int64())})
+
+
+def _unique(columns, source: Source, *, table: str = "t", snapshot=SNAPSHOT, grants=GRANTS,
+            probes: Probes | None = None) -> bool | None:
+    return unique_live(table, columns, adapter=source, snapshot=snapshot, grants=grants,
+                       probes=Probes() if probes is None else probes, timeout_s=5.0)
+
+
+def test_unique_statement_counts_the_rows_holding_a_key_against_their_distinct_keys():
+    """A NULL key meets no row in a join, so both counts are of the rows where no column of the key is NULL; a key of
+    several columns is counted as one row value."""
+    assert unique_statement("t", ["status"], "postgres") == (
+        'SELECT COUNT(*) AS "keyed_rows", COUNT(DISTINCT "status") AS "distinct_keys" FROM "t" '
+        'WHERE NOT "status" IS NULL')
+    assert unique_statement("t", ["status", "Owner"], "postgres") == (
+        'SELECT COUNT(*) AS "keyed_rows", COUNT(DISTINCT ("status", "Owner")) AS "distinct_keys" FROM "t" '
+        'WHERE NOT "status" IS NULL AND NOT "Owner" IS NULL')
+
+
+def test_unique_live_reads_afresh_and_compares_the_two_counts():
+    """As many distinct keys as rows holding one is unique, fewer is not; a table with no such row holds each of its
+    keys once. Each is one statement, run afresh, naming the table as the source stores it, as a probe of a value
+    does."""
+    bound = SNAPSHOT.model_copy(update={"source_bindings": [
+        SourceBinding(id="b", source_id="only", object_id="t", source_object="t_stored", binding_type="table")]})
+    once, twice, empty = (Source(lambda sql, counts=counts: _counts(*counts)) for counts in ((10, 10), (10, 8), (0, 0)))
+    assert _unique(["status"], once, snapshot=bound) is True
+    assert _unique(["status"], twice, snapshot=bound) is False
+    assert _unique(["status"], empty, snapshot=bound) is True
+    for source in (once, twice, empty):
+        assert source.sent == [unique_statement("t_stored", ["status"], "postgres")]
+        assert source.fresh == [True] and source.timeouts == [5.0]
+
+
+def test_unique_live_asks_once_per_key_per_plan():
+    """One plan's checks share what the source said: a key asked twice is asked once, its columns in any order and
+    named twice. Another key, and another plan's probes, are asked afresh."""
+    probes = Probes()
+    source = Source(lambda sql: _counts(10, 10))
+    assert _unique(["status", "owner"], source, probes=probes) is True
+    assert _unique(["owner", "status", "owner"], source, probes=probes) is True
+    assert len(source.sent) == 1 and probes.unique == {("t", ("owner", "status")): True}
+    assert _unique(["status"], source, probes=probes) is True
+    assert _unique(["status", "owner"], source) is True
+    assert len(source.sent) == 3
+
+
+@pytest.mark.parametrize(("table", "columns", "snapshot", "grants", "refused"), [
+    ("t", ["status", "owner"], POLICED, GrantSet(frozenset({"t"}), pii_mask=frozenset({"pii"})), False),
+    ("t", ["owner"], POLICED, GrantSet(frozenset({"t"})), False),
+    ("u", ["secret"], SNAPSHOT, GRANTS, False),
+    ("t", ["status"], SNAPSHOT, GrantSet(frozenset({"t"}), row_filters={"t": "owner = 'me'"}), False),
+    ("t", ["status"], SNAPSHOT, GrantSet(frozenset({"t"}), row_filters={"public.t": "owner = 'me'"}), False),
+    ("t", ["status"], SNAPSHOT, GRANTS, True),
+    ("t", [], SNAPSHOT, GRANTS, False),
+], ids=["masked", "denied", "ungranted table", "row-filtered table", "unknown row-filter target", "terminal refusal",
+        "no column"])
+def test_unique_live_asks_nothing_for_a_withheld_column_or_a_row_filtered_table_or_after_a_terminal_refusal(
+        table, columns, snapshot, grants, refused):
+    """How often a column's values repeat is what a mask withholds, a denied column and a table the grants hide are not
+    the builder's to ask about, and a probe runs outside mnemiq's own row filter, so a table under one is never asked:
+    as for whether a column holds NULL (`holds_null`). Nor is anything once Superset refused the request for good, or
+    a key of no column. Each is None, not measured, not asked and not remembered.
+
+    These are mnemiq's own grants. In Superset mode they carry no row filter: Superset applies its row rules itself,
+    and the plan check asks whether one applies to the builder before it calls `unique_live` at all
+    (`test_a_row_rule_on_the_joined_tables_dataset_stops_the_probe` in the planner's tests)."""
+    source = Source(lambda sql: _counts(10, 10))
+    if refused:
+        source.terminal_refusal = RuntimeError("Superset refused this caller")
+    probes = Probes()
+    assert _unique(columns, source, table=table, snapshot=snapshot, grants=grants, probes=probes) is None
+    assert source.sent == [] and probes.unique == {}
+
+
+def test_unique_live_is_none_when_the_budget_is_spent_and_does_not_remember_it(caplog):
+    """The probe shares the plan's budget: given 3 s of 10 left, it is sent with a 3 s limit, and the 4 s it takes are
+    spent; past the budget the next key is not asked, not remembered, and logged by its names alone."""
+    clock = [0.0]
+    probes = Probes(budget_s=10.0, clock=lambda: clock[0], spent_s=7.0)
+    source = Source(lambda sql: _counts(10, 10), clock=clock, takes_s=4.0)
+    assert _unique(["status"], source, probes=probes) is True
+    assert source.timeouts == [3.0] and probes.spent_s == 11.0
+    with caplog.at_level(logging.INFO):
+        assert _unique(["amount"], source, probes=probes) is None
+    assert len(source.sent) == 1 and probes.unique == {("t", ("status",)): True}
+    assert "t.amount" in caplog.text
+
+
+@pytest.mark.parametrize("answer", [
+    RuntimeError("invalid input syntax: 'Ann Smith'"),
+    pa.table({"keyed_rows": pa.array([], pa.int64()), "distinct_keys": pa.array([], pa.int64())}),
+    _counts(None, None),
+    pa.table({"?column?": [1]}),
+], ids=["failed", "no row", "null counts", "one column"])
+def test_a_count_that_fails_or_does_not_read_as_two_counts_is_none_and_logs_no_value(answer, caplog):
+    """A probe Superset does not answer, or answers with no two counts, says nothing: None, remembered so the key is not
+    asked again in the plan. A failure's log line names the key and the failure's kind; a source's words can quote a
+    value, so never them."""
+    probes = Probes()
+    source = Source(lambda sql: answer)
+    with caplog.at_level(logging.INFO, logger="mnemiq.superset.literals"):
+        assert _unique(["status"], source, probes=probes) is None
+    assert probes.unique == {("t", ("status",)): None}
+    assert _unique(["status"], source, probes=probes) is None and len(source.sent) == 1
+    lines = [r.getMessage() for r in caplog.records if r.name == "mnemiq.superset.literals"]
+    assert lines and all("t.status" in line and "Ann" not in line and "invalid" not in line for line in lines)

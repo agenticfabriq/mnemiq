@@ -31,13 +31,21 @@ column is NULL as well as the rows it names. The probe answers only whether one 
 there, never a value; it shares the plan's `Probes`, once per column, and is asked of no column the grounding would not
 place: one masked or denied, one on a table the grants hide or filter by row. A probe that fails, or is not sent, says
 nothing, and refuses nothing.
+
+**Whether a joined table's key holds each value once** is asked the same way (`unique_live`), for a dataset the build
+makes that LEFT JOINs a table by columns enrichment's profile says nothing of: the rows holding a key against their
+distinct keys, two counts, never a value. It shares the plan's `Probes`, once per key, and is asked of no column or
+table `holds_null` would not ask of. Unlike the probes above, a probe that fails or is not sent says nothing, and the
+plan check then joins nothing on it: a key is joined only where it is shown to hold each value once. Superset applies
+its row rules to the probe as to every statement the builder sends, so the counts are of the builder's rows; the plan
+check sends it only where no row rule applies to the builder on the table, as the extension's `row_rules` answers.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 import sqlglot
@@ -60,7 +68,7 @@ from mnemiq.sql.values_check import (
 )
 
 __all__ = ["HELD_NAMED", "NEGATED_OPERATORS", "Absent", "Probes", "absent_literals", "filter_statement", "holds_null",
-           "null_statement"]
+           "null_statement", "probe_withheld", "unique_live", "unique_statement"]
 
 logger = logging.getLogger(__name__)
 
@@ -93,10 +101,10 @@ class Absent:
 @dataclass
 class Probes:
     """What one check of a plan's probes share: `budget_s`, the time they may take together, `spent_s` of it taken as
-    `clock` measures it, each probe's answer by `(table, column, text)`, each column's values by `(table, column)`, and
-    whether each column holds NULL by `(table, column)`. A call is given at most the time left, and none is made once
-    it is spent. The budget is read between calls, so one call can overrun it by the transport's own margin, as a
-    probe on the ask path can."""
+    `clock` measures it, each probe's answer by `(table, column, text)`, each column's values by `(table, column)`,
+    whether each column holds NULL by `(table, column)`, and whether each key holds each value once by `(table, its
+    columns sorted)`. A call is given at most the time left, and none is made once it is spent. The budget is read
+    between calls, so one call can overrun it by the transport's own margin, as a probe on the ask path can."""
 
     budget_s: float = PROBE_BUDGET_S
     clock: Callable[[], float] = time.monotonic
@@ -104,6 +112,7 @@ class Probes:
     answers: dict[tuple[str, str, str], bool | None] = field(default_factory=dict)
     held: dict[tuple[str, str], tuple[tuple[str, ...], bool] | None] = field(default_factory=dict)
     nulls: dict[tuple[str, str], bool | None] = field(default_factory=dict)
+    unique: dict[tuple[str, tuple[str, ...]], bool | None] = field(default_factory=dict)
 
     def left_s(self) -> float:
         return self.budget_s - self.spent_s
@@ -242,10 +251,7 @@ def holds_null(table: str, column: str, *, adapter, snapshot: Snapshot, grants: 
     words can quote a value."""
     if getattr(adapter, "terminal_refusal", None) is not None:
         return None  # Superset refused this request for good: every later call meets the same refusal
-    policy = build_access_policy(snapshot, grants)
-    if column not in visible_schema(snapshot, grants).get(table, ()) or policy.masks(table, column) \
-            or policy.denies(table, column) or policy.row_filter_for(table) is not None \
-            or policy.unknown_filter_targets:
+    if probe_withheld(table, (column,), snapshot=snapshot, grants=grants):
         return None
     key = (table, column)
     if key in probes.nulls:
@@ -267,6 +273,76 @@ def holds_null(table: str, column: str, *, adapter, snapshot: Snapshot, grants: 
 
     probes.nulls[key] = probes.timed(ask, timeout_s)
     return probes.nulls[key]
+
+
+def probe_withheld(table: str, columns: Sequence[str], *, snapshot: Snapshot, grants: GrantSet) -> bool:
+    """Whether a probe of `columns` of `table` is not the builder's to send under mnemiq's own grants: a column the
+    grants hide, mask or deny, a table they filter by row (a probe runs outside mnemiq's own row filter), or any table
+    while a row filter names one the snapshot does not hold, which may be this one misspelled. Superset's row rules are
+    not mnemiq's grants, and are not read here: whoever needs a probe's rows to be every viewer's asks Superset."""
+    policy = build_access_policy(snapshot, grants)
+    visible = visible_schema(snapshot, grants).get(table, ())
+    return policy.row_filter_for(table) is not None or bool(policy.unknown_filter_targets) or any(
+        column not in visible or policy.masks(table, column) or policy.denies(table, column) for column in columns)
+
+
+def unique_statement(table: str, columns: Sequence[str], dialect: str | None) -> str:
+    """Whether `columns` of `table` hold each value once together: `SELECT COUNT(*), COUNT(DISTINCT <columns>) FROM
+    <table> WHERE <each column> IS NOT NULL`, the names quoted as stored, several columns counted as one row value. A
+    NULL in a key meets no row in a join, so both counts are of the rows whose key holds no NULL; each is named
+    (`keyed_rows`, `distinct_keys`), so the answer holds two columns of two names."""
+    named = [exp.Column(this=exp.to_identifier(column, quoted=True)) for column in columns]
+    key = named[0] if len(named) == 1 else exp.Tuple(expressions=named)
+    return (exp.select(exp.alias_(exp.Count(this=exp.Star()), "keyed_rows", quoted=True),
+                       exp.alias_(exp.Count(this=exp.Distinct(expressions=[key.copy()])), "distinct_keys", quoted=True))
+            .from_(exp.Table(this=exp.to_identifier(table, quoted=True)))
+            .where(exp.and_(*(exp.Not(this=exp.Is(this=column.copy(), expression=exp.Null())) for column in named)))
+            .sql(dialect=dialect))
+
+
+def unique_live(table: str, columns: Sequence[str], *, adapter, snapshot: Snapshot, grants: GrantSet,
+                probes: Probes, timeout_s: float) -> bool | None:
+    """Whether `columns` of `table` (a snapshot table and its columns, a joined table's key) hold each value once
+    together among the rows the builder can read, asked of the source through `adapter`, afresh, within `probes`, once
+    per key (its columns in any order): True where the rows holding a key are as many as their distinct keys, False
+    where they are more.
+
+    None where the source said nothing. Not asked, and not remembered: a key of no column, one `holds_null` would not
+    ask of (a column the grants hide, mask or deny, a table they filter by row, any table while a row filter names one
+    the snapshot does not hold), a request Superset refused for good, and a plan whose probe time is spent. Asked and
+    failed, or answered with no two counts, which is remembered, so the plan does not ask again; a failure is logged by
+    its kind alone: a source's words can quote a value."""
+    named = tuple(sorted(set(columns)))
+    if not named or getattr(adapter, "terminal_refusal", None) is not None \
+            or probe_withheld(table, named, snapshot=snapshot, grants=grants):
+        return None
+    key = (table, named)
+    if key in probes.unique:
+        return probes.unique[key]
+    shown = ", ".join(f"{table}.{column}" for column in named)
+    if probes.left_s() <= 0:
+        logger.info("whether %s holds each value once was not asked: the plan's %s s for probes was spent", shown,
+                    probes.budget_s)
+        return None  # not kept: unasked is not unanswered
+    physical = {binding.object_id: binding.source_object for binding in snapshot.source_bindings}
+    sql = unique_statement(physical.get(table, table), named, adapter.dialect)
+
+    def ask(limit: float) -> bool | None:
+        try:
+            result = _Afresh(adapter).execute_arrow(sql, timeout_s=limit)
+            counts = [result.column(0)[0].as_py(), result.column(1)[0].as_py()] \
+                if result.num_rows == 1 and result.num_columns == 2 else None
+        except Exception as exc:  # noqa: BLE001 -- unanswered, the key is not shown to hold each value once
+            logger.info("whether %s holds each value once could not be read (%s); it is not joined on", shown,
+                        type(exc).__name__)
+            return None
+        if counts is None or not all(type(count) is int for count in counts):
+            logger.info("whether %s holds each value once was answered with no two counts; it is not joined on", shown)
+            return None
+        return counts[0] == counts[1]
+
+    probes.unique[key] = probes.timed(ask, timeout_s)
+    return probes.unique[key]
 
 
 def _held(adapter, physical: dict[str, str], table: str, column: str, *, dialect: str | None,

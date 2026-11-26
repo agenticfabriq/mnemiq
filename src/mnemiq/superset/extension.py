@@ -14,12 +14,16 @@ A build needs more than an extension: it needs one that makes every object a bui
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 
-from mnemiq.superset.client import SupersetToolError
+from mnemiq.superset.client import SupersetToolError, SupersetUnavailable
 
 __all__ = ["DATASET_METRICS_BATCH", "EXTENSION_TOOLS", "ExtensionMissing", "ExtensionOutdated", "TOOL_PREFIX",
-           "call_tool", "dashboard_editorship", "dataset_metrics", "require_build_tools", "require_extension"]
+           "call_tool", "dashboard_editorship", "dataset_metrics", "require_build_tools", "require_extension",
+           "row_rule_applies"]
+
+logger = logging.getLogger(__name__)
 
 TOOL_PREFIX = "extensions.agenticfabriq.mnemiq."
 
@@ -147,3 +151,28 @@ def dashboard_editorship(client, dashboard_id: int, *, before_call: Callable[[],
         raise SupersetToolError("the extension's editors_of answered no list of dashboards", detail=str(answer)[:200])
     return next((entry for entry in entries if isinstance(entry, dict) and entry.get("dashboard_id") == dashboard_id),
                 None)
+
+
+def row_rule_applies(client, dataset_id: int) -> bool | None:
+    """Whether a row rule applies to the caller on the dataset, as the extension's `row_rules` answers it, read
+    strictly: the answer must be exactly `{"datasets": [...]}` holding at most this one entry, exactly
+    `{"dataset_id": <this id>, "applies": <a boolean>}`. None where mnemiq cannot tell: anything else (a refusal or a
+    size cut beside it, a malformed or repeated entry, an entry for another dataset, an entry saying more), a dataset
+    left out, or a failure of the call, which is logged. A refusal of the caller is raised, as the client raises it.
+
+    The one reading of `row_rules`, for the value check of a chart on a dataset the build made and for the plan
+    check's measure of a joined table's key."""
+    try:
+        answer = client.call(TOOL_PREFIX + "row_rules", {"dataset_ids": [dataset_id]})
+    except (SupersetUnavailable, SupersetToolError) as failure:
+        logger.warning("the extension's row_rules for dataset %s failed: %s", dataset_id, failure)
+        return None
+    entries = answer.get("datasets") if isinstance(answer, dict) and set(answer) == {"datasets"} else None
+    if not isinstance(entries, list) or len(entries) != 1:
+        return None
+    [entry] = entries
+    if not isinstance(entry, dict) or set(entry) != {"dataset_id", "applies"} \
+            or type(entry["dataset_id"]) is not int or entry["dataset_id"] != dataset_id \
+            or not isinstance(entry["applies"], bool):
+        return None
+    return entry["applies"]

@@ -155,15 +155,21 @@ _POSTGRES_FUNCTIONS = frozenset({"user", "current_role", "system_user"})
 
 
 def carry(metric: SavedMetric, *, table: str, stored: str, columns: Collection[str], qualifier: exp.Identifier,
-          shown: Mapping[str, str]) -> Carried | str:
+          shown: Mapping[str, str], rows_are_base: bool = False) -> Carried | str:
     """`metric`'s expression carried onto a join as `table` defines it, or why it cannot be.
 
     `table` is the table as the snapshot names it and `stored` as Superset stores it: a column the expression names
     with a table names one of these. `columns` are the table's columns the builder can read, `qualifier` the table's
     qualifier in the join (its alias, else its name, with its quoting), and `shown` each of `columns`' name on the
-    joined dataset. The expression reads only its own table's rows, by naming at least one of its columns and no other
-    table's; what it computes is the deciders' to check (`check_measure`). Printed by sqlglot, so the text may differ
-    from the expression's own (`amount::numeric` is `CAST(amount AS DECIMAL)`), both renderings alike."""
+    joined dataset. The expression reads only its own table's rows, by naming no other table's columns, and at least
+    one of its own unless `rows_are_base`; what it computes is the deciders' to check (`check_measure`). Printed by
+    sqlglot, so the text may differ from the expression's own (`amount::numeric` is `CAST(amount AS DECIMAL)`), both
+    renderings alike.
+
+    `rows_are_base` says the join's rows are `table`'s, each once: the caller says so only of a join mnemiq made from
+    `table`, `table` LEFT JOIN tables whose far sides the plan check showed hold each value once. There an expression
+    that names no column (`COUNT(*)`, `SUM(1)`) counts `table`'s rows, as on `table` alone, and is carried as written;
+    on any other join it would count the join's rows, and is refused."""
     expression = metric.expression
     # The joined dataset's measure is a Superset SQL metric, which Superset renders as a template.
     if (marker := next((d for d in JINJA_DELIMITERS if d in expression), None)) is not None:
@@ -197,7 +203,7 @@ def carry(metric: SavedMetric, *, table: str, stored: str, columns: Collection[s
         if resolve_identifier(column.this, SUPERSET_DIALECT) not in columns:
             return (f"it names {column.this.sql(dialect=SUPERSET_DIALECT)}, which {table} does not have or the "
                     "builder cannot read")
-    if not named:
+    if not named and not rows_are_base:
         return f"it names no column of {table}, so on a join it would count the join's rows"
 
     def render(column_for) -> str:

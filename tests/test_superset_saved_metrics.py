@@ -310,10 +310,10 @@ NO_COLUMN = "it names no column of claim, so on a join it would count the join's
 
 
 def _carry(expression: str, *, table: str = "claim", stored: str = "claim", columns=CLAIM,
-           qualifier: exp.Identifier | None = None, shown=None):
+           qualifier: exp.Identifier | None = None, shown=None, **more):
     return carry(_saved("m", expression), table=table, stored=stored, columns=columns,
                  qualifier=exp.to_identifier("c") if qualifier is None else qualifier,
-                 shown=CLAIM_SHOWN if shown is None else shown)
+                 shown=CLAIM_SHOWN if shown is None else shown, **more)
 
 
 @pytest.mark.parametrize("expression, decided, superset", [
@@ -393,6 +393,33 @@ def test_a_column_may_be_qualified_by_the_table_as_superset_stores_it():
 ])
 def test_a_metric_that_cannot_be_carried_is_refused_with_mnemiqs_reason(expression, reason):
     assert _carry(expression) == reason
+
+
+@pytest.mark.parametrize("expression", ["COUNT(*)", "SUM(1)", "COUNT(1)"])
+def test_a_metric_that_names_no_column_is_carried_where_the_joins_rows_are_its_tables(expression):
+    """A join whose rows are claim's, each once (`rows_are_base`: claim LEFT JOIN far sides each shown to hold each
+    value once), counts claim's rows wherever an expression names no column, as claim alone does: the metric is
+    carried as written. Told nothing of the join's rows, or told they are not claim's, carry refuses it."""
+    assert _carry(expression, rows_are_base=True) == Carried(decided=expression, superset=expression)
+    assert _carry(expression, rows_are_base=False) == NO_COLUMN
+    assert _carry(expression) == NO_COLUMN
+
+
+@pytest.mark.parametrize("expression, reason", [
+    ("COUNT({{ rows }})", "it holds {{, which Superset reads as a template marker"),
+    ("COUNT(*), SUM(1)", NOT_ONE),
+    ("COUNT(*) + (SELECT COUNT(*) FROM policy)", OTHER_ROWS),
+    ("COUNT(claim.*)", "it names *"),
+    ("COUNT(*) FILTER (WHERE policy.region = 'north')", "it names policy.region, a column of another table"),
+    ("SUM(premium)", "it names premium, which claim does not have or the builder cannot read"),
+])
+def test_rows_that_are_the_tables_lift_only_the_refusal_of_a_metric_naming_no_column(expression, reason):
+    assert _carry(expression, rows_are_base=True) == reason
+
+
+def test_rows_that_are_the_tables_carry_a_metric_naming_columns_as_any_join_does():
+    assert _carry("SUM(amount) FILTER (WHERE status = 'open')", rows_are_base=True) \
+        == _carry("SUM(amount) FILTER (WHERE status = 'open')")
 
 
 def test_a_column_the_builder_cannot_read_is_refused():
