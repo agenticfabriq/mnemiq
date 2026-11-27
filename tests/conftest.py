@@ -43,6 +43,19 @@ def _superset_dialect_kept(monkeypatch):
     monkeypatch.setattr(superset_settings, "_dialect", superset_settings._dialect)
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _superset_dialect_kept_per_module():
+    """The same, for each module: a module-scoped fixture that boots a server in Superset mode (the live suites'
+    `served`) sets the dialect while the module is set up, before any test's own guard reads it. An autouse module
+    fixture is set up before the module's other module fixtures and torn down after them, so the next module starts
+    with the dialect as this one found it."""
+    from mnemiq.superset import settings as superset_settings
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(superset_settings, "_dialect", superset_settings._dialect)
+        yield
+
+
 @pytest.fixture
 def superset_dialect_as(monkeypatch):
     """Put this test's process in a dialect, as a process that booted for a snapshot read from that database is, for a

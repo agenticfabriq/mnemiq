@@ -135,16 +135,22 @@ def use_superset_dialect(dialect: str) -> None:
 
 SNAPSHOT_REFUSED = ("This deployment's knowledge is not the one enriched for the Superset database it answers from, so "
                     "nothing is answered until an operator enriches it through Superset; mnemiq's log records why.")
+# The same for a deployment that answers from Oracle, whose snapshot an operator enriches directly from Oracle.
+SNAPSHOT_REFUSED_ORACLE = ("This deployment's knowledge is not the one enriched for the Oracle database it answers "
+                           "from, so nothing is answered until an operator enriches it directly from Oracle for "
+                           "Superset mode (`mnemiq enrich --for-superset`); mnemiq's log records why.")
 
 
 class SupersetSnapshotRefused(Exception):
-    """A request refused because the snapshot published for it is one Superset mode will not serve (one the
-    `superset:source` job does not show was enriched through Superset from the configured database and schema). The
-    message is mnemiq's sentence for the person; `detail` says which rule the snapshot failed, which names the
-    deployment's own settings, and goes to the log only."""
+    """A request refused because the snapshot published for it is one Superset mode will not serve (one its
+    `superset:source` or `superset:oracle` job does not show was enriched for the configured database and schema).
+    The message, also `message`, is mnemiq's sentence for the person: the one for the database this deployment answers
+    from, as boot set its dialect, since what an operator does differs. `detail` says which rule the snapshot failed,
+    which names the deployment's own settings, and goes to the log only."""
 
     def __init__(self, detail: str) -> None:
-        super().__init__(SNAPSHOT_REFUSED)
+        self.message = SNAPSHOT_REFUSED_ORACLE if superset_dialect() == "oracle" else SNAPSHOT_REFUSED
+        super().__init__(self.message)
         self.detail = detail
 
 

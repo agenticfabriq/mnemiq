@@ -31,6 +31,8 @@ from mnemiq.enrichment.pipeline import content_version, enrich_structural
 from mnemiq.runtime import SnapshotMissing, build_runtime, superset_source_refusal
 from mnemiq.store.bootstrap import init_store
 from mnemiq.store.snapshot_store import current_version, load_snapshot
+import mnemiq.superset.settings as superset_settings
+from mnemiq.server.superset_refusals import Refused, superset_refusal
 from mnemiq.superset.settings import (
     SNAPSHOT_REFUSED,
     SUPERSET_ORACLE_JOB,
@@ -40,6 +42,7 @@ from mnemiq.superset.settings import (
     use_superset_dialect,
 )
 from tests.superset_fake import FakeSuperset
+from tests.superset_shared import SNAPSHOT_REFUSED as SHARED_SNAPSHOT_REFUSED
 from tests.superset_shared import (
     ORACLE_SCHEMA,
     ORACLE_SCHEMA_SETTING,
@@ -578,11 +581,54 @@ def test_a_swap_to_a_snapshot_read_from_another_database_is_refused(tmp_path, se
     with caplog.at_level("WARNING", logger="mnemiq.runtime"):
         with pytest.raises(SupersetSnapshotRefused) as refused:
             runtime.reload_if_stale()
-    assert str(refused.value) == SNAPSHOT_REFUSED
+    # The person's sentence is the one for the database this server answers from.
+    assert str(refused.value) == {"postgres": SNAPSHOT_REFUSED, "oracle": ORACLE_SNAPSHOT_REFUSED}[boots]
     assert f"read from {published}" in refused.value.detail and "restart" in refused.value.detail
     assert any("restart" in record.getMessage() for record in caplog.records)
     assert runtime.snapshot is serving and superset_dialect() == boots
     assert fake.calls == [] and model.calls == 0
+
+
+# What a person asking a server that answers from Oracle is told when the snapshot published for it is not one it will
+# serve, word for word: what to do differs from PostgreSQL's, whose sentence is unchanged (`superset_shared`).
+ORACLE_SNAPSHOT_REFUSED = ("This deployment's knowledge is not the one enriched for the Oracle database it answers "
+                           "from, so nothing is answered until an operator enriches it directly from Oracle for "
+                           "Superset mode (`mnemiq enrich --for-superset`); mnemiq's log records why.")
+
+
+@pytest.mark.parametrize("published", [[], [_oracle_job(schema="SHOP2")], [_oracle_job(status="failed")],
+                                       [_source_job(schema=ORACLE_SCHEMA_SETTING)]],
+                         ids=["no-job", "another-schema", "not-finished", "read-from-postgresql"])
+def test_a_server_for_oracle_tells_the_person_to_enrich_from_oracle(tmp_path, served, monkeypatch, published):
+    """The sentence a refused swap gives the person, on every door (`superset_refusal`), names what an operator does
+    for this deployment, which answers from Oracle: enrich directly from Oracle for Superset mode."""
+    runtime = build_runtime(_deployment(tmp_path, served, [_oracle_job()]))
+    _swap(runtime, monkeypatch, _snapshot(published, version="v2"))
+    with pytest.raises(SupersetSnapshotRefused) as refused:
+        runtime.reload_if_stale()
+    assert str(refused.value) == refused.value.message == ORACLE_SNAPSHOT_REFUSED
+    assert superset_refusal(refused.value) == Refused(503, ORACLE_SNAPSHOT_REFUSED)
+    assert superset_settings.SNAPSHOT_REFUSED_ORACLE == ORACLE_SNAPSHOT_REFUSED
+
+
+def test_a_server_for_postgresql_tells_the_person_what_it_always_did(tmp_path, served, monkeypatch):
+    runtime = build_runtime(_deployment(tmp_path, served, [_source_job()]))
+    _swap(runtime, monkeypatch, _snapshot([_oracle_job(schema="SHOP2")], version="v2"))
+    with pytest.raises(SupersetSnapshotRefused) as refused:
+        runtime.reload_if_stale()
+    # Word for word as before (`superset_shared.SNAPSHOT_REFUSED` is the literal the HTTP tests read).
+    assert str(refused.value) == refused.value.message == SHARED_SNAPSHOT_REFUSED == SNAPSHOT_REFUSED
+    assert superset_refusal(refused.value) == Refused(503, SHARED_SNAPSHOT_REFUSED)
+
+
+def test_the_schema_setting_is_described_as_superset_shows_the_schema():
+    """On both databases MNEMIQ_SUPERSET_SCHEMA is the schema's name as Superset shows it: on Oracle that is not the
+    name Oracle stores, so the setting is not described by PostgreSQL's storage."""
+    from mnemiq.config import Settings as Configured
+
+    description = Configured.model_fields["superset_schema"].description
+    assert "as Superset shows it" in description and "Oracle" in description
+    assert "spelled as Postgres stores it" not in description
 
 
 def test_a_swap_to_a_newer_oracle_snapshot_is_served(tmp_path, served, monkeypatch):

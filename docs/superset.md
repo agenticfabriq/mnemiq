@@ -161,7 +161,7 @@ requests these scopes too. Open WebUI's own endpoint is not served in Superset m
 |---|---|
 | `MNEMIQ_SUPERSET_MCP_URL` | Superset's MCP service, which `superset mcp run --port 5008` serves at `http://<host>:5008/mcp`. It listens on `127.0.0.1` only unless `--host` names another address, so mnemiq on another host needs `--host`. Setting it turns Superset mode on. |
 | `MNEMIQ_SUPERSET_DATABASE_ID` | The id Superset gives the database mnemiq answers from. |
-| `MNEMIQ_SUPERSET_SCHEMA` | The schema mnemiq reads in that database, its name spelled as PostgreSQL stores it; `public` by default. |
+| `MNEMIQ_SUPERSET_SCHEMA` | The schema mnemiq reads in that database, its name as Superset shows it: on PostgreSQL as stored, on Oracle a name stored in upper case in lower case (`SHOP` as `shop`); `public` by default. |
 | `MNEMIQ_OIDC_ISSUER`, `MNEMIQ_OIDC_AUDIENCE` | Your provider's issuer, and the audience a builder's token carries. Superset's `MCP_JWT_ISSUER` and `MCP_JWT_AUDIENCE` hold the same values. |
 | `MNEMIQ_TENANT` | The tenant every token must carry. |
 | `MNEMIQ_SUPERSET_SERVICE_KEY_FILE` | For `mnemiq enrich` and `mnemiq refresh` only: the file holding the service user's API key. Not a server setting. |
@@ -593,6 +593,7 @@ the builder can do about it, or that nothing they can do is known to help. None 
 | Superset's MCP service answers with an error that is not a refusal, while mnemiq asks what the builder may read, before the answer starts | 503 | "Superset is not set up as mnemiq needs: " and what failed, for example "Superset's MCP service does not offer execute_sql, which Superset mode calls, and which Superset 7.0.0rc2 and later offer unless MCP_DISABLED_TOOLS names it" |
 | Superset does not answer in time, or answers in a way mnemiq cannot read, while mnemiq asks what the builder may read. That is the first thing mnemiq asks Superset for a question or a `/v1/schema` request, so an MCP service that is down or unreachable is answered this way | 503 | "Superset's answer about what this user may read could not be read, so nothing was answered; mnemiq's log records why." |
 | A newer snapshot was not enriched from this database and schema | 503 | "This deployment's knowledge is not the one enriched for the Superset database it answers from, so nothing is answered until an operator enriches it through Superset; mnemiq's log records why." |
+| The same, on a deployment that answers from Oracle | 503 | "This deployment's knowledge is not the one enriched for the Oracle database it answers from, so nothing is answered until an operator enriches it directly from Oracle for Superset mode (`mnemiq enrich --for-superset`); mnemiq's log records why." |
 | A request with no token | 401 | the door's own refusal, as on every `/v1` route, before Superset is asked anything |
 
 - **Once the answer has started, an outage is not a 503.** A tool error is the model's to repair, like a rejected
