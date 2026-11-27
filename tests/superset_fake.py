@@ -27,7 +27,9 @@ from dataclasses import dataclass
 from typing import Any
 
 import anyio
+import sqlglot
 import uvicorn
+from sqlglot import exp
 
 from mnemiq.superset.extension import EXTENSION_TOOLS, TOOL_PREFIX
 
@@ -75,6 +77,50 @@ class RecordingClient:
         if isinstance(answer, Exception):
             raise answer
         return answer
+
+
+def dry_run_as_sent(request: dict) -> dict:
+    """What Superset 7.0.0rc2's `execute_sql` answers a dry run (`dry_run: true`) of a statement it would run as it was
+    sent: no rows, and the statement itself as its `executed_sql`, with the request's `limit`, when it carries one, in
+    place of the statement's own, as rc2's `set_limit_value` puts it (only an Oracle adapter dry-runs with one)."""
+    executed = request["sql"]
+    if request.get("limit") is not None:
+        tree = sqlglot.parse_one(executed, read="oracle")
+        tree.set("limit", exp.Limit(expression=exp.Literal.number(request["limit"])))
+        executed = tree.sql(dialect="oracle")
+    return {"success": True, "rows": None, "columns": None, "row_count": None, "affected_rows": None, "error": None,
+            "error_type": None, "statements": [{"original_sql": request["sql"], "executed_sql": executed,
+                                                "row_count": 0, "data": None}]}
+
+
+def no_table_rule(request: dict) -> dict:
+    """What the extension's `table_rules` answers where no row rule applies to the caller on any table asked; and an
+    empty request, its probe (`extension.require_table_rules`), refused as the extension refuses one."""
+    if "tables" not in request:
+        return {"refused": "the request names no tables"}
+    return {"tables": [{"table": name, "applies": False} for name in request["tables"]]}
+
+
+def answering_dry_runs(handler: Callable) -> Callable:
+    """`handler`, an `execute_sql` answer (a function of the request, and for `FakeSuperset` of its authorization too),
+    with every dry run answered as Superset answers one of a statement it would run as sent (`dry_run_as_sent`): the
+    dry run an Oracle adapter makes before each statement it sends."""
+    def answer(request: dict, *more):
+        return dry_run_as_sent(request) if request.get("dry_run") else handler(request, *more)
+    return answer
+
+
+def as_superset_runs(answer: dict | Exception | Callable[[dict], dict]) -> Callable[[dict], dict]:
+    """`RecordingClient`'s `answer` for every statement run, with the calls an Oracle adapter makes before each
+    statement answered as Superset and the extension answer them: a dry run as sent (`dry_run_as_sent`), and
+    `table_rules` with no row rule (`no_table_rule`). A PostgreSQL adapter makes neither call."""
+    def answering(request: dict):
+        if request.get("dry_run"):
+            return dry_run_as_sent(request)
+        if "sql" not in request and ("tables" in request or request == {}):
+            return no_table_rule(request)
+        return answer(request) if callable(answer) else answer
+    return answering
 
 
 class FakeSuperset:

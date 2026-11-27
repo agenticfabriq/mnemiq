@@ -14,6 +14,13 @@ source as it is now.
 The source's catalogue is read the same way, from Postgres's `pg_catalog` (`mnemiq.superset.pg_catalog`), each part of
 it once per adapter, and each statement with `force_refresh`, so Superset runs it afresh rather than answer from its
 result cache.
+
+On Oracle a statement is sent only as Superset would run it (`mnemiq.superset.executed`): before each `execute_sql`
+the adapter has Superset dry-run the statement with the same options, asks the extension's `table_rules` whether a
+row rule applies to the caller on each table it reads, one call for each schema that holds them, and makes the call
+only when `executed.check_executed` finds that what Superset would run is the statement sent, each such table under
+its rule. That needs extension 0.3.0: a Superset without `table_rules` ends the request (`ExtensionMissing`). On
+PostgreSQL none of this is asked, and each statement is one call, as it always was.
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Callable
 from functools import cached_property
 
 import pyarrow as pa
@@ -41,6 +49,8 @@ from mnemiq.superset.client import (
 )
 from mnemiq.execute.cut import mark_sent
 from mnemiq.sql.guard import MAX_ROWS
+from mnemiq.superset.executed import check_executed, executed_sql, tables_read
+from mnemiq.superset.extension import ExtensionMissing, require_table_rules, table_rules_apply
 from mnemiq.superset.payload import (
     ResultCut,
     SupersetQueryFailed,
@@ -115,12 +125,13 @@ class SupersetSqlAdapter:
         self._schema = schema
         self._timeout_s = timeout_s
         self._refresh_every_statement = refresh_every_statement
-        self._terminal_refusal: SupersetRefusal | None = None
+        self._terminal_refusal: SupersetRefusal | ExtensionMissing | None = None
 
     @property
-    def terminal_refusal(self) -> SupersetRefusal | None:
+    def terminal_refusal(self) -> SupersetRefusal | ExtensionMissing | None:
         """The refusal the request this adapter serves ends as, or None: of the `TERMINAL_REFUSALS` any statement it
-        sent was refused with, a refusal of the caller if there was one, else the first.
+        sent was refused with, and on Oracle a Superset without the extension's `table_rules` (`ExtensionMissing`), a
+        refusal of the caller if there was one, else the first.
 
         The query runner reads each of them as a source that did not answer, the proof seam as one it could not ask,
         and the function inventory as one it could not read, so the refusal's own kind survives only here. Each stays
@@ -231,8 +242,24 @@ class SupersetSqlAdapter:
 
     def dry_run(self, sql: str) -> None:
         """Have Superset check `sql` and prepare it without running it. A refusal raises what the same refusal raises
-        from a run; a dry run Superset accepts returns nothing, whatever its payload carries."""
+        from a run; a dry run Superset accepts returns nothing, whatever its payload carries. On Oracle the dry run is
+        the one every statement is checked by, and a statement mnemiq would not send raises as from a run."""
         check_execute_response(self._execute_sql(sql, None, dry_run=True))
+
+    def confirm_sent(self, sent: str, *, before_call: Callable[[], None] | None = None) -> None:
+        """On Oracle, return when Superset would run `sent`, a statement as `names.for_superset` writes it, as mnemiq
+        reads it, each table under the row rules that may apply to the caller, checked as every statement the adapter
+        sends is (`executed.check_executed`), and no real call made: the door for SQL that Superset keeps and runs
+        later, a virtual dataset's. Raises `RefusedStatement` where mnemiq would not send it, and what Superset's own
+        refusal of the dry run raises from a run. `before_call` runs once before the first call. On PostgreSQL nothing
+        is asked and nothing runs."""
+        if self.dialect != "oracle":
+            return
+        if before_call is not None:
+            before_call()
+        limit = _superset_timeout(self._timeout_s)
+        self._as_superset_runs(sent, {"database_id": self._database_id, "sql": sent, "schema": self._schema,
+                                      "timeout": limit}, limit)
 
     def source_unavailable(self, exc: BaseException) -> bool:
         """The proof seam's question: did the source not answer, rather than answer no.
@@ -241,8 +268,10 @@ class SupersetSqlAdapter:
         not permit the tool, stays refused however the statement is rewritten, so it ends the turn rather than reaching
         the repair loop. A time limit reached and a cancel are unanswered at the proof too, as `QueryCancelled` has
         it; the runner asks for both before it asks this, so there they stay the statement's cost and the cancel.
-        Superset's refusal of a table, a result cut to size and a tool error are answers, which the model repairs."""
-        return isinstance(exc, (SupersetUnavailable, SupersetRefusal, QueryTimedOut, QueryCancelled))
+        Superset's refusal of a table, a result cut to size, a tool error and a statement mnemiq did not send are
+        answers, which the model repairs. On Oracle a Superset without the extension's `table_rules` is not: no
+        rewrite of a statement gets past it."""
+        return isinstance(exc, (SupersetUnavailable, SupersetRefusal, QueryTimedOut, QueryCancelled, ExtensionMissing))
 
     def introspect(self) -> list[str]:
         return list(self._tables)
@@ -344,6 +373,17 @@ class SupersetSqlAdapter:
             request["limit"] = row_limit  # Superset sets it as the statement's LIMIT, in place
         if force_refresh or self._refresh_every_statement:
             request["force_refresh"] = True
+        if self.dialect == "oracle":
+            try:
+                checked = self._as_superset_runs(sql, request, limit)
+            except RefusedStatement as exc:
+                raise SupersetQueryFailed(str(exc)) from exc
+            if dry_run:
+                return checked  # the dry run asked for is the one the statement was checked by
+        return self._call(request, limit)
+
+    def _call(self, request: dict, limit: int) -> dict:
+        """`execute_sql` with `request`, its answer as Superset sent it."""
         try:
             return self.client.call("execute_sql", request, timeout_s=limit + TRANSPORT_MARGIN_S)
         except SupersetCallTimedOut as exc:
@@ -352,10 +392,52 @@ class SupersetSqlAdapter:
             # as Superset's own `timed_out` answer is, never Superset being unavailable.
             raise QueryTimedOut("the statement was still running in Superset past its time limit") from exc
         except TERMINAL_REFUSALS as exc:
-            kept = self._terminal_refusal
-            if kept is None or (isinstance(exc, SupersetRefusedCaller) and not isinstance(kept, SupersetRefusedCaller)):
-                self._terminal_refusal = exc
+            self._remember(exc)
             raise
+
+    def _remember(self, exc: SupersetRefusal | ExtensionMissing) -> None:
+        """Keep `exc` as the refusal the request ends as (`terminal_refusal`): the first, unless a refusal of the
+        caller comes later."""
+        kept = self._terminal_refusal
+        if kept is None or (isinstance(exc, SupersetRefusedCaller) and not isinstance(kept, SupersetRefusedCaller)):
+            self._terminal_refusal = exc
+
+    def _as_superset_runs(self, sent: str, request: dict, limit: int) -> dict:
+        """Superset's dry run of `request` (the statement `sent`, with the options its real call carries), when
+        `executed.check_executed` finds that Superset would run it as mnemiq reads it under the rules `table_rules`
+        says apply to the caller. Raises `RefusedStatement` when it does not, and what Superset's own refusal of the
+        dry run raises from a run."""
+        payload = self._call({**request, "dry_run": True}, limit)
+        check_execute_response(payload)
+        executed = executed_sql(payload)
+        check_executed(sent, executed, rules=self._table_rules(sent), dialect=self.dialect,
+                       limit=request.get("limit"))
+        return payload
+
+    def _table_rules(self, sent: str) -> dict[str, bool | None]:
+        """Whether a row rule applies to the caller on each table `sent` reads (`executed.tables_read`), as the
+        extension's `table_rules` answers: one call for each schema that holds them, a table the statement does not
+        qualify in the adapter's schema, as Superset qualifies it. A table named by a catalog, or by no plain name, is
+        not asked about, and reads as one mnemiq cannot tell of. Where any reads so, the extension is asked whether
+        it offers `table_rules` at all; one that does not ends the request (`ExtensionMissing`), and so does a refusal
+        of the caller."""
+        read = tables_read(sent, dialect=self.dialect)
+        by_schema: dict[str, list[str]] = {}
+        for catalog, schema, name in read.values():
+            if not catalog and name:
+                by_schema.setdefault(schema or self._schema, []).append(name)
+        try:
+            answers = {schema: table_rules_apply(self.client, database_id=self._database_id, schema=schema,
+                                                 tables=names)
+                       for schema, names in by_schema.items()}
+            rules = {key: answers[schema or self._schema].get(name) if not catalog and name else None
+                     for key, (catalog, schema, name) in read.items()}
+            if None in rules.values():
+                require_table_rules(self.client)
+        except (*TERMINAL_REFUSALS, ExtensionMissing) as exc:
+            self._remember(exc)
+            raise
+        return rules
 
 
 def _refuse_template_markers(sql: str) -> None:

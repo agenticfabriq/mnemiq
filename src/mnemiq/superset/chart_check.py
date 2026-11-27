@@ -83,6 +83,7 @@ from mnemiq.superset.extension import row_rule_applies
 from mnemiq.superset.display_format import CANNOT_TELL, Displayed, displayed, fits, metric_label, shows_currency
 from mnemiq.superset.measures import Measure, MeasureKind, measure_statement, run_decided
 from mnemiq.superset.names import RefusedStatement, UnreadableStatement, for_superset
+from mnemiq.superset.payload import SupersetAccessRefused, SupersetQueryFailed
 from mnemiq.superset.saved_metrics import SavedMetric
 from mnemiq.superset.settings import superset_dialect
 
@@ -872,6 +873,8 @@ _RULE_APPLIES = ("a row rule applies to you on the chart's dataset, and mnemiq's
                  "which that rule does not narrow, so mnemiq does not compare")
 _SQL_UNSHOWN = ("Superset did not show the SQL of the chart's dataset, which this build made, so mnemiq does not check "
                 "it with its own SQL")
+_DRY_RUN_REFUSED = ("Superset refused the SQL of the chart's dataset, which this build made, when mnemiq asked how it "
+                    "would run it, so mnemiq does not check it with its own SQL; why is in the log")
 _RULES_UNKNOWN = ("mnemiq could not tell whether a row rule applies to you on the chart's dataset, so it does not "
                   "check it with its own SQL")
 
@@ -937,6 +940,16 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
             return not_checked(_RULES_UNKNOWN)
         if applies:
             return not_checked(_RULE_APPLIES)
+        # On Oracle, Superset's own dry run of the SQL it holds says whether it would run it as mnemiq reads it.
+        try:
+            adapter.confirm_sent(sent, before_call=before_call)
+        except RefusedStatement as exc:
+            return not_checked(f"the chart's dataset is one this build made with SQL Superset would not run as mnemiq "
+                               f"reads it ({exc}), so mnemiq does not check it with its own SQL")
+        except (SupersetAccessRefused, SupersetQueryFailed) as exc:
+            logger.warning("the value check: Superset refused the dry run of chart %s's dataset's SQL (%s): %s",
+                           chart_id, type(exc).__name__, exc)
+            return not_checked(_DRY_RUN_REFUSED)
         source = _virtual_source(made[dataset.dataset_id])
     own = source is not None or not dataset.is_virtual
     if not own:
@@ -1067,7 +1080,8 @@ def check_chart(adapter, *, chart_id: int, dataset_id: int, kinds: dict[str, Mea
     Superset's spelling (`for_superset`). A virtual dataset is never checked with mnemiq's own SQL, except one in
     `made` whose SQL Superset holds as it was sent and on which no row rule applies
     to the caller (the extension's `row_rules`); when one applies, or mnemiq cannot tell, its statement is not run and
-    the chart is not checked."""
+    the chart is not checked. On Oracle that SQL must also be SQL Superset's own dry run says it would run as mnemiq
+    reads it (`SupersetSqlAdapter.confirm_sent`), or the chart is not checked, saying why."""
     client = adapter.client if before_call is None else _BeforeEachCall(adapter.client, before_call)
     read = _read_chart(client, chart_id)
     if isinstance(read, NotCheckable):

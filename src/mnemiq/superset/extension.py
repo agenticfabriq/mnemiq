@@ -9,7 +9,8 @@ cannot settle it either. `require_extension` settles it by one call of a probe: 
 the installed extension answers with an empty list and never fails on. `call_tool` asks it once a call fails that way.
 
 A build needs more than an extension: it needs one that makes every object a build makes, which an older one does not.
-`require_build_tools` asks for that before a build is planned (`ExtensionOutdated`).
+`require_build_tools` asks for that before a build is planned (`ExtensionOutdated`), and `require_table_rules` asks
+for the extension's `table_rules`, which every statement Superset mode sends on Oracle needs.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from mnemiq.superset.client import SupersetToolError, SupersetUnavailable
 
 __all__ = ["DATASET_METRICS_BATCH", "EXTENSION_TOOLS", "ExtensionMissing", "ExtensionOutdated", "TABLE_RULES_BATCH",
            "TOOL_PREFIX", "call_tool", "dashboard_editorship", "dataset_metrics", "require_build_tools",
-           "require_extension", "row_rule_applies", "table_rules_apply"]
+           "require_extension", "require_table_rules", "row_rule_applies", "table_rules_apply"]
 
 logger = logging.getLogger(__name__)
 
@@ -61,13 +62,16 @@ class ExtensionMissing(RuntimeError):
 
 
 class ExtensionOutdated(ExtensionMissing):
-    """Superset offers the extension, but one older than this mnemiq, without a tool a build calls. Answered as a
-    missing extension is, with its own sentence; what Superset said is in `.detail` only."""
+    """Superset offers the extension, but one older than this mnemiq, without a tool `needed_by` calls (a build, by
+    default). Answered as a missing extension is, with its own sentence; what Superset said is in `.detail` only."""
 
-    @staticmethod
-    def _said(tool: str) -> str:
-        return (f"Superset's mnemiq extension is older than this mnemiq and does not offer {tool}, which a build calls: "
-                "update the extension installed there")
+    def __init__(self, tool: str, *, detail: str = "", needed_by: str = "a build") -> None:
+        self.needed_by = needed_by
+        super().__init__(tool, detail=detail)
+
+    def _said(self, tool: str) -> str:
+        return (f"Superset's mnemiq extension is older than this mnemiq and does not offer {tool}, which "
+                f"{self.needed_by} calls: update the extension installed there")
 
 
 def _is_not_offered(tool: str, failure: SupersetToolError) -> bool:
@@ -95,17 +99,27 @@ def require_build_tools(client) -> None:
     without touching Superset. A Superset that does not offer it is asked the extension's own probe: with no extension
     at all, `ExtensionMissing`; with one, it is older than this mnemiq (`ExtensionOutdated`). Any answer other than
     the refusal raises `SupersetToolError`, and any other failure is raised as the client raised it."""
-    tool = TOOL_PREFIX + _BUILD_PROBE
+    _require_tool(client, _BUILD_PROBE, needed_by="a build")
+
+
+def require_table_rules(client) -> None:
+    """Return when Superset offers the extension's `table_rules` (extension 0.3.0 and later), as `require_build_tools`
+    asks for a build's tools: one call of it with an empty request, which it refuses without touching Superset, and
+    `ExtensionMissing` or `ExtensionOutdated` when Superset does not offer it."""
+    _require_tool(client, "table_rules", needed_by="Superset mode on Oracle")
+
+
+def _require_tool(client, base: str, *, needed_by: str) -> None:
+    tool = TOOL_PREFIX + base
     try:
         answer = client.call(tool, {})
     except SupersetToolError as failure:
         if not _is_not_offered(tool, failure):
             raise
         require_extension(client)
-        raise ExtensionOutdated(tool, detail=failure.detail) from None
+        raise ExtensionOutdated(tool, detail=failure.detail, needed_by=needed_by) from None
     if not (isinstance(answer, dict) and "refused" in answer):
-        raise SupersetToolError(f"the extension's {_BUILD_PROBE} did not refuse an empty request",
-                                detail=str(answer)[:200])
+        raise SupersetToolError(f"the extension's {base} did not refuse an empty request", detail=str(answer)[:200])
 
 
 def call_tool(client, base: str, request: dict, *, before_call: Callable[[], None] | None = None) -> dict:

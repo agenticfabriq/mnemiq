@@ -33,7 +33,7 @@ from mnemiq.superset.client import (
 )
 from mnemiq.superset.payload import ResultCut, SupersetAccessRefused, SupersetQueryFailed
 from mnemiq.superset.settings import superset_dialect
-from tests.superset_fake import FakeSuperset, RecordingClient
+from tests.superset_fake import FakeSuperset, RecordingClient, as_superset_runs
 
 SQL = "SELECT region, count(*) AS policy_count FROM policies GROUP BY region"
 REGION_COUNTS = {"success": True, "rows": [{"region": "west", "policy_count": 16666}],
@@ -53,12 +53,23 @@ def _failed(error_type: str, error: str = "Superset's own words") -> dict:
     return {"success": False, "rows": None, "columns": None, "error": error, "error_type": error_type}
 
 
-def _adapter(answer: dict | Exception | list = REGION_COUNTS, **kwargs) -> SupersetSqlAdapter:
-    """The adapter over a recording client answering `answer`, or each of a list of answers in turn."""
+def _adapter(answer: dict | Exception | list = REGION_COUNTS, *, oracle_checks: bool = False,
+             **kwargs) -> SupersetSqlAdapter:
+    """The adapter over a recording client answering `answer`, or each of a list of answers in turn. With
+    `oracle_checks`, the dry run and the `table_rules` call an Oracle adapter makes before each statement are answered
+    as Superset answers them for a statement it runs as sent (`as_superset_runs`), and the answers are the statements'
+    own."""
     if isinstance(answer, list):
         pending = list(answer)
         answer = lambda request: pending.pop(0)  # noqa: E731
+    if oracle_checks:
+        answer = as_superset_runs(answer)
     return SupersetSqlAdapter(RecordingClient(answer), database_id=7, schema="sales", **kwargs)
+
+
+def _runs(adapter: SupersetSqlAdapter) -> list:
+    """The `execute_sql` calls that ran a statement: not a dry run, nor any other tool's call."""
+    return [call for call in adapter.client.calls if call.tool == "execute_sql" and not call.request.get("dry_run")]
 
 
 def test_request_names_database_schema_and_timeout():
@@ -176,19 +187,19 @@ PROBES = {"postgres": f"SELECT * FROM ({SQL}) AS mnemiq_probe WHERE 1 = 0",
 def test_validate_probe_has_no_as_before_its_alias(dialect):
     """Under Superset mode's Oracle dialect the probe is sent as every statement is, its table aliased by its own name
     (`names.for_superset`)."""
-    adapter = _adapter(_answer_with_no_rows())
+    adapter = _adapter(_answer_with_no_rows(), oracle_checks=True)
     assert adapter.dialect == dialect
     adapter.validate(f"{SQL};\n")
     sent = PROBES["postgres"] if dialect == "postgres" else \
         PROBES["oracle"].replace("FROM policies", 'FROM policies "POLICIES"')
-    assert adapter.client.calls[0].request["sql"] == sent
+    assert [call.request["sql"] for call in _runs(adapter)] == [sent]
 
 
 def test_the_probe_follows_the_adapters_own_dialect():
     """An adapter built for a dialect it names writes that dialect's probe, whatever Superset mode's is."""
-    adapter = _adapter(_answer_with_no_rows(), dialect="oracle")
+    adapter = _adapter(_answer_with_no_rows(), dialect="oracle", oracle_checks=True)
     adapter.validate(SQL)
-    assert adapter.client.calls[0].request["sql"] == PROBES["oracle"]
+    assert [call.request["sql"] for call in _runs(adapter)] == [PROBES["oracle"]]
 
 
 def test_validate_raises_what_superset_refuses():
@@ -565,9 +576,9 @@ def test_outer_limit_on_postgres_reads_its_limit_as_it_did(sql, bound):
 def test_an_oracle_answer_too_large_is_asked_again_below_its_fetch_first(superset_oracle, sql, asked):
     """On Oracle the deciders bound every statement with FETCH FIRST, so an answer refused as too large is asked again
     below it, as a LIMIT is on PostgreSQL."""
-    adapter = _adapter([TOO_LARGE, _rows(asked)])
+    adapter = _adapter([TOO_LARGE, _rows(asked)], oracle_checks=True)
     table = adapter.execute_answer(sql)
-    first, second = adapter.client.calls
+    first, second = _runs(adapter)
     assert "limit" not in first.request and second.request["limit"] == asked
     assert sent_of(table) == asked
 
@@ -575,9 +586,9 @@ def test_an_oracle_answer_too_large_is_asked_again_below_its_fetch_first(superse
 def test_an_answer_reads_its_row_limit_in_the_adapters_own_dialect():
     """An adapter built for Oracle reads FETCH FIRST whatever Superset mode's dialect is, as it writes its probe."""
     assert superset_dialect() != "oracle"
-    adapter = _adapter([TOO_LARGE, _rows(6)], dialect="oracle")
+    adapter = _adapter([TOO_LARGE, _rows(6)], dialect="oracle", oracle_checks=True)
     adapter.execute_answer("SELECT region FROM policies FETCH FIRST 10 ROWS ONLY")
-    assert adapter.client.calls[1].request["limit"] == 6
+    assert _runs(adapter)[1].request["limit"] == 6
 
 
 def test_a_statement_whose_limit_cannot_be_read_is_not_asked_again():
@@ -660,10 +671,10 @@ def _counts(request: dict) -> dict:
 def test_profiling_through_an_oracle_adapter_leaves_its_large_objects_out_of_counts(superset_oracle):
     """Profiling reads the adapter's types in place of its own: a CLOB is never counted, a VARCHAR2 is. The table is
     sent as Superset names it (`names.for_superset`)."""
-    adapter = _adapter(_counts)
+    adapter = _adapter(_counts, oracle_checks=True)
     stats = profile_table(adapter, TableInfo("DOCS", [ColumnInfo("ID", "NUMBER"), ColumnInfo("BODY", "CLOB"),
                                                       ColumnInfo("TITLE", "VARCHAR2(200)")]))
-    sent = [call.request["sql"] for call in adapter.client.calls]
+    sent = [call.request["sql"] for call in _runs(adapter)]
     assert sent == ['SELECT count(*), count(DISTINCT "ID"), count("ID"), count(DISTINCT "TITLE"), count("TITLE") '
                     'FROM docs "DOCS"']
     assert {s.column: s.measurement for s in stats}["BODY"] == UNSUPPORTED

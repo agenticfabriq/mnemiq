@@ -36,11 +36,13 @@ from mnemiq.superset.names import (
     stored_name,
     superset_name,
 )
+from mnemiq.superset.extension import TOOL_PREFIX
 from mnemiq.superset.payload import SupersetQueryFailed
 from mnemiq.superset.planner import BuildPlan, PlannedDataset
 from mnemiq.superset.superset_reads import superset_reads
 from mnemiq.sql.identifiers import resolve_identifier
 from mnemiq.sql.scope import base_tables
+from tests.superset_fake import answering_dry_runs, as_superset_runs, no_table_rule
 
 # SQLAlchemy 2.0.52's Oracle dialect (Superset 7.0.0rc2's) on each name: `normalize_name` and `denormalize_name`, as it
 # answered them, not as this module computes them. `test_the_mapping_is_sqlalchemys_where_it_is_installed` asks it
@@ -747,15 +749,24 @@ def test_from_superset_writes_each_table_as_the_database_reads_it(superset_oracl
 # ---------------------------------------------------------------- the adapter
 
 class _Recorder:
-    """A Superset client answering every `execute_sql` with no rows, each request kept."""
+    """A Superset client answering every `execute_sql` with no rows, each request kept; the dry run and the
+    extension's `table_rules` an Oracle adapter asks before each statement answered as for a statement Superset runs
+    as sent, under no row rule (`as_superset_runs`)."""
 
     def __init__(self) -> None:
         self.requests: list[dict] = []
+        self._answer = as_superset_runs({"success": True, "columns": [], "rows": []})
 
     def call(self, tool: str, request: dict, *, timeout_s: float | None = None) -> dict:
-        assert tool == "execute_sql"
-        self.requests.append(dict(request))
-        return {"success": True, "columns": [], "rows": []}
+        if tool != TOOL_PREFIX + "table_rules":
+            assert tool == "execute_sql"
+            self.requests.append(dict(request))
+        return self._answer(request)
+
+    @property
+    def runs(self) -> list[dict]:
+        """The requests that ran a statement: not a dry run."""
+        return [request for request in self.requests if not request.get("dry_run")]
 
 
 def test_the_adapter_sends_each_statement_in_supersets_spelling(superset_oracle):
@@ -767,11 +778,13 @@ def test_the_adapter_sends_each_statement_in_supersets_spelling(superset_oracle)
     adapter.execute_answer('SELECT "REVENUE" FROM "ORDERS" FETCH FIRST 5 ROWS ONLY')
     adapter.validate('SELECT "REVENUE" FROM "ORDERS"')
     adapter.dry_run('SELECT 1 FROM "ORDERS", "OrderItems" WHERE 1 = 0')
-    assert [request["sql"] for request in client.requests] == [
-        'SELECT "REVENUE" FROM orders "ORDERS"',
-        'SELECT "REVENUE" FROM orders "ORDERS" FETCH FIRST 5 ROWS ONLY',
-        'SELECT * FROM (SELECT "REVENUE" FROM orders "ORDERS") mnemiq_probe WHERE 1 = 0',
-        'SELECT 1 FROM orders "ORDERS", "OrderItems" "OrderItems" WHERE 1 = 0']
+    sent = ['SELECT "REVENUE" FROM orders "ORDERS"', 'SELECT "REVENUE" FROM orders "ORDERS" FETCH FIRST 5 ROWS ONLY',
+            'SELECT * FROM (SELECT "REVENUE" FROM orders "ORDERS") mnemiq_probe WHERE 1 = 0',
+            'SELECT 1 FROM orders "ORDERS", "OrderItems" "OrderItems" WHERE 1 = 0']
+    # Each statement run is dry-run first, as it is sent (`executed`); the dry run asked for is the check's own.
+    assert [request["sql"] for request in client.requests] == [sent[0], sent[0], sent[1], sent[1], sent[2], sent[2],
+                                                               sent[3]]
+    assert [request["sql"] for request in client.runs] == sent[:3]
     assert {request["schema"] for request in client.requests} == {"shop"}
 
 
@@ -887,12 +900,14 @@ def test_every_boundary_uses_the_mapping(superset_oracle):
 
 def test_the_builder_sends_a_joined_datasets_sql_in_supersets_spelling(superset_oracle, monkeypatch):
     """rc2 applies the row rules of a virtual dataset's tables to every query of it, so the SQL a joined dataset is made
-    from names them as Superset does; the plan keeps the SQL mnemiq decided, which the check reads the dataset with
-    (`made_virtual_sql`)."""
+    from names them as Superset does, and is confirmed first as Superset would run it (`confirm_sent`); the plan keeps
+    the SQL mnemiq decided, which the check reads the dataset with (`made_virtual_sql`)."""
     import mnemiq.superset.builder as builder
 
     sent: list[dict] = []
+    confirmed: list[str] = []
     monkeypatch.setattr(builder, "_created", lambda run, tool, request, **more: sent.append(request) or 21)
+    adapter = SimpleNamespace(database_id=7, schema="shop", confirm_sent=lambda sql, **more: confirmed.append(sql))
     decided = 'SELECT "O"."ID" AS "ID" FROM "ORDERS" "O" LEFT JOIN "CUSTOMERS" "C" ON "C"."ID" = "O"."CUSTOMER_ID"'
     joined = PlannedDataset(key="dataset_1", placeholder=-1, join='"ORDERS" "O" LEFT JOIN "CUSTOMERS" "C" ON 1 = 1',
                             sql=decided, name="mnemiq_dataset_1:ORDERS_CUSTOMERS")
@@ -900,9 +915,10 @@ def test_the_builder_sends_a_joined_datasets_sql_in_supersets_spelling(superset_
     plan = BuildPlan(charts=(), measures=(), datasets=(joined, table))
     build = SimpleNamespace(build_id=str(uuid.uuid4()), dashboard_id=3)
     for key in ("dataset_1", "dataset_2"):
-        builder._run_dataset(SimpleNamespace(build=build, plan=plan, key=key, adapter=ADAPTER))
+        builder._run_dataset(SimpleNamespace(build=build, plan=plan, key=key, adapter=adapter, renew=lambda: None))
     assert sent[0]["sql"] == ('SELECT "O"."ID" AS "ID" FROM orders "O" LEFT JOIN customers "C" '
                               'ON "C"."ID" = "O"."CUSTOMER_ID"')
+    assert confirmed == [sent[0]["sql"]]
     assert sent[1]["table_name"] == "orders" and "sql" not in sent[1]
     assert (sent[0]["schema"], sent[1]["schema"]) == ("shop", "shop")
 
@@ -1000,8 +1016,11 @@ def _checked(fake, monkeypatch, chart: dict, *, made: dict | None = None):
                                                                            *rows))
     # Oracle names an unquoted alias in upper case (`AS m0` comes back M0): mnemiq reads its rows by position.
     answer = _result(*rows, columns=(("REGION", "object"), ("M0", "int64")))
-    fake.reply("execute_sql", lambda request, authorization: {"success": True, "columns": [], "rows": []}
-               if request.get("force_refresh") or _PROBE.search(request["sql"]) else answer)
+    fake.reply("execute_sql", answering_dry_runs(lambda request, authorization: {"success": True, "columns": [],
+                                                                                "rows": []}
+                                                 if request.get("force_refresh") or _PROBE.search(request["sql"])
+                                                 else answer))
+    fake.reply(TOOL_PREFIX + "table_rules", lambda request, authorization: no_table_rule(request))
     _rules(fake, _no_rule)
     decided: list[str] = []
     real = chart_check.run_decided
@@ -1010,7 +1029,7 @@ def _checked(fake, monkeypatch, chart: dict, *, made: dict | None = None):
     check = chart_check.check_chart(adapter, chart_id=41, dataset_id=12,
                                     kinds={"Total premium": MeasureKind.NUMBER}, saved={}, snapshot=ORACLE_SNAPSHOT,
                                     grants=ORACLE_GRANTS, guard_fanout=False, made=made or {})
-    sent = [call.request["sql"] for call in fake.calls if call.tool == "execute_sql"
+    sent = [call.request["sql"] for call in fake.calls if call.tool == "execute_sql" and not call.request.get("dry_run")
             and not call.request.get("force_refresh") and not _PROBE.search(call.request["sql"])]
     return decided, sent, check
 

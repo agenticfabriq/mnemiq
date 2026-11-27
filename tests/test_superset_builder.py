@@ -927,6 +927,77 @@ def test_a_datasets_sql_mnemiq_does_not_send_fails_its_step(fake, world, store, 
                               "the build makes"), reread.message
 
 
+# A virtual dataset's SQL on Oracle, as the build decides it, and as `for_superset` sends it.
+ORACLE_MADE = 'SELECT "PREMIUM" AS "premium" FROM "POLICY" WHERE "REGION" = \'west\''
+ORACLE_SENT = 'SELECT "PREMIUM" AS "premium" FROM policy "POLICY" WHERE "REGION" = \'west\''
+
+
+def _dry_run_answer(executed: str):
+    """The world's `execute_sql` answering a dry run with `executed` as the statement Superset would run."""
+    def instead(request, _world):
+        if not request.get("dry_run"):
+            return None
+        return {"success": True, "rows": None, "columns": None,
+                "statements": [{"original_sql": request["sql"], "executed_sql": executed, "row_count": 0}]}
+    return Hook(instead=instead)
+
+
+def test_a_datasets_sql_superset_would_run_otherwise_fails_its_step(fake, world, store, superset_oracle):
+    """On Oracle the SQL of a dataset the build makes is dry-run in Superset first, as the build sends it, and checked
+    as every statement mnemiq sends there is (`executed`): SQL Superset would run otherwise than mnemiq reads it fails
+    the dataset's step with mnemiq's reason, and nothing is made."""
+    plan = dataclasses.replace(ONE_VIRTUAL, datasets=(dataclasses.replace(JOINED, sql=ORACLE_MADE),))
+    build = _start(store, plan).build_id
+    _run_to(store, build, _adapter(fake), "dataset_1")
+    world.hooks["execute_sql"] = _dry_run_answer(ORACLE_SENT.replace("'west'", "'east'"))
+    stopped = _next(store, build, _adapter(fake))
+    assert stopped.status == "failed" and _step(stopped, "dataset_1").reason == "statement_refused", stopped
+    assert "Superset would run a different statement" in stopped.message and "'west'" in stopped.message
+    assert "the dataset 'mnemiq_" in stopped.message, stopped.message
+    [dry_run] = world.calls("execute_sql")
+    assert dry_run.request["dry_run"] is True and dry_run.request["sql"] == ORACLE_SENT
+    assert world.calls("create_dataset") == []
+
+
+def test_a_datasets_sql_superset_refuses_at_its_dry_run_fails_its_step_without_its_words(fake, world, store,
+                                                                                        superset_oracle):
+    """Superset's own refusal of the dry run fails the step too; its words, which can name a table the builder may not
+    see, stay in the log."""
+    plan = dataclasses.replace(ONE_VIRTUAL, datasets=(dataclasses.replace(JOINED, sql=ORACLE_MADE),))
+    build = _start(store, plan).build_id
+    _run_to(store, build, _adapter(fake), "dataset_1")
+    world.hooks["execute_sql"] = Hook(instead=lambda request, _w: {
+        "success": False, "error": "Disallowed SQL tables: hidden_table", "error_type": "INVALID_SQL_ERROR"}
+        if request.get("dry_run") else None)
+    stopped = _next(store, build, _adapter(fake))
+    assert stopped.status == "failed" and _step(stopped, "dataset_1").reason == "statement_refused", stopped
+    assert "mnemiq's log says why" in stopped.message and "hidden_table" not in stopped.message, stopped.message
+    assert world.calls("create_dataset") == []
+
+
+def test_a_datasets_sql_is_made_only_once_superset_would_run_it_as_sent(fake, world, store, superset_oracle):
+    """The dry run and the row rules of the tables it reads come before the create, which carries the text dry-run."""
+    plan = dataclasses.replace(ONE_VIRTUAL, datasets=(dataclasses.replace(JOINED, sql=ORACLE_MADE),))
+    build = _start(store, plan).build_id
+    _run_to(store, build, _adapter(fake), "dataset_1")
+    fake.calls.clear()
+    made = _next(store, build, _adapter(fake))
+    assert _step(made, "dataset_1").status == "done", made
+    assert _tools(fake)[:3] == ["execute_sql", "table_rules", "create_dataset"], _tools(fake)
+    [dry_run] = world.calls("execute_sql")
+    [create] = world.calls("create_dataset")
+    assert dry_run.request["dry_run"] is True and dry_run.request["sql"] == create.request["sql"] == ORACLE_SENT
+
+
+def test_a_datasets_sql_is_not_dry_run_on_postgres(fake, world, store):
+    """On PostgreSQL the create is the dataset step's only call to Superset, as it always was."""
+    build = _start(store, ONE_VIRTUAL).build_id
+    _run_to(store, build, _adapter(fake), "dataset_1")
+    fake.calls.clear()
+    _next(store, build, _adapter(fake))
+    assert "execute_sql" not in _tools(fake) and "table_rules" not in _tools(fake), _tools(fake)
+
+
 def test_a_build_calls_no_mcp_create_claim_or_patch(fake, world, store):
     """A whole six-chart build, a dataset made for its table among its steps: every object is made by the extension's
     creates, and the build never calls MCP's `generate_chart`, `create_dataset` or `create_virtual_dataset`, a claim,

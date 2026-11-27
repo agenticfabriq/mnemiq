@@ -1,0 +1,184 @@
+{
+ "superset": "7.0.0",
+ "sqlglot": "30.17.0",
+ "schema": "shop",
+ "clause": "region = 'west'",
+ "cases": {
+  "one table under its rule": {
+   "sent": "SELECT o.id, o.status FROM orders \"O\" WHERE o.status = 'open'",
+   "ruled": [
+    "orders"
+   ],
+   "limit": null,
+   "executed": "SELECT\n  o.id,\n  o.status\nFROM (\n  SELECT\n    *\n  FROM orders\n  WHERE\n    region = 'west'\n) \"O\"\nWHERE\n  o.status = 'open'"
+  },
+  "one table with no rule": {
+   "sent": "SELECT o.id, o.status FROM orders \"O\" WHERE o.status = 'open'",
+   "ruled": [],
+   "limit": null,
+   "executed": "SELECT\n  o.id,\n  o.status\nFROM orders \"O\"\nWHERE\n  o.status = 'open'"
+  },
+  "a join, one table ruled": {
+   "sent": "SELECT o.id, c.name FROM orders \"O\" JOIN customers \"C\" ON c.id = o.customer_id",
+   "ruled": [
+    "orders"
+   ],
+   "limit": null,
+   "executed": "SELECT\n  o.id,\n  c.name\nFROM (\n  SELECT\n    *\n  FROM orders\n  WHERE\n    region = 'west'\n) \"O\"\nJOIN customers \"C\"\n  ON c.id = o.customer_id"
+  },
+  "a CTE, a subquery and a schema": {
+   "sent": "WITH recent AS (SELECT o.id FROM shop.orders \"O\" WHERE o.placed > TO_DATE('2024-01-01', 'YYYY-MM-DD')) SELECT r.id FROM recent r WHERE EXISTS (SELECT 1 FROM lines \"L\" WHERE l.order_id = r.id)",
+   "ruled": [
+    "lines",
+    "orders"
+   ],
+   "limit": null,
+   "executed": "WITH recent AS (\n  SELECT\n    o.id\n  FROM (\n    SELECT\n      *\n    FROM shop.orders\n    WHERE\n      region = 'west'\n  ) \"O\"\n  WHERE\n    o.placed > TO_DATE('2024-01-01', 'YYYY-MM-DD')\n)\nSELECT\n  r.id\nFROM recent r\nWHERE\n  EXISTS(\n    SELECT\n      1\n    FROM (\n      SELECT\n        *\n      FROM lines\n      WHERE\n        region = 'west'\n    ) \"L\"\n    WHERE\n      l.order_id = r.id\n  )"
+  },
+  "a column qualified by its table's name": {
+   "sent": "SELECT orders.id FROM orders \"ORDERS\" WHERE orders.id > 0",
+   "ruled": [
+    "orders"
+   ],
+   "limit": null,
+   "executed": "SELECT\n  orders.id\nFROM (\n  SELECT\n    *\n  FROM orders\n  WHERE\n    region = 'west'\n) \"ORDERS\"\nWHERE\n  orders.id > 0"
+  },
+  "a sampled table": {
+   "sent": "SELECT orders.id FROM orders SAMPLE (10) \"ORDERS\" WHERE orders.id > 0",
+   "ruled": [
+    "orders"
+   ],
+   "limit": null,
+   "executed": "SELECT\n  orders.id\nFROM (\n  SELECT\n    *\n  FROM orders SAMPLE (10)\n  WHERE\n    region = 'west'\n) \"ORDERS\"\nWHERE\n  orders.id > 0"
+  },
+  "a table read twice": {
+   "sent": "SELECT a.id FROM orders \"A\" JOIN orders \"B\" ON b.parent_id = a.id",
+   "ruled": [
+    "orders"
+   ],
+   "limit": null,
+   "executed": "SELECT\n  a.id\nFROM (\n  SELECT\n    *\n  FROM orders\n  WHERE\n    region = 'west'\n) \"A\"\nJOIN (\n  SELECT\n    *\n  FROM orders\n  WHERE\n    region = 'west'\n) \"B\"\n  ON b.parent_id = a.id"
+  },
+  "a quoted table": {
+   "sent": "SELECT i.qty FROM \"OrderItems\" \"I\"",
+   "ruled": [
+    "OrderItems"
+   ],
+   "limit": null,
+   "executed": "SELECT\n  i.qty\nFROM (\n  SELECT\n    *\n  FROM \"OrderItems\"\n  WHERE\n    region = 'west'\n) \"I\""
+  },
+  "Superset's limit": {
+   "sent": "SELECT o.id FROM orders \"O\" ORDER BY o.id FETCH FIRST 1000 ROWS ONLY",
+   "ruled": [
+    "orders"
+   ],
+   "limit": 7,
+   "executed": "SELECT\n  o.id\nFROM (\n  SELECT\n    *\n  FROM orders\n  WHERE\n    region = 'west'\n) \"O\"\nORDER BY\n  o.id\nFETCH FIRST 7 ROWS ONLY"
+  },
+  "Superset's limit after an offset": {
+   "sent": "SELECT o.id FROM orders \"O\" ORDER BY o.id OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY",
+   "ruled": [],
+   "limit": 7,
+   "executed": "SELECT\n  o.id\nFROM orders \"O\"\nORDER BY\n  o.id\nOFFSET 5 ROWS\nFETCH FIRST 7 ROWS ONLY"
+  },
+  "a subquery's own limit": {
+   "sent": "SELECT x.id FROM (SELECT o.id FROM orders \"O\" ORDER BY o.id FETCH FIRST 5 ROWS ONLY) x FETCH FIRST 10 ROWS ONLY",
+   "ruled": [
+    "orders"
+   ],
+   "limit": 7,
+   "executed": "SELECT\n  x.id\nFROM (\n  SELECT\n    o.id\n  FROM (\n    SELECT\n      *\n    FROM orders\n    WHERE\n      region = 'west'\n  ) \"O\"\n  ORDER BY\n    o.id\n  FETCH FIRST 5 ROWS ONLY\n) x\nFETCH FIRST 7 ROWS ONLY"
+  },
+  "a statement's own limit": {
+   "sent": "SELECT o.id FROM orders \"O\" ORDER BY o.id FETCH FIRST 10 ROWS ONLY",
+   "ruled": [
+    "orders"
+   ],
+   "limit": null,
+   "executed": "SELECT\n  o.id\nFROM (\n  SELECT\n    *\n  FROM orders\n  WHERE\n    region = 'west'\n) \"O\"\nORDER BY\n  o.id\nFETCH FIRST 10 ROWS ONLY"
+  },
+  "the proof's probe": {
+   "sent": "SELECT * FROM (SELECT o.region, COUNT(*) AS n FROM orders \"O\" GROUP BY o.region) mnemiq_probe WHERE 1 = 0",
+   "ruled": [
+    "orders"
+   ],
+   "limit": null,
+   "executed": "SELECT\n  *\nFROM (\n  SELECT\n    o.region,\n    COUNT(*) AS n\n  FROM (\n    SELECT\n      *\n    FROM orders\n    WHERE\n      region = 'west'\n  ) \"O\"\n  GROUP BY\n    o.region\n) mnemiq_probe\nWHERE\n  1 = 0"
+  },
+  "CROSS APPLY": {
+   "sent": "SELECT o.id, x.n FROM orders \"O\" CROSS APPLY (SELECT COUNT(*) AS n FROM lines \"L\" WHERE l.order_id = o.id) x",
+   "ruled": [],
+   "limit": null,
+   "executed": "SELECT\n  o.id,\n  x.n\nFROM orders \"O\" INNER JOIN LATERAL (\n  SELECT\n    COUNT(*) AS n\n  FROM lines \"L\"\n  WHERE\n    l.order_id = o.id\n) AS x"
+  },
+  "OUTER APPLY": {
+   "sent": "SELECT o.id, x.n FROM orders \"O\" OUTER APPLY (SELECT COUNT(*) AS n FROM lines \"L\" WHERE l.order_id = o.id) x",
+   "ruled": [],
+   "limit": null,
+   "executed": "SELECT\n  o.id,\n  x.n\nFROM orders \"O\" LEFT JOIN LATERAL (\n  SELECT\n    COUNT(*) AS n\n  FROM lines \"L\"\n  WHERE\n    l.order_id = o.id\n) AS x"
+  },
+  "TO_DATE with its NLS argument": {
+   "sent": "SELECT o.id FROM orders \"O\" WHERE o.placed > TO_DATE('01-JAN-2024', 'DD-MON-YYYY', 'NLS_DATE_LANGUAGE = AMERICAN')",
+   "ruled": [],
+   "limit": null,
+   "executed": "SELECT\n  o.id\nFROM orders \"O\"\nWHERE\n  o.placed > TO_DATE('01-JAN-2024', 'DD-MON-YYYY')"
+  },
+  "TO_TIMESTAMP with its NLS argument": {
+   "sent": "SELECT o.id FROM orders \"O\" WHERE o.placed > TO_TIMESTAMP('01-JAN-2024', 'DD-MON-YYYY', 'NLS_DATE_LANGUAGE = AMERICAN')",
+   "ruled": [],
+   "limit": null,
+   "executed": "SELECT\n  o.id\nFROM orders \"O\"\nWHERE\n  o.placed > TO_TIMESTAMP('01-JAN-2024', 'DD-MON-YYYY')"
+  },
+  "GROUP BY a column named sample": {
+   "sent": "SELECT o.region FROM orders \"O\" GROUP BY o.region, sample",
+   "ruled": [],
+   "limit": null,
+   "executed": "SELECT\n  o.region\nFROM orders \"O\"\nGROUP BY\n  o.region SAMPLE ()"
+  },
+  "IS NOT NULL compared": {
+   "sent": "SELECT o.id FROM orders \"O\" WHERE o.shipped IS NOT NULL = 1",
+   "ruled": [],
+   "limit": null,
+   "executed": "SELECT\n  o.id\nFROM orders \"O\"\nWHERE\n  NOT o.shipped IS NULL = 1"
+  },
+  "IS NOT NULL compared, as mnemiq prints it": {
+   "sent": "SELECT o.id FROM orders \"O\" WHERE (NOT o.shipped IS NULL) = 1",
+   "ruled": [],
+   "limit": null,
+   "executed": "SELECT\n  o.id\nFROM orders \"O\"\nWHERE\n  (\n    NOT o.shipped IS NULL\n  ) = 1"
+  },
+  "a subquery's outer-join mark": {
+   "sent": "SELECT o.id FROM orders \"O\" WHERE o.id = (SELECT MAX(l.order_id) FROM lines \"L\")(+)",
+   "ruled": [
+    "lines",
+    "orders"
+   ],
+   "limit": null,
+   "executed": "SELECT\n  o.id\nFROM (\n  SELECT\n    *\n  FROM orders\n  WHERE\n    region = 'west'\n) \"O\"\nWHERE\n  o.id = (\n    SELECT\n      MAX(l.order_id)\n    FROM (\n      SELECT\n        *\n      FROM lines\n      WHERE\n        region = 'west'\n    ) \"L\"\n  )"
+  },
+  "a qualifier two tables share": {
+   "sent": "SELECT ORDERS.ID FROM shop.orders, orders",
+   "ruled": [
+    "orders",
+    "orders"
+   ],
+   "limit": null,
+   "executed": "SELECT\n  ORDERS.ID\nFROM (\n  SELECT\n    *\n  FROM shop.orders\n  WHERE\n    region = 'west'\n) \"orders\", (\n  SELECT\n    *\n  FROM orders\n  WHERE\n    region = 'west'\n) \"orders\""
+  },
+  "a qualifier two tables share, no rule": {
+   "sent": "SELECT ORDERS.ID FROM shop.orders, orders",
+   "ruled": [],
+   "limit": null,
+   "executed": "SELECT\n  ORDERS.ID\nFROM shop.orders, orders"
+  },
+  "a qualifier that would name an outer table": {
+   "sent": "SELECT 1 AS one FROM orders \"T\" WHERE EXISTS (SELECT 1 FROM t WHERE t.x = 1)",
+   "ruled": [
+    "orders",
+    "t"
+   ],
+   "limit": null,
+   "executed": "SELECT\n  1 AS one\nFROM (\n  SELECT\n    *\n  FROM orders\n  WHERE\n    region = 'west'\n) \"T\"\nWHERE\n  EXISTS(\n    SELECT\n      1\n    FROM (\n      SELECT\n        *\n      FROM t\n      WHERE\n        region = 'west'\n    ) \"t\"\n    WHERE\n      t.x = 1\n  )"
+  }
+ }
+}
