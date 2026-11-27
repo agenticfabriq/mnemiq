@@ -905,6 +905,29 @@ def test_a_table_that_already_has_a_dataset_stops_the_build(fake, world, store):
     assert [d for d in world.datasets.values() if d["table_name"] == "claim"] == [world.datasets[60]]
 
 
+@pytest.mark.parametrize(("sql", "said"), [
+    ('WITH "claim" AS (SELECT 1 AS "ID" FROM "DUAL") SELECT "ID" FROM "CLAIM"',
+     "give the CTE a name no table of the statement has"),
+    ('SELECT COUNT(*) FROM "CLAIM" SAMPLE (10), (SELECT 1 AS "X" FROM "DUAL") "claim"',
+     "read each table in a plain FROM or JOIN"),
+    ('SELECT * FROM "CLAIM" WHERE (', "could not read the SQL of the dataset"),
+], ids=["refused", "not read alike", "unreadable"])
+def test_a_datasets_sql_mnemiq_does_not_send_fails_its_step(fake, world, store, superset_oracle, sql, said):
+    """On Oracle the SQL of a dataset the build makes is sent as `for_superset` writes it: SQL it refuses, or cannot
+    read, fails the dataset's step with mnemiq's reason, nothing sent and nothing made; the build stops there."""
+    plan = dataclasses.replace(ONE_VIRTUAL, datasets=(dataclasses.replace(JOINED, sql=sql),))
+    build = _start(store, plan).build_id
+    _run_to(store, build, _adapter(fake), "dataset_1")
+    stopped = _next(store, build, _adapter(fake))
+    assert stopped.status == "failed" and _step(stopped, "dataset_1").status == "failed", stopped
+    assert _step(stopped, "dataset_1").reason == "statement_refused", stopped
+    assert said in stopped.message and "the dataset 'mnemiq_" in stopped.message, stopped.message
+    assert world.calls("create_dataset") == []
+    reread = build_state(store, store.load_build(TENANT, build, PRINCIPAL))
+    assert reread.message == ("this build stopped at its step 'dataset_1': mnemiq did not send the SQL of a dataset "
+                              "the build makes"), reread.message
+
+
 def test_a_build_calls_no_mcp_create_claim_or_patch(fake, world, store):
     """A whole six-chart build, a dataset made for its table among its steps: every object is made by the extension's
     creates, and the build never calls MCP's `generate_chart`, `create_dataset` or `create_virtual_dataset`, a claim,
