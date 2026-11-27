@@ -15,13 +15,13 @@ A build needs more than an extension: it needs one that makes every object a bui
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from mnemiq.superset.client import SupersetToolError, SupersetUnavailable
 
-__all__ = ["DATASET_METRICS_BATCH", "EXTENSION_TOOLS", "ExtensionMissing", "ExtensionOutdated", "TOOL_PREFIX",
-           "call_tool", "dashboard_editorship", "dataset_metrics", "require_build_tools", "require_extension",
-           "row_rule_applies"]
+__all__ = ["DATASET_METRICS_BATCH", "EXTENSION_TOOLS", "ExtensionMissing", "ExtensionOutdated", "TABLE_RULES_BATCH",
+           "TOOL_PREFIX", "call_tool", "dashboard_editorship", "dataset_metrics", "require_build_tools",
+           "require_extension", "row_rule_applies", "table_rules_apply"]
 
 logger = logging.getLogger(__name__)
 
@@ -29,11 +29,15 @@ TOOL_PREFIX = "extensions.agenticfabriq.mnemiq."
 
 # The base name of every tool the extension offers; the single source the client and the test fake build names from.
 EXTENSION_TOOLS = ("create_dashboard", "create_dataset", "create_chart", "patch_chart", "add_saved_metric",
-                   "delete_dataset", "set_layout", "dataset_metrics", "editors_of", "get_layout", "row_rules")
+                   "delete_dataset", "set_layout", "dataset_metrics", "editors_of", "get_layout", "row_rules",
+                   "table_rules")
 
 # The most dataset ids one `dataset_metrics` call takes: the extension refuses a request naming more
 # (`reads.MAX_DATASETS` in the extension).
 DATASET_METRICS_BATCH = 20
+# The most table names one `table_rules` call takes: the extension refuses a request naming more
+# (`reads.MAX_TABLES` in the extension).
+TABLE_RULES_BATCH = 50
 
 # The probe, which the installed extension answers with an empty list and never fails on.
 _PROBE = ("dataset_metrics", {"dataset_ids": []})
@@ -160,8 +164,7 @@ def row_rule_applies(client, dataset_id: int) -> bool | None:
     size cut beside it, a malformed or repeated entry, an entry for another dataset, an entry saying more), a dataset
     left out, or a failure of the call, which is logged. A refusal of the caller is raised, as the client raises it.
 
-    The one reading of `row_rules`, for the value check of a chart on a dataset the build made and for the plan
-    check's measure of a joined table's key."""
+    The one reading of `row_rules`, for the value check of a chart on a dataset the build made."""
     try:
         answer = client.call(TOOL_PREFIX + "row_rules", {"dataset_ids": [dataset_id]})
     except (SupersetUnavailable, SupersetToolError) as failure:
@@ -176,3 +179,41 @@ def row_rule_applies(client, dataset_id: int) -> bool | None:
             or not isinstance(entry["applies"], bool):
         return None
     return entry["applies"]
+
+
+def table_rules_apply(client, *, database_id: int, schema: str, tables: Sequence[str]) -> dict[str, bool | None]:
+    """Whether a row rule applies to the caller on each of `tables`, each name in Superset's spelling, in `schema` (in
+    Superset's spelling too) on the database, as the extension's `table_rules` answers it: Superset's own lookup of
+    the rules a statement reading the table takes. Asked `TABLE_RULES_BATCH` names a call, each name once, in order;
+    no call for no name.
+
+    Each answer is read strictly: it must be exactly `{"tables": [...]}` holding one entry for each name the call
+    asked, in the order asked, each exactly `{"table": <that name>, "applies": <a boolean>}`. Every name of a call is
+    None, where mnemiq cannot tell, when its answer is anything else (a database the caller cannot see, a size cut, a
+    refusal, an entry left out, repeated, out of order, for another table or saying more) or the call fails, which is
+    logged: an extension older than the tool fails it. A refusal of the caller is raised, as the client raises it."""
+    names = list(dict.fromkeys(tables))
+    found: dict[str, bool | None] = {}
+    for start in range(0, len(names), TABLE_RULES_BATCH):
+        asked = names[start:start + TABLE_RULES_BATCH]
+        found.update(zip(asked, _table_rules(client, database_id, schema, asked), strict=True))
+    return found
+
+
+def _table_rules(client, database_id: int, schema: str, asked: list[str]) -> list[bool | None]:
+    """One call's answers for `asked`, in order, read as `table_rules_apply` reads them."""
+    unknown: list[bool | None] = [None] * len(asked)
+    try:
+        answer = client.call(TOOL_PREFIX + "table_rules", {"database_id": database_id, "schema": schema,
+                                                           "tables": asked})
+    except (SupersetUnavailable, SupersetToolError) as failure:
+        logger.warning("the extension's table_rules for %d tables failed: %s", len(asked), failure)
+        return unknown
+    entries = answer.get("tables") if isinstance(answer, dict) and set(answer) == {"tables"} else None
+    if not isinstance(entries, list) or len(entries) != len(asked):
+        return unknown
+    for entry, name in zip(entries, asked, strict=True):
+        if not isinstance(entry, dict) or set(entry) != {"table", "applies"} or entry["table"] != name \
+                or not isinstance(entry["applies"], bool):
+            return unknown
+    return [entry["applies"] for entry in entries]

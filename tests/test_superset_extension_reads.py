@@ -1,15 +1,21 @@
 """What the extension's read tools (`agenticfabriq.mnemiq.reads`) answer, with Superset's lookups stood in for: each
 request is read strictly, an object the caller may not read is left out (or answered as absent) without a name, and
-the layout answer is refused over 40 KB. What the tools do inside Superset is the live suite's:
+the layout answer is refused over 40 KB; and how mnemiq's client reads `table_rules`'s answer
+(`mnemiq.superset.extension.table_rules_apply`). What the tools do inside Superset is the live suite's:
 `tests/superset_live/test_extension_tools.py`.
 """
 
 import json
+import sys
+import types
 from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
 
+from mnemiq.superset.client import SupersetPermissionDenied, SupersetToolError, SupersetUnavailable
+from mnemiq.superset.extension import TABLE_RULES_BATCH, TOOL_PREFIX, table_rules_apply
+from tests import superset_stubs as stubs
 from tests.superset_extension_path import use_extension_source
 
 use_extension_source()
@@ -24,7 +30,7 @@ def refusal(tool, request):
 
 
 def test_every_read_tool_has_a_request_reader():
-    assert set(reads.REQUESTS) == {"dataset_metrics", "editors_of", "get_layout", "row_rules"}
+    assert set(reads.REQUESTS) == {"dataset_metrics", "editors_of", "get_layout", "row_rules", "table_rules"}
 
 
 def test_dataset_metrics_takes_at_most_twenty_distinct_ids():
@@ -319,3 +325,197 @@ def test_row_rules_answers_an_empty_request_without_touching_superset(monkeypatc
 
 def test_a_bad_row_rules_request_is_answered_not_raised():
     assert reads.row_rules({"dataset_ids": "1"}) == {"refused": "request", "field": "dataset_ids"}
+
+
+# ---------------------------------------------------------------- table_rules: Superset's own row-rule lookup, by table
+
+TABLE_REQUEST = {"database_id": 7, "schema": "public", "tables": ["orders"]}
+
+
+def test_table_rules_takes_a_database_a_schema_and_at_most_fifty_distinct_names():
+    assert reads.read("table_rules", {**TABLE_REQUEST, "tables": ["orders", "orders", "Customers"]}) == {
+        "database_id": 7, "schema": "public", "tables": ["orders", "Customers"]}
+    names = [f"t{i}" for i in range(reads.MAX_TABLES)]
+    assert reads.read("table_rules", {**TABLE_REQUEST, "tables": names})["tables"] == names
+    assert reads.read("table_rules", {**TABLE_REQUEST, "tables": ["x" * 250]})["tables"] == ["x" * 250]
+    assert reads.read("table_rules", {**TABLE_REQUEST, "tables": []})["tables"] == []
+    assert refusal("table_rules", {**TABLE_REQUEST, "tables": [*names, "t50"]}) == {"refused": "request",
+                                                                                    "field": "tables"}
+    for bad in ("orders", [""], ["  "], [3], [None], [["orders"]], ["x" * 251], None):
+        assert refusal("table_rules", {**TABLE_REQUEST, "tables": bad}) == {"refused": "request", "field": "tables"}
+    for bad in ("", "  ", 3, None, "x" * 256):
+        assert refusal("table_rules", {**TABLE_REQUEST, "schema": bad}) == {"refused": "request", "field": "schema"}
+    for bad in (0, "7", True, None):
+        assert refusal("table_rules", {**TABLE_REQUEST, "database_id": bad}) == {"refused": "request",
+                                                                                 "field": "database_id"}
+    for field in TABLE_REQUEST:
+        request = {key: value for key, value in TABLE_REQUEST.items() if key != field}
+        assert refusal("table_rules", request) == {"refused": "request", "field": field}
+    assert refusal("table_rules", {**TABLE_REQUEST, "catalog": "live"}) == {"refused": "request",
+                                                                            "unknown": ["catalog"]}
+
+
+def superset_rules(monkeypatch, *, databases: dict, predicates: dict) -> list:
+    """Superset's lookups `table_rules` makes, stood in: `DatabaseDAO.find_by_id` answering the databases the caller
+    may see (`databases`, by id), and rc2's `get_predicates_for_table` answering the predicates it finds for the caller
+    on a table (`predicates`, by table name; none for any other). Every lookup is recorded, in order, a database's
+    with any option it was asked with (none: Superset's own filter of the databases the caller may see applies)."""
+    asked: list = []
+
+    def find_by_id(database_id, *args, **options):
+        asked.append(("database", database_id, *args, *options.items()))
+        return databases.get(database_id)
+
+    def get_predicates_for_table(table, database, default_catalog):
+        asked.append(("predicates", table, database, default_catalog))
+        return list(predicates.get(table.table, []))
+
+    modules = {"superset": {}, "superset.daos": {}, "superset.daos.database": {"DatabaseDAO": SimpleNamespace(
+        find_by_id=find_by_id)}, "superset.sql": {}, "superset.sql.parse": {"Table": stubs.Table},
+        "superset.utils": {}, "superset.utils.rls": {"get_predicates_for_table": get_predicates_for_table}}
+    for name, attributes in modules.items():
+        module = types.ModuleType(name)
+        module.__dict__.update(attributes)
+        monkeypatch.setitem(sys.modules, name, module)
+    return asked
+
+
+def database(catalog="live"):
+    return SimpleNamespace(id=7, get_default_catalog=lambda: catalog)
+
+
+def test_table_rules_asks_supersets_own_lookup_for_each_table_as_a_statement_reads_it(monkeypatch):
+    """Each table is looked up as rc2's `apply_rls` looks up a table a statement reads with no catalog of its own:
+    `get_predicates_for_table(Table(name, schema, <the database's default catalog>), database, <that catalog>)`, as
+    the caller. A table applies when the lookup finds any predicate; the answer says only that, in the order asked."""
+    found = database()
+    asked = superset_rules(monkeypatch, databases={7: found},
+                           predicates={"orders": ["(region = 'west')"], "Customers": ["(1 = 0)", "(2 = 2)"]})
+    answer = reads.table_rules({"database_id": 7, "schema": "public", "tables": ["orders", "free", "Customers"]})
+    assert answer == {"tables": [{"table": "orders", "applies": True}, {"table": "free", "applies": False},
+                                 {"table": "Customers", "applies": True}]}
+    assert asked == [("database", 7), *(("predicates", stubs.Table(name, "public", "live"), found, "live")
+                                        for name in ("orders", "free", "Customers"))]
+    assert "west" not in json.dumps(answer) and "1 = 0" not in json.dumps(answer)
+    # A database without catalogs has none to qualify a table with, as rc2 has none.
+    asked = superset_rules(monkeypatch, databases={7: database(None)}, predicates={})
+    assert reads.table_rules(TABLE_REQUEST) == {"tables": [{"table": "orders", "applies": False}]}
+    assert asked[1][1:] == (stubs.Table("orders", "public", None), asked[1][2], None)
+
+
+def test_table_rules_of_a_database_the_caller_cannot_see_is_not_found(monkeypatch):
+    """A database the caller may not see (Superset's own `DatabaseDAO` filter, as `get_database_info` reads one) and
+    one that does not exist are answered alike, and no table is looked up."""
+    asked = superset_rules(monkeypatch, databases={}, predicates={"orders": ["(1 = 0)"]})
+    assert reads.table_rules(TABLE_REQUEST) == {"not_found": "database"}
+    assert asked == [("database", 7)]
+
+
+def test_table_rules_too_large_to_send_is_refused_before_superset_is_asked(monkeypatch):
+    """The answer echoes each name asked, so fifty long names escaped in JSON could pass Superset's size guard: such a
+    request is answered `{"too_large": true}`, read from the names alone, before any lookup. Fifty names of 250
+    characters that JSON does not escape fit."""
+    asked = superset_rules(monkeypatch, databases={7: database()}, predicates={})
+    wide = [f"{i:02d}" + "é" * 248 for i in range(reads.MAX_TABLES)]
+    assert reads.table_rules({**TABLE_REQUEST, "tables": wide}) == {"too_large": True}
+    assert asked == []
+    long = [f"{i:02d}" + "x" * 248 for i in range(reads.MAX_TABLES)]
+    answer = reads.table_rules({**TABLE_REQUEST, "tables": long})
+    assert [entry["table"] for entry in answer["tables"]] == long and size(answer) <= reads.MAX_ANSWER_BYTES
+
+
+def test_a_bad_table_rules_request_is_answered_not_raised():
+    assert reads.table_rules({**TABLE_REQUEST, "tables": "orders"}) == {"refused": "request", "field": "tables"}
+
+
+# ---------------------------------------------------------------- mnemiq's reading of table_rules
+
+class Answering:
+    """mnemiq's Superset client, stood in: each call of `table_rules` answered by `answer` (a function of the request,
+    or an answer or exception for every call), every call recorded."""
+
+    def __init__(self, answer) -> None:
+        self.answer = answer
+        self.calls: list[tuple[str, dict]] = []
+
+    def call(self, tool, request, *, timeout_s=None):
+        self.calls.append((tool, json.loads(json.dumps(request))))
+        assert tool == TOOL_PREFIX + "table_rules", tool
+        found = self.answer(request) if callable(self.answer) else self.answer
+        if isinstance(found, Exception):
+            raise found
+        return json.loads(json.dumps(found))
+
+
+def ask(client, tables, *, schema="public"):
+    return table_rules_apply(client, database_id=7, schema=schema, tables=tables)
+
+
+def test_mnemiqs_client_reads_what_the_tool_answers(monkeypatch):
+    """The join of the two ends: the extension's own `table_rules`, over Superset's lookups stood in, answering mnemiq's
+    own request, read by mnemiq's client."""
+    superset_rules(monkeypatch, databases={7: database()}, predicates={"orders": ["(1 = 0)"]})
+    client = Answering(reads.table_rules)
+    assert ask(client, ["orders", "Customers", "orders"]) == {"orders": True, "Customers": False}
+    assert client.calls == [(TOOL_PREFIX + "table_rules",
+                             {"database_id": 7, "schema": "public", "tables": ["orders", "Customers"]})]
+
+
+def test_the_client_asks_at_most_the_tools_limit_a_call_and_nothing_for_no_table():
+    assert TABLE_RULES_BATCH == reads.MAX_TABLES == 50
+    names = [f"t{i}" for i in range(120)]
+    client = Answering(lambda request: {"tables": [{"table": name, "applies": name == "t77"}
+                                                   for name in request["tables"]]})
+    found = ask(client, names)
+    assert found == {name: name == "t77" for name in names}
+    assert [request["tables"] for _, request in client.calls] == [names[:50], names[50:100], names[100:]]
+    client = Answering(AssertionError("asked"))
+    assert ask(client, []) == {} and client.calls == []
+
+
+def entries(*pairs):
+    return {"tables": [{"table": name, "applies": applies} for name, applies in pairs]}
+
+
+@pytest.mark.parametrize("answer", [
+    SupersetToolError("Internal error in extensions.agenticfabriq.mnemiq.table_rules: An unexpected error occurred."),
+    SupersetUnavailable("Superset did not answer"),
+    {"not_found": "database"},
+    {"too_large": True},
+    {"refused": "request", "field": "tables"},
+    ["not", "an", "object"],
+    {"tables": []},
+    entries(("orders", False)),
+    entries(("orders", False), ("Customers", "no")),
+    entries(("orders", False), ("customers", False)),
+    entries(("Customers", False), ("orders", False)),
+    entries(("orders", False), ("orders", False)),
+    entries(("orders", False), ("Customers", False), ("extra", False)),
+    {"tables": [{"table": "orders", "applies": False}, {"table": "Customers", "applies": False, "clause": "x"}]},
+    {"tables": [{"table": "orders", "applies": False}, "malformed"]},
+    {"tables": [{"table": "orders", "applies": False}, {"applies": False}]},
+    {**entries(("orders", False), ("Customers", False)), "_response_truncated": True},
+    {"tables": {"orders": False, "Customers": False}},
+    entries(("orders", 0), ("Customers", 0)),
+], ids=["not offered", "unavailable", "database not found", "too large", "refused", "not an object", "left out",
+        "one left out", "not a boolean", "another table", "reordered", "twice", "one more", "an entry saying more",
+        "a malformed entry", "an entry with no name", "cut for size", "not a list", "a number for a boolean"])
+def test_an_answer_mnemiq_cannot_read_whole_tells_it_nothing(answer):
+    """Read strictly, as `row_rule_applies` reads `row_rules`: exactly `{"tables": [...]}` with one entry for each name
+    asked, in the order asked, each exactly `{"table": <that name>, "applies": <a boolean>}`. Anything else, or a call
+    that fails, an extension older than the tool among them, leaves every name of the call unknown (None), never
+    False."""
+    assert ask(Answering(answer), ["orders", "Customers"]) == {"orders": None, "Customers": None}
+
+
+def test_one_call_unread_leaves_only_its_own_names_unknown():
+    names = [f"t{i}" for i in range(60)]
+    client = Answering(lambda request: {"tables": []} if "t0" in request["tables"] else entries(
+        *((name, True) for name in request["tables"])))
+    found = ask(client, names)
+    assert found == {**dict.fromkeys(names[:50]), **dict.fromkeys(names[50:], True)}
+
+
+def test_a_refusal_of_the_caller_is_raised():
+    with pytest.raises(SupersetPermissionDenied):
+        ask(Answering(SupersetPermissionDenied("no")), ["orders"])

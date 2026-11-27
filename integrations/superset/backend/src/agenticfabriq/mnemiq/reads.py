@@ -15,10 +15,11 @@ itself, which mnemiq passes to the person's panel; no label goes into a log line
 Superset's MCP response size guard (`superset/mcp_service/middleware.py`, `ResponseSizeGuardMiddleware`) does not
 truncate an extension tool's answer: over its limit (50,000 bytes by default) the call fails with Superset's own text.
 So every read tool keeps its answer under `MAX_ANSWER_BYTES` itself: `row_rules`, whose at most 20 entries are a few
-bytes each, by its size alone, and the rest by one helper (`fit`): `get_layout` refuses a
-layout over it with `{"too_large": True}`, and the tools that answer a list keep their envelope and answer each entry
-that does not fit as `{<id field>: N, "too_large": True}` (entries fill in request order, and once one does not fit
-the rest are marked). A caller treats a marked entry as unanswered.
+bytes each, by its size alone; `get_layout` refuses a layout over it with `{"too_large": True}`, and `table_rules`,
+which echoes the names it is asked, a request whose answer would be over it, the same way; and the tools that answer a
+list of objects by one helper (`fit`), which keeps their envelope and answers each entry that does not fit as
+`{<id field>: N, "too_large": True}` (entries fill in request order, and once one does not fit the rest are marked). A
+caller treats a marked entry as unanswered.
 
 Superset is imported inside the tools, as in `writes`, so this module imports without it.
 """
@@ -34,6 +35,10 @@ from agenticfabriq.mnemiq.writes import _Field
 MAX_DATASETS = 20
 MAX_CHARTS = 100
 MAX_DASHBOARDS = 20
+MAX_TABLES = 50
+# A table's name, and a schema's, as long as Superset holds one (`SqlaTable.table_name` and `SqlaTable.schema`).
+MAX_TABLE_NAME = 250
+MAX_SCHEMA_NAME = 255
 # An answer larger than this, in bytes of its JSON text, is not sent: well under the guard's 50,000.
 MAX_ANSWER_BYTES = 40_000
 MAX_LAYOUT_BYTES = MAX_ANSWER_BYTES
@@ -50,6 +55,18 @@ def _distinct_ids(limit: int):
     return read
 
 
+def _distinct_names(limit: int):
+    def read(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            raise ValueError("not a list")
+        found = list(dict.fromkeys(writes._text(MAX_TABLE_NAME)(item) for item in value))
+        if len(found) > limit:
+            raise ValueError("too many names")
+        return found
+
+    return read
+
+
 # Every read tool's request, field by field.
 REQUESTS: dict[str, dict[str, _Field]] = {
     "dataset_metrics": {"dataset_ids": _Field(_distinct_ids(MAX_DATASETS))},
@@ -58,6 +75,8 @@ REQUESTS: dict[str, dict[str, _Field]] = {
                    "dashboard_ids": _Field(_distinct_ids(MAX_DASHBOARDS), False, [])},
     "get_layout": {"dashboard_id": writes._DASHBOARD_ID},
     "row_rules": {"dataset_ids": _Field(_distinct_ids(MAX_DATASETS))},
+    "table_rules": {"database_id": _Field(writes._an_id), "schema": _Field(writes._text(MAX_SCHEMA_NAME)),
+                    "tables": _Field(_distinct_names(MAX_TABLES))},
 }
 
 
@@ -194,3 +213,34 @@ def row_rules(found: dict) -> dict:
             datasets.append({"dataset_id": dataset_id,
                              "applies": bool(writes._security().get_rls_filters(dataset))})
     return {"datasets": datasets}
+
+
+@writes._answering("table_rules", REQUESTS)
+def table_rules(found: dict) -> dict:
+    """Whether a row rule applies to the caller on each table asked, by its name in `schema` on the database, in the
+    order asked: whether Superset's own lookup of the rules a statement reading the table takes,
+    `superset.utils.rls.get_predicates_for_table`, finds any for the caller. The table is looked up as `apply_rls`
+    looks up a table a statement reads with no catalog of its own, `Table(name, schema, <the database's default
+    catalog>)`, beside that catalog, so the answer is the lookup Superset makes for mnemiq's statements, which name no
+    catalog: through every dataset of the table that lookup finds, whether or not the caller may list it. Only whether:
+    never a rule's clause, name or roles, nor which dataset carries it.
+
+    A database the caller may not see (Superset's own `DatabaseDAO` filter, as `get_database_info` finds one), or that
+    does not exist, is answered `{"not_found": "database"}`, and no table is looked up. A request whose answer would be
+    over `MAX_ANSWER_BYTES` (it echoes each name) is answered `{"too_large": True}` before Superset is asked."""
+    if _size(_table_rules_answer(found["tables"], lambda name: False)) > MAX_ANSWER_BYTES:
+        return dict(TOO_LARGE)
+    from superset.daos.database import DatabaseDAO
+    from superset.sql.parse import Table
+    from superset.utils.rls import get_predicates_for_table
+
+    database = DatabaseDAO.find_by_id(found["database_id"])
+    if database is None:
+        return writes._not_found("database")
+    catalog = database.get_default_catalog()
+    return _table_rules_answer(found["tables"], lambda name: bool(get_predicates_for_table(
+        Table(name, found["schema"], catalog), database, catalog)))
+
+
+def _table_rules_answer(names: list[str], applies) -> dict:
+    return {"tables": [{"table": name, "applies": applies(name)} for name in names]}

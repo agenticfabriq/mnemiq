@@ -73,7 +73,7 @@ BUILD = " ".join(BUILD_SCOPES)
 ASK = " ".join(ASK_SCOPES)
 WRITE_TOOLS = ("create_dashboard", "create_dataset", "create_chart", "patch_chart", "add_saved_metric",
                "delete_dataset", "set_layout")
-READ_TOOLS = ("dataset_metrics", "editors_of", "get_layout", "row_rules")
+READ_TOOLS = ("dataset_metrics", "editors_of", "get_layout", "row_rules", "table_rules")
 # The builder in most tests: Alpha and sql_lab, narrowed by no row rule.
 BUILDER = "analyst"
 MONTHLY = ("SELECT date_trunc('month', issued)::date AS month, count(*) FROM policy GROUP BY 1 ORDER BY 1")
@@ -1902,6 +1902,78 @@ def test_row_rules_says_only_whether_a_rule_applies_to_the_caller(live, extensio
     assert "west" not in json.dumps(west) and "region" not in json.dumps(west)
     assert call(as_user(live, "gamma_only"), "row_rules", dataset_ids=[policy_id, missing]) == {"datasets": []}
     observe("row_rules", west=west, analyst=analyst)
+
+
+def test_table_rules_answers_as_supersets_own_lookup_by_table(live, extension, made):
+    """`table_rules` answers, as the caller and by table, whether Superset's own lookup of the rules a statement reading
+    that table takes (rc2's `get_predicates_for_table`) finds one. Four tables of the test's own in the source, each
+    holding one row: `nulled`, whose one dataset has no schema, which Superset reads as the database's default schema
+    (`public`); `cased`, whose one dataset's schema is `PUBLIC`; `hidden`, whose one dataset `policy_only` may not read
+    or list; and `free`, with no dataset. Each of the three datasets carries a Base rule that keeps no row and applies
+    to everyone (`setup_superset.py rule-on`). The datasets are made by the extension's `create_dataset` as analyst;
+    the null schema and the case-variant one are then set in the metadata database, since Superset's create holds a
+    schema to the database's own.
+
+    Asked about `policy` and the four in `public`, analyst is answered, in the order asked and each exactly
+    `{table, applies}`: `policy` false (west's and east's rules are not analyst's), `nulled`, `cased` and `hidden`
+    true, `free` false. west is answered `policy` true; `policy_only`, whose `dataset_metrics` of `hidden`'s dataset
+    answers nothing, `hidden` true and `free` false. Superset agrees when it runs a statement: as analyst, `COUNT(*)`
+    through `execute_sql` reads 0 rows of each of the three ruled tables and 1 of `free`. `gamma_only`, who may see no
+    table of the database, and a database that does not exist, are answered `{not_found: "database"}`."""
+    import psycopg
+    from psycopg import sql
+
+    analyst = as_user(live, BUILDER)
+    build = made.build(analyst, "table rules")
+    suffix = uuid.uuid4().hex[:8]
+    tables = {kind: f"live_rules_{kind}_{suffix}" for kind in ("nulled", "cased", "hidden", "free")}
+    made.tables.extend(tables.values())
+    with psycopg.connect(live.pg_dsn, autocommit=True, connect_timeout=10) as con:
+        for name in tables.values():
+            con.execute(sql.SQL("CREATE TABLE {} (id integer PRIMARY KEY)").format(sql.Identifier("public", name)))
+            con.execute(sql.SQL("INSERT INTO {} VALUES (1)").format(sql.Identifier("public", name)))
+    datasets = {}
+    for kind in ("nulled", "cased", "hidden"):
+        answer = made.dataset(call(analyst, "create_dataset", database_id=live.database_id, schema="public",
+                                   table_name=tables[kind], dashboard_id=build.dashboard_id,
+                                   marker=build.marker(kind)), build.dashboard_id)
+        assert set(answer) == {"dataset_id"}, (kind, answer)
+        datasets[kind] = answer["dataset_id"]
+    rules: list[str] = []
+    try:
+        write_metadata("UPDATE tables SET schema = NULL WHERE id = %s", (datasets["nulled"],))
+        write_metadata("UPDATE tables SET schema = 'PUBLIC' WHERE id = %s", (datasets["cased"],))
+        for kind in ("nulled", "cased", "hidden"):
+            said = run_setup("rule-on", str(datasets[kind]))
+            assert said.startswith("rule "), said
+            rules.append(said.split()[-1])
+        asked = ["policy", *tables.values()]
+        answer = call(analyst, "table_rules", database_id=live.database_id, schema="public", tables=asked)
+        assert answer == {"tables": [{"table": name, "applies": applies} for name, applies in zip(
+            asked, (False, True, True, True, False))]}, answer
+        west = call(as_user(live, "west"), "table_rules", database_id=live.database_id, schema="public",
+                    tables=["policy", tables["free"]])
+        assert west == {"tables": [{"table": "policy", "applies": True},
+                                   {"table": tables["free"], "applies": False}]}, west
+        reader = as_user(live, "policy_only")
+        assert call(reader, "dataset_metrics", dataset_ids=[datasets["hidden"]]) == {"datasets": []}
+        hidden = call(reader, "table_rules", database_id=live.database_id, schema="public",
+                      tables=[tables["hidden"], tables["free"]])
+        assert hidden == {"tables": [{"table": tables["hidden"], "applies": True},
+                                     {"table": tables["free"], "applies": False}]}, hidden
+        source = SupersetSqlAdapter(as_user(live, BUILDER, ASK), database_id=live.database_id, schema="public")
+        counted = {kind: source.execute_arrow(f'SELECT COUNT(*) AS n FROM "{name}"').column(0)[0].as_py()
+                   for kind, name in tables.items()}
+        assert counted == {"nulled": 0, "cased": 0, "hidden": 0, "free": 1}, counted
+        for client, database_id in ((as_user(live, "gamma_only"), live.database_id), (analyst, 2_000_000_000)):
+            assert call(client, "table_rules", database_id=database_id, schema="public",
+                        tables=[tables["free"]]) == {"not_found": "database"}
+        observe("table_rules", analyst=answer, policy_only=hidden, counted=counted)
+    finally:
+        for rule in rules:
+            run_setup("rule-off", rule)
+        write_metadata("UPDATE tables SET schema = 'public' WHERE id = ANY(%s)",
+                       ([datasets["nulled"], datasets["cased"]],))
 
 
 def test_editors_of_names_editors_of_readable_objects_only(live, extension, policy_id):
