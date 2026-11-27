@@ -83,6 +83,13 @@ _AIM = 0.8
 # refusal of a table is not among them: it is the model's to repair.
 TERMINAL_REFUSALS = (SupersetRefusedCaller, SupersetPermissionDenied, SupersetDenied)
 
+# The column types `count(DISTINCT ...)` and `GROUP BY` refuse, by the dialect of the database behind Superset, as its
+# catalogue names them, upper-cased as profiling compares them (`SupersetSqlAdapter.unaggregatable_types`).
+# PostgreSQL's have no equality operator, and are spelled as `format_type` names them. Oracle's are its large objects
+# (CLOB, NCLOB, BLOB, BFILE), LONG and LONG RAW, and XMLTYPE.
+_POSTGRES_UNAGGREGATABLE = frozenset({"JSON", "XML", "POINT", "LINE", "LSEG", "BOX", "PATH", "POLYGON", "CIRCLE"})
+_ORACLE_UNAGGREGATABLE = frozenset({"CLOB", "NCLOB", "BLOB", "LONG", "LONG RAW", "BFILE", "XMLTYPE"})
+
 
 class SupersetSqlAdapter:
     """Runs statements on one Superset database and schema through `client`, each within `timeout_s` unless the
@@ -94,11 +101,6 @@ class SupersetSqlAdapter:
     result cache, and answers every later call with a copy of what it read: `decide` reads the function inventory on
     every decision, and one adapter serves one request, so the inventory is read live once per request. A read that
     raises is not remembered, and the next call asks again."""
-
-    # The Postgres types with no equality operator, which `count(DISTINCT ...)` and `GROUP BY` refuse, as
-    # `format_type` names them, upper-cased as profiling compares them. Profiling reads this in place of its table by
-    # dialect: a direct Postgres adapter declares the same dialect and profiles as it always has.
-    unaggregatable_types = frozenset({"JSON", "XML", "POINT", "LINE", "LSEG", "BOX", "PATH", "POLYGON", "CIRCLE"})
 
     def __init__(self, client: SupersetMcp, *, database_id: int, schema: str, dialect: str | None = None,
                  timeout_s: float = 30.0, refresh_every_statement: bool = False) -> None:
@@ -123,6 +125,13 @@ class SupersetSqlAdapter:
         return self._terminal_refusal
 
     @property
+    def unaggregatable_types(self) -> frozenset[str]:
+        """The column types this adapter's database cannot aggregate, by the adapter's dialect: Oracle's on Oracle,
+        PostgreSQL's otherwise. Profiling reads them in place of its own table by dialect, so a direct PostgreSQL
+        adapter, which declares the same dialect and none of these, profiles as it always has."""
+        return _ORACLE_UNAGGREGATABLE if self.dialect == "oracle" else _POSTGRES_UNAGGREGATABLE
+
+    @property
     def database_id(self) -> int:
         """The Superset database every statement runs on."""
         return self._database_id
@@ -145,17 +154,18 @@ class SupersetSqlAdapter:
         """`sql`'s result as an answer: whole, or, when it is larger than Superset's MCP service sends in one response,
         its first rows, marked with how many (`mark_sent`), for the answer to say it stops there. Superset cuts such an
         answer to the rows that fit, or refuses it when no cut fits. A refused answer is asked again with
-        `execute_sql`'s `limit`, which Superset puts in place of the statement's own LIMIT: each ask is sized from the
-        latest refusal, below the last and below the statement's own outer LIMIT (`_outer_limit`), so a re-ask never
-        answers more than the statement asks. A refusal that repeats the last one's size says the limit did not bind,
-        the result holding fewer rows than were asked: one row is asked for, and the next ask is sized from it. Up to
-        `_RE_ASKS` asks again; one still refused, a single row refused, an answer cut to no rows, or a statement whose
-        LIMIT cannot be read raises `ResultCut`, as `execute_arrow` does for any answer too large.
+        `execute_sql`'s `limit`, which Superset puts in place of the statement's own LIMIT (Oracle's FETCH FIRST): each
+        ask is sized from the latest refusal, below the last and below the statement's own outer row limit
+        (`_outer_limit`), so a re-ask never answers more than the statement asks. A refusal that repeats the last one's
+        size says the limit did not bind, the result holding fewer rows than were asked: one row is asked for, and the
+        next ask is sized from it. Up to `_RE_ASKS` asks again; one still refused, a single row refused, an answer cut
+        to no rows, or a statement whose row limit cannot be read raises `ResultCut`, as `execute_arrow` does for any
+        answer too large.
 
         Only for the answer to a question, and its reruns: every other read (a check, a catalogue page, a plan's
         probe) compares or decides on all of a result, and reads it with `execute_arrow`, which a cut result never
         reaches."""
-        bound = _outer_limit(sql)
+        bound = _outer_limit(sql, self.dialect)
         limit: int | None = None  # the rows asked for; None, the statement as written
         refused_at: int | None = None  # the size of the last refusal
         allowed = 0
@@ -205,9 +215,13 @@ class SupersetSqlAdapter:
     def validate(self, sql: str) -> None:
         """The proof the proof seam asks for in place of `EXPLAIN`: the statement as a subquery that returns no rows.
         Superset checks it for access and applies its row rules as it would to the statement itself, and the database
-        resolves every table and column in it without returning a row. Raises what the statement would."""
+        resolves every table and column in it without returning a row. Raises what the statement would.
+
+        Written in the adapter's dialect: Oracle refuses `AS` before a table alias, so there the alias follows the
+        subquery bare."""
         body = sql.strip().rstrip(";").rstrip()
-        read_execute_response(self._execute_sql(f"SELECT * FROM ({body}) AS mnemiq_probe WHERE 1 = 0", None))
+        alias = "mnemiq_probe" if self.dialect == "oracle" else "AS mnemiq_probe"
+        read_execute_response(self._execute_sql(f"SELECT * FROM ({body}) {alias} WHERE 1 = 0", None))
 
     def dry_run(self, sql: str) -> None:
         """Have Superset check `sql` and prepare it without running it. A refusal raises what the same refusal raises
@@ -341,11 +355,18 @@ def _refused_size(refused: SupersetResponseTooLarge) -> tuple[int, int] | None:
     return (sent_bytes, allowed) if sent_bytes > 0 and allowed > 0 else None
 
 
-def _outer_limit(sql: str) -> int | None:
-    """The rows `sql` asks for at most, as Superset mode's dialect reads its outer LIMIT, never past the deciders' cap
-    (`MAX_ROWS`): the bound an answer asked again stays under. None when the statement, or its LIMIT, cannot be read."""
+def _outer_limit(sql: str, dialect: str) -> int | None:
+    """The rows `sql` asks for at most, as `dialect` reads its outer row limit, never past the deciders' cap
+    (`MAX_ROWS`): the bound an answer asked again stays under. None when the statement, or its limit, cannot be read.
+
+    PostgreSQL's limit is its LIMIT. Oracle's is its row-limiting clause, `FETCH FIRST|NEXT n ROW|ROWS ONLY`, after
+    an `OFFSET m ROWS` or not, and the bound is `n` either way, the most rows it returns. Superset puts `execute_sql`'s
+    `limit` in that clause's place, as it does a LIMIT's (`set_limit_value` in `superset/sql/parse.py`). A share
+    (`PERCENT`) and a count that keeps its ties (`WITH TIES`) are no number of rows, so neither is read: 15 rows asked
+    in place of a 20 PERCENT that is 10 rows would answer more than the statement asks. Nor is a clause that states no
+    count (`FETCH FIRST ROW ONLY`, one row), below which no re-ask could go."""
     try:
-        tree = sqlglot.parse_one(sql, read=superset_dialect())
+        tree = sqlglot.parse_one(sql, read=dialect)
     except sqlglot.errors.ParseError:
         return None
     if not isinstance(tree, exp.Query):
@@ -353,10 +374,24 @@ def _outer_limit(sql: str) -> int | None:
     written = tree.args.get("limit")
     if written is None:
         return MAX_ROWS
-    value = written.expression if isinstance(written, exp.Limit) else None
+    if dialect == "oracle":
+        value = _fetched_rows(written)
+    else:
+        value = written.expression if isinstance(written, exp.Limit) else None
     if not isinstance(value, exp.Literal) or value.is_string or not value.this.isdigit():
         return None
     return min(int(value.this), MAX_ROWS)
+
+
+def _fetched_rows(written: exp.Expression) -> exp.Expression | None:
+    """The count of an Oracle row-limiting clause (`exp.Fetch`, sqlglot's `count`), or None for anything else, and
+    for a clause whose count is a share of the rows or keeps its ties."""
+    if not isinstance(written, exp.Fetch):
+        return None
+    options = written.args.get("limit_options")
+    if options is not None and (options.args.get("percent") or options.args.get("with_ties")):
+        return None
+    return written.args.get("count")
 
 
 def _payload_size(payload: dict) -> int:
