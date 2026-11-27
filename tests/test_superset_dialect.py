@@ -27,8 +27,8 @@ HOME = SRC / "superset" / "settings.py"
 KEPT = {("superset/pg_catalog.py", 'VIEW_DIALECT = "postgres"')}
 # The modules that write or read SQL in Superset mode's dialect, each of which must be seen reading it at call time.
 READERS = {"superset/adapter.py", "superset/chart_check.py", "superset/chart_form.py", "superset/grants.py",
-           "superset/measures.py", "superset/plan_rows.py", "superset/planner.py", "superset/saved_metrics.py",
-           "runtime.py"}
+           "superset/measures.py", "superset/names.py", "superset/plan_rows.py", "superset/planner.py",
+           "superset/saved_metrics.py", "runtime.py"}
 
 _CONSTANT = re.compile(r"\bSUPERSET_DIALECT\b")
 

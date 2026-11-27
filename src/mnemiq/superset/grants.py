@@ -39,6 +39,7 @@ from mnemiq.superset.client import (
     SupersetToolError,
     SupersetUnavailable,
 )
+from mnemiq.superset.names import stored_name
 from mnemiq.superset.payload import SupersetAccessRefused, SupersetQueryFailed
 from mnemiq.superset.settings import superset_dialect
 
@@ -209,7 +210,8 @@ _tables = table_bindings
 
 def _probe(names) -> str:
     """One statement naming every table in `names`, each quoted as stored so that it reaches that table and no other,
-    and returning no rows."""
+    and returning no rows. The adapter sends it with each named as Superset names the table (`for_superset`), as
+    Superset's access check matches it."""
     tables = ", ".join(exp.to_identifier(name, quoted=True).sql(superset_dialect()) for name in names)
     return f"SELECT 1 FROM {tables} WHERE 1 = 0"
 
@@ -322,8 +324,9 @@ def _dataset(item) -> ListedDataset | None:
 def _candidates(datasets: list[ListedDataset], tables: dict[str, set[str]], database_id: int, schema: str) -> list[str]:
     """The stored names of the snapshot tables that the physical datasets on the configured database and schema name,
     in the snapshot's order: the tables to ask Superset to confirm, never a grant by themselves. The schema is compared
-    as stored, as Superset compares it. Superset reads a dataset as virtual when its SQL is not empty (`SqlaTable.kind`
-    in `superset/connectors/sqla/models.py`); a virtual dataset names its own query's rows, never the tables that query
+    as Superset names it, as the configured schema is (`SupersetSqlAdapter.schema`), and as Superset compares it.
+    Superset reads a dataset as virtual when its SQL is not empty (`SqlaTable.kind` in
+    `superset/connectors/sqla/models.py`); a virtual dataset names its own query's rows, never the tables that query
     reads."""
     named: set[str] = set()
     for dataset in datasets:
@@ -333,11 +336,14 @@ def _candidates(datasets: list[ListedDataset], tables: dict[str, set[str]], data
 
 
 def _candidate_names(table_name: str) -> set[str]:
-    """The stored names a dataset named `table_name` may stand for, read as Postgres reads a name
-    (`mnemiq.sql.identifiers`): the table stored under exactly that name, as a quoted reference reads it, and, where
-    the name is a plain word Postgres reads unquoted, the table it folds to, so a dataset `Party` names a stored
-    `party`. Any other name names only itself. These are candidates only: the fallback asks Superset about every one
-    of them, and grants none on its name alone."""
+    """The stored names a dataset named `table_name` may stand for. On Oracle the one Superset reads for it
+    (`stored_name`): a dataset `orders` is the table ORDERS, and a dataset `OrderItems` the table stored so. On
+    PostgreSQL, read as Postgres reads a name (`mnemiq.sql.identifiers`): the table stored under exactly that name, as
+    a quoted reference reads it, and, where the name is a plain word Postgres reads unquoted, the table it folds to, so
+    a dataset `Party` names a stored `party`; any other name names only itself. These are candidates only: the
+    fallback asks Superset about every one of them, and grants none on its name alone."""
+    if superset_dialect() == "oracle":
+        return {stored_name(table_name)}
     names = {table_name}
     if _PLAIN_WORD.fullmatch(table_name) and not _reserved(table_name):
         names.add(resolve_stored(table_name, superset_dialect()))

@@ -654,11 +654,12 @@ def _counts(request: dict) -> dict:
 
 
 def test_profiling_through_an_oracle_adapter_leaves_its_large_objects_out_of_counts(superset_oracle):
-    """Profiling reads the adapter's types in place of its own: a CLOB is never counted, a VARCHAR2 is."""
+    """Profiling reads the adapter's types in place of its own: a CLOB is never counted, a VARCHAR2 is. The table is
+    sent as Superset names it (`names.for_superset`)."""
     adapter = _adapter(_counts)
     stats = profile_table(adapter, TableInfo("DOCS", [ColumnInfo("ID", "NUMBER"), ColumnInfo("BODY", "CLOB"),
                                                       ColumnInfo("TITLE", "VARCHAR2(200)")]))
     sent = [call.request["sql"] for call in adapter.client.calls]
     assert sent == ['SELECT count(*), count(DISTINCT "ID"), count("ID"), count(DISTINCT "TITLE"), count("TITLE") '
-                    'FROM "DOCS"']
+                    'FROM docs']
     assert {s.column: s.measurement for s in stats}["BODY"] == UNSUPPORTED
