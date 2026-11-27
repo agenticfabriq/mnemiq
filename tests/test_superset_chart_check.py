@@ -1035,6 +1035,12 @@ def test_the_reason_names_what_the_chart_was_compared_with(fake):
     assert "query_dataset" in check.reason and "mnemiq's own SQL" not in check.reason
 
 
+# Why a chart is not checked with mnemiq's own statement by an adapter that speaks another dialect than Superset
+# mode's database.
+OTHER_DIALECT = ("mnemiq's own statement for a chart is written in the dialect of Superset mode's database, Postgres or "
+                 "Oracle, and this adapter speaks another")
+
+
 def test_only_a_postgres_adapter_checks_with_its_own_sql(fake):
     """mnemiq's statement, its grain expression above all, is written in Superset mode's dialect, PostgreSQL's here:
     an adapter that speaks another is not checked with it."""
@@ -1044,7 +1050,7 @@ def test_only_a_postgres_adapter_checks_with_its_own_sql(fake):
                                  schema=SCHEMA, dialect="duckdb")
     check = check_chart(adapter, chart_id=CHART_ID, dataset_id=DATASET_ID, kinds={}, saved={},
                         snapshot=SNAPSHOT, grants=GRANTS, guard_fanout=False)
-    assert check.status is ChartStatus.NOT_CHECKED and "Postgres" in check.reason
+    assert check.status is ChartStatus.NOT_CHECKED and check.reason == OTHER_DIALECT
     assert "execute_sql" not in _tools(fake)
 
 
@@ -2744,7 +2750,7 @@ def test_under_oracle_only_an_oracle_adapter_checks_with_its_own_sql(fake, super
                                   schema=SCHEMA, dialect="postgres")
     check = check_chart(postgres, chart_id=CHART_ID, dataset_id=DATASET_ID, kinds={}, saved={}, snapshot=SNAPSHOT,
                         grants=GRANTS, guard_fanout=False)
-    assert check.status is ChartStatus.NOT_CHECKED and "Oracle" in check.reason
+    assert check.status is ChartStatus.NOT_CHECKED and check.reason == OTHER_DIALECT
     assert "execute_sql" not in _tools(fake)
     assert _adapter(fake).dialect == "oracle"
     check = _check(fake)

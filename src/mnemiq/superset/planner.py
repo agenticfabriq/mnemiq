@@ -144,13 +144,15 @@ MAX_REASON = 500
 MAX_DESCRIPTION = 500
 # Postgres keeps the first 63 bytes of a name (`NAMEDATALEN` - 1): a longer alias would be cut, and two could meet.
 _POSTGRES_MAX_IDENTIFIER = 63
-# Oracle, 12.2 and later, refuses a name past 128 bytes.
+# Oracle refuses a name past 128 bytes where the database's `COMPATIBLE` is 12.2 or later. One at 12.1 refuses a name
+# past 30 bytes, and does so loudly, when the made dataset is built.
 _ORACLE_MAX_IDENTIFIER = 128
 
 
 def max_identifier() -> int:
     """The most bytes a made dataset's column name may take, in Superset mode's dialect as it is when asked."""
     return _ORACLE_MAX_IDENTIFIER if superset_dialect() == "oracle" else _POSTGRES_MAX_IDENTIFIER
+
 
 # Which dashboards are offered: at most this many of the goal's words are searched, and this many dashboards shown.
 MAX_SEARCH_WORDS = 6
