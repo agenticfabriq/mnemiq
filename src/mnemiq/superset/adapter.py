@@ -325,16 +325,15 @@ class SupersetSqlAdapter:
 
     def _execute_sql(self, sql: str, timeout_s: float | None, *, dry_run: bool = False,
                      force_refresh: bool = False, row_limit: int | None = None) -> dict:
-        for delimiter in JINJA_DELIMITERS:
-            if delimiter in sql:
-                raise SupersetQueryFailed(f"the statement holds {delimiter}, which Superset reads as a template "
-                                          f"marker, so it was not sent; write the statement without {delimiter}")
+        _refuse_template_markers(sql)
         try:
             # Each table as Superset names it, which its access check and row rules match on (`names`).
             sql = for_superset(sql)
         except UnreadableStatement as exc:
             raise SupersetQueryFailed(f"mnemiq could not read the statement to name its tables as Superset does "
                                       f"({exc}), so it was not sent; send one SELECT") from exc
+        # The text Superset renders as a template is the text sent: checked again as it is sent.
+        _refuse_template_markers(sql)
         limit = _superset_timeout(self._timeout_s if timeout_s is None else timeout_s)
         request = {"database_id": self._database_id, "sql": sql, "schema": self._schema, "timeout": limit}
         if dry_run:
@@ -355,6 +354,14 @@ class SupersetSqlAdapter:
             if kept is None or (isinstance(exc, SupersetRefusedCaller) and not isinstance(kept, SupersetRefusedCaller)):
                 self._terminal_refusal = exc
             raise
+
+
+def _refuse_template_markers(sql: str) -> None:
+    """Raise `SupersetQueryFailed` for a statement holding a marker `execute_sql` renders as a template."""
+    for delimiter in JINJA_DELIMITERS:
+        if delimiter in sql:
+            raise SupersetQueryFailed(f"the statement holds {delimiter}, which Superset reads as a template "
+                                      f"marker, so it was not sent; write the statement without {delimiter}")
 
 
 def _refused_size(refused: SupersetResponseTooLarge) -> tuple[int, int] | None:

@@ -12,6 +12,7 @@ where a name crosses to or from Superset.
 
 from __future__ import annotations
 
+import re
 import uuid
 from types import SimpleNamespace
 
@@ -150,7 +151,7 @@ def test_a_mixed_case_name_is_never_lower_cased(superset_oracle):
     a statement; Superset's `orderitems` is another table, which Oracle reads, unquoted, as ORDERITEMS."""
     assert superset_name("OrderItems") == "OrderItems" and stored_name("OrderItems") == "OrderItems"
     assert stored_name("orderitems") == "ORDERITEMS"
-    assert for_superset('SELECT "ID" FROM "OrderItems"') == 'SELECT "ID" FROM "OrderItems"'
+    assert for_superset('SELECT "ID" FROM "OrderItems"') == 'SELECT "ID" FROM "OrderItems" "OrderItems"'
     assert from_superset('SELECT "ID" FROM "OrderItems"') == 'SELECT "ID" FROM "OrderItems"'
 
 
@@ -207,17 +208,17 @@ def test_for_superset_writes_supersets_spelling(superset_oracle):
 @pytest.mark.parametrize(("written", "sent"), [
     ('SELECT "ID" FROM ORDERS', 'SELECT "ID" FROM orders "ORDERS"'),
     ('SELECT "ID" FROM Orders', 'SELECT "ID" FROM orders "ORDERS"'),
-    ('SELECT "ID" FROM orders', 'SELECT "ID" FROM orders'),
+    ('SELECT "ID" FROM orders', 'SELECT "ID" FROM orders "ORDERS"'),
     ('SELECT "ID" FROM "ORDER_ITEMS"', 'SELECT "ID" FROM order_items "ORDER_ITEMS"'),
     ('SELECT "ID" FROM OrderItems', 'SELECT "ID" FROM orderitems "ORDERITEMS"'),
-    ('SELECT "ID" FROM "orders"', 'SELECT "ID" FROM "orders"'),
-    ('SELECT "ID" FROM "ORDER"', 'SELECT "ID" FROM "ORDER"'),
-    ('SELECT "ID" FROM "ORDER#"', 'SELECT "ID" FROM "ORDER#"'),
+    ('SELECT "ID" FROM "orders"', 'SELECT "ID" FROM "orders" "orders"'),
+    ('SELECT "ID" FROM "ORDER"', 'SELECT "ID" FROM "ORDER" "ORDER"'),
+    ('SELECT "ID" FROM "ORDER#"', 'SELECT "ID" FROM "ORDER#" "ORDER#"'),
     ('SELECT "ID" FROM order#', 'SELECT "ID" FROM "ORDER#" "ORDER#"'),
     ('SELECT "ID" FROM "A$B"', 'SELECT "ID" FROM a$b "A$B"'),
     ('SELECT "ID" FROM "SHOP"."ORDERS"', 'SELECT "ID" FROM shop.orders "ORDERS"'),
     # SQLAlchemy shows the Kelvin sign's table as `k`, which Oracle reads as another table, K: it stays quoted.
-    ('SELECT "ID" FROM "K"', 'SELECT "ID" FROM "K"'),
+    ('SELECT "ID" FROM "K"', 'SELECT "ID" FROM "K" "K"'),
 ])
 def test_each_table_is_written_as_superset_names_it(superset_oracle, written, sent):
     assert for_superset(written) == sent
@@ -294,8 +295,9 @@ def _superset_tables(sql: str) -> list[tuple[str, str]]:
 def _row_ruled(sql: str) -> str:
     """`sql` with every table it reads wrapped as rc2 applies a row rule on Oracle (`RLSAsSubqueryTransformer` in
     `superset/sql/parse.py`, Oracle's `get_rls_method` being AS_SUBQUERY): `(SELECT * FROM <table> WHERE <rule>)`,
-    aliased by the table's own alias where it has one, else by its name quoted as written there. A copy of rc2's rule,
-    since mnemiq does not install Superset; checked against rc2's own in the task's live notes."""
+    aliased by the table's own alias where it has one, else by its name quoted as written there, the table moved in
+    with all sqlglot hangs on it (a parenthesized join's first table takes its joins along, as rc2's does). A copy of
+    rc2's rule, since mnemiq does not install Superset; checked against rc2's own in the task's live notes."""
     tree = sqlglot.parse_one(sql, read="oracle")
     for table in base_tables(tree, "oracle"):
         alias = table.args.get("alias") or exp.TableAlias(this=exp.Identifier(this=table.name, quoted=True))
@@ -306,8 +308,9 @@ def _row_ruled(sql: str) -> str:
 
 
 def _unresolved(sql: str) -> list[str]:
-    """Each column qualifier in `sql` that names no source it can see, as Oracle resolves names: a source in its own
-    query's FROM or one enclosing it, by its alias, else by its table's name."""
+    """Each column qualifier in `sql` that names no source it can see, as Oracle resolves names: a source of its own
+    query or of one enclosing it (a table, at any depth of parenthesized joins, or a derived table), by its alias, else
+    by its table's name."""
     tree = sqlglot.parse_one(sql, read="oracle")
     unresolved = []
     for column in tree.find_all(exp.Column):
@@ -316,10 +319,9 @@ def _unresolved(sql: str) -> list[str]:
             continue
         wanted, select, found = resolve_identifier(qualifier, "oracle"), column.parent_select, False
         while select is not None and not found:
-            sources = [select.args["from_"].this] if select.args.get("from_") else []
-            sources += [join.this for join in select.args.get("joins") or []]
-            exposed = {resolve_identifier(source.args["alias"].this if source.args.get("alias") else source.this,
-                                          "oracle") for source in sources}
+            exposed = {resolve_identifier(node.args["alias"].this if node.args.get("alias") else node.this, "oracle")
+                       for node in select.find_all(exp.Table, exp.Subquery) if node.parent_select is select
+                       and (isinstance(node, exp.Table) or node.args.get("alias") is not None)}
             found = wanted in exposed
             select = select.parent_select
         if not found:
@@ -327,24 +329,49 @@ def _unresolved(sql: str) -> list[str]:
     return unresolved
 
 
+# A bare name followed by the alias the rewrite gives it, its stored name quoted.
+_OWN_ALIAS = re.compile(r'\b([a-z_$#][a-z0-9_$#]*) "([A-Z_$#][A-Z0-9_$#]*)"')
+
+
 @pytest.mark.parametrize("decided", [
     'SELECT "ORDERS"."REVENUE" FROM "ORDERS"',
     "SELECT ORDERS.REVENUE FROM ORDERS",
+    "SELECT orders.revenue FROM orders",
     'SELECT "ORDERS"."ID" FROM "ORDERS" WHERE EXISTS (SELECT 1 FROM "RETURNS" '
     'WHERE "RETURNS"."ORDER_ID" = "ORDERS"."ID")',
+    'SELECT "ORDERS"."ID", "RETURNS"."ID" FROM (("ORDERS" JOIN "CUSTOMERS" ON "CUSTOMERS"."ID" = "ORDERS"."CID") '
+    'JOIN "RETURNS" ON "RETURNS"."ORDER_ID" = "ORDERS"."ID")',
 ])
-def test_a_renamed_table_keeps_its_name_under_a_row_rule(superset_oracle, decided):
+def test_an_unaliased_table_keeps_its_name_under_a_row_rule(superset_oracle, decided):
     """rc2 wraps a table a row rule applies to as a subquery aliased by the table's name quoted as written, `"orders"`
     for a bare `orders`, which Oracle reads as another name than ORDERS: a column the statement qualifies by its table
-    would name nothing. So a table the rewrite renames and that has no alias is aliased by its stored name, quoted,
-    which the wrap keeps: every qualifier resolves before and after the wrap, and the access check still reads
-    `orders`. Unaliased, it would not."""
+    would name nothing. So every table with no alias is aliased by its stored name, quoted, whether the rewrite renamed
+    it or Superset's spelling was already written, and in a parenthesized join as anywhere: the wrap keeps it, every
+    qualifier resolves before and after the wrap, and the access check still reads `orders`. Unaliased, it would
+    not."""
     sent = for_superset(decided)
-    assert sorted(_superset_tables(sent)) == [("", "orders")] + ([("", "returns")] if "RETURNS" in decided else [])
+    names_read = {name for _, name in _superset_tables(sent)}
+    assert "orders" in names_read and names_read <= {"orders", "customers", "returns"}
     assert _unresolved(sent) == [] and _unresolved(_row_ruled(sent)) == []
-    unaliased = sent.replace('orders "ORDERS"', "orders").replace('returns "RETURNS"', "returns")
+    unaliased = _OWN_ALIAS.sub(lambda m: m[1] if m[1].upper() == m[2] else m[0], sent)
     assert unaliased != sent
     assert _unresolved(unaliased) == [] and _unresolved(_row_ruled(unaliased)) != []
+
+
+def test_a_parenthesized_joins_tables_are_aliased_as_any_table(superset_oracle):
+    """Each table inside a parenthesized join is aliased by its own name, as the query around it reads each by its
+    name. Under a row rule its first table's columns keep resolving, as above. rc2 wraps that first table together
+    with the joins sqlglot hangs on it (checked against rc2's own `apply_rls`), so a later table of the same
+    parenthesis, named outside it, is inside that wrap whether or not it has an alias: no alias reaches it, and it is
+    pinned here as rc2 leaves it."""
+    decided = ('SELECT "ORDERS"."ID", "CUSTOMERS"."NAME" '
+               'FROM ("ORDERS" JOIN "CUSTOMERS" ON "CUSTOMERS"."ID" = "ORDERS"."CID")')
+    sent = for_superset(decided)
+    assert sent == ('SELECT "ORDERS"."ID", "CUSTOMERS"."NAME" '
+                    'FROM (orders "ORDERS" JOIN customers "CUSTOMERS" ON "CUSTOMERS"."ID" = "ORDERS"."CID")')
+    assert _unresolved(sent) == [] and _unresolved(_row_ruled(sent)) == ['"CUSTOMERS"."NAME"']
+    unaliased = _OWN_ALIAS.sub(lambda m: m[1], sent)
+    assert set(_unresolved(_row_ruled(unaliased))) == {'"ORDERS"."ID"', '"CUSTOMERS"."NAME"'}
 
 
 def test_a_made_datasets_join_keeps_its_columns_under_a_row_rule(superset_oracle):
@@ -376,15 +403,25 @@ def test_a_made_datasets_join_keeps_its_columns_under_a_row_rule(superset_oracle
     # Two references one query exposes by one name already: mnemiq writes no alias two of them would share.
     ('SELECT COUNT(*) FROM "ORDERS", "ORDERS"', 'SELECT COUNT(*) FROM orders, orders'),
     ('SELECT COUNT(*) FROM "CUSTOMERS" "ORDERS", "ORDERS"', 'SELECT COUNT(*) FROM customers "ORDERS", orders'),
-    # A table the rewrite leaves as it is.
-    ('SELECT "ID" FROM "OrderItems"', 'SELECT "ID" FROM "OrderItems"'),
-    ('SELECT orders.revenue FROM orders', 'SELECT orders.revenue FROM orders'),
-    # An alias would not follow the name there, or would hide a column named by schema and table.
+    # ... in a parenthesized join as well, which exposes its tables to the query around it.
+    ('SELECT COUNT(*) FROM "ORDERS", ("ORDERS" JOIN "CUSTOMERS" ON 1 = 1)',
+     'SELECT COUNT(*) FROM orders, (orders JOIN customers "CUSTOMERS" ON 1 = 1)'),
+    # A table the rewrite leaves as it is, aliased all the same.
+    ('SELECT "ID" FROM "OrderItems"', 'SELECT "ID" FROM "OrderItems" "OrderItems"'),
+    ('SELECT orders.revenue FROM orders', 'SELECT orders.revenue FROM orders "ORDERS"'),
+    # Each table of a parenthesized join, at any depth.
+    ('SELECT 1 FROM (("ORDERS" JOIN "CUSTOMERS" ON 1 = 1) JOIN "ITEMS" ON 1 = 1)',
+     'SELECT 1 FROM ((orders "ORDERS" JOIN customers "CUSTOMERS" ON 1 = 1) JOIN items "ITEMS" ON 1 = 1)'),
+    # An alias would not follow the name there, or would hide a column named by schema and table: that table alone.
     ('SELECT * FROM "ORDERS" SAMPLE (10)', 'SELECT * FROM orders SAMPLE (10)'),
     ('SELECT * FROM "ORDERS" PARTITION (P1)', 'SELECT * FROM orders PARTITION (P1)'),
     ('SELECT "SHOP"."ORDERS"."ID" FROM "SHOP"."ORDERS"', 'SELECT "SHOP"."ORDERS"."ID" FROM shop.orders'),
+    ('SELECT "SHOP"."ORDERS"."ID" FROM "SHOP"."ORDERS" WHERE "SHOP"."ORDERS"."ID" IN '
+     '(SELECT "RETURNS"."ORDER_ID" FROM "RETURNS")',
+     'SELECT "SHOP"."ORDERS"."ID" FROM shop.orders WHERE "SHOP"."ORDERS"."ID" IN '
+     '(SELECT "RETURNS"."ORDER_ID" FROM returns "RETURNS")'),
 ])
-def test_only_a_renamed_table_of_its_own_name_is_aliased(superset_oracle, decided, sent):
+def test_only_an_unaliased_table_of_its_own_name_is_aliased(superset_oracle, decided, sent):
     assert for_superset(decided) == sent
     assert for_superset(sent) == sent
 
@@ -445,7 +482,7 @@ def test_the_adapter_sends_each_statement_in_supersets_spelling(superset_oracle)
         'SELECT "REVENUE" FROM orders "ORDERS"',
         'SELECT "REVENUE" FROM orders "ORDERS" FETCH FIRST 5 ROWS ONLY',
         'SELECT * FROM (SELECT "REVENUE" FROM orders "ORDERS") mnemiq_probe WHERE 1 = 0',
-        'SELECT 1 FROM orders "ORDERS", "OrderItems" WHERE 1 = 0']
+        'SELECT 1 FROM orders "ORDERS", "OrderItems" "OrderItems" WHERE 1 = 0']
     assert {request["schema"] for request in client.requests} == {"shop"}
 
 
@@ -453,6 +490,23 @@ def test_a_statement_the_adapter_cannot_rewrite_is_not_sent(superset_oracle):
     client = _Recorder()
     with pytest.raises(SupersetQueryFailed, match="not sent"):
         SupersetSqlAdapter(client, database_id=7, schema="shop").execute_arrow("SELECT * FROM ORDERS WHERE (")
+    assert client.requests == []
+
+
+def test_the_text_sent_is_the_text_checked_for_template_markers(superset_oracle, monkeypatch):
+    """`execute_sql` renders a statement as a template before it checks and runs it, so the text it is sent, written
+    in Superset's spelling, is the text held to hold no template marker. The rewrite writes only names, so here it is
+    made to add a marker, which is refused and nothing is sent; a marker in the text as written is named as before."""
+    import mnemiq.superset.adapter as adapter_module
+
+    client = _Recorder()
+    adapter = SupersetSqlAdapter(client, database_id=7, schema="shop")
+    monkeypatch.setattr(adapter_module, "for_superset", lambda sql: sql + " -- {{ x }}")
+    with pytest.raises(SupersetQueryFailed, match="holds {{, which Superset reads as a template marker"):
+        adapter.execute_arrow('SELECT 1 FROM "ORDERS"')
+    monkeypatch.undo()
+    with pytest.raises(SupersetQueryFailed, match="holds {%, which Superset reads as a template marker"):
+        adapter.execute_arrow("SELECT {% x %} FROM ORDERS")
     assert client.requests == []
 
 
@@ -568,6 +622,20 @@ def test_a_measures_dataset_is_read_as_superset_reads_it(superset_oracle):
         '(SELECT * FROM "ORDERS") AS "virtual_table"'
     with pytest.raises(ActionRefused, match="could not read"):
         _source(None, row, _facts(is_virtual=True, sql="SELECT * FROM orders WHERE ("))
+
+
+@pytest.mark.parametrize("dialect", ["postgres", "oracle"])
+def test_a_charts_summary_names_its_table_as_the_snapshot_does(request, dialect):
+    """The model is shown a chart's table beside the snapshot's columns, so in the snapshot's spelling: on Oracle the
+    table Superset reads for the dataset's name, ORDERS for `orders`; on PostgreSQL the dataset's name as it was."""
+    from mnemiq.superset.chart_change import _chart_summary
+    from mnemiq.superset.chart_check import ChartRead
+
+    if dialect == "oracle":
+        request.getfixturevalue("superset_oracle")
+    read = ChartRead(chart_id=41, title="By region", viz_type="pie", form_data=None, changed_on=None)
+    assert _chart_summary(read, _facts())["table"] == ("ORDERS" if dialect == "oracle" else "orders")
+    assert _chart_summary(read, _facts(is_virtual=True, sql="SELECT 1 FROM dual"))["table"] is None
 
 
 def test_a_charts_table_offers_the_columns_of_the_table_superset_reads(superset_oracle):

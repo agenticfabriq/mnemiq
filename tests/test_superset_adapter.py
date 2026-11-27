@@ -174,10 +174,14 @@ PROBES = {"postgres": f"SELECT * FROM ({SQL}) AS mnemiq_probe WHERE 1 = 0",
 
 
 def test_validate_probe_has_no_as_before_its_alias(dialect):
+    """Under Superset mode's Oracle dialect the probe is sent as every statement is, its table aliased by its own name
+    (`names.for_superset`)."""
     adapter = _adapter(_answer_with_no_rows())
     assert adapter.dialect == dialect
     adapter.validate(f"{SQL};\n")
-    assert adapter.client.calls[0].request["sql"] == PROBES[dialect]
+    sent = PROBES["postgres"] if dialect == "postgres" else \
+        PROBES["oracle"].replace("FROM policies", 'FROM policies "POLICIES"')
+    assert adapter.client.calls[0].request["sql"] == sent
 
 
 def test_the_probe_follows_the_adapters_own_dialect():

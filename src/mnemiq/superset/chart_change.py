@@ -157,7 +157,8 @@ def _chart_summary(read: ChartRead, facts) -> dict:
     summary = {"id": read.chart_id, "title": read.title, "type": (_family(read.viz_type).name.lower()
                                                                  if _family(read.viz_type) else read.viz_type)}
     if isinstance(facts, DatasetFacts):
-        summary["table"] = facts.table if not facts.is_virtual else None
+        # In the snapshot's spelling, as the columns shown beside it are (`_table_columns`).
+        summary["table"] = stored_name(facts.table) if not facts.is_virtual and facts.table is not None else None
         expectation = expectation_from_form_data(form, dataset=facts) if form else None
         if expectation is not None and not isinstance(expectation, NotCheckable):
             summary["measures"] = [label for label, _ in expectation.metrics]

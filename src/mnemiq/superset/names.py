@@ -53,6 +53,9 @@ _ILLEGAL_INITIAL = frozenset("0123456789_$")
 
 # The parts of a table reference Superset compares by name: the table, its schema, and a catalog.
 _PARTS = ("this", "db", "catalog")
+# What a table may carry and still take an alias right after its name: its name's parts, and the joins sqlglot hangs
+# on the first table of a parenthesized join.
+_ALIASABLE_ARGS = frozenset({*_PARTS, "joins"})
 
 
 class UnreadableStatement(ValueError):
@@ -100,13 +103,14 @@ def for_superset(sql: str) -> str:
     stored. Only the tables it reads change, where they stand; its columns, aliases, CTEs, functions and literals are
     as written.
 
-    A table renamed so that has no alias is aliased by its stored name, quoted (`orders "ORDERS"`), the name the
-    statement's columns already qualify it by. rc2 applies a row rule by wrapping the table in a subquery aliased by
-    the table's own alias, else by its name quoted as written (`RLSAsSubqueryTransformer` in `superset/sql/parse.py`):
-    `"orders"`, which Oracle reads as another name than ORDERS, so a column qualified by its table would name nothing.
-    No alias is added where another source of the same query already goes by that name (two references to one table,
-    neither aliased), so mnemiq writes no alias two sources share; nor where the table carries a clause after its name
-    (a sample, a partition, a point in time), or where a column is named by its schema and table, which an alias would
+    Each table it reads that has no alias is aliased by its stored name, quoted (`orders "ORDERS"`), the name it
+    already goes by, so its meaning is the same; renamed or already in Superset's spelling, and in a parenthesized join
+    as anywhere. rc2 applies a row rule by wrapping the table in a subquery aliased by the table's own alias, else by
+    its name quoted as written (`RLSAsSubqueryTransformer` in `superset/sql/parse.py`): `"orders"` for a bare `orders`,
+    which Oracle reads as another name than ORDERS, so a column qualified by its table would name nothing. No alias is
+    added where another source of the same query already goes by that name (two references to one table, neither
+    aliased), so mnemiq writes no alias two sources share; nor where the table carries a clause after its name (a
+    sample, a partition, a point in time), or where a column names the table by its schema too, which an alias would
     hide.
 
     Raises `UnreadableStatement` for a statement mnemiq cannot read as one, which is not to be sent: one of its tables
@@ -138,7 +142,7 @@ def _quoted(stored: str) -> exp.Identifier:
 def _rewritten(sql: str, spelled: Callable[[str], exp.Identifier], *, aliased: bool) -> str:
     """`sql` with each part of each table it reads (`base_tables`) written as `spelled` writes the stored name Oracle
     reads it as, replaced where it stands in the text, so nothing else is printed again, and, when `aliased`, each
-    table so renamed that `_aliasable` aliased by its stored name, quoted. A part whose reading is not known exactly
+    table `_aliasable` aliased by its stored name, quoted. A part whose reading is not known exactly
     (`resolve_exactly`) is left as written. Read back, the text must parse to the statement with those parts replaced
     and those aliases added, or `UnreadableStatement`."""
     try:
@@ -149,11 +153,13 @@ def _rewritten(sql: str, spelled: Callable[[str], exp.Identifier], *, aliased: b
         raise UnreadableStatement("the text holds no statement, or more than one")
     tree = parsed[0]
     tables = base_tables(tree, "oracle")
-    # Decided on the statement as written, before any part of it is renamed.
-    aliasable = {id(table) for table in tables if aliased and _aliasable(table, tree)}
+    # Decided on the statement as written, before any part of it is renamed: the tables a column names by schema too.
+    named_with_schema = {resolve_identifier(column.args.get("table"), "oracle") for column in tree.find_all(exp.Column)
+                         if column.args.get("db") is not None}
+    aliasable = {id(table) for table in tables if aliased and _aliasable(table, named_with_schema)}
     spans: list[tuple[int, int, str]] = []
     for table in tables:
-        renamed, name, name_ends = False, None, None
+        name, name_ends = None, None
         for part in _PARTS:
             identifier = table.args.get(part)
             if not isinstance(identifier, exp.Identifier):
@@ -169,10 +175,9 @@ def _rewritten(sql: str, spelled: Callable[[str], exp.Identifier], *, aliased: b
             written = spelled(stored)
             text = written.sql(dialect="oracle")
             if sql[start:end + 1] != text:
-                renamed = True
                 spans.append((start, end + 1, text))
                 identifier.replace(written)
-        if renamed and name is not None and id(table) in aliasable:
+        if name is not None and id(table) in aliasable:
             alias = _quoted(name)
             spans.append((name_ends, name_ends, " " + alias.sql(dialect="oracle")))
             table.set("alias", exp.TableAlias(this=alias))
@@ -190,21 +195,37 @@ def _rewritten(sql: str, spelled: Callable[[str], exp.Identifier], *, aliased: b
     return out
 
 
-def _aliasable(table: exp.Table, tree: exp.Expression) -> bool:
-    """Whether `table`, once renamed, takes an alias of its stored name: it has none; it is its name and nothing else
-    (no sample, partition, point in time or other clause after the name, which an alias must follow); no column of the
-    statement is named by schema and table, which Oracle reads only while the table has no alias; and no other source
-    of its query goes by the name it goes by."""
-    if table.args.get("alias") is not None or {key for key, value in table.args.items() if value} - set(_PARTS):
+def _aliasable(table: exp.Table, named_with_schema: set[str | None]) -> bool:
+    """Whether `table` takes an alias of its stored name: it has none; it is its name and nothing else but the joins a
+    parenthesized join's first table carries (no sample, partition, point in time or other clause after the name,
+    which an alias must follow); no column names it by its schema too (`named_with_schema`), which Oracle reads only
+    while the table has no alias; and no other source of its query goes by the name it goes by, those inside a
+    parenthesized join among them."""
+    if table.args.get("alias") is not None or {key for key, value in table.args.items() if value} - _ALIASABLE_ARGS:
         return False
-    if any(column.args.get("db") is not None for column in tree.find_all(exp.Column)):
+    if _exposed(table) in named_with_schema:
         return False
     select = table.parent_select
     if select is None:
         return False
-    sources = [select.args["from_"].this] if select.args.get("from_") else []
-    sources += [join.this for join in select.args.get("joins") or []]
+    sources = _sources(select.args["from_"].this) if select.args.get("from_") else []
+    for join in select.args.get("joins") or []:
+        sources += _sources(join.this)
     return [_exposed(source) for source in sources].count(_exposed(table)) == 1
+
+
+def _sources(source: exp.Expression) -> list[exp.Expression]:
+    """`source`, a query's source, and every source a join it carries brings; a parenthesized join (sqlglot's unaliased
+    subquery over a table or another such join) stands for the sources inside it, at any depth, since the query reads
+    each of them by its own name."""
+    if isinstance(source, exp.Subquery) and source.args.get("alias") is None \
+            and isinstance(source.this, (exp.Table, exp.Subquery)):
+        found = _sources(source.this)
+    else:
+        found = [source]
+    for join in source.args.get("joins") or []:
+        found += _sources(join.this)
+    return found
 
 
 def _exposed(source: exp.Expression) -> str | None:
