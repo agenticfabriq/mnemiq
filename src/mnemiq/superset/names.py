@@ -15,9 +15,9 @@ where it crosses to or from Superset:
   table of a dataset the build makes);
 - `stored_name`: the stored name Superset reads for a name it shows. That is also what SQLAlchemy's Oracle dialect
   writes the name as in SQL: quoted where `_requires_quotes`, else bare, which Oracle reads in upper case;
-- `for_superset`: a statement as mnemiq sends it, each table it reads named as Superset names the table: rc2's access
-  check matches a statement's tables to dataset names exactly (`raise_for_access` with `force_dataset_match`), and its
-  row rules attach to a table by the same names, a virtual dataset's tables included;
+- `for_superset`: a statement as mnemiq sends it, each table it reads named as Superset names the table, as its
+  datasets and row rules name it, a virtual dataset's tables included; sent only when Superset reads the same tables in
+  it as mnemiq does (`superset_reads`);
 - `from_superset`: SQL Superset holds (a virtual dataset's), each table it reads quoted as the database reads it, the
   only spelling mnemiq's deciders read a table by.
 
@@ -37,6 +37,7 @@ from sqlglot.errors import SqlglotError
 from mnemiq.sql.identifiers import resolve_exactly, resolve_identifier
 from mnemiq.sql.scope import base_tables
 from mnemiq.superset.settings import superset_dialect
+from mnemiq.superset.superset_reads import superset_reads
 
 # SQLAlchemy 2.0's Oracle `RESERVED_WORDS`, as its identifier preparer holds them, in lower case: a name among them is
 # never shown in lower case. Fewer than the words Oracle reserves; SQLAlchemy's list decides how Superset shows a name.
@@ -56,6 +57,9 @@ _PARTS = ("this", "db", "catalog")
 # What a table may carry and still take an alias right after its name: its name's parts, and the joins sqlglot hangs
 # on the first table of a parenthesized join.
 _ALIASABLE_ARGS = frozenset({*_PARTS, "joins"})
+# The clauses after a table's name that mnemiq's sqlglot (30.29.0) and Superset 7.0.0rc2's (30.17.0) parse apart: a
+# partition or subpartition. mnemiq cannot confirm that Superset reads a table carrying one as `superset_reads` does.
+_PARSED_OTHERWISE = ("partition",)
 
 
 class RefusedStatement(ValueError):
@@ -118,12 +122,11 @@ def for_superset(sql: str) -> str:
     sample, a partition, a point in time), or where a column names the table by its schema too, which an alias would
     hide.
 
-    Raises `RefusedStatement`, saying how to repair it, for a statement whose tables Superset would not find as mnemiq
-    does: one that names a CTE as it names a table it reads (rc2 matches a table's name with its CTEs' as written,
-    quotes dropped, `is_cte` in `superset/sql/parse.py`, so the table, sent as `orders`, would be the CTE `"orders"`
-    to its access check and row rules), or that reads a table over a database link. Raises `UnreadableStatement` for
-    a statement mnemiq cannot read as one, which is not to be sent: one of its tables in the database's spelling would
-    keep its dataset's row rules from attaching. On PostgreSQL, `sql`."""
+    A statement is sent only when Superset reads the same tables in it as mnemiq does: `RefusedStatement`, saying how
+    to repair it, is raised for one that names a CTE as it names a table it reads, for one that reads a table over a
+    database link, and for any in which Superset does not read each table mnemiq reads, by the name Superset gives it
+    (`_unconfirmed`). `UnreadableStatement` is raised for a statement mnemiq cannot read as one, which is not sent
+    either. On PostgreSQL, `sql`, and nothing is checked."""
     if superset_dialect() != "oracle":
         return sql
     return _rewritten(sql, _supersets_spelling, aliased=True, refusing=True)
@@ -151,10 +154,10 @@ def _quoted(stored: str) -> exp.Identifier:
 def _rewritten(sql: str, spelled: Callable[[str], exp.Identifier], *, aliased: bool, refusing: bool) -> str:
     """`sql` with each part of each table it reads (`base_tables`) written as `spelled` writes the stored name Oracle
     reads it as, replaced where it stands in the text, so nothing else is printed again, and, when `aliased`, each
-    table `_aliasable` aliased by its stored name, quoted; when `refusing`, raising `RefusedStatement` for a statement
-    `_refusal` refuses. A part whose reading is not known exactly (`resolve_exactly`) is left as written. Read back,
-    the text must parse to the statement with those parts replaced and those aliases added, or
-    `UnreadableStatement`."""
+    table `_aliasable` aliased by its stored name, quoted. A part whose reading is not known exactly (`resolve_exactly`)
+    is left as written. Read back, the text must parse to the statement with those parts replaced and those aliases
+    added, or `UnreadableStatement`. When `refusing`, `RefusedStatement` is raised for a statement `_refusal` refuses,
+    and for one with a table `_unconfirmed` finds in the text read back."""
     try:
         parsed = [tree for tree in sqlglot.parse(sql, read="oracle") if tree is not None]
     except SqlglotError as exc:
@@ -169,6 +172,9 @@ def _rewritten(sql: str, spelled: Callable[[str], exp.Identifier], *, aliased: b
     named_with_schema = {resolve_identifier(column.args.get(part), "oracle") for column in tree.find_all(exp.Column)
                          if column.args.get("db") is not None for part in ("db", "table")}
     aliasable = {id(table) for table in tables if aliased and _aliasable(table, named_with_schema)}
+    # Also before: each table's name as written, for a refusal, and as Superset names the table, for the check.
+    as_written = {id(table): _name_as_written(table) for table in tables}
+    shown = {id(table): _superset_names(table) for table in tables} if refusing else {}
     spans: list[tuple[int, int, str]] = []
     for table in tables:
         name, name_ends = None, None
@@ -193,32 +199,89 @@ def _rewritten(sql: str, spelled: Callable[[str], exp.Identifier], *, aliased: b
             alias = _quoted(name)
             spans.append((name_ends, name_ends, " " + alias.sql(dialect="oracle")))
             table.set("alias", exp.TableAlias(this=alias))
-    if not spans:
-        return sql
-    out = sql
-    for start, end, text in sorted(spans, reverse=True):
-        out = out[:start] + text + out[end:]
-    try:
-        reread = sqlglot.parse_one(out, read="oracle")
-    except SqlglotError as exc:
-        raise UnreadableStatement("the rewritten statement does not parse") from exc
-    if not _same_tree(reread, tree):
-        raise UnreadableStatement("the rewritten statement does not read as the statement with its tables renamed")
+    out, reread = sql, tree
+    if spans:
+        for start, end, text in sorted(spans, reverse=True):
+            out = out[:start] + text + out[end:]
+        try:
+            reread = sqlglot.parse_one(out, read="oracle")
+        except SqlglotError as exc:
+            raise UnreadableStatement("the rewritten statement does not parse") from exc
+        if not _same_tree(reread, tree):
+            raise UnreadableStatement("the rewritten statement does not read as the statement with its tables renamed")
+    if refusing and (unconfirmed := _unconfirmed(tables, shown, tree, reread)):
+        named = ", ".join(dict.fromkeys(as_written[id(table)] for table in unconfirmed))
+        raise RefusedStatement(f"mnemiq sends a statement to Superset only when Superset reads the same tables in it as "
+                               f"mnemiq does, which mnemiq could not confirm for {named}, so it was not sent; read each "
+                               "table in a plain FROM or JOIN, under an alias of its own")
     return out
 
 
+def _unconfirmed(tables: list[exp.Table], shown: dict[int, tuple[str, str, str] | None], decided: exp.Expression,
+                 sent: exp.Expression) -> list[exp.Table]:
+    """The tables mnemiq reads (`tables`, nodes of `decided`, the statement as rewritten) that Superset is not found to
+    read as mnemiq does in `sent`, the text sent as parsed: each must be a table node `superset_reads` finds there, at
+    its own place in the statement, by the catalog, schema and name Superset gives it (`shown`; None where mnemiq cannot
+    tell them), and none may carry a clause the two sqlglot versions parse apart (`_PARSED_OTHERWISE`). `superset_reads`
+    copies Superset 7.0.0rc2's own reading, and was checked against rc2 with its sqlglot, 30.17.0, from mnemiq's
+    sqlglot 30.29.0. Raises `UnreadableStatement` where the reading cannot be found."""
+    try:
+        read = {id(node): (node.catalog, node.db, node.name) for node in superset_reads(sent)}
+    except SqlglotError as exc:
+        raise UnreadableStatement("which tables Superset reads in it could not be found") from exc
+    placed: dict[int, exp.Expression] = {}
+    _counterparts(decided, sent, placed)
+    return [table for table in tables
+            if shown[id(table)] is None or any(table.args.get(clause) for clause in _PARSED_OTHERWISE)
+            or read.get(id(placed[id(table)])) != shown[id(table)]]
+
+
+def _superset_names(table: exp.Table) -> tuple[str, str, str] | None:
+    """The catalog, schema and name of `table` as Superset names them, each written part's stored name in Superset's
+    spelling (`superset_name`), "" for a part not written; None when a part is no name or its stored name is not known
+    (`resolve_exactly`)."""
+    shown = []
+    for part in ("catalog", "db", "this"):
+        identifier = table.args.get(part)
+        if identifier is None:
+            shown.append("")
+            continue
+        if not isinstance(identifier, exp.Identifier):
+            return None
+        stored = resolve_exactly(identifier.name, quoted=bool(identifier.args.get("quoted")), dialect="oracle")
+        if stored is None:
+            return None
+        shown.append(superset_name(stored))
+    return shown[0], shown[1], shown[2]
+
+
+def _name_as_written(table: exp.Table) -> str:
+    """`table`'s name, its schema and catalog with it, as the statement writes them."""
+    return exp.Table(**{part: table.args[part].copy() for part in _PARTS if table.args.get(part) is not None}) \
+        .sql(dialect="oracle")
+
+
+def _counterparts(mine, theirs, placed: dict[int, exp.Expression]) -> None:
+    """Each node of `mine` mapped, by its id, to the node at its place in `theirs`, a parse `_same_tree` holds to be
+    the same statement."""
+    if isinstance(mine, exp.Expression):
+        placed[id(mine)] = theirs
+        for key, value in mine.args.items():
+            _counterparts(value, theirs.args.get(key), placed)
+    elif isinstance(mine, list):
+        for one, other in zip(mine, theirs, strict=True):
+            _counterparts(one, other, placed)
+
+
 def _refusal(tree: exp.Expression, tables: list[exp.Table]) -> str | None:
-    """Why the statement is not sent to Superset, in words its writer can act on, or None. A table read over a database
-    link (an `@` in its reference, quoted or not), which is another database's, that neither Superset's datasets nor
-    its row rules name. A CTE named as a table the statement reads anywhere is named, in any case and quoting, as
-    written, as stored or as Superset names it: rc2 takes such a table for the CTE where the CTE is in scope, and the
-    comparison is kept wider than rc2's (any case, any scope) so it does not lean on how rc2 scopes a name."""
+    """Why the statement is not sent to Superset, in words its writer can act on, or None: it reads a table over a
+    database link (`_over_a_link`), another database's, which no Superset dataset names; or it names a CTE, in any
+    case and quoting, as a table it reads anywhere is named as written, as stored or as Superset names it. mnemiq sends
+    a CTE only under a name no table of the statement has, whatever scope either is in."""
     for table in tables:
-        reference = table.copy()
-        reference.set("joins", None)
-        if "@" in reference.sql(dialect="oracle"):
-            return (f"the statement reads {reference.sql(dialect='oracle')} over a database link, which mnemiq "
-                    "does not send through Superset, so it was not sent; read only this database's tables")
+        if _over_a_link(table):
+            return (f"the statement reads {_name_as_written(table)} over a database link, which mnemiq does not send "
+                    "through Superset, so it was not sent; read only this database's tables")
     read: dict[str, str] = {}
     for table in tables:
         identifier = table.this
@@ -232,9 +295,25 @@ def _refusal(tree: exp.Expression, tables: list[exp.Table]) -> str | None:
         name = cte.alias
         if name and name.casefold() in read:
             return (f"the statement names a CTE {cte.args['alias'].this.sql(dialect='oracle')} as it names the "
-                    f"table {read[name.casefold()]}, which Superset would take for the CTE, so it was not sent; give "
+                    f"table {read[name.casefold()]}, which mnemiq does not send to Superset, so it was not sent; give "
                     "the CTE a name no table of the statement has")
     return None
+
+
+def _over_a_link(table: exp.Table) -> bool:
+    """Whether `table` is read over a database link, by its name's parts and its alias, never by a comment or a clause
+    after its name: an `@` in a part of its name, quoted or not (`orders@lnk`; a quoted `"A@B"` is refused too), a part
+    sqlglot reads as a parameter (`@lnk`), or an alias that is a link (sqlglot reads `"ORDERS"@lnk` as `"ORDERS"`
+    aliased `@lnk`, and an unquoted `o@lnk` as an alias). A quoted alias holding an `@` is a name like any."""
+    for part in _PARTS:
+        named = table.args.get(part)
+        if isinstance(named, exp.Parameter) or isinstance(named, exp.Identifier) and "@" in named.name:
+            return True
+    alias = table.args.get("alias")
+    named = alias.this if alias is not None else None
+    if named is None or isinstance(named, exp.Identifier) and named.args.get("quoted"):
+        return False
+    return not isinstance(named, exp.Identifier) or "@" in named.name
 
 
 def _aliasable(table: exp.Table, named_with_schema: set[str | None]) -> bool:

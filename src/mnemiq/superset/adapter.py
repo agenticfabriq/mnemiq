@@ -327,7 +327,7 @@ class SupersetSqlAdapter:
                      force_refresh: bool = False, row_limit: int | None = None) -> dict:
         _refuse_template_markers(sql)
         try:
-            # Each table as Superset names it, which its access check and row rules match on (`names`).
+            # Each table as Superset names it, and sent only when Superset reads the tables mnemiq reads (`names`).
             sql = for_superset(sql)
         except RefusedStatement as exc:
             raise SupersetQueryFailed(str(exc)) from exc

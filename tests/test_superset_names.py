@@ -38,6 +38,7 @@ from mnemiq.superset.names import (
 )
 from mnemiq.superset.payload import SupersetQueryFailed
 from mnemiq.superset.planner import BuildPlan, PlannedDataset
+from mnemiq.superset.superset_reads import superset_reads
 from mnemiq.sql.identifiers import resolve_identifier
 from mnemiq.sql.scope import base_tables
 
@@ -196,18 +197,21 @@ def test_on_postgres_a_name_is_shown_as_stored(name):
 
 
 def test_on_postgres_a_statement_is_sent_as_written():
-    """Returned as it came, not printed again, whatever it holds: PostgreSQL's statements are byte-identical."""
-    for sql in ('SELECT "REVENUE" FROM "ORDERS"', "SELECT * FROM ORDERS", "SELECT * FROM ORDERS WHERE (", ""):
+    """Returned as it came, not printed again, whatever it holds, and nothing refused: PostgreSQL's statements are
+    byte-identical."""
+    for sql in ('SELECT "REVENUE" FROM "ORDERS"', "SELECT * FROM ORDERS", "SELECT * FROM ORDERS WHERE (", "",
+                'SELECT COUNT(*) FROM "ORDERS" SAMPLE (10), (SELECT 1 AS "X" FROM "DUAL") "orders"',
+                'WITH "orders" AS (SELECT 1 AS "ID" FROM "DUAL") SELECT "ORDERS"."ID" FROM "ORDERS"',
+                "SELECT 1 FROM orders@lnk"):
         assert for_superset(sql) is sql and from_superset(sql) is sql
 
 
 # ---------------------------------------------------------------- statements
 
 def test_for_superset_writes_supersets_spelling(superset_oracle):
-    """Each table the statement reads, as Superset names its dataset (rc2's access check matches a statement's tables
-    to dataset names exactly, and its row rules attach by them), and each column as written: Superset matches no column
-    by name, and an unquoted `sysdate` would read the function, not a column stored as SYSDATE. A table renamed so is
-    aliased by its own name (`test_a_renamed_table_keeps_its_name_under_a_row_rule`)."""
+    """Each table the statement reads, as Superset names its dataset, and each column as written: Superset matches no
+    column by name, and an unquoted `sysdate` would read the function, not a column stored as SYSDATE. A table renamed
+    so is aliased by its own name (`test_an_unaliased_table_keeps_its_name_under_a_row_rule`)."""
     assert for_superset('SELECT "REVENUE" FROM "ORDERS"') == 'SELECT "REVENUE" FROM orders "ORDERS"'
     assert for_superset('SELECT "SYSDATE", "ROWNUM" FROM "ORDERS"') == 'SELECT "SYSDATE", "ROWNUM" FROM orders "ORDERS"'
 
@@ -224,11 +228,26 @@ def test_for_superset_writes_supersets_spelling(superset_oracle):
     ('SELECT "ID" FROM order#', 'SELECT "ID" FROM "ORDER#" "ORDER#"'),
     ('SELECT "ID" FROM "A$B"', 'SELECT "ID" FROM a$b "A$B"'),
     ('SELECT "ID" FROM "SHOP"."ORDERS"', 'SELECT "ID" FROM shop.orders "ORDERS"'),
-    # SQLAlchemy shows the Kelvin sign's table as `k`, which Oracle reads as another table, K: it stays quoted.
-    ('SELECT "ID" FROM "K"', 'SELECT "ID" FROM "K" "K"'),
 ])
 def test_each_table_is_written_as_superset_names_it(superset_oracle, written, sent):
     assert for_superset(written) == sent
+
+
+@pytest.mark.parametrize("written", [
+    # SQLAlchemy shows the Kelvin sign's table as `k`, which Oracle reads as another table, K: it can be sent only
+    # quoted, by a name Superset does not give it.
+    'SELECT "ID" FROM "\u212a"',
+    # A letter whose fold on Oracle mnemiq has not measured: the table's stored name, so Superset's, is not known.
+    'SELECT "ID" FROM \u1f80x',
+    'SELECT "ID" FROM \u1f80x.orders',
+    # More parts than a catalog, a schema and a name.
+    'SELECT "ID" FROM shop.orders.x.y',
+])
+def test_a_table_not_sent_by_the_name_superset_gives_it_is_refused(superset_oracle, written):
+    """A statement is sent only when Superset reads each table in it by the name Superset gives the table: one that
+    can be written only by another name, or whose name mnemiq cannot tell, is refused, nothing sent."""
+    with pytest.raises(RefusedStatement, match="could not confirm"):
+        for_superset(written)
 
 
 # Statements holding names that are no table of the source: a CTE, a derived table's alias, a table's alias, an output
@@ -263,9 +282,13 @@ def test_writing_a_statement_twice_changes_nothing_more(superset_oracle):
 
 def test_a_table_whose_reading_is_not_known_is_left_as_written(superset_oracle):
     """An unquoted name holding a letter whose fold on Oracle mnemiq has not measured (a Greek letter with a subscript
-    iota, `resolve_exactly`) names a table mnemiq cannot spell another way and be sure it is the same one."""
+    iota, `resolve_exactly`) names a table mnemiq cannot spell another way and be sure it is the same one: Superset's
+    SQL is read with it as written, and a statement naming it is not sent
+    (`test_a_table_not_sent_by_the_name_superset_gives_it_is_refused`)."""
     sql = 'SELECT "ID" FROM ᾀx'
-    assert for_superset(sql) == sql and from_superset(sql) == sql
+    assert from_superset(sql) == sql
+    with pytest.raises(RefusedStatement):
+        for_superset(sql)
 
 
 def test_a_rewrite_that_does_not_read_back_is_refused(superset_oracle):
@@ -307,7 +330,7 @@ def _row_ruled(sql: str) -> str:
     deepest table first, as rc2 wraps them (`apply_rls` sorts its reads by depth), so a table inside another's joins is
     wrapped before that table carries it in. A copy of rc2's rule, since mnemiq does not install Superset; checked
     against rc2's own in the task's live notes. It models only the subquery wrap, over the reads mnemiq's resolver
-    finds; which reads rc2 finds is `_rc2_reads`'s."""
+    finds; which reads Superset finds is `superset_reads`'s."""
     tree = sqlglot.parse_one(sql, read="oracle")
     for table in sorted(base_tables(tree, "oracle"), key=lambda node: node.depth, reverse=True):
         alias = table.args.get("alias") or exp.TableAlias(this=exp.Identifier(this=table.name, quoted=True))
@@ -368,32 +391,13 @@ def test_an_unaliased_table_keeps_its_name_under_a_row_rule(superset_oracle, dec
 
 
 def _rc2_reads(sql: str) -> list[tuple[str, str]]:
-    """The tables rc2's access check and row rules find a statement reads, as rc2 finds them
-    (`extract_tables_from_statement`, `_find_table_sources` and `is_cte` in `superset/sql/parse.py`): every table
-    source of every scope sqlglot's `traverse_scope` gives, but one whose name, as written and as sqlglot keys it
-    (case kept, quotes dropped), is a CTE of that scope (`scope.cte_sources`); a schema-qualified one is always a
-    table. Rebuilt over mnemiq's sqlglot from rc2's code; it agrees with rc2's own on every statement the corpus check
-    in the task's live notes sent. It does not model rc2's handling of SHOW, DESCRIBE or a Command, which mnemiq
-    never sends."""
-    from sqlglot.optimizer.scope import Scope, ScopeType, traverse_scope
-
-    tree = sqlglot.parse_one(sql, read="oracle")
-    reads = []
-    for scope in traverse_scope(tree):
-        for source in scope.sources.values():
-            if not isinstance(source, exp.Table):
-                continue
-            if not (source.db or source.catalog):
-                resolved = scope.cte_sources.get(source.name)
-                if isinstance(resolved, Scope) and resolved.scope_type == ScopeType.CTE:
-                    continue
-            reads.append((source.db, source.name))
-    return reads
+    """The tables Superset reads in `sql`, each (schema, table) as Superset names it: `superset_reads`, the copy of
+    rc2's own table extraction that `for_superset` holds every statement it sends to."""
+    return [(table.db, table.name) for table in superset_reads(sqlglot.parse_one(sql, read="oracle"))]
 
 
-# A statement whose CTE has the name of a table it reads, spelled as rc2's `is_cte` compares names (as written, quotes
-# dropped, case kept) or in any other case. Each is refused: rc2 takes a reference by that name, in the CTE's scope or
-# any nested in it, for the CTE, which the first, the sixth and the last show (rc2's own extraction, the live notes).
+# A statement whose CTE has the name of a table it reads, in any case and quoting, in any scope of the statement: as
+# the table is written, as it is stored, or as Superset names it. mnemiq refuses each.
 CTE_TWINS = [
     'WITH "orders" AS (SELECT 1 AS "ID" FROM "DUAL") SELECT "ORDERS"."ID" FROM "ORDERS"',
     'WITH "Orders" AS (SELECT 1 AS "ID" FROM "DUAL") SELECT "ORDERS"."ID" FROM "ORDERS"',
@@ -412,22 +416,22 @@ CTE_TWINS = [
 @pytest.mark.parametrize("decided", CTE_TWINS)
 def test_a_cte_that_shares_a_tables_name_is_refused(superset_oracle, decided):
     """A CTE whose name, in any case and quoting, is the name of a table the statement reads (as written, as stored or
-    as Superset names it) is refused, nothing to send: rc2 compares a table's name with its CTEs' as written, quotes
-    dropped, so the table Superset is sent as `orders` is the CTE `"orders"` to it, and its access check and row rules
-    pass it by. The model is told how to repair it."""
+    as Superset names it) is refused, nothing sent, and the model is told how to repair it: mnemiq sends a CTE only
+    under a name no table of the statement has."""
     with pytest.raises(RefusedStatement, match="give the CTE a name no table of the statement has"):
         for_superset(decided)
 
 
 def test_a_cte_that_reads_as_the_cte_is_no_twin(superset_oracle):
-    """A reference Oracle reads as the CTE, as rc2 does, reads no table of that name, and is sent."""
+    """A reference Oracle reads as the CTE reads no table of that name: it is no twin, and is sent, Superset reading
+    the same tables in it as mnemiq does."""
     sent = for_superset('WITH orders AS (SELECT 1 AS "ID" FROM "DUAL") SELECT "ID" FROM orders')
     assert sent == 'WITH orders AS (SELECT 1 AS "ID" FROM dual "DUAL") SELECT "ID" FROM orders'
     assert _superset_tables(sent) == _rc2_reads(sent) == [("", "dual")]
 
 
-# Every statement this module sends in a test, written or decided: each one sent is one whose reads rc2 finds as mnemiq
-# does.
+# Statements this module's tests send, written or decided: each is sent only when Superset reads the tables in it that
+# mnemiq reads.
 SENT_HERE = [decided for decided, _ in NOT_TABLES] + CTE_TWINS + [
     'SELECT COUNT(*) FROM "ORDERS" "X", "CUSTOMERS" "X"', 'SELECT COUNT(*) FROM "ORDERS", "ORDERS"',
     'SELECT "ORDERS"."ID", "CUSTOMERS"."NAME" FROM ("ORDERS" JOIN "CUSTOMERS" ON "CUSTOMERS"."ID" = "ORDERS"."CID")',
@@ -438,9 +442,8 @@ SENT_HERE = [decided for decided, _ in NOT_TABLES] + CTE_TWINS + [
 
 @pytest.mark.parametrize("decided", SENT_HERE)
 def test_superset_finds_the_tables_mnemiq_reads(superset_oracle, decided):
-    """After the rewrite, the tables rc2 finds a sent statement reads (`_rc2_reads`) are the tables mnemiq's resolver
-    finds it reads, name for name as Superset names them: none passes Superset's access check and row rules unseen.
-    A statement where they would differ is not sent."""
+    """A statement sent is one in which Superset reads (`superset_reads`) the tables mnemiq's resolver finds it reads,
+    name for name as Superset names them; the rest are refused."""
     try:
         sent = for_superset(decided)
     except RefusedStatement:
@@ -449,25 +452,104 @@ def test_superset_finds_the_tables_mnemiq_reads(superset_oracle, decided):
     assert sorted(_rc2_reads(sent)) == sorted(_superset_tables(sent))
 
 
-def test_rc2_takes_a_tables_twin_for_the_cte(superset_oracle):
-    """What the refusal keeps from Superset: written as Superset names its tables but not refused, the first, the
-    sixth and the last twins read a table rc2 does not find (rc2's own extraction agrees, the live notes). The rest
-    are refused for a wider rule than rc2's comparison (any case, any scope of the statement), which keeps the rule
-    simple and does not lean on how rc2 scopes a name."""
-    misread = []
-    for decided in CTE_TWINS:
-        would_send = names._rewritten(decided, names._supersets_spelling, aliased=True, refusing=False)
-        if sorted(_rc2_reads(would_send)) != sorted(_superset_tables(would_send)):
-            misread.append(CTE_TWINS.index(decided))
-    assert misread == [0, 5, 6]
+# Statements in which mnemiq cannot confirm that Superset reads every table mnemiq reads, each by the name Superset gives
+# it. mnemiq refuses each.
+NOT_READ_ALIKE = [
+    'SELECT COUNT(*) FROM "ORDERS" SAMPLE (10), (SELECT 1 AS "X" FROM "DUAL") "orders"',
+    'WITH "T" AS (SELECT 1 AS "X" FROM "DUAL") SELECT COUNT(*) FROM "ORDERS" SAMPLE (10), "T" "orders"',
+    'SELECT COUNT(*) FROM "ORDERS" SAMPLE (10) CROSS JOIN (SELECT COUNT(*) AS "N" FROM "DUAL") "orders"',
+    'SELECT COUNT(*) FROM "ORDERS" PARTITION (P1), (SELECT 1 AS "X" FROM "DUAL") "orders"',
+    'SELECT COUNT(*) FROM "ORDERS" SAMPLE (10), (SELECT 1 AS "X" FROM "ORDERS" "O") "orders"',
+    'SELECT COUNT(*) FROM "ORDERS" PARTITION (P1), (SELECT 1 AS "X" FROM "DUAL") "PARTITION"',
+    'WITH "PARTITION" AS (SELECT 1 AS "X" FROM "DUAL") SELECT COUNT(*) FROM "ORDERS" PARTITION (P1), "PARTITION"',
+    'SELECT COUNT(*) FROM "ORDERS" SUBPARTITION (P1) CROSS JOIN (SELECT 1 AS "X" FROM "DUAL") "SUBPARTITION"',
+    'SELECT * FROM "ORDERS" PARTITION (P1)',
+    "(SELECT count(*) FROM (PIVOT orders ON status USING sum(id)))",
+    "(SELECT max(to_json(p)) FROM (PIVOT orders ON status USING sum(id)) p)",
+    "SELECT * FROM (PIVOT film ON title USING count(film_id)) p",
+    "SELECT * FROM (PIVOT query_table('customer') ON c USING sum(x)) p",
+    "SELECT id FROM (PIVOT claim ON id USING first(secret)) p",
+    "SELECT k FROM (UNPIVOT claim ON secret INTO NAME k VALUE v) u",
+    "SELECT * FROM LATERAL (VALUES ((SELECT max(store_id) FROM customer))) AS lv(x)",
+    "SELECT * FROM film f, LATERAL (VALUES ((SELECT max(store_id) FROM customer))) AS v(x)",
+    "SELECT 1 AS one FROM LATERAL (VALUES ((SELECT max(amount) FROM claim))) AS lv(x)",
+    "SELECT id, lv.x FROM claim CROSS JOIN LATERAL (VALUES ((SELECT max(ssn) FROM customer))) AS lv(x)",
+    "SELECT x FROM LATERAL (VALUES ((SELECT max(ssn) FROM customer))) AS lv(x)",
+    "SELECT x FROM LATERAL (VALUES ((SELECT max(store_id) FROM customer))) AS lv(x)",
+    "SELECT 1 FROM claim c, (SELECT 1) c",
+    "SELECT COLUMN_VALUE FROM TABLE(SYS.ODCINUMBERLIST(1, 2))",
+    "SELECT j.a FROM JSON_TABLE('[]', '$' COLUMNS (a NUMBER PATH '$.a')) j",
+    "SELECT id INTO flags FROM kw",
+]
 
 
-@pytest.mark.parametrize("decided", ["SELECT 1 FROM orders@lnk", 'SELECT 1 FROM "ORDERS"@lnk',
-                                     "SELECT 1 FROM shop.orders@lnk.example.com", 'SELECT 1 FROM "A@B"',
-                                     'SELECT 1 FROM "ORDERS" WHERE "ID" IN (SELECT "ID" FROM returns@lnk)'])
+@pytest.mark.parametrize("decided", NOT_READ_ALIKE)
+def test_a_statement_is_sent_only_when_superset_reads_the_tables_mnemiq_reads(superset_oracle, decided):
+    """mnemiq sends a statement only when Superset reads (`superset_reads`) each table mnemiq reads in it, by the name
+    Superset gives the table. In each of these it cannot confirm that for a table: refused, nothing sent, and the
+    model told how to repair it."""
+    with pytest.raises(RefusedStatement, match="could not confirm for .+ so it was not sent; read each table in a "
+                                               "plain FROM or JOIN, under an alias of its own"):
+        for_superset(decided)
+
+
+@pytest.mark.parametrize(("decided", "named"), [(NOT_READ_ALIKE[0], '"ORDERS"'), (NOT_READ_ALIKE[4], '"ORDERS"'),
+                                                (NOT_READ_ALIKE[-1], "flags")])
+def test_the_refusal_names_each_table_as_written(superset_oracle, decided, named):
+    with pytest.raises(RefusedStatement) as refused:
+        for_superset(decided)
+    assert f"could not confirm for {named}, so" in str(refused.value)
+
+
+def test_a_statement_repaired_as_the_refusal_asks_is_sent(superset_oracle):
+    """Each table under an alias of its own, the one with a sample too: Superset reads every table in it."""
+    sent = for_superset('SELECT COUNT(*) FROM "ORDERS" SAMPLE (10) "O", (SELECT 1 AS "X" FROM "DUAL") "orders"')
+    assert sent == 'SELECT COUNT(*) FROM orders SAMPLE (10) "O", (SELECT 1 AS "X" FROM dual "DUAL") "orders"'
+    assert sorted(_rc2_reads(sent)) == sorted(_superset_tables(sent)) == [("", "dual"), ("", "orders")]
+
+
+def test_a_statement_whose_reading_by_superset_mnemiq_cannot_find_is_not_sent(superset_oracle, monkeypatch):
+    from sqlglot.errors import OptimizeError
+
+    def unreadable(statement):
+        raise OptimizeError("no scope")
+
+    monkeypatch.setattr(names, "superset_reads", unreadable)
+    with pytest.raises(UnreadableStatement, match="which tables Superset reads"):
+        for_superset('SELECT 1 FROM "ORDERS"')
+
+
+@pytest.mark.parametrize(("sql", "read"), [
+    ("SELECT 1 FROM orders o JOIN shop.customers c ON 1 = 1", [("", "orders"), ("shop", "customers")]),
+    ("WITH t AS (SELECT * FROM orders) SELECT * FROM t", [("", "orders")]),
+    ("WITH orders AS (SELECT 1 AS x FROM dual) SELECT * FROM shop.orders", [("", "dual"), ("shop", "orders")]),
+    ("SELECT 1 FROM orders WHERE id IN (SELECT id FROM returns)", [("", "orders"), ("", "returns")]),
+    ("SELECT 1 FROM orders UNION ALL SELECT 1 FROM returns", [("", "orders"), ("", "returns")]),
+    ("SELECT n FROM (SELECT COUNT(*) AS n FROM orders) d", [("", "orders")]),
+    ("WITH t AS (SELECT 1 AS x FROM dual) SELECT * FROM t x, orders t", [("", "dual"), ("", "orders")]),
+    ("WITH t AS (SELECT 1 AS x, 2 AS y FROM dual) SELECT * FROM t PIVOT (SUM(x) FOR y IN (1 AS a))", [("", "dual")]),
+    ("WITH t AS (SELECT 1 AS x, 2 AS y FROM dual) SELECT * FROM t PIVOT (SUM(x) FOR y IN (1 AS a)) p, orders t",
+     [("", "dual"), ("", "orders")]),
+    ("WITH t AS (SELECT 1 AS x, 2 AS y FROM dual) SELECT * FROM t PIVOT (SUM(x) FOR y IN (1 AS a)) p, "
+     "(SELECT 1 AS z FROM dual) t", [("", "dual"), ("", "dual")]),
+    ("SELECT COUNT(*) FROM orders, orders", [("", "orders"), ("", "orders")]),
+])
+def test_superset_reads_each_table_source_of_each_scope(sql, read):
+    """Each table among the sources of each of the statement's scopes, each reference once, a CTE's reference not
+    among them and a table named with its schema always among them: as rc2 7.0.0rc2's own extraction reads these."""
+    assert sorted(_rc2_reads(sql)) == sorted(read)
+
+
+@pytest.mark.parametrize("decided", [
+    "SELECT 1 FROM orders@lnk", 'SELECT 1 FROM "ORDERS"@lnk', 'SELECT 1 FROM "ORDERS"@"LNK"', "SELECT 1 FROM orders @ lnk",
+    "SELECT 1 FROM orders@ lnk", "SELECT 1 FROM orders o@lnk", 'SELECT 1 FROM "SHOP"."ORDERS"@lnk',
+    "SELECT 1 FROM shop.orders@lnk.example.com", 'SELECT 1 FROM "A@B"', "SELECT 1 FROM @lnk",
+    'SELECT 1 FROM "ORDERS" JOIN returns@lnk ON 1 = 1', 'SELECT 1 FROM ("ORDERS" JOIN "RETURNS"@lnk ON 1 = 1)',
+    'SELECT 1 FROM (orders JOIN returns @ lnk ON 1 = 1)',
+    'SELECT 1 FROM "ORDERS" WHERE "ID" IN (SELECT "ID" FROM returns@lnk)'])
 def test_a_table_over_a_database_link_is_refused(superset_oracle, decided):
-    """A table read over a database link (an `@` in its reference, quoted or not) is another database's, which neither
-    Superset's datasets nor its row rules name: refused, nothing to send."""
+    """A table read over a database link (an `@` in a part of its name, quoted or not, or a link sqlglot reads as its
+    alias) is another database's, which no Superset dataset names: refused, nothing sent."""
     with pytest.raises(RefusedStatement, match="database link"):
         for_superset(decided)
 
@@ -528,7 +610,6 @@ def test_a_made_datasets_join_keeps_its_columns_under_a_row_rule(superset_oracle
      'SELECT 1 FROM ((orders "ORDERS" JOIN customers "CUSTOMERS" ON 1 = 1) JOIN items "ITEMS" ON 1 = 1)'),
     # An alias would not follow the name there, or would hide a column named by schema and table: that table alone.
     ('SELECT * FROM "ORDERS" SAMPLE (10)', 'SELECT * FROM orders SAMPLE (10)'),
-    ('SELECT * FROM "ORDERS" PARTITION (P1)', 'SELECT * FROM orders PARTITION (P1)'),
     ('SELECT "SHOP"."ORDERS"."ID" FROM "SHOP"."ORDERS"', 'SELECT "SHOP"."ORDERS"."ID" FROM shop.orders'),
     ('SELECT COUNT(*) FROM "SHOP"."ORDERS", "SHOP" WHERE "SHOP"."ORDERS"."ID" > 0',
      'SELECT COUNT(*) FROM shop.orders, shop WHERE "SHOP"."ORDERS"."ID" > 0'),
@@ -546,8 +627,8 @@ def test_only_an_unaliased_table_of_its_own_name_is_aliased(superset_oracle, dec
                                           ("", "no statement"),
                                           ("SELECT 1 FROM DUAL; SELECT 2 FROM ORDERS", "more than one")])
 def test_a_statement_mnemiq_cannot_read_as_one_is_never_rewritten(superset_oracle, sql, why):
-    """A statement whose tables mnemiq cannot find, or one of several, is refused rather than sent with a table in
-    the database's spelling, which would keep a dataset's row rules from attaching to it."""
+    """A statement whose tables mnemiq cannot find, or one of several, is refused, never sent: a statement is sent only
+    with each table it reads named as Superset names it."""
     with pytest.raises(UnreadableStatement, match=why):
         for_superset(sql)
     with pytest.raises(UnreadableStatement, match=why):
@@ -602,9 +683,13 @@ def test_the_adapter_sends_each_statement_in_supersets_spelling(superset_oracle)
     assert {request["schema"] for request in client.requests} == {"shop"}
 
 
-@pytest.mark.parametrize("sql", ["SELECT '@' FROM \"ORDERS\"",
-                                 'SELECT 1 FROM ("ORDERS" JOIN "CUSTOMERS" ON "CUSTOMERS"."NOTE" = \'@x\')'])
-def test_an_at_sign_outside_a_tables_reference_is_no_link(superset_oracle, sql):
+@pytest.mark.parametrize("sql", [
+    "SELECT '@' FROM \"ORDERS\"", 'SELECT 1 FROM ("ORDERS" JOIN "CUSTOMERS" ON "CUSTOMERS"."NOTE" = \'@x\')',
+    'SELECT "ID" FROM "ORDERS" /* by a@b */', 'SELECT "ID" FROM "ORDERS" "O" -- see x@y',
+    "SELECT \"ID\" FROM \"ORDERS\" AS OF TIMESTAMP TO_TIMESTAMP('2026-01-01 a@b', 'YYYY-MM-DD')",
+    'SELECT "ID" FROM "ORDERS" "A@B"'])
+def test_an_at_sign_outside_a_tables_name_is_no_link(superset_oracle, sql):
+    """An `@` in a literal, a comment, a clause after a table's name or a quoted alias is no database link: sent."""
     assert "@" in for_superset(sql)
 
 
@@ -615,6 +700,8 @@ def test_a_statement_the_adapter_refuses_is_not_sent_and_says_why(superset_oracl
         adapter.execute_arrow(CTE_TWINS[0])
     with pytest.raises(SupersetQueryFailed, match="database link"):
         adapter.execute_arrow("SELECT 1 FROM orders@lnk")
+    with pytest.raises(SupersetQueryFailed, match="could not confirm for"):
+        adapter.execute_arrow(NOT_READ_ALIKE[0])
     assert client.requests == []
 
 
@@ -707,9 +794,9 @@ def test_every_boundary_uses_the_mapping(superset_oracle):
 
 
 def test_the_builder_sends_a_joined_datasets_sql_in_supersets_spelling(superset_oracle, monkeypatch):
-    """rc2 applies the row rules of a virtual dataset's tables to every query of it, matched by their names, so the
-    SQL a joined dataset is made from names them as Superset does; the plan keeps the SQL mnemiq decided, which the
-    check reads the dataset with (`made_virtual_sql`)."""
+    """rc2 applies the row rules of a virtual dataset's tables to every query of it, so the SQL a joined dataset is made
+    from names them as Superset does; the plan keeps the SQL mnemiq decided, which the check reads the dataset with
+    (`made_virtual_sql`)."""
     import mnemiq.superset.builder as builder
 
     sent: list[dict] = []
