@@ -47,6 +47,7 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal
 
 import sqlglot
 from sqlglot import exp
@@ -310,8 +311,9 @@ def unique_live(table: str, columns: Sequence[str], *, adapter, snapshot: Snapsh
     None where the source said nothing. Not asked, and not remembered: a key of no column, one `holds_null` would not
     ask of (a column the grants hide, mask or deny, a table they filter by row, any table while a row filter names one
     the snapshot does not hold), a request Superset refused for good, and a plan whose probe time is spent. Asked and
-    failed, or answered with no two counts, which is remembered, so the plan does not ask again; a failure is logged by
-    its kind alone: a source's words can quote a value."""
+    failed, or answered with no two counts (each an int, or a Decimal that is a whole number: `_count`), which is
+    remembered, so the plan does not ask again; a failure is logged by its kind alone: a source's words can quote a
+    value."""
     named = tuple(sorted(set(columns)))
     if not named or getattr(adapter, "terminal_refusal", None) is not None \
             or probe_withheld(table, named, snapshot=snapshot, grants=grants):
@@ -336,13 +338,25 @@ def unique_live(table: str, columns: Sequence[str], *, adapter, snapshot: Snapsh
             logger.info("whether %s holds each value once could not be read (%s); it is not joined on", shown,
                         type(exc).__name__)
             return None
-        if counts is None or not all(type(count) is int for count in counts):
+        read = [_count(count) for count in counts] if counts is not None else None
+        if read is None or None in read:
             logger.info("whether %s holds each value once was answered with no two counts; it is not joined on", shown)
             return None
-        return counts[0] == counts[1]
+        return read[0] == read[1]
 
     probes.unique[key] = probes.timed(ask, timeout_s)
     return probes.unique[key]
+
+
+def _count(value: object) -> int | None:
+    """`value` as a count: an int (never a bool), or a Decimal that is exactly a whole number, the form Oracle's driver
+    may give a COUNT, a NUMBER, in; None for anything else, a Decimal with a fraction, a float, a bool or None among
+    them."""
+    if type(value) is int:
+        return value
+    if isinstance(value, Decimal) and value.is_finite() and value == value.to_integral_value():
+        return int(value)
+    return None
 
 
 def _held(adapter, physical: dict[str, str], table: str, column: str, *, dialect: str | None,

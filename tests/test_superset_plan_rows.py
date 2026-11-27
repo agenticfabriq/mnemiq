@@ -15,8 +15,8 @@ from sqlglot import exp
 from mnemiq.contract import Relationship
 from mnemiq.contract.values import JoinKey
 from mnemiq.superset.plan_rows import (Link, Refusal, Step, aggregated, base_among, base_of, chain, column_of,
-                                       column_text, comparable, edges, far_side, join_text, links_of, qualified,
-                                       qualify, read_join, rewrite)
+                                       column_text, comparable, edges, far_side, join_text, links_of, mistyped,
+                                       qualified, qualify, read_join, rewrite)
 from mnemiq.superset.planner import joined_names
 from mnemiq.superset.saved_metrics import normalized
 from mnemiq.superset.settings import superset_dialect
@@ -266,6 +266,51 @@ def test_columns_of_two_kinds_or_of_no_known_type_do_not_compare_exactly(left, r
     precision) reads two of its values as one; a column with no type recorded, or one that names none, could be
     either."""
     assert not comparable(left, right) and not comparable(right, left)
+
+
+# Oracle's type texts, as a snapshot enriched from Oracle records them (`ALL_TAB_COLUMNS.DATA_TYPE`, with a length or a
+# precision where one is given), by the group whose types compare exactly with each other: NUMBER and INTEGER, which
+# Oracle stores as a NUMBER, as one exact number; VARCHAR2, NVARCHAR2 and VARCHAR as one text; CHAR and NCHAR, which pad
+# with blanks, as their own; each floating type only with itself, as DATE, a timestamp with any timestamp and a zoned
+# one with any zoned one. None for a type no equality compares, itself included: Oracle refuses a LOB or a LONG in a
+# comparison.
+_ORACLE_GROUPS = {
+    "NUMBER": "exact number", "NUMBER(10)": "exact number", "NUMBER(12,2)": "exact number",
+    "NUMBER(*,0)": "exact number", "INTEGER": "exact number",
+    "VARCHAR2": "text", "VARCHAR2(40)": "text", "VARCHAR2(40 CHAR)": "text", "NVARCHAR2(20)": "text",
+    "VARCHAR(10)": "text",
+    "CHAR(1)": "blank-padded", "CHAR": "blank-padded", "NCHAR(2)": "blank-padded",
+    "BINARY_FLOAT": "binary float", "BINARY_DOUBLE": "binary double", "FLOAT": "float", "FLOAT(126)": "float",
+    "DATE": "date",
+    "TIMESTAMP(6)": "timestamp", "TIMESTAMP(3)": "timestamp", "TIMESTAMP": "timestamp",
+    "TIMESTAMP(6) WITH TIME ZONE": "zoned", "TIMESTAMP WITH TIME ZONE": "zoned",
+    "TIMESTAMP(6) WITH LOCAL TIME ZONE": "local zoned",
+    "CLOB": None, "NCLOB": None, "BLOB": None, "BFILE": None, "LONG": None, "LONG RAW": None,
+}
+
+
+def test_oracle_types_compare_in_their_groups(superset_oracle):
+    """Each Oracle type compares exactly with every type of its group and with no other, read as Oracle names it: sqlglot
+    reads CLOB as its TEXT, LONG and LONG RAW as its BIGINT, and FLOAT and BINARY_FLOAT as one FLOAT, which would put
+    each in a group it is not of."""
+    wrong = [(left, right) for left, group in _ORACLE_GROUPS.items() for right, other in _ORACLE_GROUPS.items()
+             if comparable(left, right) is not (group is not None and group == other)]
+    assert wrong == []
+    # A type no equality compares is said to be one, never to have no recorded type.
+    assert mistyped(Link(("orders", "note"), ("returns", "note")), {("orders", "note"): "CLOB",
+                                                                    ("returns", "note"): "CLOB"}) == (
+        "orders.note is CLOB and returns.note is CLOB: a link joins columns whose values compare exactly")
+
+
+def test_an_oracle_type_written_in_lower_case_is_the_same_type(superset_oracle):
+    """Oracle reads a type's name in any case, as sqlglot does: `clob` is CLOB, `long raw` is LONG RAW and
+    `binary_float` BINARY_FLOAT, never the type sqlglot reads them as."""
+    assert not comparable("clob", "clob") and not comparable("clob", "varchar2(10)")
+    assert not comparable("long raw", "long raw") and not comparable("long", "number")
+    assert not comparable("binary_float", "FLOAT") and comparable("binary_float", "BINARY_FLOAT")
+    # sqlglot reads BINARY_DOUBLE as its DOUBLE PRECISION, which on Oracle is FLOAT(126), a NUMBER.
+    assert not comparable("BINARY_DOUBLE", "DOUBLE PRECISION")
+    assert comparable("number(10)", "INTEGER") and comparable("nvarchar2(5)", "VARCHAR2(40)")
 
 
 def test_a_link_between_columns_of_two_kinds_is_never_walked():

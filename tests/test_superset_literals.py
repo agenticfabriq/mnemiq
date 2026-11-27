@@ -8,6 +8,8 @@ column's values is one of its statements, so what the source was asked is exactl
 from __future__ import annotations
 
 import logging
+from decimal import Decimal
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pytest
@@ -539,6 +541,49 @@ def test_unique_live_is_none_when_the_budget_is_spent_and_does_not_remember_it(c
         assert _unique(["amount"], source, probes=probes) is None
     assert len(source.sent) == 1 and probes.unique == {("t", ("status",)): True}
     assert "t.amount" in caplog.text
+
+
+class _OneRow:
+    """An answer of one row of two values, each read back exactly as given: what an Arrow table cannot hold, such as an
+    infinite Decimal, as well as what it can."""
+
+    num_rows, num_columns = 1, 2
+
+    def __init__(self, keyed, distinct) -> None:
+        self._values = (keyed, distinct)
+
+    def column(self, index: int):
+        return [SimpleNamespace(as_py=lambda value=self._values[index]: value)]
+
+
+@pytest.mark.parametrize(("keyed", "distinct", "unique"), [
+    (Decimal("5"), Decimal("5"), True),
+    (Decimal("5"), Decimal("4"), False),
+    (Decimal("5.0"), Decimal("5"), True),
+    (Decimal("0"), Decimal("0"), True),
+    (Decimal("5"), 5, True),
+    (Decimal("5.5"), Decimal("5.5"), None),
+    (Decimal("5.5"), Decimal("5"), None),
+    (5.0, 5.0, None),
+    (5.0, 5, None),
+    (True, True, None),
+    (Decimal("Infinity"), Decimal("Infinity"), None),
+    (Decimal("NaN"), Decimal("NaN"), None),
+    (Decimal("5"), None, None),
+])
+def test_unique_live_reads_an_integral_decimal_count(keyed, distinct, unique):
+    """Oracle's driver may give a COUNT, a NUMBER, as a Decimal: one that is exactly a whole number is the count it
+    says, as an int is. A Decimal with a fraction, a float, a bool, an infinite or NaN Decimal and a missing count are
+    no count, and say nothing."""
+    source = Source(lambda sql: _OneRow(keyed, distinct))
+    assert _unique(["status"], source) is unique
+
+
+def test_an_arrow_decimal_count_is_read():
+    """A count that reaches mnemiq as an Arrow decimal column reads as its value."""
+    decimals = pa.table({"keyed_rows": pa.array([Decimal("7")]), "distinct_keys": pa.array([Decimal("7")])})
+    assert pa.types.is_decimal(decimals.schema.field(0).type)
+    assert _unique(["status"], Source(lambda sql: decimals)) is True
 
 
 @pytest.mark.parametrize("answer", [
