@@ -2779,11 +2779,12 @@ def test_an_oracle_ranked_read_fetches_its_first_rows(superset_oracle):
 
 def test_an_oracle_made_dataset_is_read_without_as_before_its_alias(fake, superset_oracle, monkeypatch):
     """Superset reads a virtual dataset as a subquery aliased `virtual_table`, which SQLAlchemy's Oracle dialect writes
-    without `AS`, since Oracle refuses one before a table's alias; so mnemiq writes the alias bare there. A chart on a
-    dataset this build made is checked on Oracle too (its SQL names the table quoted, as the snapshot lists it: Oracle
-    reads an unquoted name in upper case). The statement mnemiq hands the deciders is read, since sqlglot's Oracle
-    dialect writes the alias bare again whatever mnemiq wrote."""
-    assert chart_check._virtual_source(MADE_SQL) == f'({MADE_SQL}) "virtual_table"'
+    without `AS`, since Oracle refuses one before a table's alias, and unquoted, a lower-case name it needs no quotes
+    for, which Oracle reads as VIRTUAL_TABLE; so mnemiq writes the alias so there, bare. A chart on a dataset this
+    build made is checked on Oracle too (its SQL names the table quoted, as the snapshot lists it: Oracle reads an
+    unquoted name in upper case). Both the statement mnemiq hands the deciders and the one they decide are read, since
+    sqlglot's Oracle dialect writes the alias without `AS` again whatever mnemiq wrote."""
+    assert chart_check._virtual_source(MADE_SQL) == f'({MADE_SQL}) virtual_table'
     written: list[str] = []
     decide = chart_check.run_decided
     monkeypatch.setattr(chart_check, "run_decided", lambda sql, **more: written.append(sql) or decide(sql, **more))
@@ -2795,8 +2796,9 @@ def test_an_oracle_made_dataset_is_read_without_as_before_its_alias(fake, supers
     check = _check(fake, made={DATASET_ID: made})
     assert check.status is ChartStatus.CHECKED, check.reason
     [mine] = written
-    assert f'FROM ({made}) "virtual_table"' in mine and ' AS "virtual_table"' not in mine
+    assert f'FROM ({made}) virtual_table WHERE ' in mine and '"virtual_table"' not in mine, mine
     [sql] = _statements(fake)
-    assert ' AS "virtual_table"' not in sql and _grouped_by(sql) == ['"region"']
+    assert f'FROM ({made}) virtual_table WHERE ' in sql and '"virtual_table"' not in sql, sql
+    assert _grouped_by(sql) == ['"region"']
     use_superset_dialect("postgres")
     assert chart_check._virtual_source(MADE_SQL) == f'({MADE_SQL}) AS "virtual_table"'

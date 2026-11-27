@@ -31,9 +31,9 @@ SQL is still the SQL the build made it with and on which no row rule applies to 
 the virtual dataset alone applies to queries of that dataset, not to SQL over its tables. Whether one applies is the
 extension's `row_rules`, which asks Superset as the builder and answers only whether; when one does, or mnemiq cannot
 tell, mnemiq's statement is not run. Such a made dataset is read as Superset reads a virtual one,
-`FROM (<its SQL>) AS "virtual_table"`, with no `AS` on Oracle (`_virtual_source`). Any other virtual dataset's saved
-metric is checked through `query_dataset` (`superset/mcp_service/dataset/tool/query_dataset.py`), which takes saved
-metric names only, and a measure written on the chart is not checked.
+`FROM (<its SQL>) AS "virtual_table"`, and on Oracle `FROM (<its SQL>) virtual_table` (`_virtual_source`). Any other
+virtual dataset's saved metric is checked through `query_dataset` (`superset/mcp_service/dataset/tool/query_dataset.py`),
+which takes saved metric names only, and a measure written on the chart is not checked.
 
 What the chart's query computes is read from its `form_data` by `chart_form.py`; this module reads Superset, runs
 mnemiq's own statement and compares.
@@ -461,9 +461,10 @@ def _unwritten(expectation: Expectation) -> str | None:
 
 def _virtual_source(sql: str) -> str:
     """A dataset this build made, read as Superset reads a virtual dataset: its SQL as a subquery aliased
-    `virtual_table`, after `AS` on PostgreSQL. Oracle refuses `AS` before a table's alias, so there the alias follows
-    bare."""
-    alias = '"virtual_table"' if superset_dialect() == "oracle" else 'AS "virtual_table"'
+    `virtual_table`, quoted after `AS` on PostgreSQL, as SQLAlchemy's PostgreSQL dialect writes it. Oracle refuses `AS`
+    before a table's alias, and SQLAlchemy's Oracle dialect writes a lower-case name unquoted, which Oracle reads as
+    VIRTUAL_TABLE: so there the alias follows bare."""
+    alias = "virtual_table" if superset_dialect() == "oracle" else 'AS "virtual_table"'
     return f"({sql}) {alias}"
 
 
