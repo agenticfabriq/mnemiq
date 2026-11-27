@@ -661,5 +661,5 @@ def test_profiling_through_an_oracle_adapter_leaves_its_large_objects_out_of_cou
                                                       ColumnInfo("TITLE", "VARCHAR2(200)")]))
     sent = [call.request["sql"] for call in adapter.client.calls]
     assert sent == ['SELECT count(*), count(DISTINCT "ID"), count("ID"), count(DISTINCT "TITLE"), count("TITLE") '
-                    'FROM docs']
+                    'FROM docs "DOCS"']
     assert {s.column: s.measurement for s in stats}["BODY"] == UNSUPPORTED

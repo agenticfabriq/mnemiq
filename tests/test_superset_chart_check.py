@@ -2819,7 +2819,7 @@ def test_an_oracle_made_dataset_is_read_without_as_before_its_alias(fake, supers
     written: list[str] = []
     decide = chart_check.run_decided
     monkeypatch.setattr(chart_check, "run_decided", lambda sql, **more: written.append(sql) or decide(sql, **more))
-    made, held = 'SELECT * FROM "POLICY"', "SELECT * FROM policy"
+    made, held = 'SELECT * FROM "POLICY"', 'SELECT * FROM policy "POLICY"'
     rows = (("east", 1200), ("west", 800))
     _serve(fake, form_data=_oracle_bar(), chart=_chart_data(["region", "Total premium"], *rows),
            mnemiq=_result(*rows), dataset=_dataset(virtual=True) | {"sql": held})
