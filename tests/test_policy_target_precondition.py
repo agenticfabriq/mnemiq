@@ -43,8 +43,13 @@ def test_a_governed_cte_decided_for_an_unmodelled_engine_is_refused(target):
 
 @pytest.mark.parametrize("target", ["duckdb", "oracle"])
 def test_the_engines_the_rule_holds_for_are_decided_as_before(target):
-    verdict = _read(FORWARD, target)
-    assert getattr(verdict, "code", None) is not RefusalCode.POLICY_TARGET_UNSUPPORTED
+    """Decided, not only spared POLICY_TARGET_UNSUPPORTED: spelled as the engine stores the tables (M223),
+    since on oracle a lowercase claim names another table, and the UNKNOWN_TABLE that came back passed a
+    check for any code but that one (Codex, reviewing M285)."""
+    schema = keyed(SCHEMA, target, "claim", "scratch")
+    policy = AccessPolicy(row_filters=keyed({"claim": "amount > 10"}, target, "claim"), policy_schema=schema)
+    verdict = decide(as_stored(FORWARD, target, "claim"), schema, dialect=target, target=target, policy=policy)
+    assert not isinstance(verdict, Refusal), verdict
 
 
 def test_a_statement_naming_no_cte_binds_the_same_everywhere_and_is_decided():
