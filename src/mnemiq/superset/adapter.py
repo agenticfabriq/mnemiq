@@ -48,7 +48,7 @@ from mnemiq.superset.payload import (
     read_execute_prefix,
     read_execute_response,
 )
-from mnemiq.superset.names import UnreadableStatement, for_superset
+from mnemiq.superset.names import RefusedStatement, UnreadableStatement, for_superset
 from mnemiq.superset.pg_catalog import PostgresCatalogue
 from mnemiq.superset.settings import superset_dialect
 
@@ -329,6 +329,8 @@ class SupersetSqlAdapter:
         try:
             # Each table as Superset names it, which its access check and row rules match on (`names`).
             sql = for_superset(sql)
+        except RefusedStatement as exc:
+            raise SupersetQueryFailed(str(exc)) from exc
         except UnreadableStatement as exc:
             raise SupersetQueryFailed(f"mnemiq could not read the statement to name its tables as Superset does "
                                       f"({exc}), so it was not sent; send one SELECT") from exc
