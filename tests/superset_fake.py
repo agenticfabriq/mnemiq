@@ -101,6 +101,18 @@ def no_table_rule(request: dict) -> dict:
     return {"tables": [{"table": name, "applies": False} for name in request["tables"]]}
 
 
+def tables_read_as_mnemiq(request: dict) -> dict:
+    """What the extension's `tables_read` answers where Superset's access check reads in a statement the tables mnemiq
+    reads in it (`executed.physical_reads`, read as Oracle's, the one dialect it is asked on), each in the request's
+    schema where the statement names none, with no catalog; and an empty request, its probe, refused."""
+    from mnemiq.superset.executed import physical_reads
+
+    if "sql" not in request:
+        return {"refused": "request", "field": "sql"}
+    return {"tables": [{"catalog": catalog or None, "schema": schema or request["schema"], "table": name}
+                       for catalog, schema, name in physical_reads(request["sql"], dialect="oracle").values()]}
+
+
 def answering_dry_runs(handler: Callable) -> Callable:
     """`handler`, an `execute_sql` answer (a function of the request, and for `FakeSuperset` of its authorization too),
     with every dry run answered as Superset answers one of a statement it would run as sent (`dry_run_as_sent`): the
@@ -112,11 +124,14 @@ def answering_dry_runs(handler: Callable) -> Callable:
 
 def as_superset_runs(answer: dict | Exception | Callable[[dict], dict]) -> Callable[[dict], dict]:
     """`RecordingClient`'s `answer` for every statement run, with the calls an Oracle adapter makes before each
-    statement answered as Superset and the extension answer them: a dry run as sent (`dry_run_as_sent`), and
-    `table_rules` with no row rule (`no_table_rule`). A PostgreSQL adapter makes neither call."""
+    statement answered as Superset and the extension answer them: a dry run as sent (`dry_run_as_sent`), `tables_read`
+    with the tables mnemiq reads (`tables_read_as_mnemiq`; told from `execute_sql` by its request, which carries no
+    time limit), and `table_rules` with no row rule (`no_table_rule`). A PostgreSQL adapter makes none of them."""
     def answering(request: dict):
         if request.get("dry_run"):
             return dry_run_as_sent(request)
+        if "sql" in request and "timeout" not in request:
+            return tables_read_as_mnemiq(request)
         if "sql" not in request and ("tables" in request or request == {}):
             return no_table_rule(request)
         return answer(request) if callable(answer) else answer

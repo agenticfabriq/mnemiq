@@ -1,5 +1,5 @@
 """The extension's MCP tools: registration only. What each tool does is its function in `writes` (the seven that change
-Superset) or `reads` (the five that only read).
+Superset) or `reads` (the six that only read).
 
 Superset registers each under `extensions.agenticfabriq.mnemiq.<name>` (`superset/core/mcp/core_mcp_injection.py`,
 `create_tool_decorator`) and wraps it in `mcp_auth_hook`, which runs it as the caller its token names. Each is gated by
@@ -103,3 +103,10 @@ def row_rules(request: dict[str, Any]) -> dict[str, Any]:
                   "statement that reads it. request: {database_id, schema, tables} (at most 50 names).")
 def table_rules(request: dict[str, Any]) -> dict[str, Any]:
     return reads.table_rules(request)
+
+
+@tool(name="tables_read", class_permission_name="Dataset", method_permission_name="read",
+      description="The tables Superset's own access check reads in one statement, each qualified as Superset's "
+                  "executor qualifies a table it applies row rules to. request: {database_id, schema, sql}.")
+def tables_read(request: dict[str, Any]) -> dict[str, Any]:
+    return reads.tables_read(request)

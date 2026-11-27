@@ -1,6 +1,6 @@
-"""Live: mnemiq's check of what Superset would run (`executed.check_executed`), held against what a real Superset
-7.0.0rc2 answers: its own dry run (`execute_sql` with `dry_run`) and the extension's own `table_rules`, with a row rule
-in place.
+"""Live: mnemiq's checks of what Superset would run (`executed.check_executed`, `executed.check_tables_read`), held
+against what a real Superset 7.0.0rc2 answers: its own dry run (`execute_sql` with `dry_run`) and the extension's own
+`table_rules` and `tables_read`, with a row rule in place.
 
 The adapter makes this check on Oracle only, and Superset mode on Oracle is checked live against an Oracle database in
 its own task. Here the database behind Superset is the live suite's PostgreSQL one, so the check reads what Superset
@@ -15,8 +15,8 @@ import json
 import pytest
 
 from mnemiq.superset.client import DelegatedToken, SupersetMcp
-from mnemiq.superset.executed import check_executed, executed_sql, tables_read
-from mnemiq.superset.extension import table_rules_apply
+from mnemiq.superset.executed import check_executed, check_tables_read, executed_sql, physical_reads
+from mnemiq.superset.extension import TOOL_PREFIX, table_rules_apply, tables_read
 from mnemiq.superset.names import RefusedStatement
 from mnemiq.superset.payload import check_execute_response
 
@@ -24,8 +24,7 @@ pytestmark = pytest.mark.integration
 
 SCHEMA = "public"
 STATEMENT = "SELECT p.region, COUNT(*) AS n FROM policy p GROUP BY p.region"
-# A table qualified by its name in another case than Superset's wrap aliases it by: PostgreSQL reads POLICY as policy,
-# and Superset wraps the table under the name as written, quoted ("POLICY"), which PostgreSQL reads as another name.
+# A table read under its name and qualified by it in upper case, which PostgreSQL reads as policy.
 STRANDED = "SELECT POLICY.region, COUNT(*) AS n FROM POLICY GROUP BY POLICY.region"
 
 
@@ -51,7 +50,7 @@ def _executed(live, client: SupersetMcp, sql: str, **more) -> str:
 
 def _rules(live, client: SupersetMcp, sql: str) -> dict[str, bool | None]:
     """Whether a row rule applies to `client`'s person on each table `sql` reads, as the extension answers it."""
-    read = tables_read(sql, dialect="postgres")
+    read = physical_reads(sql, dialect="postgres")
     answers = table_rules_apply(client, database_id=live.database_id, schema=SCHEMA,
                                 tables=[name for _, _, name in read.values()])
     return {key: answers.get(name) for key, (_, _, name) in read.items()}
@@ -92,10 +91,10 @@ def test_supersets_limit_is_excepted_only_where_one_is_asked(live):
     observe("limit", limited=" ".join(limited.split()))
 
 
-def test_a_qualifier_supersets_wrap_strands_is_refused(live):
-    """For west, Superset wraps `POLICY` under `"POLICY"`, so the qualifier POLICY, which PostgreSQL reads as policy,
-    names no source of the query: the check refuses the statement. Run as Superset would run it, PostgreSQL itself
-    rejects it, so the refusal is no false alarm; for analyst, whom no rule narrows, the statement passes and runs."""
+def test_a_qualifier_naming_no_source_in_what_superset_would_run_is_refused(live):
+    """mnemiq refuses a statement whose qualifier names no source of its query in the SQL Superset would run: here
+    the SQL Superset would run for west. Run so, PostgreSQL itself rejects it, so the refusal is no false alarm; for
+    analyst, whom no rule narrows, the statement passes and runs."""
     west, analyst = _client(live, "west"), _client(live, "analyst")
     ruled = _executed(live, west, STRANDED)
     assert '"POLICY"' in ruled, ruled
@@ -107,3 +106,44 @@ def test_a_qualifier_supersets_wrap_strands_is_refused(live):
     check_executed(STRANDED, bare, rules=_rules(live, analyst, STRANDED), dialect="postgres")
     assert analyst.call("execute_sql", _request(live, STRANDED)).get("success") is True
     observe("stranded", west=" ".join(ruled.split()), west_ran=ran.get("error_type"))
+
+
+def _read(live, client: SupersetMcp, sql: str) -> frozenset | None:
+    return tables_read(client, database_id=live.database_id, schema=SCHEMA, sql=sql)
+
+
+def _catalog(live) -> str | None:
+    """The catalog Superset qualifies an unqualified table by on the live database: its default, as the tool answers
+    it for one table."""
+    [(catalog, _, _)] = _read(live, _client(live, "analyst"), "SELECT 1 FROM policy")
+    return catalog
+
+
+@pytest.mark.parametrize(("sql", "tables"), [
+    ("SELECT p.id FROM policy p JOIN party y ON y.id = p.id", {"policy", "party"}),
+    ('WITH recent AS (SELECT id FROM policy) SELECT r.id FROM recent r JOIN "Policy Lines" l ON l.policy_id = r.id',
+     {"policy", "Policy Lines"}),
+    ("SELECT y.id FROM party y WHERE y.id IN (SELECT p.id FROM public.policy p)", {"party", "policy"}),
+], ids=["a join", "a CTE", "a subquery"])
+def test_tables_read_answers_the_tables_supersets_access_check_reads(live, sql, tables):
+    """The extension's `tables_read`, asked as analyst, answers the tables Superset's own access check reads in a
+    join, a CTE (its name never a table) and a subquery, each in the schema asked or its own, with the database's
+    default catalog; mnemiq's check finds every table it reads among them, and refuses when one is held out."""
+    analyst = _client(live, "analyst")
+    read = _read(live, analyst, sql)
+    catalog = _catalog(live)
+    assert read == frozenset((catalog, SCHEMA, name) for name in tables), read
+    check_tables_read(sql, read, schema=SCHEMA, dialect="postgres")
+    with pytest.raises(RefusedStatement, match="could not confirm for"):
+        check_tables_read(sql, frozenset(t for t in read if t[2] != "policy"), schema=SCHEMA, dialect="postgres")
+    observe("tables_read", sql=sql, read=sorted(read, key=str))
+
+
+def test_tables_read_of_text_superset_cannot_read_as_one_statement_is_unreadable(live):
+    analyst = _client(live, "analyst")
+    for sql in ("SELECT 1 FROM policy; SELECT 1 FROM party", "SELEC nothing FROM ("):
+        assert analyst.call(TOOL_PREFIX + "tables_read", {"database_id": live.database_id, "schema": SCHEMA,
+                                                          "sql": sql}) == {"unreadable": True}
+        assert _read(live, analyst, sql) is None
+    assert analyst.call(TOOL_PREFIX + "tables_read", {"database_id": 2_000_000_000, "schema": SCHEMA,
+                                                      "sql": "SELECT 1 FROM policy"}) == {"not_found": "database"}

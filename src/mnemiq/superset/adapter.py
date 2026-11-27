@@ -16,11 +16,13 @@ it once per adapter, and each statement with `force_refresh`, so Superset runs i
 result cache.
 
 On Oracle a statement is sent only as Superset would run it (`mnemiq.superset.executed`): before each `execute_sql`
-the adapter has Superset dry-run the statement with the same options, asks the extension's `table_rules` whether a
-row rule applies to the caller on each table it reads, one call for each schema that holds them, and makes the call
-only when `executed.check_executed` finds that what Superset would run is the statement sent, each such table under
-its rule. That needs extension 0.3.0: a Superset without `table_rules` ends the request (`ExtensionMissing`). On
-PostgreSQL none of this is asked, and each statement is one call, as it always was.
+the adapter has Superset dry-run the statement with the same options, asks the extension's `tables_read` which tables
+Superset's own access check reads in it and its `table_rules` whether a row rule applies to the caller on each table
+it reads, one call for each schema that holds them, and makes the call only when every table mnemiq reads is one
+Superset reads (`executed.check_tables_read`) and what Superset would run is the statement sent, each such table under
+its rule (`executed.check_executed`). That needs extension 0.3.0: a Superset without those tools ends the request
+(`ExtensionMissing`), and one that does not answer them is Superset not answering. On PostgreSQL none of this is asked,
+and each statement is one call, as it always was.
 """
 
 from __future__ import annotations
@@ -49,8 +51,14 @@ from mnemiq.superset.client import (
 )
 from mnemiq.execute.cut import mark_sent
 from mnemiq.sql.guard import MAX_ROWS
-from mnemiq.superset.executed import check_executed, executed_sql, tables_read
-from mnemiq.superset.extension import ExtensionMissing, require_table_rules, table_rules_apply
+from mnemiq.superset.executed import check_executed, check_tables_read, executed_sql, physical_reads
+from mnemiq.superset.extension import (
+    ExtensionMissing,
+    require_table_rules,
+    require_tables_read,
+    table_rules_apply,
+    tables_read,
+)
 from mnemiq.superset.payload import (
     ResultCut,
     SupersetQueryFailed,
@@ -257,9 +265,9 @@ class SupersetSqlAdapter:
             return
         if before_call is not None:
             before_call()
-        limit = _superset_timeout(self._timeout_s)
+        timeout = _superset_timeout(self._timeout_s)
         self._as_superset_runs(sent, {"database_id": self._database_id, "sql": sent, "schema": self._schema,
-                                      "timeout": limit}, limit)
+                                      "timeout": timeout}, timeout)
 
     def source_unavailable(self, exc: BaseException) -> bool:
         """The proof seam's question: did the source not answer, rather than answer no.
@@ -382,10 +390,10 @@ class SupersetSqlAdapter:
                 return checked  # the dry run asked for is the one the statement was checked by
         return self._call(request, limit)
 
-    def _call(self, request: dict, limit: int) -> dict:
-        """`execute_sql` with `request`, its answer as Superset sent it."""
+    def _call(self, request: dict, timeout: int) -> dict:
+        """`execute_sql` with `request`, its answer as Superset sent it; `timeout` is the request's time limit."""
         try:
-            return self.client.call("execute_sql", request, timeout_s=limit + TRANSPORT_MARGIN_S)
+            return self.client.call("execute_sql", request, timeout_s=timeout + TRANSPORT_MARGIN_S)
         except SupersetCallTimedOut as exc:
             # Superset took the statement and was still running it at the time limit plus the margin: its own limit
             # takes effect only once the database call returns, so the statement outran it. The statement's cost,
@@ -402,33 +410,49 @@ class SupersetSqlAdapter:
         if kept is None or (isinstance(exc, SupersetRefusedCaller) and not isinstance(kept, SupersetRefusedCaller)):
             self._terminal_refusal = exc
 
-    def _as_superset_runs(self, sent: str, request: dict, limit: int) -> dict:
-        """Superset's dry run of `request` (the statement `sent`, with the options its real call carries), when
-        `executed.check_executed` finds that Superset would run it as mnemiq reads it under the rules `table_rules`
-        says apply to the caller. Raises `RefusedStatement` when it does not, and what Superset's own refusal of the
-        dry run raises from a run."""
-        payload = self._call({**request, "dry_run": True}, limit)
+    def _as_superset_runs(self, sent: str, request: dict, timeout: int) -> dict:
+        """Superset's dry run of `request` (the statement `sent`, with the options its real call carries; `timeout` its
+        time limit), when every table mnemiq reads in `sent` is one Superset's access check reads in it
+        (`executed.check_tables_read`) and Superset would run it as mnemiq reads it under the rules `table_rules` says
+        apply to the caller (`executed.check_executed`). Raises `RefusedStatement` when not, what Superset's own refusal
+        of the dry run raises from a run, and `SupersetUnavailable` where Superset does not answer the extension."""
+        payload = self._call({**request, "dry_run": True}, timeout)
         check_execute_response(payload)
         executed = executed_sql(payload)
+        check_tables_read(sent, self._tables_read(sent), schema=self._schema, dialect=self.dialect)
         check_executed(sent, executed, rules=self._table_rules(sent), dialect=self.dialect,
                        limit=request.get("limit"))
         return payload
 
+    def _tables_read(self, sent: str) -> frozenset | None:
+        """The tables Superset's access check reads in `sent`, as the extension's `tables_read` answers, or None where
+        mnemiq cannot tell; for None the extension is asked whether it offers `tables_read` at all, and one that does
+        not ends the request (`ExtensionMissing`), as a refusal of the caller does. Superset not answering is raised
+        (`SupersetUnavailable`)."""
+        try:
+            read = tables_read(self.client, database_id=self._database_id, schema=self._schema, sql=sent)
+            if read is None:
+                require_tables_read(self.client)
+        except (*TERMINAL_REFUSALS, ExtensionMissing) as exc:
+            self._remember(exc)
+            raise
+        return read
+
     def _table_rules(self, sent: str) -> dict[str, bool | None]:
-        """Whether a row rule applies to the caller on each table `sent` reads (`executed.tables_read`), as the
+        """Whether a row rule applies to the caller on each table `sent` reads (`executed.physical_reads`), as the
         extension's `table_rules` answers: one call for each schema that holds them, a table the statement does not
         qualify in the adapter's schema, as Superset qualifies it. A table named by a catalog, or by no plain name, is
         not asked about, and reads as one mnemiq cannot tell of. Where any reads so, the extension is asked whether
         it offers `table_rules` at all; one that does not ends the request (`ExtensionMissing`), and so does a refusal
-        of the caller."""
-        read = tables_read(sent, dialect=self.dialect)
+        of the caller. Superset not answering is raised (`SupersetUnavailable`), never read as cannot tell."""
+        read = physical_reads(sent, dialect=self.dialect)
         by_schema: dict[str, list[str]] = {}
         for catalog, schema, name in read.values():
             if not catalog and name:
                 by_schema.setdefault(schema or self._schema, []).append(name)
         try:
             answers = {schema: table_rules_apply(self.client, database_id=self._database_id, schema=schema,
-                                                 tables=names)
+                                                 tables=names, raise_unavailable=True)
                        for schema, names in by_schema.items()}
             rules = {key: answers[schema or self._schema].get(name) if not catalog and name else None
                      for key, (catalog, schema, name) in read.items()}

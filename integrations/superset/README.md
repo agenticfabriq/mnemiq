@@ -263,7 +263,7 @@ Registered beside the write tools, each gated by a stock permission with the met
 Dataset or Dashboard) and the matching token scope, and changing nothing. An object the caller may not read is left out
 of an answer, or answered as not found, exactly as one that does not exist. Every answer stays under 40,000 bytes of
 JSON, inside Superset's MCP response size guard: an entry of a list that does not fit is answered with its id and
-`"too_large": true`, and a layout that does not fit, or a `table_rules` answer that would not, as
+`"too_large": true`, and a layout that does not fit, or a `table_rules` or `tables_read` answer that would not, as
 `{"too_large": true}`.
 
 | Tool | Gated by | What it answers |
@@ -273,3 +273,4 @@ JSON, inside Superset's MCP response size guard: an entry of a list that does no
 | `get_layout` | Dashboard | A dashboard's stored layout, as text, with the `changed_on` that `set_layout` takes back. |
 | `row_rules` | Dataset | For each of up to 20 datasets, whether a row rule attached to it applies to the caller, as Superset's `get_rls_filters` finds it (an embedded dashboard's guest rules are not counted); never which rule, its clause or its roles. |
 | `table_rules` | Dataset | For each of up to 50 tables of a schema on a database, by name, whether a row rule applies to the caller as Superset looks up the rules of a statement that reads the table (`get_predicates_for_table`), through whichever of the table's datasets that lookup finds, whether or not the caller may read them; never which rule, its clause, its roles or its dataset. A database the caller may not see is answered as not found. |
+| `tables_read` | Dataset | The tables Superset's own access check reads in one statement on a database (`process_jinja_sql`, as `raise_for_access` reads a statement), each with its catalog and schema as Superset's executor qualifies a table it applies row rules to: the schema asked and the database's default catalog, where the statement names none. A statement Superset cannot read as one is answered as unreadable; a database the caller may not see, as not found. |

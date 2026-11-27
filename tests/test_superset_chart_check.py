@@ -46,7 +46,13 @@ from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetPermissi
 from mnemiq.superset.measures import MeasureKind
 from mnemiq.superset.saved_metrics import SavedMetric
 from mnemiq.superset.settings import use_superset_dialect
-from tests.superset_fake import FakeSuperset, answering_dry_runs, dry_run_as_sent, no_table_rule
+from tests.superset_fake import (
+    FakeSuperset,
+    answering_dry_runs,
+    dry_run_as_sent,
+    no_table_rule,
+    tables_read_as_mnemiq,
+)
 
 TOKEN = "tok-builder"
 CHART_ID = 41
@@ -164,6 +170,7 @@ def _serve(fake, *, form_data, chart, mnemiq=None, dataset=None, query=None, inf
     # On Oracle each statement is dry-run first and its tables' row rules asked (`executed`): as sent, under none.
     fake.reply("execute_sql", answering_dry_runs(execute))
     fake.reply(TABLE_RULES, lambda request, authorization: no_table_rule(request))
+    fake.reply(TABLES_READ, lambda request, authorization: tables_read_as_mnemiq(request))
     if query is not None:
         fake.reply("query_dataset", lambda request, authorization: query)
 
@@ -1837,6 +1844,7 @@ def test_a_big_number_percent_above_100_is_format_wrong_through_check_chart(fake
 MADE_SQL = "SELECT * FROM policy"
 ROW_RULES = "extensions.agenticfabriq.mnemiq.row_rules"
 TABLE_RULES = "extensions.agenticfabriq.mnemiq.table_rules"
+TABLES_READ = "extensions.agenticfabriq.mnemiq.tables_read"
 SQL_CHANGED = ("the chart's dataset is one this build made, but its SQL is no longer the SQL the build made it with, "
                "so mnemiq does not check it with its own SQL")
 RULE_APPLIES = ("a row rule applies to you on the chart's dataset, and mnemiq's own SQL reads the tables beneath it, "
@@ -2852,12 +2860,43 @@ def test_an_oracle_made_dataset_superset_refuses_at_its_dry_run_is_not_checked_w
     assert _statements(fake) == []
 
 
+def _made_on_oracle(fake, execute=None):
+    made, held = 'SELECT * FROM "POLICY"', 'SELECT * FROM policy "POLICY"'
+    rows = (("east", 1200), ("west", 800))
+    _serve(fake, form_data=_oracle_bar(), chart=_chart_data(["region", "Total premium"], *rows),
+           mnemiq=_result(*rows), dataset=_dataset(virtual=True) | {"sql": held})
+    _rules(fake, _no_rule)
+    if execute is not None:
+        fake.reply("execute_sql", execute)
+    return made, held
+
+
+def test_an_oracle_made_dataset_superset_reads_other_tables_in_is_not_checked(fake, superset_oracle):
+    """Superset's access check must read every table mnemiq reads in the made dataset's SQL (`tables_read`), as the
+    chart's row rules apply to the tables Superset reads: else the chart is not checked, saying which."""
+    made, held = _made_on_oracle(fake)
+    fake.reply(TABLES_READ, lambda request, authorization: {"tables": []} if request.get("sql") == held
+               else tables_read_as_mnemiq(request))
+    check = _oracle_check(fake, made={DATASET_ID: made})
+    assert check.status is ChartStatus.NOT_CHECKED and "could not confirm for policy" in check.reason, check
+    assert _statements(fake) == []
+
+
+def test_an_oracle_made_datasets_check_superset_does_not_answer_is_not_checked(fake, superset_oracle):
+    """A dry run Superset ends at its time limit leaves the chart not checked, saying Superset did not answer."""
+    made, held = _made_on_oracle(fake, lambda request, authorization: {
+        "success": False, "error": "Query exceeded the timeout limit", "error_type": "timed_out"})
+    check = _oracle_check(fake, made={DATASET_ID: made})
+    assert check.status is ChartStatus.NOT_CHECKED and check.reason == chart_check._DRY_RUN_UNANSWERED, check
+    assert _statements(fake) == []
+
+
 def test_a_postgres_made_dataset_is_not_dry_run(fake):
     """On PostgreSQL the made dataset's SQL is not dry-run, as before."""
     _made(fake)
     check = _check(fake, made={DATASET_ID: MADE_SQL})
     assert check.status is ChartStatus.CHECKED, check.reason
-    assert not [call for call in fake.calls if call.request.get("dry_run") or call.tool == TABLE_RULES]
+    assert not [call for call in fake.calls if call.request.get("dry_run") or call.tool in (TABLE_RULES, TABLES_READ)]
 
 
 def test_an_oracle_made_dataset_is_read_without_as_before_its_alias(fake, superset_oracle, monkeypatch):

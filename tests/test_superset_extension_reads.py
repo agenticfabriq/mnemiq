@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from mnemiq.superset.client import SupersetPermissionDenied, SupersetToolError, SupersetUnavailable
-from mnemiq.superset.extension import TABLE_RULES_BATCH, TOOL_PREFIX, table_rules_apply
+from mnemiq.superset.extension import TABLE_RULES_BATCH, TOOL_PREFIX, table_rules_apply, tables_read
 from tests import superset_stubs as stubs
 from tests.superset_extension_path import use_extension_source
 
@@ -30,7 +30,8 @@ def refusal(tool, request):
 
 
 def test_every_read_tool_has_a_request_reader():
-    assert set(reads.REQUESTS) == {"dataset_metrics", "editors_of", "get_layout", "row_rules", "table_rules"}
+    assert set(reads.REQUESTS) == {"dataset_metrics", "editors_of", "get_layout", "row_rules", "table_rules",
+                                   "tables_read"}
 
 
 def test_dataset_metrics_takes_at_most_twenty_distinct_ids():
@@ -426,6 +427,181 @@ def test_table_rules_too_large_to_send_is_refused_before_superset_is_asked(monke
 
 def test_a_bad_table_rules_request_is_answered_not_raised():
     assert reads.table_rules({**TABLE_REQUEST, "tables": "orders"}) == {"refused": "request", "field": "tables"}
+
+
+# ---------------------------------------------------------------- tables_read: the tables Superset's access check reads
+
+READ_REQUEST = {"database_id": 7, "schema": "public", "sql": 'SELECT o.id FROM orders o JOIN shop2.lines l ON 1 = 1'}
+
+
+def test_tables_read_takes_a_database_a_schema_and_one_statements_text():
+    assert reads.read("tables_read", READ_REQUEST) == READ_REQUEST
+    longest = "SELECT 1 FROM t WHERE x = '" + "a" * (reads.MAX_SQL_BYTES - 28) + "'"
+    assert len(longest.encode()) == reads.MAX_SQL_BYTES
+    assert reads.read("tables_read", {**READ_REQUEST, "sql": longest})["sql"] == longest
+    for bad in ("", "   ", 3, None, ["SELECT 1"], longest + "x", longest[:-2] + "é'"):
+        assert refusal("tables_read", {**READ_REQUEST, "sql": bad}) == {"refused": "request", "field": "sql"}
+    for bad in ("", "  ", 3, None, "x" * 256):
+        assert refusal("tables_read", {**READ_REQUEST, "schema": bad}) == {"refused": "request", "field": "schema"}
+    for bad in (0, "7", True, None):
+        assert refusal("tables_read", {**READ_REQUEST, "database_id": bad}) == {"refused": "request",
+                                                                                "field": "database_id"}
+    for field in READ_REQUEST:
+        request = {key: value for key, value in READ_REQUEST.items() if key != field}
+        assert refusal("tables_read", request) == {"refused": "request", "field": field}
+    assert refusal("tables_read", {**READ_REQUEST, "catalog": "live"}) == {"refused": "request",
+                                                                           "unknown": ["catalog"]}
+
+
+class ParseFailure(Exception):
+    """One of the failures rc2's `process_jinja_sql` raises for a text it cannot read, stood in."""
+
+
+def superset_reading(monkeypatch, *, databases: dict, tables=(), statements: int = 1, unparseable: bool = False,
+                     fails: bool = False) -> list:
+    """Superset's lookups `tables_read` makes, stood in: `DatabaseDAO.find_by_id` answering the databases the caller
+    may see (`databases`, by id), and rc2's `process_jinja_sql` answering `tables` (rc2 `Table`s, as its access check
+    reads them) for a script of `statements` statements, `unparseable` or not, or raising (`fails`). Every lookup is
+    recorded, in order."""
+    asked: list = []
+
+    def find_by_id(database_id, *args, **options):
+        asked.append(("database", database_id, *args, *options.items()))
+        return databases.get(database_id)
+
+    def process_jinja_sql(sql, database, template_params=None):
+        asked.append(("parse", sql, database, template_params))
+        if fails:
+            raise ParseFailure("unreadable")
+        return SimpleNamespace(tables=set(tables), script=SimpleNamespace(statements=[object()] * statements,
+                                                                         has_unparseable_statement=unparseable))
+
+    modules = {"superset": {}, "superset.daos": {}, "superset.daos.database": {"DatabaseDAO": SimpleNamespace(
+        find_by_id=find_by_id)}, "superset.sql": {}, "superset.sql.parse": {"Table": stubs.Table,
+                                                                            "process_jinja_sql": process_jinja_sql},
+        "superset.exceptions": {"SupersetParseError": ParseFailure, "SupersetSecurityException": ParseFailure},
+        "jinja2": {}, "jinja2.exceptions": {"TemplateError": ParseFailure}}
+    for name, attributes in modules.items():
+        module = types.ModuleType(name)
+        module.__dict__.update(attributes)
+        monkeypatch.setitem(sys.modules, name, module)
+    return asked
+
+
+def test_tables_read_answers_the_tables_supersets_own_access_check_reads(monkeypatch):
+    """The tables rc2's access check reads in the text (`process_jinja_sql`, as `raise_for_access` reads a statement,
+    with the empty template parameters `execute_sql` renders with), each qualified as the executor qualifies a table
+    it applies rules to: the request's schema, and the database's default catalog, where the statement names none of
+    its own. Sorted, each once."""
+    found = database()
+    asked = superset_reading(monkeypatch, databases={7: found},
+                             tables=[stubs.Table("orders"), stubs.Table("lines", "shop2"),
+                                     stubs.Table("items", "shop3", "other")])
+    answer = reads.tables_read(READ_REQUEST)
+    assert answer == {"tables": [{"catalog": "live", "schema": "public", "table": "orders"},
+                                 {"catalog": "live", "schema": "shop2", "table": "lines"},
+                                 {"catalog": "other", "schema": "shop3", "table": "items"}]}
+    assert asked == [("database", 7), ("parse", READ_REQUEST["sql"], found, {})]
+    superset_reading(monkeypatch, databases={7: database(None)}, tables=[stubs.Table("orders")])
+    assert reads.tables_read(READ_REQUEST) == {"tables": [{"catalog": None, "schema": "public", "table": "orders"}]}
+
+
+def test_tables_read_of_a_database_the_caller_cannot_see_is_not_found(monkeypatch):
+    asked = superset_reading(monkeypatch, databases={}, tables=[stubs.Table("orders")])
+    assert reads.tables_read(READ_REQUEST) == {"not_found": "database"}
+    assert asked == [("database", 7)]
+
+
+@pytest.mark.parametrize("reading", [{"fails": True}, {"statements": 2}, {"statements": 0}, {"unparseable": True}],
+                         ids=["unparsed", "two statements", "none", "a command"])
+def test_tables_read_of_a_text_superset_cannot_read_as_one_statement_says_so(monkeypatch, reading):
+    """A text rc2 cannot parse, or reads as other than one statement, or as one it does not fully model (which its
+    access check refuses under strict scoping), is answered `{"unreadable": true}`, and no table."""
+    superset_reading(monkeypatch, databases={7: database()}, tables=[stubs.Table("orders")], **reading)
+    assert reads.tables_read(READ_REQUEST) == {"unreadable": True}
+
+
+def test_tables_read_too_large_to_send_says_so(monkeypatch):
+    superset_reading(monkeypatch, databases={7: database()},
+                     tables=[stubs.Table(f"{i:04d}" + "x" * 240) for i in range(200)])
+    assert reads.tables_read(READ_REQUEST) == {"too_large": True}
+
+
+def test_a_bad_tables_read_request_is_answered_not_raised():
+    assert reads.tables_read({**READ_REQUEST, "sql": ""}) == {"refused": "request", "field": "sql"}
+
+
+class Reading:
+    """mnemiq's Superset client, stood in for `tables_read`: each call answered by `answer` (a function of the
+    request, or an answer or exception), every call recorded."""
+
+    def __init__(self, answer) -> None:
+        self.answer = answer
+        self.calls: list[tuple[str, dict]] = []
+
+    def call(self, tool, request, *, timeout_s=None):
+        self.calls.append((tool, json.loads(json.dumps(request))))
+        assert tool == TOOL_PREFIX + "tables_read", tool
+        found = self.answer(request) if callable(self.answer) else self.answer
+        if isinstance(found, Exception):
+            raise found
+        return json.loads(json.dumps(found))
+
+
+def read_by(client, sql="SELECT 1 FROM orders"):
+    return tables_read(client, database_id=7, schema="public", sql=sql)
+
+
+def test_mnemiqs_client_reads_what_tables_read_answers(monkeypatch):
+    """The join of the two ends: the extension's own `tables_read`, over Superset's lookups stood in, answering
+    mnemiq's own request, read by mnemiq's client as a set of (catalog, schema, table)."""
+    superset_reading(monkeypatch, databases={7: database()}, tables=[stubs.Table("orders"),
+                                                                    stubs.Table("lines", "shop2")])
+    client = Reading(reads.tables_read)
+    assert read_by(client, READ_REQUEST["sql"]) == frozenset({("live", "public", "orders"),
+                                                              ("live", "shop2", "lines")})
+    assert client.calls == [(TOOL_PREFIX + "tables_read", READ_REQUEST)]
+    assert read_by(Reading({"tables": []})) == frozenset()
+
+
+def table(catalog="live", schema="public", name="orders"):
+    return {"catalog": catalog, "schema": schema, "table": name}
+
+
+@pytest.mark.parametrize("answer", [
+    SupersetToolError("Internal error in extensions.agenticfabriq.mnemiq.tables_read: An unexpected error occurred."),
+    {"not_found": "database"}, {"too_large": True}, {"unreadable": True}, {"refused": "request", "field": "sql"},
+    ["not", "an", "object"], {"tables": "orders"}, {"tables": [table(), "orders"]},
+    {"tables": [table(), {"catalog": None, "schema": "public"}]},
+    {"tables": [{**table(), "clause": "x"}]}, {"tables": [table(name="")]}, {"tables": [table(name=3)]},
+    {"tables": [table(schema=7)]}, {"tables": [table(catalog=False)]},
+    {"tables": [table()], "_response_truncated": True}, {"tables": [table()], "more": True},
+], ids=["not offered", "database not found", "too large", "unreadable", "refused", "not an object", "not a list",
+        "a malformed entry", "an entry short of a part", "an entry saying more", "a blank name", "a number for a name",
+        "a number for a schema", "a boolean for a catalog", "cut for size", "an envelope saying more"])
+def test_a_tables_read_answer_mnemiq_cannot_read_whole_tells_it_nothing(answer):
+    """Read strictly: exactly `{"tables": [...]}`, each entry exactly `{catalog, schema, table}`, the table a name,
+    the catalog and schema a name or null. Anything else, or a call that fails (an extension older than the tool
+    among them), is None: mnemiq cannot tell."""
+    assert read_by(Reading(answer)) is None
+
+
+def test_tables_read_raises_superset_not_answering_and_a_refusal_of_the_caller():
+    """Superset not answering is not an answer mnemiq cannot read: it is raised, as the client raises it, and so is a
+    refusal of the caller."""
+    with pytest.raises(SupersetUnavailable):
+        read_by(Reading(SupersetUnavailable("Superset did not answer")))
+    with pytest.raises(SupersetPermissionDenied):
+        read_by(Reading(SupersetPermissionDenied("no")))
+
+
+def test_table_rules_raises_superset_not_answering_when_asked_to():
+    """`table_rules_apply` reads a call Superset did not answer as unknown (the planner's reading), and raises it with
+    `raise_unavailable` (the statement check's)."""
+    client = Answering(SupersetUnavailable("Superset did not answer"))
+    assert ask(client, ["orders"]) == {"orders": None}
+    with pytest.raises(SupersetUnavailable):
+        table_rules_apply(client, database_id=7, schema="public", tables=["orders"], raise_unavailable=True)
 
 
 # ---------------------------------------------------------------- mnemiq's reading of table_rules

@@ -5,8 +5,10 @@ table a row rule applies to for the caller in a subquery carrying the rule, puts
 statement's own, and runs its own rendering of the result (`SQLExecutor._prepare_sql` and `execute` in
 `superset/sql/execution/executor.py`). A dry run (`dry_run: true`) answers that rendering, `statements[].executed_sql`,
 without running it. `SupersetSqlAdapter` dry-runs each statement it sends on Oracle with the options the real call
-carries, asks the extension's `table_rules` whether a rule applies to the caller on each table the statement reads, and
-sends the statement only when `check_executed` finds that what Superset would run is the statement mnemiq decided:
+carries, asks the extension's `tables_read` which tables Superset's own access check reads in the statement and its
+`table_rules` whether a rule applies to the caller on each table the statement reads, and sends the statement only
+when `check_tables_read` finds every table mnemiq reads among the tables Superset reads, and `check_executed` finds
+that what Superset would run is the statement mnemiq decided:
 
 - read with mnemiq's own parser, with each of Superset's wraps of a table put back as the table, the executed
   statement reads node for node as the statement sent; the top-level row limit is excepted where the call asks
@@ -21,8 +23,8 @@ A wrap is the derived table Superset's `RLSAsSubqueryTransformer` (`superset/sql
 or, for a table with none, its name quoted as written. Its rule is Superset's and is never read here, nor quoted in a
 refusal.
 
-No other difference is accepted, measured before this was written: of the statements mnemiq's sources and tests
-hold, as mnemiq prints them for Oracle, Superset's rendering reads every one alike but one, whose meaning it changes.
+No other difference is accepted: a statement Superset would render otherwise in any node is refused, and only a query
+is checked, never a text mnemiq's parser keeps as a command it does not model.
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ from mnemiq.sql.identifiers import resolve_exactly
 from mnemiq.sql.scope import base_tables
 from mnemiq.superset.names import RefusedStatement
 
-__all__ = ["check_executed", "executed_sql", "rule_key", "tables_read"]
+__all__ = ["check_executed", "check_tables_read", "executed_sql", "physical_reads", "rule_key"]
 
 # The longest piece of a statement a refusal quotes.
 _QUOTED = 160
@@ -47,9 +49,11 @@ _LEAVES = (exp.Identifier, exp.Literal, exp.Var, exp.TableAlias, exp.DataType, e
 
 _NOT_SHOWN = ("Superset's dry run of the statement did not show the one statement it would run, so mnemiq did not send "
               "it; send one SELECT")
-_UNREAD = ("Superset would run a different statement from this one, which mnemiq could not read as one statement, so it "
-           "was not sent; write the statement another way")
-_UNSENT = "mnemiq could not read the statement as one statement, so it was not sent; send one SELECT"
+_UNREAD = ("Superset would run a different statement from this one, which mnemiq could not read as one query, so it was "
+           "not sent; write the statement another way")
+_UNSENT = "mnemiq could not read the statement as one query, so it was not sent; send one SELECT"
+_UNTOLD = ("mnemiq sends a statement to Superset only when Superset reads each table mnemiq reads in it, and mnemiq could "
+           "not tell which tables Superset reads in this one, so it was not sent; send one plain SELECT")
 
 
 def rule_key(catalog: str, schema: str, table: str) -> str:
@@ -59,7 +63,7 @@ def rule_key(catalog: str, schema: str, table: str) -> str:
     return ".".join(urllib.parse.quote(part, safe="").replace(".", "%2E") for part in (catalog, schema, table) if part)
 
 
-def tables_read(sent: str, *, dialect: str) -> dict[str, tuple[str, str, str]]:
+def physical_reads(sent: str, *, dialect: str) -> dict[str, tuple[str, str, str]]:
     """Each table mnemiq reads in `sent` (`base_tables`, a CTE's reference left out), by its `rule_key`: the catalog,
     schema and name the statement names it by, "" for a part it does not name. Raises `RefusedStatement` for a text
     that is not one statement."""
@@ -78,6 +82,26 @@ def executed_sql(payload: Mapping) -> str:
     if not isinstance(executed, str) or not executed.strip():
         raise RefusedStatement(_NOT_SHOWN)
     return executed
+
+
+def check_tables_read(sent: str, read: frozenset[tuple[str | None, str | None, str]] | None, *, schema: str,
+                      dialect: str) -> None:
+    """Return when every table mnemiq reads in `sent` (`base_tables`, a CTE's reference left out) is among `read`, the
+    tables Superset's own access check reads in it, as the extension's `tables_read` answers them: each `(catalog,
+    schema, table)`, qualified as Superset qualifies a table it applies row rules to. A table mnemiq reads matches by
+    its name and the schema that qualifies it, `schema` (the session's, in Superset's spelling) where it names none,
+    and, where it names one, its catalog; Superset qualifies an unqualified table by the database's own catalog. Raise
+    `RefusedStatement` for a table that is not there, and where `read` is None: mnemiq cannot tell."""
+    if read is None:
+        raise RefusedStatement(_UNTOLD)
+    for table in base_tables(_statement(sent, dialect, unread=_UNSENT), dialect):
+        at = table.db or schema
+        if not any(name == table.name and in_schema == at and (not table.catalog or catalog == table.catalog)
+                   for catalog, in_schema, name in read):
+            named = _named(table, dialect)
+            raise RefusedStatement(f"mnemiq sends a statement to Superset only when Superset reads each table mnemiq "
+                                   f"reads in it, which mnemiq could not confirm for {named}, so it was not sent; "
+                                   f"read {named} in a plain FROM or JOIN, under an alias of its own")
 
 
 def check_executed(sent: str, executed: str, *, rules: Mapping[str, bool | None], dialect: str,
@@ -117,7 +141,13 @@ def _statement(text: str, dialect: str, *, unread: str) -> exp.Expression:
         parsed = [tree for tree in sqlglot.parse(text, read=dialect) if tree is not None]
     except SqlglotError:
         raise RefusedStatement(unread) from None
-    if len(parsed) != 1:
+    # Only a query is checked: a text mnemiq's parser keeps as a command it does not model (`exp.Command`: an EXPLAIN,
+    # a CALL, a SHOW) reads no table here, so nothing about it could be confirmed.
+    if len(parsed) != 1 or not isinstance(parsed[0], exp.Query) or parsed[0].find(exp.Command) is not None:
+        raise RefusedStatement(unread)
+    # A table's name part sqlglot keeps as text, no name (the empty middle of `shop..orders`), names nothing here.
+    if any(table.args.get(part) is not None and not isinstance(table.args[part], exp.Expression)
+           for table in parsed[0].find_all(exp.Table) for part in ("this", "db", "catalog")):
         raise RefusedStatement(unread)
     return parsed[0]
 
@@ -303,4 +333,4 @@ def _quoted(node: exp.Expression, dialect: str) -> str:
 def _named(table: exp.Table, dialect: str) -> str:
     """`table`'s name, its schema and catalog with it, as the statement writes them."""
     return exp.Table(**{part: table.args[part].copy() for part in ("this", "db", "catalog")
-                        if table.args.get(part) is not None}).sql(dialect=dialect)
+                        if isinstance(table.args.get(part), exp.Expression)}).sql(dialect=dialect)

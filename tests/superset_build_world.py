@@ -43,7 +43,7 @@ from mnemiq.superset.build_store import BuildNotFound, StoredBuild
 from mnemiq.superset import conversations as cs
 from mnemiq.superset.extension import EXTENSION_TOOLS, TOOL_PREFIX
 from tests.superset_extension_path import use_extension_source
-from tests.superset_fake import dry_run_as_sent, no_table_rule
+from tests.superset_fake import dry_run_as_sent, no_table_rule, tables_read_as_mnemiq
 
 use_extension_source()
 
@@ -521,7 +521,8 @@ class World:
                      "add_saved_metric": self._add_saved_metric, "delete_dataset": self._delete_dataset,
                      "set_layout": self._set_layout, "dataset_metrics": self._dataset_metrics,
                      "get_layout": self._get_layout, "editors_of": self._editors_of,
-                     "row_rules": self._row_rules, "table_rules": self._table_rules}
+                     "row_rules": self._row_rules, "table_rules": self._table_rules,
+                     "tables_read": lambda request, user: tables_read_as_mnemiq(request)}
         return {**plain, **{TOOL_PREFIX + name: handler for name, handler in extension.items()}}
 
     # --- listing, as `ModelListCore` lists: filters, `created_by_me`, the columns asked for, a page

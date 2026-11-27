@@ -39,7 +39,13 @@ from mnemiq.superset.grants import (
     SupersetMisconfigured,
     resolve_grants,
 )
-from tests.superset_fake import FakeSuperset, RecordingClient
+from tests.superset_fake import (
+    FakeSuperset,
+    RecordingClient,
+    dry_run_as_sent,
+    no_table_rule,
+    tables_read_as_mnemiq,
+)
 
 DATABASE_ID = 7
 SCHEMA = "sales"
@@ -657,6 +663,32 @@ def test_unavailable_denies_and_says_so(on, failure):
               "candidate alone": _in_turn(_refused(), _refused(), failure)}
     superset = _Superset(probes[on], datasets, list_answer=failure if on == "list_datasets" else None)
     grants = resolve_grants(_adapter(superset), _snapshot("policy", "party", "claim"))
+    assert grants.available is False
+    assert grants.objects == frozenset()
+
+
+@pytest.mark.parametrize("silent", ["tables_read", "table_rules"])
+def test_on_oracle_superset_not_answering_the_statement_check_denies_and_says_so(superset_oracle, silent):
+    """On Oracle each dry run is checked with the extension's `tables_read` and `table_rules`: Superset not answering
+    either is Superset not answering the probe, so the grants say they could not be read, never that the person may
+    read nothing."""
+    unanswered = SupersetUnavailable("Superset's MCP service could not be reached")
+    superset = _Superset(_access({"policy", "party"}), [_dataset(1, "policy"), _dataset(2, "party")])
+
+    def answering(request: dict):
+        if request.get("dry_run"):
+            superset(request)
+            return dry_run_as_sent(request)
+        if "sql" in request and "timeout" not in request:
+            return unanswered if silent == "tables_read" else tables_read_as_mnemiq(request)
+        if "tables" in request:
+            return unanswered if silent == "table_rules" else no_table_rule(request)
+        if request == {}:
+            return no_table_rule(request)  # the extension's probe, answered as after a call Superset did not answer
+        return superset(request)
+
+    grants = resolve_grants(SupersetSqlAdapter(RecordingClient(answering), database_id=DATABASE_ID, schema=SCHEMA),
+                            _snapshot("policy", "party"))
     assert grants.available is False
     assert grants.objects == frozenset()
 

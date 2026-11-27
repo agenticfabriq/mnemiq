@@ -73,7 +73,7 @@ BUILD = " ".join(BUILD_SCOPES)
 ASK = " ".join(ASK_SCOPES)
 WRITE_TOOLS = ("create_dashboard", "create_dataset", "create_chart", "patch_chart", "add_saved_metric",
                "delete_dataset", "set_layout")
-READ_TOOLS = ("dataset_metrics", "editors_of", "get_layout", "row_rules", "table_rules")
+READ_TOOLS = ("dataset_metrics", "editors_of", "get_layout", "row_rules", "table_rules", "tables_read")
 # The builder in most tests: Alpha and sql_lab, narrowed by no row rule.
 BUILDER = "analyst"
 MONTHLY = ("SELECT date_trunc('month', issued)::date AS month, count(*) FROM policy GROUP BY 1 ORDER BY 1")

@@ -975,6 +975,36 @@ def test_a_datasets_sql_superset_refuses_at_its_dry_run_fails_its_step_without_i
     assert world.calls("create_dataset") == []
 
 
+def test_a_datasets_sql_superset_reads_other_tables_in_fails_its_step(fake, world, store, superset_oracle):
+    """Every table mnemiq reads in a dataset's SQL must be one Superset's own access check reads in it (the
+    extension's `tables_read`), as every viewer's row rules are applied to the tables Superset reads: else the step
+    fails, saying which, and nothing is made."""
+    plan = dataclasses.replace(ONE_VIRTUAL, datasets=(dataclasses.replace(JOINED, sql=ORACLE_MADE),))
+    build = _start(store, plan).build_id
+    _run_to(store, build, _adapter(fake), "dataset_1")
+    world.hooks["tables_read"] = Hook(instead=lambda request, _w: {"tables": []})
+    stopped = _next(store, build, _adapter(fake))
+    assert stopped.status == "failed" and _step(stopped, "dataset_1").reason == "statement_refused", stopped
+    assert "could not confirm for policy" in stopped.message, stopped.message
+    assert world.calls("create_dataset") == []
+
+
+@pytest.mark.parametrize("status", ["timed_out", "stopped"])
+def test_a_datasets_dry_run_superset_does_not_finish_leaves_the_step_uncertain(fake, world, store, superset_oracle,
+                                                                            status):
+    """A dry run Superset ends at its time limit, or stops, is Superset not answering the step, as a create's is: the
+    step is left uncertain, to run again, and nothing is made."""
+    plan = dataclasses.replace(ONE_VIRTUAL, datasets=(dataclasses.replace(JOINED, sql=ORACLE_MADE),))
+    build = _start(store, plan).build_id
+    _run_to(store, build, _adapter(fake), "dataset_1")
+    world.hooks["execute_sql"] = Hook(instead=lambda request, _w: {
+        "success": False, "error": "Superset's own words", "error_type": status} if request.get("dry_run") else None)
+    state = _next(store, build, _adapter(fake))
+    step = _step(state, "dataset_1")
+    assert step.status == "uncertain" and step.reason == "superset_silent", state
+    assert world.calls("create_dataset") == []
+
+
 def test_a_datasets_sql_is_made_only_once_superset_would_run_it_as_sent(fake, world, store, superset_oracle):
     """The dry run and the row rules of the tables it reads come before the create, which carries the text dry-run."""
     plan = dataclasses.replace(ONE_VIRTUAL, datasets=(dataclasses.replace(JOINED, sql=ORACLE_MADE),))
@@ -983,7 +1013,7 @@ def test_a_datasets_sql_is_made_only_once_superset_would_run_it_as_sent(fake, wo
     fake.calls.clear()
     made = _next(store, build, _adapter(fake))
     assert _step(made, "dataset_1").status == "done", made
-    assert _tools(fake)[:3] == ["execute_sql", "table_rules", "create_dataset"], _tools(fake)
+    assert _tools(fake)[:4] == ["execute_sql", "tables_read", "table_rules", "create_dataset"], _tools(fake)
     [dry_run] = world.calls("execute_sql")
     [create] = world.calls("create_dataset")
     assert dry_run.request["dry_run"] is True and dry_run.request["sql"] == create.request["sql"] == ORACLE_SENT
@@ -995,7 +1025,7 @@ def test_a_datasets_sql_is_not_dry_run_on_postgres(fake, world, store):
     _run_to(store, build, _adapter(fake), "dataset_1")
     fake.calls.clear()
     _next(store, build, _adapter(fake))
-    assert "execute_sql" not in _tools(fake) and "table_rules" not in _tools(fake), _tools(fake)
+    assert not {"execute_sql", "tables_read", "table_rules"} & set(_tools(fake)), _tools(fake)
 
 
 def test_a_build_calls_no_mcp_create_claim_or_patch(fake, world, store):

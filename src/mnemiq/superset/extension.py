@@ -9,8 +9,9 @@ cannot settle it either. `require_extension` settles it by one call of a probe: 
 the installed extension answers with an empty list and never fails on. `call_tool` asks it once a call fails that way.
 
 A build needs more than an extension: it needs one that makes every object a build makes, which an older one does not.
-`require_build_tools` asks for that before a build is planned (`ExtensionOutdated`), and `require_table_rules` asks
-for the extension's `table_rules`, which every statement Superset mode sends on Oracle needs.
+`require_build_tools` asks for that before a build is planned (`ExtensionOutdated`), and `require_table_rules` and
+`require_tables_read` ask for the extension's `table_rules` and `tables_read`, which every statement Superset mode
+sends on Oracle needs.
 """
 
 from __future__ import annotations
@@ -22,7 +23,8 @@ from mnemiq.superset.client import SupersetToolError, SupersetUnavailable
 
 __all__ = ["DATASET_METRICS_BATCH", "EXTENSION_TOOLS", "ExtensionMissing", "ExtensionOutdated", "TABLE_RULES_BATCH",
            "TOOL_PREFIX", "call_tool", "dashboard_editorship", "dataset_metrics", "require_build_tools",
-           "require_extension", "require_table_rules", "row_rule_applies", "table_rules_apply"]
+           "require_extension", "require_table_rules", "require_tables_read", "row_rule_applies",
+           "table_rules_apply", "tables_read"]
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +33,7 @@ TOOL_PREFIX = "extensions.agenticfabriq.mnemiq."
 # The base name of every tool the extension offers; the single source the client and the test fake build names from.
 EXTENSION_TOOLS = ("create_dashboard", "create_dataset", "create_chart", "patch_chart", "add_saved_metric",
                    "delete_dataset", "set_layout", "dataset_metrics", "editors_of", "get_layout", "row_rules",
-                   "table_rules")
+                   "table_rules", "tables_read")
 
 # The most dataset ids one `dataset_metrics` call takes: the extension refuses a request naming more
 # (`reads.MAX_DATASETS` in the extension).
@@ -107,6 +109,12 @@ def require_table_rules(client) -> None:
     asks for a build's tools: one call of it with an empty request, which it refuses without touching Superset, and
     `ExtensionMissing` or `ExtensionOutdated` when Superset does not offer it."""
     _require_tool(client, "table_rules", needed_by="Superset mode on Oracle")
+
+
+def require_tables_read(client) -> None:
+    """Return when Superset offers the extension's `tables_read` (extension 0.3.0 and later), as `require_table_rules`
+    asks for `table_rules`."""
+    _require_tool(client, "tables_read", needed_by="Superset mode on Oracle")
 
 
 def _require_tool(client, base: str, *, needed_by: str) -> None:
@@ -195,7 +203,8 @@ def row_rule_applies(client, dataset_id: int) -> bool | None:
     return entry["applies"]
 
 
-def table_rules_apply(client, *, database_id: int, schema: str, tables: Sequence[str]) -> dict[str, bool | None]:
+def table_rules_apply(client, *, database_id: int, schema: str, tables: Sequence[str],
+                      raise_unavailable: bool = False) -> dict[str, bool | None]:
     """Whether a row rule applies to the caller on each of `tables`, each name in Superset's spelling, in `schema` (in
     Superset's spelling too) on the database, as the extension's `table_rules` answers it: Superset's own lookup of
     the rules a statement reading the table takes. Asked `TABLE_RULES_BATCH` names a call, each name once, in order;
@@ -205,22 +214,27 @@ def table_rules_apply(client, *, database_id: int, schema: str, tables: Sequence
     asked, in the order asked, each exactly `{"table": <that name>, "applies": <a boolean>}`. Every name of a call is
     None, where mnemiq cannot tell, when its answer is anything else (a database the caller cannot see, a size cut, a
     refusal, an entry left out, repeated, out of order, for another table or saying more) or the call fails, which is
-    logged: an extension older than the tool fails it. A refusal of the caller is raised, as the client raises it."""
+    logged: an extension older than the tool fails it. With `raise_unavailable`, a call Superset did not answer
+    (`SupersetUnavailable`) is raised instead, as the client raises it: Superset not answering is not an answer mnemiq
+    cannot read. A refusal of the caller is raised, as the client raises it."""
     names = list(dict.fromkeys(tables))
     found: dict[str, bool | None] = {}
     for start in range(0, len(names), TABLE_RULES_BATCH):
         asked = names[start:start + TABLE_RULES_BATCH]
-        found.update(zip(asked, _table_rules(client, database_id, schema, asked), strict=True))
+        found.update(zip(asked, _table_rules(client, database_id, schema, asked, raise_unavailable), strict=True))
     return found
 
 
-def _table_rules(client, database_id: int, schema: str, asked: list[str]) -> list[bool | None]:
+def _table_rules(client, database_id: int, schema: str, asked: list[str],
+                 raise_unavailable: bool = False) -> list[bool | None]:
     """One call's answers for `asked`, in order, read as `table_rules_apply` reads them."""
     unknown: list[bool | None] = [None] * len(asked)
     try:
         answer = client.call(TOOL_PREFIX + "table_rules", {"database_id": database_id, "schema": schema,
                                                            "tables": asked})
     except (SupersetUnavailable, SupersetToolError) as failure:
+        if raise_unavailable and isinstance(failure, SupersetUnavailable):
+            raise
         logger.warning("the extension's table_rules for %d tables failed: %s", len(asked), failure)
         return unknown
     entries = answer.get("tables") if isinstance(answer, dict) and set(answer) == {"tables"} else None
@@ -231,3 +245,38 @@ def _table_rules(client, database_id: int, schema: str, asked: list[str]) -> lis
                 or not isinstance(entry["applies"], bool):
             return unknown
     return [entry["applies"] for entry in entries]
+
+
+# One table as `tables_read` answers it: its catalog and schema (each a name, or None), and its name.
+ReadTable = tuple[str | None, str | None, str]
+
+
+def tables_read(client, *, database_id: int, schema: str, sql: str) -> frozenset[ReadTable] | None:
+    """The tables Superset's own access check reads in `sql`, one statement, as the extension's `tables_read` answers
+    as the caller, each `(catalog, schema, table)` as Superset qualifies a table it applies row rules to (the schema
+    `schema`, in Superset's spelling, and the database's default catalog, where the statement names none of its own).
+
+    Read strictly: the answer must be exactly `{"tables": [...]}`, each entry exactly `{"catalog", "schema", "table"}`,
+    the table a name and the catalog and schema each a name or null. None, where mnemiq cannot tell, for anything else
+    (a database the caller cannot see, a text Superset cannot read as one statement, a size cut, a refusal, a
+    malformed entry, an entry saying more) and for a tool error, which is logged: an extension older than the tool
+    fails it. Superset not answering (`SupersetUnavailable`) and a refusal of the caller are raised, as the client
+    raises them."""
+    try:
+        answer = client.call(TOOL_PREFIX + "tables_read", {"database_id": database_id, "schema": schema, "sql": sql})
+    except SupersetToolError as failure:
+        logger.warning("the extension's tables_read failed: %s", failure)
+        return None
+    entries = answer.get("tables") if isinstance(answer, dict) and set(answer) == {"tables"} else None
+    if not isinstance(entries, list):
+        return None
+    found: set[ReadTable] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"catalog", "schema", "table"}:
+            return None
+        catalog, read_schema, table = entry["catalog"], entry["schema"], entry["table"]
+        if not (isinstance(table, str) and table) or not all(part is None or isinstance(part, str) and part
+                                                             for part in (catalog, read_schema)):
+            return None
+        found.add((catalog, read_schema, table))
+    return frozenset(found)

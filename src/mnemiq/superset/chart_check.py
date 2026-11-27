@@ -54,6 +54,7 @@ from enum import StrEnum
 
 from sqlglot import exp
 
+from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Snapshot
 from mnemiq.execute.runner import DEFAULT_TIMEOUT_S, ExecutionError
@@ -875,6 +876,8 @@ _SQL_UNSHOWN = ("Superset did not show the SQL of the chart's dataset, which thi
                 "it with its own SQL")
 _DRY_RUN_REFUSED = ("Superset refused the SQL of the chart's dataset, which this build made, when mnemiq asked how it "
                     "would run it, so mnemiq does not check it with its own SQL; why is in the log")
+_DRY_RUN_UNANSWERED = ("Superset did not answer when mnemiq asked how it would run the SQL of the chart's dataset, "
+                       "which this build made, so mnemiq does not check it with its own SQL")
 _RULES_UNKNOWN = ("mnemiq could not tell whether a row rule applies to you on the chart's dataset, so it does not "
                   "check it with its own SQL")
 
@@ -950,6 +953,10 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
             logger.warning("the value check: Superset refused the dry run of chart %s's dataset's SQL (%s): %s",
                            chart_id, type(exc).__name__, exc)
             return not_checked(_DRY_RUN_REFUSED)
+        except (SupersetUnavailable, QueryTimedOut, QueryCancelled) as exc:
+            logger.warning("the value check: Superset did not answer the check of chart %s's dataset's SQL (%s)",
+                           chart_id, type(exc).__name__)
+            return not_checked(_DRY_RUN_UNANSWERED)
         source = _virtual_source(made[dataset.dataset_id])
     own = source is not None or not dataset.is_virtual
     if not own:

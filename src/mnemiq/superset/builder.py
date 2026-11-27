@@ -42,6 +42,7 @@ from typing import Any
 
 import psycopg
 
+from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
 from mnemiq.superset.build_store import (
     DEFAULT_LEASE_S,
     DONE,
@@ -604,7 +605,8 @@ def _run_dataset(run: _Run) -> _Outcome:
     Superset applies the row rules of a virtual dataset's tables to every query of it, and on Oracle only once
     Superset's own dry run of it says Superset would run it as mnemiq reads it (`SupersetSqlAdapter.confirm_sent`,
     `executed`). SQL either does not send, or Superset refuses at its dry run, fails the step with mnemiq's reason
-    (`statement_refused`), before the create."""
+    (`statement_refused`), before the create; a dry run Superset does not answer or finish leaves the step uncertain,
+    as a create Superset does not answer does (`superset_silent`)."""
     build, planned, adapter = run.build, _planned(run.plan, run.key), run.adapter
     name, dashboard_id = _dataset_name(build, planned), build.dashboard_id
     request = {"database_id": adapter.database_id, "schema": adapter.schema, "table_name": name,
@@ -618,6 +620,10 @@ def _run_dataset(run: _Run) -> _Outcome:
         except UnreadableStatement as exc:
             raise _Stop("statement_refused", f"mnemiq could not read the SQL of the dataset {name!r} to name its "
                                              f"tables as Superset does ({exc}), so it was not sent") from None
+        except (QueryTimedOut, QueryCancelled) as exc:
+            # A dry run Superset ended or stopped is Superset not answering the step, as a create's time-out is.
+            raise SupersetUnavailable("Superset did not finish the dry run of a dataset's SQL",
+                                      detail=type(exc).__name__) from exc
         except (SupersetAccessRefused, SupersetQueryFailed) as exc:
             # Superset's own words can name a table this builder may not see: they go to the log only.
             logger.warning("Superset refused the dry run of a dataset's SQL a build makes (%s): %s",

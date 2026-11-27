@@ -16,7 +16,8 @@ Superset's MCP response size guard (`superset/mcp_service/middleware.py`, `Respo
 truncate an extension tool's answer: over its limit (50,000 bytes by default) the call fails with Superset's own text.
 So every read tool keeps its answer under `MAX_ANSWER_BYTES` itself: `row_rules`, whose at most 20 entries are a few
 bytes each, by its size alone; `get_layout` refuses a layout over it with `{"too_large": True}`, and `table_rules`,
-which echoes the names it is asked, a request whose answer would be over it, the same way; and the tools that answer a
+which echoes the names it is asked, a request whose answer would be over it, the same way, as `tables_read` does an
+answer naming more tables than fit; and the tools that answer a
 list of objects by one helper (`fit`), which keeps their envelope and answers each entry that does not fit as
 `{<id field>: N, "too_large": True}` (entries fill in request order, and once one does not fit the rest are marked). A
 caller treats a marked entry as unanswered.
@@ -39,6 +40,9 @@ MAX_TABLES = 50
 # A table's name, and a schema's, as long as Superset holds one (`SqlaTable.table_name` and `SqlaTable.schema`).
 MAX_TABLE_NAME = 250
 MAX_SCHEMA_NAME = 255
+# The longest statement `tables_read` reads, in bytes of its UTF-8 text: rc2's own default bound on a script it parses
+# (`SQL_MAX_PARSE_LENGTH` in `superset/config.py`).
+MAX_SQL_BYTES = 1_000_000
 # An answer larger than this, in bytes of its JSON text, is not sent: well under the guard's 50,000.
 MAX_ANSWER_BYTES = 40_000
 MAX_LAYOUT_BYTES = MAX_ANSWER_BYTES
@@ -67,6 +71,12 @@ def _distinct_names(limit: int):
     return read
 
 
+def _statement_text(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value.encode()) > MAX_SQL_BYTES:
+        raise ValueError("not a statement's text")
+    return value
+
+
 # Every read tool's request, field by field.
 REQUESTS: dict[str, dict[str, _Field]] = {
     "dataset_metrics": {"dataset_ids": _Field(_distinct_ids(MAX_DATASETS))},
@@ -77,6 +87,8 @@ REQUESTS: dict[str, dict[str, _Field]] = {
     "row_rules": {"dataset_ids": _Field(_distinct_ids(MAX_DATASETS))},
     "table_rules": {"database_id": _Field(writes._an_id), "schema": _Field(writes._text(MAX_SCHEMA_NAME)),
                     "tables": _Field(_distinct_names(MAX_TABLES))},
+    "tables_read": {"database_id": _Field(writes._an_id), "schema": _Field(writes._text(MAX_SCHEMA_NAME)),
+                    "sql": _Field(_statement_text)},
 }
 
 
@@ -240,6 +252,40 @@ def table_rules(found: dict) -> dict:
     catalog = database.get_default_catalog()
     return _table_rules_answer(found["tables"], lambda name: bool(get_predicates_for_table(
         Table(name, found["schema"], catalog), database, catalog)))
+
+
+@writes._answering("tables_read", REQUESTS)
+def tables_read(found: dict) -> dict:
+    """The tables Superset's own access check reads in one statement's text, as the caller: rc2's
+    `process_jinja_sql` (`superset/sql/parse.py`), as `security_manager.raise_for_access` reads a statement, with the
+    empty template parameters `execute_sql` renders a statement with. Each table is qualified as the executor qualifies
+    a table it applies row rules to (`SQLExecutor._prepare_sql`): by the request's schema, and the database's default
+    catalog, where the statement names none of its own. Answered `{"tables": [{catalog, schema, table}, ...]}`, sorted,
+    each once.
+
+    A database the caller may not see, or that does not exist, is answered `{"not_found": "database"}`, as
+    `table_rules` answers one, and the text is not read. A text rc2 cannot read, or reads as other than one statement,
+    or as one it does not fully model (`has_unparseable_statement`, which its access check refuses under strict
+    scoping), is answered `{"unreadable": True}`; an answer over `MAX_ANSWER_BYTES`, `{"too_large": True}`."""
+    from jinja2.exceptions import TemplateError
+    from superset.daos.database import DatabaseDAO
+    from superset.exceptions import SupersetParseError, SupersetSecurityException
+    from superset.sql.parse import process_jinja_sql
+
+    database = DatabaseDAO.find_by_id(found["database_id"])
+    if database is None:
+        return writes._not_found("database")
+    catalog = database.get_default_catalog()
+    try:
+        parsed = process_jinja_sql(found["sql"], database, {})
+    except (SupersetParseError, SupersetSecurityException, TemplateError):
+        return {"unreadable": True}
+    if len(parsed.script.statements) != 1 or parsed.script.has_unparseable_statement:
+        return {"unreadable": True}
+    tables = {table.qualify(catalog=catalog, schema=found["schema"]) for table in parsed.tables}
+    answer = {"tables": [{"catalog": table.catalog, "schema": table.schema, "table": table.table}
+                         for table in sorted(tables, key=lambda t: (t.catalog or "", t.schema or "", t.table))]}
+    return dict(TOO_LARGE) if _size(answer) > MAX_ANSWER_BYTES else answer
 
 
 def _table_rules_answer(names: list[str], applies) -> dict:

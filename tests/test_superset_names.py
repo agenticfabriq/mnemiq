@@ -42,7 +42,7 @@ from mnemiq.superset.planner import BuildPlan, PlannedDataset
 from mnemiq.superset.superset_reads import superset_reads
 from mnemiq.sql.identifiers import resolve_identifier
 from mnemiq.sql.scope import base_tables
-from tests.superset_fake import answering_dry_runs, as_superset_runs, no_table_rule
+from tests.superset_fake import answering_dry_runs, as_superset_runs, no_table_rule, tables_read_as_mnemiq
 
 # SQLAlchemy 2.0.52's Oracle dialect (Superset 7.0.0rc2's) on each name: `normalize_name` and `denormalize_name`, as it
 # answered them, not as this module computes them. `test_the_mapping_is_sqlalchemys_where_it_is_installed` asks it
@@ -758,7 +758,7 @@ class _Recorder:
         self._answer = as_superset_runs({"success": True, "columns": [], "rows": []})
 
     def call(self, tool: str, request: dict, *, timeout_s: float | None = None) -> dict:
-        if tool != TOOL_PREFIX + "table_rules":
+        if tool not in (TOOL_PREFIX + "table_rules", TOOL_PREFIX + "tables_read"):
             assert tool == "execute_sql"
             self.requests.append(dict(request))
         return self._answer(request)
@@ -808,6 +808,29 @@ def test_a_statement_the_adapter_refuses_is_not_sent_and_says_why(superset_oracl
     with pytest.raises(SupersetQueryFailed, match="could not confirm for"):
         adapter.execute_arrow(NOT_READ_ALIKE[0])
     assert client.requests == []
+
+
+@pytest.mark.parametrize("sql", ["EXPLAIN PLAN FOR SELECT * FROM secret", "CALL p()", "SHOW TABLES",
+                                 "SELECT 1 FROM dual UNION ALL (EXPLAIN PLAN FOR SELECT 1 FROM dual)"])
+def test_on_oracle_only_a_query_is_sent(superset_oracle, sql):
+    """A text mnemiq's parser reads as no query, or as one holding a command it does not model (an EXPLAIN, a CALL, a
+    SHOW), is not sent to Superset; on PostgreSQL the text is returned as it was."""
+    with pytest.raises((RefusedStatement, UnreadableStatement)):
+        for_superset(sql)
+
+
+def test_on_postgres_a_command_is_returned_as_it_was():
+    assert for_superset("SHOW TABLES") == "SHOW TABLES"
+
+
+@pytest.mark.parametrize("sql", ['SELECT x.id FROM shop..orders "X"', "SELECT 1 FROM a..b"])
+def test_a_table_named_with_an_empty_part_is_unreadable(superset_oracle, sql):
+    """sqlglot keeps the empty middle part of `shop..orders` as plain text, no name: mnemiq cannot name the table as
+    Superset does, so the text is unreadable, sent nor read."""
+    with pytest.raises(UnreadableStatement, match="a table's name has a part mnemiq cannot read"):
+        for_superset(sql)
+    with pytest.raises(UnreadableStatement, match="a table's name has a part mnemiq cannot read"):
+        from_superset(sql)
 
 
 def test_a_statement_the_adapter_cannot_rewrite_is_not_sent(superset_oracle):
@@ -1021,6 +1044,7 @@ def _checked(fake, monkeypatch, chart: dict, *, made: dict | None = None):
                                                  if request.get("force_refresh") or _PROBE.search(request["sql"])
                                                  else answer))
     fake.reply(TOOL_PREFIX + "table_rules", lambda request, authorization: no_table_rule(request))
+    fake.reply(TOOL_PREFIX + "tables_read", lambda request, authorization: tables_read_as_mnemiq(request))
     _rules(fake, _no_rule)
     decided: list[str] = []
     real = chart_check.run_decided
