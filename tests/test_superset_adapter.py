@@ -15,7 +15,7 @@ import pytest
 
 from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
 from mnemiq.catalog import ColumnInfo, TableInfo
-from mnemiq.enrichment.profiling import UNSUPPORTED, profile_table
+from mnemiq.enrichment.profiling import _UNAGGREGATABLE, UNSUPPORTED, profile_table
 from mnemiq.execute.cut import sent_of
 from mnemiq.execute.runner import ExecutionError, QueryCancelledError, SourceUnavailableError, run
 from mnemiq.sql.guard import MAX_ROWS
@@ -631,14 +631,18 @@ def test_the_ask_after_the_measure_stays_below_the_last_refused_one():
     assert limits[2] == 1 and limits[-1] < limits[1], limits
 
 
-# The column types no aggregate may read, by dialect, as the dialect's catalogue names them, upper-cased.
+# The column types no aggregate may read, by dialect, as the dialect's catalogue names them, upper-cased: Oracle's are
+# profiling's own, its large objects, LONGs, VECTOR, XMLTYPE and the row ids.
 UNAGGREGATABLE = {"postgres": {"JSON", "XML", "POINT", "LINE", "LSEG", "BOX", "PATH", "POLYGON", "CIRCLE"},
-                  "oracle": {"CLOB", "NCLOB", "BLOB", "LONG", "LONG RAW", "BFILE", "XMLTYPE"}}
+                  "oracle": {"CLOB", "NCLOB", "BLOB", "LONG", "LONG RAW", "BFILE", "VECTOR", "XMLTYPE", "ROWID",
+                             "UROWID"}}
 
 
 def test_unaggregatable_types_follow_the_dialect(dialect):
+    """On Oracle the adapter's types are profiling's own for Oracle, one list for every Oracle source, whichever
+    adapter reads it; PostgreSQL's are the adapter's."""
     assert _adapter().unaggregatable_types == UNAGGREGATABLE[dialect]
-    assert _adapter(dialect="oracle").unaggregatable_types == UNAGGREGATABLE["oracle"]
+    assert _adapter(dialect="oracle").unaggregatable_types == UNAGGREGATABLE["oracle"] == _UNAGGREGATABLE["oracle"]
 
 
 def _counts(request: dict) -> dict:

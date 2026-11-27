@@ -26,6 +26,7 @@ import sqlglot
 from sqlglot import exp
 
 from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
+from mnemiq.enrichment.profiling import _UNAGGREGATABLE
 from mnemiq.superset.client import (
     SupersetCallTimedOut,
     SupersetDenied,
@@ -85,10 +86,11 @@ TERMINAL_REFUSALS = (SupersetRefusedCaller, SupersetPermissionDenied, SupersetDe
 
 # The column types `count(DISTINCT ...)` and `GROUP BY` refuse, by the dialect of the database behind Superset, as its
 # catalogue names them, upper-cased as profiling compares them (`SupersetSqlAdapter.unaggregatable_types`).
-# PostgreSQL's have no equality operator, and are spelled as `format_type` names them. Oracle's are its large objects
-# (CLOB, NCLOB, BLOB, BFILE), LONG and LONG RAW, and XMLTYPE.
+# PostgreSQL's have no equality operator, and are spelled as `format_type` names them. Oracle's are profiling's own
+# table for Oracle (`profiling._UNAGGREGATABLE`), one list whichever adapter reads an Oracle source: its large objects,
+# LONG and LONG RAW, VECTOR, XMLTYPE and the row ids.
 _POSTGRES_UNAGGREGATABLE = frozenset({"JSON", "XML", "POINT", "LINE", "LSEG", "BOX", "PATH", "POLYGON", "CIRCLE"})
-_ORACLE_UNAGGREGATABLE = frozenset({"CLOB", "NCLOB", "BLOB", "LONG", "LONG RAW", "BFILE", "XMLTYPE"})
+_ORACLE_UNAGGREGATABLE = _UNAGGREGATABLE["oracle"]
 
 
 class SupersetSqlAdapter:
@@ -126,9 +128,9 @@ class SupersetSqlAdapter:
 
     @property
     def unaggregatable_types(self) -> frozenset[str]:
-        """The column types this adapter's database cannot aggregate, by the adapter's dialect: Oracle's on Oracle,
-        PostgreSQL's otherwise. Profiling reads them in place of its own table by dialect, so a direct PostgreSQL
-        adapter, which declares the same dialect and none of these, profiles as it always has."""
+        """The column types this adapter's database cannot aggregate, by the adapter's dialect: on Oracle profiling's
+        own for Oracle, PostgreSQL's otherwise. Profiling reads them in place of its own table by dialect, so a direct
+        PostgreSQL adapter, which declares the same dialect and none of these, profiles as it always has."""
         return _ORACLE_UNAGGREGATABLE if self.dialect == "oracle" else _POSTGRES_UNAGGREGATABLE
 
     @property
