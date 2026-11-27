@@ -38,6 +38,7 @@ from mnemiq.superset.client import (
     SupersetToolError,
     SupersetUnavailable,
 )
+from mnemiq.superset.binding import BINDING_UNREAD, NOT_BOUND, BindingUnread, ConnectionNotBound
 from mnemiq.superset.executor import SupersetCredentialMissing
 from mnemiq.superset.grants import NOT_A_BUILDER, GrantsUnreadable, NotABuilder, SupersetMisconfigured
 from mnemiq.superset.payload import SupersetAccessRefused
@@ -406,6 +407,10 @@ RAISED = {
     # The detail names the deployment's settings, and must reach no one either.
     "snapshot-refused": (lambda: SupersetSnapshotRefused(f"the snapshot was enriched elsewhere {SAID}"), 503,
                          SNAPSHOT_REFUSED),
+    # On Oracle: the person's connection not shown to be the snapshot's, and its check unread. The detail names the
+    # deployment's login, service and schema.
+    "connection-not-bound": (lambda: ConnectionNotBound(f"it logs in as {SAID}"), 403, NOT_BOUND),
+    "binding-unread": (lambda: BindingUnread(f"ORA-03113 {SAID}"), 503, BINDING_UNREAD),
 }
 
 

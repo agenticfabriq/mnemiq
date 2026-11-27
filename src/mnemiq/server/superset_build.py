@@ -458,7 +458,7 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> BuildKit:
         adapter = superset_executor(deployment, delegation)
         # Whether Superset lets this person build at all, first: a non-builder is refused as one (NOT_A_BUILDER)
         # and learns nothing of a dashboard they named, its editors included.
-        grants = runtime.builder_grants(adapter)
+        grants = runtime.builder_grants(adapter, who)
         # Before anything is planned or kept: every write of a build goes through the extension, which must be
         # one that makes every object a build makes.
         require_build_tools(adapter.client)
@@ -547,7 +547,7 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> BuildKit:
                 raise BuildNotFound()
             profile = runtime.build_profile(build.profile, who)
             adapter = superset_executor(deployment, delegation)
-            grants = runtime.builder_grants(adapter)
+            grants = runtime.builder_grants(adapter, who)
             return {"build": _build(next_step(build, client=adapter.client, adapter=adapter, store=builds,
                                               snapshot=runtime.snapshot, grants=grants, settings=profile.settings))}
 
@@ -573,7 +573,7 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> BuildKit:
         builds = kept()
         profile = runtime.build_profile(None, who)
         adapter = superset_executor(deployment, delegation)
-        grants = runtime.builder_grants(adapter)
+        grants = runtime.builder_grants(adapter, who)
         if changing:
             require_build_tools(adapter.client)
             _held_to_its_editors(adapter.client, dashboard_id)

@@ -684,7 +684,7 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
                 raise HTTPException(status_code=404, detail=NO_ANSWER)
             _, delegation = _builder(asking_, building=False)
             adapter = superset_executor(deployment, delegation)
-            grants = runtime.builder_grants(adapter)
+            grants = runtime.builder_grants(adapter, who)
             settings = runtime.build_profile(None, who).settings
             try:
                 # Read as an answer is (`execute_answer`): larger than one response, its first rows, said so.

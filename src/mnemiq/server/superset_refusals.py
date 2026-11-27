@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from mnemiq.superset.binding import ConnectionNotBound
 from mnemiq.superset.build_store import STORE_MISSING, BuildStoreMissing
 from mnemiq.superset.client import (
     SupersetPermissionDenied,
@@ -74,6 +75,8 @@ def superset_refusal(exc: BaseException) -> Refused | None:
         return Refused(403, NOT_A_BUILDER)
     if isinstance(exc, SupersetAccessRefused):
         return Refused(403, ACCESS_REFUSED)
+    if isinstance(exc, ConnectionNotBound):  # why the connection is not the snapshot's is in `.detail`, for the log
+        return Refused(403, exc.message)
     if isinstance(exc, SupersetRefusal):  # `SupersetDenied`, and any refusal not read above
         return Refused(403, DENIED)
     if isinstance(exc, SupersetMisconfigured):

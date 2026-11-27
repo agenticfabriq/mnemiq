@@ -39,6 +39,7 @@ from mnemiq.sql.verdict import ApprovedWrite
 from mnemiq.store.bootstrap import init_store
 from mnemiq.store.control import resolve_version
 from mnemiq.store.snapshot_store import load_snapshot
+from mnemiq.superset.binding import ConnectionNotBound, binding_refusal
 from mnemiq.superset.executor import (
     NoSourceConnection,
     SupersetCredentialMissing,
@@ -171,6 +172,9 @@ class Runtime:
     default_profile: str = "default"
     answer_log: AnswerLog | None = None  # one line per answer, for a deployment with no sink
     engine_commit: str | None = None
+    # On Oracle in Superset mode, each person Superset's connection was shown to run as the snapshot's schema
+    # (`bound`), with the database, service and schema the check compared with. Kept for as long as the process runs.
+    _bound: set[tuple[str, str, int, str, str]] = field(default_factory=set, init=False, repr=False, compare=False)
 
     @property
     def _superset_mode(self) -> bool:
@@ -384,8 +388,9 @@ class Runtime:
             self.reload_if_stale()
             started = time.perf_counter()
             # What this person may read, as Superset decides when asked with their token: resolved once and handed to
-            # everything that follows, as direct mode resolves the access policy's grants.
-            grants = self._superset_grants(adapter)
+            # everything that follows, as direct mode resolves the access policy's grants. On Oracle, once their
+            # connection is shown to be the snapshot's (`bound`), before any statement of theirs is sent.
+            grants = self._superset_grants(adapter, identity)
             authz = FixedGrants(grants)
             agent = agent.with_adapter(adapter)
         else:
@@ -508,7 +513,7 @@ class Runtime:
         if delegation is None:
             raise SupersetCredentialMissing(_NO_DELEGATION)
         self.reload_if_stale()
-        return self._superset_grants(superset_executor(self.settings, delegation))
+        return self._superset_grants(superset_executor(self.settings, delegation), identity)
 
     def build_profile(self, profile: str | None, identity: IdentityContext) -> LoadedProfile:
         """The profile a build runs under (the default when None): its planner plans the build, and its settings
@@ -520,19 +525,54 @@ class Runtime:
             raise RuntimeError("this runtime was built with no profile planner, so it plans no build")
         return picked
 
-    def builder_grants(self, adapter) -> GrantSet:
-        """What the builder whose token `adapter` carries may read, as Superset says when asked as them: the grants a
-        build is planned and checked under, read once per request. The snapshot is reloaded first, as `ask` reloads it,
-        so a build and an answer read one snapshot, and a newer one Superset mode will not serve refuses both."""
+    def builder_grants(self, adapter, person: IdentityContext) -> GrantSet:
+        """What the builder `person`, whose token `adapter` carries, may read, as Superset says when asked as them: the
+        grants a build is planned and checked under, read once per request, and before anything else of the request
+        is asked of Superset that runs a statement, so on Oracle only once the builder is shown bound (`bound`). The
+        snapshot is reloaded first, as `ask` reloads it, so a build and an answer read one snapshot, and a newer one
+        Superset mode will not serve refuses both."""
         if not self._superset_mode:
             raise RuntimeError("only Superset mode builds dashboards")
         self.reload_if_stale()
-        return self._superset_grants(adapter)
+        return self._superset_grants(adapter, person)
 
-    def _superset_grants(self, adapter) -> GrantSet:
-        """What Superset says the person whose token `adapter` carries may read. Raises `GrantsUnreadable` when that
-        could not be read from Superset: every door refuses then, rather than show an empty schema or defer with the
-        access policy's wording, since Superset mode holds no policy."""
+    def bound(self, person: IdentityContext, adapter) -> str | None:
+        """None when Superset's connection runs `person`'s statements as the schema the snapshot was read from, on its
+        service; else why not, in words for the log. On PostgreSQL None, and nothing is asked.
+
+        On Oracle Superset is asked as the person, through `adapter`, the one their request runs on and whose token it
+        carries (`binding.binding_refusal`): the database's backend, and the session's login user, service and current
+        schema, each against the snapshot's `superset:oracle` job. A bound answer is kept for the person (their tenant
+        and principal, as the door verified them) with the database, service and schema it was compared with, for as
+        long as the process runs, so a later request of theirs asks nothing; it releases `adapter`'s statements
+        (`mark_bound`). A refusal is not kept, so a connection an operator puts right serves the person on their next
+        request, at the cost of one check on each request of a person refused. A read that failed raises, and is not
+        kept either (`BindingUnread`, and what `binding_refusal` raises as itself)."""
+        if superset_dialect() != "oracle":
+            return None
+        job = next((job for job in (self.snapshot.jobs if self.snapshot else []) if job.id == SUPERSET_ORACLE_JOB),
+                   None)
+        source = oracle_source(job.detail) if job is not None else None
+        if source is None:
+            return "the snapshot served records no Oracle service and schema it was read from"
+        database_id = self.settings.superset_database_id
+        key = (person.tenant_id, person.principal_id, database_id, source.service, source.schema)
+        if key not in self._bound:
+            refusal = binding_refusal(adapter, database_id=database_id, service=source.service, schema=source.schema)
+            if refusal is not None:
+                return refusal
+            self._bound.add(key)
+        adapter.mark_bound()
+        return None
+
+    def _superset_grants(self, adapter, person: IdentityContext) -> GrantSet:
+        """What Superset says `person`, whose token `adapter` carries, may read: on Oracle once their connection is
+        shown bound (`bound`; `ConnectionNotBound` otherwise, before any other statement of theirs is sent). Raises
+        `GrantsUnreadable` when that could not be read from Superset: every door refuses then, rather than show an
+        empty schema or defer with the access policy's wording, since Superset mode holds no policy."""
+        if (refusal := self.bound(person, adapter)) is not None:
+            logger.warning("Superset mode answers nothing for this person: %s", refusal)
+            raise ConnectionNotBound(refusal)
         grants = resolve_grants(adapter, self.snapshot)
         if not grants.available:
             raise GrantsUnreadable()
