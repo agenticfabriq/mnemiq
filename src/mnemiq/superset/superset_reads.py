@@ -9,9 +9,12 @@ each `exp.Table` among the sources of each scope sqlglot's `traverse_scope` give
 Checked against rc2 7.0.0rc2, run with its own sqlglot (30.17.0), from mnemiq's sqlglot 30.29.0: over the one-statement
 queries among the SQL literals of mnemiq's source and tests, as `for_superset` sends them, each table mnemiq reads in a
 statement is among the tables rc2's own extraction reads and is one rc2's `apply_rls` applies a row rule to. Where the
-two versions parse a statement apart, the reading here is not rc2's: `names` refuses the one such clause found (a
-partition), and a change of either version is to be checked again. Not modelled: rc2's access check reads a SHOW or
-DESCRIBE statement, and one sqlglot keeps as a Command, otherwise; mnemiq sends none.
+two versions read a statement apart, the reading here is not rc2's. They are known to on a partition or subpartition
+clause, on a flashback clause (AS OF), on the sources a scope lists for a pivoted or unpivoted reference, and on
+Oracle's q-quoted literals: `names` refuses a statement with any of the first three (`_CONFIRMED_ARGS`), and rc2's
+sqlglot does not parse the last, so Superset refuses those itself. A change of either version is to be checked again.
+Not modelled: rc2's access check reads a SHOW or DESCRIBE statement, and one sqlglot keeps as a Command, otherwise;
+mnemiq sends none.
 """
 
 from __future__ import annotations

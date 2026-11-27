@@ -455,11 +455,24 @@ def test_superset_finds_the_tables_mnemiq_reads(superset_oracle, decided):
 # Statements in which mnemiq cannot confirm that Superset reads every table mnemiq reads, each by the name Superset gives
 # it. mnemiq refuses each.
 NOT_READ_ALIKE = [
-    'SELECT COUNT(*) FROM "ORDERS" SAMPLE (10), (SELECT 1 AS "X" FROM "DUAL") "orders"',
-    'WITH "T" AS (SELECT 1 AS "X" FROM "DUAL") SELECT COUNT(*) FROM "ORDERS" SAMPLE (10), "T" "orders"',
-    'SELECT COUNT(*) FROM "ORDERS" SAMPLE (10) CROSS JOIN (SELECT COUNT(*) AS "N" FROM "DUAL") "orders"',
+    'SELECT COUNT(*) FROM "ORDERS" "O", (SELECT 1 AS "X" FROM "DUAL") "O"',
+    'WITH "T" AS (SELECT 1 AS "X" FROM "DUAL") SELECT COUNT(*) FROM "ORDERS" "O", "T" "O"',
+    'SELECT COUNT(*) FROM "ORDERS" "O" CROSS JOIN (SELECT COUNT(*) AS "N" FROM "DUAL") "O"',
     'SELECT COUNT(*) FROM "ORDERS" PARTITION (P1), (SELECT 1 AS "X" FROM "DUAL") "orders"',
-    'SELECT COUNT(*) FROM "ORDERS" SAMPLE (10), (SELECT 1 AS "X" FROM "ORDERS" "O") "orders"',
+    'SELECT COUNT(*) FROM "ORDERS" "O", (SELECT 1 AS "X" FROM "ORDERS" "P") "O"',
+    # A sample whose table cannot take its alias, another source going by that name.
+    'SELECT COUNT(*) FROM "ORDERS" SAMPLE (10), "CUSTOMERS" "ORDERS", (SELECT 1 AS "X" FROM "DUAL") "orders"',
+    'SELECT COUNT(*) FROM "ORDERS" SAMPLE (10), "ORDERS"',
+    # A flashback clause, bare and aliased, and an @ in its literal, which is no link.
+    'SELECT "ID" FROM "ORDERS" AS OF SCN 1',
+    'SELECT "O"."ID" FROM "ORDERS" AS OF TIMESTAMP SYSTIMESTAMP "O"',
+    "SELECT \"ID\" FROM \"ORDERS\" AS OF TIMESTAMP TO_TIMESTAMP('2026-01-01 a@b', 'YYYY-MM-DD')",
+    # A pivoted or unpivoted reference, to a table or to a CTE.
+    'SELECT * FROM "ORDERS" PIVOT (SUM("AMOUNT") FOR "STATUS" IN (\'A\' AS "A"))',
+    'WITH "W" AS (SELECT 1 AS "X", 2 AS "Y" FROM "DUAL") SELECT COUNT(*) FROM "W" PIVOT (SUM("X") FOR "Y" IN '
+    '(1 AS "A")) "P", "ORDERS" "W", (SELECT 1 AS "Z" FROM "DUAL") "W"',
+    'WITH "W" AS (SELECT 1 AS "X", 2 AS "Y" FROM "DUAL") SELECT COUNT(*) FROM "W" UNPIVOT ("V" FOR "K" IN ("X", '
+    '"Y")) "P", "ORDERS" "W", (SELECT 1 AS "Z" FROM "DUAL") "W"',
     'SELECT COUNT(*) FROM "ORDERS" PARTITION (P1), (SELECT 1 AS "X" FROM "DUAL") "PARTITION"',
     'WITH "PARTITION" AS (SELECT 1 AS "X" FROM "DUAL") SELECT COUNT(*) FROM "ORDERS" PARTITION (P1), "PARTITION"',
     'SELECT COUNT(*) FROM "ORDERS" SUBPARTITION (P1) CROSS JOIN (SELECT 1 AS "X" FROM "DUAL") "SUBPARTITION"',
@@ -499,6 +512,38 @@ def test_the_refusal_names_each_table_as_written(superset_oracle, decided, named
     with pytest.raises(RefusedStatement) as refused:
         for_superset(decided)
     assert f"could not confirm for {named}, so" in str(refused.value)
+
+
+@pytest.mark.parametrize(("decided", "sent"), [
+    ('SELECT ORDERS.ID FROM ORDERS SAMPLE (10)', 'SELECT ORDERS.ID FROM orders SAMPLE (10) "ORDERS"'),
+    ('SELECT "ORDERS"."ID" FROM "ORDERS" sample(10) WHERE "ORDERS"."ID" > 0',
+     'SELECT "ORDERS"."ID" FROM orders sample(10) "ORDERS" WHERE "ORDERS"."ID" > 0'),
+    ('SELECT "ORDERS"."ID" FROM "ORDERS" SAMPLE BLOCK (10) SEED (3)',
+     'SELECT "ORDERS"."ID" FROM orders SAMPLE BLOCK (10) SEED (3) "ORDERS"'),
+    ('SELECT "ORDERS"."ID" FROM "ORDERS" SAMPLE (.5) WHERE "ORDERS"."ID" IN (SELECT "ID" FROM "RETURNS")',
+     'SELECT "ORDERS"."ID" FROM orders SAMPLE (.5) "ORDERS" WHERE "ORDERS"."ID" IN (SELECT "ID" FROM returns "RETURNS")'),
+    ('SELECT "ORDERS"."ID" FROM ("ORDERS" SAMPLE (10) JOIN "CUSTOMERS" ON "CUSTOMERS"."ID" = "ORDERS"."CID")',
+     'SELECT "ORDERS"."ID" FROM (orders SAMPLE (10) "ORDERS" JOIN customers "CUSTOMERS" '
+     'ON "CUSTOMERS"."ID" = "ORDERS"."CID")'),
+    ('SELECT COUNT(*) FROM "ORDERS" SAMPLE (10), (SELECT 1 AS "X" FROM "DUAL") "orders"',
+     'SELECT COUNT(*) FROM orders SAMPLE (10) "ORDERS", (SELECT 1 AS "X" FROM dual "DUAL") "orders"'),
+    ('WITH "T" AS (SELECT 1 AS "X" FROM "DUAL") SELECT COUNT(*) FROM "ORDERS" SAMPLE (10), "T" "orders"',
+     'WITH "T" AS (SELECT 1 AS "X" FROM dual "DUAL") SELECT COUNT(*) FROM orders SAMPLE (10) "ORDERS", "T" "orders"'),
+    ('SELECT COUNT(*) FROM "ORDERS" SAMPLE (10) CROSS JOIN (SELECT COUNT(*) AS "N" FROM "DUAL") "orders"',
+     'SELECT COUNT(*) FROM orders SAMPLE (10) "ORDERS" CROSS JOIN (SELECT COUNT(*) AS "N" FROM dual "DUAL") "orders"'),
+    ('SELECT COUNT(*) FROM "ORDERS" SAMPLE (10), (SELECT 1 AS "X" FROM "ORDERS" "O") "orders"',
+     'SELECT COUNT(*) FROM orders SAMPLE (10) "ORDERS", (SELECT 1 AS "X" FROM orders "O") "orders"'),
+])
+def test_a_sampled_table_is_aliased_after_its_sample(superset_oracle, decided, sent):
+    """Oracle writes a table's alias after its sample clause, so a table with a sample takes its stored name as alias
+    there, as any other table takes it after its name. Superset reads every table in it, and under a row rule's wrap
+    (rc2's, as `_row_ruled` copies it) a column qualified by the table keeps resolving; with no alias it would not."""
+    assert for_superset(decided) == sent and for_superset(sent) == sent
+    assert sorted(_rc2_reads(sent)) == sorted(_superset_tables(sent))
+    assert _unresolved(sent) == [] and _unresolved(_row_ruled(sent)) == []
+    unaliased = sent.replace(') "ORDERS"', ")", 1)
+    if '"ORDERS".' in sent or "ORDERS." in sent:
+        assert _unresolved(unaliased) == [] and _unresolved(_row_ruled(unaliased)) != []
 
 
 def test_a_statement_repaired_as_the_refusal_asks_is_sent(superset_oracle):
@@ -550,7 +595,19 @@ def test_superset_reads_each_table_source_of_each_scope(sql, read):
 def test_a_table_over_a_database_link_is_refused(superset_oracle, decided):
     """A table read over a database link (an `@` in a part of its name, quoted or not, or a link sqlglot reads as its
     alias) is another database's, which no Superset dataset names: refused, nothing sent."""
-    with pytest.raises(RefusedStatement, match="database link"):
+    with pytest.raises(RefusedStatement, match="reads .+ over a database link"):
+        for_superset(decided)
+
+
+@pytest.mark.parametrize(("decided", "named"), [
+    ('SELECT seq@lnk.nextval FROM "DUAL"', "seq@lnk"), ('SELECT shop.seq@lnk.currval + 1 AS "N" FROM "DUAL"', "seq@lnk"),
+    ('SELECT f@lnk(1) FROM "DUAL"', "f@lnk"), ('SELECT shop.f@lnk(1) FROM "DUAL"', "f@lnk"),
+    ('SELECT "ID" FROM "ORDERS" WHERE "ID" = f@lnk("ID")', "f@lnk"), ('SELECT f@lnk FROM "DUAL"', "f@lnk"),
+    ('SELECT @lnk FROM "DUAL"', "@lnk")])
+def test_a_function_or_sequence_over_a_database_link_is_refused(superset_oracle, decided, named):
+    """A function or a sequence named over a database link is another database's, as a table there is: refused with
+    the same plain reason, nothing sent."""
+    with pytest.raises(RefusedStatement, match=f"names {re.escape(named)} over a database link"):
         for_superset(decided)
 
 
@@ -608,8 +665,9 @@ def test_a_made_datasets_join_keeps_its_columns_under_a_row_rule(superset_oracle
     # Each table of a parenthesized join, at any depth.
     ('SELECT 1 FROM (("ORDERS" JOIN "CUSTOMERS" ON 1 = 1) JOIN "ITEMS" ON 1 = 1)',
      'SELECT 1 FROM ((orders "ORDERS" JOIN customers "CUSTOMERS" ON 1 = 1) JOIN items "ITEMS" ON 1 = 1)'),
-    # An alias would not follow the name there, or would hide a column named by schema and table: that table alone.
-    ('SELECT * FROM "ORDERS" SAMPLE (10)', 'SELECT * FROM orders SAMPLE (10)'),
+    # A sample, which the alias follows; a column named by schema and table, which an alias would hide, leaves that
+    # table alone unaliased.
+    ('SELECT * FROM "ORDERS" SAMPLE (10)', 'SELECT * FROM orders SAMPLE (10) "ORDERS"'),
     ('SELECT "SHOP"."ORDERS"."ID" FROM "SHOP"."ORDERS"', 'SELECT "SHOP"."ORDERS"."ID" FROM shop.orders'),
     ('SELECT COUNT(*) FROM "SHOP"."ORDERS", "SHOP" WHERE "SHOP"."ORDERS"."ID" > 0',
      'SELECT COUNT(*) FROM shop.orders, shop WHERE "SHOP"."ORDERS"."ID" > 0'),
@@ -686,10 +744,10 @@ def test_the_adapter_sends_each_statement_in_supersets_spelling(superset_oracle)
 @pytest.mark.parametrize("sql", [
     "SELECT '@' FROM \"ORDERS\"", 'SELECT 1 FROM ("ORDERS" JOIN "CUSTOMERS" ON "CUSTOMERS"."NOTE" = \'@x\')',
     'SELECT "ID" FROM "ORDERS" /* by a@b */', 'SELECT "ID" FROM "ORDERS" "O" -- see x@y',
-    "SELECT \"ID\" FROM \"ORDERS\" AS OF TIMESTAMP TO_TIMESTAMP('2026-01-01 a@b', 'YYYY-MM-DD')",
-    'SELECT "ID" FROM "ORDERS" "A@B"'])
+    'SELECT "ID" FROM "ORDERS" "A@B"', 'SELECT "A@B" FROM "ORDERS"', 'SELECT "ID" AS "A@B" FROM "ORDERS"'])
 def test_an_at_sign_outside_a_tables_name_is_no_link(superset_oracle, sql):
-    """An `@` in a literal, a comment, a clause after a table's name or a quoted alias is no database link: sent."""
+    """An `@` in a literal, a comment, a quoted alias or a quoted column's name is no database link: sent. (One in a
+    clause after a table's name is none either; such a clause is refused for itself, `NOT_READ_ALIKE`.)"""
     assert "@" in for_superset(sql)
 
 
@@ -939,6 +997,23 @@ def test_the_value_check_names_what_superset_reads(fake, monkeypatch, superset_o
     assert mine.startswith('SELECT "REGION", '), mine
     [statement] = sent
     assert 'FROM orders "ORDERS"' in statement, statement
+
+
+@pytest.mark.parametrize(("made", "said"), [
+    ('WITH "orders" AS (SELECT 1 AS "ID" FROM "DUAL") SELECT "REGION", "CHANNEL", "PREMIUM" FROM "ORDERS"',
+     "give the CTE a name no table of the statement has"),
+    ('SELECT "REGION", "CHANNEL", "PREMIUM" FROM "ORDERS" WHERE (', "the statement does not parse"),
+], ids=["refused", "unreadable"])
+def test_a_made_dataset_whose_sql_mnemiq_does_not_send_is_not_checked(fake, monkeypatch, superset_oracle, made, said):
+    """The check holds Superset's copy of a made dataset's SQL to the text the build sends for it (`for_superset`).
+    SQL that `for_superset` refuses, or cannot read, leaves the chart not checked, saying why; nothing is run."""
+    from mnemiq.superset.chart_check import ChartStatus
+
+    stored = {"REGION": "REGION", "CHANNEL": "CHANNEL", "PREMIUM": "PREMIUM"}
+    decided, sent, check = _checked(fake, monkeypatch, _oracle_chart(stored, virtual_sql=made), made={12: made})
+    assert check.status is ChartStatus.NOT_CHECKED, check
+    assert "made with SQL mnemiq does not send to Superset" in check.reason and said in check.reason, check.reason
+    assert decided == [] and sent == []
 
 
 def test_a_made_dataset_is_checked_with_the_sql_the_build_decided(fake, monkeypatch, superset_oracle):

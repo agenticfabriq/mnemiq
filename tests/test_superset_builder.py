@@ -908,8 +908,7 @@ def test_a_table_that_already_has_a_dataset_stops_the_build(fake, world, store):
 @pytest.mark.parametrize(("sql", "said"), [
     ('WITH "claim" AS (SELECT 1 AS "ID" FROM "DUAL") SELECT "ID" FROM "CLAIM"',
      "give the CTE a name no table of the statement has"),
-    ('SELECT COUNT(*) FROM "CLAIM" SAMPLE (10), (SELECT 1 AS "X" FROM "DUAL") "claim"',
-     "read each table in a plain FROM or JOIN"),
+    ('SELECT COUNT(*) FROM "CLAIM" "C", (SELECT 1 AS "X" FROM "DUAL") "C"', "read each table in a plain FROM or JOIN"),
     ('SELECT * FROM "CLAIM" WHERE (', "could not read the SQL of the dataset"),
 ], ids=["refused", "not read alike", "unreadable"])
 def test_a_datasets_sql_mnemiq_does_not_send_fails_its_step(fake, world, store, superset_oracle, sql, said):

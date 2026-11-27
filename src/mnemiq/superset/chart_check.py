@@ -82,7 +82,7 @@ from mnemiq.superset.client import SupersetToolError, SupersetUnavailable
 from mnemiq.superset.extension import row_rule_applies
 from mnemiq.superset.display_format import CANNOT_TELL, Displayed, displayed, fits, metric_label, shows_currency
 from mnemiq.superset.measures import Measure, MeasureKind, measure_statement, run_decided
-from mnemiq.superset.names import for_superset
+from mnemiq.superset.names import RefusedStatement, UnreadableStatement, for_superset
 from mnemiq.superset.saved_metrics import SavedMetric
 from mnemiq.superset.settings import superset_dialect
 
@@ -925,7 +925,12 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
             return not_checked(_SQL_UNSHOWN)
         # Superset holds the SQL as the build sent it, in Superset's spelling (`for_superset`), and the dataset is read
         # with the SQL the build decided, which names each table as the deciders read one.
-        if dataset.sql != for_superset(made[dataset.dataset_id]):
+        try:
+            sent = for_superset(made[dataset.dataset_id])
+        except (RefusedStatement, UnreadableStatement) as exc:
+            return not_checked(f"the chart's dataset is one this build made with SQL mnemiq does not send to Superset "
+                               f"({exc}), so mnemiq does not check it with its own SQL")
+        if dataset.sql != sent:
             return not_checked(_SQL_CHANGED)
         applies = row_rule_applies(client, dataset.dataset_id)
         if applies is None:
