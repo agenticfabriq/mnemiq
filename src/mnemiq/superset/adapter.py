@@ -373,8 +373,8 @@ class SupersetSqlAdapter:
                                       f"({exc}), so it was not sent; send one SELECT") from exc
         # The text Superset renders as a template is the text sent: checked again as it is sent.
         _refuse_template_markers(sql)
-        limit = _superset_timeout(self._timeout_s if timeout_s is None else timeout_s)
-        request = {"database_id": self._database_id, "sql": sql, "schema": self._schema, "timeout": limit}
+        timeout = _superset_timeout(self._timeout_s if timeout_s is None else timeout_s)
+        request = {"database_id": self._database_id, "sql": sql, "schema": self._schema, "timeout": timeout}
         if dry_run:
             request["dry_run"] = True
         if row_limit is not None:
@@ -383,12 +383,12 @@ class SupersetSqlAdapter:
             request["force_refresh"] = True
         if self.dialect == "oracle":
             try:
-                checked = self._as_superset_runs(sql, request, limit)
+                checked = self._as_superset_runs(sql, request, timeout)
             except RefusedStatement as exc:
                 raise SupersetQueryFailed(str(exc)) from exc
             if dry_run:
                 return checked  # the dry run asked for is the one the statement was checked by
-        return self._call(request, limit)
+        return self._call(request, timeout)
 
     def _call(self, request: dict, timeout: int) -> dict:
         """`execute_sql` with `request`, its answer as Superset sent it; `timeout` is the request's time limit."""

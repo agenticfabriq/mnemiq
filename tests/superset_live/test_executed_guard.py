@@ -140,8 +140,12 @@ def test_tables_read_answers_the_tables_supersets_access_check_reads(live, sql, 
 
 
 def test_tables_read_of_text_superset_cannot_read_as_one_statement_is_unreadable(live):
+    """Two statements, a text Superset cannot parse, and a text holding a template marker anywhere (never rendered)
+    are each answered unreadable, and mnemiq's client reads that as cannot tell."""
     analyst = _client(live, "analyst")
-    for sql in ("SELECT 1 FROM policy; SELECT 1 FROM party", "SELEC nothing FROM ("):
+    for sql in ("SELECT 1 FROM policy; SELECT 1 FROM party", "SELEC nothing FROM (",
+                "SELECT 1 FROM {{ 'policy' }}", "SELECT 1 FROM policy WHERE region = '{% raw %}x{% endraw %}'",
+                "SELECT 1 FROM policy /* {# note #} */"):
         assert analyst.call(TOOL_PREFIX + "tables_read", {"database_id": live.database_id, "schema": SCHEMA,
                                                           "sql": sql}) == {"unreadable": True}
         assert _read(live, analyst, sql) is None

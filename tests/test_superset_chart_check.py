@@ -2872,8 +2872,8 @@ def _made_on_oracle(fake, execute=None):
 
 
 def test_an_oracle_made_dataset_superset_reads_other_tables_in_is_not_checked(fake, superset_oracle):
-    """Superset's access check must read every table mnemiq reads in the made dataset's SQL (`tables_read`), as the
-    chart's row rules apply to the tables Superset reads: else the chart is not checked, saying which."""
+    """mnemiq does not check the chart when Superset's reading of the made dataset's SQL (`tables_read`) misses a
+    table mnemiq reads, saying which."""
     made, held = _made_on_oracle(fake)
     fake.reply(TABLES_READ, lambda request, authorization: {"tables": []} if request.get("sql") == held
                else tables_read_as_mnemiq(request))

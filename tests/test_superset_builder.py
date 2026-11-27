@@ -976,9 +976,8 @@ def test_a_datasets_sql_superset_refuses_at_its_dry_run_fails_its_step_without_i
 
 
 def test_a_datasets_sql_superset_reads_other_tables_in_fails_its_step(fake, world, store, superset_oracle):
-    """Every table mnemiq reads in a dataset's SQL must be one Superset's own access check reads in it (the
-    extension's `tables_read`), as every viewer's row rules are applied to the tables Superset reads: else the step
-    fails, saying which, and nothing is made."""
+    """mnemiq refuses a dataset's SQL when Superset's reading of it (the extension's `tables_read`) misses a table
+    mnemiq reads: the step fails, saying which, and nothing is made."""
     plan = dataclasses.replace(ONE_VIRTUAL, datasets=(dataclasses.replace(JOINED, sql=ORACLE_MADE),))
     build = _start(store, plan).build_id
     _run_to(store, build, _adapter(fake), "dataset_1")

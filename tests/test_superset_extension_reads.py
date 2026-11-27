@@ -521,6 +521,26 @@ def test_tables_read_of_a_text_superset_cannot_read_as_one_statement_says_so(mon
     assert reads.tables_read(READ_REQUEST) == {"unreadable": True}
 
 
+@pytest.mark.parametrize("sql", [
+    "SELECT * FROM {{ current_user_id() }}", "{% if 1 %}SELECT 1 FROM orders{% endif %}",
+    "SELECT 1 FROM orders {# a note #}", "SELECT '{{ x }}' FROM orders", "SELECT 1 FROM orders /* {% x %} */",
+    "SELECT 1 FROM orders -- {# x", "SELECT \"{{\" FROM orders",
+], ids=["{{", "{%", "{#", "in a literal", "in a block comment", "in a line comment", "in a quoted name"])
+def test_tables_read_of_a_text_holding_a_template_marker_is_unreadable_and_never_rendered(monkeypatch, sql):
+    """A text holding a template marker, anywhere in it, is answered `{"unreadable": true}` before Superset renders or
+    parses it: mnemiq never sends one (`adapter.JINJA_DELIMITERS`), and rendering one would answer what the caller's
+    template renders to. Superset is not asked even for the database."""
+    asked = superset_reading(monkeypatch, databases={7: database()}, tables=[stubs.Table("orders")])
+    assert reads.tables_read({**READ_REQUEST, "sql": sql}) == {"unreadable": True}
+    assert asked == []
+
+
+def test_tables_read_refuses_the_markers_mnemiq_refuses():
+    from mnemiq.superset.adapter import JINJA_DELIMITERS
+
+    assert reads.TEMPLATE_MARKERS == JINJA_DELIMITERS
+
+
 def test_tables_read_too_large_to_send_says_so(monkeypatch):
     superset_reading(monkeypatch, databases={7: database()},
                      tables=[stubs.Table(f"{i:04d}" + "x" * 240) for i in range(200)])

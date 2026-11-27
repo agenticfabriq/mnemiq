@@ -43,6 +43,9 @@ MAX_SCHEMA_NAME = 255
 # The longest statement `tables_read` reads, in bytes of its UTF-8 text: rc2's own default bound on a script it parses
 # (`SQL_MAX_PARSE_LENGTH` in `superset/config.py`).
 MAX_SQL_BYTES = 1_000_000
+# The markers Superset renders a text as a template by, which mnemiq never sends (`JINJA_DELIMITERS` in
+# `mnemiq/superset/adapter.py`): `tables_read` reads no text holding one, wherever it stands in it.
+TEMPLATE_MARKERS = ("{{", "{%", "{#")
 # An answer larger than this, in bytes of its JSON text, is not sent: well under the guard's 50,000.
 MAX_ANSWER_BYTES = 40_000
 MAX_LAYOUT_BYTES = MAX_ANSWER_BYTES
@@ -263,8 +266,11 @@ def tables_read(found: dict) -> dict:
     catalog, where the statement names none of its own. Answered `{"tables": [{catalog, schema, table}, ...]}`, sorted,
     each once.
 
-    A database the caller may not see, or that does not exist, is answered `{"not_found": "database"}`, as
-    `table_rules` answers one, and the text is not read. A text rc2 cannot read, or reads as other than one statement,
+    A text holding a template marker (`TEMPLATE_MARKERS`), in a literal or a comment as anywhere, is answered
+    `{"unreadable": True}` before anything else: it is never rendered, so no answer carries what a template renders
+    to, and Superset is not asked. A database the caller may not see, or that does not exist, is answered
+    `{"not_found": "database"}`, as `table_rules` answers one, and the text is not read. A text rc2 cannot read, or
+    reads as other than one statement,
     or as one it does not fully model (`has_unparseable_statement`, which its access check refuses under strict
     scoping), is answered `{"unreadable": True}`; an answer over `MAX_ANSWER_BYTES`, `{"too_large": True}`."""
     from jinja2.exceptions import TemplateError
@@ -272,6 +278,8 @@ def tables_read(found: dict) -> dict:
     from superset.exceptions import SupersetParseError, SupersetSecurityException
     from superset.sql.parse import process_jinja_sql
 
+    if any(marker in found["sql"] for marker in TEMPLATE_MARKERS):
+        return {"unreadable": True}
     database = DatabaseDAO.find_by_id(found["database_id"])
     if database is None:
         return writes._not_found("database")
