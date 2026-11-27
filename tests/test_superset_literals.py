@@ -11,6 +11,7 @@ import logging
 from decimal import Decimal
 from types import SimpleNamespace
 
+import duckdb
 import pyarrow as pa
 import pytest
 import sqlglot
@@ -471,6 +472,57 @@ def test_unique_statement_counts_the_rows_holding_a_key_against_their_distinct_k
     assert unique_statement("t", ["status", "Owner"], "postgres") == (
         'SELECT COUNT(*) AS "keyed_rows", COUNT(DISTINCT ("status", "Owner")) AS "distinct_keys" FROM "t" '
         'WHERE NOT "status" IS NULL AND NOT "Owner" IS NULL')
+
+
+# The PostgreSQL probe of a key of two columns, counted as one row value.
+_POSTGRES_TWO = ('SELECT COUNT(*) AS "keyed_rows", COUNT(DISTINCT ("status", "Owner")) AS "distinct_keys" FROM "t" '
+                 'WHERE NOT "status" IS NULL AND NOT "Owner" IS NULL')
+
+
+def test_an_oracle_key_of_several_columns_is_counted_by_its_groups():
+    """Oracle has no row value to count distinct (`COUNT(DISTINCT ("status", "Owner"))` is PostgreSQL's grammar, not
+    Oracle's), so there a key of several columns is counted by grouping the rows that hold one by it: the groups are
+    its distinct keys, and their rows, summed, the rows holding one, none when no row does. A key of one column is
+    counted as on PostgreSQL, and PostgreSQL's statements are as they were, byte for byte."""
+    oracle = unique_statement("t", ["status", "Owner"], "oracle")
+    assert oracle == (
+        'SELECT COALESCE(SUM("n"), 0) AS "keyed_rows", COUNT(*) AS "distinct_keys" FROM (SELECT COUNT(*) AS "n" '
+        'FROM "t" WHERE NOT "status" IS NULL AND NOT "Owner" IS NULL GROUP BY "status", "Owner") "keys"')
+    tree = sqlglot.parse_one(oracle, read="oracle")
+    assert tree.find(exp.Tuple) is None and [alias.alias for alias in tree.expressions] == ["keyed_rows",
+                                                                                           "distinct_keys"]
+    assert unique_statement("t", ["status"], "oracle") == unique_statement("t", ["status"], "postgres") == (
+        'SELECT COUNT(*) AS "keyed_rows", COUNT(DISTINCT "status") AS "distinct_keys" FROM "t" '
+        'WHERE NOT "status" IS NULL')
+    assert unique_statement("t", ["status", "Owner"], "postgres") == _POSTGRES_TWO
+
+
+@pytest.mark.parametrize("rows", [
+    [("a", "x"), ("a", "x"), ("a", "y"), (None, "x"), ("b", None), ("b", "y")],
+    [("a", "x"), ("a", "y"), ("b", "x")],
+    [(None, "x"), ("a", None)],
+    [],
+], ids=["a repeated key", "each key once", "every key null", "no row"])
+def test_the_oracle_count_of_a_key_of_several_columns_reads_as_postgres_does(rows):
+    """The two counts of Oracle's statement for a key of two columns are PostgreSQL's, read where both run: the rows
+    whose key holds no NULL, and their distinct keys."""
+    connection = duckdb.connect()
+    connection.execute('CREATE TABLE "t" ("status" VARCHAR, "Owner" VARCHAR)')
+    if rows:
+        connection.executemany('INSERT INTO "t" VALUES (?, ?)', rows)
+    oracle = connection.execute(unique_statement("t", ["status", "Owner"], "oracle")).fetchall()
+    assert oracle == connection.execute(_POSTGRES_TWO).fetchall()
+    assert len(oracle) == 1 and None not in oracle[0]
+
+
+def test_unique_live_asks_an_oracle_source_in_oracles_form():
+    """The probe is written in the dialect of the adapter it is sent through: an Oracle source is asked by grouping,
+    and its two counts are read as PostgreSQL's are."""
+    source = Source(lambda sql: _counts(10, 8))
+    source.dialect = "oracle"
+    assert _unique(["status", "owner"], source) is False
+    assert source.sent == [unique_statement("t", ["owner", "status"], "oracle")]
+    assert "GROUP BY" in source.sent[0] and "COUNT(DISTINCT" not in source.sent[0]
 
 
 def test_unique_live_reads_afresh_and_compares_the_two_counts():

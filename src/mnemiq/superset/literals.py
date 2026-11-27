@@ -291,13 +291,29 @@ def unique_statement(table: str, columns: Sequence[str], dialect: str | None) ->
     """Whether `columns` of `table` hold each value once together: `SELECT COUNT(*), COUNT(DISTINCT <columns>) FROM
     <table> WHERE <each column> IS NOT NULL`, the names quoted as stored, several columns counted as one row value. A
     NULL in a key meets no row in a join, so both counts are of the rows whose key holds no NULL; each is named
-    (`keyed_rows`, `distinct_keys`), so the answer holds two columns of two names."""
+    (`keyed_rows`, `distinct_keys`), so the answer holds two columns of two names.
+
+    Oracle has no row value to count distinct, so there several columns are counted by grouping the rows that hold a
+    key by it: `SELECT COALESCE(SUM(n), 0), COUNT(*) FROM (SELECT COUNT(*) AS n FROM <table> WHERE ... GROUP BY
+    <columns>)`, its groups the distinct keys and their rows, summed, the rows holding one (none where no row does), so
+    the two counts are those PostgreSQL's statement gives."""
     named = [exp.Column(this=exp.to_identifier(column, quoted=True)) for column in columns]
+    source = exp.Table(this=exp.to_identifier(table, quoted=True))
+    keyed = exp.and_(*(exp.Not(this=exp.Is(this=column.copy(), expression=exp.Null())) for column in named))
+    if len(named) > 1 and dialect == "oracle":
+        rows = exp.Column(this=exp.to_identifier("n", quoted=True))
+        groups = (exp.select(exp.alias_(exp.Count(this=exp.Star()), "n", quoted=True)).from_(source).where(keyed)
+                  .group_by(*(column.copy() for column in named)))
+        return (exp.select(exp.alias_(exp.Coalesce(this=exp.Sum(this=rows), expressions=[exp.Literal.number(0)]),
+                                      "keyed_rows", quoted=True),
+                           exp.alias_(exp.Count(this=exp.Star()), "distinct_keys", quoted=True))
+                .from_(groups.subquery(exp.to_identifier("keys", quoted=True)))
+                .sql(dialect=dialect))
     key = named[0] if len(named) == 1 else exp.Tuple(expressions=named)
     return (exp.select(exp.alias_(exp.Count(this=exp.Star()), "keyed_rows", quoted=True),
                        exp.alias_(exp.Count(this=exp.Distinct(expressions=[key.copy()])), "distinct_keys", quoted=True))
-            .from_(exp.Table(this=exp.to_identifier(table, quoted=True)))
-            .where(exp.and_(*(exp.Not(this=exp.Is(this=column.copy(), expression=exp.Null())) for column in named)))
+            .from_(source)
+            .where(keyed)
             .sql(dialect=dialect))
 
 
