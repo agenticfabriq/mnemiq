@@ -202,7 +202,8 @@ def test_on_postgres_a_statement_is_sent_as_written():
     for sql in ('SELECT "REVENUE" FROM "ORDERS"', "SELECT * FROM ORDERS", "SELECT * FROM ORDERS WHERE (", "",
                 'SELECT COUNT(*) FROM "ORDERS" SAMPLE (10), (SELECT 1 AS "X" FROM "DUAL") "orders"',
                 'WITH "orders" AS (SELECT 1 AS "ID" FROM "DUAL") SELECT "ORDERS"."ID" FROM "ORDERS"',
-                "SELECT 1 FROM orders@lnk"):
+                "SELECT 1 FROM orders@lnk", "SELECT q'[x]' FROM ORDERS", "SELECT SHOP.ORDERS.ID FROM SHOP.ORDERS",
+                "SELECT 1 FROM (ORDERS JOIN CUSTOMERS ON 1 = 1)"):
         assert for_superset(sql) is sql and from_superset(sql) is sql
 
 
@@ -372,8 +373,9 @@ _OWN_ALIAS = re.compile(r'\b([a-z_$#][a-z0-9_$#]*) "([A-Z_$#][A-Z0-9_$#]*)"')
     ("SELECT orders.revenue FROM orders", [("", "orders")]),
     ('SELECT "ORDERS"."ID" FROM "ORDERS" WHERE EXISTS (SELECT 1 FROM "RETURNS" '
      'WHERE "RETURNS"."ORDER_ID" = "ORDERS"."ID")', [("", "orders"), ("", "returns")]),
-    ('SELECT "ORDERS"."ID", "RETURNS"."ID" FROM (("ORDERS" JOIN "CUSTOMERS" ON "CUSTOMERS"."ID" = "ORDERS"."CID") '
-     'JOIN "RETURNS" ON "RETURNS"."ORDER_ID" = "ORDERS"."ID")', [("", "customers"), ("", "orders"), ("", "returns")]),
+    ('SELECT "ORDERS"."ID", "RETURNS"."ID" FROM "ORDERS" JOIN "CUSTOMERS" ON "CUSTOMERS"."ID" = "ORDERS"."CID" '
+     'JOIN "RETURNS" ON "RETURNS"."ORDER_ID" = "ORDERS"."ID"', [("", "customers"), ("", "orders"), ("", "returns")]),
+    ("SELECT ORDERS.ID FROM (ORDERS)", [("", "orders")]),
 ])
 def test_an_unaliased_table_keeps_its_name_under_a_row_rule(superset_oracle, decided, read):
     """rc2 wraps a table a row rule applies to as a subquery aliased by the table's name quoted as written, `"orders"`
@@ -422,6 +424,21 @@ def test_a_cte_that_shares_a_tables_name_is_refused(superset_oracle, decided):
         for_superset(decided)
 
 
+@pytest.mark.parametrize(("decided", "said"), [
+    ('WITH W AS (SELECT * FROM "CLAIM") SELECT w."SECRET" FROM w', "the CTE W as w"),
+    ('WITH "W" AS (SELECT * FROM "CLAIM") SELECT w."SECRET" FROM w', "the CTE W as w"),
+    ('WITH w AS (SELECT * FROM "CLAIM") SELECT "ID" FROM "CLAIM" WHERE "ID" IN (SELECT "ID" FROM W)', "the CTE w as W"),
+    ('WITH W AS (SELECT * FROM "CLAIM") SELECT "SECRET" FROM (SELECT w.* FROM w) "D"', "the CTE W as w"),
+])
+def test_a_cte_named_otherwise_than_its_with_clause_is_refused(superset_oracle, decided, said):
+    """A CTE named, where the statement reads it, otherwise than its WITH clause writes its name (quotes aside) is
+    refused, nothing sent, though Oracle reads both as one name; the model is told to name it as the WITH clause does.
+    Named so, it is sent."""
+    with pytest.raises(RefusedStatement, match=f"names {re.escape(said)}.+name each CTE as its WITH clause does"):
+        for_superset(decided)
+    assert for_superset('WITH "W" AS (SELECT * FROM "CLAIM") SELECT W."SECRET" FROM W').endswith("FROM W")
+
+
 def test_a_cte_that_reads_as_the_cte_is_no_twin(superset_oracle):
     """A reference Oracle reads as the CTE reads no table of that name: it is no twin, and is sent, Superset reading
     the same tables in it as mnemiq does."""
@@ -434,7 +451,6 @@ def test_a_cte_that_reads_as_the_cte_is_no_twin(superset_oracle):
 # mnemiq reads.
 SENT_HERE = [decided for decided, _ in NOT_TABLES] + CTE_TWINS + [
     'SELECT COUNT(*) FROM "ORDERS" "X", "CUSTOMERS" "X"', 'SELECT COUNT(*) FROM "ORDERS", "ORDERS"',
-    'SELECT "ORDERS"."ID", "CUSTOMERS"."NAME" FROM ("ORDERS" JOIN "CUSTOMERS" ON "CUSTOMERS"."ID" = "ORDERS"."CID")',
     'WITH t AS (SELECT * FROM "ORDERS") SELECT * FROM t',
     'SELECT * FROM "SHOP"."ORDERS" "O" WHERE "O"."ID" IN (SELECT "ORDER_ID" FROM "RETURNS")',
 ]
@@ -452,8 +468,8 @@ def test_superset_finds_the_tables_mnemiq_reads(superset_oracle, decided):
     assert sorted(_rc2_reads(sent)) == sorted(_superset_tables(sent))
 
 
-# Statements in which mnemiq cannot confirm that Superset reads every table mnemiq reads, each by the name Superset gives
-# it. mnemiq refuses each.
+# Statements in which mnemiq cannot confirm that Superset reads every table mnemiq reads, each by the name Superset
+# gives it. mnemiq refuses each.
 NOT_READ_ALIKE = [
     'SELECT COUNT(*) FROM "ORDERS" "O", (SELECT 1 AS "X" FROM "DUAL") "O"',
     'WITH "T" AS (SELECT 1 AS "X" FROM "DUAL") SELECT COUNT(*) FROM "ORDERS" "O", "T" "O"',
@@ -467,6 +483,9 @@ NOT_READ_ALIKE = [
     'SELECT "ID" FROM "ORDERS" AS OF SCN 1',
     'SELECT "O"."ID" FROM "ORDERS" AS OF TIMESTAMP SYSTIMESTAMP "O"',
     "SELECT \"ID\" FROM \"ORDERS\" AS OF TIMESTAMP TO_TIMESTAMP('2026-01-01 a@b', 'YYYY-MM-DD')",
+    # A clause on a CTE's reference, as on a table.
+    'WITH "W" AS (SELECT 1 AS "X" FROM "DUAL") SELECT COUNT(*) FROM "ORDERS" "PARTITION", "W" PARTITION (P1)',
+    'WITH "W" AS (SELECT 1 AS "X" FROM "DUAL") SELECT COUNT(*) FROM "ORDERS" "O", "W" AS OF SCN 1',
     # A pivoted or unpivoted reference, to a table or to a CTE.
     'SELECT * FROM "ORDERS" PIVOT (SUM("AMOUNT") FOR "STATUS" IN (\'A\' AS "A"))',
     'WITH "W" AS (SELECT 1 AS "X", 2 AS "Y" FROM "DUAL") SELECT COUNT(*) FROM "W" PIVOT (SUM("X") FOR "Y" IN '
@@ -521,10 +540,8 @@ def test_the_refusal_names_each_table_as_written(superset_oracle, decided, named
     ('SELECT "ORDERS"."ID" FROM "ORDERS" SAMPLE BLOCK (10) SEED (3)',
      'SELECT "ORDERS"."ID" FROM orders SAMPLE BLOCK (10) SEED (3) "ORDERS"'),
     ('SELECT "ORDERS"."ID" FROM "ORDERS" SAMPLE (.5) WHERE "ORDERS"."ID" IN (SELECT "ID" FROM "RETURNS")',
-     'SELECT "ORDERS"."ID" FROM orders SAMPLE (.5) "ORDERS" WHERE "ORDERS"."ID" IN (SELECT "ID" FROM returns "RETURNS")'),
-    ('SELECT "ORDERS"."ID" FROM ("ORDERS" SAMPLE (10) JOIN "CUSTOMERS" ON "CUSTOMERS"."ID" = "ORDERS"."CID")',
-     'SELECT "ORDERS"."ID" FROM (orders SAMPLE (10) "ORDERS" JOIN customers "CUSTOMERS" '
-     'ON "CUSTOMERS"."ID" = "ORDERS"."CID")'),
+     'SELECT "ORDERS"."ID" FROM orders SAMPLE (.5) "ORDERS" WHERE "ORDERS"."ID" IN '
+     '(SELECT "ID" FROM returns "RETURNS")'),
     ('SELECT COUNT(*) FROM "ORDERS" SAMPLE (10), (SELECT 1 AS "X" FROM "DUAL") "orders"',
      'SELECT COUNT(*) FROM orders SAMPLE (10) "ORDERS", (SELECT 1 AS "X" FROM dual "DUAL") "orders"'),
     ('WITH "T" AS (SELECT 1 AS "X" FROM "DUAL") SELECT COUNT(*) FROM "ORDERS" SAMPLE (10), "T" "orders"',
@@ -586,7 +603,8 @@ def test_superset_reads_each_table_source_of_each_scope(sql, read):
 
 
 @pytest.mark.parametrize("decided", [
-    "SELECT 1 FROM orders@lnk", 'SELECT 1 FROM "ORDERS"@lnk', 'SELECT 1 FROM "ORDERS"@"LNK"', "SELECT 1 FROM orders @ lnk",
+    "SELECT 1 FROM orders@lnk", 'SELECT 1 FROM "ORDERS"@lnk', 'SELECT 1 FROM "ORDERS"@"LNK"',
+    "SELECT 1 FROM orders @ lnk",
     "SELECT 1 FROM orders@ lnk", "SELECT 1 FROM orders o@lnk", 'SELECT 1 FROM "SHOP"."ORDERS"@lnk',
     "SELECT 1 FROM shop.orders@lnk.example.com", 'SELECT 1 FROM "A@B"', "SELECT 1 FROM @lnk",
     'SELECT 1 FROM "ORDERS" JOIN returns@lnk ON 1 = 1', 'SELECT 1 FROM ("ORDERS" JOIN "RETURNS"@lnk ON 1 = 1)',
@@ -600,7 +618,8 @@ def test_a_table_over_a_database_link_is_refused(superset_oracle, decided):
 
 
 @pytest.mark.parametrize(("decided", "named"), [
-    ('SELECT seq@lnk.nextval FROM "DUAL"', "seq@lnk"), ('SELECT shop.seq@lnk.currval + 1 AS "N" FROM "DUAL"', "seq@lnk"),
+    ('SELECT seq@lnk.nextval FROM "DUAL"', "seq@lnk"),
+    ('SELECT shop.seq@lnk.currval + 1 AS "N" FROM "DUAL"', "seq@lnk"),
     ('SELECT f@lnk(1) FROM "DUAL"', "f@lnk"), ('SELECT shop.f@lnk(1) FROM "DUAL"', "f@lnk"),
     ('SELECT "ID" FROM "ORDERS" WHERE "ID" = f@lnk("ID")', "f@lnk"), ('SELECT f@lnk FROM "DUAL"', "f@lnk"),
     ('SELECT @lnk FROM "DUAL"', "@lnk")])
@@ -611,20 +630,48 @@ def test_a_function_or_sequence_over_a_database_link_is_refused(superset_oracle,
         for_superset(decided)
 
 
-def test_a_parenthesized_joins_tables_are_aliased_as_any_table(superset_oracle):
-    """Each table inside a parenthesized join is aliased by its own name, as the query around it reads each by its
-    name. Under a row rule its first table's columns keep resolving, as above. rc2 wraps that first table together
-    with the joins sqlglot hangs on it (checked against rc2's own `apply_rls`), so a later table of the same
-    parenthesis, named outside it, is inside that wrap whether or not it has an alias: no alias reaches it, and it is
-    pinned here as rc2 leaves it."""
-    decided = ('SELECT "ORDERS"."ID", "CUSTOMERS"."NAME" '
-               'FROM ("ORDERS" JOIN "CUSTOMERS" ON "CUSTOMERS"."ID" = "ORDERS"."CID")')
-    sent = for_superset(decided)
-    assert sent == ('SELECT "ORDERS"."ID", "CUSTOMERS"."NAME" '
-                    'FROM (orders "ORDERS" JOIN customers "CUSTOMERS" ON "CUSTOMERS"."ID" = "ORDERS"."CID")')
-    assert _unresolved(sent) == [] and _unresolved(_row_ruled(sent)) == ['"CUSTOMERS"."NAME"']
-    unaliased = _OWN_ALIAS.sub(lambda m: m[1], sent)
-    assert set(_unresolved(_row_ruled(unaliased))) == {'"ORDERS"."ID"', '"CUSTOMERS"."NAME"', '"CUSTOMERS"."ID"'}
+@pytest.mark.parametrize("decided", [
+    'SELECT "ORDERS"."ID", "CUSTOMERS"."NAME" FROM ("ORDERS" JOIN "CUSTOMERS" ON "CUSTOMERS"."ID" = "ORDERS"."CID")',
+    'SELECT 1 FROM (("ORDERS" JOIN "CUSTOMERS" ON 1 = 1) JOIN "ITEMS" ON 1 = 1)',
+    'SELECT COUNT(*) FROM "ORDERS", ("ORDERS" JOIN "CUSTOMERS" ON 1 = 1)',
+    'SELECT 1 FROM ("ORDERS" JOIN "CUSTOMERS" ON 1 = 1) JOIN "ITEMS" ON 1 = 1',
+    'SELECT 1 FROM "ORDERS" JOIN ("CUSTOMERS" JOIN "ITEMS" ON 1 = 1) ON 1 = 1',
+    'SELECT 1 FROM "ORDERS" WHERE "ID" IN (SELECT 1 FROM ("CUSTOMERS" JOIN "ITEMS" ON 1 = 1))',
+    'SELECT 1 FROM (("ORDERS") JOIN "CUSTOMERS" ON 1 = 1)',
+    'SELECT 1 FROM ((SELECT 1 AS "X" FROM "DUAL") "D" JOIN "CUSTOMERS" ON 1 = 1)'])
+def test_a_parenthesized_join_is_refused(superset_oracle, decided):
+    """A join inside parentheses, at any depth, is refused, nothing sent; the model is told to write the join without
+    them."""
+    with pytest.raises(RefusedStatement, match="a join inside parentheses.+write the join without the parentheses"):
+        for_superset(decided)
+
+
+@pytest.mark.parametrize("decided", [
+    'SELECT "SHOP"."ORDERS"."ID" FROM "SHOP"."ORDERS"', "SELECT SHOP.ORDERS.ID FROM SHOP.ORDERS",
+    "SELECT shop.orders.id FROM shop.orders",
+    'SELECT COUNT(*) FROM "SHOP"."ORDERS", "SHOP" WHERE "SHOP"."ORDERS"."ID" > 0',
+    'SELECT "O"."ID" FROM "SHOP"."ORDERS" "O" WHERE "O"."ID" IN (SELECT "SHOP"."RETURNS"."ID" FROM "SHOP"."RETURNS")'])
+def test_a_column_named_by_its_schema_and_table_is_refused(superset_oracle, decided):
+    """A column qualified by its table's schema and name is refused, nothing sent; the model is told to alias the table
+    and qualify the column by the alias, which is sent (`SELECT "O"."ID" FROM shop.orders "O"`)."""
+    with pytest.raises(RefusedStatement, match="by its table's schema.+alias the table and qualify the column by the "
+                                               "alias"):
+        for_superset(decided)
+    assert for_superset('SELECT "O"."ID" FROM "SHOP"."ORDERS" "O"') == 'SELECT "O"."ID" FROM shop.orders "O"'
+
+
+@pytest.mark.parametrize("decided", [
+    """SELECT q'[x]' FROM "ORDERS\"""", """SELECT nq'[x]' FROM "ORDERS\"""", """SELECT Q'<x>' FROM "ORDERS\"""",
+    """SELECT "ID" FROM "ORDERS" WHERE "NOTE" = q'{it's}'""",
+    """SELECT "ID" FROM "ORDERS" WHERE "NOTE" BETWEEN q'[a]' AND q'[b]'""",
+    """SELECT "ID" FROM "ORDERS" WHERE "AT" > SYSDATE - INTERVAL q'[1]' DAY"""])
+def test_a_q_quoted_literal_is_refused(superset_oracle, decided):
+    """mnemiq never writes a q-quoted literal, and refuses a statement holding one, nothing sent; the model is told to
+    write it as an ordinary literal. An ordinary literal holding q-quote text is sent."""
+    with pytest.raises(RefusedStatement, match="q-quoted literal.+write it as an ordinary quoted literal"):
+        for_superset(decided)
+    plain = """SELECT "ID" FROM "ORDERS" WHERE "NOTE" = 'q''[x]''' OR "NOTE" = N'y'"""
+    assert for_superset(plain) == plain.replace('FROM "ORDERS"', 'FROM orders "ORDERS"')
 
 
 def test_a_made_datasets_join_keeps_its_columns_under_a_row_rule(superset_oracle):
@@ -656,25 +703,12 @@ def test_a_made_datasets_join_keeps_its_columns_under_a_row_rule(superset_oracle
     # Two references one query exposes by one name already: mnemiq writes no alias two of them would share.
     ('SELECT COUNT(*) FROM "ORDERS", "ORDERS"', 'SELECT COUNT(*) FROM orders, orders'),
     ('SELECT COUNT(*) FROM "CUSTOMERS" "ORDERS", "ORDERS"', 'SELECT COUNT(*) FROM customers "ORDERS", orders'),
-    # ... in a parenthesized join as well, which exposes its tables to the query around it.
-    ('SELECT COUNT(*) FROM "ORDERS", ("ORDERS" JOIN "CUSTOMERS" ON 1 = 1)',
-     'SELECT COUNT(*) FROM orders, (orders JOIN customers "CUSTOMERS" ON 1 = 1)'),
     # A table the rewrite leaves as it is, aliased all the same.
     ('SELECT "ID" FROM "OrderItems"', 'SELECT "ID" FROM "OrderItems" "OrderItems"'),
     ('SELECT orders.revenue FROM orders', 'SELECT orders.revenue FROM orders "ORDERS"'),
-    # Each table of a parenthesized join, at any depth.
-    ('SELECT 1 FROM (("ORDERS" JOIN "CUSTOMERS" ON 1 = 1) JOIN "ITEMS" ON 1 = 1)',
-     'SELECT 1 FROM ((orders "ORDERS" JOIN customers "CUSTOMERS" ON 1 = 1) JOIN items "ITEMS" ON 1 = 1)'),
-    # A sample, which the alias follows; a column named by schema and table, which an alias would hide, leaves that
-    # table alone unaliased.
+    # A table in parentheses, alone, and one with a sample, which the alias follows.
+    ('SELECT 1 FROM ("ORDERS")', 'SELECT 1 FROM (orders "ORDERS")'),
     ('SELECT * FROM "ORDERS" SAMPLE (10)', 'SELECT * FROM orders SAMPLE (10) "ORDERS"'),
-    ('SELECT "SHOP"."ORDERS"."ID" FROM "SHOP"."ORDERS"', 'SELECT "SHOP"."ORDERS"."ID" FROM shop.orders'),
-    ('SELECT COUNT(*) FROM "SHOP"."ORDERS", "SHOP" WHERE "SHOP"."ORDERS"."ID" > 0',
-     'SELECT COUNT(*) FROM shop.orders, shop WHERE "SHOP"."ORDERS"."ID" > 0'),
-    ('SELECT "SHOP"."ORDERS"."ID" FROM "SHOP"."ORDERS" WHERE "SHOP"."ORDERS"."ID" IN '
-     '(SELECT "RETURNS"."ORDER_ID" FROM "RETURNS")',
-     'SELECT "SHOP"."ORDERS"."ID" FROM shop.orders WHERE "SHOP"."ORDERS"."ID" IN '
-     '(SELECT "RETURNS"."ORDER_ID" FROM returns "RETURNS")'),
 ])
 def test_only_an_unaliased_table_of_its_own_name_is_aliased(superset_oracle, decided, sent):
     assert for_superset(decided) == sent
@@ -742,7 +776,7 @@ def test_the_adapter_sends_each_statement_in_supersets_spelling(superset_oracle)
 
 
 @pytest.mark.parametrize("sql", [
-    "SELECT '@' FROM \"ORDERS\"", 'SELECT 1 FROM ("ORDERS" JOIN "CUSTOMERS" ON "CUSTOMERS"."NOTE" = \'@x\')',
+    "SELECT '@' FROM \"ORDERS\"", 'SELECT 1 FROM "ORDERS" JOIN "CUSTOMERS" ON "CUSTOMERS"."NOTE" = \'@x\'',
     'SELECT "ID" FROM "ORDERS" /* by a@b */', 'SELECT "ID" FROM "ORDERS" "O" -- see x@y',
     'SELECT "ID" FROM "ORDERS" "A@B"', 'SELECT "A@B" FROM "ORDERS"', 'SELECT "ID" AS "A@B" FROM "ORDERS"'])
 def test_an_at_sign_outside_a_tables_name_is_no_link(superset_oracle, sql):

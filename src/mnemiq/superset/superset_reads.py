@@ -1,5 +1,5 @@
-"""The tables Superset reads in a statement mnemiq sends it, found as Superset finds them, so `names.for_superset` sends a
-statement only when Superset reads the same tables in it as mnemiq does.
+"""The tables Superset reads in a statement mnemiq sends it, found as Superset finds them, so `names.for_superset`
+sends a statement only when Superset reads the same tables in it as mnemiq does.
 
 A copy of Superset 7.0.0rc2's own table extraction (`superset/sql/parse.py`), the one its access check
 (`extract_tables_from_statement`, through `_find_table_sources`) and its row rules (`SQLStatement.apply_rls`) share:
@@ -11,8 +11,8 @@ queries among the SQL literals of mnemiq's source and tests, as `for_superset` s
 statement is among the tables rc2's own extraction reads and is one rc2's `apply_rls` applies a row rule to. Where the
 two versions read a statement apart, the reading here is not rc2's. They are known to on a partition or subpartition
 clause, on a flashback clause (AS OF), on the sources a scope lists for a pivoted or unpivoted reference, and on
-Oracle's q-quoted literals: `names` refuses a statement with any of the first three (`_CONFIRMED_ARGS`), and rc2's
-sqlglot does not parse the last, so Superset refuses those itself. A change of either version is to be checked again.
+Oracle's q-quoted literals: `names` refuses a statement with any of them (`_CONFIRMED_ARGS`, `_refusal`). A change of
+either version is to be checked again.
 Not modelled: rc2's access check reads a SHOW or DESCRIBE statement, and one sqlglot keeps as a Command, otherwise;
 mnemiq sends none.
 """
