@@ -120,8 +120,9 @@ _LIST_OPERAND = frozenset({"IN", "NOT IN"})
 # `FilterConfig.sanitize_value`'s `max_length`.
 _MAX_OPERAND = 1000
 
-# The time grains a chart may group by, by the word the model writes: the ones the value check reproduces as one
-# Postgres `DATE_TRUNC` (`_GRAINS` in `mnemiq.superset.chart_form`), so a chart on any of them can be checked.
+# The time grains a chart may group by, by the word the model writes: the ones the value check reproduces as Superset's
+# own grain expression, on either database (`_GRAINS` in `mnemiq.superset.chart_form`), so a chart on any of them can
+# be checked.
 GRAINS = {"second": "PT1S", "minute": "PT1M", "hour": "PT1H", "day": "P1D", "week": "P1W", "month": "P1M",
           "quarter": "P3M", "year": "P1Y"}
 _GRAIN_WORD = {code: word for word, code in GRAINS.items()}

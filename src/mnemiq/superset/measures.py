@@ -200,20 +200,27 @@ def display_format(kind: MeasureKind, currency: str | None) -> tuple[str, dict |
     return fmt, None
 
 
-def measure_statement(measure: Measure | tuple[Measure, ...], source: str, dimensions: tuple[str, ...] = (),
-                      filters: tuple[str, ...] = ()) -> str:
+def measure_statement(measure: Measure | tuple[Measure, ...], source: str,
+                      dimensions: tuple[str | tuple[str, str], ...] = (), filters: tuple[str, ...] = ()) -> str:
     """The statement that computes `measure` over `source` (a quoted table name, an unparenthesized join,
     `a JOIN b ON ...`: the deciders refuse a parenthesized join as an unmodelled source, or a derived table, a dataset
-    the build made read as Superset reads a virtual one, `(<its SQL>) AS "virtual_table"`), grouped by
-    `dimensions` and narrowed by `filters`. A tuple of measures computes each, in order, after the dimensions, as a
-    chart that plots several does."""
+    the build made read as Superset reads a virtual one, `(<its SQL>) AS "virtual_table"`, with no `AS` on Oracle),
+    grouped by `dimensions` and narrowed by `filters`. A dimension is an expression, or an expression and the alias it
+    is selected under. A tuple of measures computes each, in order, after the dimensions, as a chart that plots several
+    does.
+
+    Grouped in Superset mode's dialect: by position on PostgreSQL, and on Oracle by each dimension's expression, as
+    Superset's query groups, since Oracle before 23 refuses `GROUP BY 1` and reads no select-list alias there."""
     measures = measure if isinstance(measure, tuple) else (measure,)
-    select = ", ".join([*dimensions, *(f"{m.expression} AS {m.name}" for m in measures)])
+    expressions = [item if isinstance(item, str) else item[0] for item in dimensions]
+    selected = [item if isinstance(item, str) else f"{item[0]} AS {item[1]}" for item in dimensions]
+    select = ", ".join([*selected, *(f"{m.expression} AS {m.name}" for m in measures)])
     sql = f"SELECT {select} FROM {source}"
     if filters:
         sql += " WHERE " + " AND ".join(f"({f})" for f in filters)
     if dimensions:
-        sql += " GROUP BY " + ", ".join(str(i) for i in range(1, len(dimensions) + 1))
+        grouped = expressions if superset_dialect() == "oracle" else [str(i) for i in range(1, len(dimensions) + 1)]
+        sql += " GROUP BY " + ", ".join(grouped)
     return sql
 
 
