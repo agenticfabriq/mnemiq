@@ -58,18 +58,22 @@ _T = exp.DataType.Type
 _KINDS = {_T.SMALLINT: "exact number", _T.INT: "exact number", _T.BIGINT: "exact number", _T.DECIMAL: "exact number",
           _T.TEXT: "text", _T.VARCHAR: "text", _T.CHAR: "blank-padded text", _T.BPCHAR: "blank-padded text"}
 # Oracle's types by the kind they share, as sqlglot's Oracle dialect reads them: NUMBER (its DECIMAL) with INTEGER and
-# SMALLINT, which Oracle stores as NUMBERs and compares as NUMBER, which rounds neither; VARCHAR2, NVARCHAR2 and VARCHAR,
-# compared as text without padding; and CHAR with NCHAR, compared padded with blanks. Any other type compares exactly
-# only with itself.
+# SMALLINT, which Oracle stores as NUMBERs and compares as NUMBER, which rounds neither; VARCHAR2 and VARCHAR, compared
+# as text without padding; and CHAR, compared padded with blanks. NVARCHAR2 and NCHAR, in the national character set,
+# are each a kind of their own: Oracle compares a VARCHAR2 or a CHAR with one by converting it into that set, which
+# reads every byte the database character set cannot decode as one replacement character, and in some legacy multibyte
+# sets several characters as one, so two keys held once each can equal one value. Any other type compares exactly only
+# with itself.
 _ORACLE_KINDS = {_T.SMALLINT: "exact number", _T.INT: "exact number", _T.DECIMAL: "exact number", _T.VARCHAR: "text",
-                 _T.NVARCHAR: "text", _T.CHAR: "blank-padded text", _T.NCHAR: "blank-padded text"}
+                 _T.NVARCHAR: "national text", _T.CHAR: "blank-padded text", _T.NCHAR: "national blank-padded text"}
 # Oracle's types read by the word Oracle names them with, before sqlglot reads them into a kind they are not of: those
 # Oracle refuses in a comparison, its LOBs and LONGs (LONG RAW among them), which sqlglot reads as its TEXT (CLOB) and
-# BIGINT (LONG); and its IEEE floating types, each its own type, where sqlglot reads BINARY_FLOAT as its FLOAT, which
-# is also how it reads Oracle's FLOAT, a NUMBER of binary precision, and BINARY_DOUBLE as DOUBLE PRECISION, Oracle's
-# name for FLOAT(126).
+# BIGINT (LONG); its IEEE floating types, each its own type, where sqlglot reads BINARY_FLOAT as its FLOAT, which is
+# also how it reads Oracle's FLOAT, a NUMBER of binary precision, and BINARY_DOUBLE as DOUBLE PRECISION, Oracle's name
+# for FLOAT(126); and its built-in types sqlglot does not know, which it reads as user-defined: RAW, compared byte for
+# byte, and the row ids, each its own type, its length aside.
 _ORACLE_UNCOMPARED = frozenset({"CLOB", "NCLOB", "BLOB", "BFILE", "LONG"})
-_ORACLE_BINARY_FLOATS = frozenset({"BINARY_FLOAT", "BINARY_DOUBLE"})
+_ORACLE_OWN_TYPES = frozenset({"BINARY_FLOAT", "BINARY_DOUBLE", "RAW", "ROWID", "UROWID"})
 # The kind of a type no equality compares, not even with itself.
 _UNCOMPARED = "compared by no equality"
 # The word a type's text starts with, as Oracle reads one it is not given quoted.
@@ -310,16 +314,19 @@ def _oracle_word(data_type: str) -> str | None:
 def _kind(data_type: str | None) -> tuple[str, str] | None:
     """The kind of a column of `data_type`, as the snapshot records it, read as Superset mode's dialect reads a type,
     every length and precision aside (`varchar(10)` is a varchar): its kind in the dialect's kinds (`_KINDS`,
-    `_ORACLE_KINDS`), else the type itself. On Oracle a type named by a word of `_ORACLE_UNCOMPARED` is of the kind no
-    equality compares, and one of `_ORACLE_BINARY_FLOATS` is that word's own type. None for no type, or one that names
-    none: unknown, a user-defined type of no name, or an array of elements of no type."""
+    `_ORACLE_KINDS`), else the type itself. On Oracle a type named by a word of `_ORACLE_OWN_TYPES` is that word's own
+    type, and the kind no equality compares is a type named by a word of `_ORACLE_UNCOMPARED`, and any other type
+    sqlglot reads as user-defined: an object type, Oracle's own (SDO_GEOMETRY, XMLTYPE) or the schema's, which compares
+    by rules of its own (a MAP method's value can read two objects as one), and UNDEFINED, Oracle's word for a type it
+    cannot describe. None for no type, or one that names none: unknown, a user-defined type of no name, or an array of
+    elements of no type."""
     if data_type is None or not data_type.strip():
         return None
     dialect = superset_dialect()
     if dialect == "oracle" and (word := _oracle_word(data_type)) is not None:
         if word in _ORACLE_UNCOMPARED:
             return _UNCOMPARED, word
-        if word in _ORACLE_BINARY_FLOATS:
+        if word in _ORACLE_OWN_TYPES:
             return "type", word
     try:
         built = exp.DataType.build(data_type, dialect=dialect, udt=True)
@@ -330,6 +337,8 @@ def _kind(data_type: str | None) -> tuple[str, str] | None:
     if built.this == _T.UNKNOWN or (built.this == _T.USERDEFINED and not built.args.get("kind")) \
             or (built.this in exp.DataType.NESTED_TYPES and not built.expressions):
         return None
+    if dialect == "oracle" and built.this == _T.USERDEFINED:
+        return _UNCOMPARED, data_type.strip()
     kinds = _ORACLE_KINDS if dialect == "oracle" else _KINDS
     if built.this in kinds and not built.expressions:
         return "kind", kinds[built.this]
@@ -341,10 +350,11 @@ def comparable(left_type: str | None, right_type: str | None) -> bool:
     no two values of either as one: both an integer or an exact numeric (smallint, integer, bigint, numeric), both text
     or varchar, or both of one other type (char with char, a double precision with a double precision, a timestamp
     with a timestamp of the same time zone kind), each read as Superset mode's dialect reads a type, its length and
-    precision aside. On Oracle: both a NUMBER (INTEGER and SMALLINT among them), both a VARCHAR2, NVARCHAR2 or VARCHAR,
-    both a CHAR or NCHAR, or both of one other type (BINARY_FLOAT, BINARY_DOUBLE and FLOAT each its own; DATE; a
-    TIMESTAMP with a TIMESTAMP of the same time zone kind). False where either has no type, or one that names none, and
-    for a type no equality compares (Oracle's LOBs and LONGs), whatever the other."""
+    precision aside. On Oracle: both a NUMBER (INTEGER and SMALLINT among them), both a VARCHAR2 or VARCHAR, both an
+    NVARCHAR2, both a CHAR, both an NCHAR, or both of one other type (BINARY_FLOAT, BINARY_DOUBLE and FLOAT each its
+    own; DATE; a TIMESTAMP with a TIMESTAMP of the same time zone kind; RAW, ROWID and UROWID each its own). False
+    where either has no type, or one that names none, and for a type no equality compares (Oracle's LOBs and LONGs, its
+    object types and UNDEFINED), whatever the other."""
     kind = _kind(left_type)
     return kind is not None and kind[0] != _UNCOMPARED and kind == _kind(right_type)
 
@@ -356,14 +366,20 @@ def _typed(column: tuple[str, str], data_type: str | None) -> str:
 
 def mistyped(link: Link, types: Types) -> str | None:
     """Why `link` is never joined by, its columns' types (`types`) not comparing exactly (`comparable`): said with both
-    columns and both types, for the repair. None where they compare exactly."""
+    columns and both types, and which of the types no equality compares, for the repair. None where they compare
+    exactly."""
     left, right = types.get(link.left), types.get(link.right)
     if comparable(left, right):
         return None
     said = (f"{_typed(link.left, left)} and {_typed(link.right, right)}: a link joins columns whose values compare "
             "exactly")
-    if _kind(left) is None or _kind(right) is None:
+    kinds = (_kind(left), _kind(right))
+    if None in kinds:
         said += ", which mnemiq cannot tell without both columns' types"
+    elif never := list(dict.fromkeys(text.strip() for text, kind in zip((left, right), kinds)
+                                     if kind[0] == _UNCOMPARED)):
+        said += (f", and a column of type {' or '.join(never)} cannot be compared exactly, not even with one of its own "
+                 "type")
     return said
 
 
