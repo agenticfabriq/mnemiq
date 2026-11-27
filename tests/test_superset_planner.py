@@ -1080,8 +1080,8 @@ def _identifier_catalogue(columns: dict[str, frozenset[str]]):
 @pytest.mark.parametrize(("dialect", "limit"), [("postgres", 63), ("oracle", 128)])
 def test_max_identifier_follows_the_dialect(request, dialect, limit):
     """A made dataset's column is named in the database, which keeps at most 63 bytes of a name on PostgreSQL
-    (`NAMEDATALEN` - 1) and 128 on Oracle (12.2 and later): a column whose name takes as many is made, and one a byte
-    longer is refused, naming the limit of the dialect it is read in."""
+    (`NAMEDATALEN` - 1) and 128 on Oracle (where the database's COMPATIBLE is 12.2 or later): a column whose name takes
+    as many is made, and one a byte longer is refused, naming the limit of the dialect it is read in."""
     from mnemiq.superset.planner import PlannedDataset, _joined, max_identifier
 
     if dialect == "oracle":

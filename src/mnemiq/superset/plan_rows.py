@@ -64,18 +64,28 @@ _KINDS = {_T.SMALLINT: "exact number", _T.INT: "exact number", _T.BIGINT: "exact
 # (GEOMETRY, TEXT, UUID, DATETIME), CLOB for its TEXT and LONG for its BIGINT, and BINARY_FLOAT and Oracle's FLOAT, a
 # NUMBER of binary precision, for one FLOAT. Any other text is no type Oracle records as a built-in: an object type,
 # Oracle's own (SDO_GEOMETRY, XMLTYPE) or the schema's, of whatever name, which compares by rules of its own (a MAP
-# method's value can read two objects as one), or UNDEFINED, Oracle's word for a type it cannot describe.
-_ORACLE_LENGTH = r"(?:\s*\([\w\s,*]*\))?"
-_ORACLE_PRECISION = r"(?:\s*\(\s*\d+\s*\))?"
+# method's value can read two objects as one), or UNDEFINED, Oracle's word for a type it cannot describe; and so is a
+# built-in's name with arguments not of its family. Names and words are read in ASCII, in any case, as Oracle reads a
+# type it is not given quoted, and a type's arguments by its family, in the digits 0 to 9: a NUMBER's, a DECIMAL's or a
+# NUMERIC's precision, or `*`, and an optional scale, which may be signed (NUMBER(10,-2) rounds to hundreds); a
+# character type's length, in bytes or characters; a FLOAT's binary precision, a RAW's and a UROWID's size, and a
+# TIMESTAMP's or an INTERVAL's precisions, each one number. A type of no family takes none.
+_ORACLE_NUMERIC_ARGUMENTS = r"(?:\s*\(\s*(?:[0-9]+|\*)(?:\s*,\s*[+-]?[0-9]+)?\s*\))?"
+_ORACLE_CHARACTER_LENGTH = r"(?:\s*\(\s*[0-9]+(?:\s*(?:BYTE|CHAR))?\s*\))?"
+_ORACLE_PRECISION = r"(?:\s*\(\s*[0-9]+\s*\))?"
 _ORACLE_BUILT_IN = re.compile(
-    rf"\s*(?:(?P<sized>NUMBER|FLOAT|DECIMAL|NUMERIC|VARCHAR2|VARCHAR|NVARCHAR2|CHAR|NCHAR|RAW|UROWID|VECTOR)"
-    rf"{_ORACLE_LENGTH}"
+    rf"\s*(?:(?P<numeric>NUMBER|DECIMAL|NUMERIC){_ORACLE_NUMERIC_ARGUMENTS}"
+    rf"|(?P<character>VARCHAR2|VARCHAR|NVARCHAR2|CHAR|NCHAR){_ORACLE_CHARACTER_LENGTH}"
+    rf"|(?P<sized>FLOAT|RAW|UROWID){_ORACLE_PRECISION}"
     r"|(?P<long>LONG(?:\s+RAW)?)"
-    r"|(?P<plain>INTEGER|INT|SMALLINT|BINARY_FLOAT|BINARY_DOUBLE|DATE|ROWID|CLOB|NCLOB|BLOB|BFILE|JSON|BOOLEAN)"
+    r"|(?P<plain>INTEGER|INT|SMALLINT|BINARY_FLOAT|BINARY_DOUBLE|DATE|ROWID|CLOB|NCLOB|BLOB|BFILE|JSON|VECTOR"
+    r"|BOOLEAN)"
     rf"|(?P<timestamp>TIMESTAMP){_ORACLE_PRECISION}(?P<zone>\s+WITH(?:\s+LOCAL)?\s+TIME\s+ZONE)?"
     rf"|INTERVAL\s+(?:(?P<year>YEAR){_ORACLE_PRECISION}\s+TO\s+MONTH"
     rf"|(?P<day>DAY){_ORACLE_PRECISION}\s+TO\s+SECOND{_ORACLE_PRECISION}))\s*",
-    re.IGNORECASE)
+    re.IGNORECASE | re.ASCII)
+# The text the direct Oracle adapter records for a column whose DATA_TYPE is NULL: no recorded type.
+_ORACLE_NO_TYPE = "UNKNOWN"
 # Oracle's built-in types by the kind they share: NUMBER with INTEGER, INT, SMALLINT, DECIMAL and NUMERIC, which Oracle
 # stores as NUMBERs and compares as NUMBER, which rounds neither; VARCHAR2 and VARCHAR, compared as text without
 # padding; and CHAR, compared padded with blanks. NVARCHAR2 and NCHAR, in the national character set, are each a kind
@@ -330,7 +340,8 @@ def _oracle_kind(data_type: str) -> tuple[str, str]:
         return "type", " ".join(["TIMESTAMP", *(match["zone"] or "").upper().split()])
     if match["year"] or match["day"]:
         return "type", "INTERVAL YEAR TO MONTH" if match["year"] else "INTERVAL DAY TO SECOND"
-    name = " ".join((match["sized"] or match["long"] or match["plain"]).upper().split())
+    name = " ".join((match["numeric"] or match["character"] or match["sized"] or match["long"]
+                     or match["plain"]).upper().split())
     if name in _ORACLE_UNCOMPARED:
         return _UNCOMPARED, name
     if name in _ORACLE_KINDS:
@@ -342,13 +353,13 @@ def _kind(data_type: str | None) -> tuple[str, str] | None:
     """The kind of a column of `data_type`, as the snapshot records it, read as Superset mode's dialect reads a type,
     every length and precision aside (`varchar(10)` is a varchar): its kind in the dialect's kinds (`_KINDS`), else the
     type itself; on Oracle, as Oracle's data dictionary records a built-in type (`_oracle_kind`), the kind no equality
-    compares for any other text. None for no type, or one that names none: unknown, a user-defined type of no name, or
-    an array of elements of no type."""
+    compares for any other text. None for no type, or one that names none: unknown (on Oracle, the direct adapter's
+    `unknown` in any case), a user-defined type of no name, or an array of elements of no type."""
     if data_type is None or not data_type.strip():
         return None
     dialect = superset_dialect()
     if dialect == "oracle":
-        return _oracle_kind(data_type)
+        return None if data_type.strip().upper() == _ORACLE_NO_TYPE else _oracle_kind(data_type)
     try:
         built = exp.DataType.build(data_type, dialect=dialect, udt=True)
     except (SqlglotError, ValueError):
