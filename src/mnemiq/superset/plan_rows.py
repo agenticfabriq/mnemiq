@@ -30,6 +30,7 @@ wrote it.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 
@@ -56,6 +57,52 @@ _T = exp.DataType.Type
 # other type compares exactly only with itself.
 _KINDS = {_T.SMALLINT: "exact number", _T.INT: "exact number", _T.BIGINT: "exact number", _T.DECIMAL: "exact number",
           _T.TEXT: "text", _T.VARCHAR: "text", _T.CHAR: "blank-padded text", _T.BPCHAR: "blank-padded text"}
+# Oracle's built-in types, read from the text its data dictionary records for a column of one
+# (`ALL_TAB_COLUMNS.DATA_TYPE`, with a length or a precision where one is given), and the spellings a column is
+# declared with that Oracle stores as a NUMBER, each by its leading words in any case, as Oracle reads a word it is not
+# given quoted: never by sqlglot's reading, which takes a name Oracle has no type of for one of its own built-ins
+# (GEOMETRY, TEXT, UUID, DATETIME), CLOB for its TEXT and LONG for its BIGINT, and BINARY_FLOAT and Oracle's FLOAT, a
+# NUMBER of binary precision, for one FLOAT. Any other text is no type Oracle records as a built-in: an object type,
+# Oracle's own (SDO_GEOMETRY, XMLTYPE) or the schema's, of whatever name, which compares by rules of its own (a MAP
+# method's value can read two objects as one), or UNDEFINED, Oracle's word for a type it cannot describe; and so is a
+# built-in's name with arguments not of its family. Names and words are read in ASCII, in any case, as Oracle reads a
+# type it is not given quoted, and a type's arguments by its family, in the digits 0 to 9: a NUMBER's, a DECIMAL's or a
+# NUMERIC's precision, or `*`, and an optional scale, which may be signed (NUMBER(10,-2) rounds to hundreds); a
+# character type's length, in bytes or characters; a FLOAT's binary precision, a RAW's and a UROWID's size, and a
+# TIMESTAMP's or an INTERVAL's precisions, each one number. A type of no family takes none.
+_ORACLE_NUMERIC_ARGUMENTS = r"(?:\s*\(\s*(?:[0-9]+|\*)(?:\s*,\s*[+-]?[0-9]+)?\s*\))?"
+_ORACLE_CHARACTER_LENGTH = r"(?:\s*\(\s*[0-9]+(?:\s*(?:BYTE|CHAR))?\s*\))?"
+_ORACLE_PRECISION = r"(?:\s*\(\s*[0-9]+\s*\))?"
+_ORACLE_BUILT_IN = re.compile(
+    rf"\s*(?:(?P<numeric>NUMBER|DECIMAL|NUMERIC){_ORACLE_NUMERIC_ARGUMENTS}"
+    rf"|(?P<character>VARCHAR2|VARCHAR|NVARCHAR2|CHAR|NCHAR){_ORACLE_CHARACTER_LENGTH}"
+    rf"|(?P<sized>FLOAT|RAW|UROWID){_ORACLE_PRECISION}"
+    r"|(?P<long>LONG(?:\s+RAW)?)"
+    r"|(?P<plain>INTEGER|INT|SMALLINT|BINARY_FLOAT|BINARY_DOUBLE|DATE|ROWID|CLOB|NCLOB|BLOB|BFILE|JSON|VECTOR"
+    r"|BOOLEAN)"
+    rf"|(?P<timestamp>TIMESTAMP){_ORACLE_PRECISION}(?P<zone>\s+WITH(?:\s+LOCAL)?\s+TIME\s+ZONE)?"
+    rf"|INTERVAL\s+(?:(?P<year>YEAR){_ORACLE_PRECISION}\s+TO\s+MONTH"
+    rf"|(?P<day>DAY){_ORACLE_PRECISION}\s+TO\s+SECOND{_ORACLE_PRECISION}))\s*",
+    re.IGNORECASE | re.ASCII)
+# The text the direct Oracle adapter records for a column whose DATA_TYPE is NULL: no recorded type.
+_ORACLE_NO_TYPE = "UNKNOWN"
+# Oracle's built-in types by the kind they share: NUMBER with INTEGER, INT, SMALLINT, DECIMAL and NUMERIC, which Oracle
+# stores as NUMBERs and compares as NUMBER, which rounds neither; VARCHAR2 and VARCHAR, compared as text without
+# padding; and CHAR, compared padded with blanks. NVARCHAR2 and NCHAR, in the national character set, are each a kind
+# of their own: Oracle compares a VARCHAR2 or a CHAR with one by converting it into that set, which reads every byte
+# the database character set cannot decode as one replacement character, and in some legacy multibyte sets several
+# characters as one, so two keys held once each can equal one value. Any other built-in type compares exactly only
+# with itself, its length aside: FLOAT, BINARY_FLOAT and BINARY_DOUBLE each its own, DATE, a TIMESTAMP with a
+# TIMESTAMP of the same time zone kind, each kind of INTERVAL, RAW, compared byte for byte, and the row ids.
+_ORACLE_KINDS = {"NUMBER": "exact number", "INTEGER": "exact number", "INT": "exact number",
+                 "SMALLINT": "exact number", "DECIMAL": "exact number", "NUMERIC": "exact number",
+                 "VARCHAR2": "text", "VARCHAR": "text", "NVARCHAR2": "national text", "CHAR": "blank-padded text",
+                 "NCHAR": "national blank-padded text"}
+# Oracle's built-in types it refuses in a comparison: its LOBs and LONGs (LONG RAW among them), JSON, VECTOR and
+# BOOLEAN.
+_ORACLE_UNCOMPARED = frozenset({"CLOB", "NCLOB", "BLOB", "BFILE", "LONG", "LONG RAW", "JSON", "VECTOR", "BOOLEAN"})
+# The kind of a type no equality compares, not even with itself.
+_UNCOMPARED = "compared by no equality"
 
 
 @dataclass(frozen=True)
@@ -282,14 +329,39 @@ def far_side(table: str, columns: Sequence[str], unique: Unique) -> bool | None:
     return None
 
 
+def _oracle_kind(data_type: str) -> tuple[str, str]:
+    """The kind of a column of `data_type` on Oracle, read from the type text's leading words (`_ORACLE_BUILT_IN`),
+    every length and precision aside: its kind in `_ORACLE_KINDS`, else its own type; and the kind no equality compares
+    for one of `_ORACLE_UNCOMPARED`, and for any text Oracle records as no built-in, which is said as written."""
+    match = _ORACLE_BUILT_IN.fullmatch(data_type)
+    if match is None:
+        return _UNCOMPARED, data_type.strip()
+    if match["timestamp"]:
+        return "type", " ".join(["TIMESTAMP", *(match["zone"] or "").upper().split()])
+    if match["year"] or match["day"]:
+        return "type", "INTERVAL YEAR TO MONTH" if match["year"] else "INTERVAL DAY TO SECOND"
+    name = " ".join((match["numeric"] or match["character"] or match["sized"] or match["long"]
+                     or match["plain"]).upper().split())
+    if name in _ORACLE_UNCOMPARED:
+        return _UNCOMPARED, name
+    if name in _ORACLE_KINDS:
+        return "kind", _ORACLE_KINDS[name]
+    return "type", name
+
+
 def _kind(data_type: str | None) -> tuple[str, str] | None:
     """The kind of a column of `data_type`, as the snapshot records it, read as Superset mode's dialect reads a type,
-    every length and precision aside (`varchar(10)` is a varchar): its kind in `_KINDS`, else the type itself. None for
-    no type, or one that names none: unknown, a user-defined type of no name, or an array of elements of no type."""
+    every length and precision aside (`varchar(10)` is a varchar): its kind in the dialect's kinds (`_KINDS`), else the
+    type itself; on Oracle, as Oracle's data dictionary records a built-in type (`_oracle_kind`), the kind no equality
+    compares for any other text. None for no type, or one that names none: unknown (on Oracle, the direct adapter's
+    `unknown` in any case), a user-defined type of no name, or an array of elements of no type."""
     if data_type is None or not data_type.strip():
         return None
+    dialect = superset_dialect()
+    if dialect == "oracle":
+        return None if data_type.strip().upper() == _ORACLE_NO_TYPE else _oracle_kind(data_type)
     try:
-        built = exp.DataType.build(data_type, dialect=superset_dialect(), udt=True)
+        built = exp.DataType.build(data_type, dialect=dialect, udt=True)
     except (SqlglotError, ValueError):
         return None
     for argument in list(built.find_all(exp.DataTypeParam)):
@@ -299,7 +371,7 @@ def _kind(data_type: str | None) -> tuple[str, str] | None:
         return None
     if built.this in _KINDS and not built.expressions:
         return "kind", _KINDS[built.this]
-    return "type", built.sql(dialect=superset_dialect())
+    return "type", built.sql(dialect=dialect)
 
 
 def comparable(left_type: str | None, right_type: str | None) -> bool:
@@ -307,9 +379,14 @@ def comparable(left_type: str | None, right_type: str | None) -> bool:
     no two values of either as one: both an integer or an exact numeric (smallint, integer, bigint, numeric), both text
     or varchar, or both of one other type (char with char, a double precision with a double precision, a timestamp
     with a timestamp of the same time zone kind), each read as Superset mode's dialect reads a type, its length and
-    precision aside. False where either has no type, or one that names none."""
+    precision aside. On Oracle: both a NUMBER (INTEGER, INT, SMALLINT, DECIMAL and NUMERIC among them), both a VARCHAR2
+    or VARCHAR, both an NVARCHAR2, both a CHAR, both an NCHAR, or both of one other built-in type (BINARY_FLOAT,
+    BINARY_DOUBLE and FLOAT each its own; DATE; a TIMESTAMP with a TIMESTAMP of the same time zone kind; each kind of
+    INTERVAL; RAW, ROWID and UROWID each its own). False where either has no type, or one that names none, and for a
+    type no equality compares (Oracle's LOBs, LONGs, JSON, VECTOR and BOOLEAN, and any type its data dictionary records
+    as no built-in: its object types and UNDEFINED), whatever the other."""
     kind = _kind(left_type)
-    return kind is not None and kind == _kind(right_type)
+    return kind is not None and kind[0] != _UNCOMPARED and kind == _kind(right_type)
 
 
 def _typed(column: tuple[str, str], data_type: str | None) -> str:
@@ -319,14 +396,20 @@ def _typed(column: tuple[str, str], data_type: str | None) -> str:
 
 def mistyped(link: Link, types: Types) -> str | None:
     """Why `link` is never joined by, its columns' types (`types`) not comparing exactly (`comparable`): said with both
-    columns and both types, for the repair. None where they compare exactly."""
+    columns and both types, and which of the types no equality compares, for the repair. None where they compare
+    exactly."""
     left, right = types.get(link.left), types.get(link.right)
     if comparable(left, right):
         return None
     said = (f"{_typed(link.left, left)} and {_typed(link.right, right)}: a link joins columns whose values compare "
             "exactly")
-    if _kind(left) is None or _kind(right) is None:
+    kinds = (_kind(left), _kind(right))
+    if None in kinds:
         said += ", which mnemiq cannot tell without both columns' types"
+    elif never := list(dict.fromkeys(text.strip() for text, kind in zip((left, right), kinds)
+                                     if kind[0] == _UNCOMPARED)):
+        said += (f", and a column of type {' or '.join(never)} cannot be compared exactly, not even with one of its own "
+                 "type")
     return said
 
 

@@ -31,9 +31,9 @@ SQL is still the SQL the build made it with and on which no row rule applies to 
 the virtual dataset alone applies to queries of that dataset, not to SQL over its tables. Whether one applies is the
 extension's `row_rules`, which asks Superset as the builder and answers only whether; when one does, or mnemiq cannot
 tell, mnemiq's statement is not run. Such a made dataset is read as Superset reads a virtual one,
-`FROM (<its SQL>) AS "virtual_table"`. Any other virtual dataset's saved metric is checked through `query_dataset`
-(`superset/mcp_service/dataset/tool/query_dataset.py`), which takes saved metric names only, and a measure written on
-the chart is not checked.
+`FROM (<its SQL>) AS "virtual_table"`, and on Oracle `FROM (<its SQL>) virtual_table` (`_virtual_source`). Any other
+virtual dataset's saved metric is checked through `query_dataset` (`superset/mcp_service/dataset/tool/query_dataset.py`),
+which takes saved metric names only, and a measure written on the chart is not checked.
 
 What the chart's query computes is read from its `form_data` by `chart_form.py`; this module reads Superset, runs
 mnemiq's own statement and compares.
@@ -61,7 +61,6 @@ from mnemiq.superset.adapter import JINJA_DELIMITERS
 from mnemiq.superset.chart_form import (
     _COMPARISONS,
     _X_AXIS,
-    _GRAINS,
     _LISTS,
     _NO_VALUE,
     _PATTERNS,
@@ -73,6 +72,7 @@ from mnemiq.superset.chart_form import (
     _quoted,
     _row_limit,
     expectation_from_form_data,
+    grain_expressions,
     ranking_of,
 )
 from mnemiq.superset.charts import Filter
@@ -136,8 +136,8 @@ _NO_GRAIN = ("Superset's data tool returned this chart's rows without its time g
 # The suffix of each `GROUPING()` marker column a grouping-sets query adds (`GROUPING_MARKER_SUFFIX` in
 # `superset/common/grouping_sets.py`), one per grouping column, marking the level each row groups by.
 _GROUPING_MARKER = "__superset_grouping"
-# Where Postgres's `DATE_TRUNC` for each grain mnemiq reproduces puts a time (`_GRAINS`): which of its fields are zero
-# or first. `DATE_TRUNC('week', ...)` gives a Monday.
+# Where Superset's expression for each grain mnemiq reproduces puts a time (`chart_form._GRAINS`), on PostgreSQL: which
+# of its fields are zero or first. `DATE_TRUNC('week', ...)` gives a Monday.
 _ON_GRAIN = {
     "PT1S": lambda t: t.microsecond == 0,
     "PT1M": lambda t: (t.second, t.microsecond) == (0, 0),
@@ -147,6 +147,12 @@ _ON_GRAIN = {
     "P1M": lambda t: t.time() == time(0) and t.day == 1,
     "P3M": lambda t: t.time() == time(0) and t.day == 1 and t.month in (1, 4, 7, 10),
     "P1Y": lambda t: t.time() == time(0) and (t.month, t.day) == (1, 1),
+}
+# On Oracle (`chart_form._ORACLE_GRAINS`), where PostgreSQL's put one, but for a week: `TRUNC(..., 'WW')` gives the
+# weekday 1 January of the time's year fell on, a whole number of weeks after that day, so the last week of a year of
+# 365 days starts on 31 December.
+_ORACLE_ON_GRAIN = _ON_GRAIN | {
+    "P1W": lambda t: t.time() == time(0) and (t.date() - date(t.year, 1, 1)).days % 7 == 0,
 }
 
 
@@ -307,10 +313,11 @@ def _canonical(value):
 
 
 def _on_the_grain(value, grain: str) -> bool:
-    """Whether a time Superset answered sits where Postgres's `DATE_TRUNC` for `grain` puts one, read as spelled: its
-    wall clock, whatever offset it carries, since the database truncates in its own time zone. A null is a null
-    group's key. Anything that is not a time is not on a grain, and no time is on a grain mnemiq does not know."""
-    on_grain = _ON_GRAIN.get(grain)
+    """Whether a time Superset answered sits where Superset's expression for `grain` puts one on Superset mode's
+    database (`_ON_GRAIN`, `_ORACLE_ON_GRAIN`), read as spelled: its wall clock, whatever offset it carries, since the
+    database truncates in its own time zone. A null is a null group's key. Anything that is not a time is not on a
+    grain, and no time is on a grain mnemiq does not know."""
+    on_grain = (_ORACLE_ON_GRAIN if superset_dialect() == "oracle" else _ON_GRAIN).get(grain)
     if on_grain is None:
         return False
     if value is None:
@@ -397,11 +404,33 @@ def _chart_rows(client, chart_id: int, expectation: Expectation) -> _Rows | Char
 
 
 def _literal(value) -> str:
+    """A filter's value as SQL in Superset mode's dialect, as Superset's query holds it: rc2 compiles a chart's query
+    with its values in place (`compile_sqla_query` in `superset/models/core.py`), so a text is a text literal and a
+    number a number on either database. Oracle before 23 has no TRUE or FALSE, and SQLAlchemy's Oracle dialect renders
+    one as 1 or 0, as mnemiq does there. On Oracle a date or a time is its DATE or TIMESTAMP literal, which reads the
+    same whatever the session's date format, and a time with a zone raises ValueError: mnemiq writes none."""
+    oracle = superset_dialect() == "oracle"
     if isinstance(value, bool):
+        if oracle:
+            return "1" if value else "0"
         return "TRUE" if value else "FALSE"
+    if oracle and isinstance(value, datetime):
+        if value.tzinfo is not None:
+            raise ValueError("mnemiq writes no time with a zone as an Oracle literal")
+        return f"TIMESTAMP '{value.isoformat(sep=' ')}'"
+    if oracle and isinstance(value, date):
+        return f"DATE '{value.isoformat()}'"
     if isinstance(value, (int, float)):
         return exp.Literal.number(value).sql(dialect=superset_dialect())
     return exp.Literal.string(str(value)).sql(dialect=superset_dialect())
+
+
+# Oracle has no ILIKE: SQLAlchemy's Oracle dialect, which compiles Superset's query, writes its `ilike` and `not_ilike`
+# as `lower(<column>) LIKE lower(<pattern>)` and `lower(<column>) NOT LIKE lower(<pattern>)`, LOWER on both sides.
+_ORACLE_ILIKE = {"ILIKE": "LIKE", "NOT ILIKE": "NOT LIKE"}
+# The filters Superset writes as `IS` a true or false (`handle_boolean_filter` in `superset/db_engine_specs/base.py`),
+# and the value SQLAlchemy's Oracle dialect renders for each there.
+_TRUE_OR_FALSE = {"IS TRUE": 1, "IS FALSE": 0}
 
 
 def _filter_sql(item: Filter) -> str:
@@ -411,31 +440,58 @@ def _filter_sql(item: Filter) -> str:
     if item.op in _LISTS:
         listed = f"{column} IN ({', '.join(_literal(v) for v in item.value)})"
         return f"NOT {listed}" if item.op == "NOT IN" else listed
+    if item.op in _ORACLE_ILIKE and superset_dialect() == "oracle":
+        return f"LOWER({column}) {_ORACLE_ILIKE[item.op]} LOWER({_literal(item.value)})"
     operator = _COMPARISONS.get(item.op) or _PATTERNS[item.op]
     return f"{column} {operator} {_literal(item.value)}"
 
 
+def _unwritten(expectation: Expectation) -> str | None:
+    """Why mnemiq does not write its statement for the chart in Superset mode's dialect, or None. On Oracle, a filter
+    `IS TRUE` or `IS FALSE`, which Superset writes there as `IS 1` or `IS 0`: a test Oracle refuses, and mnemiq writes
+    no `IS TRUE` there."""
+    if superset_dialect() != "oracle":
+        return None
+    for item in expectation.filters:
+        if item.op in _TRUE_OR_FALSE:
+            return (f"the chart's filter on {item.column!r} is {item.op}, which Superset writes on Oracle as "
+                    f"IS {_TRUE_OR_FALSE[item.op]}, a test Oracle refuses, so mnemiq does not write it")
+    return None
+
+
+def _virtual_source(sql: str) -> str:
+    """A dataset this build made, read as Superset reads a virtual dataset: its SQL as a subquery aliased
+    `virtual_table`, quoted after `AS` on PostgreSQL, as SQLAlchemy's PostgreSQL dialect writes it. Oracle refuses `AS`
+    before a table's alias, and SQLAlchemy's Oracle dialect writes a lower-case name unquoted, which Oracle reads as
+    VIRTUAL_TABLE: so there the alias follows bare."""
+    alias = "virtual_table" if superset_dialect() == "oracle" else 'AS "virtual_table"'
+    return f"({sql}) {alias}"
+
+
 def _statement(expectation: Expectation, dataset: DatasetFacts, *, grained: bool, source: str | None = None,
                ranking: Ranking | None = None, limit: int | None = None) -> str:
-    """mnemiq's statement for the chart's query, through `measure_statement`: each metric aliased by position, the
-    x-axis grouped by the grain when `grained`, as Postgres's grain expression writes it. It reads `source` when given
-    (a made dataset's SQL as Superset reads a virtual one), else the dataset's table. Under the chart's `ranking` its
-    groups come in that order, NULL last as `_ranking_problem` ranks it, so the deciders' row cap, or `limit`, keeps the
-    groups that decide the chart's cut."""
+    """mnemiq's statement for the chart's query, in Superset mode's dialect, through `measure_statement`: each metric
+    aliased by position, the x-axis grouped by the grain when `grained`, as Superset's grain expression for its database
+    writes it (`grain_expressions`), under the column's own name. It reads `source` when given (a made dataset's SQL as
+    Superset reads a virtual one, `_virtual_source`), else the dataset's table. Under the chart's `ranking` its groups
+    come in that order, NULL last as `_ranking_problem` ranks it, so the deciders' row cap, or `limit`, keeps the groups
+    that decide the chart's cut: a LIMIT on PostgreSQL, Oracle's `FETCH FIRST n ROWS ONLY`."""
     saved = dict(dataset.saved_metric_sql)
     measures = tuple(Measure(name=f"m{i}", label=label,
                              expression=saved[label] if label in dataset.saved_metric_names else expression,
                              kind=MeasureKind.NUMBER, dataset_id=dataset.dataset_id, description="", asked_by="")
                      for i, (label, expression) in enumerate(expectation.metrics))
-    columns = [_quoted(name) for name in expectation.dimensions]
+    columns: list[str | tuple[str, str]] = [_quoted(name) for name in expectation.dimensions]
     if grained and expectation.time_grain:
-        columns[0] = f"DATE_TRUNC('{_GRAINS[expectation.time_grain]}', {columns[0]}) AS {columns[0]}"
+        axis = _quoted(expectation.dimensions[0])
+        columns[0] = (grain_expressions()[expectation.time_grain].format(col=axis), axis)
     sql = measure_statement(measures, source or _quoted(dataset.table), tuple(columns),
                             tuple(_filter_sql(item) for item in expectation.filters))
     if ranking is not None:
         sql += f" ORDER BY m{ranking.metric_index} {'DESC' if ranking.descending else 'ASC'} NULLS LAST"
         if limit is not None:
-            sql += f" LIMIT {int(limit)}"
+            oracle = superset_dialect() == "oracle"
+            sql += f" FETCH FIRST {int(limit)} ROWS ONLY" if oracle else f" LIMIT {int(limit)}"
     return sql
 
 
@@ -871,7 +927,7 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
             return not_checked(_RULES_UNKNOWN)
         if applies:
             return not_checked(_RULE_APPLIES)
-        source = f'({dataset.sql}) AS "virtual_table"'
+        source = _virtual_source(dataset.sql)
     own = source is not None or not dataset.is_virtual
     if not own:
         written = [label for label, _ in expectation.metrics if label not in dataset.saved_metric_names]
@@ -894,6 +950,8 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
         saved = dict(dataset.saved_metric_sql)
         if empty := [label for label, _ in expectation.metrics if label in saved and not saved[label].strip()]:
             return not_checked(f"Superset gave no expression for the saved metric {empty[0]!r}")
+        if (unwritten := _unwritten(expectation)) is not None:
+            return not_checked(unwritten)
         sql = _statement(expectation, dataset, grained=True, source=source, ranking=ranking)
         # Checked on the statement itself, so a saved metric's own expression is covered too: `execute_sql` renders a
         # statement as a template, and the adapter would refuse it later in words about the statement, not the chart.

@@ -94,7 +94,7 @@ from mnemiq.superset.settings import superset_dialect
 __all__ = ["COUNT_METRIC", "FILTER_OPERATORS", "GRAINS", "PLANNER_MAX_TOKENS", "PLAN_JSON_SHAPE", "SCALAR",
            "BuildPlan", "FakePlanner",
            "LLMPlanner", "PlanColumn", "PlanContext", "PlanDashboard", "PlanMetric", "PlanRefused", "PlanTable",
-           "PlannedDataset", "Planner", "RefusedPart", "Repair", "draft_of", "plan_build",
+           "PlannedDataset", "Planner", "RefusedPart", "Repair", "draft_of", "max_identifier", "plan_build",
            "plan_from_draft", "plan_from_json", "plan_prompt", "plan_to_json", "with_made_datasets"]
 
 logger = logging.getLogger(__name__)
@@ -120,8 +120,9 @@ _LIST_OPERAND = frozenset({"IN", "NOT IN"})
 # `FilterConfig.sanitize_value`'s `max_length`.
 _MAX_OPERAND = 1000
 
-# The time grains a chart may group by, by the word the model writes: the ones the value check reproduces as one
-# Postgres `DATE_TRUNC` (`_GRAINS` in `mnemiq.superset.chart_form`), so a chart on any of them can be checked.
+# The time grains a chart may group by, by the word the model writes: the ones the value check reproduces as Superset's
+# own grain expression, on either database (`_GRAINS` in `mnemiq.superset.chart_form`), so a chart on any of them can
+# be checked.
 GRAINS = {"second": "PT1S", "minute": "PT1M", "hour": "PT1H", "day": "P1D", "week": "P1W", "month": "P1M",
           "quarter": "P3M", "year": "P1Y"}
 _GRAIN_WORD = {code: word for word, code in GRAINS.items()}
@@ -142,7 +143,16 @@ MAX_TITLE = 250
 MAX_REASON = 500
 MAX_DESCRIPTION = 500
 # Postgres keeps the first 63 bytes of a name (`NAMEDATALEN` - 1): a longer alias would be cut, and two could meet.
-MAX_IDENTIFIER = 63
+_POSTGRES_MAX_IDENTIFIER = 63
+# Oracle refuses a name past 128 bytes where the database's `COMPATIBLE` is 12.2 or later. One at 12.1 refuses a name
+# past 30 bytes, and does so loudly, when the made dataset is built.
+_ORACLE_MAX_IDENTIFIER = 128
+
+
+def max_identifier() -> int:
+    """The most bytes a made dataset's column name may take, in Superset mode's dialect as it is when asked."""
+    return _ORACLE_MAX_IDENTIFIER if superset_dialect() == "oracle" else _POSTGRES_MAX_IDENTIFIER
+
 
 # Which dashboards are offered: at most this many of the goal's words are searched, and this many dashboards shown.
 MAX_SEARCH_WORDS = 6
@@ -367,7 +377,7 @@ it reads each chart's rows from the tables its columns are of, joined by their l
 
 Measures are the numbers the charts show. Each is either
 - written: {"name": lower case letters, digits and _, "label": the name shown on the chart, "expression": one SQL \
-aggregate expression in PostgreSQL, "kind": one of currency, percent, count, number (a percent is a fraction from 0 \
+aggregate expression in SQL_DIALECT, "kind": one of currency, percent, count, number (a percent is a fraction from 0 \
 to 1, which Superset shows as a percent: 0.25 shows as 25%; never multiply it by 100), "description": optional, \
 "currency": an ISO 4217 code, optional, "table": only where its aggregate adds up no column}; or
 - a saved metric of a table's dataset: {"name": the plan's own name for it, "saved_metric": the saved metric's name, \
@@ -431,7 +441,9 @@ def plan_prompt(goal: str, context: PlanContext) -> tuple[str, str]:
     kept measures by name and label only, since a kept measure's expression names its dataset's columns, never a
     column with its table as the model names one."""
     families = ", ".join(_family_name(family) for family in context.families)
-    system = _SYSTEM.replace("FAMILIES", families).replace("GRAINS", ", ".join(GRAINS))
+    # SQL_DIALECT names the SQL a written measure's expression is asked in: Superset mode's dialect's.
+    sql = "Oracle SQL" if superset_dialect() == "oracle" else "PostgreSQL"
+    system = _SYSTEM.replace("SQL_DIALECT", sql).replace("FAMILIES", families).replace("GRAINS", ", ".join(GRAINS))
     document = {
         "tables": [{"name": table.name,
                     "columns": [{"name": c.name, **({"type": c.type} if c.type else {})} for c in table.columns],
@@ -1216,8 +1228,8 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
             shown = named[(name, column)]
             if shown in owners:
                 return f"the joined dataset would have two columns named {shown!r}"
-            if len(shown.encode()) > MAX_IDENTIFIER:
-                return f"the joined dataset's column {shown!r} is longer than the {MAX_IDENTIFIER} bytes of a name"
+            if len(shown.encode()) > max_identifier():
+                return f"the joined dataset's column {shown!r} is longer than the {max_identifier()} bytes of a name"
             owners[shown], types[shown] = name, catalogue.types[name].get(column)
             origins[shown] = (name, column)
             shown_as[(name, column)] = shown

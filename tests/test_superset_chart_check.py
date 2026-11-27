@@ -20,9 +20,10 @@ import inspect
 import logging
 import re
 import types
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 
 import pytest
+import sqlglot
 
 import mnemiq.superset.chart_check as chart_check
 import mnemiq.superset.chart_form as chart_form
@@ -44,6 +45,7 @@ from mnemiq.superset.charts import Filter
 from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetPermissionDenied
 from mnemiq.superset.measures import MeasureKind
 from mnemiq.superset.saved_metrics import SavedMetric
+from mnemiq.superset.settings import use_superset_dialect
 from tests.superset_fake import FakeSuperset
 
 TOKEN = "tok-builder"
@@ -62,7 +64,8 @@ USD = {"symbol": "USD", "symbolPosition": "prefix"}
 # What `execute_sql` answers the deciders' own statements: the catalogue reads (each sent with `force_refresh`) and the
 # proof's probe, which returns no rows.
 EMPTY = {"success": True, "columns": [], "rows": []}
-_PROBE = re.compile(r"AS mnemiq_probe WHERE 1 = 0$")
+# The probe in either dialect: Oracle refuses `AS` before its alias (`SupersetSqlAdapter.validate`).
+_PROBE = re.compile(r"(AS )?mnemiq_probe WHERE 1 = 0$")
 # Text only Superset writes in these tests, so where it ends up can be read.
 SAID = "superset-said-this-about-public.policy"
 # An ad hoc SQL metric as MCP's `create_metric_object` (`superset/mcp_service/chart/chart_utils.py`) writes one.
@@ -1032,15 +1035,22 @@ def test_the_reason_names_what_the_chart_was_compared_with(fake):
     assert "query_dataset" in check.reason and "mnemiq's own SQL" not in check.reason
 
 
+# Why a chart is not checked with mnemiq's own statement by an adapter that speaks another dialect than Superset
+# mode's database.
+OTHER_DIALECT = ("mnemiq's own statement for a chart is written in the dialect of Superset mode's database, Postgres or "
+                 "Oracle, and this adapter speaks another")
+
+
 def test_only_a_postgres_adapter_checks_with_its_own_sql(fake):
-    """mnemiq's statement, its grain expression above all, is written for Postgres, Superset mode's one dialect."""
+    """mnemiq's statement, its grain expression above all, is written in Superset mode's dialect, PostgreSQL's here:
+    an adapter that speaks another is not checked with it."""
     _serve(fake, form_data=_bar(), chart=_chart_data(["region", "Total premium"], ("east", 1)),
            mnemiq=_result(("east", 1)))
     adapter = SupersetSqlAdapter(SupersetMcp(fake.url, DelegatedToken(TOKEN)), database_id=DATABASE_ID,
                                  schema=SCHEMA, dialect="duckdb")
     check = check_chart(adapter, chart_id=CHART_ID, dataset_id=DATASET_ID, kinds={}, saved={},
                         snapshot=SNAPSHOT, grants=GRANTS, guard_fanout=False)
-    assert check.status is ChartStatus.NOT_CHECKED and "Postgres" in check.reason
+    assert check.status is ChartStatus.NOT_CHECKED and check.reason == OTHER_DIALECT
     assert "execute_sql" not in _tools(fake)
 
 
@@ -2535,3 +2545,260 @@ def test_the_builders_having_on_a_type_it_never_gives_one_keeps_todays_reason(vi
             "adhoc_filters": [LEFT_OUT], "adhoc_filters_b": [], "row_limit": 10}
     found = expectation_from_form_data(form, dataset=PHYSICAL)
     assert not isinstance(found, Expectation) or found.not_null == (), found
+
+
+# --- Oracle's forms ---------------------------------------------------------------------------------------------------
+# Under `superset_oracle` mnemiq writes its statement as Superset writes the chart's query on Oracle (rc2's
+# `OracleEngineSpec`, and SQLAlchemy's Oracle dialect, which compiles it), and `_adapter`, built after the fixture sets
+# the dialect, speaks Oracle.
+
+# rc2's `OracleEngineSpec._time_grain_expressions`, for the x-axis `order_date`.
+ORACLE_GRAINS = {
+    "PT1S": 'CAST("order_date" AS DATE)',
+    "PT1M": "TRUNC(CAST(\"order_date\" AS DATE), 'MI')",
+    "PT1H": "TRUNC(CAST(\"order_date\" AS DATE), 'HH')",
+    "P1D": "TRUNC(CAST(\"order_date\" AS DATE), 'DDD')",
+    "P1W": "TRUNC(CAST(\"order_date\" AS DATE), 'WW')",
+    "P1M": "TRUNC(CAST(\"order_date\" AS DATE), 'MONTH')",
+    "P3M": "TRUNC(CAST(\"order_date\" AS DATE), 'Q')",
+    "P1Y": "TRUNC(CAST(\"order_date\" AS DATE), 'YEAR')",
+}
+# Two times on each grain, where Oracle's expression for it puts one. 1 January 2026 is a Thursday, so Oracle's weeks
+# of 2026 start on Thursdays.
+ON_ORACLE_GRAIN = {
+    "PT1S": ("2026-01-05T10:11:12", "2026-01-05T10:11:13"),
+    "PT1M": ("2026-01-05T10:11:00", "2026-01-05T10:12:00"),
+    "PT1H": ("2026-01-05T10:00:00", "2026-01-05T11:00:00"),
+    "P1D": ("2026-01-05T00:00:00", "2026-01-06T00:00:00"),
+    "P1W": ("2026-01-01T00:00:00", "2026-01-08T00:00:00"),
+    "P1M": ("2026-01-01T00:00:00", "2026-02-01T00:00:00"),
+    "P3M": ("2026-01-01T00:00:00", "2026-04-01T00:00:00"),
+    "P1Y": ("2025-01-01T00:00:00", "2026-01-01T00:00:00"),
+}
+_GROUP_BY_POSITION = re.compile(r"GROUP BY\s+\d", re.IGNORECASE)
+
+
+def _grouped_by(sql: str) -> list[str]:
+    """What an Oracle statement groups by, as sqlglot's Oracle dialect reads it: it must parse there."""
+    return [node.sql(dialect="oracle") for node in sqlglot.parse_one(sql, read="oracle").args["group"].expressions]
+
+
+def test_oracle_reproduces_the_grains_postgres_does():
+    """The same grains on either database, so the grains the builder offers (`chart_change`, the planner) are ones the
+    check reproduces there, and where each puts a time is known for each of them."""
+    assert set(chart_form._ORACLE_GRAINS) == set(chart_form._GRAINS) == set(ORACLE_GRAINS)
+    assert set(chart_check._ORACLE_ON_GRAIN) == set(chart_form._ORACLE_GRAINS)
+
+
+@pytest.mark.parametrize("grain", ORACLE_GRAINS)
+def test_oracle_grains_are_supersets_own(fake, superset_oracle, grain):
+    """On Oracle mnemiq groups the x-axis by Superset's own Oracle grain expression, a TRUNC of the column cast to a
+    DATE (a second's the cast alone), and groups by that expression, never by position, which Oracle before 23
+    refuses. Superset's times on that grain are read as on it, and the chart is checked."""
+    rows = tuple((at, i + 1) for i, at in enumerate(ON_ORACLE_GRAIN[grain]))
+    _serve(fake, form_data=_line(time_grain_sqla=grain), chart=_chart_data(["order_date", "Total premium"], *rows),
+           mnemiq=_result(*rows, columns=TIME))
+    check = _check(fake)
+    assert check.status is ChartStatus.CHECKED, check.reason
+    [sql] = _statements(fake)
+    expression = ORACLE_GRAINS[grain]
+    assert f'{expression} AS "order_date"' in sql and f"GROUP BY {expression}" in sql
+    assert not _GROUP_BY_POSITION.search(sql) and "DATE_TRUNC" not in sql.upper()
+    assert _grouped_by(sql) == [expression]
+
+
+def test_an_oracle_week_sits_on_its_years_first_weekday(fake, superset_oracle):
+    """Oracle's `TRUNC(..., 'WW')` starts each week on the weekday 1 January of that year fell on, not on a Monday as
+    PostgreSQL's `DATE_TRUNC('week', ...)` does, and a 365-day year's last week starts on 31 December (2025: 1 January
+    a Wednesday, and 31 December 364 days on). Superset's rows on Mondays of 2026 are not on Oracle's week: the grain
+    was not applied, so the chart is not checked and nothing is sent, never a mismatch."""
+    on = chart_check._on_the_grain
+    assert on("2026-01-01T00:00:00", "P1W") and on("2026-01-08T00:00:00", "P1W")
+    assert on("2025-12-31T00:00:00", "P1W") and on("2025-01-01", "P1W")
+    assert not on("2026-01-05T00:00:00", "P1W")  # a Monday
+    assert not on("2026-01-02T00:00:00", "P1W") and not on("2026-01-08T00:00:01", "P1W")
+    mondays = (("2026-01-05T00:00:00", 3), ("2026-01-12T00:00:00", 4))
+    _serve(fake, form_data=_line(time_grain_sqla="P1W"), chart=_chart_data(["order_date", "Total premium"], *mondays),
+           mnemiq=_result(*mondays, columns=TIME))
+    check = _check(fake)
+    assert check.status is ChartStatus.NOT_CHECKED and check.reason == chart_check._NO_GRAIN
+    assert _statements(fake) == []
+    use_superset_dialect("postgres")
+    assert on("2026-01-05T00:00:00", "P1W") and not on("2026-01-08T00:00:00", "P1W")
+    assert not on("2025-12-31T00:00:00", "P1W")
+
+
+@pytest.mark.parametrize("grain", ["PT15M", "P1W/1970-01-03T00:00:00Z", "1969-12-28T00:00:00Z/P1W", "P2W"])
+def test_a_grain_mnemiq_cannot_write_leaves_the_chart_not_checked(fake, superset_oracle, grain):
+    """A grain outside rc2's `OracleEngineSpec` is one Superset refuses on Oracle (`get_timestamp_expr` raises for a
+    grain the engine has no expression for), and one mnemiq writes no statement for: the chart is not checked, saying
+    which grain, and nothing is sent."""
+    _serve(fake, form_data=_line(time_grain_sqla=grain), chart=_chart_data(["order_date", "Total premium"], *MONTHS),
+           mnemiq=_result(*MONTHS, columns=TIME))
+    check = _check(fake)
+    assert check.status is ChartStatus.NOT_CHECKED
+    assert check.reason == f"the chart's time grain {grain!r} is one mnemiq does not reproduce"
+    assert _statements(fake) == []
+
+
+def test_oracle_literals_are_oracles(superset_oracle):
+    """Oracle's forms of the values mnemiq writes: a date and a time as Oracle's DATE and TIMESTAMP literals, which read
+    the same whatever the session's date format, and a number and a text as SQL writes them. Oracle before 23 has no
+    TRUE or FALSE: a true or false is 1 or 0, as SQLAlchemy's Oracle dialect renders one in Superset's query. A time
+    with a zone is refused rather than written."""
+    literal = chart_check._literal
+    assert literal(date(2026, 1, 2)) == "DATE '2026-01-02'"
+    assert literal(datetime(2026, 1, 2, 3, 4, 5)) == "TIMESTAMP '2026-01-02 03:04:05'"
+    assert literal(datetime(2026, 1, 2, 3, 4, 5, 120)) == "TIMESTAMP '2026-01-02 03:04:05.000120'"
+    assert literal(12) == "12" and literal(1.5) == "1.5" and literal("o'brien") == "'o''brien'"
+    assert literal("2026-01-02") == "'2026-01-02'"  # a text stays a text, as Superset writes a text comparator
+    assert (literal(True), literal(False)) == ("1", "0")
+    with pytest.raises(ValueError, match="Oracle"):
+        literal(datetime(2026, 1, 2, tzinfo=timezone.utc))
+    for written in ("DATE '2026-01-02'", "TIMESTAMP '2026-01-02 03:04:05.000120'"):
+        assert sqlglot.parse_one(f"SELECT 1 FROM t WHERE d = {written}", read="oracle").find(sqlglot.exp.EQ)
+
+
+def test_postgres_literals_are_as_they_were():
+    literal = chart_check._literal
+    assert (literal(True), literal(False)) == ("TRUE", "FALSE")
+    assert literal(date(2026, 1, 2)) == "'2026-01-02'"
+    assert literal(datetime(2026, 1, 2, 3, 4, 5)) == "'2026-01-02 03:04:05'"
+    assert literal(12) == "12" and literal("o'brien") == "'o''brien'"
+
+
+# Filters on true or false, each as a chart's SIMPLE filter on `premium` holds it, and as mnemiq writes it on PostgreSQL
+# and on Oracle, where SQLAlchemy's Oracle dialect renders a true or false in Superset's query as 1 or 0.
+TRUE_OR_FALSE = {
+    "equal to true": ({"operator": "==", "comparator": True}, '"premium" = TRUE', '"premium" = 1'),
+    "in a list holding false": ({"operator": "IN", "comparator": [False]}, '"premium" IN (FALSE)',
+                                '"premium" IN (0)'),
+    "IS TRUE": ({"operator": "IS TRUE", "comparator": None}, '"premium" IS TRUE', None),
+    "IS FALSE": ({"operator": "IS FALSE", "comparator": None}, '"premium" IS FALSE', None),
+}
+
+
+def _on(column: str, changes: dict) -> dict:
+    return {"clause": "WHERE", "expressionType": "SIMPLE", "subject": column} | changes
+
+
+@pytest.mark.parametrize("changes, oracle", [(c, o) for c, _, o in TRUE_OR_FALSE.values()], ids=TRUE_OR_FALSE.keys())
+def test_an_oracle_chart_filtered_on_true_or_false_writes_neither(fake, superset_oracle, changes, oracle):
+    """Oracle before 23 has no TRUE or FALSE in SQL. A comparison with one is written as Superset's query writes it
+    there, with 1 or 0, and checked. Superset writes `IS TRUE` and `IS FALSE` there as `IS 1` and `IS 0`, which Oracle
+    refuses, so a chart filtered so is not checked, saying why, and mnemiq sends no statement."""
+    rows = (("east", 1200),)
+    _serve(fake, form_data=_bar(adhoc_filters=[_on("premium", changes)]),
+           chart=_chart_data(["region", "Total premium"], *rows), mnemiq=_result(*rows))
+    check = _check(fake)
+    if oracle is None:
+        assert check.status is ChartStatus.NOT_CHECKED
+        assert check.reason == (f"the chart's filter on 'premium' is {changes['operator']}, which Superset writes on "
+                                f"Oracle as IS {1 if changes['operator'] == 'IS TRUE' else 0}, a test Oracle refuses, so "
+                                "mnemiq does not write it")
+        assert _statements(fake) == []
+        return
+    assert check.status is ChartStatus.CHECKED, check.reason
+    [sql] = _statements(fake)
+    assert oracle in sql and not re.search(r"\b(TRUE|FALSE)\b", sql, re.IGNORECASE)
+
+
+@pytest.mark.parametrize("changes, written", [(c, p) for c, p, _ in TRUE_OR_FALSE.values()], ids=TRUE_OR_FALSE.keys())
+def test_a_postgres_chart_filtered_on_true_or_false_is_written_as_before(fake, changes, written):
+    rows = (("east", 1200),)
+    _serve(fake, form_data=_bar(adhoc_filters=[_on("premium", changes)]),
+           chart=_chart_data(["region", "Total premium"], *rows), mnemiq=_result(*rows))
+    check = _check(fake)
+    assert check.status is ChartStatus.CHECKED, check.reason
+    [sql] = _statements(fake)
+    assert written in sql
+
+
+@pytest.mark.parametrize("op, written, postgres", [
+    ("ILIKE", "LOWER(\"channel\") LIKE LOWER('W%')", "\"channel\" ILIKE 'W%'"),
+    ("NOT ILIKE", "LOWER(\"channel\") NOT LIKE LOWER('W%')", "\"channel\" NOT ILIKE 'W%'"),
+])
+def test_oracle_has_no_ilike(fake, superset_oracle, op, written, postgres):
+    """Oracle has no ILIKE. Superset's case-insensitive match is SQLAlchemy's `ilike`, which its Oracle dialect writes
+    as `lower(<column>) LIKE lower(<pattern>)`, so mnemiq writes the same, LOWER on both sides: a case mapping is not
+    symmetric for every character, so UPPER on both could match other rows. PostgreSQL keeps its ILIKE. mnemiq's own
+    text is read as well as the decided statement, which sqlglot's Oracle dialect writes again in the same form."""
+    assert chart_check._filter_sql(Filter("channel", op, "W%")) == written
+    rows = (("east", 1200),)
+    form = _bar(adhoc_filters=[_on("channel", {"operator": op, "comparator": "W%"})])
+    _serve(fake, form_data=form, chart=_chart_data(["region", "Total premium"], *rows), mnemiq=_result(*rows))
+    check = _check(fake)
+    assert check.status is ChartStatus.CHECKED, check.reason
+    [sql] = _statements(fake)
+    assert written in sql and "ILIKE" not in sql.upper()
+    sqlglot.parse_one(sql, read="oracle")
+    fake.calls.clear()
+    use_superset_dialect("postgres")
+    check = _check(fake)
+    assert check.status is ChartStatus.CHECKED, check.reason
+    [sql] = _statements(fake)
+    assert postgres in sql
+
+
+def test_under_oracle_only_an_oracle_adapter_checks_with_its_own_sql(fake, superset_oracle):
+    """Under Superset mode's Oracle dialect mnemiq's statement is written in Oracle's forms: an adapter that speaks
+    PostgreSQL is not checked with it, and nothing is sent, while one that speaks Oracle checks, its statement grouped
+    by the chart's column itself."""
+    rows = (("east", 1200), ("west", 800))
+    _serve(fake, form_data=_bar(), chart=_chart_data(["region", "Total premium"], *rows), mnemiq=_result(*rows))
+    postgres = SupersetSqlAdapter(SupersetMcp(fake.url, DelegatedToken(TOKEN)), database_id=DATABASE_ID,
+                                  schema=SCHEMA, dialect="postgres")
+    check = check_chart(postgres, chart_id=CHART_ID, dataset_id=DATASET_ID, kinds={}, saved={}, snapshot=SNAPSHOT,
+                        grants=GRANTS, guard_fanout=False)
+    assert check.status is ChartStatus.NOT_CHECKED and check.reason == OTHER_DIALECT
+    assert "execute_sql" not in _tools(fake)
+    assert _adapter(fake).dialect == "oracle"
+    check = _check(fake)
+    assert check.status is ChartStatus.CHECKED, check.reason
+    [sql] = _statements(fake)
+    assert _grouped_by(sql) == ['"region"'] and not _GROUP_BY_POSITION.search(sql)
+
+
+ONE_PREMIUM = Expectation(metrics=(("Total premium", "SUM(premium)"),), dimensions=("region",), time_grain=None,
+                          filters=())
+
+
+def test_an_oracle_ranked_read_fetches_its_first_rows(superset_oracle):
+    """A read in the chart's ranking order asks for its first rows with Oracle's row-limiting clause, which the adapter
+    reads as the statement's bound; PostgreSQL keeps its LIMIT and its ordinal."""
+    sql = chart_check._statement(ONE_PREMIUM, PHYSICAL, grained=True, ranking=Ranking(0, True, 10), limit=20)
+    assert sql == ('SELECT "region", SUM(premium) AS m0 FROM "policy" GROUP BY "region" '
+                   "ORDER BY m0 DESC NULLS LAST FETCH FIRST 20 ROWS ONLY")
+    assert _grouped_by(sql) == ['"region"']
+    assert chart_check._statement(ONE_PREMIUM, PHYSICAL, grained=True, ranking=Ranking(0, False, 10)).endswith(
+        "ORDER BY m0 ASC NULLS LAST")
+    use_superset_dialect("postgres")
+    assert chart_check._statement(ONE_PREMIUM, PHYSICAL, grained=True, ranking=Ranking(0, True, 10), limit=20) == (
+        'SELECT "region", SUM(premium) AS m0 FROM "policy" GROUP BY 1 ORDER BY m0 DESC NULLS LAST LIMIT 20')
+
+
+def test_an_oracle_made_dataset_is_read_without_as_before_its_alias(fake, superset_oracle, monkeypatch):
+    """Superset reads a virtual dataset as a subquery aliased `virtual_table`, which SQLAlchemy's Oracle dialect writes
+    without `AS`, since Oracle refuses one before a table's alias, and unquoted, a lower-case name it needs no quotes
+    for, which Oracle reads as VIRTUAL_TABLE; so mnemiq writes the alias so there, bare. A chart on a dataset this
+    build made is checked on Oracle too (its SQL names the table quoted, as the snapshot lists it: Oracle reads an
+    unquoted name in upper case). Both the statement mnemiq hands the deciders and the one they decide are read, since
+    sqlglot's Oracle dialect writes the alias without `AS` again whatever mnemiq wrote."""
+    assert chart_check._virtual_source(MADE_SQL) == f'({MADE_SQL}) virtual_table'
+    written: list[str] = []
+    decide = chart_check.run_decided
+    monkeypatch.setattr(chart_check, "run_decided", lambda sql, **more: written.append(sql) or decide(sql, **more))
+    made = 'SELECT * FROM "policy"'
+    rows = (("east", 1200), ("west", 800))
+    _serve(fake, form_data=_bar(), chart=_chart_data(["region", "Total premium"], *rows), mnemiq=_result(*rows),
+           dataset=_dataset(virtual=True) | {"sql": made})
+    _rules(fake, _no_rule)
+    check = _check(fake, made={DATASET_ID: made})
+    assert check.status is ChartStatus.CHECKED, check.reason
+    [mine] = written
+    assert f'FROM ({made}) virtual_table WHERE ' in mine and '"virtual_table"' not in mine, mine
+    [sql] = _statements(fake)
+    assert f'FROM ({made}) virtual_table WHERE ' in sql and '"virtual_table"' not in sql, sql
+    assert _grouped_by(sql) == ['"region"']
+    use_superset_dialect("postgres")
+    assert chart_check._virtual_source(MADE_SQL) == f'({MADE_SQL}) AS "virtual_table"'

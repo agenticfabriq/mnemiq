@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import hashlib
 import json
 import re
 from types import SimpleNamespace
@@ -30,6 +31,7 @@ from mnemiq.superset.client import SupersetToolError
 from mnemiq.superset.charts import ChartSpec, Family, Filter, SavedRef, WrittenRef
 from mnemiq.superset.extension import TOOL_PREFIX
 from mnemiq.superset.measures import Measure, MeasureKind, scales_by_100
+from mnemiq.superset.plan_rows import Link
 from mnemiq.superset.planner import (
     COUNT_METRIC,
     FILTER_OPERATORS,
@@ -37,8 +39,15 @@ from mnemiq.superset.planner import (
     BuildPlan,
     FakePlanner,
     LLMPlanner,
+    PlanColumn,
+    PlanContext,
+    PlanDashboard,
+    PlanMetric,
     PlannedDataset,
     PlanRefused,
+    PlanTable,
+    RefusedPart,
+    Repair,
     draft_of,
     joined_names,
     plan_build,
@@ -1022,6 +1031,72 @@ def test_the_prompt_asks_for_qualified_columns_and_links():
     for unasked in ("JOIN", '"join"', "<table>_<column>", "the chart's rows", "on a join", "each column alone",
                     "one table or one join"):
         assert unasked not in system, unasked
+
+
+# A small context that reaches every part of the user prompt: a table with a dataset and a saved metric, one without,
+# a column of no type, a link to a table whose name the dialect quotes, a dashboard, a kept measure and a repair.
+_PINNED_CONTEXT = PlanContext(
+    tables=(PlanTable("loans", (PlanColumn("loan_id", "integer"), PlanColumn("book_id", "integer"),
+                                PlanColumn("loaned_on", "date"), PlanColumn("Note", None)), 7,
+                      (PlanMetric("count", "COUNT(*)"),)),
+            PlanTable("Books", (PlanColumn("book_id", "integer"), PlanColumn("format", "character varying")), None,
+                      ())),
+    dashboards=(PlanDashboard(3, "Loans"),),
+    families=tuple(Family),
+    repair=Repair('{"measures": []}', (RefusedPart("measure 'renewal_rate'", "it is no aggregate"),)),
+    kept=(Measure("renewals", "Renewals", "SUM(renewals)", K.NUMBER, 7, "", "goal"),),
+    links=(Link(("loans", "book_id"), ("Books", "book_id"), "r1"),))
+_PINNED_GOAL = "Loans by month and format"
+
+
+def test_the_postgres_prompt_is_byte_identical():
+    """On PostgreSQL the model is sent the prompts it was sent before Superset mode wrote Oracle's: the system prompt,
+    and the user prompt of a fixed context, each by its SHA-256 as rendered then."""
+    system, user = plan_prompt(_PINNED_GOAL, _PINNED_CONTEXT)
+    assert hashlib.sha256(system.encode()).hexdigest() == \
+        "ee79c1f47361943e36a58763c477e3c623d73dcca16e3a3c692e0fb48094f17c"
+    assert hashlib.sha256(user.encode()).hexdigest() == \
+        "0589f3ac7c563c263889feed4c5bf84a7fb4f2ef313958b76ef93095dc8127c2"
+
+
+def test_the_prompt_says_oracle_sql_on_oracle(request):
+    """On Oracle the model is asked for each measure's expression in Oracle SQL, and the prompt names PostgreSQL
+    nowhere; the rest of the system prompt is PostgreSQL's, word for word."""
+    postgres_system, _ = plan_prompt(_PINNED_GOAL, _PINNED_CONTEXT)
+    request.getfixturevalue("superset_oracle")
+    system, user = plan_prompt(_PINNED_GOAL, _PINNED_CONTEXT)
+    assert '"expression": one SQL aggregate expression in Oracle SQL, "kind"' in system
+    assert system == postgres_system.replace(" in PostgreSQL, ", " in Oracle SQL, ")
+    assert "Postgres" not in system and "Postgres" not in user
+
+
+def _identifier_catalogue(columns: dict[str, frozenset[str]]):
+    from mnemiq.superset.planner import _Catalogue
+
+    return _Catalogue(columns=columns, stored={t: t for t in columns}, datasets={}, saved={},
+                      types={t: {} for t in columns})
+
+
+@pytest.mark.parametrize(("dialect", "limit"), [("postgres", 63), ("oracle", 128)])
+def test_max_identifier_follows_the_dialect(request, dialect, limit):
+    """A made dataset's column is named in the database, which keeps at most 63 bytes of a name on PostgreSQL
+    (`NAMEDATALEN` - 1) and 128 on Oracle (where the database's COMPATIBLE is 12.2 or later): a column whose name takes
+    as many is made, and one a byte longer is refused, naming the limit of the dialect it is read in."""
+    from mnemiq.superset.planner import PlannedDataset, _joined, max_identifier
+
+    if dialect == "oracle":
+        request.getfixturevalue("superset_oracle")
+    assert max_identifier() == limit
+    # The join's names as each dialect folds them: unquoted, Oracle reads them in upper case.
+    policy, claim, key = ("policy", "claim", "policy_id") if dialect == "postgres" else ("POLICY", "CLAIM", "POLICY_ID")
+    fits, past = "a" * limit, "b" * (limit + 1)
+    made = _joined(PlannedDataset(key="dataset_1", placeholder=-1, join=JOIN),
+                   _identifier_catalogue({policy: frozenset({key, fits}), claim: frozenset({key})}))
+    assert not isinstance(made, str), made
+    assert made.shown[(policy, fits)] == fits
+    refused = _joined(PlannedDataset(key="dataset_1", placeholder=-1, join=JOIN),
+                      _identifier_catalogue({policy: frozenset({key, past}), claim: frozenset({key})}))
+    assert refused == f"the joined dataset's column {past!r} is longer than the {limit} bytes of a name"
 
 
 def test_the_prompt_shows_the_known_links():

@@ -14,10 +14,13 @@ import time
 import pytest
 
 from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
+from mnemiq.catalog import ColumnInfo, TableInfo
+from mnemiq.enrichment.profiling import _UNAGGREGATABLE, UNSUPPORTED, profile_table
 from mnemiq.execute.cut import sent_of
 from mnemiq.execute.runner import ExecutionError, QueryCancelledError, SourceUnavailableError, run
+from mnemiq.sql.guard import MAX_ROWS
 from mnemiq.sql.prove import Proof, prove_outcome
-from mnemiq.superset.adapter import JINJA_DELIMITERS, TRANSPORT_MARGIN_S, SupersetSqlAdapter
+from mnemiq.superset.adapter import JINJA_DELIMITERS, TRANSPORT_MARGIN_S, SupersetSqlAdapter, _outer_limit
 from mnemiq.superset.client import (
     DelegatedToken,
     SupersetDenied,
@@ -154,6 +157,34 @@ def test_validate_drops_a_trailing_semicolon():
     adapter = _adapter(_answer_with_no_rows())
     adapter.validate(f"{SQL};\n")
     assert adapter.client.calls[0].request["sql"] == f"SELECT * FROM ({SQL}) AS mnemiq_probe WHERE 1 = 0"
+
+
+@pytest.fixture(params=["postgres", "oracle"])
+def dialect(request):
+    """Superset mode's dialect for one test: PostgreSQL's, the default, or Oracle's (`superset_oracle`)."""
+    if request.param == "oracle":
+        request.getfixturevalue("superset_oracle")
+    assert superset_dialect() == request.param
+    return request.param
+
+
+# The probe each dialect is sent: Oracle refuses `AS` before a table alias, PostgreSQL's stays as it was.
+PROBES = {"postgres": f"SELECT * FROM ({SQL}) AS mnemiq_probe WHERE 1 = 0",
+          "oracle": f"SELECT * FROM ({SQL}) mnemiq_probe WHERE 1 = 0"}
+
+
+def test_validate_probe_has_no_as_before_its_alias(dialect):
+    adapter = _adapter(_answer_with_no_rows())
+    assert adapter.dialect == dialect
+    adapter.validate(f"{SQL};\n")
+    assert adapter.client.calls[0].request["sql"] == PROBES[dialect]
+
+
+def test_the_probe_follows_the_adapters_own_dialect():
+    """An adapter built for a dialect it names writes that dialect's probe, whatever Superset mode's is."""
+    adapter = _adapter(_answer_with_no_rows(), dialect="oracle")
+    adapter.validate(SQL)
+    assert adapter.client.calls[0].request["sql"] == PROBES["oracle"]
 
 
 def test_validate_raises_what_superset_refuses():
@@ -488,6 +519,63 @@ def test_a_re_ask_never_asks_for_more_rows_than_the_statement_limits():
     assert adapter.client.calls[1].request["limit"] == 6  # floor(10 * 50,000 / 61,234 * 0.8)
 
 
+@pytest.mark.parametrize(("sql", "bound"), [
+    ("SELECT region FROM policies FETCH FIRST 20 ROWS ONLY", 20),
+    ("SELECT region FROM policies OFFSET 5 ROWS FETCH FIRST 20 ROWS ONLY", 20),
+    ("SELECT region FROM policies OFFSET 5 ROWS FETCH NEXT 20 ROWS ONLY", 20),
+    ("SELECT region FROM policies FETCH NEXT 1 ROW ONLY", 1),
+    ("SELECT region FROM a UNION ALL SELECT region FROM b FETCH FIRST 20 ROWS ONLY", 20),
+    ("WITH r AS (SELECT region FROM policies) SELECT region FROM r FETCH FIRST 20 ROWS ONLY", 20),
+    # The cap the deciders write on Oracle, and a count past it, which is read as the cap.
+    ("SELECT region FROM policies FETCH FIRST 1000 ROWS ONLY", MAX_ROWS),
+    ("SELECT region FROM policies FETCH FIRST 5000 ROWS ONLY", MAX_ROWS),
+    ("SELECT region FROM policies OFFSET 5 ROWS", MAX_ROWS),
+    ("SELECT region FROM policies", MAX_ROWS),
+    # A share of the rows, and a count that keeps its ties, are no number of rows: Superset's `limit` takes their
+    # place, so 15 rows asked again of a 20 PERCENT that is 10 rows would answer more than the statement asks.
+    ("SELECT region FROM policies FETCH FIRST 20 PERCENT ROWS ONLY", None),
+    ("SELECT region FROM policies ORDER BY region FETCH FIRST 20 ROWS WITH TIES", None),
+    ("SELECT region FROM policies FETCH FIRST ROW ONLY", None),
+    ("SELECT region FROM policies FETCH FIRST :n ROWS ONLY", None),
+    ("SELECT region FROM policies FETCH FIRST 2.5 ROWS ONLY", None),
+])
+def test_outer_limit_reads_fetch_first_and_offset(sql, bound):
+    assert _outer_limit(sql, "oracle") == bound
+
+
+@pytest.mark.parametrize(("sql", "bound"), [
+    ("SELECT region FROM policies LIMIT 20", 20),
+    ("SELECT region FROM policies LIMIT 20 OFFSET 5", 20),
+    ("SELECT region FROM policies LIMIT 5000", MAX_ROWS),
+    ("SELECT region FROM policies", MAX_ROWS),
+    ("SELECT region FROM policies FETCH FIRST 20 ROWS ONLY", None),
+])
+def test_outer_limit_on_postgres_reads_its_limit_as_it_did(sql, bound):
+    assert _outer_limit(sql, "postgres") == bound
+
+
+@pytest.mark.parametrize(("sql", "asked"), [
+    ("SELECT region FROM policies FETCH FIRST 1000 ROWS ONLY", 653),
+    ("SELECT region FROM policies OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY", 6),  # floor(10 * 50,000 / 61,234 * 0.8)
+])
+def test_an_oracle_answer_too_large_is_asked_again_below_its_fetch_first(superset_oracle, sql, asked):
+    """On Oracle the deciders bound every statement with FETCH FIRST, so an answer refused as too large is asked again
+    below it, as a LIMIT is on PostgreSQL."""
+    adapter = _adapter([TOO_LARGE, _rows(asked)])
+    table = adapter.execute_answer(sql)
+    first, second = adapter.client.calls
+    assert "limit" not in first.request and second.request["limit"] == asked
+    assert sent_of(table) == asked
+
+
+def test_an_answer_reads_its_row_limit_in_the_adapters_own_dialect():
+    """An adapter built for Oracle reads FETCH FIRST whatever Superset mode's dialect is, as it writes its probe."""
+    assert superset_dialect() != "oracle"
+    adapter = _adapter([TOO_LARGE, _rows(6)], dialect="oracle")
+    adapter.execute_answer("SELECT region FROM policies FETCH FIRST 10 ROWS ONLY")
+    assert adapter.client.calls[1].request["limit"] == 6
+
+
 def test_a_statement_whose_limit_cannot_be_read_is_not_asked_again():
     adapter = _adapter([TOO_LARGE])
     with pytest.raises(ResultCut):
@@ -541,3 +629,36 @@ def test_the_ask_after_the_measure_stays_below_the_last_refused_one():
     adapter.execute_answer("SELECT region, wide FROM policies LIMIT 50")
     limits = [call.request.get("limit") for call in adapter.client.calls]
     assert limits[2] == 1 and limits[-1] < limits[1], limits
+
+
+# The column types no aggregate may read, by dialect, as the dialect's catalogue names them, upper-cased: Oracle's are
+# profiling's own, its large objects, LONGs, VECTOR, XMLTYPE and the row ids.
+UNAGGREGATABLE = {"postgres": {"JSON", "XML", "POINT", "LINE", "LSEG", "BOX", "PATH", "POLYGON", "CIRCLE"},
+                  "oracle": {"CLOB", "NCLOB", "BLOB", "LONG", "LONG RAW", "BFILE", "VECTOR", "XMLTYPE", "ROWID",
+                             "UROWID"}}
+
+
+def test_unaggregatable_types_follow_the_dialect(dialect):
+    """On Oracle the adapter's types are profiling's own for Oracle, one list for every Oracle source, whichever
+    adapter reads it; PostgreSQL's are the adapter's."""
+    assert _adapter().unaggregatable_types == UNAGGREGATABLE[dialect]
+    assert _adapter(dialect="oracle").unaggregatable_types == UNAGGREGATABLE["oracle"] == _UNAGGREGATABLE["oracle"]
+
+
+def _counts(request: dict) -> dict:
+    """One row of counts, a column for each `count(` the statement holds."""
+    n = request["sql"].count("count(")
+    names = ("count", *(f"count__{i}" for i in range(1, n)))
+    return {**REGION_COUNTS, "rows": [dict.fromkeys(names, 7)],
+            "columns": [{"name": name, "type": "int64"} for name in names], "row_count": 1}
+
+
+def test_profiling_through_an_oracle_adapter_leaves_its_large_objects_out_of_counts(superset_oracle):
+    """Profiling reads the adapter's types in place of its own: a CLOB is never counted, a VARCHAR2 is."""
+    adapter = _adapter(_counts)
+    stats = profile_table(adapter, TableInfo("DOCS", [ColumnInfo("ID", "NUMBER"), ColumnInfo("BODY", "CLOB"),
+                                                      ColumnInfo("TITLE", "VARCHAR2(200)")]))
+    sent = [call.request["sql"] for call in adapter.client.calls]
+    assert sent == ['SELECT count(*), count(DISTINCT "ID"), count("ID"), count(DISTINCT "TITLE"), count("TITLE") '
+                    'FROM "DOCS"']
+    assert {s.column: s.measurement for s in stats}["BODY"] == UNSUPPORTED

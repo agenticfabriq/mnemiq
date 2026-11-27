@@ -8,6 +8,7 @@ import shlex
 from pathlib import Path
 
 import pytest
+import sqlglot
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.config import Settings
@@ -173,6 +174,33 @@ def test_the_setting_is_an_iso_code(monkeypatch):
 def test_the_statement_names_its_dimensions_and_filters():
     sql = measure_statement(_measure(), "policy", ("region",), ("premium > 0",))
     assert sql == "SELECT region, SUM(premium) AS total_premium FROM policy WHERE (premium > 0) GROUP BY 1"
+
+
+# A dimension given with its alias, as the value check gives the x-axis it groups by a time grain.
+POSTGRES_MONTH = "DATE_TRUNC('month', \"order_date\")"
+ORACLE_MONTH = "TRUNC(CAST(\"order_date\" AS DATE), 'MONTH')"
+
+
+def test_an_aliased_dimension_is_selected_under_its_alias_and_grouped_by_position():
+    """On PostgreSQL a dimension given with an alias is selected under it, and the statement groups by position, as it
+    always has."""
+    sql = measure_statement(_measure(), '"policy"', ((POSTGRES_MONTH, '"order_date"'), '"region"'))
+    assert sql == (f'SELECT {POSTGRES_MONTH} AS "order_date", "region", SUM(premium) AS total_premium FROM "policy" '
+                   "GROUP BY 1, 2")
+
+
+def test_an_oracle_measure_statement_groups_by_expressions(superset_oracle):
+    """Oracle before 23 refuses `GROUP BY 1`, and reads no select-list alias in a GROUP BY: on Oracle the statement
+    groups by each dimension's own expression, an aliased one's without its alias, as Superset's query does."""
+    sql = measure_statement(_measure(), "policy", ("region",), ("premium > 0",))
+    assert sql == "SELECT region, SUM(premium) AS total_premium FROM policy WHERE (premium > 0) GROUP BY region"
+    sql = measure_statement(_measure(), '"policy"', ((ORACLE_MONTH, '"order_date"'), '"region"'))
+    assert sql == (f'SELECT {ORACLE_MONTH} AS "order_date", "region", SUM(premium) AS total_premium FROM "policy" '
+                   f'GROUP BY {ORACLE_MONTH}, "region"')
+    grouped = sqlglot.parse_one(sql, read="oracle").args["group"].expressions
+    assert [node.sql(dialect="oracle") for node in grouped] == [ORACLE_MONTH, '"region"']
+    assert not any(isinstance(node, sqlglot.exp.Literal) for node in grouped)
+    assert measure_statement(_measure(), "policy") == "SELECT SUM(premium) AS total_premium FROM policy"
 
 
 def test_check_measure_approves_a_granted_measure(adapter):

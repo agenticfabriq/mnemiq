@@ -47,6 +47,7 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal
 
 import sqlglot
 from sqlglot import exp
@@ -290,13 +291,29 @@ def unique_statement(table: str, columns: Sequence[str], dialect: str | None) ->
     """Whether `columns` of `table` hold each value once together: `SELECT COUNT(*), COUNT(DISTINCT <columns>) FROM
     <table> WHERE <each column> IS NOT NULL`, the names quoted as stored, several columns counted as one row value. A
     NULL in a key meets no row in a join, so both counts are of the rows whose key holds no NULL; each is named
-    (`keyed_rows`, `distinct_keys`), so the answer holds two columns of two names."""
+    (`keyed_rows`, `distinct_keys`), so the answer holds two columns of two names.
+
+    Oracle has no row value to count distinct, so there several columns are counted by grouping the rows that hold a
+    key by it: `SELECT COALESCE(SUM(n), 0), COUNT(*) FROM (SELECT COUNT(*) AS n FROM <table> WHERE ... GROUP BY
+    <columns>)`, its groups the distinct keys and their rows, summed, the rows holding one (none where no row does), so
+    the two counts are those PostgreSQL's statement gives."""
     named = [exp.Column(this=exp.to_identifier(column, quoted=True)) for column in columns]
+    source = exp.Table(this=exp.to_identifier(table, quoted=True))
+    keyed = exp.and_(*(exp.Not(this=exp.Is(this=column.copy(), expression=exp.Null())) for column in named))
+    if len(named) > 1 and dialect == "oracle":
+        rows = exp.Column(this=exp.to_identifier("n", quoted=True))
+        groups = (exp.select(exp.alias_(exp.Count(this=exp.Star()), "n", quoted=True)).from_(source).where(keyed)
+                  .group_by(*(column.copy() for column in named)))
+        return (exp.select(exp.alias_(exp.Coalesce(this=exp.Sum(this=rows), expressions=[exp.Literal.number(0)]),
+                                      "keyed_rows", quoted=True),
+                           exp.alias_(exp.Count(this=exp.Star()), "distinct_keys", quoted=True))
+                .from_(groups.subquery(exp.to_identifier("keys", quoted=True)))
+                .sql(dialect=dialect))
     key = named[0] if len(named) == 1 else exp.Tuple(expressions=named)
     return (exp.select(exp.alias_(exp.Count(this=exp.Star()), "keyed_rows", quoted=True),
                        exp.alias_(exp.Count(this=exp.Distinct(expressions=[key.copy()])), "distinct_keys", quoted=True))
-            .from_(exp.Table(this=exp.to_identifier(table, quoted=True)))
-            .where(exp.and_(*(exp.Not(this=exp.Is(this=column.copy(), expression=exp.Null())) for column in named)))
+            .from_(source)
+            .where(keyed)
             .sql(dialect=dialect))
 
 
@@ -310,8 +327,9 @@ def unique_live(table: str, columns: Sequence[str], *, adapter, snapshot: Snapsh
     None where the source said nothing. Not asked, and not remembered: a key of no column, one `holds_null` would not
     ask of (a column the grants hide, mask or deny, a table they filter by row, any table while a row filter names one
     the snapshot does not hold), a request Superset refused for good, and a plan whose probe time is spent. Asked and
-    failed, or answered with no two counts, which is remembered, so the plan does not ask again; a failure is logged by
-    its kind alone: a source's words can quote a value."""
+    failed, or answered with no two counts (each an int, or a Decimal that is a whole number: `_count`), which is
+    remembered, so the plan does not ask again; a failure is logged by its kind alone: a source's words can quote a
+    value."""
     named = tuple(sorted(set(columns)))
     if not named or getattr(adapter, "terminal_refusal", None) is not None \
             or probe_withheld(table, named, snapshot=snapshot, grants=grants):
@@ -336,13 +354,25 @@ def unique_live(table: str, columns: Sequence[str], *, adapter, snapshot: Snapsh
             logger.info("whether %s holds each value once could not be read (%s); it is not joined on", shown,
                         type(exc).__name__)
             return None
-        if counts is None or not all(type(count) is int for count in counts):
+        read = [_count(count) for count in counts] if counts is not None else None
+        if read is None or None in read:
             logger.info("whether %s holds each value once was answered with no two counts; it is not joined on", shown)
             return None
-        return counts[0] == counts[1]
+        return read[0] == read[1]
 
     probes.unique[key] = probes.timed(ask, timeout_s)
     return probes.unique[key]
+
+
+def _count(value: object) -> int | None:
+    """`value` as a count: an int (never a bool), or a Decimal that is exactly a whole number, the form Oracle's driver
+    may give a COUNT, a NUMBER, in; None for anything else, a Decimal with a fraction, a float, a bool or None among
+    them."""
+    if type(value) is int:
+        return value
+    if isinstance(value, Decimal) and value.is_finite() and value == value.to_integral_value():
+        return int(value)
+    return None
 
 
 def _held(adapter, physical: dict[str, str], table: str, column: str, *, dialect: str | None,

@@ -15,8 +15,8 @@ from sqlglot import exp
 from mnemiq.contract import Relationship
 from mnemiq.contract.values import JoinKey
 from mnemiq.superset.plan_rows import (Link, Refusal, Step, aggregated, base_among, base_of, chain, column_of,
-                                       column_text, comparable, edges, far_side, join_text, links_of, qualified,
-                                       qualify, read_join, rewrite)
+                                       column_text, comparable, edges, far_side, join_text, links_of, mistyped,
+                                       qualified, qualify, read_join, rewrite)
 from mnemiq.superset.planner import joined_names
 from mnemiq.superset.saved_metrics import normalized
 from mnemiq.superset.settings import superset_dialect
@@ -266,6 +266,181 @@ def test_columns_of_two_kinds_or_of_no_known_type_do_not_compare_exactly(left, r
     precision) reads two of its values as one; a column with no type recorded, or one that names none, could be
     either."""
     assert not comparable(left, right) and not comparable(right, left)
+
+
+# Oracle's type texts, as a snapshot enriched from Oracle records them (`ALL_TAB_COLUMNS.DATA_TYPE`, with a length or a
+# precision where one is given), and the spellings a column is declared with that Oracle stores as a NUMBER, by the
+# group whose types compare exactly with each other: NUMBER, INTEGER, INT, SMALLINT, DECIMAL and NUMERIC as one exact
+# number; VARCHAR2 and VARCHAR as one text, and CHAR, which pads with blanks, as its own; NVARCHAR2 and NCHAR, in the
+# national character set, each only with itself, since a VARCHAR2 or CHAR compared with one is converted into that
+# set, which can read two stored values as one; each floating type only with itself, as DATE, a timestamp with any
+# timestamp, a zoned one with any zoned one, each interval with its own kind of interval, and RAW, ROWID and UROWID,
+# each with itself, its length aside. A type's arguments are those of its family, in any case and spacing: a number's
+# precision, or `*`, and a scale, which may be negative (NUMBER(10,-2) rounds to hundreds); a character type's length,
+# in bytes or characters; a timestamp's or an interval's precisions; a RAW's, a UROWID's or a FLOAT's one number. None
+# for a type no equality compares, itself included: Oracle refuses a LOB, a LONG, a JSON, a VECTOR or a BOOLEAN in a
+# comparison, and any other text is a type Oracle's data dictionary records as no built-in, an object type (one of the
+# schema's, or Oracle's own, such as SDO_GEOMETRY or XMLTYPE) or UNDEFINED, Oracle's word for a type it cannot
+# describe, which compare by rules mnemiq cannot read, or a name no Oracle column has, however sqlglot reads it
+# (GEOMETRY, TEXT, UUID, DATETIME, DOUBLE PRECISION), or a built-in's name with arguments not of its family (a word,
+# none between the brackets, digits other than 0 to 9, a scale on a length).
+_ORACLE_GROUPS = {
+    "NUMBER": "exact number", "NUMBER(10)": "exact number", "NUMBER(12,2)": "exact number",
+    "NUMBER(*,0)": "exact number", "NUMBER(10,-2)": "exact number", "NUMBER(*,-2)": "exact number",
+    "NUMBER(*)": "exact number", "NUMBER(5,+2)": "exact number", "number ( 10 , -2 )": "exact number",
+    "number ( * , 0 )": "exact number",
+    "INTEGER": "exact number", "INT": "exact number", "SMALLINT": "exact number",
+    "DECIMAL(10,2)": "exact number", "NUMERIC": "exact number", "NUMERIC(5)": "exact number",
+    "VARCHAR2": "text", "VARCHAR2(40)": "text", "VARCHAR2(40 CHAR)": "text", "VARCHAR2(40 BYTE)": "text",
+    "VARCHAR2(20 BYTE)": "text", "varchar2( 20  byte )": "text", "VARCHAR(10)": "text",
+    "NVARCHAR2(20)": "national text", "NVARCHAR2(40)": "national text",
+    "CHAR(1)": "blank-padded", "CHAR": "blank-padded", "CHAR(5 CHAR)": "blank-padded", "CHAR(1 CHAR)": "blank-padded",
+    "NCHAR(2)": "national blank-padded", "NCHAR(5)": "national blank-padded",
+    "BINARY_FLOAT": "binary float", "BINARY_DOUBLE": "binary double", "FLOAT": "float", "FLOAT(126)": "float",
+    "DATE": "date",
+    "TIMESTAMP(6)": "timestamp", "TIMESTAMP(3)": "timestamp", "TIMESTAMP": "timestamp",
+    "TIMESTAMP(6) WITH TIME ZONE": "zoned", "TIMESTAMP WITH TIME ZONE": "zoned",
+    "TIMESTAMP(6) WITH LOCAL TIME ZONE": "local zoned", "TIMESTAMP WITH LOCAL TIME ZONE": "local zoned",
+    "timestamp (6)  with  local time  zone": "local zoned",
+    "INTERVAL YEAR(2) TO MONTH": "year to month", "INTERVAL YEAR TO MONTH": "year to month",
+    "INTERVAL DAY(2) TO SECOND(6)": "day to second", "INTERVAL DAY(3) TO SECOND(0)": "day to second",
+    "INTERVAL DAY TO SECOND": "day to second", "interval day (2) to second (6)": "day to second",
+    "RAW(16)": "raw", "RAW(32)": "raw", "ROWID": "rowid", "UROWID": "urowid", "UROWID(4000)": "urowid",
+    "CLOB": None, "NCLOB": None, "BLOB": None, "BFILE": None, "LONG": None, "LONG RAW": None, "JSON": None,
+    "VECTOR": None, "VECTOR(3, FLOAT32)": None, "BOOLEAN": None,
+    "UNDEFINED": None, "SDO_GEOMETRY": None, "MDSYS.SDO_GEOMETRY": None, "ANYDATA": None, "XMLTYPE": None,
+    "SYS.XMLTYPE": None, "ADDRESS_T": None, '"Address"': None, "DATE_T": None, "RAW_T": None,
+    "GEOMETRY": None, "TEXT": None, "UUID": None, "INET": None, "BIT": None, "ENUM": None, "ENUM('a', 'b')": None,
+    "DATETIME": None, "VARIANT": None, "TINYINT": None, "DOUBLE PRECISION": None, "REAL": None, "TIMESTAMPTZ": None,
+    "NUMBER(10) NOT NULL": None,
+    "NUMBER(FOO)": None, "VARCHAR2(ABC)": None, "NUMBER()": None, "VARCHAR2(\u0664\u0660)": None,
+    "NUMBER(\uff11\uff10)": None, "NUMBER(10,2,3)": None, "NUMBER(-10)": None, "NUMBER(10 CHAR)": None,
+    "VARCHAR2(*)": None, "VARCHAR2(10,2)": None, "CHAR(5 WORD)": None, "CHAR()": None, "RAW(16 BYTE)": None,
+    "RAW()": None, "FLOAT(*)": None, "FLOAT(10,2)": None, "TIMESTAMP(*)": None, "TIMESTAMP()": None,
+    "TIMESTAMP(-1)": None, "INTERVAL DAY(2) TO SECOND(-1)": None, "INTERVAL YEAR(2) TO MONTH(3)": None,
+    "UROWID(ABC)": None, "INTEGER(10)": None, "DATE(3)": None,
+    # Oracle reads a type's name in ASCII letters: a long s is no S, whatever Unicode's case folding makes of it.
+    "TIME\u017fTAMP(6)": None, "INTERVAL DAY(2) TO \u017fECOND(6)": None,
+}
+
+
+def test_oracle_types_compare_in_their_groups(superset_oracle):
+    """Each Oracle type compares exactly with every type of its group and with no other, read as Oracle names it: sqlglot
+    reads CLOB as its TEXT, LONG and LONG RAW as its BIGINT, and FLOAT and BINARY_FLOAT as one FLOAT, which would put
+    each in a group it is not of."""
+    wrong = [(left, right) for left, group in _ORACLE_GROUPS.items() for right, other in _ORACLE_GROUPS.items()
+             if comparable(left, right) is not (group is not None and group == other)]
+    assert wrong == []
+    # A type no equality compares is said to be one, never to have no recorded type.
+    assert mistyped(Link(("orders", "note"), ("returns", "note")), {("orders", "note"): "CLOB",
+                                                                    ("returns", "note"): "CLOB"}) == (
+        "orders.note is CLOB and returns.note is CLOB: a link joins columns whose values compare exactly, and a column "
+        "of type CLOB cannot be compared exactly, not even with one of its own type")
+
+
+def test_an_oracle_number_of_a_negative_scale_is_a_number(superset_oracle):
+    """Oracle's NUMBER takes a negative scale, rounding to the left of the point (NUMBER(10,-2) holds hundreds), with a
+    precision or `*`: it is a NUMBER, and compares exactly with any other and with every type stored as one."""
+    for scaled in ("NUMBER(10,-2)", "NUMBER(*,-2)"):
+        assert comparable(scaled, "NUMBER") and comparable("NUMBER", scaled) and comparable(scaled, "INTEGER")
+    assert comparable("NUMBER(10,-2)", "NUMBER(*,-2)")
+
+
+@pytest.mark.parametrize("data_type", ["NUMBER(FOO)", "VARCHAR2(ABC)", "NUMBER()", "VARCHAR2(\u0664\u0660)",
+                                       "NUMBER(10 CHAR)", "RAW(16 BYTE)", "TIMESTAMP(*)"])
+def test_a_built_in_name_with_arguments_not_of_its_family_links_with_nothing(superset_oracle, data_type):
+    """A type's arguments are read by its family: a word, nothing between the brackets, digits other than 0 to 9, or
+    another family's arguments make no type Oracle records, so the text is refused even with itself, as any text Oracle
+    records as no built-in is."""
+    typed = {**TYPES, ("orders", "customer_id"): data_type, ("customers", "customer_id"): data_type}
+    assert not comparable(data_type, data_type) and not comparable(data_type, "NUMBER")
+    assert mistyped(ORDER_CUSTOMER, typed) == (
+        f"orders.customer_id is {data_type} and customers.customer_id is {data_type}: a link joins columns whose "
+        f"values compare exactly, and a column of type {data_type} cannot be compared exactly, not even with one of "
+        "its own type")
+
+
+@pytest.mark.parametrize("data_type", ["unknown", "UNKNOWN", " Unknown "])
+def test_unknown_on_oracle_is_no_recorded_type(superset_oracle, data_type):
+    """The direct Oracle adapter records `unknown` for a column whose DATA_TYPE is NULL: that is no recorded type, in
+    any case, so the repair is told mnemiq cannot tell without both columns' types, never that the type cannot be
+    compared."""
+    typed = {**TYPES, ("orders", "customer_id"): data_type, ("customers", "customer_id"): "NUMBER"}
+    assert not comparable(data_type, data_type) and not comparable(data_type, "NUMBER")
+    assert mistyped(ORDER_CUSTOMER, typed) == (
+        f"orders.customer_id is {data_type.strip()} and customers.customer_id is NUMBER: a link joins columns whose "
+        "values compare exactly, which mnemiq cannot tell without both columns' types")
+
+
+def test_an_oracle_type_written_in_lower_case_is_the_same_type(superset_oracle):
+    """Oracle reads a type's name in any case, as sqlglot does: `clob` is CLOB, `long raw` is LONG RAW and
+    `binary_float` BINARY_FLOAT, never the type sqlglot reads them as."""
+    assert not comparable("clob", "clob") and not comparable("clob", "varchar2(10)")
+    assert not comparable("long raw", "long raw") and not comparable("long", "number")
+    assert not comparable("binary_float", "FLOAT") and comparable("binary_float", "BINARY_FLOAT")
+    # sqlglot reads BINARY_DOUBLE as its DOUBLE PRECISION, which on Oracle is FLOAT(126), a NUMBER.
+    assert not comparable("BINARY_DOUBLE", "DOUBLE PRECISION")
+    assert comparable("number(10)", "INTEGER") and comparable("nvarchar2(5)", "NVARCHAR2(40)")
+    assert not comparable("nvarchar2(5)", "VARCHAR2(40)") and not comparable("nchar(5)", "char(5)")
+    assert comparable("raw(16)", "RAW(16)") and not comparable("undefined", "UNDEFINED")
+
+
+@pytest.mark.parametrize("data_type", ["GEOMETRY", "TEXT", "UUID", "INET", "ENUM", "DATETIME"])
+def test_a_type_oracle_records_as_no_built_in_links_with_nothing(superset_oracle, data_type):
+    """A type text Oracle's data dictionary records for no built-in type is an object type, or a name no Oracle column
+    has, though sqlglot reads it as one of its own built-in types: GEOMETRY, TEXT, UUID, INET, ENUM and DATETIME are
+    sqlglot's names, not Oracle's, and a schema's object type may be named any of them, comparing by rules of its own.
+    So a link between two such columns is never joined by, though both are of one type, and the repair is told the type
+    cannot be compared."""
+    typed = {**TYPES, ("orders", "customer_id"): data_type, ("customers", "customer_id"): data_type}
+    assert not comparable(data_type, data_type)
+    assert mistyped(ORDER_CUSTOMER, typed) == (
+        f"orders.customer_id is {data_type} and customers.customer_id is {data_type}: a link joins columns whose "
+        f"values compare exactly, and a column of type {data_type} cannot be compared exactly, not even with one of "
+        "its own type")
+    _refused(chain("orders", {"customers"}, SHOP_EDGES, UNIQUE, types=typed), "'customers'",
+             f"a column of type {data_type} cannot be compared exactly")
+
+
+@pytest.mark.parametrize("data_type", ["uuid", "text", "my_enum", "inet", "geometry"])
+def test_a_postgres_type_sqlglot_reads_still_compares_with_itself(data_type):
+    """Oracle's allow-list is Oracle's alone: on PostgreSQL a uuid, a text, an enum the schema declares and any other
+    type compares with itself as it always has."""
+    assert superset_dialect() == "postgres"
+    assert comparable(data_type, data_type)
+    typed = {**TYPES, ("orders", "customer_id"): data_type, ("customers", "customer_id"): data_type}
+    assert mistyped(ORDER_CUSTOMER, typed) is None
+
+
+@pytest.mark.parametrize("data_type", ["UNDEFINED", "SDO_GEOMETRY", "XMLTYPE"])
+def test_an_oracle_object_type_or_undefined_links_with_nothing(superset_oracle, data_type):
+    """Oracle's UNDEFINED, its word for a type it cannot describe, and an object type, Oracle's own or the schema's,
+    compare by rules mnemiq cannot read: an object type with a MAP method compares by the value that method gives,
+    which can read two objects as one. So a link between two such columns is never joined by, though both are of one
+    type, and the repair is told the type cannot be compared."""
+    typed = {**TYPES, ("orders", "customer_id"): data_type, ("customers", "customer_id"): data_type}
+    assert not comparable(data_type, data_type)
+    assert mistyped(ORDER_CUSTOMER, typed) == (
+        f"orders.customer_id is {data_type} and customers.customer_id is {data_type}: a link joins columns whose "
+        f"values compare exactly, and a column of type {data_type} cannot be compared exactly, not even with one of "
+        "its own type")
+    _refused(chain("orders", {"customers"}, SHOP_EDGES, UNIQUE, types=typed), "'customers'",
+             f"a column of type {data_type} cannot be compared exactly")
+
+
+def test_a_national_type_links_only_with_its_own(superset_oracle):
+    """A VARCHAR2 compared with an NVARCHAR2, or a CHAR with an NCHAR, is converted into the national character set,
+    which reads every byte the database character set cannot decode, and some legacy multibyte characters, as one: two
+    keys the far side holds once each can equal one value of the near side, and LEFT JOIN repeats its row. So such a
+    link is refused naming both types; an NVARCHAR2 with an NVARCHAR2, and an NCHAR with an NCHAR, still join."""
+    for near, far in (("NVARCHAR2(20)", "VARCHAR2(20)"), ("NCHAR(5)", "CHAR(5 CHAR)")):
+        typed = {**TYPES, ("orders", "customer_id"): near, ("customers", "customer_id"): far}
+        assert mistyped(ORDER_CUSTOMER, typed) == (
+            f"orders.customer_id is {near} and customers.customer_id is {far}: a link joins columns whose values "
+            "compare exactly")
+        _refused(chain("orders", {"customers"}, SHOP_EDGES, UNIQUE, types=typed), "'customers'")
+        same = {**typed, ("customers", "customer_id"): near}
+        assert chain("orders", {"customers"}, SHOP_EDGES, UNIQUE, types=same) == (Step("customers", (ORDER_CUSTOMER,)),)
 
 
 def test_a_link_between_columns_of_two_kinds_is_never_walked():

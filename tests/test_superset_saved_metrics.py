@@ -478,6 +478,47 @@ def test_a_name_postgres_reads_as_a_function_is_refused(expression, name):
         == f"it names {name}, which Postgres reads as a function, not a column"
 
 
+# A table with columns named as the words Oracle reads, unquoted and unqualified, as a function or a pseudocolumn: such a
+# column was created quoted, and only quoted is such a name the column.
+ORACLE_COLUMNLESS = ("SYSDATE", "SYSTIMESTAMP", "USER", "UID", "ROWNUM", "LEVEL", "CURRENT_DATE", "CURRENT_TIMESTAMP")
+ORACLE_NILADIC = frozenset({*ORACLE_COLUMNLESS, "AMOUNT"})
+
+
+@pytest.mark.parametrize(("name", "written_lower", "sqlglot_reads_a_function"), [
+    ("SYSDATE", "sysdate", True), ("SYSTIMESTAMP", "systimestamp", True), ("USER", "user", False),
+    ("UID", "uid", False), ("ROWNUM", "rownum", False), ("LEVEL", "level", False),
+    ("CURRENT_DATE", "current_date", True), ("CURRENT_TIMESTAMP", "current_timestamp", True),
+])
+def test_carry_knows_oracles_columnless_functions(superset_oracle, name, written_lower, sqlglot_reads_a_function):
+    """Oracle reads each of these words, unquoted and unqualified, as no column of the table, though the table has a
+    column of that name: a function of the session or the statement, or a pseudocolumn. sqlglot reads some of them as
+    functions itself, and the metric is carried with the function as written; it reads the others as columns, and
+    carried as `C."USER"` the metric would read the column instead, so it is refused. Quoted, the word is the column."""
+    def carried(expression: str):
+        return carry(_saved("m", expression), table="CLAIM", stored="CLAIM", columns=ORACLE_NILADIC,
+                     qualifier=exp.to_identifier("C"), shown={column: column for column in ORACLE_NILADIC},
+                     rows_are_base=True)
+
+    if sqlglot_reads_a_function:
+        assert carried(f"MAX({name})") == Carried(decided=f"MAX({name})", superset=f"MAX({name})")
+    else:
+        assert carried(f"MAX({name})") == f"it names {name}, which Oracle reads as a function or a pseudocolumn, not a column"
+        # Folded as Oracle folds a word it reads unquoted.
+        assert carried(f"MAX({written_lower})") \
+            == f"it names {written_lower}, which Oracle reads as a function or a pseudocolumn, not a column"
+    assert carried(f'MAX("{name}")') == Carried(decided=f'MAX(C."{name}")', superset=f'MAX("{name}")')
+
+
+def test_postgres_words_are_columns_on_oracle(superset_oracle):
+    """Postgres's own words for the session are Oracle columns like any other: `current_role` is the column
+    CURRENT_ROLE there."""
+    columns = frozenset({"CURRENT_ROLE", "SYSTEM_USER"})
+    for word, column in (("current_role", "CURRENT_ROLE"), ("system_user", "SYSTEM_USER")):
+        assert carry(_saved("m", f"MAX({word})"), table="CLAIM", stored="CLAIM", columns=columns,
+                     qualifier=exp.to_identifier("C"), shown={name: name for name in columns}) \
+            == Carried(decided=f'MAX(C."{column}")', superset=f'MAX("{column}")')
+
+
 @pytest.mark.parametrize("expression", ['MAX("user")', "MAX(claim.user)"])
 def test_a_quoted_or_qualified_niladic_name_is_the_column(expression):
     assert _carry(expression, columns=NILADIC, shown=NILADIC_SHOWN) \

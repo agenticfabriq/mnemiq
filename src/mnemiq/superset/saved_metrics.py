@@ -153,6 +153,12 @@ _NOT_ONE = "mnemiq cannot read its expression as one SQL expression"
 # Names sqlglot reads as a column where Postgres, unquoted and unqualified, reads a function of the session: carried
 # as `c."user"`, a metric of `MAX(user)` would read a column named user instead.
 _POSTGRES_FUNCTIONS = frozenset({"user", "current_role", "system_user"})
+# The words Oracle, unquoted and unqualified, reads as no column of the table, each as Oracle folds it: USER and UID
+# the session's, SYSDATE and its kin the statement's time, and ROWNUM and LEVEL pseudocolumns of the statement's rows.
+# sqlglot reads SYSDATE, SYSTIMESTAMP, CURRENT_DATE and CURRENT_TIMESTAMP as functions itself; they are listed so a
+# sqlglot that read one as a column would still refuse it.
+_ORACLE_FUNCTIONS = frozenset({"SYSDATE", "SYSTIMESTAMP", "USER", "UID", "ROWNUM", "LEVEL", "CURRENT_DATE",
+                               "CURRENT_TIMESTAMP"})
 
 
 def carry(metric: SavedMetric, *, table: str, stored: str, columns: Collection[str], qualifier: exp.Identifier,
@@ -189,6 +195,9 @@ def carry(metric: SavedMetric, *, table: str, stored: str, columns: Collection[s
     if len(list(tree.find_all(exp.Select))) != 1 or tree.find(exp.Subquery, exp.Exists, exp.Table, exp.Alias):
         return "it reads more than its own table's rows: a subquery, EXISTS or another table"
     named = list(tree.find_all(exp.Column))
+    oracle = superset_dialect() == "oracle"
+    columnless = _ORACLE_FUNCTIONS if oracle else _POSTGRES_FUNCTIONS
+    reads_as = "Oracle reads as a function or a pseudocolumn" if oracle else "Postgres reads as a function"
     for column in named:
         if isinstance(column.this, exp.Star):
             return "it names *"
@@ -198,9 +207,8 @@ def carry(metric: SavedMetric, *, table: str, stored: str, columns: Collection[s
                 and resolve_identifier(column.args["table"], superset_dialect()) not in (table, stored):
             return f"it names {column.sql(dialect=superset_dialect())}, a column of another table"
         if column.args.get("table") is None and not column.this.args.get("quoted") \
-                and resolve_identifier(column.this, superset_dialect()) in _POSTGRES_FUNCTIONS:
-            return (f"it names {column.this.sql(dialect=superset_dialect())}, which Postgres reads as a function, "
-                    "not a column")
+                and resolve_identifier(column.this, superset_dialect()) in columnless:
+            return f"it names {column.this.sql(dialect=superset_dialect())}, which {reads_as}, not a column"
         if resolve_identifier(column.this, superset_dialect()) not in columns:
             return (f"it names {column.this.sql(dialect=superset_dialect())}, which {table} does not have or the "
                     "builder cannot read")

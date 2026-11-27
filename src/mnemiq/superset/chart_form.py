@@ -95,10 +95,18 @@ _ADDITIVE = frozenset({"SUM", "COUNT", "MIN", "MAX"})
 # of these (`_one_sum_or_count`).
 _SUMMABLE = frozenset({"SUM", "COUNT"})
 
-# Postgres's grain expressions (`_time_grain_expressions` in `superset/db_engine_specs/postgres.py`), the ones that are
-# one `DATE_TRUNC`.
-_GRAINS = {"PT1S": "second", "PT1M": "minute", "PT1H": "hour", "P1D": "day", "P1W": "week", "P1M": "month",
-           "P3M": "quarter", "P1Y": "year"}
+# The time grains mnemiq reproduces, each as Superset's own expression for it (`_time_grain_expressions` in its engine
+# spec), `{col}` the column it groups: PostgreSQL's (`superset/db_engine_specs/postgres.py`), the ones that are one
+# `DATE_TRUNC`; and Oracle's (`superset/db_engine_specs/oracle.py`), a TRUNC of the column cast to a DATE, a second's
+# the cast alone, which are every grain rc2 writes on Oracle. The same grains on either database.
+_GRAINS = {"PT1S": "DATE_TRUNC('second', {col})", "PT1M": "DATE_TRUNC('minute', {col})",
+           "PT1H": "DATE_TRUNC('hour', {col})", "P1D": "DATE_TRUNC('day', {col})",
+           "P1W": "DATE_TRUNC('week', {col})", "P1M": "DATE_TRUNC('month', {col})",
+           "P3M": "DATE_TRUNC('quarter', {col})", "P1Y": "DATE_TRUNC('year', {col})"}
+_ORACLE_GRAINS = {"PT1S": "CAST({col} AS DATE)", "PT1M": "TRUNC(CAST({col} AS DATE), 'MI')",
+                  "PT1H": "TRUNC(CAST({col} AS DATE), 'HH')", "P1D": "TRUNC(CAST({col} AS DATE), 'DDD')",
+                  "P1W": "TRUNC(CAST({col} AS DATE), 'WW')", "P1M": "TRUNC(CAST({col} AS DATE), 'MONTH')",
+                  "P3M": "TRUNC(CAST({col} AS DATE), 'Q')", "P1Y": "TRUNC(CAST({col} AS DATE), 'YEAR')"}
 # A SIMPLE metric's aggregate (`sqla_aggregations` in `superset/connectors/sqla/models.py`).
 _AGGREGATES = {"SUM": "SUM({})", "AVG": "AVG({})", "MIN": "MIN({})", "MAX": "MAX({})", "COUNT": "COUNT({})",
                "COUNT_DISTINCT": "COUNT(DISTINCT {})"}
@@ -142,6 +150,11 @@ def _metric_items(viz_type: str, form: dict) -> list:
 
 def _quoted(name: str) -> str:
     return exp.to_identifier(name, quoted=True).sql(dialect=superset_dialect())
+
+
+def grain_expressions() -> dict[str, str]:
+    """Superset's expression for each time grain mnemiq reproduces, by Superset mode's dialect (`_GRAINS`)."""
+    return _ORACLE_GRAINS if superset_dialect() == "oracle" else _GRAINS
 
 
 def _metric(item, dataset: DatasetFacts) -> tuple[str, str] | NotCheckable:
@@ -380,7 +393,7 @@ def _row_limit(form: dict) -> int | None:
 class Ranking:
     """How the chart's query ranks its rows under its row limit: `ORDER BY <metric> DESC|ASC LIMIT <limit>`, the
     metric being the expectation's metric at `metric_index`. rc2 adds no NULLS LAST, so Postgres puts NULL first under
-    DESC, and no tiebreak."""
+    DESC, as Oracle does, and no tiebreak."""
 
     metric_index: int
     descending: bool
@@ -595,7 +608,7 @@ def expectation_from_form_data(form_data: dict, *, dataset: DatasetFacts) -> Exp
                             "apply")
     if viz_type not in _X_AXIS:
         grain = None
-    if grain is not None and grain not in _GRAINS:
+    if grain is not None and grain not in grain_expressions():
         return NotCheckable(f"the chart's time grain {grain!r} is one mnemiq does not reproduce")
     metrics = []
     for item in _metric_items(viz_type, form):
