@@ -46,7 +46,7 @@ from mnemiq.superset.payload import (
     read_execute_response,
 )
 from mnemiq.superset.pg_catalog import PostgresCatalogue
-from mnemiq.superset.settings import SUPERSET_DIALECT
+from mnemiq.superset.settings import superset_dialect
 
 # `execute_sql` renders every statement as a Jinja template before it checks access and runs it, so a statement holding
 # one of these markers could run as something other than the statement mnemiq proved. Such a statement is never sent.
@@ -87,7 +87,8 @@ TERMINAL_REFUSALS = (SupersetRefusedCaller, SupersetPermissionDenied, SupersetDe
 class SupersetSqlAdapter:
     """Runs statements on one Superset database and schema through `client`, each within `timeout_s` unless the
     caller gives its own limit. With `refresh_every_statement`, every statement, data statements included, asks
-    Superset to run it rather than answer from its result cache.
+    Superset to run it rather than answer from its result cache. Its `dialect` is Superset mode's (`superset_dialect`),
+    read as the adapter is built, unless the caller names another.
 
     Each catalogue method reads its part of the catalogue from the database on the first call, never from Superset's
     result cache, and answers every later call with a copy of what it read: `decide` reads the function inventory on
@@ -99,10 +100,10 @@ class SupersetSqlAdapter:
     # dialect: a direct Postgres adapter declares the same dialect and profiles as it always has.
     unaggregatable_types = frozenset({"JSON", "XML", "POINT", "LINE", "LSEG", "BOX", "PATH", "POLYGON", "CIRCLE"})
 
-    def __init__(self, client: SupersetMcp, *, database_id: int, schema: str, dialect: str = SUPERSET_DIALECT,
+    def __init__(self, client: SupersetMcp, *, database_id: int, schema: str, dialect: str | None = None,
                  timeout_s: float = 30.0, refresh_every_statement: bool = False) -> None:
         self.client = client
-        self.dialect = dialect
+        self.dialect = superset_dialect() if dialect is None else dialect
         self._database_id = database_id
         self._schema = schema
         self._timeout_s = timeout_s
@@ -341,10 +342,10 @@ def _refused_size(refused: SupersetResponseTooLarge) -> tuple[int, int] | None:
 
 
 def _outer_limit(sql: str) -> int | None:
-    """The rows `sql` asks for at most, as Postgres reads its outer LIMIT, never past the deciders' cap (`MAX_ROWS`):
-    the bound an answer asked again stays under. None when the statement, or its LIMIT, cannot be read."""
+    """The rows `sql` asks for at most, as Superset mode's dialect reads its outer LIMIT, never past the deciders' cap
+    (`MAX_ROWS`): the bound an answer asked again stays under. None when the statement, or its LIMIT, cannot be read."""
     try:
-        tree = sqlglot.parse_one(sql, read="postgres")
+        tree = sqlglot.parse_one(sql, read=superset_dialect())
     except sqlglot.errors.ParseError:
         return None
     if not isinstance(tree, exp.Query):

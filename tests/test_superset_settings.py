@@ -221,9 +221,9 @@ def test_a_blank_url_is_direct_mode(blank):
 
 
 def test_the_constants_other_modules_share():
-    from mnemiq.superset.settings import SUPERSET_DIALECT, SUPERSET_SOURCE_JOB
+    from mnemiq.superset.settings import SUPERSET_SOURCE_DIALECT, SUPERSET_SOURCE_JOB
 
-    assert SUPERSET_DIALECT == "postgres"
+    assert SUPERSET_SOURCE_DIALECT == "postgres"
     assert SUPERSET_SOURCE_JOB == "superset:source"
 
 

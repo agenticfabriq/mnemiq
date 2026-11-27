@@ -47,7 +47,13 @@ from mnemiq.superset.executor import (
 )
 from mnemiq.superset.grants import FixedGrants, GrantsUnreadable, resolve_grants
 from mnemiq.superset.history import superset_history
-from mnemiq.superset.settings import SUPERSET_DIALECT, SUPERSET_SOURCE_JOB, SupersetSnapshotRefused
+from mnemiq.superset.settings import (
+    SUPERSET_SOURCE_DIALECT,
+    SUPERSET_SOURCE_JOB,
+    SupersetSnapshotRefused,
+    superset_dialect,
+    use_superset_dialect,
+)
 from mnemiq.verify.judge import SemanticJudge
 from mnemiq.verify.verifier import Verifier
 
@@ -1313,8 +1319,11 @@ def build_runtime(settings: Settings) -> Runtime:
     if superset:
         if (refusal := superset_source_refusal(snapshot, settings)) is not None:
             raise SnapshotMissing(refusal)
+        # Superset mode's SQL dialect, set here once, before anything reads it: that of the database the snapshot was
+        # read from, PostgreSQL for the one kind served, a snapshot enriched through Superset.
+        use_superset_dialect(SUPERSET_SOURCE_DIALECT)
         # Runs nothing: `source_adapter` would refuse in this mode, and each request brings its own adapter.
-        adapter = NoSourceConnection(SUPERSET_DIALECT)
+        adapter = NoSourceConnection(superset_dialect())
     else:
         # Read-only attach unless writes are explicitly enabled -- the backstop under db_write.
         adapter = source_adapter(settings, read_only=not settings.write_enabled)

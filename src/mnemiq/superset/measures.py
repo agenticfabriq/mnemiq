@@ -24,6 +24,7 @@ from mnemiq.contract import Snapshot
 from mnemiq.execute.runner import run
 from mnemiq.superset.adapter import JINJA_DELIMITERS
 from mnemiq.superset.history import Decided, decide_statement, run_decided
+from mnemiq.superset.settings import superset_dialect
 from mnemiq.sql.verdict import Approved, Refusal
 
 __all__ = ["Aggregation", "Decided", "Measure", "MeasureKind", "MeasureRefused", "aggregates", "check_measure",
@@ -95,7 +96,7 @@ def aggregates(expression: str) -> Aggregation:
     row-level value, `SUM(SUM(x)) OVER ()` aggregates. A function mnemiq does not model, SQL that does not parse and
     anything but one bare expression are `CANNOT_TELL`."""
     try:
-        tree = sqlglot.parse_one(f"SELECT {expression}", read="postgres")
+        tree = sqlglot.parse_one(f"SELECT {expression}", read=superset_dialect())
     except sqlglot.errors.SqlglotError:
         return Aggregation.CANNOT_TELL
     if not isinstance(tree, exp.Select) or len(tree.expressions) != 1 \
@@ -176,7 +177,7 @@ def scales_by_100(expression: str) -> bool:
 
 def _scales_by_100(expression: str) -> bool:
     try:
-        tree = sqlglot.parse_one(f"SELECT {expression}", read="postgres")
+        tree = sqlglot.parse_one(f"SELECT {expression}", read=superset_dialect())
     except sqlglot.errors.SqlglotError:
         return False
     if any(_is(node.left, "100") or _is(node.right, "100") for node in tree.find_all(exp.Mul)):

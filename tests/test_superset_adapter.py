@@ -29,7 +29,7 @@ from mnemiq.superset.client import (
     SupersetUnavailable,
 )
 from mnemiq.superset.payload import ResultCut, SupersetAccessRefused, SupersetQueryFailed
-from mnemiq.superset.settings import SUPERSET_DIALECT
+from mnemiq.superset.settings import superset_dialect
 from tests.superset_fake import FakeSuperset, RecordingClient
 
 SQL = "SELECT region, count(*) AS policy_count FROM policies GROUP BY region"
@@ -65,7 +65,7 @@ def test_request_names_database_schema_and_timeout():
     # No `limit`, which would replace the statement's own LIMIT, and no `template_params`.
     assert adapter.client.calls[0].request == {"database_id": 7, "sql": SQL, "schema": "sales", "timeout": 30}
     assert table.to_pylist() == [{"region": "west", "policy_count": 16666}]
-    assert adapter.dialect == SUPERSET_DIALECT == "postgres"
+    assert adapter.dialect == superset_dialect() == "postgres"
 
 
 def test_data_statements_never_force_refresh():

@@ -26,7 +26,7 @@ from mnemiq.superset.adapter import JINJA_DELIMITERS
 from mnemiq.superset.client import SupersetResponseTooLarge, SupersetToolError
 from mnemiq.superset.extension import ExtensionMissing, dataset_metrics
 from mnemiq.superset.measures import Measure
-from mnemiq.superset.settings import SUPERSET_DIALECT
+from mnemiq.superset.settings import superset_dialect
 
 __all__ = ["Carried", "SavedMetric", "UNKNOWN", "carry", "normalized", "read_saved_metrics", "reusable"]
 
@@ -52,9 +52,10 @@ class SavedMetric:
 
 
 def normalized(expression: str) -> str:
-    """The expression parsed and written back as Postgres, with identifiers normalized. Raises on SQL that does not
-    parse."""
-    return sqlglot.parse_one(expression, dialect="postgres").sql(dialect="postgres", normalize=True)
+    """The expression parsed and written back in Superset mode's dialect, with identifiers normalized. Raises on SQL
+    that does not parse."""
+    dialect = superset_dialect()
+    return sqlglot.parse_one(expression, dialect=dialect).sql(dialect=dialect, normalize=True)
 
 
 def _list_dataset(client, dataset_id: int, page_size: int) -> list[dict]:
@@ -175,7 +176,7 @@ def carry(metric: SavedMetric, *, table: str, stored: str, columns: Collection[s
     if (marker := next((d for d in JINJA_DELIMITERS if d in expression), None)) is not None:
         return f"it holds {marker}, which Superset reads as a template marker"
     try:
-        tree = sqlglot.parse_one(f"SELECT {expression}", read=SUPERSET_DIALECT)
+        tree = sqlglot.parse_one(f"SELECT {expression}", read=superset_dialect())
     except SqlglotError:
         return _NOT_ONE
     # One expression and nothing else: no FROM, DISTINCT or second expression, and no alias (`AS total`, `AS (a, b)`),
@@ -194,22 +195,22 @@ def carry(metric: SavedMetric, *, table: str, stored: str, columns: Collection[s
         if column.args.get("db") or column.args.get("catalog"):
             return "it names a column with a schema"
         if column.args.get("table") is not None \
-                and resolve_identifier(column.args["table"], SUPERSET_DIALECT) not in (table, stored):
-            return f"it names {column.sql(dialect=SUPERSET_DIALECT)}, a column of another table"
+                and resolve_identifier(column.args["table"], superset_dialect()) not in (table, stored):
+            return f"it names {column.sql(dialect=superset_dialect())}, a column of another table"
         if column.args.get("table") is None and not column.this.args.get("quoted") \
-                and resolve_identifier(column.this, SUPERSET_DIALECT) in _POSTGRES_FUNCTIONS:
-            return (f"it names {column.this.sql(dialect=SUPERSET_DIALECT)}, which Postgres reads as a function, not a "
-                    "column")
-        if resolve_identifier(column.this, SUPERSET_DIALECT) not in columns:
-            return (f"it names {column.this.sql(dialect=SUPERSET_DIALECT)}, which {table} does not have or the "
+                and resolve_identifier(column.this, superset_dialect()) in _POSTGRES_FUNCTIONS:
+            return (f"it names {column.this.sql(dialect=superset_dialect())}, which Postgres reads as a function, "
+                    "not a column")
+        if resolve_identifier(column.this, superset_dialect()) not in columns:
+            return (f"it names {column.this.sql(dialect=superset_dialect())}, which {table} does not have or the "
                     "builder cannot read")
     if not named and not rows_are_base:
         return f"it names no column of {table}, so on a join it would count the join's rows"
 
     def render(column_for) -> str:
         return tree.expressions[0].transform(
-            lambda node: column_for(resolve_identifier(node.this, SUPERSET_DIALECT))
-            if isinstance(node, exp.Column) else node).sql(dialect=SUPERSET_DIALECT)
+            lambda node: column_for(resolve_identifier(node.this, superset_dialect()))
+            if isinstance(node, exp.Column) else node).sql(dialect=superset_dialect())
 
     return Carried(
         decided=render(lambda name: exp.Column(this=exp.to_identifier(name, quoted=True), table=qualifier.copy())),

@@ -22,9 +22,10 @@ The repair shows the model its plan in the form it wrote it: `read_join` reads b
 names each of a dataset's columns with its table again, as `rewrite` named it the other way, and `column_text` writes
 one column as `column_of` reads it.
 
-Every identifier is read as `SUPERSET_DIALECT` reads it (`resolve_identifier`): an unquoted name folds as the dialect
-folds it, and a quoted one is the name as written. Every identifier built here is quoted, so it reads back as the
-stored name it was built from; a column whose name the joined dataset keeps is left as the model wrote it.
+Every identifier is read as Superset mode's dialect (`superset_dialect`) reads it (`resolve_identifier`): an unquoted
+name folds as the dialect folds it, and a quoted one is the name as written. Every identifier built here is quoted, so
+it reads back as the stored name it was built from; a column whose name the joined dataset keeps is left as the model
+wrote it.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ from mnemiq.contract.semantic import Relationship
 from mnemiq.sql.fanout_check import value_terms
 from mnemiq.sql.identifiers import resolve_identifier
 from mnemiq.superset.measures import Aggregation, aggregates
-from mnemiq.superset.settings import SUPERSET_DIALECT
+from mnemiq.superset.settings import superset_dialect
 
 # Whether a table's column holds each value once, by (table, column): enrichment's key facts. A column absent is
 # unknown.
@@ -122,7 +123,7 @@ def _one_expression(expression: str) -> exp.Select | None:
     """`expression` parsed as the one column of a SELECT, or None when it is not one SQL expression: one the parser
     refuses, or one nested deeper than it reads (a RecursionError), which a model's text can be."""
     try:
-        tree = sqlglot.parse_one(f"SELECT {expression}", read=SUPERSET_DIALECT)
+        tree = sqlglot.parse_one(f"SELECT {expression}", read=superset_dialect())
     except (SqlglotError, RecursionError):
         return None
     if not isinstance(tree, exp.Select) or len(tree.expressions) != 1 \
@@ -142,15 +143,15 @@ def qualified(expression: str) -> list[tuple[str, str]] | str:
         return f"{expression!r} holds a subquery: name each column with its table, as <table>.<column>"
     named: dict[tuple[str, str], None] = {}
     for column in tree.find_all(exp.Column, bfs=False):
-        written = column.sql(dialect=SUPERSET_DIALECT)
+        written = column.sql(dialect=superset_dialect())
         if isinstance(column.this, exp.Star):
             return f"{written} is not one column: name each column with its table, as <table>.<column>"
         if column.args.get("db") or column.args.get("catalog"):
             return f"{written} names a schema: name each column with its table alone, as <table>.<column>"
         if not column.table:
             return f"{column.name!r} is named without its table: write it as <table>.{written}"
-        named[(resolve_identifier(column.args["table"], SUPERSET_DIALECT),
-               resolve_identifier(column.this, SUPERSET_DIALECT))] = None
+        named[(resolve_identifier(column.args["table"], superset_dialect()),
+               resolve_identifier(column.this, superset_dialect()))] = None
     return list(named)
 
 
@@ -167,11 +168,11 @@ def column_of(text: str) -> tuple[str, str] | str:
 
 
 def _written(name: str) -> exp.Identifier:
-    """`name` as an identifier `SUPERSET_DIALECT` reads back as `name`: unquoted where it reads so, else quoted."""
+    """`name` as an identifier Superset mode's dialect reads back as `name`: unquoted where it reads so, else quoted."""
     plain = exp.to_identifier(name, quoted=False)
-    tree = _one_expression(plain.sql(dialect=SUPERSET_DIALECT))
+    tree = _one_expression(plain.sql(dialect=superset_dialect()))
     read = tree.expressions[0] if tree is not None else None
-    if isinstance(read, exp.Column) and not read.table and resolve_identifier(read.this, SUPERSET_DIALECT) == name:
+    if isinstance(read, exp.Column) and not read.table and resolve_identifier(read.this, superset_dialect()) == name:
         return plain
     return exp.to_identifier(name, quoted=True)
 
@@ -179,7 +180,7 @@ def _written(name: str) -> exp.Identifier:
 def column_text(table: str, column: str) -> str:
     """`<table>.<column>` as the model writes a column, each name unquoted where the dialect reads it back so: the text
     `column_of` reads as (table, column)."""
-    return exp.Column(this=_written(column), table=_written(table)).sql(dialect=SUPERSET_DIALECT)
+    return exp.Column(this=_written(column), table=_written(table)).sql(dialect=superset_dialect())
 
 
 def aggregated(expression: str) -> set[str]:
@@ -194,7 +195,7 @@ def aggregated(expression: str) -> set[str]:
         # `PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x)` holds its value, x, beside the function, not in it.
         within = aggregate.parent if isinstance(aggregate.parent, exp.WithinGroup) else aggregate
         for term in value_terms(within):
-            tables.update(resolve_identifier(column.args["table"], SUPERSET_DIALECT) for column in term
+            tables.update(resolve_identifier(column.args["table"], superset_dialect()) for column in term
                           if column.table)
     return tables
 
@@ -213,7 +214,7 @@ def _named_in_aggregates(expression: str) -> set[str]:
         scope: exp.Expression = aggregate
         while isinstance(scope.parent, (exp.Filter, exp.WithinGroup)) and scope.parent.this is scope:
             scope = scope.parent
-        tables.update(resolve_identifier(column.args["table"], SUPERSET_DIALECT)
+        tables.update(resolve_identifier(column.args["table"], superset_dialect())
                       for column in scope.find_all(exp.Column) if column.table)
     return tables
 
@@ -282,13 +283,13 @@ def far_side(table: str, columns: Sequence[str], unique: Unique) -> bool | None:
 
 
 def _kind(data_type: str | None) -> tuple[str, str] | None:
-    """The kind of a column of `data_type`, as the snapshot records it, read as `SUPERSET_DIALECT` reads a type, every
-    length and precision aside (`varchar(10)` is a varchar): its kind in `_KINDS`, else the type itself. None for no
-    type, or one that names none: unknown, a user-defined type of no name, or an array of elements of no type."""
+    """The kind of a column of `data_type`, as the snapshot records it, read as Superset mode's dialect reads a type,
+    every length and precision aside (`varchar(10)` is a varchar): its kind in `_KINDS`, else the type itself. None for
+    no type, or one that names none: unknown, a user-defined type of no name, or an array of elements of no type."""
     if data_type is None or not data_type.strip():
         return None
     try:
-        built = exp.DataType.build(data_type, dialect=SUPERSET_DIALECT, udt=True)
+        built = exp.DataType.build(data_type, dialect=superset_dialect(), udt=True)
     except (SqlglotError, ValueError):
         return None
     for argument in list(built.find_all(exp.DataTypeParam)):
@@ -298,14 +299,14 @@ def _kind(data_type: str | None) -> tuple[str, str] | None:
         return None
     if built.this in _KINDS and not built.expressions:
         return "kind", _KINDS[built.this]
-    return "type", built.sql(dialect=SUPERSET_DIALECT)
+    return "type", built.sql(dialect=superset_dialect())
 
 
 def comparable(left_type: str | None, right_type: str | None) -> bool:
     """Whether an equality of a column of `left_type` and one of `right_type` compares their values exactly, so it reads
     no two values of either as one: both an integer or an exact numeric (smallint, integer, bigint, numeric), both text
     or varchar, or both of one other type (char with char, a double precision with a double precision, a timestamp
-    with a timestamp of the same time zone kind), each read as `SUPERSET_DIALECT` reads a type, its length and
+    with a timestamp of the same time zone kind), each read as Superset mode's dialect reads a type, its length and
     precision aside. False where either has no type, or one that names none."""
     kind = _kind(left_type)
     return kind is not None and kind == _kind(right_type)
@@ -489,12 +490,12 @@ def _column(table: str, column: str) -> exp.Column:
 
 def join_text(base: str, steps: Sequence[Step]) -> str:
     """The FROM clause `steps` describe: `base` LEFT JOIN each step's table ON its links' columns being equal, every
-    name quoted as `SUPERSET_DIALECT` writes it."""
-    text = exp.Table(this=_identifier(base)).sql(dialect=SUPERSET_DIALECT)
+    name quoted as Superset mode's dialect writes it."""
+    text = exp.Table(this=_identifier(base)).sql(dialect=superset_dialect())
     for step in steps:
         on = exp.and_(*(exp.EQ(this=_column(*link.left), expression=_column(*link.right)) for link in step.on))
         text += " " + exp.Join(this=exp.Table(this=_identifier(step.table)), on=on, side="LEFT").sql(
-            dialect=SUPERSET_DIALECT)
+            dialect=superset_dialect())
     return text
 
 
@@ -504,7 +505,7 @@ def read_join(text: str) -> tuple[str, tuple[Step, ...]] | None:
     link written from the table before. A join written another way is read as far as its tables and such equalities go;
     None when `text` is not tables joined, each named alone or with an alias."""
     try:
-        tree = sqlglot.parse_one(f"SELECT 1 FROM {text}", read=SUPERSET_DIALECT)
+        tree = sqlglot.parse_one(f"SELECT 1 FROM {text}", read=superset_dialect())
     except SqlglotError:
         return None
     if not isinstance(tree, exp.Select) or tree.args.get("from_") is None:
@@ -512,15 +513,15 @@ def read_join(text: str) -> tuple[str, tuple[Step, ...]] | None:
     sources = [tree.args["from_"].this, *(join.this for join in tree.args.get("joins") or [])]
     if not all(isinstance(source, exp.Table) for source in sources):
         return None
-    tables = [resolve_identifier(source.this, SUPERSET_DIALECT) for source in sources]
+    tables = [resolve_identifier(source.this, superset_dialect()) for source in sources]
     by_qualifier = {resolve_identifier(source.args["alias"].this if source.args.get("alias") else source.this,
-                                       SUPERSET_DIALECT): table for source, table in zip(sources, tables)}
+                                       superset_dialect()): table for source, table in zip(sources, tables)}
 
     def side(column: exp.Expression) -> tuple[str, str] | None:
         if not isinstance(column, exp.Column) or not column.table:
             return None
-        table = by_qualifier.get(resolve_identifier(column.args["table"], SUPERSET_DIALECT))
-        return None if table is None else (table, resolve_identifier(column.this, SUPERSET_DIALECT))
+        table = by_qualifier.get(resolve_identifier(column.args["table"], superset_dialect()))
+        return None if table is None else (table, resolve_identifier(column.this, superset_dialect()))
 
     steps: list[Step] = []
     for index, join in enumerate(tree.args.get("joins") or [], 1):
@@ -546,13 +547,13 @@ def qualify(expression: str, owners: Mapping[str, tuple[str, str]]) -> str:
     for column in list(tree.find_all(exp.Column)):
         if column.table or not isinstance(column.this, exp.Identifier):
             continue
-        owner = owners.get(resolve_identifier(column.this, SUPERSET_DIALECT))
+        owner = owners.get(resolve_identifier(column.this, superset_dialect()))
         if owner is None:
             continue
         table, name = owner
-        kept = resolve_identifier(column.this, SUPERSET_DIALECT) == name
+        kept = resolve_identifier(column.this, superset_dialect()) == name
         column.replace(exp.Column(this=column.this.copy() if kept else _written(name), table=_written(table)))
-    return tree.expressions[0].sql(dialect=SUPERSET_DIALECT)
+    return tree.expressions[0].sql(dialect=superset_dialect())
 
 
 def rewrite(expression: str, names: Mapping[tuple[str, str], str]) -> str:
@@ -561,12 +562,12 @@ def rewrite(expression: str, names: Mapping[tuple[str, str], str]) -> str:
     measure reads as one written over that table alone (`SUM(order_items.revenue)` is `SUM(revenue)`); a renamed one
     is quoted, so it reads back as the name given. `expression` is one `qualified` reads, and `names` names each of its
     columns; a column it does not name is a ValueError."""
-    tree = sqlglot.parse_one(f"SELECT {expression}", read=SUPERSET_DIALECT)
+    tree = sqlglot.parse_one(f"SELECT {expression}", read=superset_dialect())
     for column in list(tree.find_all(exp.Column)):
-        key = (resolve_identifier(column.args.get("table"), SUPERSET_DIALECT),
-               resolve_identifier(column.this, SUPERSET_DIALECT))
+        key = (resolve_identifier(column.args.get("table"), superset_dialect()),
+               resolve_identifier(column.this, superset_dialect()))
         if key not in names:
-            raise ValueError(f"the dataset has no name for {column.sql(dialect=SUPERSET_DIALECT)}")
+            raise ValueError(f"the dataset has no name for {column.sql(dialect=superset_dialect())}")
         name = names[key]
         column.replace(exp.Column(this=column.this.copy() if name == key[1] else _identifier(name)))
-    return tree.expressions[0].sql(dialect=SUPERSET_DIALECT)
+    return tree.expressions[0].sql(dialect=superset_dialect())

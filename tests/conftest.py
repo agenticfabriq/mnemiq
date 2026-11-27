@@ -33,6 +33,20 @@ def _seed_acme(request):
         seed(dsn, data_dir)
 
 
+@pytest.fixture
+def superset_oracle():
+    """Superset mode's SQL dialect set to Oracle's for one test, as boot sets it for a snapshot read from Oracle, and
+    put back as it was after the test."""
+    from mnemiq.superset.settings import superset_dialect, use_superset_dialect
+
+    before = superset_dialect()
+    use_superset_dialect("oracle")
+    try:
+        yield
+    finally:
+        use_superset_dialect(before)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_verity_cache(tmp_path_factory, monkeypatch, request):
     """Keep the Verity record cache out of the working tree.
