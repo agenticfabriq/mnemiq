@@ -40,7 +40,7 @@ from mnemiq.superset.client import (
     SupersetUnavailable,
 )
 from mnemiq.superset.payload import SupersetAccessRefused, SupersetQueryFailed
-from mnemiq.superset.settings import SUPERSET_DIALECT
+from mnemiq.superset.settings import superset_dialect
 
 logger = logging.getLogger(__name__)
 
@@ -210,7 +210,7 @@ _tables = table_bindings
 def _probe(names) -> str:
     """One statement naming every table in `names`, each quoted as stored so that it reaches that table and no other,
     and returning no rows."""
-    tables = ", ".join(exp.to_identifier(name, quoted=True).sql(SUPERSET_DIALECT) for name in names)
+    tables = ", ".join(exp.to_identifier(name, quoted=True).sql(superset_dialect()) for name in names)
     return f"SELECT 1 FROM {tables} WHERE 1 = 0"
 
 
@@ -340,7 +340,7 @@ def _candidate_names(table_name: str) -> set[str]:
     of them, and grants none on its name alone."""
     names = {table_name}
     if _PLAIN_WORD.fullmatch(table_name) and not _reserved(table_name):
-        names.add(resolve_stored(table_name, SUPERSET_DIALECT))
+        names.add(resolve_stored(table_name, superset_dialect()))
     return names
 
 

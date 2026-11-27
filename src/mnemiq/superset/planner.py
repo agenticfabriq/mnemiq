@@ -89,7 +89,7 @@ from mnemiq.superset.measures import MAX_LABEL, Measure, MeasureKind, MeasureRef
 from mnemiq.superset.plan_rows import Link, Refusal, Types, Unique, aggregated, base_among, base_of, chain, column_of, \
     column_text, edges, far_side, join_text, links_of, mistyped, qualified, qualify, read_join, rewrite
 from mnemiq.superset.saved_metrics import Carried, SavedMetric, carry, read_saved_metrics, reusable, same_definition
-from mnemiq.superset.settings import SUPERSET_DIALECT
+from mnemiq.superset.settings import superset_dialect
 
 __all__ = ["COUNT_METRIC", "FILTER_OPERATORS", "GRAINS", "PLANNER_MAX_TOKENS", "PLAN_JSON_SHAPE", "SCALAR",
            "BuildPlan", "FakePlanner",
@@ -1086,7 +1086,7 @@ def _own_columns(table: str, columns: frozenset[str]) -> dict[str, tuple[str, st
 
 
 def _quoted(name: str) -> str:
-    return exp.to_identifier(name, quoted=True).sql(dialect=SUPERSET_DIALECT)
+    return exp.to_identifier(name, quoted=True).sql(dialect=superset_dialect())
 
 
 def _made_count(dataset_id: int) -> SavedMetric:
@@ -1117,7 +1117,7 @@ def _temporal(data_type: str | None) -> bool:
     if not data_type:
         return False
     try:
-        built = exp.DataType.build(data_type, dialect=SUPERSET_DIALECT, udt=True)
+        built = exp.DataType.build(data_type, dialect=superset_dialect(), udt=True)
     except (SqlglotError, ValueError):
         return False
     return built.is_type(*exp.DataType.TEMPORAL_TYPES) and not built.is_type(*_TIME_OF_DAY)
@@ -1151,7 +1151,7 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
     if (marker := next((d for d in JINJA_DELIMITERS if d in planned.join), None)) is not None:
         return f"it holds {marker}, which Superset reads as a template marker; write it without {marker}"
     try:
-        tree = sqlglot.parse_one(f"{_JOIN_PREFIX}{planned.join}", read=SUPERSET_DIALECT)
+        tree = sqlglot.parse_one(f"{_JOIN_PREFIX}{planned.join}", read=superset_dialect())
     except SqlglotError:
         return "it is not one SQL join"
     if not isinstance(tree, exp.Select) or {key for key, value in tree.args.items() if value} - {"expressions",
@@ -1177,14 +1177,14 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
     for node in nodes:
         if (problem := _table_problem(node)) is not None:
             return problem
-        name = resolve_identifier(node.this, SUPERSET_DIALECT)
+        name = resolve_identifier(node.this, superset_dialect())
         if name not in catalogue.columns:
             return f"{node.name!r} is not a table this builder can read"
         if name in names:
             return f"it joins {node.name!r} to itself"
         names.append(name)
         alias = node.args.get("alias")
-        qualifiers[resolve_identifier(alias.this if alias else node.this, SUPERSET_DIALECT)] = name
+        qualifiers[resolve_identifier(alias.this if alias else node.this, superset_dialect())] = name
         qualifier_of[name] = (alias.this if alias else node.this).copy()
     if (problem := _condition_problem(tree, qualifiers, catalogue)) is not None:
         return problem
@@ -1230,7 +1230,7 @@ def _joined(planned: PlannedDataset, catalogue: _Catalogue) -> _Rows | str:
     select = tree.copy()
     select.set("expressions", picked)
     made = PlannedDataset(key=planned.key, placeholder=planned.placeholder, join=planned.join,
-                          sql=select.sql(dialect=SUPERSET_DIALECT), name=_virtual_name(planned.key, names))
+                          sql=select.sql(dialect=superset_dialect()), name=_virtual_name(planned.key, names))
     reader = _made_from(planned.join)
     return _Rows(frozenset(owners), f'({made.sql}) AS "virtual_table"', (_made_count(planned.placeholder),),
                  _dataset_part(planned), types, made, measured=frozenset(owners), owners=owners, shared=shared,
@@ -1259,8 +1259,8 @@ def _far_links(condition: exp.Expression, table: str, before: Sequence[str],
         sides = [side.unnest() for side in (equal.this, equal.expression)]
         if not all(isinstance(side, exp.Column) and side.table for side in sides):
             continue
-        left, right = ((qualifiers.get(resolve_identifier(side.args["table"], SUPERSET_DIALECT)),
-                        resolve_identifier(side.this, SUPERSET_DIALECT)) for side in sides)
+        left, right = ((qualifiers.get(resolve_identifier(side.args["table"], superset_dialect())),
+                        resolve_identifier(side.this, superset_dialect())) for side in sides)
         if left[0] == table and right[0] in before:
             found[Link(right, left)] = None
         elif right[0] == table and left[0] in before:
@@ -1272,7 +1272,7 @@ def _table_problem(node: exp.Table) -> str | None:
     """Why a joined table is not named alone, or with an alias alone: a function in its place, a schema, ONLY, a
     TABLESAMPLE (which would make the dataset a sample of the table), or an alias's column list."""
     if not isinstance(node.this, exp.Identifier):
-        return f"it joins tables only, never a function such as {node.this.sql(dialect=SUPERSET_DIALECT)}"
+        return f"it joins tables only, never a function such as {node.this.sql(dialect=superset_dialect())}"
     clauses = {key for key, value in node.args.items() if value} - {"this", "alias"}
     if clauses & {"db", "catalog"}:
         return "it names its tables without a schema"
@@ -1292,14 +1292,14 @@ def _condition_problem(tree: exp.Select, qualifiers: Mapping[str | None, str], c
     """Why a join's ON conditions name something other than a joined table's column: a column of a table not in the
     join, one no joined table has, or a `TABLE` read as a column (`= ANY (TABLE t)`, which sqlglot reads that way)."""
     for column in tree.find_all(exp.Column):
-        written = column.sql(dialect=SUPERSET_DIALECT)
-        name = resolve_identifier(column.this, SUPERSET_DIALECT)
+        written = column.sql(dialect=superset_dialect())
+        name = resolve_identifier(column.this, superset_dialect())
         if column.name.casefold() == "table":
             return f"its conditions name {written}: a table is joined, never read in a condition"
         if column.args.get("db") or column.args.get("catalog"):
             return f"its conditions name {written} with a schema; name a joined table's column"
         if column.table:
-            owner = qualifiers.get(resolve_identifier(column.args.get("table"), SUPERSET_DIALECT))
+            owner = qualifiers.get(resolve_identifier(column.args.get("table"), superset_dialect()))
             if owner is None:
                 return f"its conditions name {written}, and {column.table!r} is no table of the join"
             if name not in catalogue.columns[owner]:
@@ -1312,7 +1312,7 @@ def _condition_problem(tree: exp.Select, qualifiers: Mapping[str | None, str], c
 def _expression_columns(expression: str) -> list[exp.Column] | None:
     """The columns `expression` names, or None when it does not parse (`check_measure` says why)."""
     try:
-        return list(sqlglot.parse_one(f"SELECT {expression}", read=SUPERSET_DIALECT).find_all(exp.Column))
+        return list(sqlglot.parse_one(f"SELECT {expression}", read=superset_dialect()).find_all(exp.Column))
     except SqlglotError:
         return None
 
@@ -1322,9 +1322,9 @@ def _column_problem(columns: list[exp.Column], rows: _Rows) -> str | None:
     does not hold (a column two joined tables share is the dataset's only as `<table>_<column>`)."""
     for column in columns:
         if column.table:
-            return (f"name {column.sql(dialect=SUPERSET_DIALECT)} alone, as {column.name}: the joined dataset names "
+            return (f"name {column.sql(dialect=superset_dialect())} alone, as {column.name}: the joined dataset names "
                     "its columns without their tables")
-        name = resolve_identifier(column.this, SUPERSET_DIALECT)
+        name = resolve_identifier(column.this, superset_dialect())
         if name not in rows.measured:
             return _column_refusal(name, rows)
     return None
@@ -1740,7 +1740,7 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
                 refuse(part, problem)
                 continue
             reads.setdefault(measure.dataset_id, set()).update(
-                on.owners[n] for c in named if (n := resolve_identifier(c.this, SUPERSET_DIALECT)) in on.owners)
+                on.owners[n] for c in named if (n := resolve_identifier(c.this, superset_dialect())) in on.owners)
         verdict = check_measure(measure, source=on.source, dimension_names=tuple(sorted(columns_of[measure.name])),
                                 adapter=adapter, snapshot=snapshot, grants=grants, guard_fanout=settings.guard_fanout)
         if isinstance(verdict, MeasureRefused):
@@ -1802,8 +1802,8 @@ def _check(plan: BuildPlan, catalogue: _Catalogue, context: PlanContext, *, adap
             continue
         if guarded and placeholder not in grains:
             grains[placeholder] = tables_off_their_grain(
-                sqlglot.parse_one(f"{_JOIN_PREFIX}{on.planned.join}", read=SUPERSET_DIALECT),
-                visible_schema(snapshot, grants), key_facts(snapshot), SUPERSET_DIALECT)
+                sqlglot.parse_one(f"{_JOIN_PREFIX}{on.planned.join}", read=superset_dialect()),
+                visible_schema(snapshot, grants), key_facts(snapshot), superset_dialect())
         found = _carried(ref, on, catalogue, grains.get(placeholder))
         if isinstance(found, str):
             refuse(part, found)

@@ -19,7 +19,7 @@ from mnemiq.superset.plan_rows import (Link, Refusal, Step, aggregated, base_amo
                                        qualify, read_join, rewrite)
 from mnemiq.superset.planner import joined_names
 from mnemiq.superset.saved_metrics import normalized
-from mnemiq.superset.settings import SUPERSET_DIALECT
+from mnemiq.superset.settings import superset_dialect
 
 
 def _relationship(source: str, target: str, *keys: tuple[str, str], name: str | None = None) -> Relationship:
@@ -499,7 +499,7 @@ def test_join_text_is_a_left_join_chain_from_the_base():
     assert text == ('"order_items" LEFT JOIN "orders" ON "order_items"."order_id" = "orders"."order_id" '
                     'LEFT JOIN "products" ON "order_items"."product_id" = "products"."product_id" '
                     'LEFT JOIN "customers" ON "orders"."customer_id" = "customers"."customer_id"')
-    tree = sqlglot.parse_one(f"SELECT 1 FROM {text}", read=SUPERSET_DIALECT)
+    tree = sqlglot.parse_one(f"SELECT 1 FROM {text}", read=superset_dialect())
     assert [join.side for join in tree.args["joins"]] == ["LEFT", "LEFT", "LEFT"]
     two = (Link(("returns", "order_id"), ("order_items", "order_id")),
            Link(("returns", "product_id"), ("order_items", "product_id")))
@@ -542,5 +542,5 @@ def test_rewrite_names_every_qualified_column_as_the_dataset_does():
     assert normalized(rewrite("SUM(order_items.revenue)", names)) == normalized("SUM(revenue)")
     assert normalized(rewrite("SUM(order_items.revenue * order_items.quantity)", names)) == (
         normalized("SUM(revenue * quantity)"))
-    assert not [column for column in sqlglot.parse_one(f"SELECT {rewritten}", read=SUPERSET_DIALECT)
+    assert not [column for column in sqlglot.parse_one(f"SELECT {rewritten}", read=superset_dialect())
                 .find_all(exp.Column) if column.table]

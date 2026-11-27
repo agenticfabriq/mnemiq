@@ -6,6 +6,9 @@ Superset's permissions and row rules decide what each query may read. A configur
 answer (a door whose tokens Superset does not accept, a connection mnemiq opens itself, a write) refuses to start.
 Each refusal names the setting to change and never repeats a credential, because this message reaches the console and
 whatever log the operator keeps.
+
+Superset mode's SQL dialect lives here too, set once at boot (`use_superset_dialect`) and read at each use
+(`superset_dialect`).
 """
 
 from __future__ import annotations
@@ -24,14 +27,34 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Superset mode supports a Superset database on PostgreSQL only, so the SQL mnemiq writes and checks there is
-# PostgreSQL's.
-SUPERSET_DIALECT = "postgres"
-
 # The job a snapshot enriched through Superset records, naming the database and schema it was read from. A server in
 # Superset mode looks for it, so it never serves a snapshot built over a direct connection, which may hold sample
 # values that Superset's row rules would have kept from the person asking.
 SUPERSET_SOURCE_JOB = "superset:source"
+# The dialect of a snapshot that job records: enrichment through Superset reads PostgreSQL only.
+SUPERSET_SOURCE_DIALECT = "postgres"
+
+# The SQL dialects Superset mode writes and reads, by sqlglot's names for them.
+_DIALECTS = ("postgres", "oracle")
+# Superset mode's SQL dialect, that of the database its snapshot was read from: set once as a server boots in Superset
+# mode, before anything reads it, and PostgreSQL's until then, which enrichment through Superset reads with.
+_dialect = "postgres"
+
+
+def superset_dialect() -> str:
+    """Superset mode's SQL dialect, by sqlglot's name: `postgres` or `oracle`. Read where it is used, each time, never
+    into a value bound as a module is imported, which would keep what it found before boot set it."""
+    return _dialect
+
+
+def use_superset_dialect(dialect: str) -> None:
+    """Make `dialect` Superset mode's SQL dialect: once, as a server boots in Superset mode, before anything reads it.
+    Raises ValueError for anything but `postgres` or `oracle`, the dialects Superset mode writes."""
+    global _dialect
+    if dialect not in _DIALECTS:
+        raise ValueError(f"Superset mode's SQL dialect is postgres or oracle, not {dialect!r}")
+    _dialect = dialect
+
 
 SNAPSHOT_REFUSED = ("This deployment's knowledge is not the one enriched for the Superset database it answers from, so "
                     "nothing is answered until an operator enriches it through Superset; mnemiq's log records why.")

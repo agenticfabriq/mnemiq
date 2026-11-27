@@ -34,7 +34,7 @@ from mnemiq.store.bootstrap import init_store
 from mnemiq.store.snapshot_store import current_version, load_snapshot
 from mnemiq.superset.client import Bearer, DelegatedToken, SupersetMcp
 from mnemiq.superset.executor import NoSourceConnection, SupersetCredentialMissing, superset_executor
-from mnemiq.superset.settings import SNAPSHOT_REFUSED, SUPERSET_DIALECT, SupersetSnapshotRefused
+from mnemiq.superset.settings import SNAPSHOT_REFUSED, SupersetSnapshotRefused, superset_dialect
 from tests.scripted_deployment import IDENTITY, SQL, deployment, retrieve_the_one_table
 from tests.superset_fake import FakeSuperset
 from tests.superset_shared import DATABASE_ID, SCHEMA, SOURCE_ID, _snapshot, _source_job, superset_deployment
@@ -128,7 +128,8 @@ def test_boot_opens_no_source(tmp_path, model, fake, monkeypatch, no_direct_sour
     assert settings.pg_dsn  # the direct source is configured, and still never connected to
     with caplog.at_level(logging.INFO, logger="mnemiq.runtime"):
         runtime = build_runtime(settings)
-    assert isinstance(runtime.adapter, NoSourceConnection) and runtime.adapter.dialect == SUPERSET_DIALECT
+    assert isinstance(runtime.adapter, NoSourceConnection)
+    assert runtime.adapter.dialect == superset_dialect() == "postgres"
     assert fake.calls == []  # booting asks Superset nothing either
     messages = [record.getMessage() for record in caplog.records]
     assert any("Superset mode reads the function inventory per request" in m for m in messages)
@@ -137,8 +138,18 @@ def test_boot_opens_no_source(tmp_path, model, fake, monkeypatch, no_direct_sour
     assert not any(m.startswith("could not assess") for m in messages)
 
 
+def test_boot_sets_the_dialect_of_the_snapshot_it_serves(superset_oracle, tmp_path, model, fake, no_direct_source):
+    """Superset mode's dialect is set once, at boot, from the snapshot it serves, whatever it was before: a snapshot
+    enriched through Superset was read from PostgreSQL. Each request's adapter speaks it, as the agent requires."""
+    assert superset_dialect() == "oracle"
+    settings = superset_deployment(tmp_path, model.url, fake.url)
+    runtime = build_runtime(settings)
+    assert superset_dialect() == "postgres" and runtime.adapter.dialect == "postgres"
+    assert superset_executor(settings, DelegatedToken(TOKEN)).dialect == "postgres"
+
+
 def test_the_sentinel_refuses_every_source_method():
-    sentinel = NoSourceConnection(SUPERSET_DIALECT)
+    sentinel = NoSourceConnection(superset_dialect())
     calls = {"introspect": (), "list_columns": (), "foreign_keys": (), "view_definitions": (), "user_functions": (),
              "builtin_functions": (), "reachable_user_functions": (), "virtual_columns": (),
              "execute": ("SELECT 1",), "execute_arrow": ("SELECT 1",)}
@@ -265,7 +276,7 @@ def test_the_executor_takes_only_a_delegated_token(tmp_path, model, fake):
             superset_executor(settings, credential)
     adapter = superset_executor(settings, DelegatedToken(TOKEN))
     assert adapter.client.credential == DelegatedToken(TOKEN)
-    assert (adapter.database_id, adapter.schema, adapter.dialect) == (DATABASE_ID, SCHEMA, SUPERSET_DIALECT)
+    assert (adapter.database_id, adapter.schema, adapter.dialect) == (DATABASE_ID, SCHEMA, superset_dialect())
     assert fake.calls == []  # building the adapter calls nothing
 
 
@@ -501,15 +512,15 @@ def _agent(adapter) -> Agent:
 
 
 def test_with_adapter_refuses_another_dialect():
-    agent = _agent(NoSourceConnection(SUPERSET_DIALECT))
+    agent = _agent(NoSourceConnection(superset_dialect()))
     with pytest.raises(ValueError, match="duckdb"):
         agent.with_adapter(NoSourceConnection("duckdb"))
 
 
 def test_with_adapter_replaces_only_the_adapter():
-    sentinel = NoSourceConnection(SUPERSET_DIALECT)
+    sentinel = NoSourceConnection(superset_dialect())
     agent = _agent(sentinel)
-    per_request = NoSourceConnection(SUPERSET_DIALECT)
+    per_request = NoSourceConnection(superset_dialect())
     twin = agent.with_adapter(per_request)
     assert twin is not agent and twin.adapter is per_request and agent.adapter is sentinel
     assert twin.cache is agent.cache and twin.dialect == agent.dialect and twin.budget is agent.budget

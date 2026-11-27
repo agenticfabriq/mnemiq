@@ -81,6 +81,7 @@ from mnemiq.superset.extension import row_rule_applies
 from mnemiq.superset.display_format import CANNOT_TELL, Displayed, displayed, fits, metric_label, shows_currency
 from mnemiq.superset.measures import Measure, MeasureKind, measure_statement, run_decided
 from mnemiq.superset.saved_metrics import SavedMetric
+from mnemiq.superset.settings import superset_dialect
 
 __all__ = ["ChartCheck", "ChartRead", "ChartStatus", "DatasetFacts", "Expectation", "NotCheckable", "check_chart",
            "dataset_of", "expectation_from_form_data", "percent_problem", "read_chart", "read_dataset_facts"]
@@ -399,8 +400,8 @@ def _literal(value) -> str:
     if isinstance(value, bool):
         return "TRUE" if value else "FALSE"
     if isinstance(value, (int, float)):
-        return exp.Literal.number(value).sql(dialect="postgres")
-    return exp.Literal.string(str(value)).sql(dialect="postgres")
+        return exp.Literal.number(value).sql(dialect=superset_dialect())
+    return exp.Literal.string(str(value)).sql(dialect=superset_dialect())
 
 
 def _filter_sql(item: Filter) -> str:
@@ -882,9 +883,9 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
             return not_checked("the chart groups a virtual dataset by a time grain, which Superset's query_dataset "
                                "cannot ask for")
     else:
-        if getattr(adapter, "dialect", None) != "postgres":
-            return not_checked("mnemiq's own statement for a chart is written for Postgres, Superset mode's one "
-                               "dialect, and this adapter speaks another")
+        if getattr(adapter, "dialect", None) != superset_dialect():
+            return not_checked("mnemiq's own statement for a chart is written in the dialect of Superset mode's "
+                               "database, Postgres or Oracle, and this adapter speaks another")
         if dataset.database_id != getattr(adapter, "database_id", dataset.database_id) \
                 or (dataset.schema or None) != getattr(adapter, "schema", dataset.schema):
             return not_checked("the chart's dataset is on another database or schema than the one mnemiq reads")

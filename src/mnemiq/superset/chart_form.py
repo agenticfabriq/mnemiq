@@ -20,6 +20,7 @@ from sqlglot.errors import SqlglotError
 from mnemiq.superset.adapter import JINJA_DELIMITERS
 from mnemiq.superset.charts import Filter, not_null_condition
 from mnemiq.superset.display_format import metric_label
+from mnemiq.superset.settings import superset_dialect
 
 __all__ = ["DatasetFacts", "Expectation", "NotCheckable", "expectation_from_form_data"]
 
@@ -140,7 +141,7 @@ def _metric_items(viz_type: str, form: dict) -> list:
 
 
 def _quoted(name: str) -> str:
-    return exp.to_identifier(name, quoted=True).sql(dialect="postgres")
+    return exp.to_identifier(name, quoted=True).sql(dialect=superset_dialect())
 
 
 def _metric(item, dataset: DatasetFacts) -> tuple[str, str] | NotCheckable:
@@ -259,7 +260,7 @@ def _one_sum_or_count(expression) -> bool:
     if any(marker in expression for marker in JINJA_DELIMITERS):
         return False
     try:
-        node = sqlglot.parse_one(expression, read="postgres")
+        node = sqlglot.parse_one(expression, read=superset_dialect())
     except (SqlglotError, ValueError):
         return False
     if isinstance(node, exp.Sum):
