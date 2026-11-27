@@ -81,13 +81,49 @@ def test_use_superset_dialect_refuses_others(dialect):
     assert superset_dialect() == "postgres"
 
 
-def test_use_superset_dialect_sets_what_every_use_reads(superset_oracle):
+def test_use_superset_dialect_sets_what_every_use_reads():
     """Read at each use: an adapter built after the dialect is set speaks it, though its module was imported before."""
+    assert SupersetSqlAdapter(object(), database_id=7, schema="shop").dialect == "postgres"
+    use_superset_dialect("oracle")
     assert superset_dialect() == "oracle"
     assert SupersetSqlAdapter(object(), database_id=7, schema="SHOP").dialect == "oracle"
-    use_superset_dialect("postgres")
+
+
+@pytest.mark.parametrize("first, second", [("oracle", "postgres"), ("postgres", "oracle")])
+def test_the_dialect_is_set_once_in_a_process(first, second):
+    """Set once: every module reads the one value, so a second runtime booted in another dialect would change the SQL
+    of the first one under it. Another value is refused with a plain error and changes nothing; the same one again is
+    no change. Before any is set the dialect reads as PostgreSQL's, which is not a setting: either may be set."""
     assert superset_dialect() == "postgres"
-    assert SupersetSqlAdapter(object(), database_id=7, schema="shop").dialect == "postgres"
+    use_superset_dialect(first)
+    use_superset_dialect(first)
+    with pytest.raises(RuntimeError) as refused:
+        use_superset_dialect(second)
+    assert str(refused.value) == (
+        f"Superset mode's SQL dialect is already {first} in this process, set as a server booted for a snapshot read "
+        f"from that database: one process answers in one dialect, so a snapshot read from {second} is served from a "
+        "process of its own")
+    assert superset_dialect() == first
+
+
+def test_an_unknown_dialect_is_refused_after_one_is_set():
+    use_superset_dialect("oracle")
+    with pytest.raises(ValueError, match="postgres or oracle"):
+        use_superset_dialect("mysql")
+    assert superset_dialect() == "oracle"
+
+
+def test_a_tests_dialect_is_put_back_after_it(superset_oracle):
+    """The conftest's guard: this test's process is in Oracle's dialect, and the next test's is not."""
+    assert superset_dialect() == "oracle"
+
+
+def test_the_test_before_left_no_dialect():
+    """Runs after `test_a_tests_dialect_is_put_back_after_it`, in file order: nothing was left set, so Oracle's may be
+    set here, which a dialect left set would refuse."""
+    assert superset_dialect() == "postgres"
+    use_superset_dialect("oracle")
+    assert superset_dialect() == "oracle"
 
 
 def test_no_module_names_the_dialect_but_settings():

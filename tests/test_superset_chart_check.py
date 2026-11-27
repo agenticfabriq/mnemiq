@@ -45,7 +45,6 @@ from mnemiq.superset.charts import Filter
 from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetPermissionDenied
 from mnemiq.superset.measures import MeasureKind
 from mnemiq.superset.saved_metrics import SavedMetric
-from mnemiq.superset.settings import use_superset_dialect
 from tests.superset_fake import (
     FakeSuperset,
     answering_dry_runs,
@@ -2644,7 +2643,7 @@ def test_oracle_grains_are_supersets_own(fake, superset_oracle, grain):
     assert _grouped_by(sql) == [expression]
 
 
-def test_an_oracle_week_sits_on_its_years_first_weekday(fake, superset_oracle):
+def test_an_oracle_week_sits_on_its_years_first_weekday(fake, superset_oracle, superset_dialect_as):
     """Oracle's `TRUNC(..., 'WW')` starts each week on the weekday 1 January of that year fell on, not on a Monday as
     PostgreSQL's `DATE_TRUNC('week', ...)` does, and a 365-day year's last week starts on 31 December (2025: 1 January
     a Wednesday, and 31 December 364 days on). Superset's rows on Mondays of 2026 are not on Oracle's week: the grain
@@ -2660,7 +2659,7 @@ def test_an_oracle_week_sits_on_its_years_first_weekday(fake, superset_oracle):
     check = _check(fake)
     assert check.status is ChartStatus.NOT_CHECKED and check.reason == chart_check._NO_GRAIN
     assert _statements(fake) == []
-    use_superset_dialect("postgres")
+    superset_dialect_as("postgres")
     assert on("2026-01-05T00:00:00", "P1W") and not on("2026-01-08T00:00:00", "P1W")
     assert not on("2025-12-31T00:00:00", "P1W")
 
@@ -2755,7 +2754,7 @@ def test_a_postgres_chart_filtered_on_true_or_false_is_written_as_before(fake, c
     ("ILIKE", "LOWER(\"CHANNEL\") LIKE LOWER('W%')", "\"channel\" ILIKE 'W%'"),
     ("NOT ILIKE", "LOWER(\"CHANNEL\") NOT LIKE LOWER('W%')", "\"channel\" NOT ILIKE 'W%'"),
 ])
-def test_oracle_has_no_ilike(fake, superset_oracle, op, written, postgres):
+def test_oracle_has_no_ilike(fake, superset_oracle, superset_dialect_as, op, written, postgres):
     """Oracle has no ILIKE. Superset's case-insensitive match is SQLAlchemy's `ilike`, which its Oracle dialect writes
     as `lower(<column>) LIKE lower(<pattern>)`, so mnemiq writes the same, LOWER on both sides: a case mapping is not
     symmetric for every character, so UPPER on both could match other rows. PostgreSQL keeps its ILIKE. mnemiq's own
@@ -2771,7 +2770,7 @@ def test_oracle_has_no_ilike(fake, superset_oracle, op, written, postgres):
     assert written in sql and "ILIKE" not in sql.upper()
     sqlglot.parse_one(sql, read="oracle")
     fake.calls.clear()
-    use_superset_dialect("postgres")
+    superset_dialect_as("postgres")
     _serve(fake, form_data=_bar(adhoc_filters=filters), chart=_chart_data(["region", "Total premium"], *rows),
            mnemiq=_result(*rows))
     check = _check(fake)
@@ -2804,7 +2803,7 @@ ONE_PREMIUM = Expectation(metrics=(("Total premium", "SUM(premium)"),), dimensio
                           filters=())
 
 
-def test_an_oracle_ranked_read_fetches_its_first_rows(superset_oracle):
+def test_an_oracle_ranked_read_fetches_its_first_rows(superset_oracle, superset_dialect_as):
     """A read in the chart's ranking order asks for its first rows with Oracle's row-limiting clause, which the adapter
     reads as the statement's bound; PostgreSQL keeps its LIMIT and its ordinal."""
     sql = chart_check._statement(ONE_PREMIUM, PHYSICAL, grained=True, ranking=Ranking(0, True, 10), limit=20)
@@ -2813,7 +2812,7 @@ def test_an_oracle_ranked_read_fetches_its_first_rows(superset_oracle):
     assert _grouped_by(sql) == ['"REGION"']
     assert chart_check._statement(ONE_PREMIUM, PHYSICAL, grained=True, ranking=Ranking(0, False, 10)).endswith(
         "ORDER BY m0 ASC NULLS LAST")
-    use_superset_dialect("postgres")
+    superset_dialect_as("postgres")
     assert chart_check._statement(ONE_PREMIUM, PHYSICAL, grained=True, ranking=Ranking(0, True, 10), limit=20) == (
         'SELECT "region", SUM(premium) AS m0 FROM "policy" GROUP BY 1 ORDER BY m0 DESC NULLS LAST LIMIT 20')
 
@@ -2899,7 +2898,8 @@ def test_a_postgres_made_dataset_is_not_dry_run(fake):
     assert not [call for call in fake.calls if call.request.get("dry_run") or call.tool in (TABLE_RULES, TABLES_READ)]
 
 
-def test_an_oracle_made_dataset_is_read_without_as_before_its_alias(fake, superset_oracle, monkeypatch):
+def test_an_oracle_made_dataset_is_read_without_as_before_its_alias(fake, superset_oracle, superset_dialect_as,
+                                                                      monkeypatch):
     """Superset reads a virtual dataset as a subquery aliased `virtual_table`, which SQLAlchemy's Oracle dialect writes
     without `AS`, since Oracle refuses one before a table's alias, and unquoted, a lower-case name it needs no quotes
     for, which Oracle reads as VIRTUAL_TABLE; so mnemiq writes the alias so there, bare. A chart on a dataset this
@@ -2923,5 +2923,5 @@ def test_an_oracle_made_dataset_is_read_without_as_before_its_alias(fake, supers
     [sql] = _statements(fake)
     assert f'FROM ({held}) virtual_table WHERE ' in sql and '"virtual_table"' not in sql, sql
     assert _grouped_by(sql) == ['"REGION"']
-    use_superset_dialect("postgres")
+    superset_dialect_as("postgres")
     assert chart_check._virtual_source(MADE_SQL) == f'({MADE_SQL}) AS "virtual_table"'

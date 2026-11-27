@@ -47,10 +47,13 @@ from mnemiq.superset.executor import (
 )
 from mnemiq.superset.grants import FixedGrants, GrantsUnreadable, resolve_grants
 from mnemiq.superset.history import superset_history
+from mnemiq.superset.names import stored_name
 from mnemiq.superset.settings import (
-    SUPERSET_SOURCE_DIALECT,
+    SERVED_JOBS,
+    SUPERSET_ORACLE_JOB,
     SUPERSET_SOURCE_JOB,
     SupersetSnapshotRefused,
+    oracle_source,
     superset_dialect,
     use_superset_dialect,
 )
@@ -208,11 +211,11 @@ class Runtime:
             return
         snapshot, versions = load_current_snapshot(self.settings, self.con)
         if versions != self.loaded_versions:
-            if self._superset_mode and (refusal := superset_source_refusal(snapshot, self.settings)) is not None:
-                # Held to the rule boot holds the first snapshot to. The snapshot already serving is kept in memory
-                # but answers nothing: this request is refused, on every door, rather than answered from a snapshot
-                # that may hold sample values, or from the one it was published to replace. Why goes to the log once
-                # here, and the person is told mnemiq's sentence.
+            if self._superset_mode and (refusal := _superset_swap_refusal(snapshot, self.settings)) is not None:
+                # Held to the rule boot holds the first snapshot to, and to the dialect boot set from it. The snapshot
+                # already serving is kept in memory but answers nothing: this request is refused, on every door,
+                # rather than answered from a snapshot that may hold sample values, or from the one it was published
+                # to replace. Why goes to the log once here, and the person is told mnemiq's sentence.
                 logger.warning("Superset mode will not serve the snapshot published for source %r, so this request "
                                "is refused: %s", snapshot.source_id, refusal)
                 raise SupersetSnapshotRefused(refusal)
@@ -613,15 +616,25 @@ def superset_source_refusal(snapshot: Snapshot, settings: Settings) -> str | Non
     """Why Superset mode will not serve `snapshot`, or None when it will.
 
     It serves only a snapshot enriched through Superset from the database and schema it is configured for, which its
-    `superset:source` job records. A snapshot read any other way may hold sample values that Superset's row rules would
-    keep from the person asking, and one read from another database or schema describes tables this deployment does
-    not answer from."""
-    jobs = [job for job in snapshot.jobs if job.id == SUPERSET_SOURCE_JOB]
+    `superset:source` job records, or one enriched directly from Oracle for Superset mode from the schema it is
+    configured for, which its `superset:oracle` job records (`mnemiq enrich --for-superset`); one of the two kinds, never
+    both. A snapshot read any other way may hold sample values that Superset's row rules would keep from the person
+    asking, and one read from another database or schema describes tables this deployment does not answer from."""
+    jobs = [job for job in snapshot.jobs if job.id in SERVED_JOBS]
     if not jobs:
         return (f"the snapshot for source {snapshot.source_id!r} was not enriched through Superset, and Superset mode "
                 "serves only one that was: a snapshot read over a direct connection may hold sample values Superset's "
-                "row rules would keep from the person asking. Run `mnemiq enrich` in Superset mode, then `mnemiq build`")
+                "row rules would keep from the person asking. Run `mnemiq enrich` in Superset mode, then `mnemiq build`"
+                "; on Oracle, `mnemiq enrich --for-superset` over a direct connection, then `mnemiq build`")
+    if len({job.id for job in jobs}) > 1:
+        return (f"the snapshot for source {snapshot.source_id!r} records both an enrichment through Superset (its "
+                f"{SUPERSET_SOURCE_JOB} job) and one directly from Oracle (its {SUPERSET_ORACLE_JOB} job), so the "
+                "database it was read from cannot be told: run `mnemiq enrich` again")
     for job in jobs:
+        if job.id == SUPERSET_ORACLE_JOB:
+            if (refusal := _oracle_source_refusal(job, settings)) is not None:
+                return refusal
+            continue
         if job.status != "done":
             return (f"the snapshot's enrichment through Superset did not finish (its {SUPERSET_SOURCE_JOB} job is "
                     f"{job.status!r}): run `mnemiq enrich` again")
@@ -641,6 +654,52 @@ def superset_source_refusal(snapshot: Snapshot, settings: Settings) -> str | Non
     return None
 
 
+def _oracle_source_refusal(job, settings: Settings) -> str | None:
+    """Why Superset mode will not serve a snapshot for its `superset:oracle` job, or None.
+
+    MNEMIQ_SUPERSET_SCHEMA names the schema as Superset shows it, and the job names it as Oracle stores it, so the two
+    are compared through the one name mapping, in the direction Superset reads: the stored name Superset reads for the
+    setting (`stored_name`), against the job's. Superset shows a schema stored `SHOP` and one stored `shop` alike, as
+    `shop`, and reads `shop` as SHOP; compared the other way, a snapshot read from `shop` would be taken for SHOP's.
+    The mapping is Oracle's, the job's dialect, whatever the process's reads: boot sets the dialect only once this
+    check accepts the snapshot."""
+    if job.status != "done":
+        return (f"the snapshot's enrichment from Oracle for Superset mode did not finish (its {SUPERSET_ORACLE_JOB} job "
+                f"is {job.status!r}): run `mnemiq enrich --for-superset` again")
+    source = oracle_source(job.detail)
+    if source is None:
+        return (f"the snapshot's record of the Oracle database it was read from (its {SUPERSET_ORACLE_JOB} job) cannot "
+                "be read, so the snapshot is not served: run `mnemiq enrich --for-superset` again")
+    read = stored_name(settings.superset_schema, dialect=SERVED_JOBS[SUPERSET_ORACLE_JOB].dialect)
+    if read != source.schema:
+        return (f"the snapshot was enriched from Oracle schema {source.schema!r}, and MNEMIQ_SUPERSET_SCHEMA is "
+                f"{settings.superset_schema!r}, which Superset reads as {read!r}: enrich this deployment's schema, or "
+                "set the schema to the one it was enriched from, as Superset shows it")
+    return None
+
+
+def superset_snapshot_dialect(snapshot: Snapshot) -> str:
+    """Superset mode's SQL dialect for `snapshot`, one `superset_source_refusal` accepts: that of the database its job
+    says it was read from. Raises ValueError for a snapshot that carries no such job."""
+    dialects = {SERVED_JOBS[job.id].dialect for job in snapshot.jobs if job.id in SERVED_JOBS}
+    if len(dialects) != 1:
+        raise ValueError(f"the snapshot for source {snapshot.source_id!r} does not say which database it was read from")
+    return dialects.pop()
+
+
+def _superset_swap_refusal(snapshot: Snapshot, settings: Settings) -> str | None:
+    """Why a server in Superset mode will not swap to `snapshot`, a newer one published, or None: the rule boot holds
+    a snapshot to (`superset_source_refusal`), and the dialect, which boot set once from the snapshot it served and no
+    swap changes. A snapshot read from another database is served by a server booted for it."""
+    if (refusal := superset_source_refusal(snapshot, settings)) is not None:
+        return refusal
+    if (published := superset_snapshot_dialect(snapshot)) != (serving := superset_dialect()):
+        return (f"the snapshot published for source {snapshot.source_id!r} was read from {published}, and this server "
+                f"answers in {serving}'s SQL, set once as it booted: it keeps the snapshot it serves, answering nothing "
+                "from it, until it is restarted to serve the new one")
+    return None
+
+
 def _superset_source(detail: str | None) -> tuple[int, str] | None:
     """The database id and schema a `superset:source` job's detail records, or None unless the detail is exactly what
     enrichment through Superset writes: those two, the backend `postgresql`, and `values` saying none were
@@ -655,7 +714,7 @@ def _superset_source(detail: str | None) -> tuple[int, str] | None:
     # `type(...) is int`, since a JSON true reads as a bool, which Python also counts an int.
     if type(database_id) is not int or not isinstance(schema, str):
         return None
-    if record["backend"] != "postgresql" or record["values"] != "not harvested":
+    if record["backend"] != SERVED_JOBS[SUPERSET_SOURCE_JOB].backend or record["values"] != "not harvested":
         return None
     return database_id, schema
 
@@ -1320,8 +1379,9 @@ def build_runtime(settings: Settings) -> Runtime:
         if (refusal := superset_source_refusal(snapshot, settings)) is not None:
             raise SnapshotMissing(refusal)
         # Superset mode's SQL dialect, set here once, before anything reads it: that of the database the snapshot was
-        # read from, PostgreSQL for the one kind served, a snapshot enriched through Superset.
-        use_superset_dialect(SUPERSET_SOURCE_DIALECT)
+        # read from, PostgreSQL's for a snapshot enriched through Superset and Oracle's for one enriched directly from
+        # Oracle. A process that already set the other refuses (`use_superset_dialect`).
+        use_superset_dialect(superset_snapshot_dialect(snapshot))
         # Runs nothing: `source_adapter` would refuse in this mode, and each request brings its own adapter.
         adapter = NoSourceConnection(superset_dialect())
     else:

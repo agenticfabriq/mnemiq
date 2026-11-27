@@ -13,10 +13,11 @@ Superset mode's SQL dialect lives here too, set once at boot (`use_superset_dial
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import urlsplit
 
 from mnemiq.config import without_credentials
@@ -33,26 +34,102 @@ logger = logging.getLogger(__name__)
 SUPERSET_SOURCE_JOB = "superset:source"
 # The dialect of a snapshot that job records: enrichment through Superset reads PostgreSQL only.
 SUPERSET_SOURCE_DIALECT = "postgres"
+# The job a snapshot enriched directly from Oracle for Superset mode records (`mnemiq enrich --for-superset`): the
+# service the connection reached and the schema its unqualified names resolve in, as the session reported them, whether
+# values were harvested, and how the tables were profiled (`OracleSource`).
+SUPERSET_ORACLE_JOB = "superset:oracle"
+
+
+class ServedJob(NamedTuple):
+    """What a job of a snapshot Superset mode serves says of the database the snapshot was read from."""
+
+    # The backend the job's detail records, as Superset's `get_database_info` names a database's: SQLAlchemy's name.
+    backend: str
+    # Superset mode's SQL dialect for the snapshot, by sqlglot's name.
+    dialect: str
+
+
+# The jobs a snapshot Superset mode serves carries one kind of: enriched through Superset, from PostgreSQL, or directly
+# from Oracle for Superset mode.
+SERVED_JOBS = {SUPERSET_SOURCE_JOB: ServedJob("postgresql", SUPERSET_SOURCE_DIALECT),
+               SUPERSET_ORACLE_JOB: ServedJob("oracle", "oracle")}
+
+# What the `superset:oracle` job says of values: whether the enrichment login read any from the tables' rows.
+HARVESTED = "harvested"
+NOT_HARVESTED = "not harvested"
+_VALUES = (HARVESTED, NOT_HARVESTED)
+# How the tables were profiled: each exactly, or in statistics mode (some or all from the dictionary).
+EXACT = "exact"
+STATISTICS = "statistics"
+_PROFILES = (EXACT, STATISTICS)
+_ORACLE_FIELDS = frozenset({"backend", "service", "schema", "values", "profile"})
+
+
+class OracleSource(NamedTuple):
+    """What the `superset:oracle` job records: the Oracle service and schema the snapshot was read from, the schema as
+    Oracle stores it, and its `values` and `profile` words."""
+
+    service: str
+    schema: str
+    values: str
+    profile: str
+
+
+def oracle_source_detail(source: OracleSource) -> str:
+    """The `superset:oracle` job's detail for `source`, exactly as `oracle_source` reads it back. Raises ValueError for a
+    source it would not read."""
+    detail = json.dumps({"backend": SERVED_JOBS[SUPERSET_ORACLE_JOB].backend, "service": source.service,
+                         "schema": source.schema, "values": source.values, "profile": source.profile})
+    if oracle_source(detail) != source:
+        raise ValueError(f"not a record of an Oracle source Superset mode reads: {source!r}")
+    return detail
+
+
+def oracle_source(detail: str | None) -> OracleSource | None:
+    """What a `superset:oracle` job's detail records, or None unless it is exactly what enrichment writes: an object
+    with those five fields and no other, the backend `oracle`, a service and a schema each a text that is not empty,
+    and a `values` and a `profile` word each one it writes."""
+    try:
+        record = json.loads(detail or "")
+    except ValueError:
+        return None
+    if not isinstance(record, dict) or set(record) != _ORACLE_FIELDS:
+        return None
+    if record["backend"] != SERVED_JOBS[SUPERSET_ORACLE_JOB].backend:
+        return None
+    service, schema, values, profile = record["service"], record["schema"], record["values"], record["profile"]
+    if not (isinstance(service, str) and service and isinstance(schema, str) and schema):
+        return None
+    if not (isinstance(values, str) and values in _VALUES and isinstance(profile, str) and profile in _PROFILES):
+        return None
+    return OracleSource(service, schema, values, profile)
+
 
 # The SQL dialects Superset mode writes and reads, by sqlglot's names for them.
 _DIALECTS = ("postgres", "oracle")
 # Superset mode's SQL dialect, that of the database its snapshot was read from: set once as a server boots in Superset
-# mode, before anything reads it, and PostgreSQL's until then, which enrichment through Superset reads with.
-_dialect = "postgres"
+# mode, before anything reads it. None until then, read as PostgreSQL's, which enrichment through Superset reads with.
+_dialect: str | None = None
 
 
 def superset_dialect() -> str:
     """Superset mode's SQL dialect, by sqlglot's name: `postgres` or `oracle`. Read where it is used, each time, never
     into a value bound as a module is imported, which would keep what it found before boot set it."""
-    return _dialect
+    return _dialect if _dialect is not None else "postgres"
 
 
 def use_superset_dialect(dialect: str) -> None:
     """Make `dialect` Superset mode's SQL dialect: once, as a server boots in Superset mode, before anything reads it.
-    Raises ValueError for anything but `postgres` or `oracle`, the dialects Superset mode writes."""
+    Raises ValueError for anything but `postgres` or `oracle`, the dialects Superset mode writes, and RuntimeError where
+    this process already set the other: every module reads the one value, so a second runtime booted in another
+    dialect would change the first one's SQL under it. Setting the same dialect again changes nothing."""
     global _dialect
     if dialect not in _DIALECTS:
         raise ValueError(f"Superset mode's SQL dialect is postgres or oracle, not {dialect!r}")
+    if _dialect is not None and _dialect != dialect:
+        raise RuntimeError(f"Superset mode's SQL dialect is already {_dialect} in this process, set as a server booted "
+                           f"for a snapshot read from that database: one process answers in one dialect, so a "
+                           f"snapshot read from {dialect} is served from a process of its own")
     _dialect = dialect
 
 

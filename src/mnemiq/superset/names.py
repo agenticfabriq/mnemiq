@@ -100,11 +100,14 @@ def superset_name(stored: str) -> str:
     return stored
 
 
-def stored_name(shown: str) -> str:
+def stored_name(shown: str, *, dialect: str | None = None) -> str:
     """The stored name Superset reads for `shown`, a name it shows: SQLAlchemy's Oracle `denormalize_name` on Oracle,
     the name itself on PostgreSQL. A name stored in lower case is shown as itself and reads back in upper case, as
-    SQLAlchemy reads it: what Superset reads by it."""
-    if superset_dialect() != "oracle":
+    SQLAlchemy reads it: what Superset reads by it.
+
+    `dialect` is Superset mode's (`superset_dialect()`) unless given: the check of a snapshot at boot gives the dialect
+    of the database the snapshot was read from, which boot sets only once that check accepts it."""
+    if (superset_dialect() if dialect is None else dialect) != "oracle":
         return shown
     lower, upper = shown.lower(), shown.upper()
     if upper == lower:

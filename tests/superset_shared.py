@@ -19,7 +19,7 @@ from mnemiq.store.snapshot_store import save_snapshot
 from mnemiq.superset.charts import ChartSpec, Family, WrittenRef
 from mnemiq.superset.measures import Measure, MeasureKind
 from mnemiq.superset.planner import BuildPlan
-from mnemiq.superset.settings import SUPERSET_SOURCE_JOB
+from mnemiq.superset.settings import SUPERSET_ORACLE_JOB, SUPERSET_SOURCE_JOB
 from tests.superset_build_world import POLICY_DATASET
 
 # --- a Superset-mode deployment
@@ -34,6 +34,25 @@ def _source_job(*, status: str = "done", detail: str | None = None, **fields) ->
     values = {"database_id": DATABASE_ID, "schema": SCHEMA, "backend": "postgresql", "values": "not harvested"}
     values.update(fields)
     return Job(id=SUPERSET_SOURCE_JOB, source_id=SOURCE_ID, kind="superset", status=status,
+               detail=json.dumps(values) if detail is None else detail)
+
+
+# The Oracle service and schema a snapshot enriched directly from Oracle for Superset mode names, the schema as Oracle
+# stores it, and the schema setting a deployment serving it gives, as Superset shows that schema.
+ORACLE_SERVICE = "freepdb1"
+ORACLE_SCHEMA = "SHOP"
+ORACLE_SCHEMA_SETTING = "shop"
+
+
+def _oracle_job(*, status: str = "done", detail: str | None = None, without: tuple[str, ...] = (), **fields) -> Job:
+    """The job a snapshot enriched directly from Oracle for Superset mode carries (`mnemiq enrich --for-superset`),
+    naming the service and schema it read; `without` leaves those fields out."""
+    values = {"backend": "oracle", "service": ORACLE_SERVICE, "schema": ORACLE_SCHEMA, "values": "harvested",
+              "profile": "exact"}
+    values.update(fields)
+    for name in without:
+        del values[name]
+    return Job(id=SUPERSET_ORACLE_JOB, source_id=SOURCE_ID, kind="superset", status=status,
                detail=json.dumps(values) if detail is None else detail)
 
 
@@ -60,7 +79,8 @@ def superset_deployment(tmp_path, model_url: str, superset_url: str, *, jobs: li
     return Settings(acme_data_dir=None, llm_base_url=model_url, llm_api_key="stub-key", llm_model="stub-model",
                     store_path=str(store), source_id=SOURCE_ID, answer_log_path="off",
                     llm_window_check=settings.pop("llm_window_check", False), superset_mcp_url=superset_url,
-                    superset_database_id=DATABASE_ID, superset_schema=SCHEMA, **settings)
+                    superset_database_id=DATABASE_ID, superset_schema=settings.pop("superset_schema", SCHEMA),
+                    **settings)
 
 
 # --- the words answers are read by

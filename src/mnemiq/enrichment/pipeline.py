@@ -14,7 +14,17 @@ from mnemiq.enrichment.joins import build_relationships
 from mnemiq.enrichment.profiling import FAILED, profile_table, unharvested
 from mnemiq.enrichment.statistics import estimate_table, prefetch_dictionary
 from mnemiq.sql.fanout_check import PARTITIONS_JOB
-from mnemiq.superset.settings import SUPERSET_SOURCE_JOB
+from mnemiq.superset.settings import (
+    EXACT,
+    HARVESTED,
+    NOT_HARVESTED,
+    SERVED_JOBS,
+    STATISTICS,
+    SUPERSET_ORACLE_JOB,
+    SUPERSET_SOURCE_JOB,
+    OracleSource,
+    oracle_source_detail,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +126,12 @@ def content_version(snapshot: Snapshot) -> str:
     superset_source = next((j.detail for j in snapshot.jobs if j.id == SUPERSET_SOURCE_JOB), None)
     if superset_source is not None:
         body["superset_source"] = superset_source
+    # The `superset:oracle` job's DETAIL, the Oracle service and schema a snapshot enriched for Superset mode was read
+    # from, with its values and profile words, for the same reason; and the store keys a snapshot by its version, so a
+    # run for Superset mode would otherwise be stored as the run without it that it repeats. Only when set.
+    superset_oracle = next((j.detail for j in snapshot.jobs if j.id == SUPERSET_ORACLE_JOB), None)
+    if superset_oracle is not None:
+        body["superset_oracle"] = superset_oracle
     if snapshot.ontology_version:
         body["ontology_version"] = snapshot.ontology_version
     payload = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
@@ -263,8 +279,25 @@ def _estimated_columns(adapter, table, key_columns: set[str] | None, harvest_val
     ]
 
 
+# Reads what the `superset:oracle` job records of the connection enrichment reads Oracle through: the service it reached
+# and the schema its unqualified names resolve in, as the session itself reports them.
+ORACLE_BINDING_SQL = ("SELECT SYS_CONTEXT('USERENV', 'SERVICE_NAME'), SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') "
+                      "FROM DUAL")
+
+
+def oracle_binding(adapter) -> tuple[str, str]:
+    """The service and current schema of the Oracle session `adapter` reads through, as the session reports them, for
+    the `superset:oracle` job. Raises ValueError unless the answer is one row of two texts, neither empty."""
+    rows = adapter.execute(ORACLE_BINDING_SQL)
+    if not (len(rows) == 1 and len(rows[0]) == 2 and all(isinstance(value, str) and value for value in rows[0])):
+        raise ValueError("the Oracle session did not report a service and current schema")
+    service, schema = rows[0]
+    return service, schema
+
+
 def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
                       superset_source: tuple[int, str] | None = None,
+                      superset_oracle: tuple[str, str] | None = None,
                       statistics: tuple[str, ...] | None = None) -> Snapshot:
     """The no-LLM enrichment pass: discover, profile, infer joins.
 
@@ -274,7 +307,10 @@ def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
     With `harvest_values` False, profiling reads each column's counts and none of its values,
     so no column carries `coded_values`. `superset_source`, the Superset database id and schema
     the adapter reads, records them as the `superset:source` job a server in Superset mode looks
-    for; it is given only where no value is harvested, which the job says.
+    for; it is given only where no value is harvested, which the job says. `superset_oracle`, the
+    service and schema of the Oracle session the adapter reads (`oracle_binding`), records them as
+    the `superset:oracle` job instead, a snapshot enriched directly from Oracle for Superset mode,
+    with whether values were harvested and how the tables were profiled. Not both.
 
     `statistics` set is statistics mode (the manifest's `"profile": "statistics"`): each table is described from the
     source's dictionary (`estimate_table`), reading none of its rows, except the tables its patterns name (the
@@ -286,6 +322,8 @@ def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
     if superset_source is not None and harvest_values:
         raise ValueError("a snapshot enriched through Superset harvests no values: pass "
                          "harvest_values=False with superset_source")
+    if superset_source is not None and superset_oracle is not None:
+        raise ValueError("a snapshot is enriched through Superset or directly from Oracle for it, not both")
     catalog = introspect(adapter)
     exact = _exactly_profiled(catalog, statistics, source_id)
     estimated = frozenset(t.name for t in catalog if exact is not None and t.name not in exact)
@@ -447,7 +485,14 @@ def enrich_structural(adapter, source_id: str, *, harvest_values: bool = True,
         database_id, schema = superset_source
         jobs.append(Job(id=SUPERSET_SOURCE_JOB, source_id=source_id, kind="superset", status="done",
                         detail=json.dumps({"database_id": database_id, "schema": schema,
-                                           "backend": "postgresql", "values": "not harvested"})))
+                                           "backend": SERVED_JOBS[SUPERSET_SOURCE_JOB].backend,
+                                           "values": NOT_HARVESTED})))
+    if superset_oracle is not None:
+        service, schema = superset_oracle
+        source = OracleSource(service, schema, HARVESTED if harvest_values else NOT_HARVESTED,
+                              EXACT if statistics is None else STATISTICS)
+        jobs.append(Job(id=SUPERSET_ORACLE_JOB, source_id=source_id, kind="superset", status="done",
+                        detail=oracle_source_detail(source)))
 
     columns, source_bindings = _with_comments(adapter, columns, source_bindings)
     snapshot = Snapshot(

@@ -111,7 +111,8 @@ def test_the_command_line_flag_reaches_enrich(monkeypatch):
     from mnemiq import cli
 
     seen = {}
-    monkeypatch.setattr(cli, "_cmd_enrich", lambda settings, add=False: seen.setdefault("add", add) and 0)
+    monkeypatch.setattr(cli, "_cmd_enrich",
+                        lambda settings, add=False, for_superset=False: seen.setdefault("add", add) and 0)
     cli.main(["enrich", "--add"])
     cli_seen = seen.pop("add")
     cli.main(["enrich"])

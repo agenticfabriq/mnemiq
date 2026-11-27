@@ -34,7 +34,7 @@ from mnemiq.store.bootstrap import init_store
 from mnemiq.store.snapshot_store import current_version, load_snapshot
 from mnemiq.superset.client import Bearer, DelegatedToken, SupersetMcp
 from mnemiq.superset.executor import NoSourceConnection, SupersetCredentialMissing, superset_executor
-from mnemiq.superset.settings import SNAPSHOT_REFUSED, SupersetSnapshotRefused, superset_dialect
+from mnemiq.superset.settings import SNAPSHOT_REFUSED, SupersetSnapshotRefused, superset_dialect, use_superset_dialect
 from tests.scripted_deployment import IDENTITY, SQL, deployment, retrieve_the_one_table
 from tests.superset_fake import FakeSuperset
 from tests.superset_shared import DATABASE_ID, SCHEMA, SOURCE_ID, _snapshot, _source_job, superset_deployment
@@ -138,14 +138,16 @@ def test_boot_opens_no_source(tmp_path, model, fake, monkeypatch, no_direct_sour
     assert not any(m.startswith("could not assess") for m in messages)
 
 
-def test_boot_sets_the_dialect_of_the_snapshot_it_serves(superset_oracle, tmp_path, model, fake, no_direct_source):
-    """Superset mode's dialect is set once, at boot, from the snapshot it serves, whatever it was before: a snapshot
-    enriched through Superset was read from PostgreSQL. Each request's adapter speaks it, as the agent requires."""
-    assert superset_dialect() == "oracle"
+def test_boot_sets_the_dialect_of_the_snapshot_it_serves(tmp_path, model, fake, no_direct_source):
+    """Superset mode's dialect is set once, at boot, from the snapshot it serves: a snapshot enriched through Superset
+    was read from PostgreSQL. Each request's adapter speaks it, as the agent requires. Set, not read as the default:
+    Oracle's is refused after it (`tests/test_superset_oracle_snapshot.py` boots a snapshot read from Oracle)."""
     settings = superset_deployment(tmp_path, model.url, fake.url)
     runtime = build_runtime(settings)
     assert superset_dialect() == "postgres" and runtime.adapter.dialect == "postgres"
     assert superset_executor(settings, DelegatedToken(TOKEN)).dialect == "postgres"
+    with pytest.raises(RuntimeError, match="already postgres in this process"):
+        use_superset_dialect("oracle")
 
 
 def test_the_sentinel_refuses_every_source_method():

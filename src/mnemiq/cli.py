@@ -24,6 +24,10 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--add", action="store_true",
                    help="enrich the manifest's tables and keep every other table the latest snapshot holds, reading the "
                         "joins between them again; needs an earlier snapshot of the source")
+    e.add_argument("--for-superset", action="store_true",
+                   help="enrich an Oracle source over this direct connection for a server in Superset mode, recording "
+                        "the service and schema the connection reads, which that server checks before it serves the "
+                        "snapshot (on PostgreSQL, Superset mode is enriched through Superset instead)")
     sub.add_parser("build", help="index the current snapshot for retrieval")
     sub.add_parser(
         "refresh", help="re-crawl the source; re-enrich + publish if the catalog changed"
@@ -441,7 +445,49 @@ def _kept_for_add(settings: Settings, spec):
     return kept, None
 
 
-def _cmd_enrich(settings: Settings, add: bool = False) -> int:
+def _for_superset_refusal(settings: Settings) -> str | None:
+    """Why `enrich --for-superset` cannot run with `settings`, or None: it reads one Oracle source over a direct
+    connection, so it is refused in Superset mode and for any other source, before a connection is opened. Raises
+    `SourceUnconfigured` for a source configuration that names no one source, with a sentence."""
+    from mnemiq.adapters.resolve import source_spec
+
+    if settings.superset_mode:
+        return ("--for-superset enriches an Oracle source over a direct connection for a server in Superset mode, and "
+                "MNEMIQ_SUPERSET_MCP_URL is set, which enriches through Superset itself: unset it to run "
+                "--for-superset")
+    spec = source_spec(settings)
+    if spec.kind != "oracle":
+        return (f"source {spec.id!r} is {spec.kind}, and --for-superset reads Oracle only: a snapshot for Superset "
+                "mode on PostgreSQL is enriched through Superset (set MNEMIQ_SUPERSET_MCP_URL and run `mnemiq enrich`)")
+    return None
+
+
+def _add_for_superset_refusal(kept, spec, binding: tuple[str, str] | None) -> str | None:
+    """Why `enrich --add` cannot merge this run into `kept`, the source's latest snapshot, or None: a run for Superset
+    mode (`binding`, the service and schema it reads) and one not are never merged, nor two for Superset mode from
+    another Oracle service or schema, since the merged snapshot's `superset:oracle` job vouches for every table it
+    holds. Read before any table is."""
+    from mnemiq.superset.settings import SUPERSET_ORACLE_JOB, oracle_source
+
+    job = next((j for j in kept.jobs if j.id == SUPERSET_ORACLE_JOB), None)
+    if binding is None:
+        if job is None:
+            return None
+        return (f"source {spec.id!r}: the earlier snapshot was enriched for Superset mode, and --add without "
+                "--for-superset would make one Superset mode does not serve: pass --for-superset, or run without "
+                "--add")
+    earlier = oracle_source(job.detail) if job is not None and job.status == "done" else None
+    if earlier is None:
+        return (f"source {spec.id!r}: --add --for-superset adds to a snapshot enriched for Superset mode, and the "
+                "earlier one was not: run --for-superset without --add first")
+    if (earlier.service, earlier.schema) != binding:
+        return (f"source {spec.id!r}: the earlier snapshot was enriched for Superset mode from Oracle service "
+                f"{earlier.service!r} and schema {earlier.schema!r}, and this connection reads service {binding[0]!r} "
+                f"and schema {binding[1]!r}: run without --add to enrich from scratch")
+    return None
+
+
+def _cmd_enrich(settings: Settings, add: bool = False, for_superset: bool = False) -> int:
     from mnemiq.adapters.resolve import SourceUnconfigured, UnknownSourceKind
     from mnemiq.enrichment.enricher import LLMEnricher
     from mnemiq.enrichment.examples import LLMExampleGenerator, enrich_examples
@@ -456,6 +502,9 @@ def _cmd_enrich(settings: Settings, add: bool = False) -> int:
     from mnemiq.superset.settings import SupersetConfigError
 
     try:
+        if for_superset and (refusal := _for_superset_refusal(settings)) is not None:
+            print(refusal, file=sys.stderr)
+            return 1
         spec, adapter = _enrichment_source(settings)
     except (SourceUnconfigured, UnknownSourceKind, SupersetConfigError) as exc:
         print(str(exc), file=sys.stderr)
@@ -463,9 +512,23 @@ def _cmd_enrich(settings: Settings, add: bool = False) -> int:
     if getattr(adapter, "unbounded", False):
         print(f"WARNING: source {spec.id!r}: its adapter takes no statement time limit, so enrich reads it without "
               "one", file=sys.stderr)
+    # For Superset mode: the service and schema of the Oracle session the tables are read through, which the snapshot's
+    # `superset:oracle` job records and a server in Superset mode checks. Read first, before any table.
+    binding = None
+    if for_superset:
+        from mnemiq.enrichment.pipeline import oracle_binding
+
+        try:
+            binding = oracle_binding(adapter)
+        except Exception as exc:  # noqa: BLE001 -- any failure: no snapshot for Superset mode without the record
+            print(f"source {spec.id!r}: the service and current schema of the Oracle session could not be read "
+                  f"({exc}), so no snapshot for Superset mode was made", file=sys.stderr)
+            return 1
     kept = None
     if add:
         kept, refusal = _kept_for_add(settings, spec)
+        if refusal is None and kept is not None:
+            refusal = _add_for_superset_refusal(kept, spec, binding)
         if refusal:
             print(refusal, file=sys.stderr)
             return 1
@@ -508,15 +571,17 @@ def _cmd_enrich(settings: Settings, add: bool = False) -> int:
             print(refusal, file=sys.stderr)
             return 1
 
+    # Given only for a run for Superset mode, so every other run calls the structural pass as it always did.
+    for_superset_mode = {"superset_oracle": binding} if binding is not None else {}
     try:
         if superset:
             snap = enrich_structural(adapter, spec.id, harvest_values=False,
                                      superset_source=(adapter.database_id, adapter.schema))
         elif spec.profile == "statistics":
             # Each table from the source's dictionary, except the ones "exact_tables" names.
-            snap = enrich_structural(adapter, spec.id, statistics=spec.exact_tables)
+            snap = enrich_structural(adapter, spec.id, statistics=spec.exact_tables, **for_superset_mode)
         else:
-            snap = enrich_structural(adapter, spec.id)
+            snap = enrich_structural(adapter, spec.id, **for_superset_mode)
     except TablesNotFound as exc:  # a "tables" or "exact_tables" entry matching nothing: say which (M110)
         print(str(exc), file=sys.stderr)
         return 1
@@ -819,7 +884,10 @@ def _cmd_refresh(settings: Settings) -> int:
     if unserved:
         print("the stored snapshot was not enriched through this deployment's Superset database and "
               "schema -- enriching it again")
-    rc = _cmd_enrich(settings)
+    # A snapshot enriched directly from Oracle for Superset mode is enriched again for it, as it was.
+    from mnemiq.superset.settings import SUPERSET_ORACLE_JOB
+
+    rc = _cmd_enrich(settings, for_superset=any(job.id == SUPERSET_ORACLE_JOB for job in snapshot.jobs))
     if rc == 0:
         rc = _cmd_build(settings)  # build publishes the new version when a control DSN is set
     return rc
@@ -1035,7 +1103,7 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
     if args.command == "enrich":
-        return _cmd_enrich(settings, add=args.add)
+        return _cmd_enrich(settings, add=args.add, for_superset=args.for_superset)
     if args.command == "build":
         return _cmd_build(settings)
     if args.command == "refresh":
