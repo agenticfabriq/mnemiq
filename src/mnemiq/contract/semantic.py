@@ -80,6 +80,11 @@ class Column(BaseModel):
     # A single-column key the source declares and enforces (an enabled, validated primary key or
     # unique constraint, or a valid unique index). None: not read, as on every exactly profiled column.
     declared_unique: bool | None = None
+    # The meaning fields a certified record of this column stated and laid, sorted, as
+    # `apply_certified` laid them (`description`, `semantic_type`, `pii_level`, `coded_values`,
+    # `code_scheme`): which of the column's meaning a person wrote. A field the model writes after is
+    # no longer named. None: no record was laid on it since the field existed, which tells of no field.
+    certified_fields: list[str] | None = None
 
     def pii_levels(self) -> frozenset[str]:
         """Every level this column is read under, its own and its dimensions', `none` aside.

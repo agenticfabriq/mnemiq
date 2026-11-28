@@ -83,9 +83,13 @@ def superset_executor(settings: Settings, delegation: DelegatedToken) -> Superse
 
     The deadlines are the adapter's own: a statement's call waits for its time limit plus `TRANSPORT_MARGIN_S`, so a
     slow statement reads as Superset's answer that it ran out of time, never as Superset not answering. Refuses
-    anything but a `DelegatedToken`: the ask path carries the asking person's token and nothing else."""
+    anything but a `DelegatedToken`: the ask path carries the asking person's token and nothing else.
+
+    The adapter is built held: on Oracle it sends no statement but the binding check's own until the runtime has shown
+    Superset's connection for the person to run their statements as the snapshot's schema (`Runtime.bound`, which
+    every door asks before what the person may read). On PostgreSQL the hold changes nothing."""
     if not isinstance(delegation, DelegatedToken):
         raise TypeError(f"Superset mode runs a request's statements with its delegated token, not a "
                         f"{type(delegation).__name__}")
     return SupersetSqlAdapter(SupersetMcp(settings.superset_mcp_url, delegation),
-                              database_id=settings.superset_database_id, schema=settings.superset_schema)
+                              database_id=settings.superset_database_id, schema=settings.superset_schema, held=True)

@@ -87,10 +87,10 @@ def _requires_quotes(value: str) -> bool:
             or lowered != value)
 
 
-def superset_name(stored: str) -> str:
+def superset_name(stored: str, *, dialect: str | None = None) -> str:
     """`stored`, a name as the database stores it, as Superset shows it: SQLAlchemy's Oracle `normalize_name` on Oracle,
-    the name itself on PostgreSQL."""
-    if superset_dialect() != "oracle":
+    the name itself on PostgreSQL. `dialect` is Superset mode's unless given, as `stored_name` reads it."""
+    if (superset_dialect() if dialect is None else dialect) != "oracle":
         return stored
     lower, upper = stored.lower(), stored.upper()
     if upper == lower:
@@ -100,11 +100,14 @@ def superset_name(stored: str) -> str:
     return stored
 
 
-def stored_name(shown: str) -> str:
+def stored_name(shown: str, *, dialect: str | None = None) -> str:
     """The stored name Superset reads for `shown`, a name it shows: SQLAlchemy's Oracle `denormalize_name` on Oracle,
     the name itself on PostgreSQL. A name stored in lower case is shown as itself and reads back in upper case, as
-    SQLAlchemy reads it: what Superset reads by it."""
-    if superset_dialect() != "oracle":
+    SQLAlchemy reads it: what Superset reads by it.
+
+    `dialect` is Superset mode's (`superset_dialect()`) unless given: the check of a snapshot at boot gives the dialect
+    of the database the snapshot was read from, which boot sets only once that check accepts it."""
+    if (superset_dialect() if dialect is None else dialect) != "oracle":
         return shown
     lower, upper = shown.lower(), shown.upper()
     if upper == lower:
@@ -129,8 +132,11 @@ def for_superset(sql: str) -> str:
     added where another source of the same query already goes by that name (two references to one table, neither
     aliased), so mnemiq writes no alias two sources share.
 
-    A statement is sent only when Superset reads the same tables in it as mnemiq does. `RefusedStatement`, saying how
-    to repair it, is raised for one that holds a q-quoted literal, a join inside parentheses or a column named by its
+    A statement is sent only when Superset reads the same tables in it as mnemiq does: checked here against a copy of
+    Superset's reading (`superset_reads`), a cheap pre-check, and by the adapter against Superset's own
+    (`executed.check_tables_read`). `RefusedStatement`, saying how to repair it, is raised for a text that is not one
+    query, or holds a command mnemiq's parser does not model, for one that holds a q-quoted literal, a join inside
+    parentheses or a column named by its
     table's schema too, for one that names a CTE as it names a table it reads, for one that reads a table, or names a
     function or a sequence, over a database link, and for any in which Superset does not read each table mnemiq reads,
     by the name Superset gives it
@@ -174,6 +180,11 @@ def _rewritten(sql: str, spelled: Callable[[str], exp.Identifier], *, aliased: b
     if len(parsed) != 1:
         raise UnreadableStatement("the text holds no statement, or more than one")
     tree = parsed[0]
+    for table in tree.find_all(exp.Table):
+        if any(table.args.get(part) is not None and not isinstance(table.args[part], exp.Expression)
+               for part in _PARTS):
+            # sqlglot keeps an empty part (`shop..orders`) as text, no name.
+            raise UnreadableStatement("a table's name has a part mnemiq cannot read")
     tables = base_tables(tree, "oracle")
     if refusing and (refusal := _refusal(sql, tree, tables)) is not None:
         raise RefusedStatement(refusal)
@@ -306,6 +317,7 @@ def _counterparts(mine, theirs, placed: dict[int, exp.Expression]) -> None:
 
 def _refusal(sql: str, tree: exp.Expression, tables: list[exp.Table]) -> str | None:
     """Why the statement `sql`, read as `tree`, is not sent to Superset, in words its writer can act on, or None. It
+    is no query, or holds a command mnemiq's parser does not model (`exp.Command`: an EXPLAIN, a CALL, a SHOW). It
     holds a q-quoted literal (`_Q_QUOTED`), which mnemiq never writes. It reads a table, or names a function or a
     sequence, over a database link (`_over_a_link`, `_named_over_a_link`), another database's, which no Superset
     dataset names. It holds a join inside parentheses (sqlglot hangs the join on the first table or parenthesis
@@ -314,6 +326,9 @@ def _refusal(sql: str, tree: exp.Expression, tables: list[exp.Table]) -> str | N
     only under a name no table of the statement has, whatever scope either is in. Or it names a CTE where it reads it
     otherwise than its WITH clause writes it, quotes aside (`WITH W ... FROM w`), which Oracle reads as one name and
     mnemiq does not send."""
+    if not isinstance(tree, exp.Query) or tree.find(exp.Command) is not None:
+        return ("the statement is not one query, or holds a command mnemiq does not read, which mnemiq does not send "
+                "to Superset, so it was not sent; send one SELECT")
     for token in Dialect.get_or_raise("oracle").tokenize(sql):
         if token.token_type in _Q_QUOTED:
             return (f"the statement holds a q-quoted literal ({sql[token.start:token.end + 1]}), which mnemiq does not "

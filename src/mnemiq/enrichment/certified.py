@@ -705,6 +705,13 @@ def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snaps
             update["coded_values"] = coded
         update.update({field: getattr(cert, field) for field in _MEANING_AS_STATED
                        if field in stated})
+        # Which of the column's meaning a person wrote: every field this record stated and laid as
+        # stated, so a reader can tell a description it laid from one the column already carried,
+        # which it leaves. A level is named only where the record's was laid: not where a downgrade
+        # was refused, nor where an unrecognised level was read as the most sensitive.
+        update["certified_fields"] = sorted(
+            field for field in (*_MEANING_AS_STATED, "coded_values", "pii_level")
+            if field in stated and (field != "pii_level" or (states_level and pii_level == cert.pii_level)))
         new_cols.append(col.model_copy(update=update))
 
     # M135. A certified dimension's `pii_level`, read as a column's (M41): an unrecognised level

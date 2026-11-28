@@ -42,6 +42,7 @@ from typing import Any
 
 import psycopg
 
+from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
 from mnemiq.superset.build_store import (
     DEFAULT_LEASE_S,
     DONE,
@@ -69,6 +70,7 @@ from mnemiq.superset.layout import layout_chart_ids, layout_positions
 from mnemiq.superset.marker import format_marker
 from mnemiq.superset.measures import Measure
 from mnemiq.superset.names import RefusedStatement, UnreadableStatement, for_superset, superset_name
+from mnemiq.superset.payload import SupersetAccessRefused, SupersetQueryFailed
 from mnemiq.superset.planner import SCALAR, BuildPlan, PlannedDataset, plan_from_json, plan_to_json, with_made_datasets
 from mnemiq.superset.saved_metrics import SavedMetric, read_saved_metrics, same_definition
 
@@ -600,8 +602,11 @@ def _layout_of(answer: Mapping) -> dict:
 def _run_dataset(run: _Run) -> _Outcome:
     """The dataset the plan makes: over its table, or, for a virtual one, over its SQL, named for the build; its
     editors set by the same create. The SQL is sent with each table named as Superset names it (`for_superset`), as
-    Superset applies the row rules of a virtual dataset's tables to every query of it; SQL `for_superset` does not send
-    fails the step with mnemiq's reason (`statement_refused`), before any call."""
+    Superset applies the row rules of a virtual dataset's tables to every query of it, and on Oracle only once
+    Superset's own dry run of it says Superset would run it as mnemiq reads it (`SupersetSqlAdapter.confirm_sent`,
+    `executed`). SQL either does not send, or Superset refuses at its dry run, fails the step with mnemiq's reason
+    (`statement_refused`), before the create; a dry run Superset does not answer or finish leaves the step uncertain,
+    as a create Superset does not answer does (`superset_silent`)."""
     build, planned, adapter = run.build, _planned(run.plan, run.key), run.adapter
     name, dashboard_id = _dataset_name(build, planned), build.dashboard_id
     request = {"database_id": adapter.database_id, "schema": adapter.schema, "table_name": name,
@@ -609,11 +614,22 @@ def _run_dataset(run: _Run) -> _Outcome:
     if planned.virtual:
         try:
             sql = for_superset(planned.sql)
+            adapter.confirm_sent(sql, before_call=run.renew)
         except RefusedStatement as exc:
             raise _Stop("statement_refused", f"the dataset {name!r} was not made: {exc}") from None
         except UnreadableStatement as exc:
             raise _Stop("statement_refused", f"mnemiq could not read the SQL of the dataset {name!r} to name its "
                                              f"tables as Superset does ({exc}), so it was not sent") from None
+        except (QueryTimedOut, QueryCancelled) as exc:
+            # A dry run Superset ended or stopped is Superset not answering the step, as a create's time-out is.
+            raise SupersetUnavailable("Superset did not finish the dry run of a dataset's SQL",
+                                      detail=type(exc).__name__) from exc
+        except (SupersetAccessRefused, SupersetQueryFailed) as exc:
+            # Superset's own words can name a table this builder may not see: they go to the log only.
+            logger.warning("Superset refused the dry run of a dataset's SQL a build makes (%s): %s",
+                           type(exc).__name__, exc)
+            raise _Stop("statement_refused", f"the dataset {name!r} was not made: Superset refused its SQL when "
+                                             "mnemiq asked how it would run it; mnemiq's log says why") from None
         request.update(sql=sql, description=f"Made by mnemiq for dashboard {dashboard_id}.")
     made = _created(run, "create_dataset", request, made="dataset_id", what=f"the dataset {name!r}",
                     exists=f"Superset already has a dataset named {name!r} on this schema, which this builder cannot "

@@ -33,18 +33,47 @@ def _seed_acme(request):
         seed(dsn, data_dir)
 
 
+@pytest.fixture(autouse=True)
+def _superset_dialect_kept(monkeypatch):
+    """Superset mode's SQL dialect put back after each test as it was before: boot sets it once in a process
+    (`use_superset_dialect`) and refuses another, so a test that boots a runtime would otherwise decide the dialect of
+    every test after it."""
+    from mnemiq.superset import settings as superset_settings
+
+    monkeypatch.setattr(superset_settings, "_dialect", superset_settings._dialect)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _superset_dialect_kept_per_module():
+    """The same, for each module: a module-scoped fixture that boots a server in Superset mode (the live suites'
+    `served`) sets the dialect while the module is set up, before any test's own guard reads it. An autouse module
+    fixture is set up before the module's other module fixtures and torn down after them, so the next module starts
+    with the dialect as this one found it."""
+    from mnemiq.superset import settings as superset_settings
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(superset_settings, "_dialect", superset_settings._dialect)
+        yield
+
+
 @pytest.fixture
-def superset_oracle():
+def superset_dialect_as(monkeypatch):
+    """Put this test's process in a dialect, as a process that booted for a snapshot read from that database is, for a
+    test that compares what mnemiq writes in two dialects, which no one process does. Put back after the test."""
+    from mnemiq.superset import settings as superset_settings
+
+    def put(dialect: str) -> None:
+        assert dialect in ("postgres", "oracle")
+        monkeypatch.setattr(superset_settings, "_dialect", dialect)
+
+    return put
+
+
+@pytest.fixture
+def superset_oracle(superset_dialect_as):
     """Superset mode's SQL dialect set to Oracle's for one test, as boot sets it for a snapshot read from Oracle, and
     put back as it was after the test."""
-    from mnemiq.superset.settings import superset_dialect, use_superset_dialect
-
-    before = superset_dialect()
-    use_superset_dialect("oracle")
-    try:
-        yield
-    finally:
-        use_superset_dialect(before)
+    superset_dialect_as("oracle")
 
 
 @pytest.fixture(autouse=True)

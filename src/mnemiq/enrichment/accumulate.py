@@ -14,6 +14,16 @@ from mnemiq.config import SourceSpec
 from mnemiq.contract import Relationship, Snapshot
 from mnemiq.contract.semantic import Job
 from mnemiq.sql.fanout_check import PARTITIONS_JOB
+from mnemiq.superset.settings import (
+    EXACT,
+    HARVESTED,
+    NOT_HARVESTED,
+    STATISTICS,
+    SUPERSET_ORACLE_JOB,
+    OracleSource,
+    oracle_source,
+    oracle_source_detail,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +35,8 @@ logger = logging.getLogger(__name__)
 #                  over the union by the caller (`union_views`), since a run discovers views only within its subset
 #   examples       a kept example survives only if it reads no table the run enriched again
 #   jobs           a per-table job (`profile:*`, `facts:<t>`) goes with its table; source-level jobs are the run's,
-#                  except the partitions and view-discovery jobs, which keep the weaker of the two runs'
+#                  except the partitions and view-discovery jobs, which keep the weaker of the two runs', and the
+#                  `superset:oracle` job, kept only where both runs carry it for one Oracle service and schema
 #   run            the run's, since it applied the current records, certified set and ontology
 #   relationships  re-derived over the union by the caller (`union_relationships`); here, a consistent interim
 #   version        recomputed by the caller (`content_version`)
@@ -57,7 +68,8 @@ VIEWS_JOB = "discover:views"
 # Every other job whose id names a table after its kind (`profile:<t>`, `profile:<t>.<column>`, `profile:<t>:exact`,
 # `facts:<t>`, `semantic:<t>`, and any kind added later) goes with that table, so a kept table keeps its record of what
 # failed, which the closing report warns from (Codex's fourth review found `semantic:<t>` dropped).
-_SOURCE_JOBS = frozenset({"infer:relationships", VIEWS_JOB, PARTITIONS_JOB, "superset:source", "enrich:time-limit"})
+_SOURCE_JOBS = frozenset({"infer:relationships", VIEWS_JOB, PARTITIONS_JOB, "superset:source", SUPERSET_ORACLE_JOB,
+                          "enrich:time-limit"})
 
 
 def _job_table(job: Job, known: set[str]) -> str | None:
@@ -84,6 +96,21 @@ def _failure_entries(detail: str | None, known: set[str]) -> list[tuple[str | No
             table, text = entries[-1]
             entries[-1] = (table, f"{text}; {piece}")
     return entries
+
+
+def _merged_oracle_source(kept: Job | None, run: Job | None) -> Job | None:
+    """The `superset:oracle` job of a merged snapshot, or None. It vouches for every table the snapshot holds, so it is
+    kept only where both runs carry it, finished, for one Oracle service and schema; values harvested where either run
+    harvested them, and the profile statistics where either run profiled from statistics."""
+    if kept is None or run is None or kept.status != "done" or run.status != "done":
+        return None
+    earlier, this = oracle_source(kept.detail), oracle_source(run.detail)
+    if earlier is None or this is None or (earlier.service, earlier.schema) != (this.service, this.schema):
+        return None
+    merged = OracleSource(this.service, this.schema,
+                          HARVESTED if HARVESTED in (earlier.values, this.values) else NOT_HARVESTED,
+                          STATISTICS if STATISTICS in (earlier.profile, this.profile) else EXACT)
+    return run.model_copy(update={"detail": oracle_source_detail(merged)})
 
 
 def _merged_partitions(kept: Job | None, run: Job | None, run_tables: set[str], known: set[str]) -> Job | None:
@@ -137,7 +164,7 @@ def merge_run(kept: Snapshot, run: Snapshot) -> tuple[Snapshot, list[str]]:
             jobs.append(job)
     for job in run.jobs:
         table = _job_table(job, known)
-        if job.id in (PARTITIONS_JOB, VIEWS_JOB) or (table is not None and table in stay):
+        if job.id in (PARTITIONS_JOB, VIEWS_JOB, SUPERSET_ORACLE_JOB) or (table is not None and table in stay):
             continue
         jobs.append(job)
     # View discovery is the run's over its subset only, so its `done` cannot vouch for a kept run whose discovery did
@@ -153,6 +180,10 @@ def merge_run(kept: Snapshot, run: Snapshot) -> tuple[Snapshot, list[str]]:
                                     next((j for j in run.jobs if j.id == PARTITIONS_JOB), None), run_tables, known)
     if partitions is not None:
         jobs.append(partitions)
+    oracle = _merged_oracle_source(next((j for j in kept.jobs if j.id == SUPERSET_ORACLE_JOB), None),
+                                   next((j for j in run.jobs if j.id == SUPERSET_ORACLE_JOB), None))
+    if oracle is not None:
+        jobs.append(oracle)
     update["jobs"] = jobs
 
     # An interim the caller replaces with joins re-derived over the union: the kept joins among tables that stay, and

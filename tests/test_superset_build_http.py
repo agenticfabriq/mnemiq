@@ -43,7 +43,8 @@ from mnemiq.superset.client import DelegatedToken, SupersetMcp
 from mnemiq.superset.extension import EXTENSION_TOOLS, TOOL_PREFIX
 from mnemiq.superset.grants import NOT_A_BUILDER
 from mnemiq.superset.charts import Family, WrittenRef
-from mnemiq.superset.planner import BuildPlan, FakePlanner, LLMPlanner, PlanRefused, RefusedPart
+from mnemiq.superset.measures import Measure, MeasureKind
+from mnemiq.superset.planner import BuildPlan, FakePlanner, LLMPlanner, PlannedDataset, PlanRefused, RefusedPart
 from tests.auth_keys import AUDIENCE, ISSUER, claims, jwks_for, mint, rsa_key
 from tests.superset_build_world import SNAPSHOT as WORLD_SNAPSHOT
 from tests.superset_build_world import TABLES, Clock, Hook, MemoryBuildStore, World
@@ -56,11 +57,21 @@ from tests.superset_shared import (
     SIGN_IN,
     SNAPSHOT_REFUSED,
     SOURCE_ID,
+    _chart,
     _source_job,
     superset_deployment,
 )
 
 GOAL = "Policies by region"
+# A plan whose measure is over a dataset joining two tables on a key the plan check has to probe.
+CLAIMED = Measure(name="claimed", label="Claimed", expression="SUM(amount)", kind=MeasureKind.NUMBER, dataset_id=-1,
+                  description="", asked_by="")
+JOINED_PLAN = BuildPlan(
+    charts=(_chart("claimed_by_region", Family.BAR, "Claimed by region", -1, (WrittenRef(CLAIMED),),
+                   dimensions=("region",)),),
+    measures=(CLAIMED,),
+    datasets=(PlannedDataset(key="dataset_1", placeholder=-1, join="policy JOIN claim ON policy.region = "
+                                                                     "claim.claim_region"),))
 # The sentences the build routes answer with, as the person reads them.
 NOT_FOR_BUILDING = "This sign-in was made for asking, not building; open the builder from Superset again."
 EXTENSION_MISSING = "This Superset does not have the mnemiq extension installed."
@@ -461,6 +472,48 @@ def test_a_snapshot_superset_mode_will_not_serve_refuses_building(served, fake, 
     assert fake.calls == [] and store.claims == []
 
 
+def _swapping_after_the_grants(monkeypatch, runtime) -> Snapshot:
+    """Swap another snapshot in the moment a request's grants are resolved, as a reload on another thread would while
+    the request waits on Superset; the snapshot the grants were resolved against is returned."""
+    serving, real = runtime.snapshot, runtime_module.resolve_grants
+
+    def resolve_then_swap(adapter, snapshot):
+        grants = real(adapter, snapshot)
+        runtime.snapshot = snapshot.model_copy(update={"version": "swapped"})
+        return grants
+
+    monkeypatch.setattr(runtime_module, "resolve_grants", resolve_then_swap)
+    return serving
+
+
+def _recording_snapshots(monkeypatch, module, names) -> dict:
+    """Each of `names` in `module` recording the snapshot it is handed, by name."""
+    handed: dict = {}
+    for name in names:
+        def recording(*args, _real=getattr(module, name), _name=name, **kwargs):
+            handed[_name] = kwargs["snapshot"]
+            return _real(*args, **kwargs)
+        monkeypatch.setattr(module, name, recording)
+    return handed
+
+
+def test_each_build_route_reads_the_snapshot_its_grants_were_resolved_against(served, store, monkeypatch):
+    """A snapshot swapped in while a build's grants are asked of Superset is not the one the build plans, steps or reads
+    a dashboard's measures from: each route is handed the snapshot `builder_grants` resolved its grants against."""
+    client, runtime = served
+    dashboard, _ = _a_built_dashboard(client)
+    build = _stored(store, client)
+    handed = _recording_snapshots(monkeypatch, _build_module(), ("plan_build", "next_step", "Asking"))
+    serving = _swapping_after_the_grants(monkeypatch, runtime)
+    for route, send in (("plan_build", lambda: _start(client)), ("next_step", lambda: _next(client, build.build_id)),
+                        ("Asking", lambda: client.get(f"/v1/superset/dashboards/{dashboard}/measures",
+                                                      headers=_bearer(_token())))):
+        runtime.snapshot = serving
+        send()
+        assert handed[route] is serving, route
+        assert runtime.snapshot is not serving  # the swap did happen
+
+
 def _masked(base: str):
     """What rc2's MCP service answers for a tool it does not have (`GlobalErrorHandlerMiddleware`), as the tool's
     error."""
@@ -486,6 +539,22 @@ def test_missing_extension_is_named(served, fake, world, store):
     # asked once.
     assert [call.tool for call in fake.calls if call.tool.startswith("extensions.")] == [
         TOOL_PREFIX + "create_dataset", TOOL_PREFIX + "dataset_metrics"]
+
+
+def test_an_extension_without_table_rules_is_refused_before_a_join_is_planned(served, fake, world, store):
+    """On PostgreSQL too a build's plan check asks the extension's `table_rules` whether a rule applies on a joined
+    table before it probes the join's key; an extension older than that tool would have it refuse every join needing a
+    probe. So such an extension is refused before anything is planned, with the sentence an outdated extension gets,
+    and the planner is never asked for a plan that joins."""
+    client, runtime = served
+    planner = _planned(runtime, FakePlanner(JOINED_PLAN))
+    world.hooks["table_rules"] = Hook(instead=_masked("table_rules"))
+    r = _start(client)
+    assert r.status_code == 503, r.text
+    assert r.json()["detail"] == EXTENSION_OUTDATED
+    assert store._builds == {} and _writes(fake) == [] and planner.goals == []
+    assert [call.tool for call in fake.calls if call.tool.startswith("extensions.")] == [
+        TOOL_PREFIX + "create_dataset", TOOL_PREFIX + "table_rules", TOOL_PREFIX + "dataset_metrics"]
 
 
 def test_an_outdated_extension_is_refused_before_planning(served, fake, world, store):
@@ -638,12 +707,13 @@ PLANNING = {"list_datasets", "list_metrics", "list_dashboards"}
 
 def _asked_only_who_may_build_and_whether_they_edit(fake, dashboard_id: int) -> None:
     """What Superset was asked, in order, and nothing else: the grants' dry run (whether the builder may build), the
-    build's probe of the extension (`create_dataset` with an empty request, which it refuses), and its read of whether
-    the builder edits the dashboard. No planning call and no create."""
+    build's probes of the extension (`create_dataset` and `table_rules`, each with an empty request, which it
+    refuses), and its read of whether the builder edits the dashboard. No planning call and no create."""
     assert [call.tool for call in fake.calls] == ["execute_sql", TOOL_PREFIX + "create_dataset",
-                                                  TOOL_PREFIX + "editors_of"], [call.tool for call in fake.calls]
-    grants, probe, editors = fake.calls
-    assert grants.request.get("dry_run") is True and probe.request == {}
+                                                  TOOL_PREFIX + "table_rules", TOOL_PREFIX + "editors_of"], \
+        [call.tool for call in fake.calls]
+    grants, probe, rules, editors = fake.calls
+    assert grants.request.get("dry_run") is True and probe.request == rules.request == {}
     assert editors.request == {"dashboard_ids": [dashboard_id]}
     assert not {call.tool for call in fake.calls} & PLANNING and _writes(fake) == []
 

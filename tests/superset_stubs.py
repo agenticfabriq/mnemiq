@@ -153,6 +153,10 @@ class Table:
     schema: str | None = None
     catalog: str | None = None
 
+    def qualify(self, *, catalog: str | None = None, schema: str | None = None) -> Table:
+        """rc2's `Table.qualify`: the table with `schema` and `catalog` where it names none of its own."""
+        return Table(self.table, self.schema or schema, self.catalog or catalog)
+
 
 class SubjectType:
     """rc2's `SubjectType` (`superset/subjects/types.py`): what an editor subject stands for."""

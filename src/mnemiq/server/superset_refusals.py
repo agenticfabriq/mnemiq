@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from mnemiq.superset.binding import ConnectionNotBound
 from mnemiq.superset.build_store import STORE_MISSING, BuildStoreMissing
 from mnemiq.superset.client import (
     SupersetPermissionDenied,
@@ -29,7 +30,7 @@ from mnemiq.superset.executor import SupersetCredentialMissing, SupersetReadOnly
 from mnemiq.superset.extension import ExtensionMissing, ExtensionOutdated
 from mnemiq.superset.grants import GRANTS_UNREADABLE, NOT_A_BUILDER, GrantsUnreadable, NotABuilder, SupersetMisconfigured
 from mnemiq.superset.payload import SupersetAccessRefused
-from mnemiq.superset.settings import SNAPSHOT_REFUSED, SupersetSnapshotRefused
+from mnemiq.superset.settings import SupersetSnapshotRefused
 
 # Superset no longer accepts the person's token, or knows no user for it.
 SIGN_IN_AGAIN = "Superset did not accept this sign-in; sign in to Superset again."
@@ -74,6 +75,8 @@ def superset_refusal(exc: BaseException) -> Refused | None:
         return Refused(403, NOT_A_BUILDER)
     if isinstance(exc, SupersetAccessRefused):
         return Refused(403, ACCESS_REFUSED)
+    if isinstance(exc, ConnectionNotBound):  # why the connection is not the snapshot's is in `.detail`, for the log
+        return Refused(403, exc.message)
     if isinstance(exc, SupersetRefusal):  # `SupersetDenied`, and any refusal not read above
         return Refused(403, DENIED)
     if isinstance(exc, SupersetMisconfigured):
@@ -81,7 +84,7 @@ def superset_refusal(exc: BaseException) -> Refused | None:
     if isinstance(exc, GrantsUnreadable):
         return Refused(503, GRANTS_UNREADABLE)
     if isinstance(exc, SupersetSnapshotRefused):  # which rule the snapshot failed is in `.detail`, for the log
-        return Refused(503, SNAPSHOT_REFUSED)
+        return Refused(503, exc.message)
     if isinstance(exc, (SupersetToolError, SupersetUnavailable)):  # a response too large to send among them
         return Refused(503, str(exc))
     if isinstance(exc, SupersetCredentialMissing):

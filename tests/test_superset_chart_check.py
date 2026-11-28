@@ -45,8 +45,13 @@ from mnemiq.superset.charts import Filter
 from mnemiq.superset.client import DelegatedToken, SupersetMcp, SupersetPermissionDenied
 from mnemiq.superset.measures import MeasureKind
 from mnemiq.superset.saved_metrics import SavedMetric
-from mnemiq.superset.settings import use_superset_dialect
-from tests.superset_fake import FakeSuperset
+from tests.superset_fake import (
+    FakeSuperset,
+    answering_dry_runs,
+    dry_run_as_sent,
+    no_table_rule,
+    tables_read_as_mnemiq,
+)
 
 TOKEN = "tok-builder"
 CHART_ID = 41
@@ -161,7 +166,10 @@ def _serve(fake, *, form_data, chart, mnemiq=None, dataset=None, query=None, inf
             return EMPTY
         return mnemiq(request["sql"]) if callable(mnemiq) else mnemiq
 
-    fake.reply("execute_sql", execute)
+    # On Oracle each statement is dry-run first and its tables' row rules asked (`executed`): as sent, under none.
+    fake.reply("execute_sql", answering_dry_runs(execute))
+    fake.reply(TABLE_RULES, lambda request, authorization: no_table_rule(request))
+    fake.reply(TABLES_READ, lambda request, authorization: tables_read_as_mnemiq(request))
     if query is not None:
         fake.reply("query_dataset", lambda request, authorization: query)
 
@@ -1834,6 +1842,8 @@ def test_a_big_number_percent_above_100_is_format_wrong_through_check_chart(fake
 
 MADE_SQL = "SELECT * FROM policy"
 ROW_RULES = "extensions.agenticfabriq.mnemiq.row_rules"
+TABLE_RULES = "extensions.agenticfabriq.mnemiq.table_rules"
+TABLES_READ = "extensions.agenticfabriq.mnemiq.tables_read"
 SQL_CHANGED = ("the chart's dataset is one this build made, but its SQL is no longer the SQL the build made it with, "
                "so mnemiq does not check it with its own SQL")
 RULE_APPLIES = ("a row rule applies to you on the chart's dataset, and mnemiq's own SQL reads the tables beneath it, "
@@ -2633,7 +2643,7 @@ def test_oracle_grains_are_supersets_own(fake, superset_oracle, grain):
     assert _grouped_by(sql) == [expression]
 
 
-def test_an_oracle_week_sits_on_its_years_first_weekday(fake, superset_oracle):
+def test_an_oracle_week_sits_on_its_years_first_weekday(fake, superset_oracle, superset_dialect_as):
     """Oracle's `TRUNC(..., 'WW')` starts each week on the weekday 1 January of that year fell on, not on a Monday as
     PostgreSQL's `DATE_TRUNC('week', ...)` does, and a 365-day year's last week starts on 31 December (2025: 1 January
     a Wednesday, and 31 December 364 days on). Superset's rows on Mondays of 2026 are not on Oracle's week: the grain
@@ -2649,7 +2659,7 @@ def test_an_oracle_week_sits_on_its_years_first_weekday(fake, superset_oracle):
     check = _check(fake)
     assert check.status is ChartStatus.NOT_CHECKED and check.reason == chart_check._NO_GRAIN
     assert _statements(fake) == []
-    use_superset_dialect("postgres")
+    superset_dialect_as("postgres")
     assert on("2026-01-05T00:00:00", "P1W") and not on("2026-01-08T00:00:00", "P1W")
     assert not on("2025-12-31T00:00:00", "P1W")
 
@@ -2744,7 +2754,7 @@ def test_a_postgres_chart_filtered_on_true_or_false_is_written_as_before(fake, c
     ("ILIKE", "LOWER(\"CHANNEL\") LIKE LOWER('W%')", "\"channel\" ILIKE 'W%'"),
     ("NOT ILIKE", "LOWER(\"CHANNEL\") NOT LIKE LOWER('W%')", "\"channel\" NOT ILIKE 'W%'"),
 ])
-def test_oracle_has_no_ilike(fake, superset_oracle, op, written, postgres):
+def test_oracle_has_no_ilike(fake, superset_oracle, superset_dialect_as, op, written, postgres):
     """Oracle has no ILIKE. Superset's case-insensitive match is SQLAlchemy's `ilike`, which its Oracle dialect writes
     as `lower(<column>) LIKE lower(<pattern>)`, so mnemiq writes the same, LOWER on both sides: a case mapping is not
     symmetric for every character, so UPPER on both could match other rows. PostgreSQL keeps its ILIKE. mnemiq's own
@@ -2760,7 +2770,7 @@ def test_oracle_has_no_ilike(fake, superset_oracle, op, written, postgres):
     assert written in sql and "ILIKE" not in sql.upper()
     sqlglot.parse_one(sql, read="oracle")
     fake.calls.clear()
-    use_superset_dialect("postgres")
+    superset_dialect_as("postgres")
     _serve(fake, form_data=_bar(adhoc_filters=filters), chart=_chart_data(["region", "Total premium"], *rows),
            mnemiq=_result(*rows))
     check = _check(fake)
@@ -2793,7 +2803,7 @@ ONE_PREMIUM = Expectation(metrics=(("Total premium", "SUM(premium)"),), dimensio
                           filters=())
 
 
-def test_an_oracle_ranked_read_fetches_its_first_rows(superset_oracle):
+def test_an_oracle_ranked_read_fetches_its_first_rows(superset_oracle, superset_dialect_as):
     """A read in the chart's ranking order asks for its first rows with Oracle's row-limiting clause, which the adapter
     reads as the statement's bound; PostgreSQL keeps its LIMIT and its ordinal."""
     sql = chart_check._statement(ONE_PREMIUM, PHYSICAL, grained=True, ranking=Ranking(0, True, 10), limit=20)
@@ -2802,12 +2812,94 @@ def test_an_oracle_ranked_read_fetches_its_first_rows(superset_oracle):
     assert _grouped_by(sql) == ['"REGION"']
     assert chart_check._statement(ONE_PREMIUM, PHYSICAL, grained=True, ranking=Ranking(0, False, 10)).endswith(
         "ORDER BY m0 ASC NULLS LAST")
-    use_superset_dialect("postgres")
+    superset_dialect_as("postgres")
     assert chart_check._statement(ONE_PREMIUM, PHYSICAL, grained=True, ranking=Ranking(0, True, 10), limit=20) == (
         'SELECT "region", SUM(premium) AS m0 FROM "policy" GROUP BY 1 ORDER BY m0 DESC NULLS LAST LIMIT 20')
 
 
-def test_an_oracle_made_dataset_is_read_without_as_before_its_alias(fake, superset_oracle, monkeypatch):
+def test_an_oracle_made_dataset_superset_would_run_otherwise_is_not_checked(fake, superset_oracle):
+    """On Oracle the made dataset's SQL, as Superset holds it, is dry-run before mnemiq's own statement over it is
+    decided, and checked as every statement mnemiq sends there is (`executed`): SQL Superset would run otherwise than
+    mnemiq reads it leaves the chart not checked, saying why, and mnemiq's own statement is not run."""
+    made, held = 'SELECT * FROM "POLICY"', 'SELECT * FROM policy "POLICY"'
+    rows = (("east", 1200), ("west", 800))
+    _serve(fake, form_data=_oracle_bar(), chart=_chart_data(["region", "Total premium"], *rows),
+           mnemiq=_result(*rows), dataset=_dataset(virtual=True) | {"sql": held})
+    _rules(fake, _no_rule)
+    otherwise = dry_run_as_sent({"sql": held.replace("*", '"REGION"')})
+
+    def execute(request, authorization):
+        if request.get("dry_run"):
+            return otherwise if request["sql"] == held else dry_run_as_sent(request)
+        return EMPTY if request.get("force_refresh") else _result(*rows)
+
+    fake.reply("execute_sql", execute)
+    check = _oracle_check(fake, made={DATASET_ID: made})
+    assert check.status is ChartStatus.NOT_CHECKED, check
+    assert check.reason.startswith("the chart's dataset is one this build made with SQL Superset would not run as "
+                                   "mnemiq reads it"), check.reason
+    assert "Superset would run a different statement" in check.reason, check.reason
+    [dry_run] = [call for call in fake.calls if call.tool == "execute_sql"]
+    assert dry_run.request["dry_run"] is True and dry_run.request["sql"] == held
+    assert _statements(fake) == []
+
+
+def test_an_oracle_made_dataset_superset_refuses_at_its_dry_run_is_not_checked_without_its_words(fake,
+                                                                                                superset_oracle):
+    made, held = 'SELECT * FROM "POLICY"', 'SELECT * FROM policy "POLICY"'
+    rows = (("east", 1200), ("west", 800))
+    _serve(fake, form_data=_oracle_bar(), chart=_chart_data(["region", "Total premium"], *rows),
+           mnemiq=_result(*rows), dataset=_dataset(virtual=True) | {"sql": held})
+    _rules(fake, _no_rule)
+    fake.reply("execute_sql", lambda request, authorization: {
+        "success": False, "error": "Disallowed SQL tables: hidden_table", "error_type": "INVALID_SQL_ERROR"})
+    check = _oracle_check(fake, made={DATASET_ID: made})
+    assert check.status is ChartStatus.NOT_CHECKED, check
+    assert check.reason == chart_check._DRY_RUN_REFUSED and "hidden_table" not in check.reason
+    assert _statements(fake) == []
+
+
+def _made_on_oracle(fake, execute=None):
+    made, held = 'SELECT * FROM "POLICY"', 'SELECT * FROM policy "POLICY"'
+    rows = (("east", 1200), ("west", 800))
+    _serve(fake, form_data=_oracle_bar(), chart=_chart_data(["region", "Total premium"], *rows),
+           mnemiq=_result(*rows), dataset=_dataset(virtual=True) | {"sql": held})
+    _rules(fake, _no_rule)
+    if execute is not None:
+        fake.reply("execute_sql", execute)
+    return made, held
+
+
+def test_an_oracle_made_dataset_superset_reads_other_tables_in_is_not_checked(fake, superset_oracle):
+    """mnemiq does not check the chart when Superset's reading of the made dataset's SQL (`tables_read`) misses a
+    table mnemiq reads, saying which."""
+    made, held = _made_on_oracle(fake)
+    fake.reply(TABLES_READ, lambda request, authorization: {**tables_read_as_mnemiq(request), "tables": []}
+               if request.get("sql") == held else tables_read_as_mnemiq(request))
+    check = _oracle_check(fake, made={DATASET_ID: made})
+    assert check.status is ChartStatus.NOT_CHECKED and "could not confirm for policy" in check.reason, check
+    assert _statements(fake) == []
+
+
+def test_an_oracle_made_datasets_check_superset_does_not_answer_is_not_checked(fake, superset_oracle):
+    """A dry run Superset ends at its time limit leaves the chart not checked, saying Superset did not answer."""
+    made, held = _made_on_oracle(fake, lambda request, authorization: {
+        "success": False, "error": "Query exceeded the timeout limit", "error_type": "timed_out"})
+    check = _oracle_check(fake, made={DATASET_ID: made})
+    assert check.status is ChartStatus.NOT_CHECKED and check.reason == chart_check._DRY_RUN_UNANSWERED, check
+    assert _statements(fake) == []
+
+
+def test_a_postgres_made_dataset_is_not_dry_run(fake):
+    """On PostgreSQL the made dataset's SQL is not dry-run, as before."""
+    _made(fake)
+    check = _check(fake, made={DATASET_ID: MADE_SQL})
+    assert check.status is ChartStatus.CHECKED, check.reason
+    assert not [call for call in fake.calls if call.request.get("dry_run") or call.tool in (TABLE_RULES, TABLES_READ)]
+
+
+def test_an_oracle_made_dataset_is_read_without_as_before_its_alias(fake, superset_oracle, superset_dialect_as,
+                                                                      monkeypatch):
     """Superset reads a virtual dataset as a subquery aliased `virtual_table`, which SQLAlchemy's Oracle dialect writes
     without `AS`, since Oracle refuses one before a table's alias, and unquoted, a lower-case name it needs no quotes
     for, which Oracle reads as VIRTUAL_TABLE; so mnemiq writes the alias so there, bare. A chart on a dataset this
@@ -2831,5 +2923,5 @@ def test_an_oracle_made_dataset_is_read_without_as_before_its_alias(fake, supers
     [sql] = _statements(fake)
     assert f'FROM ({held}) virtual_table WHERE ' in sql and '"virtual_table"' not in sql, sql
     assert _grouped_by(sql) == ['"REGION"']
-    use_superset_dialect("postgres")
+    superset_dialect_as("postgres")
     assert chart_check._virtual_source(MADE_SQL) == f'({MADE_SQL}) AS "virtual_table"'

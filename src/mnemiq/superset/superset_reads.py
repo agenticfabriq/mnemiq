@@ -1,6 +1,13 @@
 """The tables Superset reads in a statement mnemiq sends it, found as Superset finds them, so `names.for_superset`
 sends a statement only when Superset reads the same tables in it as mnemiq does.
 
+`names` holds each reference to this copy: each table mnemiq reads must be one this reading finds at its own place in
+the statement, by the name Superset gives it. On Oracle the adapter also asks Superset's own reading, the extension's
+`tables_read`, and sends a statement, a virtual dataset's SQL the build makes among them, only when every distinct
+table mnemiq reads in it is one Superset's reading names (`executed.check_tables_read`), and when Superset's own
+rendering of it with a rule on every one of those tables wraps each place mnemiq reads a table
+(`executed.check_executed`): that confirms each reference through Superset itself, for whoever's rules apply.
+
 A copy of Superset 7.0.0rc2's own table extraction (`superset/sql/parse.py`), the one its access check
 (`extract_tables_from_statement`, through `_find_table_sources`) and its row rules (`SQLStatement.apply_rls`) share:
 each `exp.Table` among the sources of each scope sqlglot's `traverse_scope` gives (`Scope.sources`), except one rc2's

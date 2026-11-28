@@ -1,5 +1,5 @@
 """The extension's MCP tools: registration only. What each tool does is its function in `writes` (the seven that change
-Superset) or `reads` (the four that only read).
+Superset) or `reads` (the seven that only read).
 
 Superset registers each under `extensions.agenticfabriq.mnemiq.<name>` (`superset/core/mcp/core_mcp_injection.py`,
 `create_tool_decorator`) and wraps it in `mcp_auth_hook`, which runs it as the caller its token names. Each is gated by
@@ -96,3 +96,25 @@ def get_layout(request: dict[str, Any]) -> dict[str, Any]:
                   "request: {dataset_ids}.")
 def row_rules(request: dict[str, Any]) -> dict[str, Any]:
     return reads.row_rules(request)
+
+
+@tool(name="table_rules", class_permission_name="Dataset", method_permission_name="read",
+      description="Whether any row rule applies to the caller on each table, as Superset looks up the rules of a "
+                  "statement that reads it. request: {database_id, schema, tables} (at most 50 names).")
+def table_rules(request: dict[str, Any]) -> dict[str, Any]:
+    return reads.table_rules(request)
+
+
+@tool(name="tables_read", class_permission_name="Dataset", method_permission_name="read",
+      description="The tables Superset's own access check reads in one statement, each qualified as Superset's "
+                  "executor qualifies a table it applies row rules to. request: {database_id, schema, sql}.")
+def tables_read(request: dict[str, Any]) -> dict[str, Any]:
+    return reads.tables_read(request)
+
+
+@tool(name="session_binding", class_permission_name="Dataset", method_permission_name="read",
+      description="Whether the caller's session on an Oracle database, as Superset opens it for their statements, "
+                  "logs in as a schema, keeps it as its current schema and reached a service; only whether. "
+                  "request: {database_id, service, schema}.")
+def session_binding(request: dict[str, Any]) -> dict[str, Any]:
+    return reads.session_binding(request)

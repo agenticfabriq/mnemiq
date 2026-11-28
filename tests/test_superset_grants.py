@@ -39,7 +39,13 @@ from mnemiq.superset.grants import (
     SupersetMisconfigured,
     resolve_grants,
 )
-from tests.superset_fake import FakeSuperset, RecordingClient
+from tests.superset_fake import (
+    FakeSuperset,
+    RecordingClient,
+    dry_run_as_sent,
+    no_table_rule,
+    tables_read_as_mnemiq,
+)
 
 DATABASE_ID = 7
 SCHEMA = "sales"
@@ -659,6 +665,110 @@ def test_unavailable_denies_and_says_so(on, failure):
     grants = resolve_grants(_adapter(superset), _snapshot("policy", "party", "claim"))
     assert grants.available is False
     assert grants.objects == frozenset()
+
+
+@pytest.mark.parametrize("silent", ["tables_read", "table_rules"])
+def test_on_oracle_superset_not_answering_the_statement_check_denies_and_says_so(superset_oracle, silent):
+    """On Oracle each dry run is checked with the extension's `tables_read` and `table_rules`: Superset not answering
+    either is Superset not answering the probe, so the grants say they could not be read, never that the person may
+    read nothing."""
+    unanswered = SupersetUnavailable("Superset's MCP service could not be reached")
+    superset = _Superset(_access({"policy", "party"}), [_dataset(1, "policy"), _dataset(2, "party")])
+
+    def answering(request: dict):
+        if request.get("dry_run"):
+            superset(request)
+            return dry_run_as_sent(request)
+        if "sql" in request and "timeout" not in request:
+            return unanswered if silent == "tables_read" else tables_read_as_mnemiq(request)
+        if "tables" in request:
+            return unanswered if silent == "table_rules" else no_table_rule(request)
+        if request == {}:
+            return no_table_rule(request)  # the extension's probe, answered as after a call Superset did not answer
+        return superset(request)
+
+    grants = resolve_grants(SupersetSqlAdapter(RecordingClient(answering), database_id=DATABASE_ID, schema=SCHEMA),
+                            _snapshot("policy", "party"))
+    assert grants.available is False
+    assert grants.objects == frozenset()
+
+
+def _oracle_superset(readable, datasets=()):
+    """Superset and the extension on Oracle, as the statement check asks them (`executed`): a dry run answered as
+    `_access(readable)` decides and otherwise as run as sent, `tables_read` as Superset reading the tables mnemiq
+    reads (its rendering with a rule on every table, and its size bound), and `table_rules` with no rule. Every
+    request is kept, in order, with the tool it was asked of told from its fields."""
+    superset = _Superset(_access(readable), list(datasets))
+    asked: list[tuple[str, dict]] = []
+
+    def answering(request: dict):
+        if request.get("dry_run"):
+            asked.append(("dry run", request))
+            refused = superset(request)
+            return refused if refused is not DRY_RUN_OK else dry_run_as_sent(request)
+        if "sql" in request and "timeout" not in request:
+            answer = tables_read_as_mnemiq(request)
+            asked.append(("tables_read", answer))
+            return answer
+        if "tables" in request or request == {}:
+            asked.append(("table_rules", request))
+            return no_table_rule(request)
+        asked.append(("other", request))
+        return superset(request)
+
+    return answering, asked
+
+
+@pytest.mark.parametrize("wide", [8, 30])
+def test_on_oracle_a_schema_of_hundreds_of_tables_is_probed_in_parts_that_each_fit(superset_oracle, wide):
+    """On Oracle every dry run is held to Superset's own reading of its tables (`tables_read`), whose answer, with its
+    rendering of each table under a rule, is bounded in size. The probe of a snapshot of 700 tables is sent in parts,
+    each sized to fit that bound, so a person who may read the whole database is granted every table, as one probe
+    would grant them, in a bounded number of calls, and no answer is cut for size."""
+    names = [(f"T{i:04d}" + "X" * wide)[:wide] for i in range(700)]
+    answering, asked = _oracle_superset({name.lower() for name in names})  # as Superset names them, and reads them
+    grants = resolve_grants(SupersetSqlAdapter(RecordingClient(answering), database_id=DATABASE_ID, schema=SCHEMA),
+                            _snapshot(*names))
+    assert grants.available is True and grants.objects == frozenset(names)
+    read = [answer for tool, answer in asked if tool == "tables_read"]
+    assert read and all("tables" in answer for answer in read), [answer for answer in read if "tables" not in answer]
+    assert sorted(t["table"] for answer in read for t in answer["tables"]) == sorted(n.lower() for n in names)
+    dry_runs = [request for tool, request in asked if tool == "dry run"]
+    assert len(dry_runs) == len(read) <= 8
+    # Each part: its dry run, its `tables_read`, and `table_rules` fifty tables a call.
+    assert len(asked) <= 3 * len(read) + len(names) // 50 <= 40, len(asked)
+
+
+def test_the_estimate_a_probe_is_sized_by_is_above_supersets_own_answer(superset_oracle):
+    """`tables_read`'s answer for probes of 1 to 300 tables of names 5 to 128 characters, as Superset 7.0.0rc2's own
+    code renders it (`tests/fixtures/superset_rc2_executed.py`, `sizes`): the estimate each part is sized by is above
+    every one, and so the share of the bound each part is held to keeps it under the bound."""
+    import json
+    from pathlib import Path
+
+    from mnemiq.superset.grants import _ANSWER_OVERHEAD, _answer_bytes
+
+    measured = json.loads((Path(__file__).parent / "fixtures" / "superset_rc2_executed.json").read_text())["sizes"]
+    assert measured
+    for size in measured:
+        names = [(f"T{i:04d}" + "X" * size["width"])[:size["width"]] for i in range(size["n"])]
+        estimate = _ANSWER_OVERHEAD + sum(_answer_bytes(name, "shop") for name in names)
+        assert size["bytes"] <= estimate, (size, estimate)
+
+
+def test_on_oracle_a_part_superset_refuses_is_confirmed_table_by_table_in_that_part_alone(superset_oracle):
+    """A person who may read every table but one: the parts Superset accepts are granted whole, the one holding the
+    table it refuses is confirmed table by table, and that table alone is not granted, as one probe and its fallback
+    would decide."""
+    names = [f"T{i:04d}XXX" for i in range(700)]
+    hidden = names[400]
+    answering, asked = _oracle_superset({name.lower() for name in names} - {hidden.lower()},
+                                        [_dataset(i + 1, name.lower()) for i, name in enumerate(names)])
+    grants = resolve_grants(SupersetSqlAdapter(RecordingClient(answering), database_id=DATABASE_ID, schema=SCHEMA),
+                            _snapshot(*names))
+    assert grants.objects == frozenset(names) - {hidden}
+    alone = [request for tool, request in asked if tool == "dry run" and request["sql"].count('"') == 2]
+    assert 0 < len(alone) < 300, len(alone)
 
 
 def test_unavailable_from_the_wire_denies_and_says_so():
