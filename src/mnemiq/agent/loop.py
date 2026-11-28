@@ -758,8 +758,11 @@ class Agent:
                                narrowed=_narrowed_of(executed))
 
         if not executed:
-            # no candidate ran -> fall back to the single repairing path (today's floor)
-            return self._answer_single(packet, snapshot, grants, identity, deadline, emit)
+            # no candidate ran -> fall back to the single repairing path (today's floor). Its answer says none
+            # ran, where the single path alone says nothing: a reader of the vote (a sweep row, the audit record,
+            # the answer on the wire) must tell this, the least settled vote, from a mode that never voted.
+            return replace(self._answer_single(packet, snapshot, grants, identity, deadline, emit),
+                           candidates_executed=0)
 
         groups = cluster([table for _, table in executed])
         views = [

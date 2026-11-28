@@ -454,6 +454,16 @@ def test_without_min_agreement_fragmentation_still_answers():
     assert ans.deferred is False  # min_agreement=None: today's behavior
 
 
+def test_a_vote_where_no_candidate_ran_says_none_ran():
+    """With every candidate declining, the vote falls back to the single repairing path. Its answer says 0 of them ran,
+    not nothing: nothing is what a one-candidate mode reports, so a sweep row, the audit record and the answer on the
+    wire could not tell the fallback, the least settled vote there is, from a mode that never voted."""
+    agent = _vote_agent(['{"sql": null, "reason": "cannot"}'] * 3 + [_sql("count(*)")], 3)
+    ans = _answer(agent)
+    assert ans.candidates_executed == 0
+    assert ans.agreement is None, "no cluster to take a share of"
+
+
 def test_the_single_path_reports_no_candidate_count():
     ans = _answer(_agent(['{"sql": "SELECT n FROM claim"}']))
     assert ans.candidates_executed is None
