@@ -15,12 +15,13 @@ The source's catalogue is read the same way, from Postgres's `pg_catalog` (`mnem
 it once per adapter, and each statement with `force_refresh`, so Superset runs it afresh rather than answer from its
 result cache.
 
-On Oracle a statement is sent only as Superset would run it (`mnemiq.superset.executed`): before each `execute_sql`
-the adapter has Superset dry-run the statement with the same options, asks the extension's `tables_read` which tables
-Superset's own access check reads in it and its `table_rules` whether a row rule applies to the caller on each table
-it reads, one call for each schema that holds them, and makes the call only when every table mnemiq reads is one
-Superset reads (`executed.check_tables_read`) and what Superset would run is the statement sent, each such table under
-its rule (`executed.check_executed`). That needs extension 0.3.0: a Superset without those tools ends the request
+On Oracle a statement is sent only as Superset would run it (`mnemiq.superset.executed`): before anything reaches
+`execute_sql` the adapter asks the extension's `tables_read` which tables Superset's own access check reads in the
+statement and how Superset would run it were a row rule to apply to each, and checks that answer; only then has
+Superset dry-run the statement with the same options the call carries, and asks its `table_rules` whether a row rule
+applies to the caller on each table it reads, one call for each schema that holds them; and it makes the call only
+when every table mnemiq reads is one Superset reads (`executed.check_tables_read`) and what Superset would run is the
+statement sent, each such table under its rule (`executed.check_executed`). That needs extension 0.3.0: a Superset without those tools ends the request
 (`ExtensionMissing`), and one that does not answer them is Superset not answering. On PostgreSQL none of this is asked,
 and each statement is one call, as it always was.
 
@@ -460,20 +461,23 @@ class SupersetSqlAdapter:
 
     def _as_superset_runs(self, sent: str, request: dict, timeout: int) -> dict:
         """Superset's dry run of `request` (the statement `sent`, with the options its real call carries; `timeout` its
-        time limit), when every table mnemiq reads in `sent` is one Superset's access check reads in it
-        (`executed.check_tables_read`); when Superset would run it as mnemiq reads it were a row rule to apply to every
+        time limit), asked only once the extension's `tables_read` (which reads no text the database's own template
+        processor would read as more than text, and never renders one) has answered for `sent` and its answer is
+        checked: every table mnemiq reads in `sent` is one Superset's access check reads in it
+        (`executed.check_tables_read`), and Superset would run it as mnemiq reads it were a row rule to apply to every
         table it reads, each place a table is read under its rule (`tables_read`'s `ruled`, held by
-        `executed.check_executed` with a rule on every table): so for whoever's rules apply; and when it would run it
-        as mnemiq reads it under the rules `table_rules` says apply to the caller (`executed.check_executed`, on the
-        dry run). Raises `RefusedStatement` when not, what Superset's own refusal of the dry run raises from a run, and
-        `SupersetUnavailable` where Superset does not answer the extension."""
-        payload = self._call({**request, "dry_run": True}, timeout)
-        check_execute_response(payload)
-        executed = executed_sql(payload)
+        `executed.check_executed` with a rule on every table), so for whoever's rules apply. So nothing reaches
+        `execute_sql`, which renders a statement as a template, before then. The dry run is then held to the rules
+        `table_rules` says apply to the caller (`executed.check_executed`). Raises `RefusedStatement` when any check
+        fails, what Superset's own refusal of the dry run raises from a run, and `SupersetUnavailable` where Superset
+        does not answer the extension."""
         read = self._tables_read(sent)
         check_tables_read(sent, None if read is None else read.tables, schema=self._schema, dialect=self.dialect)
         check_executed(sent, read.ruled, rules=dict.fromkeys(physical_reads(sent, dialect=self.dialect), True),
                        dialect=self.dialect)
+        payload = self._call({**request, "dry_run": True}, timeout)
+        check_execute_response(payload)
+        executed = executed_sql(payload)
         check_executed(sent, executed, rules=self._table_rules(sent), dialect=self.dialect,
                        limit=request.get("limit"))
         return payload

@@ -1013,7 +1013,7 @@ def test_a_datasets_sql_is_made_only_once_superset_would_run_it_as_sent(fake, wo
     fake.calls.clear()
     made = _next(store, build, _adapter(fake))
     assert _step(made, "dataset_1").status == "done", made
-    assert _tools(fake)[:4] == ["execute_sql", "tables_read", "table_rules", "create_dataset"], _tools(fake)
+    assert _tools(fake)[:4] == ["tables_read", "execute_sql", "table_rules", "create_dataset"], _tools(fake)
     [dry_run] = world.calls("execute_sql")
     [create] = world.calls("create_dataset")
     assert dry_run.request["dry_run"] is True and dry_run.request["sql"] == create.request["sql"] == ORACLE_SENT

@@ -4,11 +4,12 @@ Superset's `execute_sql` does not run the text it is sent. It reads the statemen
 table a row rule applies to for the caller in a subquery carrying the rule, puts the call's `limit` in place of the
 statement's own, and runs its own rendering of the result (`SQLExecutor._prepare_sql` and `execute` in
 `superset/sql/execution/executor.py`). A dry run (`dry_run: true`) answers that rendering, `statements[].executed_sql`,
-without running it. `SupersetSqlAdapter` dry-runs each statement it sends on Oracle with the options the real call
-carries, asks the extension's `tables_read` which tables Superset's own access check reads in the statement and its
-`table_rules` whether a rule applies to the caller on each table the statement reads, and sends the statement only
-when `check_tables_read` finds every table mnemiq reads among the tables Superset reads, and `check_executed` finds
-that what Superset would run is the statement mnemiq decided:
+without running it. Before it sends a statement on Oracle, `SupersetSqlAdapter` asks the extension's `tables_read`
+which tables Superset's own access check reads in it (and how Superset would run it were a row rule to apply to each),
+then has Superset dry-run it with the options the real call carries, and asks the extension's `table_rules` whether
+a rule applies to the caller on each table the statement reads; it sends the statement only when `check_tables_read`
+finds every table mnemiq reads among the tables Superset reads, and `check_executed` finds that what Superset would
+run is the statement mnemiq decided:
 
 - read with mnemiq's own parser, with each of Superset's wraps of a table put back as the table, the executed
   statement reads node for node as the statement sent; the top-level row limit is excepted where the call asks

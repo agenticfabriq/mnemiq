@@ -1470,7 +1470,9 @@ def test_a_dashboard_is_built_on_by_its_editors_only(live, served, model, policy
     dashboard and does not edit it, as `editors_of` itself answers west. Expected:
     - west's start is refused, 403, with mnemiq's sentence naming the editors ("This builder is not an editor of
       dashboard N; its editors are ..."): the planner is not asked, no build is kept, the only Superset calls are the
-      grants read, the extension's probe and `editors_of`, and west has made nothing in Superset;
+      grants read, the extension's read-only probes of the tools a build calls (`create_dataset` and `table_rules`,
+      each with an empty request, which it refuses) and `editors_of`, no write call is made, and west has made nothing
+      in Superset;
     - analyst makes west an editor too, through Superset's API: west's start is then 201; analyst takes west off the
       editors before west's first `/next`, which is refused at the dashboard step (the build `failed`, its dashboard
       step `failed` as `not_editor`, the sentence naming analyst); west has still made nothing and no write call was
@@ -1493,9 +1495,12 @@ def test_a_dashboard_is_built_on_by_its_editors_only(live, served, model, policy
                                     f"{label_of(BUILDER)}."), start.body
     assert refused.planner.goals == []
     tools = {short(call.tool) for call in start.calls}
-    assert "ext.editors_of" in tools and tools <= {"execute_sql", short(PROBE), "ext.editors_of"}, tools
-    assert [(call.request, "refused" in (call.payload or {})) for call in start.calls if call.tool == PROBE] == [
-        ({}, True)]
+    # The build's read-only probes of the tools it calls: each an empty request, which the extension refuses.
+    probes = (PROBE, TOOL_PREFIX + "table_rules")
+    assert "ext.editors_of" in tools and tools <= {"execute_sql", *map(short, probes), "ext.editors_of"}, tools
+    for probe in probes:
+        assert [(call.request, "refused" in (call.payload or {})) for call in start.calls if call.tool == probe] == [
+            ({}, True)], probe
     assert writes(start.calls) == []
     assert served.builds() == builds_before and made_by("west") == before
     assert_no_model_call(refused)

@@ -376,15 +376,15 @@ def _tools(superset: _Superset) -> list[str]:
     return [tool if not request.get("dry_run") else "dry run" for tool, request in superset.calls]
 
 
-def test_on_oracle_the_dry_run_comes_first_and_the_real_call_after_the_check(superset_oracle):
-    """The dry run, then `tables_read` of the statement sent, then `table_rules` for the tables it reads, then the
-    real call, which carries the dry run's options but `dry_run`."""
+def test_on_oracle_tables_read_comes_first_then_the_dry_run_and_the_real_call_after_the_check(superset_oracle):
+    """`tables_read` of the statement sent first, its answer checked, then the dry run, then `table_rules` for the
+    tables it reads, then the real call, which carries the dry run's options but `dry_run`."""
     case = CASES["one table under its rule"]
     superset = _Superset(executed=case["executed"], rules={"orders": True})
     table = _oracle(superset).execute_arrow(case["sent"])
     assert table.num_rows == 1
-    assert _tools(superset) == ["dry run", TABLES_READ, TABLE_RULES, "execute_sql"]
-    (_, probe), (_, read), (_, asked), (_, real) = superset.calls
+    assert _tools(superset) == [TABLES_READ, "dry run", TABLE_RULES, "execute_sql"]
+    (_, read), (_, probe), (_, asked), (_, real) = superset.calls
     assert probe == {**real, "dry_run": True} and "dry_run" not in real
     assert real == {"database_id": 7, "sql": case["sent"], "schema": "shop", "timeout": 30}
     assert read == {"database_id": 7, "schema": "shop", "sql": case["sent"]}
@@ -398,7 +398,7 @@ def test_on_oracle_a_refused_statement_is_never_run(superset_oracle):
     superset = _Superset(executed=CASES["one table with no rule"]["executed"], rules={"orders": True})
     with pytest.raises(SupersetQueryFailed, match="orders"):
         _oracle(superset).execute_arrow(case["sent"])
-    assert _tools(superset) == ["dry run", TABLES_READ, TABLE_RULES]
+    assert _tools(superset) == [TABLES_READ, "dry run", TABLE_RULES]
 
 
 def test_on_oracle_supersets_own_refusal_of_the_dry_run_is_raised_as_from_a_run(superset_oracle):
@@ -408,7 +408,7 @@ def test_on_oracle_supersets_own_refusal_of_the_dry_run_is_raised_as_from_a_run(
     with pytest.raises(Exception) as raised:
         _oracle(superset).execute_arrow('SELECT s.id FROM secret "S"')
     assert type(raised.value) is SupersetAccessRefused, raised.value
-    assert _tools(superset) == ["dry run"]
+    assert _tools(superset) == [TABLES_READ, "dry run"]
 
 
 def test_on_oracle_the_limit_and_refresh_the_real_call_carries_are_the_dry_runs(superset_oracle):
@@ -418,7 +418,7 @@ def test_on_oracle_the_limit_and_refresh_the_real_call_carries_are_the_dry_runs(
     case = CASES["Superset's limit"]
     superset = _Superset(executed=case["executed"], rules={"orders": True})
     _oracle(superset, refresh_every_statement=True)._execute_sql(case["sent"], None, row_limit=7)
-    (_, probe), _, _, (_, real) = superset.calls
+    _, (_, probe), _, (_, real) = superset.calls
     assert probe == {**real, "dry_run": True} and real["limit"] == 7 and real["force_refresh"] is True
 
 
@@ -426,7 +426,7 @@ def test_on_oracle_a_dry_run_asked_for_is_the_check_s_own(superset_oracle):
     """`dry_run` sends one dry run, checked, and no real call."""
     superset = _Superset()
     _oracle(superset).dry_run('SELECT o.id FROM orders "O"')
-    assert _tools(superset) == ["dry run", TABLES_READ, TABLE_RULES]
+    assert _tools(superset) == [TABLES_READ, "dry run", TABLE_RULES]
 
 
 def test_on_oracle_the_proofs_probe_is_checked_too(superset_oracle):
@@ -436,8 +436,8 @@ def test_on_oracle_the_proofs_probe_is_checked_too(superset_oracle):
     superset.run = {"success": True, "rows": [], "columns": [{"name": "region", "type": "object"},
                                                              {"name": "n", "type": "int64"}]}
     adapter.validate('SELECT o.region, COUNT(*) AS n FROM orders "O" GROUP BY o.region')
-    assert _tools(superset) == ["dry run", TABLES_READ, TABLE_RULES, "execute_sql"]
-    assert superset.calls[0][1]["sql"] == case["sent"]
+    assert _tools(superset) == [TABLES_READ, "dry run", TABLE_RULES, "execute_sql"]
+    assert superset.calls[1][1]["sql"] == case["sent"]
 
 
 def test_on_oracle_tables_are_asked_by_the_schema_that_qualifies_them(superset_oracle):
@@ -457,7 +457,7 @@ def test_on_oracle_a_rule_superset_cannot_tell_of_is_one_the_table_must_be_wrapp
     superset = _Superset(answers={"tables": "not a list"})
     with pytest.raises(SupersetQueryFailed, match="could not tell whether one applies to orders"):
         _oracle(superset).execute_arrow('SELECT o.id FROM orders "O"')
-    assert _tools(superset) == ["dry run", TABLES_READ, TABLE_RULES, TABLE_RULES]
+    assert _tools(superset) == [TABLES_READ, "dry run", TABLE_RULES, TABLE_RULES]
 
 
 @pytest.mark.parametrize(("missing", "raised"), [("all", ExtensionMissing), ("table_rules", ExtensionOutdated)])
@@ -504,18 +504,18 @@ def test_on_oracle_a_refusal_of_the_caller_at_table_rules_is_remembered(superset
 
 
 def test_on_oracle_a_table_superset_does_not_read_as_mnemiq_does_is_never_sent(superset_oracle):
-    """`tables_read` without a table mnemiq reads: nothing is sent, the reason naming the table, and `table_rules`
-    is not asked."""
+    """`tables_read` without a table mnemiq reads: nothing is sent, not even the dry run, the reason naming the table,
+    and `table_rules` is not asked."""
     superset = _Superset(read={"tables": [{"catalog": None, "schema": "shop", "table": "orders"}],
                                "ruled": 'SELECT o.id FROM orders "O"'})
     with pytest.raises(SupersetQueryFailed, match="could not confirm for lines"):
         _oracle(superset).execute_arrow('SELECT o.id FROM orders "O" JOIN lines "L" ON l.order_id = o.id')
-    assert _tools(superset) == ["dry run", TABLES_READ]
+    assert _tools(superset) == [TABLES_READ]
 
 
 def test_on_oracle_a_place_superset_would_not_wrap_under_a_rule_on_every_table_is_never_sent(superset_oracle):
     """`tables_read`'s rendering with a rule on every table leaves one place a table is read unwrapped: nothing is
-    sent, the reason naming the table, and `table_rules` is not asked."""
+    sent, not even the dry run, the reason naming the table, and `table_rules` is not asked."""
     case = CASES["a table read twice"]
     unwrapped = case["placeholder"].replace('JOIN (\n  SELECT\n    *\n  FROM orders\n  WHERE\n    1 = 1\n) "B"',
                                             'JOIN orders "B"')
@@ -526,7 +526,35 @@ def test_on_oracle_a_place_superset_would_not_wrap_under_a_rule_on_every_table_i
     superset = _Superset(executed=case["executed"], read=read)
     with pytest.raises(SupersetQueryFailed, match="could not confirm for orders"):
         _oracle(superset).execute_arrow(case["sent"])
-    assert _tools(superset) == ["dry run", TABLES_READ]
+    assert _tools(superset) == [TABLES_READ]
+
+
+@pytest.mark.parametrize("door", ["ask", "made dataset"])
+def test_on_oracle_a_text_superset_would_read_as_a_template_never_reaches_execute_sql(superset_oracle, door):
+    """A text the database's own template processor reads as more than text, with delimiters of its own (here
+    `<<...>>`, inside a comment, which the fixed markers do not catch): `tables_read` answers it unreadable, and
+    nothing reaches `execute_sql`, neither the dry run nor the real call, so Superset never renders it."""
+    sent = 'SELECT o.id FROM orders "O" /* << side_effect() >> */'
+
+    def read(request):
+        return {"unreadable": True} if "<<" in request["sql"] else tables_read_as_mnemiq(request)
+
+    superset = _Superset(read=read)
+    with pytest.raises(SupersetQueryFailed if door == "ask" else RefusedStatement,
+                       match="could not tell which tables Superset reads"):
+        if door == "ask":
+            _oracle(superset).execute_arrow(sent)
+        else:
+            _oracle(superset).confirm_sent(sent)
+    assert "execute_sql" not in [tool for tool, _ in superset.calls], superset.calls
+    assert _tools(superset) == [TABLES_READ, TABLES_READ]  # the answer, and the probe telling it from an old extension
+
+
+def test_on_oracle_confirm_sent_asks_tables_read_before_its_dry_run(superset_oracle):
+    case = CASES["one table under its rule"]
+    superset = _Superset(executed=case["executed"], rules={"orders": True})
+    _oracle(superset).confirm_sent(case["sent"])
+    assert _tools(superset) == [TABLES_READ, "dry run", TABLE_RULES]
 
 
 def test_on_oracle_tables_read_that_cannot_tell_is_a_refusal(superset_oracle):
@@ -535,7 +563,7 @@ def test_on_oracle_tables_read_that_cannot_tell_is_a_refusal(superset_oracle):
     superset = _Superset(read={"unreadable": True})
     with pytest.raises(SupersetQueryFailed, match="could not tell which tables Superset reads"):
         _oracle(superset).execute_arrow('SELECT o.id FROM orders "O"')
-    assert _tools(superset) == ["dry run", TABLES_READ, TABLES_READ]
+    assert _tools(superset) == [TABLES_READ, TABLES_READ]
 
 
 @pytest.mark.parametrize("at", [TABLES_READ, TABLE_RULES])
@@ -586,7 +614,7 @@ def test_confirm_sent_checks_a_statement_as_superset_would_run_it_on_oracle_only
     superset = _Superset(executed=case["executed"])
     with pytest.raises(RefusedStatement, match="Superset would run a different statement"):
         _oracle(superset).confirm_sent(case["sent"])
-    assert _tools(superset) == ["dry run", TABLES_READ, TABLE_RULES]
+    assert _tools(superset) == [TABLES_READ, "dry run", TABLE_RULES]
     called: list[str] = []
     _oracle(_Superset()).confirm_sent('SELECT o.id FROM orders "O"', before_call=lambda: called.append("renewed"))
     assert called == ["renewed"]
