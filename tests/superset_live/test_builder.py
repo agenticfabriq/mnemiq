@@ -38,7 +38,6 @@ from pathlib import Path
 
 import pytest
 
-from mnemiq.contract import IdentityContext
 from mnemiq.execute.runner import DEFAULT_TIMEOUT_S
 from mnemiq.server.superset_refusals import SIGN_IN_AGAIN
 from mnemiq.superset.build_store import BUILD_TABLE, MEASURE_TABLE
@@ -57,7 +56,6 @@ from mnemiq.superset.planner import BuildPlan, FakePlanner, PlannedDataset
 from mnemiq.superset.saved_metrics import normalized
 from tests.superset_extension_path import use_extension_source
 from tests.superset_live.live import (
-    TENANT,
     Call,
     Recorder,
     carrying,
@@ -1375,7 +1373,7 @@ def test_the_null_probe_reads_the_source_as_the_builder(live, served, enriched, 
     settings, _ = enriched
     minted = live.minted(BUILDER, "build")
     adapter = superset_executor(settings, DelegatedToken(minted))
-    grants = served.runtime.builder_grants(adapter, IdentityContext(tenant_id=TENANT, principal_id=BUILDER))
+    grants = served.runtime.builder_grants(adapter)
     probes = Probes()
 
     def asked(column: str) -> bool | None:

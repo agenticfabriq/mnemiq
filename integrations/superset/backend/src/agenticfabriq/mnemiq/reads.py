@@ -1,7 +1,9 @@
 """The extension's read tools, one function per tool, as `writes` has the write tools: `tools.py` registers them on
 Superset's MCP service, which runs each as the caller its token names (`mcp_auth_hook`, `superset/mcp_service/auth.py`).
 
-They change nothing. Each keeps the write tools' rules that apply to a read:
+They change nothing. One, `session_binding`, opens a connection to the database as the caller and runs one fixed
+statement that reads no data; the others read Superset's own metadata. Each keeps the write tools' rules that apply to
+a read:
 
 - Its answer is short and structured; Superset's own text never reaches it.
 - An object the caller may not read is left out of an answer about several, or answered as one that does not exist,
@@ -27,11 +29,15 @@ Superset is imported inside the tools, as in `writes`, so this module imports wi
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 from typing import Any
 
 from agenticfabriq.mnemiq import writes
 from agenticfabriq.mnemiq.writes import _Field
+
+logger = logging.getLogger(__name__)
 
 MAX_DATASETS = 20
 MAX_CHARTS = 100
@@ -46,6 +52,13 @@ MAX_SQL_BYTES = 1_000_000
 # The markers Superset renders a text as a template by, which mnemiq never sends (`JINJA_DELIMITERS` in
 # `mnemiq/superset/adapter.py`): `tables_read` reads no text holding one, wherever it stands in it.
 TEMPLATE_MARKERS = ("{{", "{%", "{#")
+# The longest Oracle service name `session_binding` takes, as a schema's.
+MAX_SERVICE_NAME = MAX_SCHEMA_NAME
+# What `session_binding` runs, word for word: the session's login user, the service it reached and its current schema,
+# each as Oracle stores it. DUAL is the only table it reads.
+SESSION_SQL = "SELECT USER, SYS_CONTEXT('USERENV','SERVICE_NAME'), SYS_CONTEXT('USERENV','CURRENT_SCHEMA') FROM DUAL"
+# The backend of a database `session_binding` reads a session of, as rc2's `Database.backend` names it.
+ORACLE = "oracle"
 # An answer larger than this, in bytes of its JSON text, is not sent: well under the guard's 50,000.
 MAX_ANSWER_BYTES = 40_000
 MAX_LAYOUT_BYTES = MAX_ANSWER_BYTES
@@ -92,6 +105,8 @@ REQUESTS: dict[str, dict[str, _Field]] = {
                     "tables": _Field(_distinct_names(MAX_TABLES))},
     "tables_read": {"database_id": _Field(writes._an_id), "schema": _Field(writes._text(MAX_SCHEMA_NAME)),
                     "sql": _Field(_statement_text)},
+    "session_binding": {"database_id": _Field(writes._an_id), "service": _Field(writes._text(MAX_SERVICE_NAME)),
+                        "schema": _Field(writes._text(MAX_SCHEMA_NAME))},
 }
 
 
@@ -294,6 +309,51 @@ def tables_read(found: dict) -> dict:
     answer = {"tables": [{"catalog": table.catalog, "schema": table.schema, "table": table.table}
                          for table in sorted(tables, key=lambda t: (t.catalog or "", t.schema or "", t.table))]}
     return dict(TOO_LARGE) if _size(answer) > MAX_ANSWER_BYTES else answer
+
+
+@writes._answering("session_binding", REQUESTS)
+def session_binding(found: dict) -> dict:
+    """Whether the session Superset opens on the database for the caller, as `execute_sql` opens one for a statement in
+    `schema`, logs in as `schema`, keeps it as its current schema and reached `service`, each as Oracle stores it:
+    `{"bound": true}` or `{"bound": false}`, and never a value the session read.
+
+    The database is found as `table_rules` finds one, through Superset's own `DatabaseDAO` filter: a database the
+    caller may not see, or that does not exist, is answered `{"not_found": "database"}`, and one whose backend is not
+    Oracle `{"refused": "backend"}`; on neither is anything run. Otherwise the tool runs `SESSION_SQL`, and nothing the
+    caller sends, on the connection rc2's executor opens for the caller (`SQLExecutor._execute_statements`):
+    `get_raw_connection` with the database's default catalog and the schema as Superset shows it (its dialect's
+    `normalize_name`), so the caller's own login where the database impersonates its users, through the engine spec's
+    `execute`. It reads no table of the caller's and no row of data.
+
+    A session that cannot be read (no connection, the statement failing, an answer other than one row of three
+    values) is answered `{"unread": true}`, with no message: what failed is logged here by its kind alone."""
+    from superset.daos.database import DatabaseDAO
+
+    database = DatabaseDAO.find_by_id(found["database_id"])
+    if database is None:
+        return writes._not_found("database")
+    if database.backend != ORACLE:
+        return {"refused": "backend"}
+    try:
+        shown = database.get_dialect().normalize_name(found["schema"])
+        with database.get_raw_connection(catalog=database.get_default_catalog(), schema=shown) as connection:
+            with contextlib.closing(connection.cursor()) as cursor:
+                database.db_engine_spec.execute(cursor, SESSION_SQL, database)
+                rows = [tuple(row) for row in cursor.fetchall()]
+    except Exception as exc:  # any failure to read the session is answered as one, never raised  # noqa: BLE001
+        logger.warning("session_binding could not read the session on database %s (%s)", found["database_id"],
+                       type(exc).__name__)
+        return {"unread": True}
+    if len(rows) != 1 or len(rows[0]) != 3:
+        return {"unread": True}
+    return {"bound": session_bound(rows[0], service=found["service"], schema=found["schema"])}
+
+
+def session_bound(row: tuple, *, service: str, schema: str) -> bool:
+    """Whether `row`, `SESSION_SQL`'s (login user, service, current schema), logs in as `schema`, keeps it as its
+    current schema and reached `service`, each compared exactly, as Oracle stores it."""
+    user, reached, current = row
+    return user == schema and current == schema and reached == service
 
 
 def _table_rules_answer(names: list[str], applies) -> dict:

@@ -73,7 +73,8 @@ BUILD = " ".join(BUILD_SCOPES)
 ASK = " ".join(ASK_SCOPES)
 WRITE_TOOLS = ("create_dashboard", "create_dataset", "create_chart", "patch_chart", "add_saved_metric",
                "delete_dataset", "set_layout")
-READ_TOOLS = ("dataset_metrics", "editors_of", "get_layout", "row_rules", "table_rules", "tables_read")
+READ_TOOLS = ("dataset_metrics", "editors_of", "get_layout", "row_rules", "table_rules", "tables_read",
+              "session_binding")
 # The builder in most tests: Alpha and sql_lab, narrowed by no row rule.
 BUILDER = "analyst"
 MONTHLY = ("SELECT date_trunc('month', issued)::date AS month, count(*) FROM policy GROUP BY 1 ORDER BY 1")
@@ -1974,6 +1975,27 @@ def test_table_rules_answers_as_supersets_own_lookup_by_table(live, extension, m
             run_setup("rule-off", rule)
         write_metadata("UPDATE tables SET schema = 'public' WHERE id = ANY(%s)",
                        ([datasets["nulled"], datasets["cased"]],))
+
+
+def test_session_binding_refuses_a_database_that_is_not_oracle_and_finds_none_the_caller_cannot_see(live, extension):
+    """`session_binding` finds the database through Superset's own filter of the databases the caller may see, and runs
+    its statement only on an Oracle one. The live suite's database is PostgreSQL: analyst, who may see it, is answered
+    `{refused: "backend"}`, and so is `policy_only`, granted one dataset and not the database, whom no table access
+    check stops short of the tool's own; `gamma_only`, who may see no table of it, and a database that does not exist
+    are answered `{not_found: "database"}`; a request naming a statement is refused as a request. mnemiq's reading of
+    each is None, which it reads as not bound. (On an Oracle database the tool's answer is the live Oracle run's: this
+    Superset has none.)"""
+    from mnemiq.superset.extension import session_binding
+
+    asked = {"database_id": live.database_id, "service": "freepdb1", "schema": "PUBLIC"}
+    analyst = as_user(live, BUILDER, ASK)
+    assert call(analyst, "session_binding", **asked) == {"refused": "backend"}
+    assert call(as_user(live, "policy_only", ASK), "session_binding", **asked) == {"refused": "backend"}
+    assert call(as_user(live, "gamma_only", ASK), "session_binding", **asked) == {"not_found": "database"}
+    assert call(analyst, "session_binding", **{**asked, "database_id": 2_000_000_000}) == {"not_found": "database"}
+    assert call(analyst, "session_binding", **asked, sql="SELECT 1") == {"refused": "request", "unknown": ["sql"]}
+    assert session_binding(analyst, **asked) is None
+    observe("session_binding", analyst=call(analyst, "session_binding", **asked))
 
 
 def test_editors_of_names_editors_of_readable_objects_only(live, extension, policy_id):

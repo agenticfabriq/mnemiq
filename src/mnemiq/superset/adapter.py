@@ -24,10 +24,11 @@ its rule (`executed.check_executed`). That needs extension 0.3.0: a Superset wit
 (`ExtensionMissing`), and one that does not answer them is Superset not answering. On PostgreSQL none of this is asked,
 and each statement is one call, as it always was.
 
-On Oracle the adapter a request runs on (`superset_executor`) is built `held`: it sends no statement but the binding
-check's own (`binding.BINDING_SQL`) until the runtime marks the person it carries the token of bound
-(`mark_bound`), once Superset's connection for them was shown to run their statements as the snapshot's schema
-(`Runtime.bound`). A statement asked before that is refused before any call, as a refusal the request ends as.
+On Oracle the adapter a request runs on (`superset_executor`) is built `held`: its client, the one every statement and
+every tool of the request is called through, calls nothing but the extension's `session_binding` until the runtime
+marks the adapter bound (`mark_bound`), once Superset's session for the person whose token it carries was shown to run
+their statements as the snapshot's schema (`Runtime.bound`). A call asked before that is refused before it is made, as
+a refusal the request ends as.
 """
 
 from __future__ import annotations
@@ -56,9 +57,10 @@ from mnemiq.superset.client import (
 )
 from mnemiq.execute.cut import mark_sent
 from mnemiq.sql.guard import MAX_ROWS
-from mnemiq.superset.binding import BINDING_SQL, ConnectionNotBound
+from mnemiq.superset.binding import ConnectionNotBound
 from mnemiq.superset.executed import check_executed, check_tables_read, executed_sql, physical_reads
 from mnemiq.superset.extension import (
+    TOOL_PREFIX,
     ExtensionMissing,
     require_table_rules,
     require_tables_read,
@@ -119,13 +121,16 @@ TERMINAL_REFUSALS = (SupersetRefusedCaller, SupersetPermissionDenied, SupersetDe
 _POSTGRES_UNAGGREGATABLE = frozenset({"JSON", "XML", "POINT", "LINE", "LSEG", "BOX", "PATH", "POLYGON", "CIRCLE"})
 _ORACLE_UNAGGREGATABLE = _UNAGGREGATABLE["oracle"]
 
+# The one tool a held adapter's client calls before the runtime marks it bound: the binding's own check.
+_BINDING_TOOL = TOOL_PREFIX + "session_binding"
+
 
 class SupersetSqlAdapter:
     """Runs statements on one Superset database and schema through `client`, each within `timeout_s` unless the
     caller gives its own limit. With `refresh_every_statement`, every statement, data statements included, asks
     Superset to run it rather than answer from its result cache. Its `dialect` is Superset mode's (`superset_dialect`),
-    read as the adapter is built, unless the caller names another. On Oracle, a `held` adapter sends no statement but
-    the binding check's own until `mark_bound`.
+    read as the adapter is built, unless the caller names another. On Oracle, a `held` adapter's client calls nothing
+    but the extension's `session_binding` until `mark_bound`.
 
     Each catalogue method reads its part of the catalogue from the database on the first call, never from Superset's
     result cache, and answers every later call with a copy of what it read: `decide` reads the function inventory on
@@ -134,26 +139,32 @@ class SupersetSqlAdapter:
 
     def __init__(self, client: SupersetMcp, *, database_id: int, schema: str, dialect: str | None = None,
                  timeout_s: float = 30.0, refresh_every_statement: bool = False, held: bool = False) -> None:
-        self.client = client
         self.dialect = superset_dialect() if dialect is None else dialect
         self._database_id = database_id
         self._schema = schema
         self._timeout_s = timeout_s
         self._refresh_every_statement = refresh_every_statement
         self._terminal_refusal: SupersetRefusal | ExtensionMissing | None = None
-        self._held = held
+        self._bound = False
+        self.client = _HeldClient(client, self) if held else client
+
+    @property
+    def bound(self) -> bool:
+        """Whether the runtime marked this adapter bound: Superset's session for its person was shown, in the request it
+        serves, to run their statements as the snapshot's schema."""
+        return self._bound
 
     def mark_bound(self) -> None:
-        """Release a `held` adapter's statements: the runtime's word that Superset's connection for the person whose
-        token this adapter carries runs their statements as the snapshot's schema (`Runtime.bound`). Called there and
-        nowhere else."""
-        self._held = False
+        """Release a `held` adapter's calls: the runtime's word, for the one request this adapter serves, that Superset's
+        session for the person whose token it carries runs their statements as the snapshot's schema
+        (`Runtime.bound`). Called there and nowhere else."""
+        self._bound = True
 
     @property
     def terminal_refusal(self) -> SupersetRefusal | ExtensionMissing | None:
         """The refusal the request this adapter serves ends as, or None: of the `TERMINAL_REFUSALS` any statement it
         sent was refused with, and on Oracle a Superset without the extension's `table_rules` (`ExtensionMissing`) and a
-        statement asked of a held adapter (`ConnectionNotBound`), a refusal of the caller if there was one, else the
+        call asked of a held adapter (`ConnectionNotBound`), a refusal of the caller if there was one, else the
         first.
 
         The query runner reads each of them as a source that did not answer, the proof seam as one it could not ask,
@@ -278,7 +289,6 @@ class SupersetSqlAdapter:
         is asked and nothing runs."""
         if self.dialect != "oracle":
             return
-        self._hold(sent)
         if before_call is not None:
             before_call()
         timeout = _superset_timeout(self._timeout_s)
@@ -378,8 +388,6 @@ class SupersetSqlAdapter:
 
     def _execute_sql(self, sql: str, timeout_s: float | None, *, dry_run: bool = False,
                      force_refresh: bool = False, row_limit: int | None = None) -> dict:
-        if self.dialect == "oracle":
-            self._hold(sql)
         _refuse_template_markers(sql)
         try:
             # Each table as Superset names it, and sent only when Superset reads the tables mnemiq reads (`names`).
@@ -421,12 +429,12 @@ class SupersetSqlAdapter:
             self._remember(exc)
             raise
 
-    def _hold(self, sql: str) -> None:
-        """Refuse `sql`, as the person not shown bound (`ConnectionNotBound`, which the request ends as), while the
-        adapter is held and `sql` is not the binding check's own statement as written."""
-        if self._held and sql != BINDING_SQL:
-            refusal = ConnectionNotBound("a statement was asked before Superset's connection for this person was "
-                                         "checked, so it was not sent")
+    def _hold(self) -> None:
+        """Refuse a call of this adapter's client, as the person not shown bound (`ConnectionNotBound`, which the
+        request ends as), while the adapter is on Oracle and not marked bound."""
+        if self.dialect == "oracle" and not self._bound:
+            refusal = ConnectionNotBound("a call was asked before Superset's session for this person was shown to be "
+                                         "the snapshot's, so it was not made")
             self._remember(refusal)
             raise refusal
 
@@ -489,6 +497,25 @@ class SupersetSqlAdapter:
             self._remember(exc)
             raise
         return rules
+
+
+class _HeldClient:
+    """The client of a held adapter: `client`, whose every call but the extension's `session_binding` waits on the
+    binding (`SupersetSqlAdapter._hold`), so no statement and no other tool of the request reaches Superset on Oracle
+    before the runtime marks `adapter` bound. It carries `client`'s credential and nothing else of its own."""
+
+    def __init__(self, client: SupersetMcp, adapter: SupersetSqlAdapter) -> None:
+        self._client = client
+        self._adapter = adapter
+
+    @property
+    def credential(self):
+        return self._client.credential
+
+    def call(self, tool: str, request: dict, **options) -> dict:
+        if tool != _BINDING_TOOL:
+            self._adapter._hold()
+        return self._client.call(tool, request, **options)
 
 
 def _refuse_template_markers(sql: str) -> None:

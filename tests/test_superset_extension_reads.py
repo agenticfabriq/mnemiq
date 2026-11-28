@@ -31,7 +31,7 @@ def refusal(tool, request):
 
 def test_every_read_tool_has_a_request_reader():
     assert set(reads.REQUESTS) == {"dataset_metrics", "editors_of", "get_layout", "row_rules", "table_rules",
-                                   "tables_read"}
+                                   "tables_read", "session_binding"}
 
 
 def test_dataset_metrics_takes_at_most_twenty_distinct_ids():

@@ -583,7 +583,7 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
             return _conflict(ALREADY_DONE)
         builds = build.kept()
         try:
-            stored = confirm_proposed_build(asking_, builds, proposal["build_id"], deployment=deployment)
+            stored = confirm_proposed_build(asking_, builds, proposal["build_id"], runtime=runtime)
         except (DashboardBusy, PlanStale) as exc:
             builds.withdraw_proposal(who.tenant_id, proposal["build_id"], who.principal_id)
             settle(who, conversation_id, index, {"state": "replanned"}, "applying")
@@ -684,7 +684,7 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
                 raise HTTPException(status_code=404, detail=NO_ANSWER)
             _, delegation = _builder(asking_, building=False)
             adapter = superset_executor(deployment, delegation)
-            grants = runtime.builder_grants(adapter, who)
+            grants = runtime.builder_grants(adapter)
             settings = runtime.build_profile(None, who).settings
             try:
                 # Read as an answer is (`execute_answer`): larger than one response, its first rows, said so.
