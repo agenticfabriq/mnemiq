@@ -369,11 +369,17 @@ class Agent:
         if (declined := self.decline_if_too_long(packet.question)) is not None:
             return declined
         deadline = self.budget.started()
+        # A vote's candidates as they run: this turn's own, so a model failure that ends the vote reports how many had
+        # run, and a one-candidate turn reports none. Held here, not on the exception, which a writer or client may
+        # raise again in another turn (Codex's review).
+        executed: list | None = None
         try:
             if self.candidates <= 1:
                 return self._answer_single(packet, snapshot, grants, identity, deadline, emit)
-            return self._answer_consistent(packet, snapshot, grants, identity, deadline, emit)
+            executed = []
+            return self._answer_consistent(packet, snapshot, grants, identity, deadline, emit, executed)
         except ModelUnavailable as exc:
+            ran = None if executed is None else len(executed)
             # Symmetry with the source-outage path: something happened TO us, so it is a
             # stated failure the caller can act on, never a deferral and never a traceback
             # out of the transport. `failed` is what keeps it out of the deferral rate (M6).
@@ -394,6 +400,7 @@ class Agent:
                     reason_code=DeferralReason.MODEL_UNAVAILABLE,
                     model_error=exc.kind,
                     narrowed=getattr(exc, _ACCESS, None),
+                    candidates_executed=ran,
                 )
             if isinstance(exc, ContextTooLong):
                 # Refused rather than cut: the same configuration problem, told the same way.
@@ -410,6 +417,7 @@ class Agent:
                     reason_code=DeferralReason.MODEL_UNAVAILABLE,
                     model_error=exc.kind,
                     narrowed=getattr(exc, _ACCESS, None),
+                    candidates_executed=ran,
                 )
             return AgentAnswer(
                 answer=(
@@ -421,6 +429,7 @@ class Agent:
                 reason_code=DeferralReason.MODEL_UNAVAILABLE,
                 model_error=exc.kind,
                 narrowed=getattr(exc, _ACCESS, None),
+                candidates_executed=ran,
             )
 
     def _answer_single(
@@ -666,13 +675,15 @@ class Agent:
         grants: GrantSet,
         identity: IdentityContext,
         deadline,
-        emit: Emit | None = None,
+        emit: Emit | None,
+        executed: list,
     ) -> AgentAnswer:
+        """The vote. Its candidates run into `executed`, the turn's own list, which `answer` reads if a model
+        failure ends the vote; it is only ever appended to here."""
         # Generate N candidates across engineered strategies and let execution vote. Each is
         # decided independently; a refusal or deferral just drops that candidate -- EXCEPT an
         # undefined-term deferral, which is a finding about the question rather than about the
         # candidate, and is carried out below rather than outvoted.
-        executed: list[tuple[Approved, object]] = []
         held: dict = {"spent_s": 0.0}  # what the source said about a filter value, asked once a turn
         undefined: Deferred | None = None
         for i in range(self.candidates):
@@ -758,8 +769,11 @@ class Agent:
                                narrowed=_narrowed_of(executed))
 
         if not executed:
-            # no candidate ran -> fall back to the single repairing path (today's floor)
-            return self._answer_single(packet, snapshot, grants, identity, deadline, emit)
+            # no candidate ran -> fall back to the single repairing path (today's floor). Its answer says none
+            # ran, where the single path alone says nothing: a reader of the vote (a sweep row, the audit record,
+            # the answer on the wire) must tell this, the least settled vote, from a mode that never voted.
+            return replace(self._answer_single(packet, snapshot, grants, identity, deadline, emit),
+                           candidates_executed=0)
 
         groups = cluster([table for _, table in executed])
         views = [
@@ -825,7 +839,11 @@ class Agent:
         with step(emit, Stage.VERIFY):
             blocked, verdict = self._verified(packet, approved, table)
         if blocked is not None:
-            return blocked
+            # The vote's decline, so it carries the vote, as the answer below does: without it a reader of the
+            # vote (a sweep row, the audit record, the answer on the wire) sees a question never voted on.
+            return replace(blocked, agreement=agreement, judge_engaged=judge_engaged,
+                           judge_override=judge_override, judge_fell_back=judge_fell_back,
+                           judge_fallback_reason=judge_fallback_reason, candidates_executed=len(executed))
 
         base = _stamp(self._synthesize(
             packet, approved, identity, table, deadline, cached=False,

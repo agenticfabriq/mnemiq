@@ -41,7 +41,7 @@ from mnemiq.sweep.config import (
     scrub_credentials, start_profile,
 )
 from mnemiq.sweep.plan import TIMING_CASES
-from mnemiq.sweep.run import INVALID, PROFILE, ROWS, _identity, _rows_so_far
+from mnemiq.sweep.run import INVALID, PROFILE, ROWS, VOTE_FIELDS, _identity, _rows_so_far
 from mnemiq.sweep.split import saved_split, split
 from mnemiq.sweep.stats import mcnemar_p, mcnemar_p_one_sided
 
@@ -234,7 +234,7 @@ def grade_control(cfg: SweepConfig, control: Control) -> list[dict]:
                 "made_up": not case.answerable and result.outcome == Outcome.WRONG, "sql": result.sql,
                 "ms": None, "rows_ms": None, "calls": None, "prompt_tokens": None, "completion_tokens": None,
                 "profile_version": None, "engine_build": None, "error_kind": _control_error_kind(result),
-                "model_error": None, "verify_layer": None,
+                "model_error": None, "verify_layer": None, **{name: None for name in VOTE_FIELDS},
             })
     finally:
         for adapter in adapters.values():

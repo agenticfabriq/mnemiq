@@ -388,7 +388,14 @@ def _ask(runtime: Runtime, case: EvaluationCase, mode: str, arm: Arm, identity: 
         "error_kind": _error_kind(result, answer, model_error),
         "model_error": model_error,
         "verify_layer": answer.verify_layer if answer is not None else None,
+        # What the vote did, where a mode writes several candidates (None otherwise): how many ran, the winning
+        # cluster's share of them, and the judge's part, so a deep sweep can say how often its candidates disagreed
+        # and how each such answer ended.
+        **{name: getattr(answer, name, None) for name in VOTE_FIELDS},
     }
+
+
+VOTE_FIELDS = ("candidates_executed", "agreement", "judge_engaged", "judge_override", "judge_fell_back")
 
 
 def _replay(cfg: SweepConfig, arm: Arm, folder: Path,

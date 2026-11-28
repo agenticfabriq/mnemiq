@@ -454,6 +454,105 @@ def test_without_min_agreement_fragmentation_still_answers():
     assert ans.deferred is False  # min_agreement=None: today's behavior
 
 
+def test_a_vote_the_verifier_blocks_keeps_its_record():
+    """The verifier blocking the vote's winner declines the question, and that decline is the vote's: it says how many
+    candidates ran and how they split, as an answered vote does. A deep-mode sweep found these declines carrying no vote
+    at all, so the questions a disagreement-gated step would be for read as never voted on."""
+    from mnemiq.verify.verdict import VerifyVerdict
+
+    class _Blocks:
+        def verify(self, packet, approved, table):
+            return VerifyVerdict(confidence=0.2, defer=True, reason="judged unlikely", layer="judge")
+
+    agent = _vote_agent([_sql("count(*)"), _sql("count(*)"), _sql("count(*)"), _sql("sum(n)"), _sql("max(n)")], 5)
+    agent.verifier = _Blocks()
+    ans = _answer(agent)
+    assert ans.deferred and ans.verify_layer == "judge"
+    assert ans.candidates_executed == 5 and ans.agreement == 0.6
+
+
+class _FailsOnCall(FakeGenerator):
+    """The scripted writer, whose model goes away on call `n` (1-based)."""
+
+    def __init__(self, replies, n, failure=None):
+        super().__init__(replies)
+        self._n = n
+        self._failure = failure
+
+    def propose(self, packet, feedback=None, strategy=None):
+        if len(self.calls) + 1 == self._n:
+            self.calls.append(feedback)
+            from mnemiq.llm.client import ModelUnavailable
+            raise self._failure() if self._failure else ModelUnavailable("the provider went away", kind="connect")
+        return super().propose(packet, feedback=feedback, strategy=strategy)
+
+
+@pytest.mark.parametrize(("replies", "fails_on", "ran"), [
+    # every candidate declines and the single path's writer fails: none had run (Codex's review)
+    (['{"sql": null, "reason": "cannot"}'] * 3, 4, 0),
+    # the second candidate's writer fails after the first ran
+    ([_sql("count(*)")], 2, 1),
+])
+def test_a_model_failure_during_the_vote_keeps_how_many_had_run(replies, fails_on, ran):
+    agent = _vote_agent([], 3)
+    agent.generator = _FailsOnCall(replies, fails_on)
+    ans = _answer(agent)
+    assert ans.failed and ans.model_error == "connect"
+    assert ans.candidates_executed == ran
+
+
+@pytest.mark.parametrize("failure", ["ContextTooLong", "PromptCut"])
+def test_the_window_failures_keep_how_many_had_run_too(failure):
+    """The handler words these two apart from an outage; each still says how many candidates had run."""
+    from mnemiq.llm import client
+
+    agent = _vote_agent([], 3)
+    agent.generator = _FailsOnCall([_sql("count(*)")], 2, failure=lambda: getattr(client, failure)("the window"))
+    ans = _answer(agent)
+    assert ans.failed and ans.model_error == getattr(client, failure).kind
+    assert ans.candidates_executed == 1
+
+
+def test_one_model_error_raised_in_two_turns_carries_neither_turns_count_into_the_other():
+    """A writer or client may raise one exception object more than once. The count is the turn's, not the
+    exception's: a vote cut short after one candidate reports 1, and a later one-candidate turn failing on the same
+    object reports none (Codex's review)."""
+    from mnemiq.llm.client import ModelUnavailable
+
+    shared = ModelUnavailable("the provider went away", kind="connect")
+
+    class _Raises(_FailsOnCall):
+        def propose(self, packet, feedback=None, strategy=None):
+            if len(self.calls) + 1 == self._n:
+                self.calls.append(feedback)
+                raise shared
+            return FakeGenerator.propose(self, packet, feedback=feedback, strategy=strategy)
+
+    voting = _vote_agent([], 3)
+    voting.generator = _Raises([_sql("count(*)")], 2)
+    assert _answer(voting).candidates_executed == 1
+    single = _agent([])
+    single.generator = _Raises([], 1)
+    assert _answer(single).candidates_executed is None
+
+
+def test_a_model_failure_in_a_one_candidate_mode_records_no_vote():
+    agent = _agent([])
+    agent.generator = _FailsOnCall([], 1)
+    ans = _answer(agent)
+    assert ans.failed and ans.candidates_executed is None
+
+
+def test_a_vote_where_no_candidate_ran_says_none_ran():
+    """With every candidate declining, the vote falls back to the single repairing path. Its answer says 0 of them ran,
+    not nothing: nothing is what a one-candidate mode reports, so a sweep row, the audit record and the answer on the
+    wire could not tell the fallback, the least settled vote there is, from a mode that never voted."""
+    agent = _vote_agent(['{"sql": null, "reason": "cannot"}'] * 3 + [_sql("count(*)")], 3)
+    ans = _answer(agent)
+    assert ans.candidates_executed == 0
+    assert ans.agreement is None, "no cluster to take a share of"
+
+
 def test_the_single_path_reports_no_candidate_count():
     ans = _answer(_agent(['{"sql": "SELECT n FROM claim"}']))
     assert ans.candidates_executed is None
