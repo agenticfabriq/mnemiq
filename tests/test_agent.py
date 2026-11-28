@@ -454,6 +454,23 @@ def test_without_min_agreement_fragmentation_still_answers():
     assert ans.deferred is False  # min_agreement=None: today's behavior
 
 
+def test_a_vote_the_verifier_blocks_keeps_its_record():
+    """The verifier blocking the vote's winner declines the question, and that decline is the vote's: it says how many
+    candidates ran and how they split, as an answered vote does. A deep-mode sweep found these declines carrying no vote
+    at all, so the questions a disagreement-gated step would be for read as never voted on."""
+    from mnemiq.verify.verdict import VerifyVerdict
+
+    class _Blocks:
+        def verify(self, packet, approved, table):
+            return VerifyVerdict(confidence=0.2, defer=True, reason="judged unlikely", layer="judge")
+
+    agent = _vote_agent([_sql("count(*)"), _sql("count(*)"), _sql("count(*)"), _sql("sum(n)"), _sql("max(n)")], 5)
+    agent.verifier = _Blocks()
+    ans = _answer(agent)
+    assert ans.deferred and ans.verify_layer == "judge"
+    assert ans.candidates_executed == 5 and ans.agreement == 0.6
+
+
 def test_a_vote_where_no_candidate_ran_says_none_ran():
     """With every candidate declining, the vote falls back to the single repairing path. Its answer says 0 of them ran,
     not nothing: nothing is what a one-candidate mode reports, so a sweep row, the audit record and the answer on the

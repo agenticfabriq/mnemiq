@@ -828,7 +828,11 @@ class Agent:
         with step(emit, Stage.VERIFY):
             blocked, verdict = self._verified(packet, approved, table)
         if blocked is not None:
-            return blocked
+            # The vote's decline, so it carries the vote, as the answer below does: without it a reader of the
+            # vote (a sweep row, the audit record, the answer on the wire) sees a question never voted on.
+            return replace(blocked, agreement=agreement, judge_engaged=judge_engaged,
+                           judge_override=judge_override, judge_fell_back=judge_fell_back,
+                           judge_fallback_reason=judge_fallback_reason, candidates_executed=len(executed))
 
         base = _stamp(self._synthesize(
             packet, approved, identity, table, deadline, cached=False,
