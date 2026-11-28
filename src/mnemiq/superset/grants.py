@@ -16,6 +16,16 @@ adapter carries, in two steps:
 Superset has no column rules for SQL, so whatever the person may read they read raw: every level the snapshot
 classifies anything at is cleared. Superset's refusal text can name a table the person cannot see, so it is logged and
 never reaches the grants or an exception's message.
+
+A snapshot enriched directly from Oracle may hold values harvested from rows with the enrichment login
+(`harvested.values_harvested`). Its grants withhold those of every object but each granted table Superset, asked as the
+person, says no row rule applies to for them (`GrantSet.values_withheld`): the extension's `table_rules`, asked through
+the request's adapter, which answers from what the grant check's own dry runs were told (`SupersetSqlAdapter.
+table_rules`). Every dry run on Oracle asks `table_rules` of each table it names, and the grant check names each table
+it grants, so harvested values cost no call of their own where the check was answered; the rest are asked, fifty a
+call. Asking for every granted table on every request, rather than for those a request goes on to use, keeps one
+decision for the whole request: its prompt, its value checks, its history and the schema it shows. A snapshot that
+harvested none asks nothing more.
 """
 
 from __future__ import annotations
@@ -39,7 +49,8 @@ from mnemiq.superset.client import (
     SupersetToolError,
     SupersetUnavailable,
 )
-from mnemiq.superset.names import stored_name
+from mnemiq.superset.harvested import snapshot_objects, values_harvested
+from mnemiq.superset.names import stored_name, superset_name
 from mnemiq.superset.payload import SupersetAccessRefused, SupersetQueryFailed
 from mnemiq.superset.settings import superset_dialect
 
@@ -128,7 +139,8 @@ class UnreadableAnswer(Exception):
 
 
 def resolve_grants(adapter: SupersetSqlAdapter, snapshot: Snapshot) -> GrantSet:
-    """The snapshot tables the person whose token `adapter` carries may read, as Superset decides.
+    """The snapshot tables the person whose token `adapter` carries may read, as Superset decides, and the objects whose
+    harvested values they may not use (`_values_withheld`).
 
     The snapshot's tables are its table bindings, each probed by the name the source stores it under and granted by
     its object id. Raises `NotABuilder` when the person's roles do not permit `execute_sql` or `list_datasets`, and
@@ -138,20 +150,51 @@ def resolve_grants(adapter: SupersetSqlAdapter, snapshot: Snapshot) -> GrantSet:
     datasets cannot be read whole."""
     tables = table_bindings(snapshot)
     if not tables:
-        return GrantSet(frozenset())
+        return GrantSet(frozenset(), values_withheld=_values_withheld(adapter, snapshot, frozenset()))
     clearance = classified_levels(snapshot)
     try:
         if _accepted(adapter, list(tables)):
-            return GrantSet(frozenset(object_id for ids in tables.values() for object_id in ids),
-                            pii_clearance=clearance)
-        datasets = read_datasets(adapter)
-        candidates = _candidates(datasets, tables, adapter.database_id, adapter.schema)
-        confirmed = _confirmed(adapter, candidates)
+            granted = frozenset(object_id for ids in tables.values() for object_id in ids)
+        else:
+            datasets = read_datasets(adapter)
+            candidates = _candidates(datasets, tables, adapter.database_id, adapter.schema)
+            confirmed = _confirmed(adapter, candidates)
+            logger.info("granted %d of %d tables: those Superset confirmed of the %d its %d datasets for this user "
+                        "name", len(confirmed), len(tables), len(candidates), len(datasets))
+            granted = frozenset(object_id for name in confirmed for object_id in tables[name])
+        withheld = _values_withheld(adapter, snapshot, granted)
     except UnreadableAnswer:
         return UNAVAILABLE
-    logger.info("granted %d of %d tables: those Superset confirmed of the %d its %d datasets for this user name",
-                len(confirmed), len(tables), len(candidates), len(datasets))
-    return GrantSet(frozenset(object_id for name in confirmed for object_id in tables[name]), pii_clearance=clearance)
+    return GrantSet(granted, pii_clearance=clearance, values_withheld=withheld)
+
+
+def _values_withheld(adapter: SupersetSqlAdapter, snapshot: Snapshot, granted: frozenset[str]) -> frozenset[str]:
+    """The objects of `snapshot` whose harvested values a request of the person whose token `adapter` carries may not
+    use: none where the snapshot harvested none, and nothing is asked; else every object it names but each table in
+    `granted` that Superset says no row rule applies to for the person (`SupersetSqlAdapter.table_rules`, by the
+    table's name as Superset shows it, in the configured schema).
+
+    A rule that applies and an answer mnemiq cannot read withhold. A table not granted is not asked, and nor is one
+    whose stored name is not the one Superset reads for the name it shows it by: no answer about that name is about it.
+    Neither is shown. Raises `UnreadableAnswer` when Superset does not answer, as for any question of the grants."""
+    if not values_harvested(snapshot):
+        return frozenset()
+    asked: dict[str, set[str]] = {}
+    for stored, ids in table_bindings(snapshot).items():
+        shown = superset_name(stored)
+        if ids & granted and stored_name(shown) == stored:
+            asked.setdefault(shown, set()).update(ids & granted)
+    free: set[str] = set()
+    if asked:
+        try:
+            rules = adapter.table_rules(list(asked))
+        except SupersetUnavailable as exc:
+            logger.warning("Superset's row rules got no answer (%s: %s); granting nothing", exc, exc.detail)
+            raise UnreadableAnswer from exc
+        free = {object_id for name, ids in asked.items() if rules.get(name) is False for object_id in ids}
+        logger.info("harvested values: %d of %d granted tables shown, where Superset says no row rule applies to this "
+                    "user", len(free), len(granted))
+    return snapshot_objects(snapshot) - free
 
 
 def _accepted(adapter: SupersetSqlAdapter, names: list[str]) -> bool:

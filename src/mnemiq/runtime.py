@@ -49,6 +49,7 @@ from mnemiq.superset.executor import (
 )
 from mnemiq.superset.extension import SessionAnswer, session_binding
 from mnemiq.superset.grants import FixedGrants, GrantsUnreadable, SupersetMisconfigured, resolve_grants
+from mnemiq.superset.harvested import served_values, values_scoped
 from mnemiq.superset.history import superset_history
 from mnemiq.superset.names import stored_name
 from mnemiq.superset.settings import (
@@ -174,6 +175,10 @@ class Runtime:
     default_profile: str = "default"
     answer_log: AnswerLog | None = None  # one line per answer, for a deployment with no sink
     engine_commit: str | None = None
+    # Superset mode's reader of the store's value index, held to the served source's rows (`ValueIndex`'s
+    # `source_id`), and read by a request only through `served_values`. None: built by hand, or direct mode, whose
+    # agents hold their own.
+    value_index: ValueIndex | None = None
 
     @property
     def _superset_mode(self) -> bool:
@@ -298,35 +303,43 @@ class Runtime:
             return self.snapshot.source_id
         return (self.settings.source_id if self.settings else None) or "unknown"
 
-    def _retrieve(self, question: str, identity, authz, grants, settings, name: str, picked):
+    def _retrieve(self, question: str, identity, authz, grants, settings, name: str, picked, snapshot):
         """The packet `ask` retrieves, and `search` with it: one call, so the table-search check scores exactly what
-        answering reads (the two doors, M81)."""
+        answering reads (the two doors, M81). `snapshot` is the one the request reads (`_served`)."""
         return retrieve(
             self.con, question, identity, authz, self.embedder,
             # The default lives on the Settings field, not here. It was written out as a
             # literal 12 and silently kept the old value when the measured default moved
             # to 24 -- a second copy of a number is a second thing to forget.
             k=settings.retrieval_k if settings else DEFAULT_RETRIEVAL_K,
-            table_facts=self.snapshot.table_facts if self.snapshot else (),
+            table_facts=snapshot.table_facts if snapshot else (),
             # Both doors pass this or the eval measures a prompt form `ask` cannot emit
             # -- the M81 shape the two-doors guard exists to catch, which it did.
             card_style=self._card_style(name, picked),
             dialect=getattr(self.adapter, "dialect", None),
             # Definitions ride with the snapshot: the glossary channel had no runtime
             # producer until the ontology digest, so this stayed unfed from Plan 08 until SP1.
-            definitions=self.snapshot.definitions if self.snapshot else (),
+            definitions=snapshot.definitions if snapshot else (),
             # Certified metrics and dimensions were appended to the snapshot by
             # `apply_certified` and passed to nothing -- five of the fs corpus's twenty-eight
             # records reaching the model not at all, and the five carrying the most explicit
             # meaning.
-            metrics=self.snapshot.metrics if self.snapshot else (),
-            dimensions=self.snapshot.dimensions if self.snapshot else (),
-            columns=self.snapshot.columns if self.snapshot else (),
+            metrics=snapshot.metrics if snapshot else (),
+            dimensions=snapshot.dimensions if snapshot else (),
+            columns=snapshot.columns if snapshot else (),
             ontology_index=self.ontology,
             # M4: lets retrieve re-render each card against this identity's column policy.
-            snapshot=self.snapshot,
+            snapshot=snapshot,
             grants=grants,
         )
+
+    def _served(self, grants: GrantSet) -> Snapshot | None:
+        """The snapshot a request under `grants` reads, every reader of it handed this one: in Superset mode the served
+        snapshot with what the request may not use of the values enrichment harvested taken out (`values_scoped`),
+        and elsewhere the served snapshot itself. Read once the snapshot is reloaded, so it is the one served now."""
+        if self._superset_mode and self.snapshot is not None:
+            return values_scoped(self.snapshot, grants)
+        return self.snapshot
 
     def search(self, question: str, identity: IdentityContext, profile: str | None = None) -> SearchResult:
         """What `ask` would put before the model for `question`, without asking it: the tables retrieval ranks, best
@@ -339,9 +352,10 @@ class Runtime:
         settings, fitter = (picked.settings, picked.fitter) if picked else (self.settings, self.fitter)
         grants = self.authz.grants_for(identity)
         self.reload_if_stale()
-        packet = self._retrieve(question, identity, self.authz, grants, settings, name, picked)
+        snapshot = self._served(grants)
+        packet = self._retrieve(question, identity, self.authz, grants, settings, name, picked, snapshot)
         packet.history = scope_history(None, grants.fingerprint)
-        fit = (fitter.measure(packet, self.snapshot, grants, card_style=self._card_style(name, picked))
+        fit = (fitter.measure(packet, snapshot, grants, card_style=self._card_style(name, picked))
                if fitter is not None else None)
         return SearchResult(tables=[c.object_id for c in packet.cards], fit=fit, granted=frozenset(grants.objects))
 
@@ -391,7 +405,9 @@ class Runtime:
             # session is shown to be the snapshot's (`bound`), before anything else of theirs is asked of Superset.
             grants = self._superset_grants(adapter)
             authz = FixedGrants(grants)
-            agent = agent.with_adapter(adapter)
+            # The value index this request may read: the snapshot's own harvested values of the tables whose values
+            # its grants show, and none for a snapshot that harvested none (`served_values`).
+            agent = agent.with_adapter(adapter).with_values(served_values(self.value_index, self.snapshot, grants))
         else:
             # ONE resolution per question, handed to everything below (M13). The provider may re-read
             # its policy file per call, so asking twice let retrieval scope the cards against one
@@ -403,17 +419,20 @@ class Runtime:
                                     time.perf_counter(), picked)
             self.reload_if_stale()
             started = time.perf_counter()
+        # Every reader of the snapshot below reads this one, which in Superset mode holds only what this request may use
+        # of the values enrichment harvested.
+        snapshot = self._served(grants)
         with step(emit, Stage.RETRIEVE, mode=name):
-            packet = self._retrieve(question, identity, authz, grants, settings, name, picked)
+            packet = self._retrieve(question, identity, authz, grants, settings, name, picked, snapshot)
         if superset:
-            # No few-shot example is served, whatever the store holds, as no value index is (`NoValueIndex`): an
-            # example's SQL can carry a literal read with another credential, outside Superset's row rules, and the
-            # store keeps examples under any source id. Enrichment through Superset writes none of its own.
+            # No few-shot example is served, whatever the store holds: an example's SQL can carry a literal read with
+            # another credential, outside Superset's row rules, and the store keeps examples under any source id.
+            # Enrichment through Superset writes none of its own.
             packet.examples = []
             # No row the client sent back is kept. The newest turn with SQL is decided again under these grants, with
             # the answering agent's own value index and fan-out setting, and run again through this request's adapter
             # within the answer statement's time limit, so "it" in a follow-up names rows this person may read now.
-            packet.history = superset_history(history, grants=grants, snapshot=self.snapshot, adapter=adapter,
+            packet.history = superset_history(history, grants=grants, snapshot=snapshot, adapter=adapter,
                                               timeout_s=agent.timeout_s, values=agent.values,
                                               guard_fanout=agent.guard_fanout)
         else:
@@ -422,8 +441,8 @@ class Runtime:
         # After the history, which the prompt carries too; before the agent, so the generator, the
         # corrector and the judge all read the cards the window has room for (M127).
         if fitter is not None:
-            packet = fitter.fit(packet, self.snapshot, grants, card_style=self._card_style(name, picked))
-        answer = agent.answer(packet, self.snapshot, grants, identity, emit=emit)
+            packet = fitter.fit(packet, snapshot, grants, card_style=self._card_style(name, picked))
+        answer = agent.answer(packet, snapshot, grants, identity, emit=emit)
         if superset and (refused := adapter.terminal_refusal) is not None:
             # Superset refused the person during the answer, reading the function inventory, at the proof, or running
             # the statement: their token, their roles, or without saying why. The agent read that as a source that did
@@ -484,7 +503,8 @@ class Runtime:
     def schema(self, identity: IdentityContext, *, delegation: DelegatedToken | None = None) -> list[dict]:
         """The tables and cards this identity may see, scoped by TABLE and by COLUMN. In Superset mode, what Superset
         says the person whose token `delegation` is may read."""
-        return self._cards(self._grants_for(identity, delegation))
+        grants = self._grants_for(identity, delegation)
+        return self._cards(grants, self._served(grants))
 
     def scope(self, identity: IdentityContext, *, delegation: DelegatedToken | None = None) -> dict:
         """Everything an opening screen needs: the cards in scope, and the questions to offer.
@@ -495,12 +515,11 @@ class Runtime:
         resolution is Superset's, asked with `delegation`, as `schema` asks it.
         """
         grants = self._grants_for(identity, delegation)
+        snapshot = self._served(grants)
         starters: list[str] = []
-        if self.snapshot is not None:
-            starters = compose_starters(
-                self.snapshot, grants, build_access_policy(self.snapshot, grants)
-            )
-        return {"tables": self._cards(grants), "starters": starters}
+        if snapshot is not None:
+            starters = compose_starters(snapshot, grants, build_access_policy(snapshot, grants))
+        return {"tables": self._cards(grants, snapshot), "starters": starters}
 
     def _grants_for(self, identity: IdentityContext, delegation: DelegatedToken | None) -> GrantSet:
         """`identity`'s grants under the access policy, or in Superset mode what Superset says the person whose token
@@ -592,21 +611,22 @@ class Runtime:
             raise GrantsUnreadable()
         return grants
 
-    def _cards(self, grants) -> list[dict]:
+    def _cards(self, grants, snapshot) -> list[dict]:
         """M4: this filtered on `oid in grants.objects` alone -- table level -- while promising
         that metadata never leaks. The stored card is rendered once at enrich time from the whole
         snapshot, so a granted table's card listed every column including denied ones, with their
         pii_level and their harvested coded values. The card is re-rendered per identity now; the
-        stored one stays identity-independent because it is what gets embedded and indexed.
+        stored one stays identity-independent because it is what gets embedded and indexed. `snapshot` is the one the
+        request reads (`_served`).
         """
-        if self.snapshot is None:
+        if snapshot is None:
             # Nothing to scope a card against, so no card is served: the stored one is unscoped (M274).
             return []
         rows = self.con.execute("SELECT object_id, card FROM semantic_object").fetchall()
         allowed = grants.objects
         scoped = {
             card.object_id: card.text
-            for card in build_cards(self.snapshot, policy=build_access_policy(self.snapshot, grants))
+            for card in build_cards(snapshot, policy=build_access_policy(snapshot, grants))
         }
         # Only the scoped re-render: an indexed table the current snapshot no longer holds is left out, never served
         # as its stored, whole-snapshot card (M274).
@@ -620,13 +640,14 @@ class Runtime:
         if self._superset_mode:
             raise SupersetReadOnly()
         grants = self.authz.grants_for(identity)
-        visible = visible_schema(self.snapshot, grants) if self.snapshot else {}
-        policy = build_access_policy(self.snapshot, grants) if self.snapshot else AccessPolicy()
+        snapshot = self._served(grants)
+        visible = visible_schema(snapshot, grants) if snapshot else {}
+        policy = build_access_policy(snapshot, grants) if snapshot else AccessPolicy()
         dialect = getattr(self.adapter, "dialect", "duckdb")
         # The same map the read path builds in `plan_query`. Without it the write decider's view
         # floor is a parameter nobody passes -- the whole control, satisfied in tests and absent
         # in production.
-        views = inventory_for(self.snapshot)
+        views = inventory_for(snapshot)
         verdict = decide_write(sql, visible, grants, adapter=self.adapter, dialect=dialect,
                                policy=policy, views=views,
                                # M226: a federated grant is keyed `catalog.table`, a single
@@ -983,8 +1004,9 @@ def _warn_stale_codes(snapshot: Snapshot | None, con, authz: AuthzProvider | Non
     value index is read without any filter, so listing them would show values from rows a role cannot read (M5), and
     the line says why.
 
-    Superset mode harvests no values, so it judges nothing (`NoValueIndex`), as its writer is given none. An index that
-    cannot be read is said and skipped: an advisory never stops a boot, or a swap on a user's request."""
+    Superset mode judges nothing (`NoValueIndex`): what it may read of a value index is decided per request, by the row
+    rules of the person asking (`served_values`), and this line is no person's. An index that cannot be read is said
+    and skipped: an advisory never stops a boot, or a swap on a user's request."""
     if snapshot is None:
         return
     try:
@@ -1498,9 +1520,11 @@ def build_runtime(settings: Settings) -> Runtime:
     for profile_name, profile in profiles.items():
         kit = build_components(profile.settings, adapter, con)
         if superset:
-            # Superset mode harvests no values, so it serves none, whatever the store holds: a direct
+            # Superset mode serves no value index from its agents, whatever the store holds: a direct
             # enrichment's values may be there, under this source id or another, and `ValueIndex`
-            # reads every row of the table.
+            # unscoped reads every row of the table. Each request is handed the index it may read
+            # (`served_values`): a harvested snapshot's own source's values of the tables whose values
+            # its grants show, and none otherwise.
             kit = replace(kit, values=NoValueIndex())
         # Per-mode result verifier: sanity (free) in every mode, judge in `thinking` and `deep`; the
         # judge is built once and shared. MNEMIQ_VERIFY=0 forces off (byte-for-byte), =1 forces full.
@@ -1583,4 +1607,8 @@ def build_runtime(settings: Settings) -> Runtime:
         default_profile=default_profile,
         answer_log=answer_log,
         engine_commit=commit,
+        # Opened here, once, so no request writes to the store: a request reads it through `served_values`. Only on
+        # Oracle, the one database a snapshot Superset mode serves may hold harvested values from.
+        value_index=(ValueIndex(con, source_id=snapshot.source_id) if superset and superset_dialect() == "oracle"
+                     else None),
     )

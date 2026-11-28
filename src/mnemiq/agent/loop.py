@@ -343,6 +343,13 @@ class Agent:
         twin.adapter = adapter
         return twin
 
+    def with_values(self, values) -> Agent:
+        """This agent grounding filter values in `values`, every other part shared: a copy, as `with_adapter` makes one,
+        so the value index one request may read never becomes the one another request is answered with."""
+        twin = copy.copy(self)
+        twin.values = values
+        return twin
+
     def decline_if_too_long(self, question: str) -> AgentAnswer | None:
         """The decline for a question too long to read whole, or None. Every stage reads the question whole, so
         a longer one is declined, never cut (M147). Both doors call this before retrieval, which embeds the

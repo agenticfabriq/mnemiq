@@ -130,41 +130,45 @@ class NoValueIndex:
 
 class ValueIndex:
     """Read side of the value index. Resilient to a store built before value grounding: the
-    table is ensured on construction, so an un-indexed store simply answers 'not indexed'."""
+    table is ensured on construction, so an un-indexed store simply answers 'not indexed'.
 
-    def __init__(self, con: duckdb.DuckDBPyConnection) -> None:
+    With `source_id`, only the rows enrichment wrote for that source are read; without it, every
+    row is, as direct mode has always read the index. A store may hold another source's values
+    under the same table names, and a reader serving one snapshot must not read them."""
+
+    def __init__(self, con: duckdb.DuckDBPyConnection, source_id: str | None = None) -> None:
         self._con = con
+        self._source_id = source_id
         con.execute(_DDL)
 
+    @property
+    def source_id(self) -> str | None:
+        """The source whose rows this reader is held to, or None for every source's."""
+        return self._source_id
+
+    def _rows(self, query: str, params: list, tail: str = "") -> list[tuple]:
+        """`query`'s rows, `tail` after its conditions, the rows held to `source_id` where one was given."""
+        if self._source_id is not None:
+            query, params = f"{query} AND source_id = ?", [*params, self._source_id]
+        return self._con.execute(query + tail, params).fetchall()
+
     def has(self, object_id: str, column: str) -> bool:
-        row = self._con.execute(
-            "SELECT 1 FROM value_index WHERE object_id = ? AND column_name = ? LIMIT 1",
-            [object_id, column],
-        ).fetchone()
-        return row is not None
+        return bool(self._rows("SELECT 1 FROM value_index WHERE object_id = ? AND column_name = ?",
+                               [object_id, column], " LIMIT 1"))
 
     def contains(self, object_id: str, column: str, literal: str) -> bool:
-        row = self._con.execute(
-            "SELECT 1 FROM value_index "
-            "WHERE object_id = ? AND column_name = ? AND value_text = ? LIMIT 1",
-            [object_id, column, literal],
-        ).fetchone()
-        return row is not None
+        return bool(self._rows("SELECT 1 FROM value_index WHERE object_id = ? AND column_name = ? AND value_text = ?",
+                               [object_id, column, literal], " LIMIT 1"))
 
     def holders(self, literal: str) -> set[tuple[str, str]]:
         """Every (object, column) the index holds `literal` in, in one query: `repair_hints` asks which columns hold a
         refused value, and one `has` and `contains` per column cost seconds on a wide schema (the final review)."""
-        return {(o, c) for o, c in self._con.execute(
-            "SELECT DISTINCT object_id, column_name FROM value_index WHERE value_text = ?", [literal]).fetchall()}
+        return {(o, c) for o, c in self._rows(
+            "SELECT DISTINCT object_id, column_name FROM value_index WHERE value_text = ?", [literal])}
 
     def _values(self, object_id: str, column: str) -> list[str]:
-        return [
-            r[0]
-            for r in self._con.execute(
-                "SELECT value_text FROM value_index WHERE object_id = ? AND column_name = ?",
-                [object_id, column],
-            ).fetchall()
-        ]
+        return [r[0] for r in self._rows("SELECT value_text FROM value_index WHERE object_id = ? AND column_name = ?",
+                                         [object_id, column])]
 
     def values(self, object_id: str, column: str) -> list[str]:
         """Every value the index holds for the column, sorted; none for a column it does not index."""

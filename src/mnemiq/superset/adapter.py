@@ -36,7 +36,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from functools import cached_property
 
 import pyarrow as pa
@@ -150,6 +150,10 @@ class SupersetSqlAdapter:
         self._refresh_every_statement = refresh_every_statement
         self._terminal_refusal: SupersetRefusal | ExtensionMissing | None = None
         self._bound_to: tuple[int, str, str] | None = None
+        # Whether a row rule applies to the caller on each table of the adapter's schema, by its name as Superset shows
+        # it, as `table_rules` answered a statement of the request this adapter serves, where it answered: what
+        # `table_rules` (the method) answers from. A statement's own check never reads it and asks again each time.
+        self._rules_told: dict[str, bool] = {}
         self.client = _HeldClient(client, self) if held else client
 
     @property
@@ -477,6 +481,25 @@ class SupersetSqlAdapter:
             raise
         return read
 
+    def table_rules(self, names: Sequence[str]) -> dict[str, bool | None]:
+        """Whether a row rule applies to the caller on each of `names`, tables in the adapter's schema by their names
+        as Superset shows them, as the extension's `table_rules` answers (`extension.table_rules_apply`): from what a
+        statement of this request was told about a table, and asked, `TABLE_RULES_BATCH` names a call, for the rest.
+        None where mnemiq cannot tell, which is never kept, so it is asked again. One adapter serves one request, so
+        nothing is answered from another. Superset not answering is raised (`SupersetUnavailable`), and so is a refusal
+        of the caller, which the request ends as (`terminal_refusal`)."""
+        missing = [name for name in dict.fromkeys(names) if name not in self._rules_told]
+        told: dict[str, bool | None] = {}
+        if missing:
+            try:
+                told = table_rules_apply(self.client, database_id=self._database_id, schema=self._schema,
+                                         tables=missing, raise_unavailable=True)
+            except TERMINAL_REFUSALS as exc:
+                self._remember(exc)
+                raise
+            self._rules_told.update({name: applies for name, applies in told.items() if applies is not None})
+        return {name: self._rules_told[name] if name in self._rules_told else told.get(name) for name in names}
+
     def _table_rules(self, sent: str) -> dict[str, bool | None]:
         """Whether a row rule applies to the caller on each table `sent` reads (`executed.physical_reads`), as the
         extension's `table_rules` answers: one call for each schema that holds them, a table the statement does not
@@ -493,6 +516,8 @@ class SupersetSqlAdapter:
             answers = {schema: table_rules_apply(self.client, database_id=self._database_id, schema=schema,
                                                  tables=names, raise_unavailable=True)
                        for schema, names in by_schema.items()}
+            self._rules_told.update({name: applies for name, applies in answers.get(self._schema, {}).items()
+                                     if applies is not None})
             rules = {key: answers[schema or self._schema].get(name) if not catalog and name else None
                      for key, (catalog, schema, name) in read.items()}
             if None in rules.values():

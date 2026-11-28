@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from mnemiq.contract import IdentityContext
+from mnemiq.sql.qualify import names_one_object
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,10 @@ class GrantSet:
     # nothing. Both deny everything -- the difference is that one is an outage an operator must be
     # told about, and before this they were the same empty set (register M2).
     available: bool = True
+    # The objects whose values enrichment harvested from their rows this request may not use: in Superset mode on a
+    # snapshot enriched directly from Oracle, every table Superset does not say, asked as the person, no row rule
+    # applies to for them (`superset.grants.resolve_grants`). Empty everywhere else. Read through `values_shown`.
+    values_withheld: frozenset[str] = frozenset()
 
     def allows(self, object_id: str) -> bool:
         return object_id in self.objects
@@ -53,6 +58,11 @@ class GrantSet:
         `available` is deliberately excluded: it describes whether we could READ the policy, not
         what the policy grants. Including it would repartition the cache during an outage, which
         is a second failure on top of the first.
+
+        `values_withheld` is included where it holds anything, and only then, so every fingerprint
+        taken where nothing is withheld is what it was. A turn answered while a table's values were
+        shown may quote one, and a request withholding them must not be reminded of it
+        (`scope_history` keeps only turns of the same fingerprint).
         """
         parts = [
             "R:" + "|".join(sorted(self.objects)),
@@ -60,7 +70,21 @@ class GrantSet:
             "C:" + "|".join(sorted(self.pii_clearance)),
             "M:" + "|".join(sorted(self.pii_mask)),
         ]
+        if self.values_withheld:
+            parts.append("W:" + "|".join(sorted(self.values_withheld)))
         return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:12]
+
+
+def values_shown(grants: GrantSet, object_id: str) -> bool:
+    """Whether a request under `grants` may use the values enrichment harvested from the rows of `object_id`: not
+    where `values_withheld` names it, nor where a row filter of the grants does, since the harvest read every row and
+    the filter keeps some from this identity. Names match ignoring case (`names_one_object`): matching more withholds
+    more, never less.
+
+    The one predicate every reader of harvested values decides by. In Superset mode they are the snapshot a request
+    reads and the value index it reads (`superset.harvested`); direct mode's row filters keep their own handling as
+    well, in the value check, which quotes no value of a filtered table."""
+    return not (names_one_object(object_id, grants.values_withheld) or names_one_object(object_id, grants.row_filters))
 
 
 EMPTY = GrantSet(frozenset())
