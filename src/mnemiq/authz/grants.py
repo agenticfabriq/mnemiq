@@ -39,9 +39,9 @@ class GrantSet:
     available: bool = True
     # The objects of which this request may not use what enrichment read from their rows (harvested values, and the
     # counts a request shows), nor, where no value was harvested, show the meaning the model wrote from those counts
-    # (descriptions no certified record stated, table facts, examples, codes not certified): in Superset mode on a
-    # snapshot enriched directly from Oracle, every table Superset does not say, asked as the person, no row rule
-    # applies to for them (`superset.grants.resolve_grants`). Empty everywhere else. Read through `values_shown`.
+    # (descriptions no certified record stated, code schemes, table facts, examples, codes not certified): in Superset
+    # mode on a snapshot enriched directly from Oracle, every table Superset does not say, asked as the person, no row
+    # rule applies to for them (`superset.grants.resolve_grants`). Empty everywhere else. Read through `values_shown`.
     values_withheld: frozenset[str] = frozenset()
 
     def allows(self, object_id: str) -> bool:

@@ -966,6 +966,53 @@ def test_a_certified_record_marks_the_fields_it_states():
     assert _column(unset, ITEMS).certified_fields == ["semantic_type"]
 
 
+def test_a_description_the_model_writes_over_a_marked_column_is_no_longer_marked():
+    """The mark names only what a certified record stated and the column still holds: a description, type and level
+    the model writes afterwards are not marked as the record's, and on a snapshot that harvested no values a ruled
+    table's model-written description is withheld."""
+    from mnemiq.enrichment.enricher import FakeEnricher
+    from mnemiq.enrichment.semantic import enrich_semantic
+
+    laid = apply_certified(_unharvested(), [_certified(
+        f"{ORDERS}.STATUS", description="Certified status", semantic_type="code", pii_level="none",
+        code_scheme=CodeScheme(id="scheme-cert", label="Certified scheme"))])
+    assert _column(laid, ORDERS).certified_fields == ["code_scheme", "description", "pii_level", "semantic_type"]
+    reply = json.dumps({"columns": [{"name": "STATUS", "description": "Written by the model", "semantic_type": "code",
+                                     "pii_level": "none"}]})
+    described = enrich_semantic(laid, FakeEnricher({ORDERS: reply}))
+    status = _column(described, ORDERS)
+    assert status.description == "Written by the model" and status.certified_fields == ["code_scheme"]
+    shown = values_scoped(described, _withholding(ORDERS), shown=True)
+    assert _column(shown, ORDERS).description is None
+
+
+def test_codes_the_model_drops_are_no_longer_marked():
+    """A column the model reads as a measure loses its code list; the mark no longer names the codes."""
+    from mnemiq.enrichment.enricher import FakeEnricher
+    from mnemiq.enrichment.semantic import enrich_semantic
+
+    laid = apply_certified(_unharvested(), [_certified(f"{ORDERS}.STATUS", coded_values=[CodedValue(code="C1")])])
+    assert _column(laid, ORDERS).certified_fields == ["coded_values"]
+    reply = json.dumps({"columns": [{"name": "STATUS", "description": "A measure", "semantic_type": "amount"}]})
+    status = _column(enrich_semantic(laid, FakeEnricher({ORDERS: reply})), ORDERS)
+    assert status.coded_values == [] and status.certified_fields == []
+
+
+@pytest.mark.parametrize("own, stated, laid, marked", [
+    ("pii", "phi", "phi", True),
+    ("pii", "none", "pii", False),  # an unattested record may not lower a level: the column's own is kept
+    ("none", "personal", "pii", False),  # a level outside the vocabulary is read as the most sensitive
+], ids=["laid as stated", "a refused downgrade", "an unrecognised level"])
+def test_the_mark_names_a_level_only_where_the_records_level_was_laid(own, stated, laid, marked):
+    snapshot = _unharvested()
+    held = snapshot.model_copy(update={"columns": [
+        c.model_copy(update={"pii_level": own}) if c.id == f"{ITEMS}.STATUS" else c for c in snapshot.columns]})
+    out = apply_certified(held, [_certified(f"{ITEMS}.STATUS", pii_level=stated)])
+    column = _column(out, ITEMS)
+    assert column.pii_level == laid
+    assert ("pii_level" in column.certified_fields) is marked
+
+
 def test_a_description_a_certified_record_did_not_state_is_withheld_with_the_rest():
     """A record certifying a ruled column's type alone vouches for no description: the one the model wrote stays out
     of what is shown, beside the counts. The same record on a free table leaves its description shown."""

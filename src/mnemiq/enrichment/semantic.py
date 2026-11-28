@@ -50,12 +50,19 @@ def _annotated(column: Column, annotation: ColumnAnnotation) -> Column:
         # Preserve grounded meanings + provenance; annotation.code_meanings is ignored.
         coded_values = column.coded_values
 
+    # The fields a certified record stated (`certified_fields`) name what the column holds: every one written here is
+    # the model's now, so it is no longer named.
+    written = {"description", "semantic_type", "pii_level"} | (
+        {"coded_values"} if coded_values is not column.coded_values else set())
+    certified = (None if column.certified_fields is None
+                 else [field for field in column.certified_fields if field not in written])
     return column.model_copy(
         update={
             "description": annotation.description,
             "semantic_type": annotation.semantic_type,
             "pii_level": annotation.pii_level,
             "coded_values": coded_values,
+            "certified_fields": certified,
         }
     )
 
