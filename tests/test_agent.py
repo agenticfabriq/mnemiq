@@ -471,6 +471,55 @@ def test_a_vote_the_verifier_blocks_keeps_its_record():
     assert ans.candidates_executed == 5 and ans.agreement == 0.6
 
 
+class _FailsOnCall(FakeGenerator):
+    """The scripted writer, whose model goes away on call `n` (1-based)."""
+
+    def __init__(self, replies, n, failure=None):
+        super().__init__(replies)
+        self._n = n
+        self._failure = failure
+
+    def propose(self, packet, feedback=None, strategy=None):
+        if len(self.calls) + 1 == self._n:
+            self.calls.append(feedback)
+            from mnemiq.llm.client import ModelUnavailable
+            raise self._failure() if self._failure else ModelUnavailable("the provider went away", kind="connect")
+        return super().propose(packet, feedback=feedback, strategy=strategy)
+
+
+@pytest.mark.parametrize(("replies", "fails_on", "ran"), [
+    # every candidate declines and the single path's writer fails: none had run (Codex, reviewing E72's branch)
+    (['{"sql": null, "reason": "cannot"}'] * 3, 4, 0),
+    # the second candidate's writer fails after the first ran
+    ([_sql("count(*)")], 2, 1),
+])
+def test_a_model_failure_during_the_vote_keeps_how_many_had_run(replies, fails_on, ran):
+    agent = _vote_agent([], 3)
+    agent.generator = _FailsOnCall(replies, fails_on)
+    ans = _answer(agent)
+    assert ans.failed and ans.model_error == "connect"
+    assert ans.candidates_executed == ran
+
+
+@pytest.mark.parametrize("failure", ["ContextTooLong", "PromptCut"])
+def test_the_window_failures_keep_how_many_had_run_too(failure):
+    """The handler words these two apart from an outage; each still says how many candidates had run."""
+    from mnemiq.llm import client
+
+    agent = _vote_agent([], 3)
+    agent.generator = _FailsOnCall([_sql("count(*)")], 2, failure=lambda: getattr(client, failure)("the window"))
+    ans = _answer(agent)
+    assert ans.failed and ans.model_error == getattr(client, failure).kind
+    assert ans.candidates_executed == 1
+
+
+def test_a_model_failure_in_a_one_candidate_mode_records_no_vote():
+    agent = _agent([])
+    agent.generator = _FailsOnCall([], 1)
+    ans = _answer(agent)
+    assert ans.failed and ans.candidates_executed is None
+
+
 def test_a_vote_where_no_candidate_ran_says_none_ran():
     """With every candidate declining, the vote falls back to the single repairing path. Its answer says 0 of them ran,
     not nothing: nothing is what a one-candidate mode reports, so a sweep row, the audit record and the answer on the
