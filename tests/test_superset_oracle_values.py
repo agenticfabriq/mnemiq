@@ -426,16 +426,14 @@ def test_an_object_bound_under_several_names_is_shown_only_when_every_name_has_n
     assert _values_withheld(_adapter(_oracle_client()), viewed, frozenset({ORDERS, ITEMS})) == {ORDERS}
 
 
-def test_values_not_harvested_ask_nothing_and_withhold_nothing(superset_oracle):
-    """An Oracle snapshot whose values were not harvested holds none to withhold: the grants ask no more than the grant
-    check's own statement asks, and withhold nothing."""
+def test_values_not_harvested_still_withhold_what_was_read_of_a_ruled_tables_rows(superset_oracle):
+    """An Oracle snapshot whose values were not harvested still holds the counts profiling read from every row: the
+    grants withhold a ruled table as for a harvested one, and ask no more than the grant check's own statement asks."""
     snapshot = _harvested_snapshot(jobs=[_oracle_job(values="not harvested")])
     assert not values_harvested(snapshot)
     client = _oracle_client({SHOWN[ORDERS]})
-    adapter = _adapter(client)
-    adapter.table_rules = None  # nothing may ask it
-    grants = resolve_grants(adapter, snapshot)
-    assert grants.values_withheld == frozenset()
+    grants = resolve_grants(_adapter(client), snapshot)
+    assert grants.values_withheld == {ORDERS}
     assert len(_table_rule_calls(client)) == 1  # the grant check's own
 
 
@@ -839,14 +837,15 @@ def test_a_rule_superset_cannot_tell_of_withholds(runtime, served):
     assert not any(HARVESTED[t]["code"] in _prompts(model) for t in (ORDERS, ITEMS))
 
 
-def test_values_not_harvested_serve_no_value_index_and_ask_nothing_more(tmp_path, served, answered):
-    """An Oracle snapshot whose values were not harvested is served as before: its content whole, no value index."""
+def test_values_not_harvested_serve_no_value_index_and_decide_with_the_snapshot_whole(tmp_path, served, answered):
+    """An Oracle snapshot whose values were not harvested is decided with whole and served no value index; its ruled
+    table is withheld, for what the request shows of it."""
     fake, _ = served
     RuledSuperset(fake, {SHOWN[ORDERS]})
     runtime = _deployment(tmp_path, served, _harvested_snapshot(jobs=[_oracle_job(values="not harvested")]))
     _ask(runtime)
     [seen] = answered
-    assert isinstance(seen["values"], NoValueIndex) and seen["grants"].values_withheld == frozenset()
+    assert isinstance(seen["values"], NoValueIndex) and seen["grants"].values_withheld == {ORDERS}
     assert seen["snapshot"] is runtime.snapshot
 
 
@@ -901,18 +900,35 @@ def test_a_withheld_tables_profile_is_kept_for_decisions_and_taken_out_of_what_i
     assert values_scoped(unharvested, _withholding(ORDERS), shown=True) is unharvested
 
 
+def test_a_withheld_tables_counts_are_left_out_of_what_is_shown_where_no_value_was_harvested():
+    """Profiling reads every row whether or not values were harvested: for an Oracle snapshot that harvested none, what
+    a request shows leaves a withheld table's counts and estimates out, and nothing else; a shown table keeps its
+    counts, and the snapshot the request decides with is the served one."""
+    snapshot = _profiled(_harvested_snapshot(jobs=[_oracle_job(values="not harvested")]))
+    shown = values_scoped(snapshot, _withholding(ORDERS), shown=True)
+    held = _column(shown, ORDERS, "AMOUNT")
+    assert (held.row_count, held.distinct_count, held.null_count, held.estimate) == (None, None, None, None)
+    assert _column(shown, ORDERS).coded_values == _column(snapshot, ORDERS).coded_values  # values handled as before
+    assert _column(shown, ORDERS).description == _column(snapshot, ORDERS).description
+    assert shown.table_facts == snapshot.table_facts and shown.examples == snapshot.examples
+    assert _column(shown, ITEMS, "AMOUNT") == _column(snapshot, ITEMS, "AMOUNT")
+    assert values_scoped(snapshot, _withholding(ORDERS)) is snapshot
+    assert values_scoped(snapshot, _withholding(), shown=True) is snapshot
+
+
 def _card_of(text: str, table: str) -> str:
     """The part of a prompt or schema text that is `table`'s card."""
     return next(part for part in text.split("TABLE ")[1:] if part.startswith(f"{table}\n"))
 
 
-def test_a_ruled_tables_profile_reaches_no_card_starter_or_prompt_and_still_decides(tmp_path, served, answered):
+@pytest.mark.parametrize("values", ["harvested", "not harvested"])
+def test_a_ruled_tables_profile_reaches_no_card_starter_or_prompt_and_still_decides(tmp_path, served, answered, values):
     """With a rule on ORDERS: ORDERS' card says nothing its counts say (no ENTIRELY NULL note), ITEMS' card does; the
     opening screen's starter about the biggest table's amount is ITEMS', since ORDERS' size is not told; and the agent
     decides with ORDERS' counts still there. With no rule, the starter is about ORDERS."""
     fake, model = served
     superset = RuledSuperset(fake, {SHOWN[ORDERS]})
-    runtime = _deployment(tmp_path, served, _profiled(_harvested_snapshot()))
+    runtime = _deployment(tmp_path, served, _profiled(_harvested_snapshot(jobs=[_oracle_job(values=values)])))
     for listed in (_scope(runtime)["tables"], runtime.schema(ASKER, delegation=DelegatedToken(TOKEN))):
         cards = {card["object_id"]: card["card"] for card in listed}
         assert "ENTIRELY NULL" not in cards[ORDERS] and "ENTIRELY NULL" in cards[ITEMS]
@@ -986,6 +1002,26 @@ FIELD_READERS = {
         "cli.py", "enrichment/accumulate.py", "semantic/federation.py", "semantic/store.py", "store/federated_build.py",
         "generate/prompts.py",  # a packet's, which Superset mode empties
         "semantic/starters.py", "superset/harvested.py",  # the request's snapshot
+    },
+    # A column's counts and estimates: profiling and enrichment offline; the fan-out guard, which decides and never
+    # shows; the card and the starters, handed the snapshot a request shows. `row_count` is also a result's (an answer's
+    # preview, as the MCP door, a trace and the server serialise it).
+    "row_count": {
+        "enrichment/joins.py", "enrichment/pipeline.py", "enrichment/profiling.py", "enrichment/prompts.py",
+        "enrichment/semantic.py", "sql/fanout_check.py", "semantic/cards.py", "semantic/starters.py",
+        "mcp/server.py", "observability/trace_sink.py", "server/serialize.py", "server/superset_conversations.py",
+    },
+    "distinct_count": {
+        "enrichment/grounding.py", "enrichment/joins.py", "enrichment/pipeline.py", "enrichment/profiling.py",
+        "enrichment/prompts.py", "enrichment/semantic.py", "ontology/binder.py", "semantic/values.py",
+        "sql/fanout_check.py",
+    },
+    "null_count": {
+        "enrichment/joins.py", "enrichment/pipeline.py", "enrichment/profiling.py", "enrichment/prompts.py",
+        "enrichment/semantic.py", "sql/fanout_check.py", "semantic/cards.py",
+    },
+    "estimate": {
+        "enrichment/pipeline.py", "enrichment/semantic.py", "enrichment/statistics.py", "sql/fanout_check.py",
     },
 }
 

@@ -1,18 +1,21 @@
-"""What a request in Superset mode may use of the values enrichment harvested from a table's rows.
+"""What a request in Superset mode may use of what enrichment read from a table's rows: the values it harvested, and
+the counts it profiled.
 
 A snapshot enriched directly from Oracle for Superset mode (`mnemiq enrich --for-superset`) was read with the
-enrichment login, past every Superset row rule, and its `superset:oracle` job says whether values were harvested
-(`values_harvested`). The grants of each request withhold the values of every table Superset does not say, asked as the
-person, no row rule applies to for them (`superset.grants.resolve_grants`, `GrantSet.values_withheld`), and what the
-request reads follows them, by one predicate (`values_shown`):
+enrichment login, past every Superset row rule (`rows_read`): its counts always, its values where its `superset:oracle`
+job says they were harvested (`values_harvested`). The grants of each request withhold what was read of every table
+Superset does not say, asked as the person, no row rule applies to for them (`superset.grants.resolve_grants`,
+`GrantSet.values_withheld`), and what the request reads follows them, by one predicate (`values_shown`):
 
 - the snapshot it reads (`values_scoped`), with each withheld table's harvested content taken out: its columns' code
   lists and the meanings grounded for them, the code scheme its values bound a column to, its column descriptions,
   which the model wrote from its code lists and so may quote a value, its table facts, which the model wrote from those
   descriptions, and every example that reads it, whose SQL was written from them and kept because it returned rows. A
   code list grounded from a lookup table carries that table's labels, so a table holding one is shown only while every
-  table that column joins is shown, and withheld where no join of it is recorded. What enrichment read from the
-  database's dictionary or decided for itself stays: names, types, comments, classifications and counts.
+  table that column joins is shown, and withheld where no join of it is recorded. What the request shows a person or the
+  model leaves out the table's row, distinct and null counts and its estimates too, harvested values or not. What
+  enrichment read from the database's dictionary or decided for itself stays: names, types, comments and
+  classifications.
 - the value index it reads (`ShownValues`): the rows enrichment wrote for the snapshot's own source, of the tables the
   snapshot names whose values are shown. Every other column reads as one the index does not hold, so the value check
   checks nothing on it, and where the answer path asks whether a value exists it asks Superset, as the person, under
@@ -33,10 +36,17 @@ from mnemiq.contract.semantic import Example
 from mnemiq.semantic.values import NoValueIndex, ValueIndex
 from mnemiq.superset.settings import NOT_HARVESTED, SUPERSET_ORACLE_JOB, oracle_source
 
-__all__ = ["ShownValues", "served_values", "snapshot_objects", "values_harvested", "values_scoped"]
+__all__ = ["ShownValues", "rows_read", "served_values", "snapshot_objects", "values_harvested", "values_scoped"]
 
 # Where a meaning was grounded from a lookup table's label column (`enrichment.grounding.ground_from_lookup`).
 _LOOKUP = "lookup"
+
+
+def rows_read(snapshot: Snapshot) -> bool:
+    """Whether enrichment read `snapshot`'s tables' rows past every Superset row rule, as a snapshot enriched directly
+    from Oracle for Superset mode records (its `superset:oracle` job): its profile's counts, whether or not it
+    harvested values. A snapshot without the job (one enriched through Superset) is not one."""
+    return any(job.id == SUPERSET_ORACLE_JOB for job in snapshot.jobs)
 
 
 def values_harvested(snapshot: Snapshot) -> bool:
@@ -110,28 +120,34 @@ def values_scoped(snapshot: Snapshot, grants: GrantSet, *, shown: bool = False) 
     but `_shown_tables`) with its columns' code lists, code schemes and descriptions taken out, its table facts dropped,
     and every example reading it dropped. With `shown`, the snapshot the request shows a person or the model (its
     cards, its schema and its starters): such an object's columns lose their row, distinct and null counts and their
-    estimates too, read from its rows as its values were. Without, the snapshot the request decides with keeps them, for
-    the checks that never show them (the fan-out guard's uniqueness of a key). Everything else is the snapshot's own. A
-    snapshot that harvested no values, and one with nothing to take out, is returned itself; it is never changed."""
-    if not values_harvested(snapshot):
+    estimates too, read from its rows as its values were, and for a snapshot that harvested no values these alone.
+    Without, the snapshot the request decides with keeps them, for the checks that never show them (the fan-out guard's
+    uniqueness of a key). Everything else is the snapshot's own. A snapshot whose rows enrichment did not read past the
+    rules (`rows_read`), and one with nothing to take out, is returned itself; it is never changed."""
+    if not rows_read(snapshot):
+        return snapshot
+    harvested = values_harvested(snapshot)
+    if not (harvested or shown):
         return snapshot
     tables = _shown_tables(snapshot, grants)
-    taken = {"coded_values": [], "code_scheme": None, "description": None, **(_PROFILE if shown else {})}
-    columns = [column if column.object_id in tables or not _carries(column, profile=shown)
+    taken = {**({"coded_values": [], "code_scheme": None, "description": None} if harvested else {}),
+             **(_PROFILE if shown else {})}
+    columns = [column if column.object_id in tables or not _carries(column, values=harvested, profile=shown)
                else column.model_copy(update=taken)
                for column in snapshot.columns]
-    facts = [facts for facts in snapshot.table_facts if facts.object_id in tables]
-    examples = [example for example in snapshot.examples if (read := _reads(example)) and read <= tables]
+    facts = [facts for facts in snapshot.table_facts if not harvested or facts.object_id in tables]
+    examples = [example for example in snapshot.examples
+                if not harvested or ((read := _reads(example)) and read <= tables)]
     if (all(new is old for new, old in zip(columns, snapshot.columns)) and len(facts) == len(snapshot.table_facts)
             and len(examples) == len(snapshot.examples)):
         return snapshot
     return snapshot.model_copy(update={"columns": columns, "table_facts": facts, "examples": examples})
 
 
-def _carries(column, *, profile: bool) -> bool:
-    """Whether `column` carries anything `values_scoped` takes out of a withheld table: its harvested values, and with
-    `profile` its counts and estimates."""
-    return bool(column.coded_values or column.code_scheme is not None or column.description
+def _carries(column, *, values: bool, profile: bool) -> bool:
+    """Whether `column` carries anything `values_scoped` takes out of a withheld table: with `values` its harvested
+    values, and with `profile` its counts and estimates."""
+    return bool((values and (column.coded_values or column.code_scheme is not None or column.description))
                 or (profile and any(getattr(column, name) is not None for name in _PROFILE)))
 
 

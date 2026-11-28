@@ -37,9 +37,10 @@ class GrantSet:
     # nothing. Both deny everything -- the difference is that one is an outage an operator must be
     # told about, and before this they were the same empty set (register M2).
     available: bool = True
-    # The objects whose values enrichment harvested from their rows this request may not use: in Superset mode on a
-    # snapshot enriched directly from Oracle, every table Superset does not say, asked as the person, no row rule
-    # applies to for them (`superset.grants.resolve_grants`). Empty everywhere else. Read through `values_shown`.
+    # The objects of which this request may not use what enrichment read from their rows (harvested values, and the
+    # counts a request shows): in Superset mode on a snapshot enriched directly from Oracle, every table Superset does
+    # not say, asked as the person, no row rule applies to for them (`superset.grants.resolve_grants`). Empty
+    # everywhere else. Read through `values_shown`.
     values_withheld: frozenset[str] = frozenset()
 
     def allows(self, object_id: str) -> bool:

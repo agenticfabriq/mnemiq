@@ -17,15 +17,15 @@ Superset has no column rules for SQL, so whatever the person may read they read 
 classifies anything at is cleared. Superset's refusal text can name a table the person cannot see, so it is logged and
 never reaches the grants or an exception's message.
 
-A snapshot enriched directly from Oracle may hold values harvested from rows with the enrichment login
-(`harvested.values_harvested`). Its grants withhold those of every object but each granted table Superset, asked as the
-person, says no row rule applies to for them (`GrantSet.values_withheld`): the extension's `table_rules`, asked through
-the request's adapter, which answers from what the grant check's own dry runs were told (`SupersetSqlAdapter.
-table_rules`). Every dry run on Oracle asks `table_rules` of each table it names, and the grant check names each table
-it grants, so harvested values cost no call of their own where the check was answered; the rest are asked, fifty a
-call. Asking for every granted table on every request, rather than for those a request goes on to use, keeps one
-decision for the whole request: its prompt, its value checks, its history and the schema it shows. A snapshot that
-harvested none asks nothing more.
+A snapshot enriched directly from Oracle was read from rows with the enrichment login (`harvested.rows_read`): its
+counts always, and its values where they were harvested. Its grants withhold what was read of every object but each
+granted table Superset, asked as the person, says no row rule applies to for them (`GrantSet.values_withheld`): the
+extension's `table_rules`, asked through the request's adapter, which answers from what the grant check's own dry runs
+were told (`SupersetSqlAdapter.table_rules`). Every dry run on Oracle asks `table_rules` of each table it names, and
+the grant check names each table it grants, so this costs no call of its own where the check was answered; the rest
+are asked, fifty a call. Asking for every granted table on every request, rather than for those a request goes on to
+use, keeps one decision for the whole request: its prompt, its value checks, its history and the schema it shows. A
+snapshot enriched through Superset asks nothing more.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ from mnemiq.superset.client import (
     SupersetUnavailable,
 )
 from mnemiq.superset.extension import TABLES_READ_ANSWER_BYTES
-from mnemiq.superset.harvested import snapshot_objects, values_harvested
+from mnemiq.superset.harvested import rows_read, snapshot_objects
 from mnemiq.superset.names import stored_name, superset_name
 from mnemiq.superset.payload import SupersetAccessRefused, SupersetQueryFailed
 from mnemiq.superset.settings import superset_dialect
@@ -176,15 +176,16 @@ def resolve_grants(adapter: SupersetSqlAdapter, snapshot: Snapshot) -> GrantSet:
 
 
 def _values_withheld(adapter: SupersetSqlAdapter, snapshot: Snapshot, granted: frozenset[str]) -> frozenset[str]:
-    """The objects of `snapshot` whose harvested values a request of the person whose token `adapter` carries may not
-    use: none where the snapshot harvested none, and nothing is asked; else every object it names but each one in
-    `granted` that Superset says no row rule applies to for the person under every name the snapshot binds it to
+    """The objects of `snapshot` of which a request of the person whose token `adapter` carries may not show what
+    enrichment read from their rows (their harvested values, and their counts): none where enrichment read no row past
+    the rules (`rows_read`), and nothing is asked; else every object it names but each one in `granted` that Superset
+    says no row rule applies to for the person under every name the snapshot binds it to
     (`SupersetSqlAdapter.table_rules`, each name as Superset shows it, in the configured schema).
 
     A rule that applies under any of its names, and an answer mnemiq cannot read, withhold it. A table not granted is
     not asked about; nor is an object bound to anything but a table, or bound under a plain lower-case name. None is
     shown. Raises `UnreadableAnswer` when Superset does not answer, as for any question of the grants."""
-    if not values_harvested(snapshot):
+    if not rows_read(snapshot):
         return frozenset()
     bindings: dict[str, list[tuple[str, str]]] = {}
     for binding in snapshot.source_bindings:
@@ -202,8 +203,8 @@ def _values_withheld(adapter: SupersetSqlAdapter, snapshot: Snapshot, granted: f
             logger.warning("Superset's row rules got no answer (%s: %s); granting nothing", exc, exc.detail)
             raise UnreadableAnswer from exc
         free = {object_id for object_id, named in names.items() if all(rules.get(name) is False for name in named)}
-        logger.info("harvested values: %d of %d granted tables shown, where Superset says no row rule applies to this "
-                    "user", len(free), len(granted))
+        logger.info("what was read from rows: %d of %d granted tables shown, where Superset says no row rule applies "
+                    "to this user", len(free), len(granted))
     return snapshot_objects(snapshot) - free
 
 
