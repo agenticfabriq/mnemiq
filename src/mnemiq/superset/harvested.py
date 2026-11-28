@@ -115,40 +115,65 @@ def _shown_tables(snapshot: Snapshot, grants: GrantSet) -> frozenset[str]:
 _PROFILE = {"row_count": None, "distinct_count": None, "null_count": None, "estimate": None}
 
 
+# Where a code's meaning was certified, in Verity, by a person: its provenance is known.
+_CERTIFIED = "certified"
+
+
 def values_scoped(snapshot: Snapshot, grants: GrantSet, *, shown: bool = False) -> Snapshot:
     """`snapshot` as a request under `grants` reads it: each object whose harvested content it may not read (every one
     but `_shown_tables`) with its columns' code lists, code schemes and descriptions taken out, its table facts dropped,
     and every example reading it dropped. With `shown`, the snapshot the request shows a person or the model (its
     cards, its schema and its starters): such an object's columns lose their row, distinct and null counts and their
-    estimates too, read from its rows as its values were, and for a snapshot that harvested no values these alone.
-    Without, the snapshot the request decides with keeps them, for the checks that never show them (the fan-out guard's
-    uniqueness of a key). Everything else is the snapshot's own. A snapshot whose rows enrichment did not read past the
-    rules (`rows_read`), and one with nothing to take out, is returned itself; it is never changed."""
+    estimates too, read from its rows as its values were. Without, the snapshot the request decides with keeps them,
+    for the checks that never show them (the fan-out guard's uniqueness of a key).
+
+    For a snapshot that harvested no values, the snapshot a request decides with is the served one, and the one it
+    shows still leaves out, beside such an object's counts, what the model wrote from a card carrying them: its columns'
+    descriptions, its code schemes, its table facts and the examples reading it, and every code but those a person
+    certified (`source` "certified"). A column whose meaning was certified (`certified_refs`) keeps its description,
+    which no model wrote.
+
+    Everything else is the snapshot's own. A snapshot whose rows enrichment did not read past the rules (`rows_read`),
+    and one with nothing to take out, is returned itself; it is never changed."""
     if not rows_read(snapshot):
         return snapshot
     harvested = values_harvested(snapshot)
     if not (harvested or shown):
         return snapshot
     tables = _shown_tables(snapshot, grants)
-    taken = {**({"coded_values": [], "code_scheme": None, "description": None} if harvested else {}),
-             **(_PROFILE if shown else {})}
-    columns = [column if column.object_id in tables or not _carries(column, values=harvested, profile=shown)
-               else column.model_copy(update=taken)
+    certified = frozenset(ref.object_id for ref in snapshot.certified_refs if ref.object_type == "column")
+    columns = [column if column.object_id in tables
+               else _withheld(column, harvested=harvested, shown=shown, certified=column.id in certified)
                for column in snapshot.columns]
-    facts = [facts for facts in snapshot.table_facts if not harvested or facts.object_id in tables]
-    examples = [example for example in snapshot.examples
-                if not harvested or ((read := _reads(example)) and read <= tables)]
+    facts = [facts for facts in snapshot.table_facts if facts.object_id in tables]
+    examples = [example for example in snapshot.examples if (read := _reads(example)) and read <= tables]
     if (all(new is old for new, old in zip(columns, snapshot.columns)) and len(facts) == len(snapshot.table_facts)
             and len(examples) == len(snapshot.examples)):
         return snapshot
     return snapshot.model_copy(update={"columns": columns, "table_facts": facts, "examples": examples})
 
 
-def _carries(column, *, values: bool, profile: bool) -> bool:
-    """Whether `column` carries anything `values_scoped` takes out of a withheld table: with `values` its harvested
-    values, and with `profile` its counts and estimates."""
-    return bool((values and (column.coded_values or column.code_scheme is not None or column.description))
-                or (profile and any(getattr(column, name) is not None for name in _PROFILE)))
+def _withheld(column, *, harvested: bool, shown: bool, certified: bool):
+    """`column`, of a withheld table, as `values_scoped` leaves it; `column` itself where nothing is taken out. With
+    values `harvested`, its code list, code scheme and description; else, in what is `shown`, every code but a
+    certified one, its code scheme, and its description unless the column's meaning was `certified`. In what is
+    `shown`, its counts and estimates too."""
+    update: dict = {}
+    if harvested:
+        coded = []
+        description = None
+    else:
+        coded = [value for value in column.coded_values if value.source == _CERTIFIED]
+        description = column.description if certified else None
+    if coded != column.coded_values:
+        update["coded_values"] = coded
+    if column.code_scheme is not None:
+        update["code_scheme"] = None
+    if description != column.description:
+        update["description"] = description
+    if shown:
+        update.update({name: None for name in _PROFILE if getattr(column, name) is not None})
+    return column.model_copy(update=update) if update else column
 
 
 class ShownValues:

@@ -32,6 +32,7 @@ from mnemiq.agent.loop import Agent
 from mnemiq.authz.grants import GrantSet, values_shown
 from mnemiq.contract import CodedValue, Column, IdentityContext, Snapshot
 from mnemiq.contract.semantic import (
+    CertifiedRef,
     CodeScheme,
     ColumnEstimate,
     Example,
@@ -900,20 +901,82 @@ def test_a_withheld_tables_profile_is_kept_for_decisions_and_taken_out_of_what_i
     assert values_scoped(unharvested, _withholding(ORDERS), shown=True) is unharvested
 
 
-def test_a_withheld_tables_counts_are_left_out_of_what_is_shown_where_no_value_was_harvested():
-    """Profiling reads every row whether or not values were harvested: for an Oracle snapshot that harvested none, what
-    a request shows leaves a withheld table's counts and estimates out, and nothing else; a shown table keeps its
-    counts, and the snapshot the request decides with is the served one."""
-    snapshot = _profiled(_harvested_snapshot(jobs=[_oracle_job(values="not harvested")]))
+# A description a person certified, in Verity, for one column of each table: its provenance is known.
+CERTIFIED = {ORDERS: "The sales region the order was booked in", ITEMS: "The sales region the item ships to"}
+
+
+def _unharvested(snapshot: Snapshot | None = None) -> Snapshot:
+    """`snapshot` (by default the two tables, profiled) as enriched from Oracle with no value harvested: each table's
+    status column keeps a code list of one certified code and one grounded from rows, and each table has a REGION
+    column whose description and code list were certified."""
+    base = snapshot or _profiled(_harvested_snapshot(jobs=[_oracle_job(values="not harvested")]))
+    columns = []
+    for column in base.columns:
+        if column.name == "STATUS":
+            column = column.model_copy(update={"coded_values": [
+                CodedValue(code="C1", meaning="certified status", source="certified"),
+                CodedValue(code=HARVESTED[column.object_id]["code"], meaning=HARVESTED[column.object_id]["meaning"],
+                           source="correlated")]})
+        columns.append(column)
+    regions = [Column(id=f"{t}.REGION", object_id=t, name="REGION", data_type="VARCHAR2(10)",
+                      description=CERTIFIED[t], coded_values=[CodedValue(code="W", meaning="west", source="certified")])
+               for t in (ORDERS, ITEMS)]
+    refs = [CertifiedRef(object_type="column", object_id=f"{t}.REGION", version_hash="h1") for t in (ORDERS, ITEMS)]
+    return base.model_copy(update={"columns": [*columns, *regions], "certified_refs": refs})
+
+
+def test_where_no_value_was_harvested_a_withheld_tables_written_meaning_and_counts_are_not_shown():
+    """Profiling read every row, and the model wrote each description, table fact and example from a card carrying the
+    counts: for an Oracle snapshot that harvested no values, what a request shows leaves out a withheld table's counts,
+    estimates, model-written column descriptions, code schemes, table facts and the examples reading it, and keeps what
+    a person certified (a certified column's description, certified codes). A shown table keeps everything, and the
+    snapshot the request decides with is the served one."""
+    snapshot = _unharvested()
     shown = values_scoped(snapshot, _withholding(ORDERS), shown=True)
     held = _column(shown, ORDERS, "AMOUNT")
     assert (held.row_count, held.distinct_count, held.null_count, held.estimate) == (None, None, None, None)
-    assert _column(shown, ORDERS).coded_values == _column(snapshot, ORDERS).coded_values  # values handled as before
-    assert _column(shown, ORDERS).description == _column(snapshot, ORDERS).description
-    assert shown.table_facts == snapshot.table_facts and shown.examples == snapshot.examples
-    assert _column(shown, ITEMS, "AMOUNT") == _column(snapshot, ITEMS, "AMOUNT")
+    status = _column(shown, ORDERS)
+    assert status.description is None and status.code_scheme is None
+    assert [cv.code for cv in status.coded_values] == ["C1"]  # the certified code; the one read from rows is out
+    region = _column(shown, ORDERS, "REGION")
+    assert region.description == CERTIFIED[ORDERS] and [cv.code for cv in region.coded_values] == ["W"]
+    assert [tf.object_id for tf in shown.table_facts] == [ITEMS]
+    assert [e.object_id for e in shown.examples] == [ITEMS]
+    for name in ("AMOUNT", "NOTE", "STATUS", "REGION"):
+        assert _column(shown, ITEMS, name) == _column(snapshot, ITEMS, name), name
     assert values_scoped(snapshot, _withholding(ORDERS)) is snapshot
     assert values_scoped(snapshot, _withholding(), shown=True) is snapshot
+
+
+def test_where_values_were_harvested_a_withheld_tables_certified_meaning_is_withheld_too():
+    """With values harvested the rule is as it was: a withheld table's code lists, schemes and descriptions are taken
+    out, certified ones included."""
+    snapshot = _unharvested(_profiled(_harvested_snapshot()))
+    shown = values_scoped(snapshot, _withholding(ORDERS), shown=True)
+    region = _column(shown, ORDERS, "REGION")
+    assert region.description is None and region.coded_values == []
+    assert _column(shown, ITEMS, "REGION") == _column(snapshot, ITEMS, "REGION")
+
+
+def test_a_ruled_tables_written_meaning_reaches_no_card_where_no_value_was_harvested(tmp_path, served, answered):
+    """End to end, with values not harvested and a rule on ORDERS: neither the schema nor the writer's prompt carries
+    ORDERS' model-written description or table fact, both carry its certified description, and ITEMS' cards carry its
+    own, its table fact on the prompt's; the agent decides with the served snapshot."""
+    fake, model = served
+    RuledSuperset(fake, {SHOWN[ORDERS]})
+    runtime = _deployment(tmp_path, served, _unharvested())
+    cards = {card["object_id"]: card["card"] for card in _scope(runtime)["tables"]}
+    _ask(runtime)
+    [request] = [r for r in model.requests if "QUESTION:" in json.dumps(r)][:1]
+    prompt = request["messages"][-1]["content"]
+    for orders, items in ((cards[ORDERS], cards[ITEMS]), (_card_of(prompt, ORDERS), _card_of(prompt, ITEMS))):
+        assert HARVESTED[ORDERS]["description"] not in orders and HARVESTED[ORDERS]["fact"] not in orders
+        assert CERTIFIED[ORDERS] in orders
+        assert HARVESTED[ITEMS]["description"] in items and CERTIFIED[ITEMS] in items
+    # Table facts ride on a retrieved card, not on the schema's.
+    assert HARVESTED[ITEMS]["fact"] in _card_of(prompt, ITEMS)
+    [seen] = answered
+    assert seen["snapshot"] is runtime.snapshot
 
 
 def _card_of(text: str, table: str) -> str:
