@@ -1982,10 +1982,10 @@ def test_session_binding_refuses_a_database_that_is_not_oracle_and_finds_none_th
     its statement only on an Oracle one. The live suite's database is PostgreSQL: analyst, who may see it, is answered
     `{refused: "backend"}`, and so is `policy_only`, granted one dataset and not the database, whom no table access
     check stops short of the tool's own; `gamma_only`, who may see no table of it, and a database that does not exist
-    are answered `{not_found: "database"}`; a request naming a statement is refused as a request. mnemiq's reading of
-    each is None, which it reads as not bound. (On an Oracle database the tool's answer is the live Oracle run's: this
-    Superset has none.)"""
-    from mnemiq.superset.extension import session_binding
+    are answered `{not_found: "database"}`; a request naming a statement is refused as a request. mnemiq reads the
+    first as a database that is not Oracle and the second as one Superset does not show the person. (On an Oracle
+    database the tool's answer is the live Oracle run's: this Superset has none.)"""
+    from mnemiq.superset.extension import SessionAnswer, session_binding
 
     asked = {"database_id": live.database_id, "service": "freepdb1", "schema": "PUBLIC"}
     analyst = as_user(live, BUILDER, ASK)
@@ -1994,7 +1994,8 @@ def test_session_binding_refuses_a_database_that_is_not_oracle_and_finds_none_th
     assert call(as_user(live, "gamma_only", ASK), "session_binding", **asked) == {"not_found": "database"}
     assert call(analyst, "session_binding", **{**asked, "database_id": 2_000_000_000}) == {"not_found": "database"}
     assert call(analyst, "session_binding", **asked, sql="SELECT 1") == {"refused": "request", "unknown": ["sql"]}
-    assert session_binding(analyst, **asked) is None
+    assert session_binding(analyst, **asked) is SessionAnswer.NOT_ORACLE
+    assert session_binding(as_user(live, "gamma_only", ASK), **asked) is SessionAnswer.NOT_SHOWN
     observe("session_binding", analyst=call(analyst, "session_binding", **asked))
 
 

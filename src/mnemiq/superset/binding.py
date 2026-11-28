@@ -9,20 +9,23 @@ everyone, or, where the database impersonates its users, as the person. So mnemi
 Superset's session for them is shown to log in as that schema's owner, keep that schema as its current schema, and
 reach the service the snapshot was read from.
 
-`binding_refusal` asks the extension's `session_binding`, as the person, through the adapter their request runs on
-(`extension.session_binding`): the tool opens the session Superset opens for the person's statements and answers only
-whether it is bound, never what it read. The service and the schema are asked as the job records them, as Oracle
-stores them, so no name is mapped between spellings. The tool finds the database through Superset's own filter of the
-databases the caller may see and refuses one whose backend is not Oracle, so no separate description of the database
-is asked.
+`Runtime.bound` asks the extension's `session_binding`, as the person, through the adapter their request runs on
+(`extension.session_binding`), once per request: the tool opens the session Superset opens for the person's statements
+and answers only whether it is bound, never what it read. The service and the schema are asked as the job records them,
+as Oracle stores them, so no name is mapped between spellings. The tool finds the database through Superset's own
+filter of the databases the caller may see and refuses one whose backend is not Oracle, so no separate description of
+the database is asked.
 
-`Runtime.bound` asks it once per request, and keeps nothing between requests.
+Only "not bound" refuses the person as not bound (`ConnectionNotBound`, 403). What else ends the request says what it
+is: the tool could not read the session (`BindingUnread`, Superset not answering, 503: try again); the database is not
+Oracle (a deployment misconfigured, 503, naming the setting); Superset does not show the person the database
+(Superset's refusal, 403); an answer mnemiq cannot read (the tool's error, 503); an extension without the tool (an older
+extension, 503). In every case the person is held: nothing else of the request reaches Superset.
 """
 
 from __future__ import annotations
 
-from mnemiq.superset.client import SupersetRefusal
-from mnemiq.superset.extension import session_binding
+from mnemiq.superset.client import SupersetRefusal, SupersetUnavailable
 
 # What a person is told when their connection was not shown to be the snapshot's. Why goes to the log only: it names
 # the deployment's service and schema.
@@ -41,20 +44,25 @@ class ConnectionNotBound(SupersetRefusal):
         self.message = NOT_BOUND
 
 
-def binding_refusal(adapter, *, database_id: int, service: str, schema: str) -> str | None:
-    """None when the extension's `session_binding`, asked as the person whose token `adapter` carries, answers that the
-    session Superset opens for them on database `database_id` logs in as `schema`, keeps it as its current schema and
-    reached `service` (each as Oracle stores it); else why not, in words for the log.
 
-    Any answer but bound or not (an extension older than the tool, a database not Oracle or not shown to the person, a
-    session the tool could not read, an answer mnemiq cannot read) is not bound. Superset not answering
-    (`SupersetUnavailable`) and a refusal of the person raise as themselves."""
-    found = session_binding(adapter.client, database_id=database_id, service=service, schema=schema)
-    if found is True:
-        return None
-    if found is False:
-        return (f"Superset's session for this person on database {database_id} does not log in as {schema!r}, keep "
-                f"it as its current schema and reach service {service!r}, as the snapshot was read")
-    return (f"Superset's mnemiq extension did not say whether its session for this person on database {database_id} "
-            "is the snapshot's (its answer is logged): an extension older than 0.3.0, a database Superset does not "
-            "show the person or that is not Oracle, or a session it could not read")
+# What a person is told when Superset could not say whether their session is bound: it may pass, so try again.
+BINDING_UNREAD = ("Superset could not say whether its connection to Oracle runs your statements as the schema this "
+                  "deployment answers from, so nothing was answered; try again, and if it persists, an operator can see "
+                  "why in mnemiq's log.")
+# What a person is told when the database Superset mode answers from is not an Oracle database in Superset.
+NOT_ORACLE = ("Superset is not set up as mnemiq needs: the database MNEMIQ_SUPERSET_DATABASE_ID names is not an Oracle "
+              "database in Superset, and this deployment answers from Oracle; an operator sets MNEMIQ_SUPERSET_DATABASE_ID "
+              "to the id Superset gives its Oracle database.")
+# What a person is told when the extension's answer cannot be read.
+UNREADABLE = ("Superset's mnemiq extension gave an answer this mnemiq cannot read about the connection Superset runs your "
+              "statements on, so nothing was answered; an operator checks that the extension and mnemiq are the same "
+              "release.")
+
+
+class BindingUnread(SupersetUnavailable):
+    """Superset could not say whether the person's session is bound: the tool could not read it, or failed for its own
+    reason. Superset not answering, read as such: the request is refused, and the next one asks again. `detail` goes to
+    the log only."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(BINDING_UNREAD, detail=detail)

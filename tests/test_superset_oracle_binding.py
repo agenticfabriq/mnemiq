@@ -29,11 +29,19 @@ from mnemiq.runtime import build_runtime
 from mnemiq.server.superset_build import WRITE_SCOPES, confirm_proposed_build
 from mnemiq.server.superset_refusals import Refused, superset_refusal
 from mnemiq.superset.adapter import SupersetSqlAdapter
-from mnemiq.superset.binding import NOT_BOUND, ConnectionNotBound
+from mnemiq.server.superset_refusals import DENIED, EXTENSION_MISSING, EXTENSION_OUTDATED
+from mnemiq.superset.binding import BINDING_UNREAD, NOT_BOUND, BindingUnread, ConnectionNotBound
 from mnemiq.superset.build_store import PROPOSED, StoredBuild
-from mnemiq.superset.client import DelegatedToken, SupersetRefusedCaller, SupersetUnavailable
+from mnemiq.superset.client import (
+    DelegatedToken,
+    SupersetDenied,
+    SupersetRefusedCaller,
+    SupersetToolError,
+    SupersetUnavailable,
+)
 from mnemiq.superset.executor import superset_executor
-from mnemiq.superset.extension import TOOL_PREFIX
+from mnemiq.superset.extension import EXTENSION_TOOLS, TOOL_PREFIX, ExtensionMissing, ExtensionOutdated
+from mnemiq.superset.grants import SupersetMisconfigured
 from tests.superset_extension_path import use_extension_source
 from tests.superset_fake import (
     SUPERSET_TOOLS,
@@ -65,10 +73,9 @@ OWNER = IdentityContext(tenant_id="t", principal_id="owner")
 OTHER = IdentityContext(tenant_id="t", principal_id="other")
 OWNER_TOKEN, OTHER_TOKEN = "tok-owner", "tok-other"
 PEOPLE = {OWNER_TOKEN: OWNER, OTHER_TOKEN: OTHER}
-# The tools a build, a change or an answer calls on the adapter's client, Superset's own and the extension's.
-EVERY_TOOL = (*SUPERSET_TOOLS, *(TOOL_PREFIX + base for base in (
-    "create_dashboard", "create_dataset", "create_chart", "patch_chart", "add_saved_metric", "delete_dataset",
-    "set_layout", "dataset_metrics", "editors_of", "get_layout", "row_rules", "table_rules", "tables_read")))
+# Every tool a build, a change or an answer may call on the adapter's client, Superset's own and each of the
+# extension's but the check itself, read from the one list of the extension's tools, so a tool added later is held too.
+EVERY_TOOL = (*SUPERSET_TOOLS, *(TOOL_PREFIX + base for base in EXTENSION_TOOLS if base != "session_binding"))
 
 
 @pytest.fixture(autouse=True)
@@ -97,8 +104,7 @@ class OracleSuperset:
 
     def _binding(self, request, authorization):
         session = self.sessions[authorization.removeprefix("Bearer ")]
-        if isinstance(session, Exception):
-            raise session
+        # An exception is returned, as the fake sends a handler's exception: as the error result's text.
         return {"bound": session} if isinstance(session, bool) else session
 
     @staticmethod
@@ -167,21 +173,90 @@ def test_a_person_not_bound_is_refused_and_nothing_else_is_sent(runtime, served)
     assert _tools(fake) == [BINDING] and model.calls == 0
 
 
-@pytest.mark.parametrize("answer", [
-    {"refused": "backend"}, {"not_found": "database"}, {"unread": True}, {"refused": "request", "field": "schema"},
-    {"bound": "true"}, {"bound": True, "more": True},
-    RuntimeError("Internal error in extensions.agenticfabriq.mnemiq.session_binding: An unexpected error occurred."),
-], ids=["not-oracle", "database-not-shown", "session-unread", "request-refused", "a-text", "saying-more",
-        "older-extension"])
-def test_an_answer_that_is_not_bound_or_not_is_a_refusal(runtime, served, answer):
-    """None from the extension's reading, an older extension's failure included, is not bound: the person is refused,
-    and nothing else is sent."""
+# rc2's MCP service's text for a tool it does not have, and for an unexpected error inside one it has
+# (`GlobalErrorHandlerMiddleware`): the same masked text, which the fake sends after `Error: `.
+def _masked(tool: str) -> RuntimeError:
+    return RuntimeError(f"Internal error in {tool}: An unexpected error occurred. Error ID: 3f9c0a1b. Please contact "
+                        "support if this persists.")
+
+
+def _older_extension(fake) -> dict:
+    """The extension before `session_binding`: the tool is masked as not there, and the extension's own probe
+    answers."""
+    fake.reply(TOOL_PREFIX + "dataset_metrics", lambda request, authorization: {"datasets": []})
+    return {OWNER_TOKEN: _masked(BINDING)}
+
+
+# Each answer that is neither bound nor not, what the request ends as, and what the person is told: a session the
+# tool could not read is Superset not answering (503, try again); a database that is not Oracle is a deployment
+# misconfigured (503, naming the setting); a database Superset does not show the person is Superset's refusal (403);
+# an answer mnemiq cannot read is the tool's error (503); an extension without the tool is an older extension (503).
+FAILURES = {
+    "session-unread": ({"unread": True}, BindingUnread, Refused(503, BINDING_UNREAD), [BINDING]),
+    "not-oracle": ({"refused": "backend"}, SupersetMisconfigured, None, [BINDING]),
+    "database-not-shown": ({"not_found": "database"}, SupersetDenied, Refused(403, DENIED), [BINDING]),
+    "unreadable": ({"bound": "true"}, SupersetToolError, None, [BINDING]),
+    "older-extension": (_older_extension, ExtensionOutdated, Refused(503, EXTENSION_OUTDATED),
+                        [BINDING, BINDING, TOOL_PREFIX + "dataset_metrics"]),
+}
+
+
+@pytest.mark.parametrize("answer, raised, told, tools", FAILURES.values(), ids=FAILURES.keys())
+def test_each_other_answer_ends_the_request_as_what_it_is_and_the_person_stays_held(runtime, served, answer, raised,
+                                                                                     told, tools):
+    fake, model = served
+    OracleSuperset(fake, answer(fake) if callable(answer) else {OWNER_TOKEN: answer})
+    adapter = superset_executor(runtime.settings, DelegatedToken(OWNER_TOKEN))
+    with pytest.raises(raised) as ended:
+        runtime.bound(adapter)
+    assert not isinstance(ended.value, ConnectionNotBound)
+    refused = superset_refusal(ended.value)
+    assert refused == told if told is not None else refused.status == 503
+    for named in (ORACLE_SERVICE, ORACLE_SCHEMA, ORACLE_SCHEMA_SETTING, "owner"):
+        assert named not in refused.detail, named
+    assert _tools(fake) == tools and model.calls == 0
+    with pytest.raises(ConnectionNotBound):  # the person is held still
+        adapter.client.call(TOOL_PREFIX + "create_chart", {})
+    assert _tools(fake) == tools
+
+
+def test_a_database_that_is_not_oracle_says_which_setting_to_change(runtime, served):
     fake, _ = served
-    OracleSuperset(fake, {OWNER_TOKEN: answer})
-    with pytest.raises(ConnectionNotBound) as refused:
+    OracleSuperset(fake, {OWNER_TOKEN: {"refused": "backend"}})
+    with pytest.raises(SupersetMisconfigured) as misconfigured:
         _schema(runtime, OWNER_TOKEN)
-    assert "did not say" in refused.value.detail
-    assert _tools(fake) == [BINDING]
+    assert "MNEMIQ_SUPERSET_DATABASE_ID" in misconfigured.value.message and "Oracle" in misconfigured.value.message
+
+
+def test_an_answer_mnemiq_cannot_read_says_so(runtime, served):
+    fake, _ = served
+    OracleSuperset(fake, {OWNER_TOKEN: {"bound": True, "more": True}})
+    with pytest.raises(SupersetToolError, match="mnemiq cannot read"):
+        _schema(runtime, OWNER_TOKEN)
+
+
+def test_a_superset_without_the_extension_is_named(tmp_path):
+    with FakeSuperset(extension=False) as fake, StubModel(sql="SELECT 1") as model:
+        runtime = _indexed(build_runtime(superset_deployment(tmp_path, model.url, fake.url, jobs=[_oracle_job()],
+                                                             superset_schema=ORACLE_SCHEMA_SETTING)))
+        with pytest.raises(ExtensionMissing) as missing:
+            _schema(runtime, OWNER_TOKEN)
+        assert not isinstance(missing.value, ExtensionOutdated)
+        assert superset_refusal(missing.value) == Refused(503, EXTENSION_MISSING)
+        assert _tools(fake) == [BINDING, BINDING, TOOL_PREFIX + "dataset_metrics"]
+
+
+def test_a_held_client_lets_the_extensions_own_probe_through_and_nothing_else_of_it(superset_oracle):
+    """The extension's presence probe, `dataset_metrics` of no dataset, which the extension answers without touching
+    Superset, is let through a held client, so an older extension is told from a missing one; the same tool asked for
+    any dataset is held."""
+    inner = RecordingClient(as_superset_runs({"datasets": []}))
+    adapter = SupersetSqlAdapter(inner, database_id=DATABASE_ID, schema=ORACLE_SCHEMA_SETTING, held=True)
+    adapter.client.call(TOOL_PREFIX + "dataset_metrics", {"dataset_ids": []})
+    for request in ({"dataset_ids": [3]}, {"dataset_ids": [], "more": 1}, {}):
+        with pytest.raises(ConnectionNotBound):
+            adapter.client.call(TOOL_PREFIX + "dataset_metrics", request)
+    assert [sent.request for sent in inner.calls] == [{"dataset_ids": []}]
 
 
 def test_superset_not_answering_is_superset_not_answering(runtime, served):
@@ -248,6 +323,30 @@ def test_one_person_is_refused_while_another_is_served(runtime, served):
     assert _schema(runtime, OWNER_TOKEN)
     assert _tools(fake, OTHER_TOKEN) == [BINDING, BINDING]
     assert model.calls == 0
+
+
+def test_the_check_asks_for_the_database_the_adapter_runs_on(runtime, superset_oracle):
+    """The database asked about is the one the request's adapter sends every statement to."""
+    inner = RecordingClient(lambda request: {"bound": True})
+    adapter = SupersetSqlAdapter(inner, database_id=9, schema=ORACLE_SCHEMA_SETTING, held=True)
+    assert runtime.bound(adapter) is None
+    assert [(sent.tool, sent.request) for sent in inner.calls] == [(BINDING, {**ASKED, "database_id": 9})]
+
+
+def test_a_mark_for_another_snapshot_is_not_trusted_within_the_request(runtime, served, monkeypatch):
+    """The mark records what it was shown for: the database, service and schema asked. A newer snapshot read from
+    another service, swapped in within the same request, is asked about again, and a session not bound to it holds
+    the adapter again."""
+    fake, _ = served
+    superset = OracleSuperset(fake, {OWNER_TOKEN: True})
+    adapter = superset_executor(runtime.settings, DelegatedToken(OWNER_TOKEN))
+    assert runtime.bound(adapter) is None and adapter.bound_to == (DATABASE_ID, ORACLE_SERVICE, ORACLE_SCHEMA)
+    runtime.snapshot = _snapshot([_oracle_job(service="otherpdb")], version="v2")
+    superset.sessions[OWNER_TOKEN] = False
+    assert "does not log in as" in runtime.bound(adapter)
+    assert fake.calls[1].request == {**ASKED, "service": "otherpdb"}
+    with pytest.raises(ConnectionNotBound):
+        adapter.client.call(TOOL_PREFIX + "create_chart", {})
 
 
 def test_the_check_asks_for_the_snapshot_being_served(runtime, served, monkeypatch):
@@ -329,7 +428,7 @@ def test_a_held_adapters_client_calls_nothing_but_the_check_until_its_person_is_
     assert inner.calls == [] and isinstance(adapter.terminal_refusal, ConnectionNotBound)
     adapter.client.call(BINDING, dict(ASKED))
     assert [sent.tool for sent in inner.calls] == [BINDING]
-    adapter.mark_bound()
+    adapter.mark_bound((DATABASE_ID, ORACLE_SERVICE, ORACLE_SCHEMA))
     adapter.client.call(tool, {})
     assert [sent.tool for sent in inner.calls] == [BINDING, tool]
 
@@ -342,7 +441,7 @@ def test_a_held_adapter_sends_no_statement_until_its_person_is_bound(superset_or
         with pytest.raises(ConnectionNotBound):
             send()
     assert inner.calls == []
-    adapter.mark_bound()
+    adapter.mark_bound((DATABASE_ID, ORACLE_SERVICE, ORACLE_SCHEMA))
     adapter.execute("SELECT 1 FROM DUAL")
     assert [sent.tool for sent in inner.calls][-1] == "execute_sql"
 

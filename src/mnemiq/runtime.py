@@ -39,14 +39,16 @@ from mnemiq.sql.verdict import ApprovedWrite
 from mnemiq.store.bootstrap import init_store
 from mnemiq.store.control import resolve_version
 from mnemiq.store.snapshot_store import load_snapshot
-from mnemiq.superset.binding import ConnectionNotBound, binding_refusal
+from mnemiq.superset.binding import NOT_ORACLE, UNREADABLE, BindingUnread, ConnectionNotBound
+from mnemiq.superset.client import SupersetDenied, SupersetToolError
 from mnemiq.superset.executor import (
     NoSourceConnection,
     SupersetCredentialMissing,
     SupersetReadOnly,
     superset_executor,
 )
-from mnemiq.superset.grants import FixedGrants, GrantsUnreadable, resolve_grants
+from mnemiq.superset.extension import SessionAnswer, session_binding
+from mnemiq.superset.grants import FixedGrants, GrantsUnreadable, SupersetMisconfigured, resolve_grants
 from mnemiq.superset.history import superset_history
 from mnemiq.superset.names import stored_name
 from mnemiq.superset.settings import (
@@ -534,28 +536,42 @@ class Runtime:
 
     def bound(self, adapter) -> str | None:
         """None when Superset's session for the person whose token `adapter` carries runs their statements as the schema
-        the snapshot was read from, on its service; else why not, in words for the log. On PostgreSQL None, and nothing
-        is asked.
+        the snapshot was read from, on its service; else, when it is not bound, why not, in words for the log. On
+        PostgreSQL None, and nothing is asked.
 
         On Oracle the extension's `session_binding` is asked as the person, through `adapter`, the one their request
-        runs on (`binding.binding_refusal`), for the service and schema the snapshot's `superset:oracle` job records.
-        Asked once per request: a bound answer marks `adapter` bound (`mark_bound`), which releases its calls and
-        answers any later question of the same request; the next request, on an adapter of its own, asks again. So a
-        connection re-pointed while the server runs serves no one on the strength of an earlier answer, and a
-        connection put right serves the person on their next request. Nothing is kept between requests, a refusal
-        included."""
-        if superset_dialect() != "oracle" or adapter.bound:
+        runs on (`extension.session_binding`), for the database the adapter runs on and the service and schema the
+        snapshot's `superset:oracle` job records. Asked once per request: a bound answer marks `adapter` bound to that
+        database, service and schema (`mark_bound`), which releases its calls and answers a later question of the same
+        request only while the snapshot still names them; a mark for another is not trusted, and holds the adapter
+        until asked again. The next request, on an adapter of its own, asks again, so nothing is kept between
+        requests, a refusal included.
+
+        Any answer but bound or not raises what it is, the person held: the tool could not read the session
+        (`BindingUnread`, 503); the database is not Oracle (`SupersetMisconfigured`, 503); Superset does not show the
+        person the database (`SupersetDenied`, 403); an answer mnemiq cannot read (`SupersetToolError`, 503); an
+        extension without the tool (`ExtensionOutdated`) or none (`ExtensionMissing`). Superset not answering and a
+        refusal of the person raise as themselves."""
+        if superset_dialect() != "oracle":
             return None
         job = next((job for job in (self.snapshot.jobs if self.snapshot else []) if job.id == SUPERSET_ORACLE_JOB),
                    None)
         source = oracle_source(job.detail) if job is not None else None
         if source is None:
+            adapter.mark_bound(None)
             return "the snapshot served records no Oracle service and schema it was read from"
-        refusal = binding_refusal(adapter, database_id=self.settings.superset_database_id, service=source.service,
-                                  schema=source.schema)
-        if refusal is None:
-            adapter.mark_bound()
-        return refusal
+        asked = (adapter.database_id, source.service, source.schema)
+        if adapter.bound_to == asked:
+            return None
+        adapter.mark_bound(None)  # a mark for another database, service or schema is not this one
+        answer = session_binding(adapter.client, database_id=asked[0], service=asked[1], schema=asked[2])
+        if answer is SessionAnswer.BOUND:
+            adapter.mark_bound(asked)
+            return None
+        if answer is SessionAnswer.NOT_BOUND:
+            return (f"Superset's session for this person on database {asked[0]} does not log in as {asked[2]!r}, keep "
+                    f"it as its current schema and reach service {asked[1]!r}, as the snapshot was read")
+        raise _binding_ended(answer, asked[0])
 
     def require_bound(self, adapter) -> None:
         """Return when `bound` says the session of `adapter`'s person is the snapshot's; else raise
@@ -648,6 +664,26 @@ class Runtime:
 
 def _authz(settings: Settings) -> AuthzProvider:
     return FileAuthzProvider(settings.authz_path) if settings.authz_path else DenyAll()
+
+
+def _binding_ended(answer: SessionAnswer | None, database_id: int) -> Exception:
+    """What a request ends as when the extension's `session_binding` answers neither bound nor not (`answer`), each
+    logged here: none of them says the person's session is or is not the snapshot's, so none refuses the person as not
+    bound, and the person is held."""
+    if answer is SessionAnswer.UNREAD:
+        detail = f"Superset's mnemiq extension could not read the session for this person on database {database_id}"
+        logger.warning("%s, so this request is not answered; the next one asks again", detail)
+        return BindingUnread(detail)
+    if answer is SessionAnswer.NOT_ORACLE:
+        logger.warning("Superset database %s is not an Oracle database, and the snapshot was read from Oracle",
+                       database_id)
+        return SupersetMisconfigured(NOT_ORACLE)
+    if answer is SessionAnswer.NOT_SHOWN:
+        logger.warning("Superset does not show this person database %s", database_id)
+        return SupersetDenied("Superset did not show this person the database Superset mode answers from",
+                              detail=f"database {database_id} not found for this person")
+    logger.warning("Superset's mnemiq extension gave session_binding an answer this mnemiq cannot read")
+    return SupersetToolError(UNREADABLE)
 
 
 def superset_source_refusal(snapshot: Snapshot, settings: Settings) -> str | None:

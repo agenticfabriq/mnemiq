@@ -60,6 +60,7 @@ from mnemiq.sql.guard import MAX_ROWS
 from mnemiq.superset.binding import ConnectionNotBound
 from mnemiq.superset.executed import check_executed, check_tables_read, executed_sql, physical_reads
 from mnemiq.superset.extension import (
+    PRESENCE_PROBE,
     TOOL_PREFIX,
     ExtensionMissing,
     require_table_rules,
@@ -121,8 +122,11 @@ TERMINAL_REFUSALS = (SupersetRefusedCaller, SupersetPermissionDenied, SupersetDe
 _POSTGRES_UNAGGREGATABLE = frozenset({"JSON", "XML", "POINT", "LINE", "LSEG", "BOX", "PATH", "POLYGON", "CIRCLE"})
 _ORACLE_UNAGGREGATABLE = _UNAGGREGATABLE["oracle"]
 
-# The one tool a held adapter's client calls before the runtime marks it bound: the binding's own check.
+# The one tool a held adapter's client calls before the runtime marks it bound: the binding's own check; and, with
+# exactly its own request, the extension's presence probe, which settles whether an extension without the check's
+# tool is older or not there.
 _BINDING_TOOL = TOOL_PREFIX + "session_binding"
+_PRESENCE_PROBE = (TOOL_PREFIX + PRESENCE_PROBE[0], PRESENCE_PROBE[1])
 
 
 class SupersetSqlAdapter:
@@ -145,20 +149,20 @@ class SupersetSqlAdapter:
         self._timeout_s = timeout_s
         self._refresh_every_statement = refresh_every_statement
         self._terminal_refusal: SupersetRefusal | ExtensionMissing | None = None
-        self._bound = False
+        self._bound_to: tuple[int, str, str] | None = None
         self.client = _HeldClient(client, self) if held else client
 
     @property
-    def bound(self) -> bool:
-        """Whether the runtime marked this adapter bound: Superset's session for its person was shown, in the request it
-        serves, to run their statements as the snapshot's schema."""
-        return self._bound
+    def bound_to(self) -> tuple[int, str, str] | None:
+        """What the runtime last showed this adapter's person bound to, in the request it serves: the database, service
+        and schema asked (`Runtime.bound`), or None while it holds."""
+        return self._bound_to
 
-    def mark_bound(self) -> None:
-        """Release a `held` adapter's calls: the runtime's word, for the one request this adapter serves, that Superset's
-        session for the person whose token it carries runs their statements as the snapshot's schema
-        (`Runtime.bound`). Called there and nowhere else."""
-        self._bound = True
+    def mark_bound(self, to: tuple[int, str, str] | None) -> None:
+        """Release a `held` adapter's calls, with `to` the database, service and schema Superset's session for the
+        person whose token it carries was shown bound to for the one request this adapter serves (`Runtime.bound`);
+        None holds them again. Called there and nowhere else."""
+        self._bound_to = to
 
     @property
     def terminal_refusal(self) -> SupersetRefusal | ExtensionMissing | None:
@@ -432,7 +436,7 @@ class SupersetSqlAdapter:
     def _hold(self) -> None:
         """Refuse a call of this adapter's client, as the person not shown bound (`ConnectionNotBound`, which the
         request ends as), while the adapter is on Oracle and not marked bound."""
-        if self.dialect == "oracle" and not self._bound:
+        if self.dialect == "oracle" and self._bound_to is None:
             refusal = ConnectionNotBound("a call was asked before Superset's session for this person was shown to be "
                                          "the snapshot's, so it was not made")
             self._remember(refusal)
@@ -502,7 +506,10 @@ class SupersetSqlAdapter:
 class _HeldClient:
     """The client of a held adapter: `client`, whose every call but the extension's `session_binding` waits on the
     binding (`SupersetSqlAdapter._hold`), so no statement and no other tool of the request reaches Superset on Oracle
-    before the runtime marks `adapter` bound. It carries `client`'s credential and nothing else of its own."""
+    before the runtime marks `adapter` bound. The extension's presence probe (`extension.PRESENCE_PROBE`, its
+    `dataset_metrics` of no dataset, which it answers without touching Superset) is let through with exactly its own
+    request, so a Superset without the check's tool is told from one without the extension. It carries `client`'s
+    credential and nothing else of its own."""
 
     def __init__(self, client: SupersetMcp, adapter: SupersetSqlAdapter) -> None:
         self._client = client
@@ -513,7 +520,7 @@ class _HeldClient:
         return self._client.credential
 
     def call(self, tool: str, request: dict, **options) -> dict:
-        if tool != _BINDING_TOOL:
+        if tool != _BINDING_TOOL and (tool, request) != _PRESENCE_PROBE:
             self._adapter._hold()
         return self._client.call(tool, request, **options)
 

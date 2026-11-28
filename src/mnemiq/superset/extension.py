@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
+from enum import Enum
 
 from mnemiq.superset.client import SupersetToolError, SupersetUnavailable
 
-__all__ = ["DATASET_METRICS_BATCH", "EXTENSION_TOOLS", "ExtensionMissing", "ExtensionOutdated", "TABLE_RULES_BATCH",
-           "TOOL_PREFIX", "call_tool", "dashboard_editorship", "dataset_metrics", "require_build_tools",
+__all__ = ["DATASET_METRICS_BATCH", "EXTENSION_TOOLS", "PRESENCE_PROBE", "ExtensionMissing", "ExtensionOutdated",
+           "SessionAnswer", "TABLE_RULES_BATCH", "TOOL_PREFIX", "call_tool", "dashboard_editorship", "dataset_metrics", "require_build_tools",
            "require_extension", "require_table_rules", "require_tables_read", "row_rule_applies",
            "session_binding", "table_rules_apply", "tables_read"]
 
@@ -42,8 +43,8 @@ DATASET_METRICS_BATCH = 20
 # (`reads.MAX_TABLES` in the extension).
 TABLE_RULES_BATCH = 50
 
-# The probe, which the installed extension answers with an empty list and never fails on.
-_PROBE = ("dataset_metrics", {"dataset_ids": []})
+# The probe, which the installed extension answers with an empty list and never fails on, without touching Superset.
+PRESENCE_PROBE = ("dataset_metrics", {"dataset_ids": []})
 # The build's probe: the extension's own create of a dataset, which a build sends and an older extension lacks. This
 # one refuses an empty request as a request it cannot read, before it touches Superset.
 _BUILD_PROBE = "create_dataset"
@@ -86,7 +87,7 @@ def _is_not_offered(tool: str, failure: SupersetToolError) -> bool:
 def require_extension(client) -> None:
     """Return when Superset offers the extension's tools, as the client's caller sees them; raise `ExtensionMissing`
     when it does not. One call, of the probe. Any other failure is raised as the client raised it."""
-    probe, request = TOOL_PREFIX + _PROBE[0], _PROBE[1]
+    probe, request = TOOL_PREFIX + PRESENCE_PROBE[0], PRESENCE_PROBE[1]
     try:
         client.call(probe, dict(request))
     except SupersetToolError as failure:
@@ -282,23 +283,43 @@ def tables_read(client, *, database_id: int, schema: str, sql: str) -> frozenset
     return frozenset(found)
 
 
-def session_binding(client, *, database_id: int, service: str, schema: str) -> bool | None:
-    """Whether the session Superset opens on the database for the client's caller, as `execute_sql` opens one, logs in
-    as `schema`, keeps it as its current schema and reached `service` (both as Oracle stores them), as the extension's
-    `session_binding` answers it.
+class SessionAnswer(Enum):
+    """What the extension's `session_binding` answers, read strictly."""
 
-    Read strictly: True or False only for an answer exactly `{"bound": <a boolean>}`. None for anything else (a database
-    the caller cannot see or that is not Oracle, a session the tool could not read, a refusal, a size cut, an answer
-    saying more) and for a tool error (an extension older than the tool among them), each logged; a caller reads None
-    as not bound. Superset not answering (`SupersetUnavailable`) and a refusal of the caller are raised, as the client
-    raises them."""
+    BOUND = "bound"            # {"bound": true}
+    NOT_BOUND = "not bound"    # {"bound": false}
+    UNREAD = "unread"          # {"unread": true}, or the tool failing for its own reason
+    NOT_ORACLE = "not oracle"  # {"refused": "backend"}
+    NOT_SHOWN = "not shown"    # {"not_found": "database"}
+
+
+# Each answer `session_binding` gives, exactly as it gives it, and what it says.
+_SESSION_ANSWERS = (({"bound": True}, SessionAnswer.BOUND), ({"bound": False}, SessionAnswer.NOT_BOUND),
+                    ({"unread": True}, SessionAnswer.UNREAD), ({"refused": "backend"}, SessionAnswer.NOT_ORACLE),
+                    ({"not_found": "database"}, SessionAnswer.NOT_SHOWN))
+
+
+def session_binding(client, *, database_id: int, service: str, schema: str) -> SessionAnswer | None:
+    """What the extension's `session_binding` says, asked as the client's caller, of the session Superset opens for them
+    on the database, as `execute_sql` opens one: whether it logs in as `schema`, keeps it as its current schema and
+    reached `service` (both as Oracle stores them), or why it cannot say.
+
+    Read strictly: each `SessionAnswer` only for the answer the tool gives exactly, and None for any other, an answer
+    mnemiq cannot read, which is logged. A masked failure of the call is settled as `_require_tool` settles one: the
+    tool asked again with an empty request, then the extension's own probe, so an extension without the tool raises
+    `ExtensionOutdated` (needed by Superset mode on Oracle) and a Superset without the extension `ExtensionMissing`;
+    the tool that is there and failed for its own reason, and any other tool error, is `UNREAD`. Superset not answering
+    (`SupersetUnavailable`) and a refusal of the caller are raised, as the client raises them."""
+    tool = TOOL_PREFIX + "session_binding"
     try:
-        answer = client.call(TOOL_PREFIX + "session_binding", {"database_id": database_id, "service": service,
-                                                               "schema": schema})
+        answer = client.call(tool, {"database_id": database_id, "service": service, "schema": schema})
     except SupersetToolError as failure:
         logger.warning("the extension's session_binding failed: %s %s", failure, failure.detail)
-        return None
-    if isinstance(answer, dict) and set(answer) == {"bound"} and isinstance(answer["bound"], bool):
-        return answer["bound"]
+        if _is_not_offered(tool, failure):
+            _require_tool(client, "session_binding", needed_by="Superset mode on Oracle")
+        return SessionAnswer.UNREAD
+    for given, kind in _SESSION_ANSWERS:
+        if answer == given and type(next(iter(answer.values()))) is type(next(iter(given.values()))):
+            return kind
     logger.warning("the extension's session_binding answered %s", str(answer)[:200])
     return None

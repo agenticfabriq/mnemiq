@@ -20,7 +20,14 @@ from types import SimpleNamespace
 import pytest
 
 from mnemiq.superset.client import SupersetPermissionDenied, SupersetToolError, SupersetUnavailable
-from mnemiq.superset.extension import EXTENSION_TOOLS, TOOL_PREFIX, session_binding
+from mnemiq.superset.extension import (
+    EXTENSION_TOOLS,
+    TOOL_PREFIX,
+    ExtensionMissing,
+    ExtensionOutdated,
+    SessionAnswer,
+    session_binding,
+)
 from tests.superset_extension_path import use_extension_source
 
 use_extension_source()
@@ -239,26 +246,73 @@ def read_by(client):
 
 def test_mnemiqs_client_reads_what_the_tool_answers(monkeypatch):
     """The join of the two ends: the extension's own tool, over Superset's lookups stood in, answering mnemiq's own
-    request, read by mnemiq's client."""
-    superset_binding(monkeypatch, databases={7: lambda record: Database(record)})
+    request, read by mnemiq's client as each kind of answer."""
     client = Reading(reads.session_binding)
-    assert read_by(client) is True
-    assert client.calls == [(TOOL_PREFIX + "session_binding", REQUEST)]
-    superset_binding(monkeypatch, databases={7: lambda record: Database(record, rows=[("APP", "freepdb1", "SHOP")])})
-    assert read_by(client) is False
+    for database, kind in ((lambda record: Database(record), SessionAnswer.BOUND),
+                           (lambda record: Database(record, rows=[("APP", "freepdb1", "SHOP")]), SessionAnswer.NOT_BOUND),
+                           (lambda record: Database(record, rows=[]), SessionAnswer.UNREAD),
+                           (lambda record: Database(record, backend="postgresql"), SessionAnswer.NOT_ORACLE),
+                           (None, SessionAnswer.NOT_SHOWN)):
+        superset_binding(monkeypatch, databases={7: database} if database is not None else {})
+        assert read_by(client) is kind, kind
+    assert client.calls[0] == (TOOL_PREFIX + "session_binding", REQUEST)
 
 
 @pytest.mark.parametrize("answer", [
-    SupersetToolError("Internal error in extensions.agenticfabriq.mnemiq.session_binding: An unexpected error "
-                      "occurred."),
-    {"refused": "backend"}, {"not_found": "database"}, {"unread": True}, {"refused": "request", "field": "schema"},
-    {"bound": "true"}, {"bound": 1}, {"bound": True, "more": True}, {"bound": True, "_response_truncated": True}, [],
-], ids=["not offered", "not oracle", "database not found", "unread", "refused", "a text", "a number", "saying more",
-        "cut", "not an object"])
-def test_any_answer_but_bound_or_not_is_none(answer):
-    """Read strictly: exactly `{"bound": <a boolean>}`. Anything else, or a call that fails (an extension older than
-    the tool among them), is None, which mnemiq reads as not bound."""
+    {"refused": "request", "field": "schema"}, {"bound": "true"}, {"bound": 1}, {"bound": True, "more": True},
+    {"bound": True, "_response_truncated": True}, {"unread": False}, {"refused": "isolation"},
+    {"not_found": "dashboard"}, [],
+], ids=["refused", "a text", "a number", "saying more", "cut", "unread false", "another refusal", "another not found",
+        "not an object"])
+def test_an_answer_of_no_kind_the_tool_gives_is_none(answer):
+    """Read strictly: exactly `{"bound": <a boolean>}`, `{"unread": true}`, `{"refused": "backend"}` or
+    `{"not_found": "database"}`. Anything else is None: an answer mnemiq cannot read."""
     assert read_by(Reading(answer)) is None
+
+
+# What rc2's MCP service sends for a tool it does not have, and for an unexpected error inside one it has
+# (`GlobalErrorHandlerMiddleware`): the same masked text.
+MASKED = ("Error: Internal error in extensions.agenticfabriq.mnemiq.session_binding: An unexpected error occurred. "
+          "Error ID: 3f9c0a1b. Please contact support if this persists.")
+
+
+def masked(tool: str = "session_binding") -> SupersetToolError:
+    return SupersetToolError(f"Superset's {tool} tool failed", detail=MASKED.replace("session_binding", tool))
+
+
+def test_an_extension_without_the_tool_is_an_older_extension():
+    """The tool's masked failure is settled as `_require_tool` settles one: the tool asked again with an empty request,
+    which the tool refuses and an older extension fails the same way, then the extension's own probe, which an older
+    extension answers. So an extension older than the tool is `ExtensionOutdated`, needed by Superset mode on
+    Oracle."""
+    def answer(request):
+        if request == {"dataset_ids": []}:
+            return {"datasets": []}
+        return masked()
+
+    client = Reading(answer)
+    with pytest.raises(ExtensionOutdated) as outdated:
+        read_by(client)
+    assert outdated.value.needed_by == "Superset mode on Oracle"
+    assert [tool for tool, _ in client.calls] == [TOOL_PREFIX + "session_binding", TOOL_PREFIX + "session_binding",
+                                                  TOOL_PREFIX + "dataset_metrics"]
+    assert [request for _, request in client.calls][1:] == [{}, {"dataset_ids": []}]
+
+
+def test_a_superset_without_the_extension_is_named():
+    client = Reading(lambda request: masked("dataset_metrics" if request == {"dataset_ids": []} else "session_binding"))
+    with pytest.raises(ExtensionMissing) as missing:
+        read_by(client)
+    assert not isinstance(missing.value, ExtensionOutdated)
+
+
+def test_the_tools_own_failure_is_unread():
+    """A masked failure of the tool where the tool, asked again with an empty request, refuses it: the tool is there and
+    failed for its own reason, so the session is unread. Any other tool error is unread too."""
+    client = Reading(lambda request: {"refused": "request", "field": "database_id"} if request == {} else masked())
+    assert read_by(client) is SessionAnswer.UNREAD
+    assert read_by(Reading(SupersetToolError("Superset's session_binding tool failed", detail="Error: boom"))) is \
+        SessionAnswer.UNREAD
 
 
 def test_superset_not_answering_and_a_refusal_of_the_caller_are_raised():
