@@ -132,9 +132,8 @@ class ValueIndex:
     """Read side of the value index. Resilient to a store built before value grounding: the
     table is ensured on construction, so an un-indexed store simply answers 'not indexed'.
 
-    With `source_id`, only the rows enrichment wrote for that source are read; without it, every
-    row is, as direct mode has always read the index. A store may hold another source's values
-    under the same table names, and a reader serving one snapshot must not read them."""
+    With `source_id`, the index reads the rows enrichment wrote for that source alone; without
+    it, every row it holds."""
 
     def __init__(self, con: duckdb.DuckDBPyConnection, source_id: str | None = None) -> None:
         self._con = con

@@ -100,28 +100,39 @@ def _shown_tables(snapshot: Snapshot, grants: GrantSet) -> frozenset[str]:
                      and all(source is not None and values_shown(grants, source) for source in lookups.get(name, ())))
 
 
-def values_scoped(snapshot: Snapshot, grants: GrantSet) -> Snapshot:
+# What a withheld table's columns lose in the snapshot a request shows, beside their harvested values: the counts and
+# estimates profiling read from its rows, past the rule as the values were.
+_PROFILE = {"row_count": None, "distinct_count": None, "null_count": None, "estimate": None}
+
+
+def values_scoped(snapshot: Snapshot, grants: GrantSet, *, shown: bool = False) -> Snapshot:
     """`snapshot` as a request under `grants` reads it: each object whose harvested content it may not read (every one
     but `_shown_tables`) with its columns' code lists, code schemes and descriptions taken out, its table facts dropped,
-    and every example reading it dropped. Everything else is the snapshot's own. A snapshot that harvested no values,
-    and one with nothing to take out, is returned itself; it is never changed."""
+    and every example reading it dropped. With `shown`, the snapshot the request shows a person or the model (its
+    cards, its schema and its starters): such an object's columns lose their row, distinct and null counts and their
+    estimates too, read from its rows as its values were. Without, the snapshot the request decides with keeps them, for
+    the checks that never show them (the fan-out guard's uniqueness of a key). Everything else is the snapshot's own. A
+    snapshot that harvested no values, and one with nothing to take out, is returned itself; it is never changed."""
     if not values_harvested(snapshot):
         return snapshot
-    shown = _shown_tables(snapshot, grants)
-    columns = [column if column.object_id in shown or not _harvested_fields(column)
-               else column.model_copy(update={"coded_values": [], "code_scheme": None, "description": None})
+    tables = _shown_tables(snapshot, grants)
+    taken = {"coded_values": [], "code_scheme": None, "description": None, **(_PROFILE if shown else {})}
+    columns = [column if column.object_id in tables or not _carries(column, profile=shown)
+               else column.model_copy(update=taken)
                for column in snapshot.columns]
-    facts = [facts for facts in snapshot.table_facts if facts.object_id in shown]
-    examples = [example for example in snapshot.examples if (read := _reads(example)) and read <= shown]
+    facts = [facts for facts in snapshot.table_facts if facts.object_id in tables]
+    examples = [example for example in snapshot.examples if (read := _reads(example)) and read <= tables]
     if (all(new is old for new, old in zip(columns, snapshot.columns)) and len(facts) == len(snapshot.table_facts)
             and len(examples) == len(snapshot.examples)):
         return snapshot
     return snapshot.model_copy(update={"columns": columns, "table_facts": facts, "examples": examples})
 
 
-def _harvested_fields(column) -> bool:
-    """Whether `column` carries anything `values_scoped` takes out of a withheld table."""
-    return bool(column.coded_values or column.code_scheme is not None or column.description)
+def _carries(column, *, profile: bool) -> bool:
+    """Whether `column` carries anything `values_scoped` takes out of a withheld table: its harvested values, and with
+    `profile` its counts and estimates."""
+    return bool(column.coded_values or column.code_scheme is not None or column.description
+                or (profile and any(getattr(column, name) is not None for name in _PROFILE)))
 
 
 class ShownValues:

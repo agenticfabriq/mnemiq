@@ -1373,7 +1373,7 @@ def test_the_null_probe_reads_the_source_as_the_builder(live, served, enriched, 
     settings, _ = enriched
     minted = live.minted(BUILDER, "build")
     adapter = superset_executor(settings, DelegatedToken(minted))
-    grants = served.runtime.builder_grants(adapter)
+    grants, _ = served.runtime.builder_grants(adapter)
     probes = Probes()
 
     def asked(column: str) -> bool | None:

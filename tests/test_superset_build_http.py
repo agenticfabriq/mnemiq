@@ -472,6 +472,48 @@ def test_a_snapshot_superset_mode_will_not_serve_refuses_building(served, fake, 
     assert fake.calls == [] and store.claims == []
 
 
+def _swapping_after_the_grants(monkeypatch, runtime) -> Snapshot:
+    """Swap another snapshot in the moment a request's grants are resolved, as a reload on another thread would while
+    the request waits on Superset; the snapshot the grants were resolved against is returned."""
+    serving, real = runtime.snapshot, runtime_module.resolve_grants
+
+    def resolve_then_swap(adapter, snapshot):
+        grants = real(adapter, snapshot)
+        runtime.snapshot = snapshot.model_copy(update={"version": "swapped"})
+        return grants
+
+    monkeypatch.setattr(runtime_module, "resolve_grants", resolve_then_swap)
+    return serving
+
+
+def _recording_snapshots(monkeypatch, module, names) -> dict:
+    """Each of `names` in `module` recording the snapshot it is handed, by name."""
+    handed: dict = {}
+    for name in names:
+        def recording(*args, _real=getattr(module, name), _name=name, **kwargs):
+            handed[_name] = kwargs["snapshot"]
+            return _real(*args, **kwargs)
+        monkeypatch.setattr(module, name, recording)
+    return handed
+
+
+def test_each_build_route_reads_the_snapshot_its_grants_were_resolved_against(served, store, monkeypatch):
+    """A snapshot swapped in while a build's grants are asked of Superset is not the one the build plans, steps or reads
+    a dashboard's measures from: each route is handed the snapshot `builder_grants` resolved its grants against."""
+    client, runtime = served
+    dashboard, _ = _a_built_dashboard(client)
+    build = _stored(store, client)
+    handed = _recording_snapshots(monkeypatch, _build_module(), ("plan_build", "next_step", "Asking"))
+    serving = _swapping_after_the_grants(monkeypatch, runtime)
+    for route, send in (("plan_build", lambda: _start(client)), ("next_step", lambda: _next(client, build.build_id)),
+                        ("Asking", lambda: client.get(f"/v1/superset/dashboards/{dashboard}/measures",
+                                                      headers=_bearer(_token())))):
+        runtime.snapshot = serving
+        send()
+        assert handed[route] is serving, route
+        assert runtime.snapshot is not serving  # the swap did happen
+
+
 def _masked(base: str):
     """What rc2's MCP service answers for a tool it does not have (`GlobalErrorHandlerMiddleware`), as the tool's
     error."""

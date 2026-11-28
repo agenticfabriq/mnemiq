@@ -416,8 +416,9 @@ def test_the_gate_serves_a_snapshot_read_from_the_schema_superset_shows_as_the_s
     # `shop` it is given as SHOP, so the setting names SHOP and not the snapshot's schema. Compared the other way, as
     # Superset shows the snapshot's schema, the two would be taken for one.
     ("shop", "shop", False),
-    # The setting in Oracle's own spelling is read by Superset as itself: the same schema.
-    ("SHOP", "SHOP", True),
+    # The setting in Oracle's own spelling names the schema, but Superset's datasets name it `shop`: refused, with the
+    # spelling to set.
+    ("SHOP", "SHOP", False),
     # A mixed-case quoted schema is shown and read as stored, case kept.
     ("Shop", "Shop", True),
     ("Shop", "shop", False),
@@ -429,6 +430,18 @@ def test_the_gate_matches_the_schema_through_the_name_mapping(stored, setting, s
     assert (refusal is None) is served, refusal
     if not served:
         assert f"{stored!r}" in refusal and "MNEMIQ_SUPERSET_SCHEMA" in refusal
+
+
+@pytest.mark.parametrize("stored, setting, spelling", [("SHOP", "SHOP", "shop"), ("ORDERS_2026", "ORDERS_2026",
+                                                                            "orders_2026")])
+def test_a_setting_in_oracles_spelling_is_refused_naming_the_one_superset_shows(stored, setting, spelling):
+    """MNEMIQ_SUPERSET_SCHEMA must be the schema's name as Superset shows it, the name its datasets record: the
+    operator is told the spelling to set. The person is told the deployment's own sentence, as for any snapshot it
+    will not serve."""
+    refusal = superset_source_refusal(_snapshot([_oracle_job(schema=stored)]), _settings(setting))
+    assert refusal is not None and "MNEMIQ_SUPERSET_SCHEMA" in refusal and f"{spelling!r}" in refusal
+    assert superset_source_refusal(_snapshot([_oracle_job(schema=stored)]), _settings(spelling)) is None
+    assert superset_dialect() == "postgres"  # judged before boot sets the dialect, as Oracle's mapping reads it
 
 
 def test_the_gate_compares_the_name_superset_reads_for_the_setting():

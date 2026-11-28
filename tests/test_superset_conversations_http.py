@@ -519,6 +519,21 @@ def test_results_rerun_as_the_person_now_and_store_nothing(served, fake, world, 
     assert client.post(f"{PREFIX}/{talk}/messages/0/results", headers=_bearer(_token())).status_code == 404
 
 
+def test_results_rerun_on_the_snapshot_their_grants_were_resolved_against(served, fake, world, talks, monkeypatch):
+    """A snapshot swapped in while the rerun's grants are asked of Superset is not the one its statement is decided
+    against."""
+    client, runtime = served
+    _routing(runtime, Routed(Intent.ASK, "x"))
+    _answering(monkeypatch)
+    talk = _new(client)
+    _send(client, talk, "how many policies by region?")
+    handed = build_http._recording_snapshots(monkeypatch, _module(), ("run_decided",))
+    serving = build_http._swapping_after_the_grants(monkeypatch, runtime)
+    r = client.post(f"{PREFIX}/{talk}/messages/1/results", headers=_bearer(_token()))
+    assert r.status_code == 200, r.text
+    assert handed["run_decided"] is serving and runtime.snapshot is not serving
+
+
 def test_results_after_access_narrowed_answer_the_ask_paths_refusal(served, fake, world, monkeypatch):
     """The person can no longer read the answer's table: the Ask path's own refusal sentence, and no row."""
     client, runtime = served

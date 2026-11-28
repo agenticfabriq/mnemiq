@@ -460,7 +460,7 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> BuildKit:
         adapter = superset_executor(deployment, delegation)
         # Whether Superset lets this person build at all, first: a non-builder is refused as one (NOT_A_BUILDER)
         # and learns nothing of a dashboard they named, its editors included.
-        grants = runtime.builder_grants(adapter)
+        grants, served = runtime.builder_grants(adapter)
         # Before anything is planned or kept: every write of a build goes through the extension, which must be
         # one that makes every object a build makes.
         require_build_tools(adapter.client)
@@ -474,7 +474,7 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> BuildKit:
         on_it = builds.measures_for(who.tenant_id, dashboard_id) if dashboard_id is not None else []
         built_on = datasets_built_on(on_it) if dashboard_id is not None else None
         plan = plan_build(goal, planner=planner, client=adapter.client, adapter=adapter,
-                          snapshot=runtime.snapshot, grants=grants, settings=profile.settings,
+                          snapshot=served, grants=grants, settings=profile.settings,
                           offer_reuse=dashboard_id is None and not fresh, onto=dashboard_id, built_on=built_on,
                           kept=tuple(row.measure for row in on_it))
         if isinstance(plan, PlanRefused):
@@ -549,9 +549,9 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> BuildKit:
                 raise BuildNotFound()
             profile = runtime.build_profile(build.profile, who)
             adapter = superset_executor(deployment, delegation)
-            grants = runtime.builder_grants(adapter)
+            grants, served = runtime.builder_grants(adapter)
             return {"build": _build(next_step(build, client=adapter.client, adapter=adapter, store=builds,
-                                              snapshot=runtime.snapshot, grants=grants, settings=profile.settings))}
+                                              snapshot=served, grants=grants, settings=profile.settings))}
 
         return answered(work)
 
@@ -575,7 +575,7 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> BuildKit:
         builds = kept()
         profile = runtime.build_profile(None, who)
         adapter = superset_executor(deployment, delegation)
-        grants = runtime.builder_grants(adapter)
+        grants, served = runtime.builder_grants(adapter)
         if changing:
             require_build_tools(adapter.client)
             _held_to_its_editors(adapter.client, dashboard_id)
@@ -583,7 +583,7 @@ def mount_superset_build(app: FastAPI, runtime, doors, asker) -> BuildKit:
             if builds.dashboard_building(who.tenant_id, dashboard_id):
                 raise DashboardBusy()
         return Asking(adapter=adapter, store=builds, tenant=who.tenant_id, principal=who.principal_id,
-                      dashboard_id=dashboard_id, snapshot=runtime.snapshot, grants=grants, settings=profile.settings)
+                      dashboard_id=dashboard_id, snapshot=served, grants=grants, settings=profile.settings)
 
     @app.get("/v1/superset/dashboards/{dashboard_id}/measures")
     def measures(dashboard_id: Annotated[int, Path(gt=0, le=MAX_ID)], asking_=Depends(asker)) -> dict:

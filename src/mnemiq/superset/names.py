@@ -87,10 +87,10 @@ def _requires_quotes(value: str) -> bool:
             or lowered != value)
 
 
-def superset_name(stored: str) -> str:
+def superset_name(stored: str, *, dialect: str | None = None) -> str:
     """`stored`, a name as the database stores it, as Superset shows it: SQLAlchemy's Oracle `normalize_name` on Oracle,
-    the name itself on PostgreSQL."""
-    if superset_dialect() != "oracle":
+    the name itself on PostgreSQL. `dialect` is Superset mode's unless given, as `stored_name` reads it."""
+    if (superset_dialect() if dialect is None else dialect) != "oracle":
         return stored
     lower, upper = stored.lower(), stored.upper()
     if upper == lower:

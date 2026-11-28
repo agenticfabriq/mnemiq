@@ -684,11 +684,11 @@ def mount_superset_conversations(app: FastAPI, runtime, doors, asker, build: Bui
                 raise HTTPException(status_code=404, detail=NO_ANSWER)
             _, delegation = _builder(asking_, building=False)
             adapter = superset_executor(deployment, delegation)
-            grants = runtime.builder_grants(adapter)
+            grants, served = runtime.builder_grants(adapter)
             settings = runtime.build_profile(None, who).settings
             try:
                 # Read as an answer is (`execute_answer`): larger than one response, its first rows, said so.
-                outcome = run_decided(answer["sql"], adapter=adapter, snapshot=runtime.snapshot, grants=grants,
+                outcome = run_decided(answer["sql"], adapter=adapter, snapshot=served, grants=grants,
                                       timeout_s=DEFAULT_TIMEOUT_S, guard_fanout=settings.guard_fanout, answer=True)
             except ExecutionError as exc:
                 logger.warning("a reopened answer's query did not run again: %s", exc.full_text)

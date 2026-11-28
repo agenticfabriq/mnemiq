@@ -31,7 +31,15 @@ import mnemiq
 from mnemiq.agent.loop import Agent
 from mnemiq.authz.grants import GrantSet, values_shown
 from mnemiq.contract import CodedValue, Column, IdentityContext, Snapshot
-from mnemiq.contract.semantic import CodeScheme, Example, JoinKey, Relationship, SourceBinding, TableFacts
+from mnemiq.contract.semantic import (
+    CodeScheme,
+    ColumnEstimate,
+    Example,
+    JoinKey,
+    Relationship,
+    SourceBinding,
+    TableFacts,
+)
 from mnemiq.llm.embeddings import LLMEmbedder
 from mnemiq.runtime import build_runtime
 from mnemiq.semantic.store import build_index
@@ -623,8 +631,8 @@ def test_a_request_reads_the_index_only_for_a_harvested_snapshot_of_its_own_sour
     assert isinstance(served_values(held, _harvested_snapshot(jobs=[_source_job()]), grants), NoValueIndex)
 
 
-def test_an_unscoped_index_reads_every_source_as_it_always_did(index):
-    """Direct mode's index is unscoped, as it was: it reads every source's rows."""
+def test_an_index_given_a_source_reads_that_sources_rows(index):
+    """With a source id the index reads that source's rows; without one, every row it holds."""
     assert ValueIndex(index).contains(ITEMS, "STATUS", OTHER_SOURCES_VALUE)
     assert not ValueIndex(index, source_id=SOURCE_ID).contains(ITEMS, "STATUS", OTHER_SOURCES_VALUE)
     assert ValueIndex(index, source_id=SOURCE_ID).values(ITEMS, "STATUS") == [HARVESTED[ITEMS]["code"]]
@@ -682,7 +690,8 @@ def test_an_answer_over_a_ruled_and_a_free_table_shows_only_the_free_tables_valu
 
 def test_the_fit_and_the_history_read_the_scoped_snapshot(runtime, served, monkeypatch):
     """The prompt fit, which renders the cards again when it trims them, and the history, which decides the newest
-    turn's SQL again, are handed the snapshot this request reads, not the served one whole."""
+    turn's SQL again, are handed the snapshot this request reads, not the served one whole: the fit the one it shows,
+    the history the one it decides with."""
     import mnemiq.runtime as runtime_module
 
     fake, _ = served
@@ -706,6 +715,8 @@ def test_the_fit_and_the_history_read_the_scoped_snapshot(runtime, served, monke
     for reader in ("fit", "history"):
         assert _column(handed[reader], ORDERS).coded_values == [], reader
         assert _column(handed[reader], ITEMS).coded_values, reader
+    # The fit shows the cards, so ORDERS' counts are out of its snapshot; the history decides, so they are in its.
+    assert _column(handed["fit"], ORDERS).row_count is None and _column(handed["history"], ORDERS).row_count == 10
 
 
 def _swapping_after_the_grants(monkeypatch, runtime, swapped: Snapshot) -> None:
@@ -859,6 +870,61 @@ def test_postgresql_superset_mode_is_unchanged(tmp_path, answered):
     assert seen["snapshot"] is runtime.snapshot and isinstance(seen["values"], NoValueIndex)
     assert seen["grants"].values_withheld == frozenset()
     assert runtime.value_index is None  # no index is even opened
+
+
+def _profiled(snapshot: Snapshot) -> Snapshot:
+    """`snapshot` with, on each table, an amount column of its own size and a column every row of which is NULL."""
+    sizes = {ORDERS: 100, ITEMS: 5}
+    extra = [column for table, rows in sizes.items() for column in (
+        Column(id=f"{table}.AMOUNT", object_id=table, name="AMOUNT", data_type="NUMBER", semantic_type="amount",
+               row_count=rows, distinct_count=rows, null_count=0,
+               estimate=ColumnEstimate(rows=rows, distinct=rows, nulls=0)),
+        Column(id=f"{table}.NOTE", object_id=table, name="NOTE", data_type="VARCHAR2(40)", row_count=rows,
+               distinct_count=0, null_count=rows))]
+    return snapshot.model_copy(update={"columns": [*snapshot.columns, *extra]})
+
+
+def test_a_withheld_tables_profile_is_kept_for_decisions_and_taken_out_of_what_is_shown():
+    """A withheld table's counts were read past the rule as its values were: the snapshot a request shows (`shown`)
+    takes its row, distinct and null counts and its estimates out, and the one it decides with keeps them, for the
+    checks that never render them (the fan-out guard's uniqueness). A shown table keeps its counts in both."""
+    snapshot = _profiled(_harvested_snapshot())
+    shown = values_scoped(snapshot, _withholding(ORDERS), shown=True)
+    held, free = _column(shown, ORDERS, "AMOUNT"), _column(shown, ITEMS, "AMOUNT")
+    assert (held.row_count, held.distinct_count, held.null_count, held.estimate) == (None, None, None, None)
+    assert free == _column(snapshot, ITEMS, "AMOUNT")
+    assert _column(shown, ORDERS, "NOTE").null_count is None
+    decided = values_scoped(snapshot, _withholding(ORDERS))
+    assert _column(decided, ORDERS, "AMOUNT") == _column(snapshot, ORDERS, "AMOUNT")
+    assert values_scoped(snapshot, _withholding(), shown=True) is snapshot
+    unharvested = _profiled(_harvested_snapshot(jobs=[_source_job()]))
+    assert values_scoped(unharvested, _withholding(ORDERS), shown=True) is unharvested
+
+
+def _card_of(text: str, table: str) -> str:
+    """The part of a prompt or schema text that is `table`'s card."""
+    return next(part for part in text.split("TABLE ")[1:] if part.startswith(f"{table}\n"))
+
+
+def test_a_ruled_tables_profile_reaches_no_card_starter_or_prompt_and_still_decides(tmp_path, served, answered):
+    """With a rule on ORDERS: ORDERS' card says nothing its counts say (no ENTIRELY NULL note), ITEMS' card does; the
+    opening screen's starter about the biggest table's amount is ITEMS', since ORDERS' size is not told; and the agent
+    decides with ORDERS' counts still there. With no rule, the starter is about ORDERS."""
+    fake, model = served
+    superset = RuledSuperset(fake, {SHOWN[ORDERS]})
+    runtime = _deployment(tmp_path, served, _profiled(_harvested_snapshot()))
+    for listed in (_scope(runtime)["tables"], runtime.schema(ASKER, delegation=DelegatedToken(TOKEN))):
+        cards = {card["object_id"]: card["card"] for card in listed}
+        assert "ENTIRELY NULL" not in cards[ORDERS] and "ENTIRELY NULL" in cards[ITEMS]
+    assert "What is the total AMOUNT in ITEMS?" in _scope(runtime)["starters"]
+    _ask(runtime)
+    [request] = [r for r in model.requests if "QUESTION:" in json.dumps(r)][:1]
+    prompt = request["messages"][-1]["content"]
+    assert "ENTIRELY NULL" not in _card_of(prompt, ORDERS) and "ENTIRELY NULL" in _card_of(prompt, ITEMS)
+    [seen] = answered
+    assert _column(seen["snapshot"], ORDERS, "AMOUNT").row_count == 100
+    superset.ruled = set()
+    assert "What is the total AMOUNT in ORDERS?" in _scope(runtime)["starters"]
 
 
 def test_only_superset_mode_reads_a_scoped_snapshot():
@@ -1017,12 +1083,15 @@ def test_the_runtime_reads_its_served_snapshot_only_where_known():
     assert _snapshot_reads((SOURCE / "runtime.py").read_text()) == SNAPSHOT_READS
 
 
-# What the server and the builder hand another object's snapshot to: the builder's planner, its next step, the context
-# of a measure's change, and the chart and statement checks, none of which reads a field `values_scoped` takes out
-# (pinned above, by module). A request in Superset mode is answered from the snapshot `Runtime._served` scopes; a build
-# reads the served one, its names, links and key facts.
+# What the server and the builder hand another object's snapshot to. The server reads none of the runtime's: its build
+# routes take the snapshot `builder_grants` returns, the one their grants were resolved against. The builder hands the
+# snapshot it was given (a run's, a measure change's) to the chart and statement checks, none of which reads a field
+# `values_scoped` takes out (pinned above, by module). A request in Superset mode is answered from the snapshot
+# `Runtime._served` scopes; a build reads the request's whole, its names, links and key facts.
 SNAPSHOT_HAND_OFFS = {
-    "server": {("runtime", "plan_build"), ("runtime", "next_step"), ("runtime", "Asking"), ("runtime", "run_decided")},
+    # The build routes plan, step, check and run again from the snapshot `builder_grants` resolved their grants against,
+    # never from a second read of the runtime's.
+    "server": set(),
     "superset": {("run", "check_chart"), ("asking", "visible_schema"), ("asking", "check_chart"),
                  ("asking", "check_measure"), ("asking", "run_decided")},
 }
