@@ -388,9 +388,8 @@ def test_a_table_not_granted_is_withheld_and_never_asked(superset_oracle):
     assert [call["tables"] for call in _table_rule_calls(client)] == [["items"]]
 
 
-def test_a_name_superset_reads_back_as_another_table_is_not_asked_and_is_withheld(superset_oracle):
-    """A table stored in lower case is shown by Superset under the name it reads as the upper-case table, so no answer
-    about that name is about it: it is never asked, and its values are withheld."""
+def test_a_table_stored_under_a_plain_lower_case_name_is_not_asked_and_is_withheld(superset_oracle):
+    """A table stored under a plain lower-case name is never asked about, and its values are withheld."""
     from mnemiq.superset.grants import _values_withheld
 
     snapshot = _harvested_snapshot()
@@ -399,6 +398,24 @@ def test_a_name_superset_reads_back_as_another_table_is_not_asked_and_is_withhel
     client = _oracle_client()
     assert _values_withheld(_adapter(client), lower, frozenset({"orders", ITEMS})) == {"orders", ORDERS}
     assert [call["tables"] for call in _table_rule_calls(client)] == [["items"]]
+
+
+def test_an_object_bound_under_several_names_is_shown_only_when_every_name_has_no_rule(superset_oracle):
+    """An object the snapshot binds under two stored names is shown only when Superset says no rule applies under each
+    of them: a rule under one withholds it."""
+    from mnemiq.superset.grants import _values_withheld
+
+    snapshot = _harvested_snapshot()
+    twice = snapshot.model_copy(update={"source_bindings": [*snapshot.source_bindings, SourceBinding(
+        id="sb:ORDERS_ARCHIVE", source_id=SOURCE_ID, object_id=ORDERS, source_object="ORDERS_ARCHIVE",
+        binding_type="table")]})
+    client = _oracle_client({"orders_archive"})
+    assert _values_withheld(_adapter(client), twice, frozenset({ORDERS, ITEMS})) == {ORDERS}
+    free = _oracle_client()
+    assert _values_withheld(_adapter(free), twice, frozenset({ORDERS, ITEMS})) == frozenset()
+    viewed = snapshot.model_copy(update={"source_bindings": [*snapshot.source_bindings, SourceBinding(
+        id="sb:ORDERS_V", source_id=SOURCE_ID, object_id=ORDERS, source_object="ORDERS_V", binding_type="view")]})
+    assert _values_withheld(_adapter(_oracle_client()), viewed, frozenset({ORDERS, ITEMS})) == {ORDERS}
 
 
 def test_values_not_harvested_ask_nothing_and_withhold_nothing(superset_oracle):
@@ -481,6 +498,60 @@ def test_a_column_grounded_from_a_withheld_lookup_table_withholds_its_own_table(
     assert values_scoped(with_lookup, _withholding()) is with_lookup
     unjoined = with_lookup.model_copy(update={"relationships": []})
     assert _column(values_scoped(unjoined, _withholding(ORDERS)), ITEMS, "ORDER_ID").coded_values == []
+
+
+def _with_supplier_lookup(snapshot: Snapshot, *, joined: bool = True) -> Snapshot:
+    """`snapshot` with a lookup-grounded column on ITEMS whose labels were read from SUPPLIERS, a table the snapshot
+    binds too, joined to it where `joined`."""
+    lookup = Column(id="ITEMS.SUPPLIER_ID", object_id=ITEMS, name="SUPPLIER_ID", data_type="NUMBER",
+                    coded_values=[CodedValue(code="9", meaning=SUPPLIER_LABEL, source="lookup")])
+    suppliers = Column(id="SUPPLIERS.ID", object_id="SUPPLIERS", name="ID", data_type="NUMBER")
+    join = Relationship(id="r-suppliers", **{"from": ITEMS}, to="SUPPLIERS", cardinality="many_to_one",
+                        join_keys=[JoinKey(left="SUPPLIER_ID", right="ID")])
+    return snapshot.model_copy(update={
+        "version": f"{snapshot.version}-suppliers",
+        "columns": [*snapshot.columns, lookup, suppliers],
+        "source_bindings": [*snapshot.source_bindings, SourceBinding(
+            id="sb:SUPPLIERS", source_id=SOURCE_ID, object_id="SUPPLIERS", source_object="SUPPLIERS",
+            binding_type="table")],
+        "relationships": [*snapshot.relationships, *([join] if joined else [])]})
+
+
+# A label read from SUPPLIERS, carried on ITEMS' lookup-grounded column.
+SUPPLIER_LABEL = "DEPOT_SUPPLIER_LABEL"
+
+
+def test_values_are_shown_only_for_a_granted_table():
+    """A table the grants do not give the person is shown nothing, whatever the withheld set names: what is shown is a
+    granted table Superset was asked about, never one the grants know nothing of."""
+    assert not values_shown(GrantSet(frozenset({ITEMS})), ORDERS)
+    assert values_shown(GrantSet(frozenset({ITEMS})), ITEMS)
+
+
+def test_a_lookup_from_a_table_the_grants_were_not_decided_for_withholds_its_table():
+    """Grants decided for one snapshot, scoping another that records a new lookup join from ITEMS to SUPPLIERS: the
+    grants never asked of SUPPLIERS, so ITEMS' code lists, which carry SUPPLIERS' labels, are withheld, and so is
+    SUPPLIERS; ORDERS, ruled, stays withheld."""
+    decided = _withholding(ORDERS)  # ITEMS and ORDERS granted, only ITEMS asked and free
+    scoped = values_scoped(_with_supplier_lookup(_harvested_snapshot()), decided)
+    assert _column(scoped, ITEMS, "SUPPLIER_ID").coded_values == [] and _column(scoped, ITEMS).coded_values == []
+    assert _column(scoped, ORDERS).coded_values == []
+    values = ShownValues(NoValueIndex(), decided, frozenset({ORDERS, ITEMS, "SUPPLIERS"}))
+    assert not values._shown("SUPPLIERS")
+
+
+def test_a_lookup_column_with_no_join_recorded_withholds_its_table_with_nothing_withheld():
+    """Where the grants withhold nothing, a lookup-grounded column whose join is not recorded still withholds its table:
+    which table its labels came from cannot be told."""
+    granted = GrantSet(frozenset({ORDERS, ITEMS, "SUPPLIERS"}))
+    scoped = values_scoped(_with_supplier_lookup(_harvested_snapshot(), joined=False), granted)
+    assert _column(scoped, ITEMS, "SUPPLIER_ID").coded_values == [] and _column(scoped, ITEMS).coded_values == []
+    assert _column(scoped, ORDERS).coded_values
+    joined = _with_supplier_lookup(_harvested_snapshot())
+    assert values_scoped(joined, granted) is joined
+    for jobs in ([_oracle_job(values="not harvested")], [_source_job()]):  # nothing harvested: nothing taken out
+        unharvested = _with_supplier_lookup(_harvested_snapshot(jobs=jobs), joined=False)
+        assert values_scoped(unharvested, GrantSet(frozenset({ITEMS}))) is unharvested
 
 
 def test_an_example_reading_a_table_the_snapshot_does_not_name_is_withheld():
@@ -637,6 +708,47 @@ def test_the_fit_and_the_history_read_the_scoped_snapshot(runtime, served, monke
         assert _column(handed[reader], ITEMS).coded_values, reader
 
 
+def _swapping_after_the_grants(monkeypatch, runtime, swapped: Snapshot) -> None:
+    """Make the served snapshot `swapped` the moment a request's grants are resolved, as a reload on another thread
+    would while this request waits on Superset."""
+    import mnemiq.runtime as runtime_module
+
+    real = runtime_module.resolve_grants
+
+    def resolve_then_swap(adapter, snapshot):
+        grants = real(adapter, snapshot)
+        runtime.snapshot = swapped
+        return grants
+
+    monkeypatch.setattr(runtime_module, "resolve_grants", resolve_then_swap)
+
+
+def test_a_request_reads_one_snapshot_though_another_is_swapped_in_while_its_grants_are_resolved(
+        runtime, served, answered, monkeypatch):
+    """A snapshot swapped in while the request's grants are asked of Superset is not read by that request: its prompt,
+    its value index and every reader are the snapshot its grants were decided for. The swapped one records a lookup on
+    ITEMS carrying SUPPLIERS' labels, which no part of this request asked about."""
+    fake, model = served
+    RuledSuperset(fake, {SHOWN[ORDERS]})
+    first = runtime.snapshot
+    _swapping_after_the_grants(monkeypatch, runtime, _with_supplier_lookup(first))
+    _ask(runtime)
+    [seen] = answered
+    assert seen["snapshot"].version == first.version
+    assert SUPPLIER_LABEL not in _prompts(model) and "SUPPLIER_ID" not in _prompts(model)
+    assert seen["values"].has(ITEMS, "STATUS") and not seen["values"].has("SUPPLIERS", "ID")
+
+
+def test_the_schema_reads_one_snapshot_though_another_is_swapped_in_while_its_grants_are_resolved(
+        runtime, served, monkeypatch):
+    fake, _ = served
+    RuledSuperset(fake, {SHOWN[ORDERS]})
+    _swapping_after_the_grants(monkeypatch, runtime, _with_supplier_lookup(runtime.snapshot))
+    scope = _scope(runtime)
+    assert SUPPLIER_LABEL not in json.dumps(scope) and "SUPPLIER_ID" not in json.dumps(scope)
+    assert HARVESTED[ITEMS]["code"] in json.dumps(scope)
+
+
 def test_a_wrong_literal_on_the_free_table_is_repaired_with_its_values_and_one_on_the_ruled_table_is_not(
         runtime, served, monkeypatch):
     """Through an answer: the writer's filter on a value ITEMS' column does not hold is refused naming the values it
@@ -750,8 +862,7 @@ def test_postgresql_superset_mode_is_unchanged(tmp_path, answered):
 
 
 def test_only_superset_mode_reads_a_scoped_snapshot():
-    """Direct mode reads the served snapshot whatever its grants hold: its row filters keep their own meaning there,
-    and it withholds no values. Superset mode reads the scoped one."""
+    """Direct mode's snapshot is returned as it is; Superset mode reads the scoped one."""
     from types import SimpleNamespace
 
     from mnemiq.runtime import Runtime
@@ -759,9 +870,9 @@ def test_only_superset_mode_reads_a_scoped_snapshot():
     snapshot = _harvested_snapshot()
     grants = GrantSet(frozenset({ORDERS, ITEMS}), row_filters={ORDERS: "1 = 1"}, values_withheld=frozenset({ORDERS}))
     fields = {"con": None, "snapshot": snapshot, "adapter": None, "agent": None, "embedder": None, "authz": None}
-    assert Runtime(**fields, settings=None)._served(grants) is snapshot
-    assert Runtime(**fields, settings=SimpleNamespace(superset_mode=False))._served(grants) is snapshot
-    scoped = Runtime(**fields, settings=SimpleNamespace(superset_mode=True))._served(grants)
+    assert Runtime(**fields, settings=None)._served(grants, snapshot) is snapshot
+    assert Runtime(**fields, settings=SimpleNamespace(superset_mode=False))._served(grants, snapshot) is snapshot
+    scoped = Runtime(**fields, settings=SimpleNamespace(superset_mode=True))._served(grants, snapshot)
     assert _column(scoped, ORDERS).coded_values == [] and _column(scoped, ITEMS).coded_values
 
 
@@ -776,49 +887,151 @@ def _modules_reading(attribute: str) -> set[str]:
             if isinstance(node, ast.Attribute) and node.attr == attribute and isinstance(node.ctx, ast.Load)}
 
 
-# The modules that read a column's code list: enrichment's, run offline over the source; the ontology binder, the same;
-# and at answer time the card and starter renderers, which the runtime hands only the snapshot a request reads
-# (`Runtime._served`), and the scoping that makes it.
-CODED_VALUE_READERS = {
-    "enrichment/accumulate.py", "enrichment/certified.py", "enrichment/grounding.py", "enrichment/semantic.py",
-    "enrichment/statistics.py", "ontology/binder.py", "semantic/cards.py", "semantic/starters.py",
-    "superset/harvested.py",
+# The modules that read each field `values_scoped` takes out of a withheld table, by its attribute's name. A new reader
+# fails `test_every_reader_of_a_stripped_field_is_known` until it is shown to read the snapshot a request reads (or to
+# read the field of something else: `description` is also a measure's, a setting's and a cursor's), and is added here.
+FIELD_READERS = {
+    "coded_values": {
+        # enrichment and the ontology binder, offline, over the source
+        "enrichment/accumulate.py", "enrichment/certified.py", "enrichment/grounding.py", "enrichment/semantic.py",
+        "enrichment/statistics.py", "ontology/binder.py",
+        # at answer time: the renderers the runtime hands the request's snapshot, and the scoping that makes it
+        "semantic/cards.py", "semantic/starters.py", "superset/harvested.py",
+    },
+    "code_scheme": {
+        "enrichment/grounding.py", "ontology/binder.py", "semantic/ontology_index.py",  # offline
+        "semantic/cards.py", "semantic/retrieval.py",  # handed the request's snapshot (and its columns)
+        "superset/harvested.py",  # the scoping
+    },
+    "description": {
+        "enrichment/facts.py", "enrichment/grounding.py", "enrichment/semantic.py", "ontology/digest.py",  # offline
+        "semantic/cards.py", "semantic/fit.py",  # a column's, from the request's snapshot
+        "superset/harvested.py",  # the scoping
+        # another object's: a cursor's (`adapters`), a setting's (`config.py`), a Superset measure's
+        "adapters/oracle.py", "adapters/pg.py", "adapters/sqlite.py", "config.py", "server/superset_build.py",
+        "superset/build_store.py", "superset/measure_actions.py", "superset/measures.py", "superset/planner.py",
+    },
+    "table_facts": {
+        "eval/engine.py", "semantic/federation.py",  # eval and the federated merge, never a Superset-mode request
+        "llm/window.py",  # the prompt-window advisory, an operator's log
+        "runtime.py", "semantic/fit.py", "superset/harvested.py",  # the request's snapshot
+    },
+    "examples": {
+        "cli.py", "enrichment/accumulate.py", "semantic/federation.py", "semantic/store.py", "store/federated_build.py",
+        "generate/prompts.py",  # a packet's, which Superset mode empties
+        "semantic/starters.py", "superset/harvested.py",  # the request's snapshot
+    },
 }
 
 
-def test_every_reader_of_a_code_list_is_one_whose_snapshot_was_scoped():
-    """A new reader of `coded_values` fails this until it is shown to read the snapshot a request reads: it is then
-    added here, beside the renderers the runtime hands that snapshot."""
-    assert _modules_reading("coded_values") == CODED_VALUE_READERS
+@pytest.mark.parametrize("field", sorted(FIELD_READERS))
+def test_every_reader_of_a_stripped_field_is_known(field):
+    assert _modules_reading(field) == FIELD_READERS[field]
 
 
-# The functions the runtime may hand its served snapshot to whole: the checks of a snapshot at boot and on a swap, the
-# advisories that log for an operator, the binding's record, and the scoping and grants that decide what a request may
-# read of it. Every reader of a request's snapshot is handed what `_served` returns instead.
-SNAPSHOT_TAKERS = {
-    "_served", "values_scoped", "values_harvested", "snapshot_objects", "served_values", "resolve_grants",
-    "_superset_swap_refusal", "superset_source_refusal", "superset_snapshot_dialect", "_warn_view_inventory",
-    "_warn_cut_meaning", "_warn_stale_codes", "_warn_prompt_window", "_warn_policy_advisories", "save_snapshot",
-}
+def _functions(tree: ast.Module):
+    """The module's functions and its classes' methods."""
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield node
+        elif isinstance(node, ast.ClassDef):
+            yield from (item for item in node.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)))
+
+
+def _is_snapshot_of(node, holder: str) -> bool:
+    return (isinstance(node, ast.Attribute) and node.attr == "snapshot" and isinstance(node.ctx, ast.Load)
+            and isinstance(node.value, ast.Name) and node.value.id == holder)
+
+
+def _snapshot_reads(source: str) -> dict[str, int]:
+    """For each function or method of `source`, how many times it reads `self.snapshot`, however the read is used: an
+    argument, a part of one (`self.snapshot.table_facts if self.snapshot else ()`), an alias, a condition."""
+    reads: dict[str, int] = {}
+    for function in _functions(ast.parse(source)):
+        if count := sum(_is_snapshot_of(node, "self") for node in ast.walk(function)):
+            reads[function.name] = reads.get(function.name, 0) + count
+    return reads
 
 
 def _callee(call: ast.Call) -> str:
     return call.func.attr if isinstance(call.func, ast.Attribute) else getattr(call.func, "id", "?")
 
 
-def _is_served_snapshot(node) -> bool:
-    return (isinstance(node, ast.Attribute) and node.attr == "snapshot" and isinstance(node.value, ast.Name)
-            and node.value.id == "self")
+def _snapshot_hand_offs(source: str) -> set[tuple[str, str]]:
+    """Each read of another object's snapshot (`runtime.snapshot`, `asking.snapshot`, ...) in `source`, as the object's
+    name and the function of the nearest call holding it as an argument, or part of one; "<not an argument>" for a read
+    no call takes (an alias, a return, a comparison)."""
+    tree = ast.parse(source)
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    found: set[tuple[str, str]] = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Attribute) and node.attr == "snapshot" and isinstance(node.ctx, ast.Load)
+                and isinstance(node.value, ast.Name) and node.value.id != "self"):
+            continue
+        taker, child, parent = "<not an argument>", node, parents.get(node)
+        while parent is not None and not isinstance(parent, ast.stmt):
+            if isinstance(parent, ast.Call) and child is not parent.func:
+                taker = _callee(parent)
+                break
+            child, parent = parent, parents.get(parent)
+        found.add((node.value.id, taker))
+    return found
 
 
-def test_the_runtime_hands_no_reader_its_served_snapshot_unscoped():
-    """In `runtime.py`, `self.snapshot` is an argument only of a function that decides what a request may read of it,
-    or that checks or advises on it: every card, starter, retrieval, fit, history and answer is handed the snapshot
-    `_served` returns, which in Superset mode has the withheld tables' harvested content taken out."""
-    tree = ast.parse((SOURCE / "runtime.py").read_text())
-    handed = sorted({_callee(node) for node in ast.walk(tree) if isinstance(node, ast.Call)
-                     for arg in (*node.args, *(k.value for k in node.keywords)) if _is_served_snapshot(arg)})
-    assert set(handed) <= SNAPSHOT_TAKERS, set(handed) - SNAPSHOT_TAKERS
+@pytest.mark.parametrize(("source", "reads"), [
+    ("def ask(self):\n    retrieve(table_facts=self.snapshot.table_facts if self.snapshot else ())\n", {"ask": 2}),
+    ("def _cards(self, x):\n    build_cards(self.snapshot if x else None)\n", {"_cards": 1}),
+    ("def scope(self):\n    snap = self.snapshot\n    compose_starters(snap)\n", {"scope": 1}),
+    ("class R:\n    def fit(self, p):\n        return fitter.fit(p, self.snapshot)\n", {"fit": 1}),
+    ("def swap(self, s):\n    self.snapshot = s\n", {}),
+    ("def scope(self, snapshot):\n    compose_starters(snapshot, other.snapshot)\n", {}),
+], ids=["inside a conditional argument", "a conditional argument", "an alias", "a method", "a store", "not self's"])
+def test_the_read_counter_counts_every_way_the_snapshot_is_read(source, reads):
+    assert _snapshot_reads(source) == reads
+
+
+@pytest.mark.parametrize(("source", "found"), [
+    ("run_decided(sql, snapshot=runtime.snapshot)\n", {("runtime", "run_decided")}),
+    ("plan(x if y else runtime.snapshot)\n", {("runtime", "plan")}),
+    ("plan(only(runtime.snapshot.columns))\n", {("runtime", "only")}),
+    ("s = runtime.snapshot\nplan(s)\n", {("runtime", "<not an argument>")}),
+    ("def f():\n    return asking.snapshot\n", {("asking", "<not an argument>")}),
+    ("runtime.snapshot.model_copy()\n", {("runtime", "<not an argument>")}),
+    ("plan(self.snapshot, snapshot)\n", set()),
+], ids=["a keyword", "a conditional", "a part of one", "an alias", "a return", "its own method", "not another's"])
+def test_the_hand_off_finder_finds_every_way_a_snapshot_is_handed_on(source, found):
+    assert _snapshot_hand_offs(source) == found
+
+
+# Where `runtime.py` reads the snapshot it serves, and how often. Each request's door reads it once, after the reload
+# (`_reloaded`, and in direct mode `_grants_for` and `write`, which do not reload), and hands that one reference to
+# its grants, its value index and its scoping; the rest is bookkeeping read by no person: the source id answers are
+# recorded under, the certified versions a trace names, and the binding check's own record when it is asked with no
+# snapshot of a request (`bound`).
+SNAPSHOT_READS = {"_reloaded": 1, "_grants_for": 1, "write": 1, "bound": 1, "_source_id": 3, "_record": 2}
+
+
+def test_the_runtime_reads_its_served_snapshot_only_where_known():
+    """A new read of `self.snapshot` in `runtime.py`, or a second one in a door, fails this: a request reads one
+    snapshot, so a swap while it runs never gives its grants one snapshot and its readers another."""
+    assert _snapshot_reads((SOURCE / "runtime.py").read_text()) == SNAPSHOT_READS
+
+
+# What the server and the builder hand another object's snapshot to: the builder's planner, its next step, the context
+# of a measure's change, and the chart and statement checks, none of which reads a field `values_scoped` takes out
+# (pinned above, by module). A request in Superset mode is answered from the snapshot `Runtime._served` scopes; a build
+# reads the served one, its names, links and key facts.
+SNAPSHOT_HAND_OFFS = {
+    "server": {("runtime", "plan_build"), ("runtime", "next_step"), ("runtime", "Asking"), ("runtime", "run_decided")},
+    "superset": {("run", "check_chart"), ("asking", "visible_schema"), ("asking", "check_chart"),
+                 ("asking", "check_measure"), ("asking", "run_decided")},
+}
+
+
+@pytest.mark.parametrize("package", sorted(SNAPSHOT_HAND_OFFS))
+def test_the_server_and_the_builder_hand_the_snapshot_only_to_known_non_readers(package):
+    found = set().union(*(_snapshot_hand_offs(path.read_text()) for path in (SOURCE / package).glob("*.py")))
+    assert found == SNAPSHOT_HAND_OFFS[package]
 
 
 # Where a value index is opened: direct mode's components, and the runtime, for its advisories and, in Superset mode,

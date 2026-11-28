@@ -18,9 +18,11 @@ request reads follows them, by one predicate (`values_shown`):
   checks nothing on it, and where the answer path asks whether a value exists it asks Superset, as the person, under
   their rules.
 
-Both are Superset mode's alone, and the runtime applies them there alone: a column read as one the index does not hold
-is asked of the source, which in Superset mode answers under the person's row rules, and in direct mode would read
-every row. Direct mode keeps its own reading of row filters (the value check quotes no value of a filtered table).
+A table's values are shown only where the grants give the table to the person and Superset, asked in this request,
+says no rule applies to it; a lookup's labels only where the same holds of each table its column joins. The runtime
+hands the grants, the scoping and the index one snapshot per request (`Runtime._reloaded`), the one the grants were
+decided for, and applies both in Superset mode alone: a column the index reads as one it does not hold is asked of
+Superset, as the person, under their row rules.
 """
 
 from __future__ import annotations
@@ -89,8 +91,9 @@ def _lookup_sources(snapshot: Snapshot) -> dict[str, set[str | None]]:
 
 def _shown_tables(snapshot: Snapshot, grants: GrantSet) -> frozenset[str]:
     """The tables of `snapshot` whose harvested content a request under `grants` may read: each whose values are shown
-    (`values_shown`), and whose lookup-grounded code lists join only tables whose values are shown too. No other
-    object is ever one: a name the snapshot binds to no table cannot be told to be a shown one."""
+    (`values_shown`: granted, and not withheld), and whose lookup-grounded code lists join only tables whose values are
+    shown too, and are joined. No other object is ever one: a name the snapshot binds to no table cannot be told to be
+    a shown one."""
     lookups = _lookup_sources(snapshot)
     return frozenset(name for name in _tables(snapshot)
                      if values_shown(grants, name)
@@ -100,19 +103,25 @@ def _shown_tables(snapshot: Snapshot, grants: GrantSet) -> frozenset[str]:
 def values_scoped(snapshot: Snapshot, grants: GrantSet) -> Snapshot:
     """`snapshot` as a request under `grants` reads it: each object whose harvested content it may not read (every one
     but `_shown_tables`) with its columns' code lists, code schemes and descriptions taken out, its table facts dropped,
-    and every example reading it dropped. Everything else is the snapshot's own. With nothing withheld, `snapshot`
-    itself; it is never changed."""
-    if not grants.values_withheld and not grants.row_filters:
+    and every example reading it dropped. Everything else is the snapshot's own. A snapshot that harvested no values,
+    and one with nothing to take out, is returned itself; it is never changed."""
+    if not values_harvested(snapshot):
         return snapshot
     shown = _shown_tables(snapshot, grants)
-    columns = [column if column.object_id in shown
+    columns = [column if column.object_id in shown or not _harvested_fields(column)
                else column.model_copy(update={"coded_values": [], "code_scheme": None, "description": None})
                for column in snapshot.columns]
-    return snapshot.model_copy(update={
-        "columns": columns,
-        "table_facts": [facts for facts in snapshot.table_facts if facts.object_id in shown],
-        "examples": [example for example in snapshot.examples if (read := _reads(example)) and read <= shown],
-    })
+    facts = [facts for facts in snapshot.table_facts if facts.object_id in shown]
+    examples = [example for example in snapshot.examples if (read := _reads(example)) and read <= shown]
+    if (all(new is old for new, old in zip(columns, snapshot.columns)) and len(facts) == len(snapshot.table_facts)
+            and len(examples) == len(snapshot.examples)):
+        return snapshot
+    return snapshot.model_copy(update={"columns": columns, "table_facts": facts, "examples": examples})
+
+
+def _harvested_fields(column) -> bool:
+    """Whether `column` carries anything `values_scoped` takes out of a withheld table."""
+    return bool(column.coded_values or column.code_scheme is not None or column.description)
 
 
 class ShownValues:

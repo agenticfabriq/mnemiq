@@ -76,15 +76,17 @@ class GrantSet:
 
 
 def values_shown(grants: GrantSet, object_id: str) -> bool:
-    """Whether a request under `grants` may use the values enrichment harvested from the rows of `object_id`: not
-    where `values_withheld` names it, nor where a row filter of the grants does, since the harvest read every row and
-    the filter keeps some from this identity. Names match ignoring case (`names_one_object`): matching more withholds
-    more, never less.
+    """Whether a request under `grants` may use the values enrichment harvested from the rows of `object_id`: only for
+    an object the grants give the person (by its exact id, as they grant it), and not where `values_withheld` names it,
+    nor where a row filter of the grants does, since the harvest read every row and the filter keeps some from this
+    identity. Withheld and filtered names match ignoring case (`names_one_object`): matching more withholds more, never
+    less.
 
-    The one predicate every reader of harvested values decides by. In Superset mode they are the snapshot a request
-    reads and the value index it reads (`superset.harvested`); direct mode's row filters keep their own handling as
-    well, in the value check, which quotes no value of a filtered table."""
-    return not (names_one_object(object_id, grants.values_withheld) or names_one_object(object_id, grants.row_filters))
+    The one predicate the readers of harvested values decide by: in Superset mode, the snapshot a request reads and the
+    value index it reads (`superset.harvested`). Requiring the grant makes what is shown an object the grants were
+    decided for, never one they know nothing of."""
+    return grants.allows(object_id) and not (names_one_object(object_id, grants.values_withheld)
+                                             or names_one_object(object_id, grants.row_filters))
 
 
 EMPTY = GrantSet(frozenset())

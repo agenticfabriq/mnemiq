@@ -170,28 +170,31 @@ def resolve_grants(adapter: SupersetSqlAdapter, snapshot: Snapshot) -> GrantSet:
 
 def _values_withheld(adapter: SupersetSqlAdapter, snapshot: Snapshot, granted: frozenset[str]) -> frozenset[str]:
     """The objects of `snapshot` whose harvested values a request of the person whose token `adapter` carries may not
-    use: none where the snapshot harvested none, and nothing is asked; else every object it names but each table in
-    `granted` that Superset says no row rule applies to for the person (`SupersetSqlAdapter.table_rules`, by the
-    table's name as Superset shows it, in the configured schema).
+    use: none where the snapshot harvested none, and nothing is asked; else every object it names but each one in
+    `granted` that Superset says no row rule applies to for the person under every name the snapshot binds it to
+    (`SupersetSqlAdapter.table_rules`, each name as Superset shows it, in the configured schema).
 
-    A rule that applies and an answer mnemiq cannot read withhold. A table not granted is not asked, and nor is one
-    whose stored name is not the one Superset reads for the name it shows it by: no answer about that name is about it.
-    Neither is shown. Raises `UnreadableAnswer` when Superset does not answer, as for any question of the grants."""
+    A rule that applies under any of its names, and an answer mnemiq cannot read, withhold it. A table not granted is
+    not asked about; nor is an object bound to anything but a table, or bound under a plain lower-case name. None is
+    shown. Raises `UnreadableAnswer` when Superset does not answer, as for any question of the grants."""
     if not values_harvested(snapshot):
         return frozenset()
-    asked: dict[str, set[str]] = {}
-    for stored, ids in table_bindings(snapshot).items():
-        shown = superset_name(stored)
-        if ids & granted and stored_name(shown) == stored:
-            asked.setdefault(shown, set()).update(ids & granted)
+    bindings: dict[str, list[tuple[str, str]]] = {}
+    for binding in snapshot.source_bindings:
+        bindings.setdefault(binding.object_id, []).append((binding.binding_type, binding.source_object))
+    names: dict[str, list[str]] = {}
+    for object_id, bound in bindings.items():
+        if object_id in granted and all(kind == "table" and stored_name(superset_name(stored)) == stored
+                                        for kind, stored in bound):
+            names[object_id] = [superset_name(stored) for _, stored in bound]
     free: set[str] = set()
-    if asked:
+    if names:
         try:
-            rules = adapter.table_rules(list(asked))
+            rules = adapter.table_rules(list(dict.fromkeys(name for named in names.values() for name in named)))
         except SupersetUnavailable as exc:
             logger.warning("Superset's row rules got no answer (%s: %s); granting nothing", exc, exc.detail)
             raise UnreadableAnswer from exc
-        free = {object_id for name, ids in asked.items() if rules.get(name) is False for object_id in ids}
+        free = {object_id for object_id, named in names.items() if all(rules.get(name) is False for name in named)}
         logger.info("harvested values: %d of %d granted tables shown, where Superset says no row rule applies to this "
                     "user", len(free), len(granted))
     return snapshot_objects(snapshot) - free

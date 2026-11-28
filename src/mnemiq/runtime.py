@@ -333,13 +333,21 @@ class Runtime:
             grants=grants,
         )
 
-    def _served(self, grants: GrantSet) -> Snapshot | None:
-        """The snapshot a request under `grants` reads, every reader of it handed this one: in Superset mode the served
-        snapshot with what the request may not use of the values enrichment harvested taken out (`values_scoped`),
-        and elsewhere the served snapshot itself. Read once the snapshot is reloaded, so it is the one served now."""
-        if self._superset_mode and self.snapshot is not None:
-            return values_scoped(self.snapshot, grants)
+    def _reloaded(self) -> Snapshot | None:
+        """The snapshot a request reads, read once, after the reload: an answer's or the schema's grants, value index
+        and scoping are all handed this one reference (asks, `scope` and `schema`). The reload is not serialised and
+        resolving the grants waits on Superset, so a snapshot swapped in by another request meanwhile is never read by
+        such a request: its grants were decided for this snapshot alone."""
+        self.reload_if_stale()
         return self.snapshot
+
+    def _served(self, grants: GrantSet, snapshot: Snapshot | None) -> Snapshot | None:
+        """`snapshot`, the request's (`_reloaded`), as a request under `grants` reads it, every reader of it handed
+        this one: in Superset mode with what the request may not use of the values enrichment harvested taken out
+        (`values_scoped`), and elsewhere `snapshot` itself."""
+        if self._superset_mode and snapshot is not None:
+            return values_scoped(snapshot, grants)
+        return snapshot
 
     def search(self, question: str, identity: IdentityContext, profile: str | None = None) -> SearchResult:
         """What `ask` would put before the model for `question`, without asking it: the tables retrieval ranks, best
@@ -351,8 +359,7 @@ class Runtime:
         name = self.router.route(question, None)
         settings, fitter = (picked.settings, picked.fitter) if picked else (self.settings, self.fitter)
         grants = self.authz.grants_for(identity)
-        self.reload_if_stale()
-        snapshot = self._served(grants)
+        snapshot = self._served(grants, self._reloaded())
         packet = self._retrieve(question, identity, self.authz, grants, settings, name, picked, snapshot)
         packet.history = scope_history(None, grants.fingerprint)
         fit = (fitter.measure(packet, snapshot, grants, card_style=self._card_style(name, picked))
@@ -398,16 +405,16 @@ class Runtime:
             if (declined := agent.decline_if_too_long(question)) is not None:
                 return self._record(declined, name, UNAVAILABLE, identity, question, None,
                                     time.perf_counter(), picked)
-            self.reload_if_stale()
+            served = self._reloaded()
             started = time.perf_counter()
             # What this person may read, as Superset decides when asked with their token: resolved once and handed to
             # everything that follows, as direct mode resolves the access policy's grants. On Oracle, once their
             # session is shown to be the snapshot's (`bound`), before anything else of theirs is asked of Superset.
-            grants = self._superset_grants(adapter)
+            grants = self._superset_grants(adapter, served)
             authz = FixedGrants(grants)
             # The value index this request may read: the snapshot's own harvested values of the tables whose values
             # its grants show, and none for a snapshot that harvested none (`served_values`).
-            agent = agent.with_adapter(adapter).with_values(served_values(self.value_index, self.snapshot, grants))
+            agent = agent.with_adapter(adapter).with_values(served_values(self.value_index, served, grants))
         else:
             # ONE resolution per question, handed to everything below (M13). The provider may re-read
             # its policy file per call, so asking twice let retrieval scope the cards against one
@@ -417,11 +424,11 @@ class Runtime:
             if (declined := agent.decline_if_too_long(question)) is not None:
                 return self._record(declined, name, grants, identity, question, None,
                                     time.perf_counter(), picked)
-            self.reload_if_stale()
+            served = self._reloaded()
             started = time.perf_counter()
-        # Every reader of the snapshot below reads this one, which in Superset mode holds only what this request may use
-        # of the values enrichment harvested.
-        snapshot = self._served(grants)
+        # Every reader of the snapshot below reads this one, the request's, which in Superset mode holds only what this
+        # request may use of the values enrichment harvested.
+        snapshot = self._served(grants, served)
         with step(emit, Stage.RETRIEVE, mode=name):
             packet = self._retrieve(question, identity, authz, grants, settings, name, picked, snapshot)
         if superset:
@@ -503,8 +510,8 @@ class Runtime:
     def schema(self, identity: IdentityContext, *, delegation: DelegatedToken | None = None) -> list[dict]:
         """The tables and cards this identity may see, scoped by TABLE and by COLUMN. In Superset mode, what Superset
         says the person whose token `delegation` is may read."""
-        grants = self._grants_for(identity, delegation)
-        return self._cards(grants, self._served(grants))
+        grants, served = self._grants_for(identity, delegation)
+        return self._cards(grants, self._served(grants, served))
 
     def scope(self, identity: IdentityContext, *, delegation: DelegatedToken | None = None) -> dict:
         """Everything an opening screen needs: the cards in scope, and the questions to offer.
@@ -514,24 +521,26 @@ class Runtime:
         describes, which is cheap to avoid here and awkward to detect later. In Superset mode that
         resolution is Superset's, asked with `delegation`, as `schema` asks it.
         """
-        grants = self._grants_for(identity, delegation)
-        snapshot = self._served(grants)
+        grants, served = self._grants_for(identity, delegation)
+        snapshot = self._served(grants, served)
         starters: list[str] = []
         if snapshot is not None:
             starters = compose_starters(snapshot, grants, build_access_policy(snapshot, grants))
         return {"tables": self._cards(grants, snapshot), "starters": starters}
 
-    def _grants_for(self, identity: IdentityContext, delegation: DelegatedToken | None) -> GrantSet:
+    def _grants_for(self, identity: IdentityContext,
+                    delegation: DelegatedToken | None) -> tuple[GrantSet, Snapshot | None]:
         """`identity`'s grants under the access policy, or in Superset mode what Superset says the person whose token
-        `delegation` is may read, asked through an adapter built for this request. Superset mode refuses a request with
-        no token before asking anything, and reloads the snapshot first, as `ask` does there, so that the schema and
-        the answers are read from one snapshot, and a newer one it will not serve refuses both."""
+        `delegation` is may read, asked through an adapter built for this request; and the snapshot they were decided
+        for, the one the request reads. Superset mode refuses a request with no token before asking anything, and
+        reloads the snapshot first, as `ask` does there, so that the schema and the answers are read from one snapshot,
+        and a newer one it will not serve refuses both."""
         if not self._superset_mode:
-            return self.authz.grants_for(identity)
+            return self.authz.grants_for(identity), self.snapshot
         if delegation is None:
             raise SupersetCredentialMissing(_NO_DELEGATION)
-        self.reload_if_stale()
-        return self._superset_grants(superset_executor(self.settings, delegation))
+        served = self._reloaded()
+        return self._superset_grants(superset_executor(self.settings, delegation), served), served
 
     def build_profile(self, profile: str | None, identity: IdentityContext) -> LoadedProfile:
         """The profile a build runs under (the default when None): its planner plans the build, and its settings
@@ -550,10 +559,9 @@ class Runtime:
         read one snapshot, and a newer one Superset mode will not serve refuses both."""
         if not self._superset_mode:
             raise RuntimeError("only Superset mode builds dashboards")
-        self.reload_if_stale()
-        return self._superset_grants(adapter)
+        return self._superset_grants(adapter, self._reloaded())
 
-    def bound(self, adapter) -> str | None:
+    def bound(self, adapter, snapshot: Snapshot | None = None) -> str | None:
         """None when Superset's session for the person whose token `adapter` carries runs their statements as the schema
         the snapshot was read from, on its service; else, when it is not bound, why not, in words for the log. On
         PostgreSQL None, and nothing is asked.
@@ -570,11 +578,14 @@ class Runtime:
         (`BindingUnread`, 503); the database is not Oracle (`SupersetMisconfigured`, 503); Superset does not show the
         person the database (`SupersetDenied`, 403); an answer mnemiq cannot read (`SupersetToolError`, 503); an
         extension without the tool (`ExtensionOutdated`) or none (`ExtensionMissing`). Superset not answering and a
-        refusal of the person raise as themselves."""
+        refusal of the person raise as themselves.
+
+        `snapshot` is the request's (`_reloaded`), the one its grants are decided for; the served one where none is
+        given."""
         if superset_dialect() != "oracle":
             return None
-        job = next((job for job in (self.snapshot.jobs if self.snapshot else []) if job.id == SUPERSET_ORACLE_JOB),
-                   None)
+        snapshot = self.snapshot if snapshot is None else snapshot
+        job = next((job for job in (snapshot.jobs if snapshot else []) if job.id == SUPERSET_ORACLE_JOB), None)
         source = oracle_source(job.detail) if job is not None else None
         if source is None:
             adapter.mark_bound(None)
@@ -592,21 +603,23 @@ class Runtime:
                     f"it as its current schema and reach service {asked[1]!r}, as the snapshot was read")
         raise _binding_ended(answer, asked[0])
 
-    def require_bound(self, adapter) -> None:
-        """Return when `bound` says the session of `adapter`'s person is the snapshot's; else raise
-        `ConnectionNotBound`, why logged. Every door asks it before anything else of the request is asked of Superset:
-        the grants (`_superset_grants`), and a build's confirm before it reads the dashboard."""
-        if (refusal := self.bound(adapter)) is not None:
+    def require_bound(self, adapter, snapshot: Snapshot | None = None) -> None:
+        """Return when `bound` says the session of `adapter`'s person is the snapshot's (`snapshot`, the request's, or
+        the served one where none is given); else raise `ConnectionNotBound`, why logged. Every door asks it before
+        anything else of the request is asked of Superset: the grants (`_superset_grants`), and a build's confirm before
+        it reads the dashboard."""
+        if (refusal := self.bound(adapter, snapshot)) is not None:
             logger.warning("Superset mode answers nothing for this person: %s", refusal)
             raise ConnectionNotBound(refusal)
 
-    def _superset_grants(self, adapter) -> GrantSet:
-        """What Superset says the person whose token `adapter` carries may read: on Oracle once their session is shown
-        bound (`require_bound`; `ConnectionNotBound` otherwise, before anything else of theirs is asked). Raises
-        `GrantsUnreadable` when that could not be read from Superset: every door refuses then, rather than show an
-        empty schema or defer with the access policy's wording, since Superset mode holds no policy."""
-        self.require_bound(adapter)
-        grants = resolve_grants(adapter, self.snapshot)
+    def _superset_grants(self, adapter, snapshot: Snapshot | None) -> GrantSet:
+        """What Superset says the person whose token `adapter` carries may read of `snapshot`, the request's: on Oracle
+        once their session is shown bound (`require_bound`; `ConnectionNotBound` otherwise, before anything else of
+        theirs is asked). Raises `GrantsUnreadable` when that could not be read from Superset: every door refuses then,
+        rather than show an empty schema or defer with the access policy's wording, since Superset mode holds no
+        policy."""
+        self.require_bound(adapter, snapshot)
+        grants = resolve_grants(adapter, snapshot)
         if not grants.available:
             raise GrantsUnreadable()
         return grants
@@ -640,7 +653,7 @@ class Runtime:
         if self._superset_mode:
             raise SupersetReadOnly()
         grants = self.authz.grants_for(identity)
-        snapshot = self._served(grants)
+        snapshot = self._served(grants, self.snapshot)
         visible = visible_schema(snapshot, grants) if snapshot else {}
         policy = build_access_policy(snapshot, grants) if snapshot else AccessPolicy()
         dialect = getattr(self.adapter, "dialect", "duckdb")
