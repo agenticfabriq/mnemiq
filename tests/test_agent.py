@@ -488,7 +488,7 @@ class _FailsOnCall(FakeGenerator):
 
 
 @pytest.mark.parametrize(("replies", "fails_on", "ran"), [
-    # every candidate declines and the single path's writer fails: none had run (Codex, reviewing E72's branch)
+    # every candidate declines and the single path's writer fails: none had run (Codex's review)
     (['{"sql": null, "reason": "cannot"}'] * 3, 4, 0),
     # the second candidate's writer fails after the first ran
     ([_sql("count(*)")], 2, 1),
@@ -516,7 +516,7 @@ def test_the_window_failures_keep_how_many_had_run_too(failure):
 def test_one_model_error_raised_in_two_turns_carries_neither_turns_count_into_the_other():
     """A writer or client may raise one exception object more than once. The count is the turn's, not the
     exception's: a vote cut short after one candidate reports 1, and a later one-candidate turn failing on the same
-    object reports none (Codex, reviewing E72's branch)."""
+    object reports none (Codex's review)."""
     from mnemiq.llm.client import ModelUnavailable
 
     shared = ModelUnavailable("the provider went away", kind="connect")
