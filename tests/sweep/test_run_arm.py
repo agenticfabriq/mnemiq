@@ -473,3 +473,41 @@ def test_a_resume_that_stops_while_writing_the_profile_file_leaves_the_last_one_
     with pytest.raises(OSError, match="stopped here"):
         run_arm(cfg, arm, tuning(cfg), folder)
     assert (folder / "profile.toml").read_text() == whole
+
+
+def test_a_deep_row_records_what_the_vote_did(tmp_path, stub_model):
+    """A sweep of deep mode can say how often its candidates disagreed and how each such answer ended: the row
+    carries the vote from the answer, the candidates run, the winning cluster's share and the judge's part."""
+    judging = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub_model(gold=True), modes=["deep"], judge=judged_by(judging))
+    assert run_arm(cfg, arm, tuning(cfg), arm_folder(cfg, arm, 1)) == "complete"
+    answered = [r for r in read_rows(cfg, arm) if r["outcome"] == "correct"]
+    assert answered, "the gold model answered"
+    for row in answered:
+        assert row["candidates_executed"] == 5 and row["agreement"] == 1.0, row  # every candidate wrote the gold
+        # A clear vote is not put to the judge; the engine then records no override and no fallback.
+        assert row["judge_engaged"] is False and row["judge_override"] is False and row["judge_fell_back"] is None
+
+
+def test_a_one_candidate_row_records_no_vote(tmp_path, stub_model):
+    cfg, arm = one_arm(tmp_path, stub_model(gold=True), modes=["instant"])
+    assert run_arm(cfg, arm, tuning(cfg), arm_folder(cfg, arm, 1)) == "complete"
+    rows = read_rows(cfg, arm)
+    assert rows and all(r["agreement"] is None and r["judge_engaged"] is None for r in rows)
+
+
+def test_a_deep_row_records_a_split_vote(tmp_path, stub_model):
+    """The case a deep sweep is read for: two of five candidates (the decompose strategy's) answer otherwise, so the
+    winning cluster holds three, and the row says so."""
+    import json as _json
+
+    def right_unless_decomposing(request):
+        return "silently decompose the question" not in _json.dumps(request)
+
+    judging = stub_model(gold=True)
+    cfg, arm = one_arm(tmp_path, stub_model(gold_when=right_unless_decomposing), modes=["deep"],
+                       judge=judged_by(judging))
+    assert run_arm(cfg, arm, tuning(cfg), arm_folder(cfg, arm, 1)) == "complete"
+    split = [r for r in read_rows(cfg, arm) if r["candidates_executed"] == 5 and r["agreement"] == 0.6]
+    assert split, sorted({(r["candidates_executed"], r["agreement"]) for r in read_rows(cfg, arm)})
+    assert all(isinstance(r["judge_engaged"], bool) for r in split)
