@@ -249,19 +249,6 @@ def _carry_access(exc: BaseException, narrowed) -> None:
         pass
 
 
-# How many of a vote's candidates had run when a model failure ended the turn, read by `Agent.answer`'s handler
-# into the failure it reports, so the vote's readers can tell a vote cut short from a mode that never voted.
-_VOTED = "_mnemiq_candidates_executed"
-
-
-def _carry_vote(exc: BaseException, ran: int) -> None:
-    """Put how many candidates had run on `exc`; a class the attribute cannot be set on is left as it is."""
-    try:
-        setattr(exc, _VOTED, ran)
-    except Exception:  # noqa: BLE001 -- the record is an aid to the audit, never the failure
-        pass
-
-
 def _stamp(answer: AgentAnswer, verdict) -> AgentAnswer:
     """Carry the verifier's read onto an answer that PASSED it.
 
@@ -382,11 +369,17 @@ class Agent:
         if (declined := self.decline_if_too_long(packet.question)) is not None:
             return declined
         deadline = self.budget.started()
+        # A vote's candidates as they run: this turn's own, so a model failure that ends the vote reports how many had
+        # run, and a one-candidate turn reports none. Held here, not on the exception, which a writer or client may
+        # raise again in another turn (Codex's review).
+        executed: list | None = None
         try:
             if self.candidates <= 1:
                 return self._answer_single(packet, snapshot, grants, identity, deadline, emit)
-            return self._answer_consistent(packet, snapshot, grants, identity, deadline, emit)
+            executed = []
+            return self._answer_consistent(packet, snapshot, grants, identity, deadline, emit, executed)
         except ModelUnavailable as exc:
+            ran = None if executed is None else len(executed)
             # Symmetry with the source-outage path: something happened TO us, so it is a
             # stated failure the caller can act on, never a deferral and never a traceback
             # out of the transport. `failed` is what keeps it out of the deferral rate (M6).
@@ -407,7 +400,7 @@ class Agent:
                     reason_code=DeferralReason.MODEL_UNAVAILABLE,
                     model_error=exc.kind,
                     narrowed=getattr(exc, _ACCESS, None),
-                    candidates_executed=getattr(exc, _VOTED, None),
+                    candidates_executed=ran,
                 )
             if isinstance(exc, ContextTooLong):
                 # Refused rather than cut: the same configuration problem, told the same way.
@@ -424,7 +417,7 @@ class Agent:
                     reason_code=DeferralReason.MODEL_UNAVAILABLE,
                     model_error=exc.kind,
                     narrowed=getattr(exc, _ACCESS, None),
-                    candidates_executed=getattr(exc, _VOTED, None),
+                    candidates_executed=ran,
                 )
             return AgentAnswer(
                 answer=(
@@ -436,7 +429,7 @@ class Agent:
                 reason_code=DeferralReason.MODEL_UNAVAILABLE,
                 model_error=exc.kind,
                 narrowed=getattr(exc, _ACCESS, None),
-                candidates_executed=getattr(exc, _VOTED, None),
+                candidates_executed=ran,
             )
 
     def _answer_single(
@@ -682,27 +675,11 @@ class Agent:
         grants: GrantSet,
         identity: IdentityContext,
         deadline,
-        emit: Emit | None = None,
-    ) -> AgentAnswer:
-        """The vote, whose candidates run into `executed`: a model failure anywhere in it (a later candidate's
-        writer, the single path it falls back to) leaves on its way out how many had run."""
-        executed: list[tuple[Approved, object]] = []
-        try:
-            return self._vote(packet, snapshot, grants, identity, deadline, emit, executed)
-        except ModelUnavailable as exc:
-            _carry_vote(exc, len(executed))
-            raise
-
-    def _vote(
-        self,
-        packet: ContextPacket,
-        snapshot: Snapshot,
-        grants: GrantSet,
-        identity: IdentityContext,
-        deadline,
         emit: Emit | None,
         executed: list,
     ) -> AgentAnswer:
+        """The vote. Its candidates run into `executed`, the turn's own list, which `answer` reads if a model
+        failure ends the vote; it is only ever appended to here."""
         # Generate N candidates across engineered strategies and let execution vote. Each is
         # decided independently; a refusal or deferral just drops that candidate -- EXCEPT an
         # undefined-term deferral, which is a finding about the question rather than about the

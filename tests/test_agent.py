@@ -513,6 +513,29 @@ def test_the_window_failures_keep_how_many_had_run_too(failure):
     assert ans.candidates_executed == 1
 
 
+def test_one_model_error_raised_in_two_turns_carries_neither_turns_count_into_the_other():
+    """A writer or client may raise one exception object more than once. The count is the turn's, not the
+    exception's: a vote cut short after one candidate reports 1, and a later one-candidate turn failing on the same
+    object reports none (Codex, reviewing E72's branch)."""
+    from mnemiq.llm.client import ModelUnavailable
+
+    shared = ModelUnavailable("the provider went away", kind="connect")
+
+    class _Raises(_FailsOnCall):
+        def propose(self, packet, feedback=None, strategy=None):
+            if len(self.calls) + 1 == self._n:
+                self.calls.append(feedback)
+                raise shared
+            return FakeGenerator.propose(self, packet, feedback=feedback, strategy=strategy)
+
+    voting = _vote_agent([], 3)
+    voting.generator = _Raises([_sql("count(*)")], 2)
+    assert _answer(voting).candidates_executed == 1
+    single = _agent([])
+    single.generator = _Raises([], 1)
+    assert _answer(single).candidates_executed is None
+
+
 def test_a_model_failure_in_a_one_candidate_mode_records_no_vote():
     agent = _agent([])
     agent.generator = _FailsOnCall([], 1)
