@@ -177,10 +177,11 @@ def resolve_grants(adapter: SupersetSqlAdapter, snapshot: Snapshot) -> GrantSet:
 
 def _values_withheld(adapter: SupersetSqlAdapter, snapshot: Snapshot, granted: frozenset[str]) -> frozenset[str]:
     """The objects of `snapshot` of which a request of the person whose token `adapter` carries may not show what
-    enrichment read from their rows (their harvested values, and their counts): none where enrichment read no row past
-    the rules (`rows_read`), and nothing is asked; else every object it names but each one in `granted` that Superset
-    says no row rule applies to for the person under every name the snapshot binds it to
-    (`SupersetSqlAdapter.table_rules`, each name as Superset shows it, in the configured schema).
+    enrichment read from their rows (their harvested values, and their counts) or, where no value was harvested, what
+    the model wrote from those counts (`harvested.values_scoped`): none where enrichment read no row past the rules
+    (`rows_read`), and nothing is asked; else every object it names but each one in `granted` that Superset says no
+    row rule applies to for the person under every name the snapshot binds it to (`SupersetSqlAdapter.table_rules`,
+    each name as Superset shows it, in the configured schema).
 
     A rule that applies under any of its names, and an answer mnemiq cannot read, withhold it. A table not granted is
     not asked about; nor is an object bound to anything but a table, or bound under a plain lower-case name. None is

@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 # Column fields hashed only when set, so a snapshot written before they existed keeps its version.
-_HASHED_WHEN_SET = ("estimate", "declared_unique", "comment")
+_HASHED_WHEN_SET = ("estimate", "declared_unique", "comment", "certified_fields")
 # A comment the database holds is cut to this, after the prompt screen (`sanitize`): it rides on cards and prompts.
 COMMENT_LIMIT = 300
 

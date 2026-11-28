@@ -59,6 +59,21 @@
       },
       "Column": {
         "properties": {
+          "certified_fields": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Certified Fields"
+          },
           "code_scheme": {
             "anyOf": [
               {
@@ -877,7 +892,7 @@
     "title": "CertifiedRecord",
     "type": "object"
   },
-  "format_version": "1.7.0",
+  "format_version": "1.8.0",
   "identity_context": {
     "properties": {
       "attributes": {
@@ -1189,6 +1204,21 @@
       },
       "Column": {
         "properties": {
+          "certified_fields": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Certified Fields"
+          },
           "code_scheme": {
             "anyOf": [
               {

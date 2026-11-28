@@ -13,9 +13,13 @@ Superset does not say, asked as the person, no row rule applies to for them (`su
   descriptions, and every example that reads it, whose SQL was written from them and kept because it returned rows. A
   code list grounded from a lookup table carries that table's labels, so a table holding one is shown only while every
   table that column joins is shown, and withheld where no join of it is recorded. What the request shows a person or the
-  model leaves out the table's row, distinct and null counts and its estimates too, harvested values or not. What
-  enrichment read from the database's dictionary or decided for itself stays: names, types, comments and
-  classifications.
+  model leaves out the table's row, distinct and null counts and its estimates too, harvested values or not; and where
+  no value was harvested, the meaning the model wrote from a card carrying those counts: the table's column
+  descriptions, code schemes, table facts and the examples reading it, and every code but those a person certified. A
+  description is kept there only where a certified record stated it, as `apply_certified` marks the column
+  (`Column.certified_fields`); a column that mark does not name it on, or that carries no mark, reads as one whose
+  description the model wrote. What enrichment read from the database's dictionary or decided for itself stays: names,
+  types, comments and classifications.
 - the value index it reads (`ShownValues`): the rows enrichment wrote for the snapshot's own source, of the tables the
   snapshot names whose values are shown. Every other column reads as one the index does not hold, so the value check
   checks nothing on it, and where the answer path asks whether a value exists it asks Superset, as the person, under
@@ -130,8 +134,8 @@ def values_scoped(snapshot: Snapshot, grants: GrantSet, *, shown: bool = False) 
     For a snapshot that harvested no values, the snapshot a request decides with is the served one, and the one it
     shows still leaves out, beside such an object's counts, what the model wrote from a card carrying them: its columns'
     descriptions, its code schemes, its table facts and the examples reading it, and every code but those a person
-    certified (`source` "certified"). A column whose meaning was certified (`certified_refs`) keeps its description,
-    which no model wrote.
+    certified (`source` "certified"). A column keeps its description only where a certified record stated it
+    (`certified_fields` names it), as no model wrote it; a column with no such mark keeps none.
 
     Everything else is the snapshot's own. A snapshot whose rows enrichment did not read past the rules (`rows_read`),
     and one with nothing to take out, is returned itself; it is never changed."""
@@ -141,9 +145,9 @@ def values_scoped(snapshot: Snapshot, grants: GrantSet, *, shown: bool = False) 
     if not (harvested or shown):
         return snapshot
     tables = _shown_tables(snapshot, grants)
-    certified = frozenset(ref.object_id for ref in snapshot.certified_refs if ref.object_type == "column")
     columns = [column if column.object_id in tables
-               else _withheld(column, harvested=harvested, shown=shown, certified=column.id in certified)
+               else _withheld(column, harvested=harvested, shown=shown,
+                              certified="description" in (column.certified_fields or ()))
                for column in snapshot.columns]
     facts = [facts for facts in snapshot.table_facts if facts.object_id in tables]
     examples = [example for example in snapshot.examples if (read := _reads(example)) and read <= tables]
@@ -156,7 +160,7 @@ def values_scoped(snapshot: Snapshot, grants: GrantSet, *, shown: bool = False) 
 def _withheld(column, *, harvested: bool, shown: bool, certified: bool):
     """`column`, of a withheld table, as `values_scoped` leaves it; `column` itself where nothing is taken out. With
     values `harvested`, its code list, code scheme and description; else, in what is `shown`, every code but a
-    certified one, its code scheme, and its description unless the column's meaning was `certified`. In what is
+    certified one, its code scheme, and its description unless a certified record stated it (`certified`). In what is
     `shown`, its counts and estimates too."""
     update: dict = {}
     if harvested:

@@ -30,9 +30,8 @@ from sqlglot import exp
 import mnemiq
 from mnemiq.agent.loop import Agent
 from mnemiq.authz.grants import GrantSet, values_shown
-from mnemiq.contract import CodedValue, Column, IdentityContext, Snapshot
+from mnemiq.contract import CertifiedRecord, CodedValue, Column, IdentityContext, RecordEnvelope, Snapshot
 from mnemiq.contract.semantic import (
-    CertifiedRef,
     CodeScheme,
     ColumnEstimate,
     Example,
@@ -54,6 +53,7 @@ from mnemiq.superset.adapter import SupersetSqlAdapter
 from mnemiq.superset.client import DelegatedToken, SupersetUnavailable
 from mnemiq.superset.extension import TOOL_PREFIX
 from mnemiq.superset.grants import resolve_grants
+from mnemiq.enrichment.certified import CertifiedSet, apply_certified
 from mnemiq.superset.harvested import ShownValues, snapshot_objects, values_harvested, values_scoped
 from tests.superset_fake import (
     FakeSuperset,
@@ -918,11 +918,18 @@ def _unharvested(snapshot: Snapshot | None = None) -> Snapshot:
                 CodedValue(code=HARVESTED[column.object_id]["code"], meaning=HARVESTED[column.object_id]["meaning"],
                            source="correlated")]})
         columns.append(column)
-    regions = [Column(id=f"{t}.REGION", object_id=t, name="REGION", data_type="VARCHAR2(10)",
-                      description=CERTIFIED[t], coded_values=[CodedValue(code="W", meaning="west", source="certified")])
-               for t in (ORDERS, ITEMS)]
-    refs = [CertifiedRef(object_type="column", object_id=f"{t}.REGION", version_hash="h1") for t in (ORDERS, ITEMS)]
-    return base.model_copy(update={"columns": [*columns, *regions], "certified_refs": refs})
+    regions = [Column(id=f"{t}.REGION", object_id=t, name="REGION", data_type="VARCHAR2(10)") for t in (ORDERS, ITEMS)]
+    stated = [_certified(f"{t}.REGION", description=CERTIFIED[t],
+                         coded_values=[CodedValue(code="W", meaning="west")]) for t in (ORDERS, ITEMS)]
+    return apply_certified(base.model_copy(update={"columns": [*columns, *regions]}), stated)
+
+
+def _certified(column_id: str, **stated) -> CertifiedRecord:
+    """A certified record of the column `column_id` stating exactly the fields given."""
+    table, _, name = column_id.partition(".")
+    return CertifiedRecord(envelope=RecordEnvelope(object_type="column", object_id=column_id, version="v1",
+                                                   source_system="verity"),
+                           payload=Column(id=column_id, object_id=table, name=name, **stated))
 
 
 def test_where_no_value_was_harvested_a_withheld_tables_written_meaning_and_counts_are_not_shown():
@@ -946,6 +953,87 @@ def test_where_no_value_was_harvested_a_withheld_tables_written_meaning_and_coun
         assert _column(shown, ITEMS, name) == _column(snapshot, ITEMS, name), name
     assert values_scoped(snapshot, _withholding(ORDERS)) is snapshot
     assert values_scoped(snapshot, _withholding(), shown=True) is snapshot
+
+
+def test_a_certified_record_marks_the_fields_it_states():
+    """`apply_certified` records on the column which meaning fields its record stated, and only those."""
+    snapshot = apply_certified(_unharvested(), [_certified(f"{ORDERS}.STATUS", semantic_type="code")])
+    assert _column(snapshot, ORDERS).certified_fields == ["semantic_type"]
+    assert _column(snapshot, ORDERS, "REGION").certified_fields == ["coded_values", "description"]
+    assert _column(snapshot, ITEMS).certified_fields is None
+    # A level stated as null is no statement (`apply_certified` keeps the column's own): not marked.
+    unset = apply_certified(_unharvested(), [_certified(f"{ITEMS}.STATUS", semantic_type="code", pii_level=None)])
+    assert _column(unset, ITEMS).certified_fields == ["semantic_type"]
+
+
+def test_a_description_a_certified_record_did_not_state_is_withheld_with_the_rest():
+    """A record certifying a ruled column's type alone vouches for no description: the one the model wrote stays out
+    of what is shown, beside the counts. The same record on a free table leaves its description shown."""
+    snapshot = apply_certified(_unharvested(), [_certified(f"{t}.STATUS", semantic_type="code")
+                                                for t in (ORDERS, ITEMS)])
+    shown = values_scoped(snapshot, _withholding(ORDERS), shown=True)
+    assert _column(shown, ORDERS).description is None and _column(shown, ORDERS).row_count is None
+    assert _column(shown, ITEMS).description == HARVESTED[ITEMS]["description"]
+
+
+def test_a_snapshot_without_the_marker_withholds_a_certified_columns_description():
+    """A snapshot written before the marker records no field a record stated: a ruled column's description is withheld
+    though a certified reference names the column."""
+    marked = _unharvested()
+    unmarked = marked.model_copy(update={"columns": [column.model_copy(update={"certified_fields": None})
+                                                      for column in marked.columns]})
+    assert any(ref.object_id == f"{ORDERS}.REGION" for ref in unmarked.certified_refs)
+    shown = values_scoped(unmarked, _withholding(ORDERS), shown=True)
+    assert _column(shown, ORDERS, "REGION").description is None
+    assert _column(shown, ITEMS, "REGION").description == CERTIFIED[ITEMS]
+
+
+def test_a_later_run_laying_a_record_without_a_description_withholds_the_earlier_runs():
+    """`enrich --add`: an earlier run's model-written description is kept by the merge, and a record certified since,
+    stating the column's type alone, is laid over the merged snapshot again: the description is still the model's, so
+    a ruled table's stays out of what is shown."""
+    from mnemiq.enrichment.accumulate import merge_run, reapply_overlays
+
+    earlier = _unharvested()
+    run = earlier.model_copy(update={
+        "columns": [c for c in earlier.columns if c.object_id == ITEMS],
+        "source_bindings": [b for b in earlier.source_bindings if b.object_id == ITEMS],
+        "table_facts": [], "examples": []})
+    merged, _ = merge_run(earlier, run)
+    laid = reapply_overlays(merged, CertifiedSet(records=[_certified(f"{ORDERS}.STATUS", semantic_type="code")]),
+                            None)
+    assert _column(laid, ORDERS).description == HARVESTED[ORDERS]["description"]  # kept, and the model's
+    assert any(ref.object_id == f"{ORDERS}.STATUS" for ref in laid.certified_refs)
+    shown = values_scoped(laid, _withholding(ORDERS), shown=True)
+    assert _column(shown, ORDERS).description is None
+
+
+def test_a_snapshot_written_without_the_marker_keeps_its_version():
+    """The marker is hashed only where set: a snapshot no record marked keeps the version it had."""
+    from mnemiq.enrichment.pipeline import content_version
+
+    assert content_version(_harvested_snapshot()) == "adac94bece37"
+    marked = _harvested_snapshot().model_copy(update={"columns": [
+        c.model_copy(update={"certified_fields": ["description"]}) if c.id == f"{ORDERS}.STATUS" else c
+        for c in _harvested_snapshot().columns]})
+    assert content_version(marked) != "adac94bece37"
+
+
+def test_a_ruled_columns_description_no_record_stated_reaches_no_card_or_prompt(tmp_path, served, answered):
+    """End to end, values not harvested, a rule on ORDERS, and a record certifying each table's status type alone:
+    neither the schema nor the writer's prompt carries ORDERS' model-written description; ITEMS' carry its own."""
+    fake, model = served
+    RuledSuperset(fake, {SHOWN[ORDERS]})
+    snapshot = apply_certified(_unharvested(), [_certified(f"{t}.STATUS", semantic_type="code")
+                                                for t in (ORDERS, ITEMS)])
+    runtime = _deployment(tmp_path, served, snapshot)
+    cards = {card["object_id"]: card["card"] for card in _scope(runtime)["tables"]}
+    _ask(runtime)
+    [request] = [r for r in model.requests if "QUESTION:" in json.dumps(r)][:1]
+    prompt = request["messages"][-1]["content"]
+    for orders, items in ((cards[ORDERS], cards[ITEMS]), (_card_of(prompt, ORDERS), _card_of(prompt, ITEMS))):
+        assert HARVESTED[ORDERS]["description"] not in orders and CERTIFIED[ORDERS] in orders
+        assert HARVESTED[ITEMS]["description"] in items
 
 
 def test_where_values_were_harvested_a_withheld_tables_certified_meaning_is_withheld_too():

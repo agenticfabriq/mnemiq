@@ -531,9 +531,9 @@ def test_on_oracle_a_place_superset_would_not_wrap_under_a_rule_on_every_table_i
 
 @pytest.mark.parametrize("door", ["ask", "made dataset"])
 def test_on_oracle_a_text_superset_would_read_as_a_template_never_reaches_execute_sql(superset_oracle, door):
-    """A text the database's own template processor reads as more than text, with delimiters of its own (here
-    `<<...>>`, inside a comment, which the fixed markers do not catch): `tables_read` answers it unreadable, and
-    nothing reaches `execute_sql`, neither the dry run nor the real call, so Superset never renders it."""
+    """On Oracle, `tables_read` answers unreadable a text its database's template processor would not read as plain
+    text (here a comment holding the processor's own delimiters), and nothing reaches `execute_sql`, neither the dry
+    run nor the real call, so Superset never renders it."""
     sent = 'SELECT o.id FROM orders "O" /* << side_effect() >> */'
 
     def read(request):
