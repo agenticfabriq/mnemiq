@@ -20,6 +20,7 @@ from mnemiq.sql.decide import decide
 from mnemiq.sql.decide_write import decide_write
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Refusal, RefusalCode
+from tests.stored_names import as_stored, keyed
 
 SCHEMA = {"claim": {"amount"}, "scratch": {"amount"}}
 FILTERED = AccessPolicy(row_filters={"claim": "amount > 10"}, policy_schema=SCHEMA)
@@ -42,8 +43,13 @@ def test_a_governed_cte_decided_for_an_unmodelled_engine_is_refused(target):
 
 @pytest.mark.parametrize("target", ["duckdb", "oracle"])
 def test_the_engines_the_rule_holds_for_are_decided_as_before(target):
-    verdict = _read(FORWARD, target)
-    assert getattr(verdict, "code", None) is not RefusalCode.POLICY_TARGET_UNSUPPORTED
+    """Decided, not only spared POLICY_TARGET_UNSUPPORTED: spelled as the engine stores the tables (M223),
+    since on oracle a lowercase claim names another table, and the UNKNOWN_TABLE that came back passed a
+    check for any code but that one (Codex, reviewing M285)."""
+    schema = keyed(SCHEMA, target, "claim", "scratch")
+    policy = AccessPolicy(row_filters=keyed({"claim": "amount > 10"}, target, "claim"), policy_schema=schema)
+    verdict = decide(as_stored(FORWARD, target, "claim"), schema, dialect=target, target=target, policy=policy)
+    assert not isinstance(verdict, Refusal), verdict
 
 
 def test_a_statement_naming_no_cte_binds_the_same_everywhere_and_is_decided():
@@ -67,6 +73,35 @@ def test_the_write_decider_refuses_it_too():
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.POLICY_TARGET_UNSUPPORTED
 
 
+# The shapes where Oracle's binding of a CTE name is known to differ from the rule's, by the error Oracle gives,
+# and the control. Written with the table as Oracle stores it unquoted: the deciders decide a reference only where
+# it is spelled as the table is listed (M223), so a lowercase key and spelling refused every statement, the control
+# included, and the live test below failed for a month unseen (M285).
+M150_CASES = {
+    "ORA-32031": "WITH foo AS (SELECT amount FROM m150_claim), m150_claim (amount) AS "
+                 "(SELECT 1 UNION ALL SELECT 40) SELECT amount FROM foo",
+    "ORA-32042": "WITH m150_claim (amount) AS (SELECT 1 UNION ALL SELECT amount + 1 "
+                 "FROM m150_claim WHERE amount < 3) SELECT amount FROM m150_claim",
+}
+M150_CONTROL = "WITH foo AS (SELECT amount FROM m150_claim) SELECT amount FROM foo"
+
+
+def _decide_on_oracle(sql: str):
+    schema = keyed({"m150_claim": {"amount"}}, "oracle", "m150_claim")
+    policy = AccessPolicy(row_filters=keyed({"m150_claim": "amount > 10"}, "oracle", "m150_claim"),
+                          policy_schema=schema)
+    return decide(as_stored(sql, "oracle", "m150_claim"), schema, dialect="oracle", target="oracle", policy=policy)
+
+
+def test_both_oracle_shapes_and_the_control_reach_oracle_under_the_row_filter():
+    """The decider's half of the live test below, which CI cannot run: nothing here stops them, so what
+    Oracle does with them is Oracle's to say."""
+    for sql in (*M150_CASES.values(), M150_CONTROL):
+        verdict = _decide_on_oracle(sql)
+        assert not isinstance(verdict, Refusal), (sql, verdict)
+        assert "amount > 10" in verdict.target_sql, "the row filter applied"
+
+
 ORACLE_DSN = os.environ.get("MNEMIQ_ORACLE_TEST_DSN")
 
 
@@ -87,26 +122,18 @@ def test_oracle_rejects_a_forward_reference_and_a_rewritten_self_reference():
             cur.execute("DROP TABLE m150_claim PURGE")
         except oracledb.DatabaseError:
             pass
-        schema = {"m150_claim": {"amount"}}
-        policy = AccessPolicy(row_filters={"m150_claim": "amount > 10"}, policy_schema=schema)
         cur.execute("CREATE TABLE m150_claim (amount NUMBER)")
         try:
             cur.execute("INSERT INTO m150_claim VALUES (5)")
             cur.execute("INSERT INTO m150_claim VALUES (20)")
-            cases = {
-                "ORA-32031": "WITH foo AS (SELECT amount FROM m150_claim), m150_claim (amount) AS "
-                             "(SELECT 1 UNION ALL SELECT 40) SELECT amount FROM foo",
-                "ORA-32042": "WITH m150_claim (amount) AS (SELECT 1 UNION ALL SELECT amount + 1 "
-                             "FROM m150_claim WHERE amount < 3) SELECT amount FROM m150_claim",
-            }
-            for error, sql in cases.items():
-                verdict = decide(sql, schema, dialect="oracle", target="oracle", policy=policy)
+            for error, sql in M150_CASES.items():
+                verdict = _decide_on_oracle(sql)
                 assert not isinstance(verdict, Refusal), (sql, verdict)
                 with pytest.raises(oracledb.DatabaseError, match=error):
                     cur.execute(verdict.target_sql)
             # The control: with no CTE named like the table, the policy applies and rows come back.
-            verdict = decide("WITH foo AS (SELECT amount FROM m150_claim) SELECT amount FROM foo",
-                             schema, dialect="oracle", target="oracle", policy=policy)
+            verdict = _decide_on_oracle(M150_CONTROL)
+            assert not isinstance(verdict, Refusal), verdict
             cur.execute(verdict.target_sql)
             assert [r[0] for r in cur.fetchall()] == [20]
         finally:
