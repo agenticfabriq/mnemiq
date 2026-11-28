@@ -98,7 +98,7 @@ _INTENT_KEYS = ("key", "kind", "name", "dataset_id")
 REASONS = frozenset({"not_editor", "not_found", "claimed_by_another", "extension_refused", "not_saved", "too_large",
                      "candidates", "not_made", "dataset_exists", "layout_unreadable", "kept_changing",
                      "measure_conflict", "tool_error", "abandoned", "unreadable", "busy", "superset_silent",
-                     "lease_passed"})
+                     "lease_passed", "statement_refused"})
 
 DEFAULT_LEASE_S = 600  # longer than any one Superset call's deadline
 # How long a build may go untouched (every claim, renewal and finish touches it), no claim of it holding, before

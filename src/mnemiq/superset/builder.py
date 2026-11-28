@@ -68,6 +68,7 @@ from mnemiq.superset.extension import call_tool, dashboard_editorship
 from mnemiq.superset.layout import layout_chart_ids, layout_positions
 from mnemiq.superset.marker import format_marker
 from mnemiq.superset.measures import Measure
+from mnemiq.superset.names import RefusedStatement, UnreadableStatement, for_superset, superset_name
 from mnemiq.superset.planner import SCALAR, BuildPlan, PlannedDataset, plan_from_json, plan_to_json, with_made_datasets
 from mnemiq.superset.saved_metrics import SavedMetric, read_saved_metrics, same_definition
 
@@ -106,6 +107,7 @@ _REASON_SAID = {
     "busy": "Superset was busy with an object of the step",
     "superset_silent": "Superset did not answer a call of the step in time",
     "lease_passed": "the step ran past its lease",
+    "statement_refused": "mnemiq did not send the SQL of a dataset the build makes",
 }
 
 
@@ -330,8 +332,9 @@ class _Run:
         return {step.object_id for step in self.build.steps if step.kind == "dataset" and step.object_id is not None}
 
     def made_virtual_sql(self) -> dict[int, str]:
-        """Each virtual dataset this build made, by its id, with the SQL its step sent to `create_dataset`: what the
-        check needs to read one with mnemiq's own SQL (`check_chart`'s `made`)."""
+        """Each virtual dataset this build made, by its id, with the SQL the plan decided for it, which its step sent to
+        `create_dataset` in Superset's spelling (`for_superset`): what the check needs to read one with mnemiq's own SQL
+        (`check_chart`'s `made`)."""
         sent = {planned.key: planned.sql for planned in self.plan.datasets if planned.virtual and planned.sql}
         return {step.object_id: sent[step.key] for step in self.build.steps
                 if step.kind == "dataset" and step.object_id is not None and step.key in sent}
@@ -425,10 +428,11 @@ def _chart_spec(plan: BuildPlan, key: str) -> ChartSpec:
 
 
 def _dataset_name(build: StoredBuild, planned: PlannedDataset) -> str:
-    """A physical dataset is named as its table is stored; a virtual one by the plan, then its build's id, so two
-    builds that join the same tables make two datasets of two names."""
+    """A physical dataset is named as Superset names its table (`superset_name`: on Oracle `orders` for a stored
+    ORDERS, as Superset lists the table and as the statements mnemiq sends name it); a virtual one by the plan, then its
+    build's id, so two builds that join the same tables make two datasets of two names."""
     if not planned.virtual:
-        return planned.table_name
+        return superset_name(planned.table_name)
     suffix = build.build_id[:_BUILD_SUFFIX]
     return f"{planned.name[:_DATASET_NAME_MAX - len(suffix) - 1]}_{suffix}"
 
@@ -595,13 +599,22 @@ def _layout_of(answer: Mapping) -> dict:
 
 def _run_dataset(run: _Run) -> _Outcome:
     """The dataset the plan makes: over its table, or, for a virtual one, over its SQL, named for the build; its
-    editors set by the same create."""
+    editors set by the same create. The SQL is sent with each table named as Superset names it (`for_superset`), as
+    Superset applies the row rules of a virtual dataset's tables to every query of it; SQL `for_superset` does not send
+    fails the step with mnemiq's reason (`statement_refused`), before any call."""
     build, planned, adapter = run.build, _planned(run.plan, run.key), run.adapter
     name, dashboard_id = _dataset_name(build, planned), build.dashboard_id
     request = {"database_id": adapter.database_id, "schema": adapter.schema, "table_name": name,
                "dashboard_id": dashboard_id, "marker": _marker(build, planned.key, dashboard_id)}
     if planned.virtual:
-        request.update(sql=planned.sql, description=f"Made by mnemiq for dashboard {dashboard_id}.")
+        try:
+            sql = for_superset(planned.sql)
+        except RefusedStatement as exc:
+            raise _Stop("statement_refused", f"the dataset {name!r} was not made: {exc}") from None
+        except UnreadableStatement as exc:
+            raise _Stop("statement_refused", f"mnemiq could not read the SQL of the dataset {name!r} to name its "
+                                             f"tables as Superset does ({exc}), so it was not sent") from None
+        request.update(sql=sql, description=f"Made by mnemiq for dashboard {dashboard_id}.")
     made = _created(run, "create_dataset", request, made="dataset_id", what=f"the dataset {name!r}",
                     exists=f"Superset already has a dataset named {name!r} on this schema, which this builder cannot "
                            "use; the build uses only datasets it can read or makes")

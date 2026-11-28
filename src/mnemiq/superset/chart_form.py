@@ -20,6 +20,7 @@ from sqlglot.errors import SqlglotError
 from mnemiq.superset.adapter import JINJA_DELIMITERS
 from mnemiq.superset.charts import Filter, not_null_condition
 from mnemiq.superset.display_format import metric_label
+from mnemiq.superset.names import stored_name
 from mnemiq.superset.settings import superset_dialect
 
 __all__ = ["DatasetFacts", "Expectation", "NotCheckable", "expectation_from_form_data"]
@@ -149,7 +150,10 @@ def _metric_items(viz_type: str, form: dict) -> list:
 
 
 def _quoted(name: str) -> str:
-    return exp.to_identifier(name, quoted=True).sql(dialect=superset_dialect())
+    """A name Superset gave (a dataset's table, or a column a chart names), as the SQL mnemiq decides names it: the
+    stored name Superset reads for it (`stored_name`), quoted. On Oracle a dataset `orders` is the table ORDERS, and a
+    column `region` of a dataset that normalizes its columns is REGION, as one that does not names it."""
+    return exp.to_identifier(stored_name(name), quoted=True).sql(dialect=superset_dialect())
 
 
 def grain_expressions() -> dict[str, str]:

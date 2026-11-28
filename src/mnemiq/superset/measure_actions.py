@@ -68,6 +68,7 @@ from mnemiq.superset.history import run_decided
 from mnemiq.superset.layout import layout_chart_ids, layout_without
 from mnemiq.superset.measures import Measure, MeasureKind, MeasureRefused, check_measure, display_format, \
     measure_statement, scales_by_100
+from mnemiq.superset.names import UnreadableStatement, from_superset
 from mnemiq.superset.saved_metrics import read_saved_metrics
 from mnemiq.sql.verdict import Refusal
 
@@ -546,7 +547,12 @@ def _source(asking: Asking, row, facts) -> str:
         if row.measure.dataset_id not in row.made_dataset_ids or not facts.sql:
             raise ActionRefused("The measure's dataset is virtual and not one mnemiq made for this dashboard, so "
                                 "mnemiq cannot check a new definition on it; nothing was changed.")
-        return f'({facts.sql}) AS "virtual_table"'
+        # Superset holds the SQL in its own spelling, as the build sent it; the deciders read each table as stored.
+        try:
+            return f'({from_superset(facts.sql)}) AS "virtual_table"'
+        except UnreadableStatement:
+            raise ActionRefused("mnemiq could not read the SQL of the measure's dataset, so it cannot check a new "
+                                "definition on it; nothing was changed.") from None
     return _quoted(facts.table)
 
 

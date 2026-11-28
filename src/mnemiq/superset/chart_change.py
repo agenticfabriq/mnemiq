@@ -46,6 +46,7 @@ from mnemiq.superset.charts import Family, Filter, _adhoc_filter
 from mnemiq.superset.dashboard_charts import _OPERATOR, datasets_built_on
 from mnemiq.superset.display_format import metric_label
 from mnemiq.superset.extension import call_tool
+from mnemiq.superset.names import stored_name
 from mnemiq.superset.planner import SCALAR
 from mnemiq.superset.measure_actions import (
     Asking,
@@ -144,9 +145,11 @@ def _family(viz_type: str) -> Family | None:
 
 
 def _table_columns(asking: Asking, facts) -> list[str]:
+    """The columns of a physical dataset's table the person may read, as the snapshot names them: the table Superset
+    reads for the dataset's name (`stored_name`)."""
     if not isinstance(facts, DatasetFacts) or facts.is_virtual or not facts.table:
         return []
-    return sorted(visible_schema(asking.snapshot, asking.grants).get(facts.table, set()))
+    return sorted(visible_schema(asking.snapshot, asking.grants).get(stored_name(facts.table), set()))
 
 
 def _chart_summary(read: ChartRead, facts) -> dict:
@@ -154,7 +157,8 @@ def _chart_summary(read: ChartRead, facts) -> dict:
     summary = {"id": read.chart_id, "title": read.title, "type": (_family(read.viz_type).name.lower()
                                                                  if _family(read.viz_type) else read.viz_type)}
     if isinstance(facts, DatasetFacts):
-        summary["table"] = facts.table if not facts.is_virtual else None
+        # In the snapshot's spelling, as the columns shown beside it are (`_table_columns`).
+        summary["table"] = stored_name(facts.table) if not facts.is_virtual and facts.table is not None else None
         expectation = expectation_from_form_data(form, dataset=facts) if form else None
         if expectation is not None and not isinstance(expectation, NotCheckable):
             summary["measures"] = [label for label, _ in expectation.metrics]

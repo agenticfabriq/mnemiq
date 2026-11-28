@@ -2,12 +2,14 @@
 use as they use any other.
 
 Every statement runs as the person whose token the client carries, so Superset's permissions and row rules decide what
-it reads. For a data statement the adapter sends the database, the schema, the statement and a time limit, and nothing
-else: no `limit`, which Superset would put in place of the statement's own LIMIT, except to ask again, below that LIMIT,
-for an answer refused as larger than one response (`execute_answer`); no `template_params`; and, on the ask
-path, nothing that asks Superset to skip its result cache, which keys a result on the statement after its row rules are
-applied and is consulted only once access is checked. The adapter enrichment reads through is built to send
-`force_refresh` with every statement instead, since a re-enrich is meant to read the source as it is now.
+it reads. Every statement is sent with each table it reads named as Superset names it (`names.for_superset`), which
+Superset's access check and row rules match on. For a data statement the adapter sends the database, the schema, the
+statement and a time limit, and nothing else: no `limit`, which Superset would put in place of the statement's own
+LIMIT, except to ask again, below that LIMIT, for an answer refused as larger than one response (`execute_answer`); no
+`template_params`; and, on the ask path, nothing that asks Superset to skip its result cache, which keys a result on
+the statement after its row rules are applied and is consulted only once access is checked. The adapter enrichment
+reads through is built to send `force_refresh` with every statement instead, since a re-enrich is meant to read the
+source as it is now.
 
 The source's catalogue is read the same way, from Postgres's `pg_catalog` (`mnemiq.superset.pg_catalog`), each part of
 it once per adapter, and each statement with `force_refresh`, so Superset runs it afresh rather than answer from its
@@ -46,6 +48,7 @@ from mnemiq.superset.payload import (
     read_execute_prefix,
     read_execute_response,
 )
+from mnemiq.superset.names import RefusedStatement, UnreadableStatement, for_superset
 from mnemiq.superset.pg_catalog import PostgresCatalogue
 from mnemiq.superset.settings import superset_dialect
 
@@ -140,7 +143,8 @@ class SupersetSqlAdapter:
 
     @property
     def schema(self) -> str:
-        """The schema every statement runs in, spelled as Postgres stores it."""
+        """The schema every statement runs in, as Superset names it and its datasets record it: as stored on
+        PostgreSQL, and on Oracle in SQLAlchemy's spelling (`shop` for a stored SHOP, `names.superset_name`)."""
         return self._schema
 
     def execute_arrow(self, sql: str, timeout_s: float | None = None) -> pa.Table:
@@ -321,10 +325,17 @@ class SupersetSqlAdapter:
 
     def _execute_sql(self, sql: str, timeout_s: float | None, *, dry_run: bool = False,
                      force_refresh: bool = False, row_limit: int | None = None) -> dict:
-        for delimiter in JINJA_DELIMITERS:
-            if delimiter in sql:
-                raise SupersetQueryFailed(f"the statement holds {delimiter}, which Superset reads as a template "
-                                          f"marker, so it was not sent; write the statement without {delimiter}")
+        _refuse_template_markers(sql)
+        try:
+            # Each table as Superset names it, and sent only when Superset reads the tables mnemiq reads (`names`).
+            sql = for_superset(sql)
+        except RefusedStatement as exc:
+            raise SupersetQueryFailed(str(exc)) from exc
+        except UnreadableStatement as exc:
+            raise SupersetQueryFailed(f"mnemiq could not read the statement to name its tables as Superset does "
+                                      f"({exc}), so it was not sent; send one SELECT") from exc
+        # The text Superset renders as a template is the text sent: checked again as it is sent.
+        _refuse_template_markers(sql)
         limit = _superset_timeout(self._timeout_s if timeout_s is None else timeout_s)
         request = {"database_id": self._database_id, "sql": sql, "schema": self._schema, "timeout": limit}
         if dry_run:
@@ -345,6 +356,14 @@ class SupersetSqlAdapter:
             if kept is None or (isinstance(exc, SupersetRefusedCaller) and not isinstance(kept, SupersetRefusedCaller)):
                 self._terminal_refusal = exc
             raise
+
+
+def _refuse_template_markers(sql: str) -> None:
+    """Raise `SupersetQueryFailed` for a statement holding a marker `execute_sql` renders as a template."""
+    for delimiter in JINJA_DELIMITERS:
+        if delimiter in sql:
+            raise SupersetQueryFailed(f"the statement holds {delimiter}, which Superset reads as a template "
+                                      f"marker, so it was not sent; write the statement without {delimiter}")
 
 
 def _refused_size(refused: SupersetResponseTooLarge) -> tuple[int, int] | None:

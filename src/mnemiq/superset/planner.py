@@ -86,6 +86,7 @@ from mnemiq.superset.literals import NEGATED_OPERATORS, Absent, Probes, absent_l
 from mnemiq.superset.marker import format_marker
 from mnemiq.superset.measures import MAX_LABEL, Measure, MeasureKind, MeasureRefused, check_measure, scales_by_100, \
     superset_text_problem
+from mnemiq.superset.names import UnreadableStatement, from_superset, stored_name
 from mnemiq.superset.plan_rows import Link, Refusal, Types, Unique, aggregated, base_among, base_of, chain, column_of, \
     column_text, edges, far_side, join_text, links_of, mistyped, qualified, qualify, read_join, rewrite
 from mnemiq.superset.saved_metrics import Carried, SavedMetric, carry, read_saved_metrics, reusable, same_definition
@@ -187,7 +188,9 @@ PLAN_CUT = ("No plan was made: the goal and what this builder can see (the table
 class PlannedDataset:
     """A dataset the build makes. Physical, on `table` (the snapshot's table, as the model and the deciders name it), or
     virtual, on `join` (an unparenthesized join, as `check_measure` takes one). The plan check fills in what the build
-    sends: a physical dataset's `table_name` (as Superset stores the table), a virtual one's `sql` and `name`."""
+    sends: a physical dataset's `table_name` (as the database stores the table, which the build names the dataset by
+    in Superset's spelling), a virtual one's `sql` (as decided, which the build sends in Superset's spelling) and
+    `name`."""
 
     key: str
     placeholder: int
@@ -933,14 +936,14 @@ class _Catalogue:
 
 def _datasets_by_table(listed: Sequence[ListedDataset], adapter, stored: dict[str, str]) -> dict[str, int]:
     """Each visible table's physical dataset on the configured database and schema, of those `read_datasets` listed:
-    the first by id of those named exactly as the table is stored. rc2 reads a physical dataset FROM
-    `table(self.table_name, schema=self.schema)` (`SqlaTable.get_sqla_table` in `superset/connectors/sqla/models.py`),
-    which SQLAlchemy quotes when the name is not all lower case, so a dataset `Party` reads `"Party"`, never a stored
-    `party`."""
+    the first by id of those whose name reads the table as it is stored (`stored_name`). rc2 reads a physical dataset
+    FROM `table(self.table_name, schema=self.schema)` (`SqlaTable.get_sqla_table` in
+    `superset/connectors/sqla/models.py`), which SQLAlchemy quotes when the name is not all lower case, so on PostgreSQL
+    a dataset `Party` reads `"Party"`, never a stored `party`, and on Oracle a dataset `orders` reads ORDERS."""
     physical = [d for d in listed if d.database_id == adapter.database_id and d.schema == adapter.schema and not d.sql]
     found: dict[str, int] = {}
     for table, name in stored.items():
-        named = [d.id for d in physical if d.table_name == name]
+        named = [d.id for d in physical if stored_name(d.table_name) == name]
         if named:
             found[table] = min(named)
     return found
@@ -2091,14 +2094,22 @@ def _readable_kept(kept: Sequence[Measure], catalogue: _Catalogue, adapter, clie
 
 def _source_for_builder(facts: DatasetFacts | NotCheckable, adapter, stored: set[str]) -> str | None:
     """A dataset, as Superset answered it to the builder, as the FROM of a statement over it (as Superset reads it:
-    a table, or `(<its SQL>) AS "virtual_table"`), or None where it is not on the deployment's database and schema, or
-    is a physical one over a table the builder's catalogue does not hold."""
+    a table, or `(<its SQL>) AS "virtual_table"`), or None where it is not on the deployment's database and schema, is
+    a physical one over a table the builder's catalogue does not hold, or a virtual one whose SQL mnemiq cannot read.
+    Each table in the database's spelling, as the deciders read one: a physical dataset's by the stored name Superset
+    reads for it (`stored_name`), a virtual one's as the database reads its SQL (`from_superset`)."""
     if not isinstance(facts, DatasetFacts) or facts.database_id != adapter.database_id \
             or facts.schema != adapter.schema:
         return None
     if not facts.is_virtual:
-        return _quoted(facts.table) if facts.table in stored else None
-    return f'({facts.sql}) AS "virtual_table"' if facts.sql else None
+        table = stored_name(facts.table) if facts.table is not None else None
+        return _quoted(table) if table in stored else None
+    if not facts.sql:
+        return None
+    try:
+        return f'({from_superset(facts.sql)}) AS "virtual_table"'
+    except UnreadableStatement:
+        return None
 
 
 def _too_large(exc: ContextTooLong | PromptCut) -> PlanRefused:

@@ -30,10 +30,12 @@ A virtual dataset is never checked with mnemiq's own SQL, except one this build 
 SQL is still the SQL the build made it with and on which no row rule applies to the builder: a row rule attached to
 the virtual dataset alone applies to queries of that dataset, not to SQL over its tables. Whether one applies is the
 extension's `row_rules`, which asks Superset as the builder and answers only whether; when one does, or mnemiq cannot
-tell, mnemiq's statement is not run. Such a made dataset is read as Superset reads a virtual one,
-`FROM (<its SQL>) AS "virtual_table"`, and on Oracle `FROM (<its SQL>) virtual_table` (`_virtual_source`). Any other
-virtual dataset's saved metric is checked through `query_dataset` (`superset/mcp_service/dataset/tool/query_dataset.py`),
-which takes saved metric names only, and a measure written on the chart is not checked.
+tell, mnemiq's statement is not run. The build sent that SQL in Superset's spelling (`names.for_superset`), which is
+the text Superset must still hold, and the dataset is read with the SQL the build decided, as Superset reads a virtual
+one, `FROM (<its SQL>) AS "virtual_table"`, and on Oracle `FROM (<its SQL>) virtual_table` (`_virtual_source`). Any
+other virtual dataset's saved metric is checked through `query_dataset`
+(`superset/mcp_service/dataset/tool/query_dataset.py`), which takes saved metric names only, and a measure written on
+the chart is not checked.
 
 What the chart's query computes is read from its `form_data` by `chart_form.py`; this module reads Superset, runs
 mnemiq's own statement and compares.
@@ -80,6 +82,7 @@ from mnemiq.superset.client import SupersetToolError, SupersetUnavailable
 from mnemiq.superset.extension import row_rule_applies
 from mnemiq.superset.display_format import CANNOT_TELL, Displayed, displayed, fits, metric_label, shows_currency
 from mnemiq.superset.measures import Measure, MeasureKind, measure_statement, run_decided
+from mnemiq.superset.names import RefusedStatement, UnreadableStatement, for_superset
 from mnemiq.superset.saved_metrics import SavedMetric
 from mnemiq.superset.settings import superset_dialect
 
@@ -920,14 +923,21 @@ def _numbers(client, adapter, *, chart_id: int, form: dict, dataset_id: int, sna
     if dataset.is_virtual and dataset.dataset_id in made:
         if not isinstance(dataset.sql, str) or not dataset.sql:
             return not_checked(_SQL_UNSHOWN)
-        if dataset.sql != made[dataset.dataset_id]:
+        # Superset holds the SQL as the build sent it, in Superset's spelling (`for_superset`), and the dataset is read
+        # with the SQL the build decided, which names each table as the deciders read one.
+        try:
+            sent = for_superset(made[dataset.dataset_id])
+        except (RefusedStatement, UnreadableStatement) as exc:
+            return not_checked(f"the chart's dataset is one this build made with SQL mnemiq does not send to Superset "
+                               f"({exc}), so mnemiq does not check it with its own SQL")
+        if dataset.sql != sent:
             return not_checked(_SQL_CHANGED)
         applies = row_rule_applies(client, dataset.dataset_id)
         if applies is None:
             return not_checked(_RULES_UNKNOWN)
         if applies:
             return not_checked(_RULE_APPLIES)
-        source = _virtual_source(dataset.sql)
+        source = _virtual_source(made[dataset.dataset_id])
     own = source is not None or not dataset.is_virtual
     if not own:
         written = [label for label, _ in expectation.metrics if label not in dataset.saved_metric_names]
@@ -1053,8 +1063,9 @@ def check_chart(adapter, *, chart_id: int, dataset_id: int, kinds: dict[str, Mea
     `before_call`, when given, runs before each Superset call the check makes itself, and once before mnemiq's own
     decided statement (whose catalogue reads, probe and run the adapter makes); whatever it raises ends the check.
 
-    `made` holds each virtual dataset the caller's build made, by id, with the SQL it made it with. A virtual dataset is
-    never checked with mnemiq's own SQL, except one in `made` whose SQL is unchanged and on which no row rule applies
+    `made` holds each virtual dataset the caller's build made, by id, with the SQL it decided for it, which it sent in
+    Superset's spelling (`for_superset`). A virtual dataset is never checked with mnemiq's own SQL, except one in
+    `made` whose SQL Superset holds as it was sent and on which no row rule applies
     to the caller (the extension's `row_rules`); when one applies, or mnemiq cannot tell, its statement is not run and
     the chart is not checked."""
     client = adapter.client if before_call is None else _BeforeEachCall(adapter.client, before_call)
