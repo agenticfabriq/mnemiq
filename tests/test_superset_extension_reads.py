@@ -382,7 +382,9 @@ def superset_rules(monkeypatch, *, databases: dict, predicates: dict) -> list:
 
 
 def database(catalog="live"):
-    return SimpleNamespace(id=7, get_default_catalog=lambda: catalog)
+    """A database the caller may see, with its default catalog and its engine's way of applying a row rule."""
+    return SimpleNamespace(id=7, get_default_catalog=lambda: catalog,
+                           db_engine_spec=SimpleNamespace(get_rls_method=lambda: "AS_SUBQUERY"))
 
 
 def test_table_rules_asks_supersets_own_lookup_for_each_table_as_a_statement_reads_it(monkeypatch):
@@ -457,12 +459,55 @@ class ParseFailure(Exception):
     """One of the failures rc2's `process_jinja_sql` raises for a text it cannot read, stood in."""
 
 
+class Statement:
+    """rc2's `SQLStatement`, stood in for `tables_read`: its `parse_predicate`, its `apply_rls` (each call recorded in
+    `asked`, raising `ParseFailure` when `wrap_fails`), and its `.format()`, which answers `ruled`."""
+
+    def __init__(self, asked: list, ruled: str, wrap_fails: bool) -> None:
+        self.asked, self.ruled, self.wrap_fails = asked, ruled, wrap_fails
+
+    def parse_predicate(self, predicate: str):
+        return ("predicate", predicate)
+
+    def apply_rls(self, catalog, schema, predicates, method):
+        self.asked.append(("wrap", catalog, schema, predicates, method))
+        if self.wrap_fails:
+            raise ParseFailure("cannot wrap")
+
+    def format(self):
+        return self.ruled
+
+
+class Node:
+    """A node of the template processor's parse (`jinja2.nodes`), stood in: its children; its type is named as
+    jinja2's is (`node`)."""
+
+    def __init__(self, *children) -> None:
+        self.children = children
+
+    def iter_child_nodes(self):
+        return iter(self.children)
+
+
+def node(kind: str, *children) -> Node:
+    """A stand-in node of jinja2's type `kind`."""
+    return type(kind, (Node,), {})(*children)
+
+
+def plain(sql: str) -> Node:
+    """What a template processor's environment parses a text without template syntax to: the text, as data only."""
+    return node("Template", node("Output", node("TemplateData")))
+
+
 def superset_reading(monkeypatch, *, databases: dict, tables=(), statements: int = 1, unparseable: bool = False,
-                     fails: bool = False) -> list:
+                     fails: bool = False, ruled: str = 'SELECT 1 FROM (SELECT * FROM orders WHERE 1 = 1) "O"',
+                     wrap_fails: bool = False, parse=plain, env: bool = True) -> list:
     """Superset's lookups `tables_read` makes, stood in: `DatabaseDAO.find_by_id` answering the databases the caller
-    may see (`databases`, by id), and rc2's `process_jinja_sql` answering `tables` (rc2 `Table`s, as its access check
-    reads them) for a script of `statements` statements, `unparseable` or not, or raising (`fails`). Every lookup is
-    recorded, in order."""
+    may see (`databases`, by id); the database's template processor (`get_template_processor`), whose environment
+    parses a text as `parse` does (a tree of `Node`s, or an exception), or which has no environment (`env`); and rc2's
+    `process_jinja_sql` answering `tables` (rc2 `Table`s, as its access check reads them) for a script of `statements`
+    statements, `unparseable` or not, or raising (`fails`), each statement wrapping as `Statement` does and rendered
+    as `ruled`. Every lookup is recorded, in order."""
     asked: list = []
 
     def find_by_id(database_id, *args, **options):
@@ -473,12 +518,24 @@ def superset_reading(monkeypatch, *, databases: dict, tables=(), statements: int
         asked.append(("parse", sql, database, template_params))
         if fails:
             raise ParseFailure("unreadable")
-        return SimpleNamespace(tables=set(tables), script=SimpleNamespace(statements=[object()] * statements,
-                                                                         has_unparseable_statement=unparseable))
+        return SimpleNamespace(tables=set(tables), script=SimpleNamespace(
+            statements=[Statement(asked, ruled, wrap_fails) for _ in range(statements)],
+            has_unparseable_statement=unparseable))
+
+    def parsed(sql):
+        asked.append(("template", sql))
+        found = parse(sql)
+        if isinstance(found, Exception):
+            raise found
+        return found
+
+    def get_template_processor(database, *args, **options):
+        return SimpleNamespace(env=SimpleNamespace(parse=parsed)) if env else SimpleNamespace()
 
     modules = {"superset": {}, "superset.daos": {}, "superset.daos.database": {"DatabaseDAO": SimpleNamespace(
         find_by_id=find_by_id)}, "superset.sql": {}, "superset.sql.parse": {"Table": stubs.Table,
                                                                             "process_jinja_sql": process_jinja_sql},
+        "superset.jinja_context": {"get_template_processor": get_template_processor},
         "superset.exceptions": {"SupersetParseError": ParseFailure, "SupersetSecurityException": ParseFailure},
         "jinja2": {}, "jinja2.exceptions": {"TemplateError": ParseFailure}}
     for name, attributes in modules.items():
@@ -492,7 +549,10 @@ def test_tables_read_answers_the_tables_supersets_own_access_check_reads(monkeyp
     """The tables rc2's access check reads in the text (`process_jinja_sql`, as `raise_for_access` reads a statement,
     with the empty template parameters `execute_sql` renders with), each qualified as the executor qualifies a table
     it applies rules to: the request's schema, and the database's default catalog, where the statement names none of
-    its own. Sorted, each once."""
+    its own. Sorted, each once. Beside them, `ruled`: the statement as rc2's own `apply_rls` renders it with the
+    placeholder rule on every one of those tables, by the method the database's engine applies rules by
+    (`get_rls_method`), the catalog and schema the executor passes, then `.format()`: what Superset would run were a
+    rule to apply to every table it reads. No rule of anyone's is read."""
     found = database()
     asked = superset_reading(monkeypatch, databases={7: found},
                              tables=[stubs.Table("orders"), stubs.Table("lines", "shop2"),
@@ -500,10 +560,41 @@ def test_tables_read_answers_the_tables_supersets_own_access_check_reads(monkeyp
     answer = reads.tables_read(READ_REQUEST)
     assert answer == {"tables": [{"catalog": "live", "schema": "public", "table": "orders"},
                                  {"catalog": "live", "schema": "shop2", "table": "lines"},
-                                 {"catalog": "other", "schema": "shop3", "table": "items"}]}
-    assert asked == [("database", 7), ("parse", READ_REQUEST["sql"], found, {})]
-    superset_reading(monkeypatch, databases={7: database(None)}, tables=[stubs.Table("orders")])
-    assert reads.tables_read(READ_REQUEST) == {"tables": [{"catalog": None, "schema": "public", "table": "orders"}]}
+                                 {"catalog": "other", "schema": "shop3", "table": "items"}],
+                      "ruled": 'SELECT 1 FROM (SELECT * FROM orders WHERE 1 = 1) "O"'}
+    placeholder = [("predicate", reads.PLACEHOLDER_RULE)]
+    assert asked == [("database", 7), ("template", READ_REQUEST["sql"]), ("parse", READ_REQUEST["sql"], found, {}),
+                     ("wrap", "live", "public", {stubs.Table("orders", "public", "live"): placeholder,
+                                                 stubs.Table("lines", "shop2", "live"): placeholder,
+                                                 stubs.Table("items", "shop3", "other"): placeholder},
+                      "AS_SUBQUERY")]
+    assert reads.PLACEHOLDER_RULE == "1 = 1"
+    superset_reading(monkeypatch, databases={7: database(None)}, tables=[stubs.Table("orders")], ruled="x")
+    assert reads.tables_read(READ_REQUEST) == {"tables": [{"catalog": None, "schema": "public", "table": "orders"}],
+                                               "ruled": "x"}
+
+
+@pytest.mark.parametrize("parse", [
+    lambda sql: node("Template", node("Output", node("TemplateData"), node("Name"))),
+    lambda sql: node("Template", node("If", node("Const"))),
+    lambda sql: ParseFailure("unexpected end of template"),
+], ids=["an expression", "a statement", "unparsable"])
+def test_tables_read_of_a_text_the_template_processor_reads_as_more_than_text_is_unreadable(monkeypatch, parse):
+    """The database's own template processor (`get_template_processor`, which a deployment's
+    `CUSTOM_TEMPLATE_PROCESSORS` decides, with delimiters of its own) parses the text, never rendering it: anything
+    but text (its `TemplateData` inside an output), or a text it cannot parse, is answered `{"unreadable": true}`,
+    and Superset does not read it."""
+    asked = superset_reading(monkeypatch, databases={7: database()}, tables=[stubs.Table("orders")], parse=parse)
+    assert reads.tables_read(READ_REQUEST) == {"unreadable": True}
+    assert [entry[0] for entry in asked] == ["database", "template"]
+    asked = superset_reading(monkeypatch, databases={7: database()}, tables=[stubs.Table("orders")], env=False)
+    assert reads.tables_read(READ_REQUEST) == {"unreadable": True}
+    assert [entry[0] for entry in asked] == ["database"]
+
+
+def test_tables_read_of_a_text_rc2_cannot_wrap_is_unreadable(monkeypatch):
+    superset_reading(monkeypatch, databases={7: database()}, tables=[stubs.Table("orders")], wrap_fails=True)
+    assert reads.tables_read(READ_REQUEST) == {"unreadable": True}
 
 
 def test_tables_read_of_a_database_the_caller_cannot_see_is_not_found(monkeypatch):
@@ -542,9 +633,19 @@ def test_tables_read_refuses_the_markers_mnemiq_refuses():
 
 
 def test_tables_read_too_large_to_send_says_so(monkeypatch):
+    """Over `MAX_ANSWER_BYTES` by its tables, or by its rendering, the answer is `{"too_large": true}`."""
     superset_reading(monkeypatch, databases={7: database()},
                      tables=[stubs.Table(f"{i:04d}" + "x" * 240) for i in range(200)])
     assert reads.tables_read(READ_REQUEST) == {"too_large": True}
+    superset_reading(monkeypatch, databases={7: database()}, tables=[stubs.Table("orders")],
+                     ruled="x" * reads.MAX_ANSWER_BYTES)
+    assert reads.tables_read(READ_REQUEST) == {"too_large": True}
+
+
+def test_the_client_sizes_tables_read_by_the_tools_own_bound():
+    from mnemiq.superset.extension import TABLES_READ_ANSWER_BYTES
+
+    assert TABLES_READ_ANSWER_BYTES == reads.MAX_ANSWER_BYTES
 
 
 def test_a_bad_tables_read_request_is_answered_not_raised():
@@ -578,31 +679,40 @@ def test_mnemiqs_client_reads_what_tables_read_answers(monkeypatch):
     superset_reading(monkeypatch, databases={7: database()}, tables=[stubs.Table("orders"),
                                                                     stubs.Table("lines", "shop2")])
     client = Reading(reads.tables_read)
-    assert read_by(client, READ_REQUEST["sql"]) == frozenset({("live", "public", "orders"),
-                                                              ("live", "shop2", "lines")})
+    read = read_by(client, READ_REQUEST["sql"])
+    assert read.tables == frozenset({("live", "public", "orders"), ("live", "shop2", "lines")})
+    assert read.ruled == 'SELECT 1 FROM (SELECT * FROM orders WHERE 1 = 1) "O"'
     assert client.calls == [(TOOL_PREFIX + "tables_read", READ_REQUEST)]
-    assert read_by(Reading({"tables": []})) == frozenset()
+    assert read_by(Reading({"tables": [], "ruled": "SELECT 1 FROM dual"})).tables == frozenset()
 
 
 def table(catalog="live", schema="public", name="orders"):
     return {"catalog": catalog, "schema": schema, "table": name}
 
 
+RULED = "SELECT 1 FROM dual"
+
+
 @pytest.mark.parametrize("answer", [
     SupersetToolError("Internal error in extensions.agenticfabriq.mnemiq.tables_read: An unexpected error occurred."),
     {"not_found": "database"}, {"too_large": True}, {"unreadable": True}, {"refused": "request", "field": "sql"},
-    ["not", "an", "object"], {"tables": "orders"}, {"tables": [table(), "orders"]},
-    {"tables": [table(), {"catalog": None, "schema": "public"}]},
-    {"tables": [{**table(), "clause": "x"}]}, {"tables": [table(name="")]}, {"tables": [table(name=3)]},
-    {"tables": [table(schema=7)]}, {"tables": [table(catalog=False)]},
-    {"tables": [table()], "_response_truncated": True}, {"tables": [table()], "more": True},
+    ["not", "an", "object"], {"tables": "orders", "ruled": RULED}, {"tables": [table(), "orders"], "ruled": RULED},
+    {"tables": [table(), {"catalog": None, "schema": "public"}], "ruled": RULED},
+    {"tables": [{**table(), "clause": "x"}], "ruled": RULED}, {"tables": [table(name="")], "ruled": RULED},
+    {"tables": [table(name=3)], "ruled": RULED}, {"tables": [table(schema=7)], "ruled": RULED},
+    {"tables": [table(catalog=False)], "ruled": RULED},
+    {"tables": [table()], "ruled": RULED, "_response_truncated": True},
+    {"tables": [table()], "ruled": RULED, "more": True},
+    {"tables": [table()]}, {"tables": [table()], "ruled": ""}, {"tables": [table()], "ruled": "  "},
+    {"tables": [table()], "ruled": 3}, {"tables": [table()], "ruled": None},
 ], ids=["not offered", "database not found", "too large", "unreadable", "refused", "not an object", "not a list",
         "a malformed entry", "an entry short of a part", "an entry saying more", "a blank name", "a number for a name",
-        "a number for a schema", "a boolean for a catalog", "cut for size", "an envelope saying more"])
+        "a number for a schema", "a boolean for a catalog", "cut for size", "an envelope saying more",
+        "no rendering", "an empty rendering", "a blank rendering", "a number for a rendering", "a null rendering"])
 def test_a_tables_read_answer_mnemiq_cannot_read_whole_tells_it_nothing(answer):
-    """Read strictly: exactly `{"tables": [...]}`, each entry exactly `{catalog, schema, table}`, the table a name,
-    the catalog and schema a name or null. Anything else, or a call that fails (an extension older than the tool
-    among them), is None: mnemiq cannot tell."""
+    """Read strictly: exactly `{"tables": [...], "ruled": <text>}`, each entry exactly `{catalog, schema, table}`, the
+    table a name, the catalog and schema a name or null, the rendering a text. Anything else, or a call that fails (an
+    extension older than the tool among them), is None: mnemiq cannot tell."""
     assert read_by(Reading(answer)) is None
 
 

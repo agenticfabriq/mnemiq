@@ -21,6 +21,7 @@ from mnemiq.superset.executed import check_executed, check_tables_read, executed
 from mnemiq.superset.extension import TOOL_PREFIX, ExtensionMissing, ExtensionOutdated
 from mnemiq.superset.names import RefusedStatement
 from mnemiq.superset.payload import SupersetAccessRefused, SupersetQueryFailed
+from tests.superset_fake import tables_read_as_mnemiq
 
 RC2 = json.loads((Path(__file__).parent / "fixtures" / "superset_rc2_executed.json").read_text())
 CASES = RC2["cases"]
@@ -63,6 +64,43 @@ def test_a_statement_superset_would_run_as_sent_passes(name):
 def test_a_compared_is_not_null_as_mnemiq_prints_it_passes():
     """`(NOT x IS NULL) = 1`, as mnemiq prints a compared IS NOT NULL, rc2 renders as mnemiq reads it."""
     _check("IS NOT NULL compared, as mnemiq prints it")
+
+
+# The cases whose statement mnemiq sends: held to rc2's rendering of it with a rule on every table it reads too.
+SENDABLE = ["one table under its rule", "one table with no rule", "a join, one table ruled",
+            "a CTE, a subquery and a schema", "a column qualified by its table's name", "a sampled table",
+            "a table read twice", "a quoted table", "Superset's limit", "Superset's limit after an offset",
+            "a subquery's own limit", "a statement's own limit", "the proof's probe",
+            "IS NOT NULL compared, as mnemiq prints it", "a table read in a query and its subquery"]
+
+
+def _everywhere(sent: str) -> dict[str, bool]:
+    """Rules as if one applied to every table mnemiq reads in `sent`."""
+    return dict.fromkeys(physical_reads(sent, dialect="oracle"), True)
+
+
+@pytest.mark.parametrize("name", SENDABLE)
+def test_rc2s_rendering_with_a_rule_on_every_table_wraps_each_place_a_table_is_read(name):
+    """rc2's own `apply_rls` with the placeholder rule on every table it reads (`tables_read`'s `ruled`): every place
+    mnemiq reads a table is wrapped, so `check_executed` with a rule on every table passes."""
+    case = CASES[name]
+    check_executed(case["sent"], case["placeholder"], rules=_everywhere(case["sent"]), dialect="oracle")
+
+
+@pytest.mark.parametrize(("name", "kept"), [
+    ("a table read twice", 'JOIN (\n  SELECT\n    *\n  FROM orders\n  WHERE\n    1 = 1\n) "B"'),
+    ("a table read in a query and its subquery",
+     'FROM (\n      SELECT\n        *\n      FROM orders\n      WHERE\n        1 = 1\n    ) "P"'),
+])
+def test_one_place_of_a_table_left_unwrapped_where_every_table_is_ruled_is_refused(name, kept):
+    """A table read at two places, wrapped at one and not the other in the rendering with a rule on every table:
+    refused, naming the table, whatever rules apply to the person asking."""
+    case = CASES[name]
+    assert kept in case["placeholder"]
+    unwrapped = case["placeholder"].replace(kept, kept.split("(")[0] + 'orders "' + kept.rsplit('"', 2)[1] + '"')
+    assert unwrapped != case["placeholder"]
+    with pytest.raises(RefusedStatement, match="could not confirm for orders"):
+        check_executed(case["sent"], unwrapped, rules=_everywhere(case["sent"]), dialect="oracle")
 
 
 @pytest.mark.parametrize("name", [
@@ -289,7 +327,8 @@ class _Superset:
     """Stands in for `SupersetMcp` before Superset and the extension: records each call; answers a dry run with the
     statement it is given as `executed` (by default, a statement whose text Superset would run as sent), `tables_read`
     with `read` (by default, the tables mnemiq reads in the statement, in the schema asked where it names none),
-    `table_rules` from `rules` by table name (`answers` in its place when given), and a run with one row."""
+    `table_rules` from `rules` by table name (`answers` in its place when given), and a run with one row. Its default
+    `tables_read` answer renders every one of those tables wrapped (`superset_fake.ruled_as_rc2`)."""
 
     def __init__(self, *, executed=None, rules: dict | None = None, answers=None, read=None, run=ROWS) -> None:
         self.calls: list[tuple[str, dict]] = []
@@ -316,8 +355,7 @@ class _Superset:
                 raise answer
             if answer is not None:
                 return answer
-            return {"tables": [{"catalog": None, "schema": schema or request["schema"], "table": name}
-                               for _, schema, name in physical_reads(request["sql"], dialect="oracle").values()]}
+            return tables_read_as_mnemiq(request)
         if tool == TABLE_RULES:
             if "tables" not in request and not callable(self.answers):
                 return {"refused": "the request names no tables"}  # the extension's answer to its probe
@@ -468,9 +506,26 @@ def test_on_oracle_a_refusal_of_the_caller_at_table_rules_is_remembered(superset
 def test_on_oracle_a_table_superset_does_not_read_as_mnemiq_does_is_never_sent(superset_oracle):
     """`tables_read` without a table mnemiq reads: nothing is sent, the reason naming the table, and `table_rules`
     is not asked."""
-    superset = _Superset(read={"tables": [{"catalog": None, "schema": "shop", "table": "orders"}]})
+    superset = _Superset(read={"tables": [{"catalog": None, "schema": "shop", "table": "orders"}],
+                               "ruled": 'SELECT o.id FROM orders "O"'})
     with pytest.raises(SupersetQueryFailed, match="could not confirm for lines"):
         _oracle(superset).execute_arrow('SELECT o.id FROM orders "O" JOIN lines "L" ON l.order_id = o.id')
+    assert _tools(superset) == ["dry run", TABLES_READ]
+
+
+def test_on_oracle_a_place_superset_would_not_wrap_under_a_rule_on_every_table_is_never_sent(superset_oracle):
+    """`tables_read`'s rendering with a rule on every table leaves one place a table is read unwrapped: nothing is
+    sent, the reason naming the table, and `table_rules` is not asked."""
+    case = CASES["a table read twice"]
+    unwrapped = case["placeholder"].replace('JOIN (\n  SELECT\n    *\n  FROM orders\n  WHERE\n    1 = 1\n) "B"',
+                                            'JOIN orders "B"')
+
+    def read(request):
+        return {**tables_read_as_mnemiq(request), "ruled": unwrapped}
+
+    superset = _Superset(executed=case["executed"], read=read)
+    with pytest.raises(SupersetQueryFailed, match="could not confirm for orders"):
+        _oracle(superset).execute_arrow(case["sent"])
     assert _tools(superset) == ["dry run", TABLES_READ]
 
 
@@ -512,6 +567,16 @@ def test_on_postgres_one_call_and_the_request_as_before():
                                                "timeout": 30}),
                               ("execute_sql", {"database_id": 7, "sql": "SELECT id FROM orders", "schema": "public",
                                                "timeout": 30, "dry_run": True})]
+
+
+@pytest.mark.parametrize("marker", ["{{", "{%", "{#"])
+def test_confirm_sent_never_sends_a_template_marker(superset_oracle, marker):
+    """A made dataset's SQL holding a marker Superset renders as a template is refused before any call, as a statement
+    the adapter runs is."""
+    superset = _Superset()
+    with pytest.raises(RefusedStatement, match="which Superset reads as a template marker"):
+        _oracle(superset).confirm_sent(f'SELECT o.id FROM orders "O" /* {marker} */')
+    assert superset.calls == []
 
 
 def test_confirm_sent_checks_a_statement_as_superset_would_run_it_on_oracle_only(superset_oracle):

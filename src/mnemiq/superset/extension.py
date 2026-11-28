@@ -9,7 +9,8 @@ cannot settle it either. `require_extension` settles it by one call of a probe: 
 the installed extension answers with an empty list and never fails on. `call_tool` asks it once a call fails that way.
 
 A build needs more than an extension: it needs one that makes every object a build makes, which an older one does not.
-`require_build_tools` asks for that before a build is planned (`ExtensionOutdated`), and `require_table_rules` and
+`require_build_tools` asks for that, and for every other tool a build calls on its dialect, before a build is planned
+(`ExtensionOutdated`), and `require_table_rules` and
 `require_tables_read` ask for the extension's `table_rules` and `tables_read`, which every statement Superset mode
 sends on Oracle needs.
 """
@@ -19,13 +20,15 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Sequence
 from enum import Enum
+from typing import NamedTuple
 
 from mnemiq.superset.client import SupersetToolError, SupersetUnavailable
+from mnemiq.superset.settings import superset_dialect
 
 __all__ = ["DATASET_METRICS_BATCH", "EXTENSION_TOOLS", "PRESENCE_PROBE", "ExtensionMissing", "ExtensionOutdated",
-           "SessionAnswer", "TABLE_RULES_BATCH", "TOOL_PREFIX", "call_tool", "dashboard_editorship", "dataset_metrics", "require_build_tools",
+           "SessionAnswer", "TABLE_RULES_BATCH", "TABLES_READ_ANSWER_BYTES", "TOOL_PREFIX", "call_tool", "dashboard_editorship", "dataset_metrics", "require_build_tools",
            "require_extension", "require_table_rules", "require_tables_read", "row_rule_applies",
-           "session_binding", "table_rules_apply", "tables_read"]
+           "session_binding", "table_rules_apply", "tables_read", "TablesRead"]
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +45,9 @@ DATASET_METRICS_BATCH = 20
 # The most table names one `table_rules` call takes: the extension refuses a request naming more
 # (`reads.MAX_TABLES` in the extension).
 TABLE_RULES_BATCH = 50
+# The most bytes of JSON text `tables_read` answers in; a larger answer is answered `{"too_large": true}`
+# (`reads.MAX_ANSWER_BYTES` in the extension).
+TABLES_READ_ANSWER_BYTES = 40_000
 
 # The probe, which the installed extension answers with an empty list and never fails on, without touching Superset.
 PRESENCE_PROBE = ("dataset_metrics", {"dataset_ids": []})
@@ -96,13 +102,23 @@ def require_extension(client) -> None:
         raise
 
 
-def require_build_tools(client) -> None:
-    """Return when Superset offers the extension's tools a build calls, as the client's caller sees them. One call,
-    of the build's probe: `create_dataset` with an empty request, which this extension refuses (`{"refused": ...}`)
-    without touching Superset. A Superset that does not offer it is asked the extension's own probe: with no extension
-    at all, `ExtensionMissing`; with one, it is older than this mnemiq (`ExtensionOutdated`). Any answer other than
-    the refusal raises `SupersetToolError`, and any other failure is raised as the client raised it."""
-    _require_tool(client, _BUILD_PROBE, needed_by="a build")
+# The extension's tools a build calls, probed before it is planned (`require_build_tools`): its creates (probed by
+# `create_dataset`) and the plan check's `table_rules`, on either dialect; on Oracle also `tables_read`, which every
+# statement sent there is held to, and `session_binding`, which every request asks first.
+_BUILD_TOOLS = (_BUILD_PROBE, "table_rules")
+_ORACLE_BUILD_TOOLS = ("tables_read", "session_binding")
+
+
+def require_build_tools(client, *, dialect: str | None = None) -> None:
+    """Return when Superset offers the extension's tools a build calls on `dialect` (Superset mode's, by default), as
+    the client's caller sees them: one call of each, an empty request, which this extension refuses
+    (`{"refused": ...}`) without touching Superset; `create_dataset` first. A Superset that does not offer one is asked
+    the extension's own probe: with no extension at all, `ExtensionMissing`; with one, it is older than this mnemiq
+    (`ExtensionOutdated`, naming the tool). Any answer other than the refusal raises `SupersetToolError`, and any other
+    failure is raised as the client raised it."""
+    oracle = (superset_dialect() if dialect is None else dialect) == "oracle"
+    for base in _BUILD_TOOLS + (_ORACLE_BUILD_TOOLS if oracle else ()):
+        _require_tool(client, base, needed_by="a build")
 
 
 def require_table_rules(client) -> None:
@@ -252,24 +268,35 @@ def _table_rules(client, database_id: int, schema: str, asked: list[str],
 ReadTable = tuple[str | None, str | None, str]
 
 
-def tables_read(client, *, database_id: int, schema: str, sql: str) -> frozenset[ReadTable] | None:
+class TablesRead(NamedTuple):
+    """What the extension's `tables_read` answers of one statement: the tables Superset's access check reads in it,
+    and `ruled`, the statement as Superset would run it were a row rule to apply to every one of them."""
+
+    tables: frozenset[ReadTable]
+    ruled: str
+
+
+def tables_read(client, *, database_id: int, schema: str, sql: str) -> TablesRead | None:
     """The tables Superset's own access check reads in `sql`, one statement, as the extension's `tables_read` answers
     as the caller, each `(catalog, schema, table)` as Superset qualifies a table it applies row rules to (the schema
-    `schema`, in Superset's spelling, and the database's default catalog, where the statement names none of its own).
+    `schema`, in Superset's spelling, and the database's default catalog, where the statement names none of its own),
+    and the statement as Superset would run it were a rule to apply to every one of them (`ruled`).
 
-    Read strictly: the answer must be exactly `{"tables": [...]}`, each entry exactly `{"catalog", "schema", "table"}`,
-    the table a name and the catalog and schema each a name or null. None, where mnemiq cannot tell, for anything else
-    (a database the caller cannot see, a text Superset cannot read as one statement, a size cut, a refusal, a
-    malformed entry, an entry saying more) and for a tool error, which is logged: an extension older than the tool
-    fails it. Superset not answering (`SupersetUnavailable`) and a refusal of the caller are raised, as the client
-    raises them."""
+    Read strictly: the answer must be exactly `{"tables": [...], "ruled": <text>}`, each entry exactly `{"catalog",
+    "schema", "table"}`, the table a name and the catalog and schema each a name or null, the rendering a text. None,
+    where mnemiq cannot tell, for anything else (a database the caller cannot see, a text Superset cannot read as one
+    statement, a size cut, a refusal, a malformed entry, an entry saying more) and for a tool error, which is logged:
+    an extension older than the tool fails it. Superset not answering (`SupersetUnavailable`) and a refusal of the
+    caller are raised, as the client raises them."""
     try:
         answer = client.call(TOOL_PREFIX + "tables_read", {"database_id": database_id, "schema": schema, "sql": sql})
     except SupersetToolError as failure:
         logger.warning("the extension's tables_read failed: %s", failure)
         return None
-    entries = answer.get("tables") if isinstance(answer, dict) and set(answer) == {"tables"} else None
-    if not isinstance(entries, list):
+    if not isinstance(answer, dict) or set(answer) != {"tables", "ruled"}:
+        return None
+    entries, ruled = answer["tables"], answer["ruled"]
+    if not isinstance(entries, list) or not isinstance(ruled, str) or not ruled.strip():
         return None
     found: set[ReadTable] = set()
     for entry in entries:
@@ -280,7 +307,7 @@ def tables_read(client, *, database_id: int, schema: str, sql: str) -> frozenset
                                                              for part in (catalog, read_schema)):
             return None
         found.add((catalog, read_schema, table))
-    return frozenset(found)
+    return TablesRead(frozenset(found), ruled)
 
 
 class SessionAnswer(Enum):

@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextvars
 import inspect
 import json
+import re
 import socket
 import threading
 import time
@@ -101,16 +102,50 @@ def no_table_rule(request: dict) -> dict:
     return {"tables": [{"table": name, "applies": False} for name in request["tables"]]}
 
 
+def ruled_as_rc2(sql: str) -> str:
+    """`sql` as Superset 7.0.0rc2's `apply_rls` renders it with a placeholder rule (`1 = 1`) on every table mnemiq reads
+    in it (`base_tables`, read as Oracle's), the rest as sent, as `dry_run_as_sent` answers a statement: each such table,
+    at each place, in a subquery aliased by its alias, else by its name quoted as written
+    (`RLSAsSubqueryTransformer`). What `tables_read` answers as `ruled` where Superset reads each of them wherever it
+    stands. (rc2's own rendering of a whole statement is held to mnemiq's reading in `tests/test_superset_executed.py`,
+    from rc2's own code.)"""
+    from mnemiq.sql.scope import base_tables
+
+    tree = sqlglot.parse_one(sql, read="oracle")
+    spans = []
+    for table in base_tables(tree, "oracle"):
+        parts = [table.args[part] for part in ("catalog", "db", "this") if isinstance(table.args.get(part), exp.Identifier)]
+        alias = table.args.get("alias")
+        named = alias.this if isinstance(alias, exp.TableAlias) and isinstance(alias.this, exp.Identifier) else None
+        start = min(part.meta["start"] for part in parts)
+        end = (named or parts[-1]).meta["end"] + 1
+        if named is not None:
+            inner = re.sub(r"\s+AS\s*$", "", sql[start:named.meta["start"]], flags=re.IGNORECASE).rstrip()
+            outer = sql[named.meta["start"]:end]
+        else:
+            inner = sql[start:end]
+            outer = exp.to_identifier(table.name, quoted=True).sql(dialect="oracle")
+        spans.append((start, end, f"(SELECT * FROM {inner} WHERE 1 = 1) {outer}"))
+    for start, end, text in sorted(spans, reverse=True):
+        sql = sql[:start] + text + sql[end:]
+    return sql
+
+
 def tables_read_as_mnemiq(request: dict) -> dict:
     """What the extension's `tables_read` answers where Superset's access check reads in a statement the tables mnemiq
     reads in it (`executed.physical_reads`, read as Oracle's, the one dialect it is asked on), each in the request's
-    schema where the statement names none, with no catalog; and an empty request, its probe, refused."""
+    schema where the statement names none, with no catalog, and renders it with every one of them wrapped
+    (`ruled_as_rc2`); an answer over the tool's size bound (`TABLES_READ_ANSWER_BYTES`, measured as the tool measures
+    it) answered `{"too_large": true}`, as the tool answers one; and an empty request, its probe, refused."""
     from mnemiq.superset.executed import physical_reads
+    from mnemiq.superset.extension import TABLES_READ_ANSWER_BYTES
 
     if "sql" not in request:
         return {"refused": "request", "field": "sql"}
-    return {"tables": [{"catalog": catalog or None, "schema": schema or request["schema"], "table": name}
-                       for catalog, schema, name in physical_reads(request["sql"], dialect="oracle").values()]}
+    answer = {"tables": [{"catalog": catalog or None, "schema": schema or request["schema"], "table": name}
+                         for catalog, schema, name in physical_reads(request["sql"], dialect="oracle").values()],
+              "ruled": ruled_as_rc2(request["sql"])}
+    return {"too_large": True} if len(json.dumps(answer).encode()) > TABLES_READ_ANSWER_BYTES else answer
 
 
 def answering_dry_runs(handler: Callable) -> Callable:

@@ -14,7 +14,8 @@ that what Superset would run is the statement mnemiq decided:
   statement reads node for node as the statement sent; the top-level row limit is excepted where the call asks
   Superset for one, and must then be a plain count of at most the rows asked;
 - every occurrence of every table mnemiq reads is wrapped where a rule applies to it for the caller, and where mnemiq
-  cannot tell whether one does;
+  cannot tell whether one does; and, in Superset's rendering of the statement with a rule on every table it reads
+  (the extension's `tables_read`, its `ruled`), every occurrence, so for whoever's rules apply;
 - every column qualifier of the executed statement names one table or subquery of its query or of a query around it,
   and each of the statement's own names the same source there as it does in the statement sent.
 
@@ -129,11 +130,12 @@ def check_executed(sent: str, executed: str, *, rules: Mapping[str, bool | None]
 
 def _unruled(named: str, told: bool | None) -> str:
     if told is None:
-        return (f"mnemiq sends a statement to Superset only when Superset would apply each row rule of yours to each "
-                f"table it reads, and mnemiq could not tell whether one applies to {named}, so it was not sent")
-    return (f"mnemiq sends a statement to Superset only when Superset would apply each row rule of yours to each table "
-            f"it reads, which mnemiq could not confirm for {named}, so it was not sent; read {named} in a plain FROM "
-            "or JOIN, under an alias of its own")
+        return (f"mnemiq sends a statement to Superset only when Superset would apply each row rule that applies to "
+                f"a table it reads at each place it reads it, and mnemiq could not tell whether one applies to "
+                f"{named}, so it was not sent")
+    return (f"mnemiq sends a statement to Superset only when Superset would apply each row rule that applies to a "
+            f"table it reads at each place it reads it, which mnemiq could not confirm for {named}, so it was not "
+            f"sent; read {named} in a plain FROM or JOIN, under an alias of its own")
 
 
 def _statement(text: str, dialect: str, *, unread: str) -> exp.Expression:

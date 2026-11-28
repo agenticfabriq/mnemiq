@@ -196,6 +196,34 @@ def test_require_extension_asks_once():
         assert [c.tool for c in fake.calls] == [DATASET_METRICS]
 
 
+@pytest.mark.parametrize("dialect", ["postgres", "oracle"])
+def test_require_build_tools_asks_for_every_tool_a_build_needs_on_its_dialect(dialect, request):
+    """A build's plan check asks the extension's `table_rules` on either dialect, and on Oracle each statement a build
+    sends needs `tables_read` and the request needs `session_binding`: each is probed (an empty request, which the
+    extension refuses without touching Superset) before anything is planned, and an extension without one is older
+    than this mnemiq (`ExtensionOutdated`), naming the tool, never a build that runs and refuses its joins."""
+    from mnemiq.superset.extension import ExtensionOutdated, require_build_tools
+
+    if dialect == "oracle":
+        request.getfixturevalue("superset_oracle")
+    needed = ["create_dataset", "table_rules"] + (["tables_read", "session_binding"] if dialect == "oracle" else [])
+    with FakeSuperset() as fake:
+        for base in needed:
+            fake.reply(TOOL_PREFIX + base, lambda request, authorization: {"refused": "request", "field": "x"})
+        assert require_build_tools(_client(fake)) is None
+        assert [(c.tool, c.request) for c in fake.calls] == [(TOOL_PREFIX + base, {}) for base in needed]
+    for missing in needed[1:]:
+        with FakeSuperset() as fake:
+            for base in needed:
+                fake.reply(TOOL_PREFIX + base, (lambda request, authorization, base=base: RuntimeError(
+                    f"Internal error in {TOOL_PREFIX}{base}: An unexpected error occurred. Error ID: 2."))
+                    if base == missing else (lambda request, authorization: {"refused": "request", "field": "x"}))
+            fake.reply(DATASET_METRICS, lambda request, authorization: {"datasets": []})
+            with pytest.raises(ExtensionOutdated) as caught:
+                require_build_tools(_client(fake))
+            assert f"does not offer {TOOL_PREFIX}{missing}, which a build calls" in str(caught.value)
+
+
 def test_require_build_tools_tells_an_older_extension_from_none():
     """Whether Superset offers the creates a build sends, settled by one call of the extension's `create_dataset` with
     an empty request, which this extension refuses without touching Superset. rc2's masked error is then told apart
@@ -205,11 +233,13 @@ def test_require_build_tools_tells_an_older_extension_from_none():
     from mnemiq.superset.extension import ExtensionOutdated, require_build_tools
 
     create = TOOL_PREFIX + "create_dataset"
+    rules = TOOL_PREFIX + "table_rules"
     masked = RuntimeError(f"Internal error in {create}: An unexpected error occurred. Error ID: 2.")
     with FakeSuperset() as fake:
         fake.reply(create, lambda request, authorization: {"refused": "request", "field": "database_id"})
+        fake.reply(rules, lambda request, authorization: {"refused": "request", "field": "database_id"})
         assert require_build_tools(_client(fake)) is None
-        assert [(c.tool, c.request) for c in fake.calls] == [(create, {})]
+        assert [(c.tool, c.request) for c in fake.calls] == [(create, {}), (rules, {})]
     with FakeSuperset(extension=False) as fake:
         with pytest.raises(ExtensionMissing) as caught:
             require_build_tools(_client(fake))

@@ -63,6 +63,7 @@ from mnemiq.superset.extension import (
     PRESENCE_PROBE,
     TOOL_PREFIX,
     ExtensionMissing,
+    TablesRead,
     require_table_rules,
     require_tables_read,
     table_rules_apply,
@@ -297,6 +298,10 @@ class SupersetSqlAdapter:
         is asked and nothing runs."""
         if self.dialect != "oracle":
             return
+        try:
+            _refuse_template_markers(sent)  # as every statement the adapter sends, before any call
+        except SupersetQueryFailed as exc:
+            raise RefusedStatement(str(exc)) from exc
         if before_call is not None:
             before_call()
         timeout = _superset_timeout(self._timeout_s)
@@ -456,20 +461,26 @@ class SupersetSqlAdapter:
     def _as_superset_runs(self, sent: str, request: dict, timeout: int) -> dict:
         """Superset's dry run of `request` (the statement `sent`, with the options its real call carries; `timeout` its
         time limit), when every table mnemiq reads in `sent` is one Superset's access check reads in it
-        (`executed.check_tables_read`) and Superset would run it as mnemiq reads it under the rules `table_rules` says
-        apply to the caller (`executed.check_executed`). Raises `RefusedStatement` when not, what Superset's own refusal
-        of the dry run raises from a run, and `SupersetUnavailable` where Superset does not answer the extension."""
+        (`executed.check_tables_read`); when Superset would run it as mnemiq reads it were a row rule to apply to every
+        table it reads, each place a table is read under its rule (`tables_read`'s `ruled`, held by
+        `executed.check_executed` with a rule on every table): so for whoever's rules apply; and when it would run it
+        as mnemiq reads it under the rules `table_rules` says apply to the caller (`executed.check_executed`, on the
+        dry run). Raises `RefusedStatement` when not, what Superset's own refusal of the dry run raises from a run, and
+        `SupersetUnavailable` where Superset does not answer the extension."""
         payload = self._call({**request, "dry_run": True}, timeout)
         check_execute_response(payload)
         executed = executed_sql(payload)
-        check_tables_read(sent, self._tables_read(sent), schema=self._schema, dialect=self.dialect)
+        read = self._tables_read(sent)
+        check_tables_read(sent, None if read is None else read.tables, schema=self._schema, dialect=self.dialect)
+        check_executed(sent, read.ruled, rules=dict.fromkeys(physical_reads(sent, dialect=self.dialect), True),
+                       dialect=self.dialect)
         check_executed(sent, executed, rules=self._table_rules(sent), dialect=self.dialect,
                        limit=request.get("limit"))
         return payload
 
-    def _tables_read(self, sent: str) -> frozenset | None:
-        """The tables Superset's access check reads in `sent`, as the extension's `tables_read` answers, or None where
-        mnemiq cannot tell; for None the extension is asked whether it offers `tables_read` at all, and one that does
+    def _tables_read(self, sent: str) -> TablesRead | None:
+        """The tables Superset's access check reads in `sent`, and its rendering with a rule on every one of them, as the
+        extension's `tables_read` answers, or None where mnemiq cannot tell; for None the extension is asked whether it offers `tables_read` at all, and one that does
         not ends the request (`ExtensionMissing`), as a refusal of the caller does. Superset not answering is raised
         (`SupersetUnavailable`)."""
         try:

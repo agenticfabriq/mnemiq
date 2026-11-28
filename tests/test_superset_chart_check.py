@@ -2874,8 +2874,8 @@ def test_an_oracle_made_dataset_superset_reads_other_tables_in_is_not_checked(fa
     """mnemiq does not check the chart when Superset's reading of the made dataset's SQL (`tables_read`) misses a
     table mnemiq reads, saying which."""
     made, held = _made_on_oracle(fake)
-    fake.reply(TABLES_READ, lambda request, authorization: {"tables": []} if request.get("sql") == held
-               else tables_read_as_mnemiq(request))
+    fake.reply(TABLES_READ, lambda request, authorization: {**tables_read_as_mnemiq(request), "tables": []}
+               if request.get("sql") == held else tables_read_as_mnemiq(request))
     check = _oracle_check(fake, made={DATASET_ID: made})
     assert check.status is ChartStatus.NOT_CHECKED and "could not confirm for policy" in check.reason, check
     assert _statements(fake) == []

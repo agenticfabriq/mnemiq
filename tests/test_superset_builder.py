@@ -49,7 +49,7 @@ from tests.superset_build_world import (
     World,
     dataset_id_of,
 )
-from tests.superset_fake import FakeSuperset
+from tests.superset_fake import FakeSuperset, tables_read_as_mnemiq
 from tests.superset_shared import BY_REGION, ONE_BAR, POLICIES, _chart
 
 TENANT = "tenant-a"
@@ -981,7 +981,8 @@ def test_a_datasets_sql_superset_reads_other_tables_in_fails_its_step(fake, worl
     plan = dataclasses.replace(ONE_VIRTUAL, datasets=(dataclasses.replace(JOINED, sql=ORACLE_MADE),))
     build = _start(store, plan).build_id
     _run_to(store, build, _adapter(fake), "dataset_1")
-    world.hooks["tables_read"] = Hook(instead=lambda request, _w: {"tables": []})
+    world.hooks["tables_read"] = Hook(instead=lambda request, _w: {**tables_read_as_mnemiq(request), "tables": []}
+                                      if "sql" in request else None)
     stopped = _next(store, build, _adapter(fake))
     assert stopped.status == "failed" and _step(stopped, "dataset_1").reason == "statement_refused", stopped
     assert "could not confirm for policy" in stopped.message, stopped.message

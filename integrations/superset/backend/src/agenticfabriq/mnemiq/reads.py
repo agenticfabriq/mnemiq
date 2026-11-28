@@ -8,7 +8,9 @@ a read:
 - Its answer is short and structured; Superset's own text never reaches it.
 - An object the caller may not read is left out of an answer about several, or answered as one that does not exist,
   by the same check Superset's own tools use (`can_access_datasource`, `can_access_chart`, `can_access_dashboard`),
-  so an object out of reach reads as one that is not there.
+  so an object out of reach reads as one that is not there. Except `table_rules`, which answers whether a row rule
+  applies to the caller on a table through every dataset of it Superset's own lookup finds, the ones the caller may
+  not read among them, and only that: never the rule, its clause, its roles or the dataset.
 - It takes no user id from the caller.
 
 An editor's label (`Subject.label`) is returned only for an object the caller may read, and only in the answer
@@ -59,6 +61,12 @@ MAX_SERVICE_NAME = MAX_SCHEMA_NAME
 SESSION_SQL = "SELECT USER, SYS_CONTEXT('USERENV','SERVICE_NAME'), SYS_CONTEXT('USERENV','CURRENT_SCHEMA') FROM DUAL"
 # The backend of a database `session_binding` reads a session of, as rc2's `Database.backend` names it.
 ORACLE = "oracle"
+# The rule `tables_read` renders a statement with on every table it reads: a predicate true of every row, read by the
+# statement's own `parse_predicate`, so the rendering is what Superset would run were a rule to apply to each table.
+PLACEHOLDER_RULE = "1 = 1"
+# The only nodes a template processor's environment parses plain text to (`jinja2.nodes`): `tables_read` reads no text
+# its database's processor would read as anything more.
+_PLAIN_TEXT_NODES = frozenset({"Template", "Output", "TemplateData"})
 # An answer larger than this, in bytes of its JSON text, is not sent: well under the guard's 50,000.
 MAX_ANSWER_BYTES = 40_000
 MAX_LAYOUT_BYTES = MAX_ANSWER_BYTES
@@ -278,17 +286,22 @@ def tables_read(found: dict) -> dict:
     `process_jinja_sql` (`superset/sql/parse.py`), as `security_manager.raise_for_access` reads a statement, with the
     empty template parameters `execute_sql` renders a statement with. Each table is qualified as the executor qualifies
     a table it applies row rules to (`SQLExecutor._prepare_sql`): by the request's schema, and the database's default
-    catalog, where the statement names none of its own. Answered `{"tables": [{catalog, schema, table}, ...]}`, sorted,
-    each once.
+    catalog, where the statement names none of its own. Answered `{"tables": [{catalog, schema, table}, ...], "ruled":
+    <text>}`, the tables sorted, each once, and `ruled` the statement as rc2's own `apply_rls` renders it with
+    `PLACEHOLDER_RULE` on every one of them, by the method the database's engine applies rules by (`get_rls_method`),
+    then `.format()`: what Superset would run were a rule to apply to every table it reads. No rule is read.
 
     A text holding a template marker (`TEMPLATE_MARKERS`), in a literal or a comment as anywhere, is answered
     `{"unreadable": True}` before anything else: it is never rendered, so no answer carries what a template renders
     to, and Superset is not asked. A database the caller may not see, or that does not exist, is answered
-    `{"not_found": "database"}`, as `table_rules` answers one, and the text is not read. A text rc2 cannot read, or
-    reads as other than one statement,
-    or as one it does not fully model (`has_unparseable_statement`, which its access check refuses under strict
-    scoping), is answered `{"unreadable": True}`; an answer over `MAX_ANSWER_BYTES`, `{"too_large": True}`."""
+    `{"not_found": "database"}`, as `table_rules` answers one, and the text is not read. A text the database's own
+    template processor (`get_template_processor`, which a deployment's `CUSTOM_TEMPLATE_PROCESSORS` decide) parses to
+    anything but text, or cannot parse, is answered `{"unreadable": True}`, and is not rendered either. So is a text
+    rc2 cannot read, or reads as other than one statement, or as one it does not fully model
+    (`has_unparseable_statement`, which its access check refuses under strict scoping), or cannot render with the
+    placeholder rule; an answer over `MAX_ANSWER_BYTES` is answered `{"too_large": True}`."""
     from jinja2.exceptions import TemplateError
+    from sqlglot.errors import SqlglotError
     from superset.daos.database import DatabaseDAO
     from superset.exceptions import SupersetParseError, SupersetSecurityException
     from superset.sql.parse import process_jinja_sql
@@ -298,6 +311,8 @@ def tables_read(found: dict) -> dict:
     database = DatabaseDAO.find_by_id(found["database_id"])
     if database is None:
         return writes._not_found("database")
+    if not _plain_text(found["sql"], database):
+        return {"unreadable": True}
     catalog = database.get_default_catalog()
     try:
         parsed = process_jinja_sql(found["sql"], database, {})
@@ -305,10 +320,41 @@ def tables_read(found: dict) -> dict:
         return {"unreadable": True}
     if len(parsed.script.statements) != 1 or parsed.script.has_unparseable_statement:
         return {"unreadable": True}
+    [statement] = parsed.script.statements
     tables = {table.qualify(catalog=catalog, schema=found["schema"]) for table in parsed.tables}
+    try:
+        statement.apply_rls(catalog, found["schema"],
+                            {table: [statement.parse_predicate(PLACEHOLDER_RULE)] for table in tables},
+                            database.db_engine_spec.get_rls_method())
+        ruled = statement.format()
+    except (SupersetParseError, SqlglotError):
+        return {"unreadable": True}
     answer = {"tables": [{"catalog": table.catalog, "schema": table.schema, "table": table.table}
-                         for table in sorted(tables, key=lambda t: (t.catalog or "", t.schema or "", t.table))]}
+                         for table in sorted(tables, key=lambda t: (t.catalog or "", t.schema or "", t.table))],
+              "ruled": ruled}
     return dict(TOO_LARGE) if _size(answer) > MAX_ANSWER_BYTES else answer
+
+
+def _plain_text(sql: str, database: Any) -> bool:
+    """Whether the database's own template processor reads `sql` as text and nothing more: its environment parses it
+    (never renders it) to `_PLAIN_TEXT_NODES` alone. A processor with no environment, and a text it cannot parse, are
+    not plain text."""
+    from jinja2.exceptions import TemplateError
+    from superset.jinja_context import get_template_processor
+
+    env = getattr(get_template_processor(database=database), "env", None)
+    if env is None:
+        return False
+    try:
+        pending = [env.parse(sql)]
+    except TemplateError:
+        return False
+    while pending:
+        node = pending.pop()
+        if type(node).__name__ not in _PLAIN_TEXT_NODES:
+            return False
+        pending.extend(node.iter_child_nodes())
+    return True
 
 
 @writes._answering("session_binding", REQUESTS)

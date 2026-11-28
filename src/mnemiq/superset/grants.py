@@ -30,6 +30,7 @@ harvested none asks nothing more.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -49,6 +50,7 @@ from mnemiq.superset.client import (
     SupersetToolError,
     SupersetUnavailable,
 )
+from mnemiq.superset.extension import TABLES_READ_ANSWER_BYTES
 from mnemiq.superset.harvested import snapshot_objects, values_harvested
 from mnemiq.superset.names import stored_name, superset_name
 from mnemiq.superset.payload import SupersetAccessRefused, SupersetQueryFailed
@@ -57,6 +59,11 @@ from mnemiq.superset.settings import superset_dialect
 logger = logging.getLogger(__name__)
 
 LIST_DATASETS = "list_datasets"
+
+# The share of the bytes `tables_read` answers in that a part of a grant probe is sized to on Oracle (`_probe_parts`),
+# and the bytes of that answer beside its tables: its envelope, and the rendering's own words.
+_PROBE_SHARE = 0.75
+_ANSWER_OVERHEAD = 200
 
 # The datasets asked for on a page until a page is cut: the most `ListDatasetsRequest.page_size` allows
 # (`MAX_PAGE_SIZE` in `superset/mcp_service/constants.py`).
@@ -153,7 +160,7 @@ def resolve_grants(adapter: SupersetSqlAdapter, snapshot: Snapshot) -> GrantSet:
         return GrantSet(frozenset(), values_withheld=_values_withheld(adapter, snapshot, frozenset()))
     clearance = classified_levels(snapshot)
     try:
-        if _accepted(adapter, list(tables)):
+        if all(_accepted(adapter, part) for part in _probe_parts(adapter, list(tables))):
             granted = frozenset(object_id for ids in tables.values() for object_id in ids)
         else:
             datasets = read_datasets(adapter)
@@ -228,17 +235,53 @@ def _accepted(adapter: SupersetSqlAdapter, names: list[str]) -> bool:
 
 
 def _confirmed(adapter: SupersetSqlAdapter, candidates: list[str]) -> list[str]:
-    """The candidates Superset confirms the person may read: all of them when it accepts a dry run naming them all,
-    else each it accepts a dry run of alone. A single candidate refused is not asked about again."""
-    if not candidates or _accepted(adapter, candidates):
-        return candidates
+    """The candidates Superset confirms the person may read, part by part (`_probe_parts`; one part on PostgreSQL):
+    all of a part when it accepts a dry run naming them all, else each it accepts a dry run of alone. A single
+    candidate refused is not asked about again. Superset's access check is per table, so the parts decide what one
+    dry run naming them all would."""
     confirmed = []
-    if len(candidates) > 1:  # a single candidate was just asked about alone
-        confirmed = [name for name in candidates if _accepted(adapter, [name])]
+    for part in _probe_parts(adapter, candidates):
+        if _accepted(adapter, part):
+            confirmed += part
+        elif len(part) > 1:  # a single candidate was just asked about alone
+            confirmed += [name for name in part if _accepted(adapter, [name])]
     for name in candidates:
         if name not in confirmed:
             logger.info("Superset did not confirm %r for this user, so it is not granted", name)
     return confirmed
+
+
+def _probe_parts(adapter: SupersetSqlAdapter, names: list[str]) -> list[list[str]]:
+    """`names` in the parts each one dry run names: on Oracle, as many as keep the answer of the extension's
+    `tables_read` of that dry run, which each is held to, within the share `_PROBE_SHARE` of the bytes it answers in
+    (`TABLES_READ_ANSWER_BYTES`), each table's bytes estimated from above (`_answer_bytes`), so no answer is cut for
+    size and none is refused for it; elsewhere all of them, in one. In order; none empty."""
+    if adapter.dialect != "oracle" or not names:
+        return [list(names)] if names else []
+    budget = TABLES_READ_ANSWER_BYTES * _PROBE_SHARE
+    parts: list[list[str]] = [[]]
+    size = _ANSWER_OVERHEAD
+    for name in names:
+        cost = _answer_bytes(name, adapter.schema)
+        if parts[-1] and size + cost > budget:
+            parts.append([])
+            size = _ANSWER_OVERHEAD
+        parts[-1].append(name)
+        size += cost
+    return parts
+
+
+def _answer_bytes(stored: str, schema: str) -> int:
+    """An estimate from above of the bytes the table stored as `stored` adds to `tables_read`'s answer for a probe
+    naming it, as the tool measures them (its JSON text, every character past ASCII escaped): its entry, the catalog
+    counted as long as the schema, and its place in the rendering with a rule on every table, the table and its alias
+    each quoted, the indentation one level deeper than rc2's (`tests/fixtures/superset_rc2_executed.json` holds rc2's
+    own sizes, which a test holds this above)."""
+    shown = superset_name(stored)
+    quoted, alias = (exp.to_identifier(name, quoted=True).sql(dialect="oracle") for name in (shown, stored))
+    entry = json.dumps({"catalog": schema, "schema": schema, "table": shown})
+    wrap = json.dumps(f"(\n    SELECT\n      *\n    FROM {quoted}\n    WHERE\n      1 = 1\n  ) {alias},\n  ")
+    return len(entry) + 2 + len(wrap) - 2
 
 
 def table_bindings(snapshot: Snapshot) -> dict[str, set[str]]:

@@ -43,7 +43,8 @@ from mnemiq.superset.client import DelegatedToken, SupersetMcp
 from mnemiq.superset.extension import EXTENSION_TOOLS, TOOL_PREFIX
 from mnemiq.superset.grants import NOT_A_BUILDER
 from mnemiq.superset.charts import Family, WrittenRef
-from mnemiq.superset.planner import BuildPlan, FakePlanner, LLMPlanner, PlanRefused, RefusedPart
+from mnemiq.superset.measures import Measure, MeasureKind
+from mnemiq.superset.planner import BuildPlan, FakePlanner, LLMPlanner, PlannedDataset, PlanRefused, RefusedPart
 from tests.auth_keys import AUDIENCE, ISSUER, claims, jwks_for, mint, rsa_key
 from tests.superset_build_world import SNAPSHOT as WORLD_SNAPSHOT
 from tests.superset_build_world import TABLES, Clock, Hook, MemoryBuildStore, World
@@ -56,11 +57,21 @@ from tests.superset_shared import (
     SIGN_IN,
     SNAPSHOT_REFUSED,
     SOURCE_ID,
+    _chart,
     _source_job,
     superset_deployment,
 )
 
 GOAL = "Policies by region"
+# A plan whose measure is over a dataset joining two tables on a key the plan check has to probe.
+CLAIMED = Measure(name="claimed", label="Claimed", expression="SUM(amount)", kind=MeasureKind.NUMBER, dataset_id=-1,
+                  description="", asked_by="")
+JOINED_PLAN = BuildPlan(
+    charts=(_chart("claimed_by_region", Family.BAR, "Claimed by region", -1, (WrittenRef(CLAIMED),),
+                   dimensions=("region",)),),
+    measures=(CLAIMED,),
+    datasets=(PlannedDataset(key="dataset_1", placeholder=-1, join="policy JOIN claim ON policy.region = "
+                                                                     "claim.claim_region"),))
 # The sentences the build routes answer with, as the person reads them.
 NOT_FOR_BUILDING = "This sign-in was made for asking, not building; open the builder from Superset again."
 EXTENSION_MISSING = "This Superset does not have the mnemiq extension installed."
@@ -488,6 +499,22 @@ def test_missing_extension_is_named(served, fake, world, store):
         TOOL_PREFIX + "create_dataset", TOOL_PREFIX + "dataset_metrics"]
 
 
+def test_an_extension_without_table_rules_is_refused_before_a_join_is_planned(served, fake, world, store):
+    """On PostgreSQL too a build's plan check asks the extension's `table_rules` whether a rule applies on a joined
+    table before it probes the join's key; an extension older than that tool would have it refuse every join needing a
+    probe. So such an extension is refused before anything is planned, with the sentence an outdated extension gets,
+    and the planner is never asked for a plan that joins."""
+    client, runtime = served
+    planner = _planned(runtime, FakePlanner(JOINED_PLAN))
+    world.hooks["table_rules"] = Hook(instead=_masked("table_rules"))
+    r = _start(client)
+    assert r.status_code == 503, r.text
+    assert r.json()["detail"] == EXTENSION_OUTDATED
+    assert store._builds == {} and _writes(fake) == [] and planner.goals == []
+    assert [call.tool for call in fake.calls if call.tool.startswith("extensions.")] == [
+        TOOL_PREFIX + "create_dataset", TOOL_PREFIX + "table_rules", TOOL_PREFIX + "dataset_metrics"]
+
+
 def test_an_outdated_extension_is_refused_before_planning(served, fake, world, store):
     """A Superset whose mnemiq extension is older than this mnemiq, and lacks the create a build sends: the build's
     probe of it (`create_dataset` with an empty request, which this extension refuses without touching Superset)
@@ -638,12 +665,13 @@ PLANNING = {"list_datasets", "list_metrics", "list_dashboards"}
 
 def _asked_only_who_may_build_and_whether_they_edit(fake, dashboard_id: int) -> None:
     """What Superset was asked, in order, and nothing else: the grants' dry run (whether the builder may build), the
-    build's probe of the extension (`create_dataset` with an empty request, which it refuses), and its read of whether
-    the builder edits the dashboard. No planning call and no create."""
+    build's probes of the extension (`create_dataset` and `table_rules`, each with an empty request, which it
+    refuses), and its read of whether the builder edits the dashboard. No planning call and no create."""
     assert [call.tool for call in fake.calls] == ["execute_sql", TOOL_PREFIX + "create_dataset",
-                                                  TOOL_PREFIX + "editors_of"], [call.tool for call in fake.calls]
-    grants, probe, editors = fake.calls
-    assert grants.request.get("dry_run") is True and probe.request == {}
+                                                  TOOL_PREFIX + "table_rules", TOOL_PREFIX + "editors_of"], \
+        [call.tool for call in fake.calls]
+    grants, probe, rules, editors = fake.calls
+    assert grants.request.get("dry_run") is True and probe.request == rules.request == {}
     assert editors.request == {"dashboard_ids": [dashboard_id]}
     assert not {call.tool for call in fake.calls} & PLANNING and _writes(fake) == []
 

@@ -108,15 +108,19 @@ def test_a_qualifier_naming_no_source_in_what_superset_would_run_is_refused(live
     observe("stranded", west=" ".join(ruled.split()), west_ran=ran.get("error_type"))
 
 
-def _read(live, client: SupersetMcp, sql: str) -> frozenset | None:
+def _read(live, client: SupersetMcp, sql: str):
     return tables_read(client, database_id=live.database_id, schema=SCHEMA, sql=sql)
 
 
 def _catalog(live) -> str | None:
     """The catalog Superset qualifies an unqualified table by on the live database: its default, as the tool answers
     it for one table."""
-    [(catalog, _, _)] = _read(live, _client(live, "analyst"), "SELECT 1 FROM policy")
+    [(catalog, _, _)] = _read(live, _client(live, "analyst"), "SELECT 1 FROM policy").tables
     return catalog
+
+
+def _everywhere(sql: str) -> dict[str, bool]:
+    return dict.fromkeys(physical_reads(sql, dialect="postgres"), True)
 
 
 @pytest.mark.parametrize(("sql", "tables"), [
@@ -124,19 +128,39 @@ def _catalog(live) -> str | None:
     ('WITH recent AS (SELECT id FROM policy) SELECT r.id FROM recent r JOIN "Policy Lines" l ON l.policy_id = r.id',
      {"policy", "Policy Lines"}),
     ("SELECT y.id FROM party y WHERE y.id IN (SELECT p.id FROM public.policy p)", {"party", "policy"}),
-], ids=["a join", "a CTE", "a subquery"])
+    ("SELECT a.id FROM policy a JOIN policy b ON b.id = a.id + 1 WHERE a.id IN (SELECT c.id FROM policy c)",
+     {"policy"}),
+], ids=["a join", "a CTE", "a subquery", "one table at three places"])
 def test_tables_read_answers_the_tables_supersets_access_check_reads(live, sql, tables):
-    """The extension's `tables_read`, asked as analyst, answers the tables Superset's own access check reads in a
-    join, a CTE (its name never a table) and a subquery, each in the schema asked or its own, with the database's
-    default catalog; mnemiq's check finds every table it reads among them, and refuses when one is held out."""
+    """The extension's `tables_read`, asked as analyst (whom no rule narrows), answers the tables Superset's own access
+    check reads in a join, a CTE (its name never a table), a subquery and one table read at three places, each in the
+    schema asked or its own, with the database's default catalog; and its rendering of the statement with the
+    placeholder rule on every one of them, each place a table is read wrapped. mnemiq's checks pass both, and refuse
+    when a table is held out, or one place a table is read is left unwrapped."""
     analyst = _client(live, "analyst")
     read = _read(live, analyst, sql)
     catalog = _catalog(live)
-    assert read == frozenset((catalog, SCHEMA, name) for name in tables), read
-    check_tables_read(sql, read, schema=SCHEMA, dialect="postgres")
+    assert read.tables == frozenset((catalog, SCHEMA, name) for name in tables), read
+    check_tables_read(sql, read.tables, schema=SCHEMA, dialect="postgres")
     with pytest.raises(RefusedStatement, match="could not confirm for"):
-        check_tables_read(sql, frozenset(t for t in read if t[2] != "policy"), schema=SCHEMA, dialect="postgres")
-    observe("tables_read", sql=sql, read=sorted(read, key=str))
+        check_tables_read(sql, frozenset(t for t in read.tables if t[2] != "policy"), schema=SCHEMA,
+                          dialect="postgres")
+    assert "1 = 1" in read.ruled and "region" not in read.ruled, read.ruled
+    check_executed(sql, read.ruled, rules=_everywhere(sql), dialect="postgres")
+    observe("tables_read", sql=sql, read=sorted(read.tables, key=str), ruled=" ".join(read.ruled.split()))
+
+
+def test_one_place_left_unwrapped_in_supersets_rendering_is_refused(live):
+    """Superset's own rendering of a statement reading `policy` at two places, with one of the wraps taken out:
+    refused, naming the table."""
+    sql = "SELECT a.id FROM policy a JOIN policy b ON b.id = a.id + 1"
+    ruled = _read(live, _client(live, "analyst"), sql).ruled
+    wrapped = " ".join(ruled.split())
+    assert wrapped.count("1 = 1") == 2, wrapped
+    one = wrapped.replace("JOIN ( SELECT * FROM policy WHERE 1 = 1 ) AS b", "JOIN policy AS b")
+    assert one != wrapped, wrapped
+    with pytest.raises(RefusedStatement, match="could not confirm for policy"):
+        check_executed(sql, one, rules=_everywhere(sql), dialect="postgres")
 
 
 def test_tables_read_of_text_superset_cannot_read_as_one_statement_is_unreadable(live):
